@@ -8,12 +8,37 @@ static inline uint8_t getStatusATA(void) {
 uint8_t waitForIdleATA(void) {
   uint32_t timeout = 100000000;
   while (timeout--) {
-    uint8_t status = getStatusATA();
-    if (status == 0xFF) return 0;
-    if (status & ATA_SR_BSY) continue;
-    if (status & (ATA_SR_ERR | ATA_SR_DF)) return 0; // Fail fast
-    if (!(status & ATA_SR_DRDY)) continue;
-    else return 1;
+    uint8_t st = getStatusATA();
+    if (st == 0xFF) return 0;
+
+    if (st & ATA_SR_BSY) continue;
+    if (st & (ATA_SR_ERR | ATA_SR_DF)) return 0;   // fail fast
+
+    // IMPORTANT: "idle/ready for a new command" must also mean DRQ is NOT asserted.
+    if (st & ATA_SR_DRQ) continue;
+
+    if (!(st & ATA_SR_DRDY)) continue;
+    return 1;
+  }
+  return 0;
+}
+
+static uint8_t waitForCompletionATA(void) {
+  uint32_t timeout = 10000000;
+  while (timeout--) {
+    uint8_t st = getStatusATA();
+    if (st == 0xFF) return 0;
+
+    if (st & ATA_SR_BSY) continue;
+    if (st & (ATA_SR_ERR | ATA_SR_DF)) return 0;
+
+    // Completion requires DRQ to be cleared (data phase ended).
+    if (st & ATA_SR_DRQ) continue;
+
+    // Optional but safe: require DRDY as well.
+    if (!(st & ATA_SR_DRDY)) continue;
+
+    return 1;
   }
   return 0;
 }
@@ -158,14 +183,17 @@ uint8_t writeToDiskATA48(uint64_t lba, const void* addr, uint32_t sectorCount) {
   while (sectorCount) {
     if (!waitForIdleATA()) return 0;
 
-    // single-sector command path: 1 sector per command
     setupLBADest48(lba, 1);
 
     outb(ATA_REG_COMMAND, ATA_CMD_WRITE_SECTORS_EXT); // 0x34
     for (int i = 0; i < 4; i++) inb(ATA_REG_CONTROL);
 
     if (!waitForDRQATA()) return 0;
+
     outsw(ATA_REG_DATA, ptr, 256);
+
+    // <-- THIS is the critical missing step
+    if (!waitForCompletionATA()) return 0;
 
     ptr += 256;
     lba += 1;
@@ -177,25 +205,31 @@ uint8_t writeToDiskATA48(uint64_t lba, const void* addr, uint32_t sectorCount) {
 }
 
 uint8_t readFromDiskATA48(uint64_t lba, void* addr, uint32_t sectorCount) {
-  uint16_t* ptr = (uint16_t*)addr;
+    uint16_t* ptr = (uint16_t*)addr;
 
-  while (sectorCount) {
-    if (!waitForIdleATA()) return 0;
+    while (sectorCount) {
+        if (!waitForIdleATA()) return 2;
 
-    // single-sector command path: 1 sector per command
-    setupLBADest48(lba, 1);
+        setupLBADest48(lba, 1);
+        outb(ATA_REG_COMMAND, ATA_CMD_READ_SECTORS_EXT); // 0x24
 
-    outb(ATA_REG_COMMAND, ATA_CMD_READ_SECTORS_EXT);  // 0x24
-    for (int i = 0; i < 4; i++) inb(ATA_REG_CONTROL);
+        // 400ns delay
+        for (int i = 0; i < 4; i++) inb(ATA_REG_CONTROL);
 
-    if (!waitForDRQATA()) return 0;
-    insw(ATA_REG_DATA, ptr, 256);
+        if (!waitForDRQATA()) return 3;
 
-    ptr += 256;
-    lba += 1;
-    sectorCount -= 1;
-  }
+        insw(ATA_REG_DATA, ptr, 256);
 
-  if (!waitForIdleATA()) return 0;
-  return 1;
+        // <-- THIS is the critical missing step
+        if (!waitForCompletionATA()) return 4;
+
+        ptr += 256;
+        lba += 1;
+        sectorCount -= 1;
+    }
+
+    // Final settle (now redundant-ish, but fine)
+    if (!waitForIdleATA()) return 4;
+
+    return 1;
 }

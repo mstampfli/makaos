@@ -48,6 +48,7 @@
 // initializes ata controller and sets multiple mode
 uint8_t ata_init(void);
 
+
 // reads sectors from disk using lba28
 uint8_t ata_disk_read_28_poll(uint32_t lba, void* addr, uint32_t sector_count);
 
@@ -66,3 +67,7 @@ uint8_t ata_wait_idle(void);
 
 // waits for bsy to clear and drq to set
 uint8_t ata_wait_drq(void);
+
+
+uint8_t initializeATA(void);
+uint8_t readFromDiskATA48(uint64_t lba, void* addr, uint32_t sectorCount);

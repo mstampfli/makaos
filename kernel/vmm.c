@@ -20,6 +20,18 @@ static inline phys_addr_t virt_to_phys(virt_addr_t virt) {
     return virt - HHDM_OFFSET;
 }
 
+__attribute__((no_caller_saved_registers))
+static inline uint64_t cr2_get(void) {
+    unsigned long val;
+    __asm__ __volatile__(
+        "mov %%cr2, %0"
+        : "=r" (val)  // output: move cr2 into a general-purpose register 
+        :             // no inputs 
+        : "memory"    // clobber: ensure memory ordering 
+    );
+    return val;
+}
+
 static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
   uint8_t* ptr = (uint8_t*)addr;
   for (volatile uint64_t i = 0; i < amount_bytes; i++) {
@@ -127,6 +139,8 @@ void vmm_page_free(virt_addr_t vaddr, uint64_t flags) {
   pmm_frame_free(addr_phys_ptr >> PAGE_SHIFT);
 }
 
+//LEGACY
+/*
 pte_t* vmm_pte_get_offline(virt_addr_t pml4_virt, virt_addr_t vaddr, uint8_t create) {
     uint8_t levels_shift[] = {39, 30, 21, 12};
     uint64_t* current_table_virt = (uint64_t*)pml4_virt;
@@ -154,36 +168,20 @@ pte_t* vmm_pte_get_offline(virt_addr_t pml4_virt, virt_addr_t vaddr, uint8_t cre
 
     uint64_t pt_idx = (vaddr >> 12) & 0x1FF;
     return &current_table_virt[pt_idx];
-}
+}*/
 
+//legacy
+/*
 void vmm_page_map_internal(virt_addr_t pml4_virt, virt_addr_t vaddr, phys_addr_t paddr, uint64_t flags) {
     // We need a version of vmm_pte_get that doesn't use vmm_pml4_get()
     pte_t* pte = vmm_pte_get_offline(pml4_virt, vaddr, 1);
     if (pte) {
         *pte = (paddr & PAGE_ADDR_MASK) | flags | PAGE_PRESENT;
     }
-}
+}*/
 
-void vmm_kernel_map(virt_addr_t pml4_virt) {
-    virt_addr_t v_start = (uint64_t)__kernel_start;
-    phys_addr_t p_start = v_start;
-    uint64_t size    = (uint64_t)__kernel_end - v_start;
-
-    for (uint64_t i = 0; i < size; i += PAGE_SIZE) {
-        vmm_page_map_internal(pml4_virt, v_start + i, p_start + i, PAGE_WRITABLE);
-    }
-    
-    uint64_t rsp = read_rsp();
-    uint64_t window = 256 * 1024; // 256 KiB safety margin
-
-    uint64_t start = align_down(rsp - window);
-    uint64_t end   = align_up(rsp + PAGE_SIZE); // include current page and one above
-    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-        vmm_page_map_internal(pml4_virt, va, va, PAGE_WRITABLE);
-    }
-}
-
-// Maps a 1GB physical frame to a virtual address by terminating the walk at Level 3
+// Maps a 1GB physical frame to a virtual address by terminating the walk at Level 3 (Legacy)
+/*
 uint8_t vmm_page_1gb_map_offline(virt_addr_t pml4_virt, virt_addr_t vaddr, phys_addr_t paddr, uint64_t flags) {
     uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
     uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
@@ -206,35 +204,36 @@ uint8_t vmm_page_1gb_map_offline(virt_addr_t pml4_virt, virt_addr_t vaddr, phys_
     pdpt_virt[pdpt_idx] = (paddr & 0x000FFFFFC0000000ULL) | flags | PAGE_PRESENT | PS_BIT;
 
     return 1;
-}
+}*/
 
-uint8_t vmm_hhdm_create(virt_addr_t pml4_virt) {
-  phys_addr_t max_pa = pmm_highest_address_get();
-  
-  uint8_t success = 1;
-  for (phys_addr_t p = 0; p < max_pa; p += GIB_SIZE) {
-    if (!vmm_page_1gb_map_offline(pml4_virt, p + HHDM_OFFSET, p, PAGE_WRITABLE | PAGE_NX)) return 0;
-  }
+//Legacy
+/*
+void vmm_unmap_identity_and_flush(boot_info_t* info) {
+    // info->pml4_phys is a physical address. 
+    // Access it via the HHDM.
+    uint64_t* pml4 = (uint64_t*)(info->pml4_phys + info->hhdm_offset);
 
-  if (!success) return 0;
-  return 1;
-}
+    // Unmap the first 512GB (index 0)
+    pml4[0] = 0;
 
-uint8_t vmm_init(void) {
-  phys_addr_t pml4_phys = pmm_frame_alloc();
-  if (pml4_phys == PMM_INVALID_FRAME) return 0;
+    // Invalidate TLB
+    __asm__ volatile (
+        "mov %%cr3, %%rax\n\t"
+        "mov %%rax, %%cr3"
+        : : : "rax", "memory"
+    );
+}*/
 
-  //early its 1:1 so no conversion here
-  virt_addr_t pml4_virt = pml4_phys;
-  
-  zero(pml4_virt, 4096);
-  if (!vmm_hhdm_create(pml4_virt)) return 0;
-  
-
-  vmm_kernel_map(pml4_virt);
-  vmm_pml4_load(pml4_phys);
+uint8_t vmm_init(boot_info_t* info) {
   
   return 1;
+}
+
+void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
+  virt_addr_t fault_addr = cr2_get();
+  //if (fault_addr >= HHDM_OFFSET) isr_general_exception_ec("#PF Page Fault", f, ec);
+ 
+  vmm_page_alloc(fault_addr, PAGE_WRITABLE);
 }
 
 //void vmm_address_space_switch(phys_addr_t pml4_phys) {}
