@@ -21,7 +21,7 @@ CFLAGS=(
   -fno-builtin
   -fno-asynchronous-unwind-tables
   -fno-unwind-tables
-  -fno-omit-frame-pointer
+  -fno-omit-frame-pointer -mcmodel=kernel
   -O0
   -g
   -Wall -Wextra -Wpedantic
@@ -116,7 +116,7 @@ LOADER_LBA=33
 KERNEL_LBA=2048
 
 # big enough for loader+kernel growth
-DISK_SECTORS=$((KERNEL_LBA + 32768))   # +16 MiB after kernel start
+DISK_SECTORS=$((KERNEL_LBA + 65536 + 2048))   # +16 MiB after kernel start
 
 truncate -s $((DISK_SECTORS * 512)) "$BUILD_DIR/disk.img"
 
@@ -130,7 +130,13 @@ stat -c "%n %s" "$BUILD_DIR/disk.img"
 echo "[+] Running QEMU"
 
 qemu-system-x86_64 \
+  -accel tcg,thread=single \
+  -smp 1 \
+  -nodefaults \
+  -no-user-config \
   -drive format=raw,file=build/disk.img,if=ide \
-  -serial mon:stdio \
-  -no-reboot \
-  -no-shutdown
+  -serial stdio \
+  -monitor none \
+  -gdb tcp::1234 \
+  -no-reboot -no-shutdown
+

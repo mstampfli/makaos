@@ -19,7 +19,7 @@ typedef struct idtr_t {
 
 
 
-typedef struct idt_entry_t {
+typedef struct idt_gate_t {
     uint16_t handler_offset_low;
     uint16_t segment_selector;
     uint8_t  ist;
@@ -27,4 +27,33 @@ typedef struct idt_entry_t {
     uint16_t handler_offset_mid;
     uint32_t handler_offset_high;
     uint32_t reserved;
-} __attribute__((packed)) idt_entry_t;
+} __attribute__((packed)) idt_gate_t;
+
+// initializes descriptors and loads idtr
+void idt_init(void);
+void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame);
+void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_t error_code);
+
+extern void isr0_entry(void);
+extern void isr1_entry(void);
+extern void isr2_entry(void);
+
+extern void isr5_entry(void);
+extern void isr6_entry(void);
+extern void isr7_entry(void);
+
+extern void isr8_entry(void);
+extern void isr9_entry(void);
+
+extern void isr10_entry(void);
+extern void isr11_entry(void);
+extern void isr12_entry(void);
+extern void isr13_entry(void);
+extern void isr14_entry(void);
+
+extern void isr16_entry(void);
+extern void isr17_entry(void);
+extern void isr18_entry(void);
+extern void isr19_entry(void);
+extern void isr20_entry(void);
+extern void isr21_entry(void);

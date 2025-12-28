@@ -1,4 +1,6 @@
+#pragma once
 #include "common.h"
+#include "idt.h"
 
 typedef uint64_t pte_t;
 typedef uint64_t pde_t;
@@ -76,7 +78,6 @@ typedef struct vmm_page_info_t{
 
 #define VMM_INVALID_PAGE UINT64_MAX
 
-uint8_t vmm_init(void);
 void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags); 
 void vmm_page_free(virt_addr_t vaddr, uint64_t flags); 
-
+uint8_t vmm_init(boot_info_t* info);

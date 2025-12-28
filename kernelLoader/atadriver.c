@@ -1,5 +1,5 @@
 #include "ata_driver.h"
-#include "common.h"
+/*#include "common.h"
 
 static inline uint8_t ata_status_get(void) {
     return inb(ATA_REG_STATUS);
@@ -48,7 +48,8 @@ uint8_t ata_init(void) {
   }
 
   for (int i = 0; i < 4; i++) inb(ATA_REG_CONTROL);
-
+// optional idk
+  outb(ATA_REG_SECCOUNT, 16);
   outb(ATA_REG_COMMAND, ATA_CMD_SET_MULTIPLE);
   for (int i = 0; i < 4; i++) inb(ATA_REG_CONTROL);
 
@@ -196,4 +197,4 @@ uint8_t ata_disk_read_48_poll(uint64_t lba, void* addr, uint32_t sector_count) {
 
   if (!ata_wait_idle()) return 0;
   return 1;
-}
+}*/

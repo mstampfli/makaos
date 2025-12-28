@@ -3,7 +3,7 @@ ENTRY(_start)
 SECTIONS
 {
     /* Kernel link/virtual address */
-    . = 0x400000;
+    . = 0xFFFFFFFF80000000;
 
     __kernel_start = .;
 

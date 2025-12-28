@@ -2,6 +2,9 @@
 #include "common.h"
 
 static phys_addr_t g_phys_ceiling = 0;
+static uint64_t g_frame_bitmap[BITMAP_BYTES];
+//static uint64_t g_frame_count;  // actual frames present from E820
+
 
 static inline void frame_bitmap_set(uint64_t frame_idx) {
     // frame_idx / 64

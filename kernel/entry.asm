@@ -9,7 +9,7 @@ _start:
   cld
   mov [bootinfo_ptr], rdi
 
-  mov rax, 0x00700000 ; Force 64-bit immediate load
+  mov rax, 0x00400000 ; Force 64-bit immediate load
   mov rsp, rax        ; Move to RSP
   call kmain
 
