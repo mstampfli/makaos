@@ -13,6 +13,19 @@ typedef unsigned char  uint8_t;
 typedef uint64_t uintptr_t;
 typedef uintptr_t virt_addr_t;
 typedef uint64_t phys_addr_t;
+typedef unsigned long size_t;
+
+typedef short int16_t;
+typedef int int32_t;
+typedef long long int64_t;
+typedef char int8_t;
+
+#ifndef __cplusplus
+  typedef unsigned char bool;
+  #define true  1
+  #define false 0
+#else
+#endif
 
 typedef struct e820_entry_t {
     uint64_t base;
@@ -42,6 +55,7 @@ __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const v
 #define PAGE_MASK  (PAGE_SIZE - 1)
 #define VGA_ADDR 0xB8000ULL 
 #define UINT64_MAX ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
+#define UINT32_MAX 0xFFFFFFFFU
 
 #define HHDM_OFFSET 0xFFFF800000000000ULL
 #define GIB_SIZE    (1ULL << 30)
@@ -71,3 +85,6 @@ typedef struct __attribute__((packed)) boot_info_t {
     uint64_t hhdm_offset;
     uint64_t pml4_phys;
 } boot_info_t;
+
+extern phys_addr_t KERNEL_BASE_PHYS;
+extern uint64_t KERNEL_SIZE;

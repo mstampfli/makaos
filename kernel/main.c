@@ -20,6 +20,9 @@ void kmain(void) {
     
     extern void* bootinfo_ptr; //phys
     boot_info_t* info = (boot_info_t*)((uint64_t)bootinfo_ptr + HHDM_OFFSET);
+    
+    KERNEL_BASE_PHYS = info->kernel_phys_base;
+    KERNEL_SIZE = (uint64_t)__kernel_end - (uint64_t)__kernel_start;
 
     idt_init();
     pmm_init(info->e820_map, info->e820_count);

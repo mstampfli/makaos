@@ -79,7 +79,7 @@ pte_t* vmm_pte_get(phys_addr_t pml4_phys, virt_addr_t vaddr, uint8_t create) {
     if (!(entry & PAGE_PRESENT)) {
       if (!create) return NULL;
 
-      phys_addr_t new_frame = pmm_frame_alloc();
+      phys_addr_t new_frame = pmm_buddy_alloc(0);
       if (new_frame == PMM_INVALID_FRAME) return NULL;
 
       zero(vmm_phys_to_virt(new_frame), 4096);
@@ -124,7 +124,7 @@ uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr, phys_addr_t* ou
 }
 
 void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags) {
-  phys_addr_t page_frame = pmm_frame_alloc();
+  phys_addr_t page_frame = pmm_buddy_alloc(0);
   if (page_frame == PMM_INVALID_FRAME) return NULL;
 
   uint8_t success = vmm_page_map(vmm_pml4_get(), vaddr, page_frame, flags);
@@ -136,7 +136,7 @@ void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags) {
 void vmm_page_free(virt_addr_t vaddr, uint64_t flags) {
   phys_addr_t addr_phys_ptr;
   if (vmm_page_unmap(vmm_pml4_get(), vaddr, &addr_phys_ptr)) 
-  pmm_frame_free(addr_phys_ptr >> PAGE_SHIFT);
+  pmm_buddy_free(addr_phys_ptr >> PAGE_SHIFT, 0);
 }
 
 //LEGACY
