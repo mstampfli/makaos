@@ -8,7 +8,6 @@ static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
 }
 
 void setup_paging(boot_info_t* info, uint64_t k_phys, uint64_t p_ceiling) {
-    // We need:
     //  - PML4
     //  - PDPT for low identity
     //  - PD   for low identity (2MiB pages)
@@ -28,9 +27,7 @@ void setup_paging(boot_info_t* info, uint64_t k_phys, uint64_t p_ceiling) {
 
     zero((virt_addr_t)pml4, 6 * 4096);
 
-    // -----------------------------
-    // 1) Identity map first 1GiB using 2MiB pages
-    // -----------------------------
+    // Identity map first 1GiB using 2MiB pages
     pml4[0] = (uint64_t)pdpt_id | (PTE_P | PTE_RW);
     pdpt_id[0] = (uint64_t)pd_id | (PTE_P | PTE_RW);
 
@@ -40,11 +37,9 @@ void setup_paging(boot_info_t* info, uint64_t k_phys, uint64_t p_ceiling) {
         pd_id[i] = phys | (PTE_P | PTE_RW | PTE_PS); // 2MiB page
     }
 
-    // -----------------------------
-    // 2) Higher-half kernel map at 0xFFFFFFFF80000000 using 2MiB pages
+    // Higher-half kernel map at 0xFFFFFFFF80000000 using 2MiB pages
     // PML4[511] = higher-half
     // PDPT index 510 corresponds to 0xFFFFFFFF80000000..0xFFFFFFFFBFFFFFFF
-    // -----------------------------
     pml4[511] = (uint64_t)pdpt_hh | (PTE_P | PTE_RW);
     pdpt_hh[510] = (uint64_t)pd_kern | (PTE_P | PTE_RW);
 
@@ -54,9 +49,7 @@ void setup_paging(boot_info_t* info, uint64_t k_phys, uint64_t p_ceiling) {
         pd_kern[i] = phys | (PTE_P | PTE_RW | PTE_PS); // 2MiB page
     }
 
-    // -----------------------------
-    // 3) HHDM using 1GiB pages
-    // -----------------------------
+    // HHDM using 1GiB pages
     uint16_t hhdm_pml4_idx = (HHDM_OFFSET >> 39) & 0x1FF;
     pml4[hhdm_pml4_idx] = (uint64_t)pdpt_hhdm | (PTE_P | PTE_RW);
 
