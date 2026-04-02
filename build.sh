@@ -56,6 +56,35 @@ objcopy -O binary \
   "$BUILD_DIR/kernelLoader.elf" "$BUILD_DIR/kernelLoader.bin"
 
 
+echo "[+] Building user binaries"
+
+USER_DIR="user"
+USER_CFLAGS=(
+  -ffreestanding -m64 -mno-red-zone
+  -fno-pie -fno-pic -fno-plt
+  -fno-stack-protector -fno-builtin
+  -fno-asynchronous-unwind-tables -fno-unwind-tables
+  -O0 -Wall -Wextra
+  -Wno-unused-parameter
+)
+
+nasm -f elf64 "$USER_DIR/entry.asm" -o "$BUILD_DIR/user_entry.o"
+gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
+ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_test_vmalloc.o" \
+   -o "$BUILD_DIR/user_test_vmalloc.elf"
+objcopy -O binary "$BUILD_DIR/user_test_vmalloc.elf" "$BUILD_DIR/user_test_vmalloc.bin"
+
+# Generate a C header that embeds the binary as a byte array.
+BIN="$BUILD_DIR/user_test_vmalloc.bin"
+SZ=$(stat -c "%s" "$BIN")
+{
+  echo "#pragma once"
+  echo "static const unsigned char g_user_test_vmalloc[] = {"
+  xxd -i < "$BIN"
+  echo "};"
+  echo "static const unsigned int g_user_test_vmalloc_size = ${SZ}U;"
+} > "$BUILD_DIR/user_test_vmalloc.h"
+
 echo "[+] Building kernel (C/ASM → ELF → BIN)"
 
 # ---- build kernel (the one loaded by kernelLoader) ----
@@ -63,7 +92,7 @@ KERNEL_C_OBJS=()
 for src in "$KERNEL_DIR"/*.c; do
   [ -e "$src" ] || continue
   obj="$BUILD_DIR/kernel_$(basename "${src%.c}").o"
-  gcc "${CFLAGS[@]}" -c "$src" -o "$obj"
+  gcc "${CFLAGS[@]}" -I "$BUILD_DIR" -c "$src" -o "$obj"
   KERNEL_C_OBJS+=("$obj")
 done
 
@@ -114,16 +143,32 @@ echo "[+] Creating disk image"
 
 LOADER_LBA=33
 KERNEL_LBA=2048
+FAT32_LBA=4096       # FAT32 partition starts here (after kernel region)
+FAT32_SECTORS=65536  # 32 MiB FAT32 volume
 
-# big enough for loader+kernel growth
-DISK_SECTORS=$((KERNEL_LBA + 65536 + 2048))   # +16 MiB after kernel start
+# Total: FAT32 end + small slack
+DISK_SECTORS=$((FAT32_LBA + FAT32_SECTORS + 2048))
 
 truncate -s $((DISK_SECTORS * 512)) "$BUILD_DIR/disk.img"
 
-dd if="$BUILD_DIR/boot1.bin"        of="$BUILD_DIR/disk.img" bs=512 seek=0          conv=notrunc status=none
-dd if="$BUILD_DIR/boot2.bin"        of="$BUILD_DIR/disk.img" bs=512 seek=1          conv=notrunc status=none
+dd if="$BUILD_DIR/boot1.bin"        of="$BUILD_DIR/disk.img" bs=512 seek=0           conv=notrunc status=none
+dd if="$BUILD_DIR/boot2.bin"        of="$BUILD_DIR/disk.img" bs=512 seek=1           conv=notrunc status=none
 dd if="$BUILD_DIR/kernelLoader.bin" of="$BUILD_DIR/disk.img" bs=512 seek=$LOADER_LBA conv=notrunc status=none
 dd if="$BUILD_DIR/kernel.bin"       of="$BUILD_DIR/disk.img" bs=512 seek=$KERNEL_LBA conv=notrunc status=none
+
+# Create FAT32 volume at FAT32_LBA.
+# Extract that region, format it, write it back.
+FAT32_BYTES=$((FAT32_SECTORS * 512))
+FAT32_OFFSET=$((FAT32_LBA * 512))
+dd if="$BUILD_DIR/disk.img" of="$BUILD_DIR/fat32.img" bs=512 skip=$FAT32_LBA count=$FAT32_SECTORS status=none
+mkfs.fat -F 32 -S 512 "$BUILD_DIR/fat32.img" > /dev/null 2>&1
+# Copy any files from build/fs/ into the FAT32 image (if directory exists).
+if [ -d "$BUILD_DIR/fs" ]; then
+    for f in "$BUILD_DIR/fs"/*; do
+        [ -f "$f" ] && mcopy -i "$BUILD_DIR/fat32.img" "$f" :: 2>/dev/null || true
+    done
+fi
+dd if="$BUILD_DIR/fat32.img" of="$BUILD_DIR/disk.img" bs=512 seek=$FAT32_LBA conv=notrunc status=none
 
 stat -c "%n %s" "$BUILD_DIR/disk.img"
 
@@ -135,6 +180,8 @@ qemu-system-x86_64 \
   -nodefaults \
   -no-user-config \
   -drive format=raw,file=build/disk.img,if=ide \
+  -vga std \
+  -display sdl \
   -serial stdio \
   -monitor none \
   -gdb tcp::1234 \

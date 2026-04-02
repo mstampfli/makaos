@@ -7,7 +7,7 @@
 #define PMM_INVALID_FRAME UINT64_MAX
 #define PMM_INVALID_ADDR  UINT64_MAX
 
-#define PMM_RESERVED_FRAMES ((64 * 1024 * 1024) >> PAGE_SHIFT)
+#define PMM_RESERVED_FRAMES ((4 * 1024 * 1024) >> PAGE_SHIFT)
 
 #define MAX_ORDER 32
 
@@ -58,3 +58,4 @@ void pmm_buddy_free(phys_addr_t addr, uint8_t order);
 void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size);
 void* pmm_slab_alloc(slab_cache_t* cache);
 void pmm_slab_free(void* ptr);
+uint8_t pmm_is_slab_ptr(void* ptr);

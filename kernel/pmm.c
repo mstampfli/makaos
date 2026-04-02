@@ -122,17 +122,17 @@ mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count) {
   uint64_t hole_size_largest = 0; // in frame indices
 
   uintptr_t kernel_start_idx = align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT;
-  uintptr_t kernel_end_idx = align_up(KERNEL_BASE_PHYS + KERNEL_SIZE) >> PAGE_SHIFT;
+  uintptr_t kernel_end_idx = align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT;
 
   for (uint32_t i = 0; i < count; i++) {
     e820_entry_t entry = map[i];
+
+    if (entry.type != 1) continue;
 
     uint64_t end = entry.base + entry.length;
     if (end > g_phys_ceiling) {
       g_phys_ceiling = end;
     }
-
-    if (entry.type != 1) continue;
 
     uint64_t start = align_up(entry.base);
     end = align_down(entry.base + entry.length);
@@ -282,7 +282,7 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   uint64_t meta_frame_end_idx   = meta_frame_start_idx + meta_frames;
 
   uint64_t kernel_start_idx = (align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT);
-  uint64_t kernel_end_idx   = (align_up(KERNEL_BASE_PHYS + KERNEL_SIZE) >> PAGE_SHIFT);
+  uint64_t kernel_end_idx   = (align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT);
 
   // carve: [coalesce]... [slab_trackers][slab_heads]
   uint64_t off = 0;
@@ -630,6 +630,14 @@ void pmm_slab_free(void* ptr) {
   if (h->inuse == 0) {
     pmm_slab_destroy(cache, h);
   }
+}
+
+uint8_t pmm_is_slab_ptr(void* ptr) {
+  if (!ptr) return 0;
+  phys_addr_t phys = virt_to_phys((virt_addr_t)ptr);
+  uint64_t frame_index = (phys >> PAGE_SHIFT);
+  if (frame_index >= g_total_frames) return 0;
+  return g_slab_trackers[frame_index] != NULL;
 }
 
 phys_addr_t pmm_highest_address_get(void) {

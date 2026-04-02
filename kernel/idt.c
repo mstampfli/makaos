@@ -1,6 +1,8 @@
 #include "idt.h"
+#include "signal.h"
+#include "sched.h"
 
-volatile uint16_t* g_vga = (volatile uint16_t*)VGA_ADDR;
+volatile uint16_t* g_vga = (volatile uint16_t*)(VGA_ADDR + HHDM_OFFSET);
 
 __attribute__((aligned(16)))
 static idt_gate_t idt[256] = {0};
@@ -42,21 +44,33 @@ void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame) {
     for (;;) { __asm__ __volatile__("cli; hlt"); }
 }
 
+static void serial_putc_idt(char c) {
+    while (!(inb(0x3F8 + 5) & 0x20));
+    outb(0x3F8, (uint8_t)c);
+}
+static void serial_puts_idt(const char* s) {
+    for (; *s; s++) serial_putc_idt(*s);
+}
+static void serial_hex_idt(uint64_t v) {
+    for (int i = 60; i >= 0; i -= 4) {
+        uint8_t n = (uint8_t)((v >> i) & 0xF);
+        serial_putc_idt(n < 10 ? '0' + n : 'A' + (n - 10));
+    }
+    serial_putc_idt('\n');
+}
+
 void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_t error_code) {
     volatile uint16_t* v = g_vga; //VGA
-    
-    // Clear screen
-    //for (int i = 0; i < 80 * 25; i++) v[i] = (uint16_t)' ' | (0x07 << 8);
-    
+
     // Print message
     for (uint32_t i = 0; msg[i] != '\0'; i++) {
         v[i] = (uint16_t)msg[i] | (0x07 << 8);
     }
-    
+
     // Print error code and CR2
     uint64_t cr2;
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-    
+
     vga_hex_draw(v, error_code, 1);  // Error code
     vga_hex_draw(v, cr2, 2);          // CR2 (faulting address)
     vga_hex_draw(v, frame->ip, 3);    // RIP
@@ -64,30 +78,82 @@ void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_
     uint64_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
     vga_hex_draw(v, rsp, 5);          // Current RSP
-    
+
+    // Also dump to serial for headless debugging.
+    serial_puts_idt("EXCEPTION: ");
+    serial_puts_idt(msg);
+    serial_putc_idt('\n');
+    serial_puts_idt("ec="); serial_hex_idt(error_code);
+    serial_puts_idt("ip="); serial_hex_idt(frame->ip);
+    serial_puts_idt("cs="); serial_hex_idt(frame->cs);
+    serial_puts_idt("sp="); serial_hex_idt(frame->sp);
+
     for (;;) { __asm__ __volatile__("cli; hlt"); }
 }
 
-void isr0_divide_error(interrupt_frame_t* f) { isr_general_exception_no_ec("#DE Divide Error", f); }
-void isr1_debug(interrupt_frame_t* f) { isr_general_exception_no_ec("#DB Debug", f); }
-void isr2_nmi(interrupt_frame_t* f) { isr_general_exception_no_ec("Non-Maskable Interrupt", f); }
-void isr5_bound(interrupt_frame_t* f) { isr_general_exception_no_ec("#BR BOUND Range Exceeded", f); }
-void isr6_invalid_opcode(interrupt_frame_t* f){ isr_general_exception_no_ec("#UD Invalid Opcode", f); }
-void isr7_device_na(interrupt_frame_t* f) { isr_general_exception_no_ec("#NM Device Not Available", f); }
-void isr8_double_fault(interrupt_frame_t* f, uint64_t ec) { isr_general_exception_ec("#DF Double Fault", f, ec); }
-void isr9_coprocessor_overrun(interrupt_frame_t* f) { isr_general_exception_no_ec("Coprocessor Segment Overrun", f); }
-void isr10_invalid_tss(interrupt_frame_t* f, uint64_t ec) { isr_general_exception_ec("#TS Invalid TSS", f, ec); }
-void isr11_seg_np(interrupt_frame_t* f, uint64_t ec) { isr_general_exception_ec("#NP Segment Not Present", f, ec); }
-void isr12_stack_fault(interrupt_frame_t* f, uint64_t ec){ isr_general_exception_ec("#SS Stack Fault", f, ec); }
-void isr13_gp(interrupt_frame_t* f, uint64_t ec) { isr_general_exception_ec("#GP General Protection", f, ec); }
-// Vector 14 imported from vmm.h (lazy alloc)
-// Vector 15 reserved
-void isr16_x87_fp(interrupt_frame_t* f)      { isr_general_exception_no_ec("#MF x87 FPU FP Error", f); }
-void isr17_alignment(interrupt_frame_t* f, uint64_t ec)  { isr_general_exception_ec("#AC Alignment Check", f, ec); }
-void isr18_machine_check(interrupt_frame_t* f){ isr_general_exception_no_ec("#MC Machine Check", f); }
-void isr19_simd_fp(interrupt_frame_t* f)      { isr_general_exception_no_ec("#XM SIMD FP Exception", f); }
-void isr20_virtualization(interrupt_frame_t* f){ isr_general_exception_no_ec("#VE Virtualization Exception", f); }
-void isr21_control_protection(interrupt_frame_t* f, uint64_t ec) { isr_general_exception_ec("#CP Control Protection", f, ec); }
+// ── Exception dispatch helpers ────────────────────────────────────────────
+// If the fault came from user mode (CS & 3 == 3), send a signal and return.
+// If from kernel mode, halt (kernel bug — unrecoverable).
+
+static inline uint8_t from_user(interrupt_frame_t* f) {
+    return (f->cs & 3) == 3;
+}
+
+static void user_signal_or_halt_noec(interrupt_frame_t* f, int sig, const char* msg) {
+    if (from_user(f)) {
+        signal_send(g_current, sig);
+        signal_deliver_pending();
+        return;
+    }
+    isr_general_exception_no_ec(msg, f);
+}
+
+static void user_signal_or_halt_ec(interrupt_frame_t* f, uint64_t ec, int sig, const char* msg) {
+    if (from_user(f)) {
+        signal_send(g_current, sig);
+        signal_deliver_pending();
+        return;
+    }
+    isr_general_exception_ec(msg, f, ec);
+}
+
+void isr0_divide_error(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGFPE,  "#DE Divide Error"); }
+void isr1_debug(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGILL,  "#DB Debug"); }
+void isr2_nmi(interrupt_frame_t* f)
+    { isr_general_exception_no_ec("Non-Maskable Interrupt", f); } // NMI always halt
+void isr5_bound(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGSEGV, "#BR BOUND Range Exceeded"); }
+void isr6_invalid_opcode(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGILL,  "#UD Invalid Opcode"); }
+void isr7_device_na(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGILL,  "#NM Device Not Available"); }
+void isr8_double_fault(interrupt_frame_t* f, uint64_t ec)
+    { isr_general_exception_ec("#DF Double Fault", f, ec); } // always kernel halt
+void isr9_coprocessor_overrun(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGILL,  "Coprocessor Segment Overrun"); }
+void isr10_invalid_tss(interrupt_frame_t* f, uint64_t ec)
+    { isr_general_exception_ec("#TS Invalid TSS", f, ec); }
+void isr11_seg_np(interrupt_frame_t* f, uint64_t ec)
+    { user_signal_or_halt_ec(f, ec, SIGSEGV, "#NP Segment Not Present"); }
+void isr12_stack_fault(interrupt_frame_t* f, uint64_t ec)
+    { user_signal_or_halt_ec(f, ec, SIGSEGV, "#SS Stack Fault"); }
+void isr13_gp(interrupt_frame_t* f, uint64_t ec)
+    { user_signal_or_halt_ec(f, ec, SIGSEGV, "#GP General Protection"); }
+// Vector 14: page fault — handled in vmm.c (sends SIGSEGV via kill_current)
+void isr16_x87_fp(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGFPE,  "#MF x87 FPU FP Error"); }
+void isr17_alignment(interrupt_frame_t* f, uint64_t ec)
+    { user_signal_or_halt_ec(f, ec, SIGBUS, "#AC Alignment Check"); }
+void isr18_machine_check(interrupt_frame_t* f)
+    { isr_general_exception_no_ec("#MC Machine Check", f); } // always halt
+void isr19_simd_fp(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGFPE,  "#XM SIMD FP Exception"); }
+void isr20_virtualization(interrupt_frame_t* f)
+    { user_signal_or_halt_noec(f, SIGILL,  "#VE Virtualization Exception"); }
+void isr21_control_protection(interrupt_frame_t* f, uint64_t ec)
+    { user_signal_or_halt_ec(f, ec, SIGILL, "#CP Control Protection"); }
 
 static void idt_gate_set(uint8_t vec, uint64_t addr, uint16_t selector, uint8_t ist_index, uint8_t type_attr) {
     idt[vec].handler_offset_low = (uint16_t)(addr & 0xFFFFu);
@@ -101,14 +167,18 @@ static void idt_gate_set(uint8_t vec, uint64_t addr, uint16_t selector, uint8_t 
 
 void idt_init(void) {
     const uint8_t ist0 = 0;
+    const uint8_t ist1 = 1; // IST1 → #DF: dedicated stack so a stack-overflow
+                             //             double fault doesn't triple-fault
+    const uint8_t ist2 = 2; // IST2 → #NMI: NMI must not share stack with
+                             //              whatever code it interrupted
 
     idt_gate_set(0,  (uint64_t)isr0_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
     idt_gate_set(1,  (uint64_t)isr1_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
-    idt_gate_set(2,  (uint64_t)isr2_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
+    idt_gate_set(2,  (uint64_t)isr2_entry, KERNEL_CS, ist2, IDT_ATTR_INTGATE);
     idt_gate_set(5,  (uint64_t)isr5_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
     idt_gate_set(6,  (uint64_t)isr6_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
     idt_gate_set(7,  (uint64_t)isr7_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
-    idt_gate_set(8,  (uint64_t)isr8_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
+    idt_gate_set(8,  (uint64_t)isr8_entry, KERNEL_CS, ist1, IDT_ATTR_INTGATE);
     idt_gate_set(9,  (uint64_t)isr9_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
     idt_gate_set(10, (uint64_t)isr10_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
     idt_gate_set(11, (uint64_t)isr11_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
@@ -123,4 +193,8 @@ void idt_init(void) {
     idt_gate_set(21, (uint64_t)isr21_entry, KERNEL_CS, ist0, IDT_ATTR_INTGATE);
 
     lidt(idt, sizeof(idt) - 1);
+}
+
+void idt_irq_register(uint8_t vec, uint64_t handler_addr) {
+    idt_gate_set(vec, handler_addr, KERNEL_CS, 0, IDT_ATTR_INTGATE);
 }

@@ -49,7 +49,10 @@ __attribute__((no_caller_saved_registers)) void outb_irq(uint16_t port, uint8_t 
 __attribute__((no_caller_saved_registers)) void insw_irq(uint16_t port, void* addr, uint32_t count);
 __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const void* addr, uint32_t count);
 
-#define KERNEL_CS 0x18
+#define KERNEL_CS    0x08   // kernel code segment selector
+#define KERNEL_SS    0x10   // kernel data/stack segment selector
+#define USER_CS      0x2B   // user code selector  (0x28 | RPL3)
+#define USER_SS      0x23   // user data selector  (0x20 | RPL3)
 #define PAGE_SHIFT 12  // 12 for 4KB, 21 for 2MB, 30 for 1GB
 #define PAGE_SIZE  (1ULL << PAGE_SHIFT)
 #define PAGE_MASK  (PAGE_SIZE - 1)
@@ -65,6 +68,29 @@ __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const v
 #define NULL ((void*)0)
 
 typedef struct __attribute__((packed)) boot_info_t {
+    uint32_t sig0;
+    uint32_t sig1;
+    uint32_t sig2;
+    uint32_t sig3;
+
+    uint16_t e820_dbg_flags_before;
+    uint16_t e820_dbg_es;
+    uint16_t e820_dbg_di;
+
+    uint32_t e820_dbg_eax_before;
+    uint32_t e820_dbg_ebx_before;
+    uint32_t e820_dbg_ecx_before;
+    uint32_t e820_dbg_edx_before;
+
+    uint16_t e820_dbg_flags_after;
+    uint8_t  e820_dbg_cf_after;
+    uint8_t  _pad1;
+
+    uint32_t e820_dbg_eax_after;
+    uint32_t e820_dbg_ebx_after;
+    uint32_t e820_dbg_ecx_after;
+    uint32_t e820_dbg_edx_after;
+
     uint16_t e820_count;
     e820_entry_t e820_map[E820_MAX];
 
@@ -87,4 +113,6 @@ typedef struct __attribute__((packed)) boot_info_t {
 } boot_info_t;
 
 extern phys_addr_t KERNEL_BASE_PHYS;
-extern uint64_t KERNEL_SIZE;
+extern uint64_t    KERNEL_SIZE;           // actual kernel binary size (from linker symbols)
+extern uint64_t    LOADER_RESERVED_SIZE;  // physical region to exclude from PMM:
+                                          // covers kernel + loader page tables at top of window

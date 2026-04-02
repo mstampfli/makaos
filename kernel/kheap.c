@@ -34,10 +34,11 @@ static inline uint8_t size_to_order(size_t size) {
 }
 
 void kheap_init(void) {
-  g_kheap.base = align_up(KERNEL_BASE_PHYS);
-  g_kheap.end = align_up(KERNEL_BASE_PHYS + KERNEL_SIZE);
+  // heap occupies all virtual space after the kernel image
+  g_kheap.base = align_up((virt_addr_t)__kernel_end);
+  g_kheap.end  = 0xFFFFFFFFFFFFFFFFULL;
   g_kheap.cache_size_max = 2 * PAGE_SIZE;
-  
+
   for (size_t i = 0; i < KMALLOC_CACHE_COUNT; i++) {
     pmm_slab_cache_init(&g_kheap.caches[i], g_kmalloc_sizes[i]);
   }
@@ -50,23 +51,25 @@ void* kmalloc(size_t size) {
     return pmm_slab_alloc(&g_kheap.caches[idx]);
   }
 
-  uint8_t order = size_to_order(size);
+  uint8_t order = size_to_order(size + 8);
   phys_addr_t phys = pmm_buddy_alloc(order);
   if (phys == PMM_INVALID_ADDR) return NULL;
 
-  return (void*)(phys + HHDM_OFFSET);
+  uint8_t* raw = (uint8_t*)(phys + HHDM_OFFSET);
+  *raw = order;
+  return (void*)(raw + 8);
 }
 
 void kfree(void* addr) {
   if (!addr) return;
 
-  frame_t* frame = virt_to_frame((virt_addr_t)addr);
-  
-  if (frame->flags & FRAME_SLAB) {
-    pmm_slab_free(frame, addr);
+  if (pmm_is_slab_ptr(addr)) {
+    pmm_slab_free(addr);
   } else {
-    phys_addr_t phys = (phys_addr_t)((virt_addr_t)addr - HHDM_OFFSET);
-    pmm_buddy_free(phys, frame->order);
+    uint8_t* raw = (uint8_t*)addr - 8;
+    uint8_t order = *raw;
+    phys_addr_t phys = (phys_addr_t)((virt_addr_t)raw - HHDM_OFFSET);
+    pmm_buddy_free(phys, order);
   }
 }
 

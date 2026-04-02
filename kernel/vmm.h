@@ -1,83 +1,98 @@
 #pragma once
 #include "common.h"
-#include "idt.h"
 
 typedef uint64_t pte_t;
-typedef uint64_t pde_t;
-typedef uint64_t pdpte_t;
-typedef uint64_t pml4e_t;
 
-typedef struct vmm_page_info_t{
-  uint8_t present;
-  uint64_t paddr;
-  uint64_t flags;
-} vmm_page_info_t;
+// ── Page Table Entry Bits ─────────────────────────────────────────────────
+// Each entry (PML4E, PDPTE, PDE, PTE) is 64 bits:
+//   bit 63     : NX  – No-Execute (instruction fetch blocked). Requires NXE in EFER.
+//   bits 51:12 : physical address of the next table or the mapped page frame
+//   bit  8     : G   – Global (TLB survives CR3 writes; unused here)
+//   bit  7     : PS  – Page Size (makes this entry a 2MiB/1GiB huge page)
+//   bit  6     : D   – Dirty (CPU sets when the page is written; leaf only)
+//   bit  5     : A   – Accessed (CPU sets when the page is read)
+//   bit  4     : PCD – Page-level Cache Disable
+//   bit  3     : PWT – Page-level Write-Through
+//   bit  2     : US  – User/Supervisor: 0 = kernel-only, 1 = ring-3 accessible
+//   bit  1     : RW  – Read/Write: 0 = read-only, 1 = writable
+//   bit  0     : P   – Present: entry is valid
 
-/* Base Hardware Bit Definitions */
-#define _MMU_BIT_PRESENT  (1ULL << 0)
-#define _MMU_BIT_RW       (1ULL << 1)
-#define _MMU_BIT_USER     (1ULL << 2)
-#define _MMU_BIT_PWT      (1ULL << 3)
-#define _MMU_BIT_PCD      (1ULL << 4)
-#define _MMU_BIT_ACCESSED (1ULL << 5)
-#define _MMU_BIT_DIRTY    (1ULL << 6)
-#define _MMU_BIT_PS       (1ULL << 7)
-#define _MMU_BIT_GLOBAL   (1ULL << 8)
-#define _MMU_BIT_NX       (1ULL << 63)
+#define PAGE_PRESENT  (1ULL << 0)
+#define PAGE_WRITABLE (1ULL << 1)
+#define PAGE_USER     (1ULL << 2)   // ring-3 can access
+#define PAGE_PWT      (1ULL << 3)
+#define PAGE_PCD      (1ULL << 4)
+#define PAGE_ACCESSED (1ULL << 5)
+#define PAGE_DIRTY    (1ULL << 6)
+#define PAGE_PS       (1ULL << 7)   // huge page (2MiB at PD, 1GiB at PDPT)
+#define PAGE_GLOBAL   (1ULL << 8)
+#define PAGE_NX       (1ULL << 63)  // no-execute; must enable NXE in EFER first!
 
-#define MMU_ADDR_MASK     0x000FFFFFFFFFF000ULL
+#define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
-/* PML4E Aliases */
-#define PML4E_PRESENT   _MMU_BIT_PRESENT
-#define PML4E_RW        _MMU_BIT_RW
-#define PML4E_USER      _MMU_BIT_USER
-#define PML4E_PWT       _MMU_BIT_PWT
-#define PML4E_PCD       _MMU_BIT_PCD
-#define PML4E_ACCESSED  _MMU_BIT_ACCESSED
-#define PML4E_NX        _MMU_BIT_NX
-
-/* PDPE Aliases */
-#define PDPE_PRESENT    _MMU_BIT_PRESENT
-#define PDPE_RW         _MMU_BIT_RW
-#define PDPE_USER       _MMU_BIT_USER
-#define PDPE_PWT        _MMU_BIT_PWT
-#define PDPE_PCD        _MMU_BIT_PCD
-#define PDPE_ACCESSED   _MMU_BIT_ACCESSED
-#define PDPE_1G_HUGE    _MMU_BIT_PS
-#define PDPE_NX         _MMU_BIT_NX
-
-/* PDE Aliases */
-#define PDE_PRESENT     _MMU_BIT_PRESENT
-#define PDE_RW          _MMU_BIT_RW
-#define PDE_USER        _MMU_BIT_USER
-#define PDE_PWT         _MMU_BIT_PWT
-#define PDE_PCD         _MMU_BIT_PCD
-#define PDE_ACCESSED    _MMU_BIT_ACCESSED
-#define PDE_2M_HUGE     _MMU_BIT_PS
-#define PDE_NX          _MMU_BIT_NX
-
-/* PTE Aliases */
-#define PTE_PRESENT     _MMU_BIT_PRESENT
-#define PTE_RW          _MMU_BIT_RW
-#define PTE_USER        _MMU_BIT_USER
-#define PTE_PWT         _MMU_BIT_PWT
-#define PTE_PCD         _MMU_BIT_PCD
-#define PTE_ACCESSED    _MMU_BIT_ACCESSED
-#define PTE_DIRTY       _MMU_BIT_DIRTY
-#define PTE_PAT         _MMU_BIT_PS
-#define PTE_GLOBAL      _MMU_BIT_GLOBAL
-#define PTE_NX          _MMU_BIT_NX
+// ── Convenience combinations ──────────────────────────────────────────────
+// Kernel code  : P|RW          → kernel r/w, executable (no NX, no US)
+// Kernel data  : P|RW|NX       → kernel r/w, NOT executable
+// User code    : P|RW|US       → ring-3 r/w, executable (no NX)
+// User data    : P|RW|US|NX    → ring-3 r/w, NOT executable
+// User rodata  : P|US|NX       → ring-3 read-only, NOT executable
+#define VMM_KCODE   (PAGE_PRESENT | PAGE_WRITABLE)
+#define VMM_KDATA   (PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX)
+#define VMM_UCODE   (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+#define VMM_UDATA   (PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NX)
+#define VMM_URODATA (PAGE_PRESENT | PAGE_USER | PAGE_NX)
 
 #define VMM_INVALID UINT64_MAX
 
-#define PAGE_PRESENT    (1ULL << 0)
-#define PAGE_WRITABLE   (1ULL << 1)
-#define PAGE_USER       (1ULL << 2)
-#define PAGE_NX         (1ULL << 63)
-#define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+// ── User address space layout ─────────────────────────────────────────────
+// Just a convention — nothing enforces these at hardware level.
+#define VMM_USER_CODE_BASE   0x0000000000400000ULL   // code/text at 4MiB
+#define VMM_USER_STACK_TOP   0x00007FFFFFFFE000ULL   // stack grows DOWN from here
+#define VMM_USER_STACK_PAGES 512ULL                  // 512 × 4KiB = 2MiB stack
 
-#define VMM_INVALID_PAGE UINT64_MAX
+// ── API ───────────────────────────────────────────────────────────────────
 
-void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags); 
-void vmm_page_free(virt_addr_t vaddr, uint64_t flags); 
-uint8_t vmm_init(boot_info_t* info);
+// Call once after PMM is ready. Stores the kernel PML4 phys for cloning.
+void vmm_init(phys_addr_t kernel_pml4_phys);
+
+// Create a fresh PML4 for a new process:
+//   lower half (PML4[0..255])  : zeroed  – process gets an empty user space
+//   upper half (PML4[256..511]): copied from kernel PML4 – all processes share
+//                                the same kernel/HHDM mappings automatically
+phys_addr_t vmm_alloc_pml4(void);
+
+// Map one 4KiB page: virt → phys, with the given flags.
+// Use VMM_UDATA/VMM_UCODE etc. for flags.
+uint8_t vmm_page_map(phys_addr_t pml4_phys, virt_addr_t vaddr,
+                     phys_addr_t paddr, uint64_t flags);
+
+// Unmap one 4KiB page. Writes the physical address to *out_paddr if not NULL.
+// Does NOT free the physical page frame — caller's responsibility.
+uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr,
+                       phys_addr_t* out_paddr);
+
+// Allocate a physical frame, map it at vaddr in the CURRENT address space.
+void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags);
+
+// Unmap and free the frame at vaddr in the CURRENT address space.
+void vmm_page_free(virt_addr_t vaddr);
+
+// Switch address space: writes pml4_phys to CR3, flushing the TLB.
+void vmm_switch(phys_addr_t pml4_phys);
+
+// Free all lower-half (user-space) page TABLE frames in a PML4.
+// Does NOT free the physical pages the process had mapped (data/code/stack).
+// Does NOT free the PML4 frame itself — caller frees it.
+void vmm_free_user(phys_addr_t pml4_phys);
+
+// Return the physical address of the kernel's own PML4 (set by vmm_init).
+// Use this when you need to map pages into the kernel address space
+// regardless of which process is currently running (current CR3 may differ).
+phys_addr_t vmm_kernel_pml4_get(void);
+
+// Page-fault ISR (called from IDT handler for vector 14)
+typedef struct interrupt_frame_t interrupt_frame_t;
+void isr14_page_fault(interrupt_frame_t* f, uint64_t ec);
+
+// Return the physical address currently in CR3.
+phys_addr_t vmm_current_pml4(void);

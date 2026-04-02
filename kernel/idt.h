@@ -31,6 +31,10 @@ typedef struct idt_gate_t {
 
 // initializes descriptors and loads idtr
 void idt_init(void);
+
+// Register an IRQ handler at the given vector (e.g. 0x20 for IRQ0).
+// Used by timer drivers and future device drivers.
+void idt_irq_register(uint8_t vec, uint64_t handler_addr);
 void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame);
 void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_t error_code);
 
