@@ -156,3 +156,22 @@ user_trampoline:
     push r12                ; user RIP
 
     iretq
+
+; ── fork_trampoline ───────────────────────────────────────────────────────
+; Entry point for a newly forked child process on its very first run.
+; context_switch's `ret` lands here.
+;
+; Stack layout on entry (pushed by task_fork, bottom-to-top):
+;   [rsp+0]  user RIP   → pop into rcx for sysretq
+;   [rsp+8]  user RFLAGS → pop into r11
+;   [rsp+16] user RSP   → pop into rsp (switches stack to user)
+;
+; Child returns 0 from fork (rax = 0).
+global fork_trampoline
+fork_trampoline:
+    xor  rax, rax        ; child returns 0 from fork
+    pop  rcx             ; user RIP
+    pop  r11             ; user RFLAGS
+    pop  rsp             ; user RSP (switches to user stack — must be last)
+    cli
+    o64 sysret

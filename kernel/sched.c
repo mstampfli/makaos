@@ -5,66 +5,83 @@
 #include "tss.h"
 #include "common.h"
 
+// ── MLFQ parameters ───────────────────────────────────────────────────────
+// 4 priority levels.  Level 0 is highest (interactive).
+// Quantum doubles at each level.  Boost every BOOST_INTERVAL ticks moves
+// all tasks back to level 0, preventing starvation of CPU-bound tasks.
+
+#define MLFQ_LEVELS      4
+#define BOOST_INTERVAL   100   // ticks ≈ 1 s at 100 Hz
+
+static const uint8_t s_quanta[MLFQ_LEVELS] = {2, 4, 8, 16};
+
 // ── Globals ───────────────────────────────────────────────────────────────
 
 task_t* g_current = NULL;
 
-// FIFO run queue: processes waiting to run.
-// head = next to be dequeued; tail = last enqueued.
-static task_t* s_head = NULL;
-static task_t* s_tail = NULL;
+// Per-level FIFO queues.
+static task_t* s_heads[MLFQ_LEVELS];
+static task_t* s_tails[MLFQ_LEVELS];
 
-// Built-in idle process.  Represents kmain's execution context.
-// It is NEVER placed in the run queue — it is the fallback when the queue
-// is empty.  Its cpu_ctx_t is filled by the first context_switch away from it.
-// In sched.c
-// kernel/sched.c
-
-// Allocate a static buffer for the idle process stack
-static uint8_t s_idle_stack[PAGE_SIZE]; 
-
+// Idle process — never put on a queue, runs when all queues are empty.
+static uint8_t      s_idle_stack[PAGE_SIZE];
+static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
+static task_files_t s_idle_files = { .fd_table = NULL, .fd_capacity = 0, .refs = 1 };
 static task_t s_idle = {
-    .pid        = 0,
-    .tgid       = 0,
-    .ppid       = 0,
-    .flags      = TASK_FLAG_KTHREAD,
-    .state      = TASK_RUNNING,
-    .pml4_phys  = 0,
-    .ctx        = {0},
-    .kstack_top = (uint64_t)s_idle_stack + PAGE_SIZE,
-    .next       = NULL,
+    .pid          = 0,
+    .tgid         = 0,
+    .ppid         = 0,
+    .flags        = TASK_FLAG_KTHREAD,
+    .state        = TASK_RUNNING,
+    .mm_shared    = &s_idle_mm,
+    .files_shared = &s_idle_files,
+    .ctx          = {0},
+    .kstack_top   = (uint64_t)s_idle_stack + PAGE_SIZE,
+    .next         = NULL,
 };
+
+static volatile uint32_t s_tick_count  = 0;
+static volatile uint8_t  s_reschedule  = 0;
 
 // ── Internal helpers ──────────────────────────────────────────────────────
 
+// Enqueue at the task's current mlfq_level.
+// Initialises ticks_left if this is the task's first run (ticks_left == 0).
 static void enqueue(task_t* p) {
     p->state = TASK_READY;
     p->next  = NULL;
-    if (!s_tail) {
-        s_head = s_tail = p;
+    if (p->mlfq_ticks_left == 0)
+        p->mlfq_ticks_left = s_quanta[p->mlfq_level];
+
+    uint8_t lvl = p->mlfq_level;
+    if (!s_tails[lvl]) {
+        s_heads[lvl] = s_tails[lvl] = p;
     } else {
-        s_tail->next = p;
-        s_tail = p;
+        s_tails[lvl]->next = p;
+        s_tails[lvl] = p;
     }
 }
 
+// Dequeue from the highest non-empty level.
 static task_t* dequeue(void) {
-    if (!s_head) return NULL;
-    task_t* p = s_head;
-    s_head = p->next;
-    if (!s_head) s_tail = NULL;
-    p->next = NULL;
-    return p;
+    for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
+        if (!s_heads[i]) continue;
+        task_t* p = s_heads[i];
+        s_heads[i] = p->next;
+        if (!s_heads[i]) s_tails[i] = NULL;
+        p->next = NULL;
+        return p;
+    }
+    return NULL;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 
 void sched_init(void) {
-    s_head   = NULL;
-    s_tail   = NULL;
-    g_current = &s_idle;
+    for (uint8_t i = 0; i < MLFQ_LEVELS; i++)
+        s_heads[i] = s_tails[i] = NULL;
 
-    // Register sched_tick as the timer callback.
+    g_current = &s_idle;
     timer_register_tick(sched_tick);
 }
 
@@ -72,35 +89,81 @@ void sched_add(task_t* proc) {
     enqueue(proc);
 }
 
-// Returns the head of the run queue (for signal_send_group to walk).
-task_t* sched_queue_head(void) {
-    return s_head;
-}
-
-// Called from timer IRQ — only sets a flag, never touches the stack.
-static volatile uint8_t s_reschedule = 0;
+// ── sched_tick ────────────────────────────────────────────────────────────
+// Called from timer IRQ — only sets flags/counters, never touches the stack.
 
 void sched_tick(void) {
-    s_reschedule = 1;
+    s_tick_count++;
+
+    // Priority boost: move every task in levels 1-3 back to level 0.
+    if (s_tick_count % BOOST_INTERVAL == 0) {
+        for (uint8_t i = 1; i < MLFQ_LEVELS; i++) {
+            task_t* t = s_heads[i];
+            while (t) {
+                task_t* nxt = t->next;
+                t->mlfq_level     = 0;
+                t->mlfq_ticks_left = s_quanta[0];
+                t->next = NULL;
+                if (!s_tails[0]) { s_heads[0] = s_tails[0] = t; }
+                else             { s_tails[0]->next = t; s_tails[0] = t; }
+                t = nxt;
+            }
+            s_heads[i] = s_tails[i] = NULL;
+        }
+        // Boost the currently running task too.
+        if (g_current && g_current != &s_idle) {
+            g_current->mlfq_level      = 0;
+            g_current->mlfq_ticks_left = s_quanta[0];
+        }
+    }
+
+    // Tick down the running task's quantum.
+    if (g_current && g_current != &s_idle) {
+        if (g_current->mlfq_ticks_left > 0)
+            g_current->mlfq_ticks_left--;
+        if (g_current->mlfq_ticks_left == 0)
+            s_reschedule = 1;
+    } else {
+        s_reschedule = 1;   // idle → always try to find real work
+    }
 }
 
-// Called voluntarily from process context — does the actual switch.
-static void do_switch(void) {
+// ── do_switch ─────────────────────────────────────────────────────────────
+// Called from process context.  `preempted` is true when the quantum expired
+// (timer path); false for voluntary yield/sleep.
+
+static void do_switch(uint8_t preempted) {
     task_t* next = dequeue();
-    if (!next) return;
+
+    if (!next) {
+        if (preempted) return;   // nothing to switch to — let current task keep running
+        // Voluntary yield/sleep: HLT until an interrupt wakes something.
+        while (!next) {
+            __asm__ volatile("sti\nhlt\ncli");
+            next = dequeue();
+        }
+    }
 
     task_t* prev = g_current;
-    if (prev != &s_idle && prev->state == TASK_RUNNING)
+    if (prev != &s_idle && prev->state == TASK_RUNNING) {
+        if (preempted) {
+            // Used full quantum → demote.
+            if (prev->mlfq_level < MLFQ_LEVELS - 1)
+                prev->mlfq_level++;
+            prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+        } else {
+            // Voluntary — stay at same level, refresh quantum.
+            prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+        }
         enqueue(prev);
+    }
 
     next->state = TASK_RUNNING;
     g_current   = next;
 
     tss_set_rsp0(next->kstack_top);
+    context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
-    context_switch(&prev->ctx, &next->ctx, next->pml4_phys);
-
-    // Deliver any pending signals to the task we just switched back to.
     signal_deliver_pending();
 
     if (prev != &s_idle && prev->state == TASK_DEAD)
@@ -111,18 +174,60 @@ static void do_switch(void) {
 
 void sched_yield(void) {
     s_reschedule = 0;
-    do_switch();
+    do_switch(0);
+}
+
+void sched_preempt(void) {
+    if (!s_reschedule) return;
+    s_reschedule = 0;
+    do_switch(1);
 }
 
 void sched_sleep(void) {
-    if (g_current && g_current != &s_idle)
+    if (g_current && g_current != &s_idle) {
         g_current->state = TASK_SLEEPING;
+        // Refresh quantum so the task gets a full slice when woken.
+        g_current->mlfq_ticks_left = s_quanta[g_current->mlfq_level];
+    }
     s_reschedule = 0;
-    do_switch();
+    do_switch(0);
 }
 
 void sched_wake(task_t* proc) {
     if (!proc) return;
     if (proc->state != TASK_SLEEPING) return;
-    enqueue(proc);  // sets state to TASK_READY
+    enqueue(proc);
 }
+
+// ── sched_wait_pid ────────────────────────────────────────────────────────
+
+typedef struct { uint32_t pid; uint8_t found; } wait_pid_arg_t;
+
+static void find_pid_cb(task_t* t, void* data) {
+    wait_pid_arg_t* a = (wait_pid_arg_t*)data;
+    if (t->pid == a->pid) a->found = 1;
+}
+
+void sched_wait_pid(uint32_t pid) {
+    for (;;) {
+        wait_pid_arg_t a = {pid, 0};
+        sched_for_each(find_pid_cb, &a);
+        if (!a.found) break;
+        sched_yield();
+    }
+}
+
+// ── sched_for_each ────────────────────────────────────────────────────────
+// Walks every task in every MLFQ level.
+
+void sched_for_each(void (*cb)(task_t*, void*), void* data) {
+    for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
+        task_t* t = s_heads[i];
+        while (t) {
+            cb(t, data);
+            t = t->next;
+        }
+    }
+}
+
+// ── sched_queue_head — removed: use sched_for_each instead ───────────────

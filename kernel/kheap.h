@@ -2,7 +2,7 @@
 #include "common.h"
 #include "pmm.h"
 
-#define KMALLOC_CACHE_COUNT 11
+#define KMALLOC_CACHE_COUNT 10
 #define BLOCK_FREE          1ULL
 #define BLOCK_SIZE_MASK     (~0x7ULL)
 

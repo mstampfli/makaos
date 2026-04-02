@@ -1,6 +1,7 @@
 #include "timer.h"
 #include "pic.h"
 #include "idt.h"
+#include "sched.h"
 
 // ── PIT (8253/8254) timer driver ──────────────────────────────────────────
 // The PIT has a fixed input clock of 1,193,182 Hz.
@@ -25,6 +26,7 @@ void timer_register_tick(void (*fn)(void)) {
 void timer_irq_handler(void) {
     g_irq_count++;
     if (s_tick_fn) s_tick_fn();
+    sched_preempt();
 }
 
 // Assembly stub for IRQ0; defined in irq_stubs.asm.

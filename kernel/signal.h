@@ -28,9 +28,16 @@
 //   SIGILL  → TERM + print diagnostic
 
 // ── Per-task signal state (embedded in task_t) ────────────────────────────
+// Pending signals are stored in a ring buffer so duplicate signals of the same
+// type are not silently dropped and delivery order is preserved.
+// The blocked mask remains a bitmask (one bit per signal number).
+#define SIG_QUEUE_SIZE 32   // power of 2; max pending signals queued at once
+
 typedef struct {
-    uint32_t pending;   // bitmask of pending signals (bit N = signal N+1)
-    uint32_t blocked;   // bitmask of blocked signals (SIGKILL/SIGSTOP always 0 here)
+    uint8_t  queue[SIG_QUEUE_SIZE]; // ring buffer of pending signal numbers (1-based)
+    uint8_t  head;                  // index of next signal to dequeue
+    uint8_t  tail;                  // index of next free slot to enqueue
+    uint32_t blocked;               // bitmask: bit (sig-1) set → signal is blocked
 } sigstate_t;
 
 // ── API ───────────────────────────────────────────────────────────────────

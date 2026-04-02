@@ -269,7 +269,7 @@ pml4_phys               dq 0
 dap_kernel:
   db 16
   db 0
-  dw 16
+  dw 64         ; load up to 64 sectors (32 KiB) of kernelLoader
   dw 0
   dw 0x2000
   dq 33

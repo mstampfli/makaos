@@ -323,8 +323,6 @@ void snake_fn(void) {
 /* ── Ring-3 vmalloc test launcher ───────────────────────────────────────── */
 static void fs_puts(uint32_t row, const char* s, uint16_t attr);
 
-static uint32_t s_next_pid = 10;
-
 void test_vmalloc_fn(void) {
     fs_puts(0, "[TEST] launching ring-3 vmalloc test...", ATTR(BLACK, YELLOW));
 
@@ -349,7 +347,7 @@ void test_vmalloc_fn(void) {
     for (uint32_t i = bin_size; i < (uint32_t)(pages * PAGE_SIZE); i++) dst[i] = 0;
 
     // Create and schedule the user process.
-    task_t* ut = task_create_user(code_phys, pages, s_next_pid++);
+    task_t* ut = task_create_user(code_phys, pages, pid_alloc());
     if (!ut) {
         fs_puts(0, "[TEST] FAIL: task_create_user returned NULL", ATTR(RED, WHITE));
         for (;;) sched_yield();

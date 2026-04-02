@@ -87,6 +87,27 @@ phys_addr_t vmm_kernel_pml4_get(void) {
     return g_kernel_pml4;
 }
 
+// ── vmm_map_mmio ──────────────────────────────────────────────────────────
+// Maps physical MMIO pages into a private kernel window (0xFFFF900000000000+).
+// Pages are mapped uncacheable (PCD+PWT) so device register reads/writes are
+// not buffered or reordered by the CPU cache.
+#define MMIO_VIRT_BASE 0xFFFF900000000000ULL
+static virt_addr_t s_mmio_next = MMIO_VIRT_BASE;
+
+virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
+    uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    virt_addr_t base = s_mmio_next;
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD | PAGE_PWT;
+    for (uint64_t i = 0; i < pages; i++) {
+        vmm_page_map(g_kernel_pml4,
+                     base + i * PAGE_SIZE,
+                     phys + i * PAGE_SIZE,
+                     flags);
+    }
+    s_mmio_next += pages * PAGE_SIZE;
+    return base;
+}
+
 void vmm_init(phys_addr_t kernel_pml4_phys) {
     g_kernel_pml4 = kernel_pml4_phys;
 
@@ -205,6 +226,77 @@ void vmm_free_user(phys_addr_t pml4_phys) {
         pmm_buddy_free(pml4[i] & PAGE_ADDR_MASK, 0);       // free PDPT frame
     }
     // Caller frees the PML4 frame itself
+}
+
+// ── vmm_clone_user ────────────────────────────────────────────────────────
+// Deep-copy all user (lower half) page table entries from src to dst PML4.
+// For each present leaf PTE: allocate a new frame, memcpy 4096 bytes via HHDM,
+// and map it into dst with the same flags.
+// Also allocates new intermediate table frames (PDPT/PD/PT) as needed.
+// Returns 1 on success, 0 on OOM.
+uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
+    uint64_t* src_pml4v = (uint64_t*)(src_pml4 + HHDM_OFFSET);
+    uint64_t* dst_pml4v = (uint64_t*)(dst_pml4 + HHDM_OFFSET);
+
+    for (int pi = 0; pi < 256; pi++) {
+        if (!(src_pml4v[pi] & PAGE_PRESENT)) continue;
+
+        // Allocate new PDPT frame for dst.
+        phys_addr_t dst_pdpt_phys = pmm_buddy_alloc(0);
+        if (dst_pdpt_phys == PMM_INVALID_ADDR) return 0;
+        zero_page(dst_pdpt_phys + HHDM_OFFSET);
+
+        uint64_t inter_flags = (src_pml4v[pi] & ~PAGE_ADDR_MASK) & 0xFFF;
+        dst_pml4v[pi] = dst_pdpt_phys | inter_flags | PAGE_PRESENT;
+
+        uint64_t* src_pdpt = (uint64_t*)((src_pml4v[pi] & PAGE_ADDR_MASK) + HHDM_OFFSET);
+        uint64_t* dst_pdpt = (uint64_t*)(dst_pdpt_phys + HHDM_OFFSET);
+
+        for (int qi = 0; qi < 512; qi++) {
+            if (!(src_pdpt[qi] & PAGE_PRESENT)) continue;
+
+            phys_addr_t dst_pd_phys = pmm_buddy_alloc(0);
+            if (dst_pd_phys == PMM_INVALID_ADDR) return 0;
+            zero_page(dst_pd_phys + HHDM_OFFSET);
+
+            uint64_t inter_flags2 = (src_pdpt[qi] & ~PAGE_ADDR_MASK) & 0xFFF;
+            dst_pdpt[qi] = dst_pd_phys | inter_flags2 | PAGE_PRESENT;
+
+            uint64_t* src_pd = (uint64_t*)((src_pdpt[qi] & PAGE_ADDR_MASK) + HHDM_OFFSET);
+            uint64_t* dst_pd = (uint64_t*)(dst_pd_phys + HHDM_OFFSET);
+
+            for (int ri = 0; ri < 512; ri++) {
+                if (!(src_pd[ri] & PAGE_PRESENT)) continue;
+
+                phys_addr_t dst_pt_phys = pmm_buddy_alloc(0);
+                if (dst_pt_phys == PMM_INVALID_ADDR) return 0;
+                zero_page(dst_pt_phys + HHDM_OFFSET);
+
+                uint64_t inter_flags3 = (src_pd[ri] & ~PAGE_ADDR_MASK) & 0xFFF;
+                dst_pd[ri] = dst_pt_phys | inter_flags3 | PAGE_PRESENT;
+
+                uint64_t* src_pt = (uint64_t*)((src_pd[ri] & PAGE_ADDR_MASK) + HHDM_OFFSET);
+                uint64_t* dst_pt = (uint64_t*)(dst_pt_phys + HHDM_OFFSET);
+
+                for (int si = 0; si < 512; si++) {
+                    if (!(src_pt[si] & PAGE_PRESENT)) continue;
+
+                    phys_addr_t src_frame = src_pt[si] & PAGE_ADDR_MASK;
+                    phys_addr_t dst_frame = pmm_buddy_alloc(0);
+                    if (dst_frame == PMM_INVALID_ADDR) return 0;
+
+                    // memcpy 4096 bytes via HHDM.
+                    uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
+                    uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
+                    for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+
+                    uint64_t leaf_flags = src_pt[si] & ~PAGE_ADDR_MASK;
+                    dst_pt[si] = dst_frame | leaf_flags;
+                }
+            }
+        }
+    }
+    return 1;
 }
 
 // ── Page-fault handler (vector 14) ───────────────────────────────────────

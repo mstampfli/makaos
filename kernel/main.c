@@ -11,16 +11,20 @@
 #include "timer.h"
 #include "sched.h"
 #include "ata_poll.h"
+#include "ahci.h"
+#include "ext2.h"
+#include "tsc.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
-/* ── Process entry points (implemented in apps.c) ───────── */
+/* ── Process entry points ───────────────────────────────── */
 extern void home_fn(void);
 extern void snake_fn(void);
 extern void fs_init_fn(void);
 extern void test_vmalloc_fn(void);
+extern void shell_fn(void);
 
 /* ── kmain ───────────────────────────────────────────────── */
 static void serial_init_and_say(void) {
@@ -59,30 +63,29 @@ void kmain(void) {
     }
 
     idt_init();
+    pic_init(0x20, 0x28);  // remap PIC early so pic_unmask works in ahci_init
+    tsc_init();
     pmm_buddy_init_from_map(info->e820_map, info->e820_count);
     kheap_init();
     vmm_init(info->pml4_phys);
     tss_init();
     syscall_init();
 
-    // Initialise ATA primary master (polling, disables ATA IRQs).
     ata_poll_init();
+    ahci_init();
+    ext2_init(4096);  // ext2 partition starts at LBA 4096 on the single AHCI disk
 
-    task_t* p_test = process_create(test_vmalloc_fn, 1);
+    task_t* p_shell = process_create(shell_fn, pid_alloc());
 
-    if (!p_test)
+    if (!p_shell)
         for (;;) __asm__ volatile("hlt");
 
-    pic_init(0x20, 0x28);
-    keyboard_init();
-
     sched_init();
-    sched_add(p_test);
+    keyboard_init();
+    sched_add(p_shell);
     timer_init(100);
 
     __asm__ volatile("sti");
-    for (;;) {
+    for (;;)
         __asm__ volatile("hlt");
-        sched_yield();
-    }
 }

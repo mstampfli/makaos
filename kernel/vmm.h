@@ -90,9 +90,19 @@ void vmm_free_user(phys_addr_t pml4_phys);
 // regardless of which process is currently running (current CR3 may differ).
 phys_addr_t vmm_kernel_pml4_get(void);
 
+// Map a physical MMIO region into kernel virtual space with cache-disabled flags.
+// Returns the virtual address to use for accessing the device registers.
+// Successive calls allocate from a growing window starting at 0xFFFF900000000000.
+virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes);
+
 // Page-fault ISR (called from IDT handler for vector 14)
 typedef struct interrupt_frame_t interrupt_frame_t;
 void isr14_page_fault(interrupt_frame_t* f, uint64_t ec);
 
 // Return the physical address currently in CR3.
 phys_addr_t vmm_current_pml4(void);
+
+// Deep-copy all user (lower half, PML4[0..255]) pages from src_pml4 to dst_pml4.
+// Allocates new PDPT/PD/PT frames and new data frames for each present leaf PTE.
+// Returns 1 on success, 0 on OOM.
+uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4);

@@ -16,6 +16,21 @@ inb:
     movzx eax, al
     ret
 
+global outl
+outl:
+    ; RDI = port, RSI = val
+    mov dx, di
+    mov eax, esi
+    out dx, eax
+    ret
+
+global inl
+inl:
+    ; RDI = port, returns EAX
+    mov dx, di
+    in  eax, dx
+    ret
+
 global outw
 outw:
     ; RDI = port, RSI = val
@@ -35,9 +50,9 @@ inw:
 global insw
 insw:
   ; RDI = port, RSI = dst, RDX = count_words
-  mov dx, di
+  mov rcx, rdx      ; save count FIRST (mov dx,di would clobber rdx low bits)
+  mov dx, di        ; port into DX
   mov rdi, rsi      ; rep insw uses RDI as destination
-  mov rcx, rdx
   cld
   rep insw
   ret
@@ -45,8 +60,8 @@ insw:
 global outsw
 outsw:
     ; RDI = port, RSI = src, RDX = count_words
-    mov dx, di
-    mov rcx, rdx
+    mov rcx, rdx      ; save count FIRST
+    mov dx, di        ; port into DX
     cld
     rep outsw         ; uses RSI as source
     ret

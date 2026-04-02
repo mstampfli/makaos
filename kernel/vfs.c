@@ -10,26 +10,29 @@
 // g_vga is defined in syscall.c (backed by VGA_ADDR + HHDM_OFFSET).
 extern volatile uint16_t* g_vga;
 
-static uint32_t s_vga_row = 0;
-static uint32_t s_vga_col = 0;
+uint32_t g_vga_row = 0;
+uint32_t g_vga_col = 0;
+
+// ── Current working directory ─────────────────────────────────────────────
+char g_cwd[256] = "/";
 
 static void vga_putchar(char c) {
-    if (c == '\n' || s_vga_col >= VGA_COLS) {
-        s_vga_col = 0;
-        s_vga_row++;
-        if (s_vga_row >= VGA_ROWS) {
+    if (c == '\n' || g_vga_col >= VGA_COLS) {
+        g_vga_col = 0;
+        g_vga_row++;
+        if (g_vga_row >= VGA_ROWS) {
             // Scroll up one row.
             for (uint32_t r = 0; r < VGA_ROWS - 1; r++)
                 for (uint32_t c2 = 0; c2 < VGA_COLS; c2++)
                     g_vga[r * VGA_COLS + c2] = g_vga[(r + 1) * VGA_COLS + c2];
             for (uint32_t c2 = 0; c2 < VGA_COLS; c2++)
                 g_vga[(VGA_ROWS - 1) * VGA_COLS + c2] = (uint16_t)' ' | (0x07U << 8);
-            s_vga_row = VGA_ROWS - 1;
+            g_vga_row = VGA_ROWS - 1;
         }
         if (c == '\n') return;
     }
-    g_vga[s_vga_row * VGA_COLS + s_vga_col] = (uint16_t)(uint8_t)c | (0x07U << 8);
-    s_vga_col++;
+    g_vga[g_vga_row * VGA_COLS + g_vga_col] = (uint16_t)(uint8_t)c | (0x07U << 8);
+    g_vga_col++;
 }
 
 static int64_t vga_write(vfs_file_t* self, const void* buf, uint64_t len) {
