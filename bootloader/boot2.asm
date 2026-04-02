@@ -43,7 +43,7 @@ start:
   ; Gather BIOS info
   ; --------------------------
   call get_e820_map
-  call get_vbe
+  ;call get_vbe
 
 enter_protected_mode:
   cli
