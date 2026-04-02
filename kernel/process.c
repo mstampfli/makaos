@@ -5,141 +5,268 @@
 #include "kheap.h"
 #include "vfs.h"
 
-// ── task_create_kthread ───────────────────────────────────────────────────
-// Kernel thread: shares the kernel PML4 (no clone), runs at CPL=0.
-// kstack allocated BEFORE pml4 so the shallow-copy in vmm_alloc_pml4
-// already includes this stack's mapping in the upper half.
-task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
-    task_t* t = kmalloc(sizeof(task_t));
+// ── task_mm_t helpers ─────────────────────────────────────────────────────
 
+task_mm_t* task_mm_alloc(phys_addr_t pml4, mm_t* mm) {
+    task_mm_t* m = kmalloc(sizeof(task_mm_t));
+    if (!m) return NULL;
+    m->pml4_phys = pml4;
+    m->mm        = mm;
+    m->refs      = 1;
+    return m;
+}
+
+void task_mm_release(task_mm_t* m) {
+    if (!m) return;
+    if (--m->refs > 0) return;
+    vmm_free_user(m->pml4_phys);
+    pmm_buddy_free(m->pml4_phys, 0);
+    if (m->mm) mm_destroy(m->mm);
+    kfree(m);
+}
+
+// ── task_files_t helpers ──────────────────────────────────────────────────
+#define FD_INITIAL_CAP 4
+
+uint8_t fd_table_init(task_files_t* f, uint32_t cap) {
+    f->fd_table = kmalloc(cap * sizeof(vfs_file_t*));
+    if (!f->fd_table) return 0;
+    for (uint32_t i = 0; i < cap; i++) f->fd_table[i] = NULL;
+    f->fd_capacity = cap;
+    return 1;
+}
+
+uint8_t fd_table_grow(task_files_t* f) {
+    uint32_t new_cap = f->fd_capacity * 2;
+    vfs_file_t** tbl = kmalloc(new_cap * sizeof(vfs_file_t*));
+    if (!tbl) return 0;
+    for (uint32_t i = 0; i < f->fd_capacity; i++) tbl[i] = f->fd_table[i];
+    for (uint32_t i = f->fd_capacity; i < new_cap; i++) tbl[i] = NULL;
+    kfree(f->fd_table);
+    f->fd_table    = tbl;
+    f->fd_capacity = new_cap;
+    return 1;
+}
+
+task_files_t* task_files_alloc(void) {
+    task_files_t* f = kmalloc(sizeof(task_files_t));
+    if (!f) return NULL;
+    f->fd_table    = NULL;
+    f->fd_capacity = 0;
+    f->refs        = 1;
+    return f;
+}
+
+void task_files_release(task_files_t* f) {
+    if (!f) return;
+    if (--f->refs > 0) return;
+    for (uint32_t i = 0; i < f->fd_capacity; i++)
+        if (f->fd_table[i]) vfs_close(f->fd_table[i]);
+    kfree(f->fd_table);
+    kfree(f);
+}
+
+// ── PID pool ──────────────────────────────────────────────────────────────
+#define PID_MAX   4095u
+#define PID_WORDS ((PID_MAX + 1 + 63u) / 64u)
+
+static uint64_t s_pid_bitmap[PID_WORDS] = { [0] = 0x3FFu };
+static uint32_t s_pid_next = 10;
+
+uint32_t pid_alloc(void) {
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        uint32_t start = (pass == 0) ? s_pid_next : 10u;
+        uint32_t end   = (pass == 0) ? PID_MAX    : s_pid_next;
+        for (uint32_t pid = start; pid <= end; pid++) {
+            uint32_t w = pid / 64u, b = pid % 64u;
+            if (!(s_pid_bitmap[w] & (1ull << b))) {
+                s_pid_bitmap[w] |= (1ull << b);
+                s_pid_next = (pid + 1 <= PID_MAX) ? pid + 1 : 10u;
+                return pid;
+            }
+        }
+    }
+    return 0;
+}
+
+void pid_free(uint32_t pid) {
+    if (pid < 10 || pid > PID_MAX) return;
+    s_pid_bitmap[pid / 64u] &= ~(1ull << (pid % 64u));
+}
+
+// ── Common task init ──────────────────────────────────────────────────────
+
+static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
+                              task_mm_t* mm, task_files_t* files) {
     t->pid              = pid;
     t->tgid             = pid;
     t->ppid             = 0;
-    t->flags            = TASK_FLAG_KTHREAD;
+    t->flags            = flags;
     t->state            = TASK_READY;
     t->next             = NULL;
-    t->mm               = NULL;
-    t->sigstate.pending = 0;
+    t->mm_shared        = mm;
+    t->files_shared     = files;
+    t->mlfq_level       = 0;
+    t->mlfq_ticks_left  = 0;
+    t->sigstate.head    = 0;
+    t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+}
 
-    // Allocate kstack first, then PML4 (so PML4 copy includes this stack).
+// ── task_create_kthread ───────────────────────────────────────────────────
+task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
+    task_t* t = kmalloc(sizeof(task_t));
+    if (!t) return NULL;
+
+    task_mm_t* mm = task_mm_alloc(vmm_alloc_pml4(), NULL);
+    if (!mm) { kfree(t); return NULL; }
+
+    task_files_t* files = task_files_alloc();
+    if (!files) { task_mm_release(mm); kfree(t); return NULL; }
+    fd_table_init(files, FD_INITIAL_CAP);
+    files->fd_table[0] = vfs_kbd_open();
+    files->fd_table[1] = vfs_vga_open();
+    files->fd_table[2] = vfs_vga_open();
+
+    task_init_common(t, pid, TASK_FLAG_KTHREAD, mm, files);
+
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
-    t->pml4_phys  = vmm_alloc_pml4();
 
-    // Build initial kernel stack frame for context_switch.
-    // context_switch pops: r15, r14, r13, r12, rbp, rbx  then ret.
     uint64_t* stk = (uint64_t*)kstack_top;
-    *(--stk) = 0;                  // alignment pad
+    *(--stk) = 0;
     *(--stk) = (uint64_t)proc_trampoline;
-    *(--stk) = 0;                  // rbx
-    *(--stk) = 0;                  // rbp
-    *(--stk) = (uint64_t)entry;    // r12 → picked up by proc_trampoline
-    *(--stk) = 0;                  // r13
-    *(--stk) = 0;                  // r14
-    *(--stk) = 0;                  // r15
-
+    *(--stk) = 0; *(--stk) = 0;         // rbx, rbp
+    *(--stk) = (uint64_t)entry;          // r12
+    *(--stk) = 0; *(--stk) = 0; *(--stk) = 0; // r13, r14, r15
     t->ctx.rsp = (uint64_t)stk;
-
-    // Set up standard file descriptors.
-    for (int i = 0; i < VFS_MAX_FDS; i++) t->fd_table[i] = NULL;
-    t->fd_table[0] = vfs_kbd_open();
-    t->fd_table[1] = vfs_vga_open();
-    t->fd_table[2] = vfs_vga_open();
 
     return t;
 }
 
 // ── task_create_user ──────────────────────────────────────────────────────
-// User process: own PML4 + mm_t, ring-3 entry via user_trampoline + iretq.
-// Code pages are mapped eagerly (they're already loaded into physical memory).
-// Stack and heap are demand-paged: VMAs registered here, physical frames
-// allocated on first #PF.
 task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pid) {
     task_t* t = kmalloc(sizeof(task_t));
+    if (!t) return NULL;
 
-    t->pid              = pid;
-    t->tgid             = pid;
-    t->ppid             = 0;
-    t->flags            = 0;
-    t->state            = TASK_READY;
-    t->next             = NULL;
-    t->sigstate.pending = 0;
-    t->sigstate.blocked = 0;
-
-    // Allocate kstack first, then PML4.
-    virt_addr_t kstack_top = kstack_alloc();
-    t->kstack_top = kstack_top;
-    t->pml4_phys  = vmm_alloc_pml4();
-
-    // Create the memory descriptor.
+    phys_addr_t pml4 = vmm_alloc_pml4();
     mm_t* mm = mm_create();
-    t->mm = mm;
+    task_mm_t* tmm = task_mm_alloc(pml4, mm);
+    if (!tmm) { kfree(t); return NULL; }
 
-    // ── Code region: read+execute, no write (W^X) ────────────────────────
+    task_files_t* files = task_files_alloc();
+    if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
+    fd_table_init(files, FD_INITIAL_CAP);
+    files->fd_table[0] = vfs_kbd_open();
+    files->fd_table[1] = vfs_vga_open();
+    files->fd_table[2] = vfs_vga_open();
+
     virt_addr_t code_start = VMM_USER_CODE_BASE;
     virt_addr_t code_end   = code_start + (virt_addr_t)code_pages * PAGE_SIZE;
-    mm_vma_add(mm, code_start, code_end, VMA_R | VMA_X);
+    mm_vma_add(mm, code_start, code_end, VMA_R | VMA_W | VMA_X);
+    for (uint32_t i = 0; i < code_pages; i++)
+        vmm_page_map(pml4, code_start + (virt_addr_t)i * PAGE_SIZE,
+                     code_phys + (phys_addr_t)i * PAGE_SIZE,
+                     mm_vma_pte_flags(VMA_R | VMA_W | VMA_X));
 
-    // Map code pages eagerly — they're already in physical memory.
-    for (uint32_t i = 0; i < code_pages; i++) {
-        vmm_page_map(t->pml4_phys,
-                     code_start + (virt_addr_t)i * PAGE_SIZE,
-                     code_phys  + (phys_addr_t)i * PAGE_SIZE,
-                     mm_vma_pte_flags(VMA_R | VMA_X));
-    }
-
-    // ── Stack region: read+write, no execute ─────────────────────────────
-    // Guard page: one unmapped page just below the stack — no VMA there,
-    // so any access faults and kills the process (stack overflow detection).
     virt_addr_t stack_end   = VMM_USER_STACK_TOP;
     virt_addr_t stack_start = stack_end - VMM_USER_STACK_PAGES * PAGE_SIZE;
     mm_vma_add(mm, stack_start, stack_end, VMA_R | VMA_W | VMA_ANON);
-    // Stack is demand-paged: no physical frames allocated here.
-    // The first push from user_trampoline will fault → page in.
 
-    // ── Heap region: starts just after code, demand-paged ────────────────
-    virt_addr_t heap_start = (code_end + PAGE_SIZE - 1) & ~PAGE_MASK; // page-align up
+    virt_addr_t heap_start = (code_end + PAGE_SIZE - 1) & ~PAGE_MASK;
     mm->brk_start = heap_start;
     mm->brk       = heap_start;
-    // No VMA yet — sys_brk adds one when the process calls brk().
 
-    // Build kernel stack frame: context_switch → user_trampoline → iretq.
+    task_init_common(t, pid, 0, tmm, files);
+
+    virt_addr_t kstack_top = kstack_alloc();
+    t->kstack_top = kstack_top;
+
     uint64_t* stk = (uint64_t*)kstack_top;
-    *(--stk) = 0;                          // alignment
-    *(--stk) = (uint64_t)user_trampoline;  // ret addr
-    *(--stk) = 0;                          // rbx
-    *(--stk) = 0;                          // rbp
-    *(--stk) = VMM_USER_CODE_BASE;         // r12 = user RIP
-    *(--stk) = VMM_USER_STACK_TOP;         // r13 = user RSP
-    *(--stk) = 0;                          // r14
-    *(--stk) = 0;                          // r15
-
+    *(--stk) = 0;
+    *(--stk) = (uint64_t)user_trampoline;
+    *(--stk) = 0; *(--stk) = 0;      // rbx, rbp
+    *(--stk) = VMM_USER_CODE_BASE;   // r12
+    *(--stk) = VMM_USER_STACK_TOP;   // r13
+    *(--stk) = 0; *(--stk) = 0;      // r14, r15
     t->ctx.rsp = (uint64_t)stk;
-
-    // Set up standard file descriptors.
-    for (int i = 0; i < VFS_MAX_FDS; i++) t->fd_table[i] = NULL;
-    t->fd_table[0] = vfs_kbd_open();
-    t->fd_table[1] = vfs_vga_open();
-    t->fd_table[2] = vfs_vga_open();
 
     return t;
 }
 
 // ── task_get_mm ───────────────────────────────────────────────────────────
 mm_t* task_get_mm(void* task) {
-    return ((task_t*)task)->mm;
+    return ((task_t*)task)->mm_shared->mm;
 }
 
 // ── task_destroy ──────────────────────────────────────────────────────────
 void task_destroy(task_t* t) {
     if (!t) return;
+    pid_free(t->pid);
     kstack_free(t->kstack_top);
-    // vmm_free_user frees all page table frames AND the physical frames
-    // that were demand-paged into the lower half.
-    vmm_free_user(t->pml4_phys);
-    pmm_buddy_free(t->pml4_phys, 0);
-    // Free VMA descriptors (mm_destroy does not touch physical memory).
-    if (t->mm) mm_destroy(t->mm);
+    task_mm_release(t->mm_shared);
+    task_files_release(t->files_shared);
     kfree(t);
+}
+
+// ── task_fork ─────────────────────────────────────────────────────────────
+task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp) {
+    task_t* t = kmalloc(sizeof(task_t));
+    if (!t) return NULL;
+
+    // Fork = new process: deep-copy both mm and files.
+    phys_addr_t new_pml4 = vmm_alloc_pml4();
+    if (new_pml4 == PMM_INVALID_ADDR) { kfree(t); return NULL; }
+
+    if (!vmm_clone_user(new_pml4, parent->mm_shared->pml4_phys)) {
+        vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        return NULL;
+    }
+
+    mm_t* new_mm = mm_clone(parent->mm_shared->mm);
+    if (!new_mm) {
+        vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        return NULL;
+    }
+
+    task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
+    if (!tmm) {
+        mm_destroy(new_mm); vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        return NULL;
+    }
+
+    task_files_t* files = task_files_alloc();
+    if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
+    fd_table_init(files, parent->files_shared->fd_capacity);
+    for (uint32_t i = 0; i < parent->files_shared->fd_capacity; i++)
+        files->fd_table[i] = parent->files_shared->fd_table[i];
+
+    t->pid              = pid_alloc();
+    t->tgid             = t->pid;
+    t->ppid             = parent->pid;
+    t->flags            = 0;
+    t->state            = TASK_READY;
+    t->next             = NULL;
+    t->mm_shared        = tmm;
+    t->files_shared     = files;
+    t->mlfq_level       = 0;
+    t->mlfq_ticks_left  = 0;
+    t->sigstate.head    = 0;
+    t->sigstate.tail    = 0;
+    t->sigstate.blocked = 0;
+
+    virt_addr_t kstack_top = kstack_alloc();
+    t->kstack_top = kstack_top;
+
+    uint64_t* stk = (uint64_t*)kstack_top;
+    *(--stk) = user_rsp;
+    *(--stk) = user_rflags;
+    *(--stk) = user_rip;
+    *(--stk) = (uint64_t)fork_trampoline;
+    *(--stk) = 0; *(--stk) = 0; // rbx, rbp
+    *(--stk) = 0; *(--stk) = 0; // r12, r13
+    *(--stk) = 0; *(--stk) = 0; // r14, r15
+    t->ctx.rsp = (uint64_t)stk;
+
+    return t;
 }

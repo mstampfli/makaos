@@ -24,6 +24,8 @@ default rel
 
 extern timer_irq_handler
 extern keyboard_irq_handler
+extern ahci_irq_handler
+extern g_ahci_irq      ; uint8_t — IRQ line (0-15), set by ahci_init
 
 %macro PUSH_GPRS 0
     push r15
@@ -90,4 +92,38 @@ irq1_entry:
     call keyboard_irq_handler
 
     POP_GPRS
+    iretq
+
+; ── AHCI: generic stub, IRQ line read from g_ahci_irq ────────────────────
+; Slave IRQs (8-15): EOI to slave PIC (0xA0) then master (0x20).
+; Master IRQs (0-7): EOI to master only.
+global ahci_irq_entry
+ahci_irq_entry:
+    PUSH_GPRS
+
+    mov al, 0x20
+    movzx ecx, byte [rel g_ahci_irq]
+    cmp cl, 8
+    jl .master_only
+    out 0xA0, al    ; slave EOI
+.master_only:
+    out 0x20, al    ; master EOI
+
+    call ahci_irq_handler
+
+    POP_GPRS
+    iretq
+
+; ── Spurious IRQ stubs ────────────────────────────────────────────────────
+; IRQ7  (vec 0x27): spurious from master PIC — no EOI at all.
+; IRQ15 (vec 0x2F): spurious from slave PIC  — EOI master only (cascade).
+global spurious_irq7_entry
+spurious_irq7_entry:
+    iretq
+
+global spurious_irq15_entry
+spurious_irq15_entry:
+    ; Master saw a real IRQ2 (cascade) so it needs an EOI; slave did not.
+    mov al, 0x20
+    out 0x20, al
     iretq

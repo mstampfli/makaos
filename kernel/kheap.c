@@ -5,7 +5,8 @@ static const size_t g_kmalloc_sizes[KMALLOC_CACHE_COUNT] = {
     8, 16, 32, 64,
     128, 256, 512,
     1024, 2048, 4096,
-    8192
+    // 8192 and above go directly to buddy allocator (slab needs 64KB blocks
+    // to satisfy SLAB_MIN_OBJECTS=8, which is wasteful and often fails).
 };
 
 static inline uint64_t align_down(virt_addr_t addr) {

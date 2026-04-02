@@ -13,8 +13,6 @@
 //   - vfs_close frees whatever the driver allocated for its context.
 //   - NULL function pointers mean "not supported" → returns -1.
 
-#define VFS_MAX_FDS  16   // file descriptors per task
-
 typedef struct vfs_file_t {
     // Read up to `len` bytes into `buf`.  Returns bytes read, 0 on EOF, -1 on error.
     int64_t (*read )(struct vfs_file_t* self, void*       buf, uint64_t len);
@@ -41,6 +39,13 @@ static inline int64_t vfs_write(vfs_file_t* f, const void* buf, uint64_t len) {
 static inline void vfs_close(vfs_file_t* f) {
     if (f && f->close) f->close(f);
 }
+
+// ── Shared VGA cursor state (defined in vfs.c) ────────────────────────────
+extern uint32_t g_vga_row;
+extern uint32_t g_vga_col;
+
+// ── Current working directory (absolute path, "/" by default) ─────────────
+extern char g_cwd[256];
 
 // ── Built-in device constructors ─────────────────────────────────────────
 
