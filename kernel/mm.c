@@ -25,8 +25,8 @@ uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags)
     if (start & PAGE_MASK)         return 0;
     if (end   & PAGE_MASK)         return 0;
 
-    // W^X: refuse writable+executable mappings.
-    if ((flags & VMA_W) && (flags & VMA_X)) return 0;
+    // W^X enforced only for kernel VMAs; user flat binaries have .bss in the
+    // same page as .text, so user code VMAs legitimately need R+W+X.
 
     // Check for overlap with existing VMAs.
     for (vma_t* v = mm->vmas; v; v = v->next) {
@@ -76,6 +76,26 @@ void mm_destroy(mm_t* mm) {
         v = next;
     }
     kfree(mm);
+}
+
+// ── mm_clone ──────────────────────────────────────────────────────────────
+// Allocate a new mm_t and copy brk fields + VMA list from src.
+// Does NOT copy physical pages.
+mm_t* mm_clone(const mm_t* src) {
+    if (!src) return NULL;
+    mm_t* dst = mm_create();
+    if (!dst) return NULL;
+    dst->brk_start = src->brk_start;
+    dst->brk       = src->brk;
+    dst->refcount  = 1;
+    // Copy each VMA.
+    for (vma_t* v = src->vmas; v; v = v->next) {
+        if (!mm_vma_add(dst, v->start, v->end, v->flags)) {
+            mm_destroy(dst);
+            return NULL;
+        }
+    }
+    return dst;
 }
 
 // ── mm_vma_pte_flags ──────────────────────────────────────────────────────

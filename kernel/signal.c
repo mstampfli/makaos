@@ -11,13 +11,17 @@ void signal_send(task_t* t, int sig) {
     if (!t) return;
     if (sig < 1 || sig >= NSIG) return;
 
-    uint32_t bit = 1u << (uint32_t)(sig - 1);
-
     // SIGKILL is unblockable — forcibly clear the blocked bit.
     if (sig == SIGKILL)
-        t->sigstate.blocked &= ~bit;
+        t->sigstate.blocked &= ~(1u << (uint32_t)(sig - 1));
 
-    t->sigstate.pending |= bit;
+    // Enqueue into ring buffer.  If full, drop (same as classic bitmask overflow).
+    sigstate_t* ss = &t->sigstate;
+    uint8_t next_tail = (ss->tail + 1) & (SIG_QUEUE_SIZE - 1);
+    if (next_tail != ss->head) {   // not full
+        ss->queue[ss->tail] = (uint8_t)sig;
+        ss->tail = next_tail;
+    }
 
     // Wake the task if it's sleeping so it processes the signal promptly.
     if (t->state == TASK_SLEEPING)
@@ -29,20 +33,19 @@ void signal_send(task_t* t, int sig) {
 // Walks the run queue and also checks g_current.
 // NOTE: this only reaches tasks in the scheduler's queue + current task.
 // A task that is TASK_DEAD is skipped.
+typedef struct { uint32_t tgid; int sig; } sig_group_arg_t;
+
+static void sig_group_cb(task_t* t, void* data) {
+    sig_group_arg_t* a = (sig_group_arg_t*)data;
+    if (t->tgid == a->tgid && t != g_current && t->state != TASK_DEAD)
+        signal_send(t, a->sig);
+}
+
 void signal_send_group(uint32_t tgid, int sig) {
-    // Check current task.
     if (g_current && g_current->tgid == tgid)
         signal_send(g_current, sig);
-
-    // Walk run queue.  The queue is a singly-linked list via ->next.
-    // We access it directly — single CPU, no races.
-    extern task_t* sched_queue_head(void);
-    task_t* t = sched_queue_head();
-    while (t) {
-        if (t->tgid == tgid && t != g_current)
-            signal_send(t, sig);
-        t = t->next;
-    }
+    sig_group_arg_t a = {tgid, sig};
+    sched_for_each(sig_group_cb, &a);
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────
@@ -56,18 +59,34 @@ void signal_deliver_pending(void) {
     if (!g_current || g_current->state == TASK_DEAD) return;
 
     sigstate_t* ss = &g_current->sigstate;
-    uint32_t deliverable = ss->pending & ~ss->blocked;
-    if (!deliverable) return;
 
-    // Find the lowest-numbered pending signal.
+    // Dequeue the first unblocked signal from the ring buffer.
     int sig = 0;
-    for (int i = 0; i < NSIG - 1; i++) {
-        if (deliverable & (1u << i)) { sig = i + 1; break; }
+    uint8_t scan = ss->head;
+    while (scan != ss->tail) {
+        uint8_t candidate = ss->queue[scan];
+        uint32_t bit = 1u << (uint32_t)(candidate - 1);
+        if (!(ss->blocked & bit)) {
+            sig = (int)candidate;
+            // Remove this entry by shifting the head past it.
+            // If it's not at head, compact the ring to close the gap.
+            if (scan == ss->head) {
+                ss->head = (ss->head + 1) & (SIG_QUEUE_SIZE - 1);
+            } else {
+                // Shift entries down to close the gap at `scan`.
+                uint8_t i = scan;
+                while (i != ss->tail) {
+                    uint8_t next = (i + 1) & (SIG_QUEUE_SIZE - 1);
+                    ss->queue[i] = ss->queue[next];
+                    i = next;
+                }
+                ss->tail = (ss->tail - 1) & (SIG_QUEUE_SIZE - 1);
+            }
+            break;
+        }
+        scan = (scan + 1) & (SIG_QUEUE_SIZE - 1);
     }
     if (!sig) return;
-
-    // Clear the pending bit.
-    ss->pending &= ~(1u << (uint32_t)(sig - 1));
 
     // Print diagnostic for fatal hardware signals.
     extern volatile uint16_t* g_vga;

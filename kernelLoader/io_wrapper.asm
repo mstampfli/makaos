@@ -51,6 +51,21 @@ outsw:
     rep outsw         ; uses RSI as source
     ret
 
+global outl
+outl:
+    ; RDI = port, RSI = val
+    mov dx, di
+    mov eax, esi
+    out dx, eax
+    ret
+
+global inl
+inl:
+    ; RDI = port, returns EAX
+    mov dx, di
+    in  eax, dx
+    ret
+
 ; SysV caller-saved regs:
 ; RAX RCX RDX RSI RDI R8 R9 R10 R11
 ;

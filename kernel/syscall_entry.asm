@@ -1,8 +1,14 @@
 bits 64
 
 extern syscall_dispatch
-extern g_tss          ; TSS struct in tss.c — RSP0 is at byte offset 4
-extern g_syscall_user_rsp ; scratch qword in syscall.c to stash user RSP
+extern g_tss                  ; TSS struct in tss.c — RSP0 is at byte offset 4
+extern g_syscall_user_rsp     ; scratch qword in syscall.c to stash user RSP
+extern g_syscall_user_rip     ; scratch qword in syscall.c to stash user RIP
+extern g_syscall_user_rflags  ; scratch qword in syscall.c to stash user RFLAGS
+extern g_exec_requested       ; byte flag set by sys_exec
+extern g_exec_entry           ; new entry RIP for exec
+extern g_exec_rsp             ; new user RSP for exec
+extern g_exec_pml4            ; new PML4 phys for exec
 
 global syscall_entry
 
@@ -20,9 +26,11 @@ global syscall_entry
 ; rax    = return value
 
 syscall_entry:
-    ; 1. Save user RSP in a static scratch variable.
+    ; 1. Save user RSP/RIP/RFLAGS in static scratch variables.
     ;    We cannot push yet — rsp is the user stack.
-    mov [rel g_syscall_user_rsp], rsp
+    mov [rel g_syscall_user_rsp],    rsp
+    mov [rel g_syscall_user_rip],    rcx
+    mov [rel g_syscall_user_rflags], r11
 
     ; 2. Switch to kernel stack (TSS.RSP0, byte offset 4 in tss_t).
     mov rsp, [rel g_tss + 4]
@@ -31,9 +39,11 @@ syscall_entry:
     sti
 
     ; 4. Push the three values sysretq needs so they survive the C call.
-    push rcx                            ; user RIP   (rcx on entry)
+    ;    Push user RSP first (lowest priority, popped last) so that rcx and r11
+    ;    can be popped while still on the kernel stack before switching RSP.
+    push qword [rel g_syscall_user_rsp] ; user RSP   (pushed first → popped last)
     push r11                            ; user RFLAGS
-    push qword [rel g_syscall_user_rsp] ; user RSP
+    push rcx                            ; user RIP   (pushed last → popped first)
 
     ; 5. Save GPRs the user expects intact that C may clobber.
     push rdi
@@ -63,13 +73,26 @@ syscall_entry:
     pop rdi
 
     ; 8. Restore sysretq operands (reverse order of step 4).
-    pop  rsp         ; user RSP  — now rsp points at user stack again
-    pop  r11         ; user RFLAGS
-    pop  rcx         ; user RIP
+    ;    Pop rcx and r11 first while still on the kernel stack, THEN switch RSP.
+    pop  rcx         ; user RIP   — still on kernel stack
+    pop  r11         ; user RFLAGS — still on kernel stack
+    pop  rsp         ; user RSP   — now rsp points at user stack (must be last)
 
-    ; 9. Disable interrupts before sysretq (mandatory).
+    ; 9. Check if exec was requested (sys_exec sets g_exec_requested = 1).
+    ;    If so, override rcx/r11/rsp/cr3 before sysretq.
+    cmp byte [rel g_exec_requested], 0
+    je  .sysret_normal
+    mov byte [rel g_exec_requested], 0
+    mov rcx, [rel g_exec_entry]
+    mov r11, 0x202              ; RFLAGS: IF=1 + reserved bit
+    mov rsp, [rel g_exec_rsp]
+    mov rax, [rel g_exec_pml4]
+    mov cr3, rax
+
+.sysret_normal:
+    ; 10. Disable interrupts before sysretq (mandatory).
     cli
 
-    ; 10. Return to user space.
+    ; 11. Return to user space.
     ;     o64 sysret = sysretq: RIP←rcx, RFLAGS←r11, CS←USER_CS, SS←USER_SS
     o64 sysret

@@ -1,4 +1,8 @@
 #include "pic.h"
+#include "idt.h"
+
+extern void spurious_irq7_entry(void);
+extern void spurious_irq15_entry(void);
 
 // Small I/O delay: writing to port 0x80 (POST diagnostic port) is safe on
 // all x86 hardware and gives enough time for old ISA devices to respond.
@@ -26,6 +30,10 @@ void pic_init(uint8_t base_master, uint8_t base_slave) {
     // Mask all IRQ lines.  Callers unmask only what they need.
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
+
+    // Register spurious IRQ handlers so a stray IRQ7/IRQ15 doesn't GP-fault.
+    idt_irq_register(base_master + 7, (uint64_t)spurious_irq7_entry);
+    idt_irq_register(base_slave  + 7, (uint64_t)spurious_irq15_entry);
 }
 
 void pic_eoi(uint8_t irq) {
@@ -44,4 +52,8 @@ void pic_unmask(uint8_t irq) {
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
     uint8_t  bit  = (irq < 8) ? irq : (irq - 8);
     outb(port, inb(port) & (uint8_t)~(1u << bit));
+    // Slave IRQs (8-15) reach the CPU through the cascade on master IRQ2.
+    // Unmask it too, or the slave's output is invisible to the CPU.
+    if (irq >= 8)
+        outb(PIC1_DATA, inb(PIC1_DATA) & ~(1u << 2));
 }

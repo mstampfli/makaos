@@ -52,3 +52,7 @@ void mm_destroy(mm_t* mm);
 
 // Convert VMA flags → PTE flags for vmm_page_map.
 uint64_t mm_vma_pte_flags(uint32_t vma_flags);
+
+// Clone a mm_t: allocate a new mm_t, copy brk_start/brk, copy VMA list.
+// Does NOT copy physical pages (use vmm_clone_user for that).
+mm_t* mm_clone(const mm_t* src);
