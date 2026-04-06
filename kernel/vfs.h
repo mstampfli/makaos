@@ -29,8 +29,9 @@ typedef struct vfs_file_t {
     // May be NULL for non-seekable files (devices, pipes).
     int64_t (*seek )(struct vfs_file_t* self, int64_t offset, int whence);
 
-    void*    ctx;    // driver-specific state (may be NULL for stateless drivers)
-    uint32_t flags;  // VFS_FLAG_* (reserved for future use)
+    void*    ctx;      // driver-specific state (may be NULL for stateless drivers)
+    uint32_t flags;    // open flags (O_APPEND etc.)
+    uint32_t refcount; // reference count; 0 = static object (never freed)
 } vfs_file_t;
 
 // ── Convenience wrappers ──────────────────────────────────────────────────
@@ -44,8 +45,20 @@ static inline int64_t vfs_write(vfs_file_t* f, const void* buf, uint64_t len) {
     return f->write(f, buf, len);
 }
 
+// dup: increment refcount so two fds share one file description.
+// Returns f (same pointer), or NULL if f is NULL.
+static inline vfs_file_t* vfs_dup(vfs_file_t* f) {
+    if (f && f->refcount > 0) f->refcount++;
+    return f;
+}
+
+// close: decrement refcount; only call driver close when it reaches 0.
+// Static objects (refcount==0) are never freed.
 static inline void vfs_close(vfs_file_t* f) {
-    if (f && f->close) f->close(f);
+    if (!f) return;
+    if (f->refcount == 0) return;           // static object
+    if (--f->refcount > 0) return;          // still referenced
+    if (f->close) f->close(f);             // last reference: free it
 }
 
 // ── Shared VGA cursor state (defined in vfs.c) ────────────────────────────

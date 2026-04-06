@@ -522,12 +522,13 @@ vfs_file_t* ext2_open(const char* path) {
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(fd); return NULL; }
 
-    f->read  = ext2_vfs_read;
-    f->write = ext2_vfs_write;   // always available; caller enforces O_RDONLY
-    f->seek  = ext2_vfs_seek;
-    f->close = ext2_vfs_close;
-    f->ctx   = fd;
-    f->flags = 0;
+    f->read     = ext2_vfs_read;
+    f->write    = ext2_vfs_write;   // caller enforces O_RDONLY by clearing this
+    f->seek     = ext2_vfs_seek;
+    f->close    = ext2_vfs_close;
+    f->ctx      = fd;
+    f->flags    = 0;
+    f->refcount = 1;
     return f;
 }
 

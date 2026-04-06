@@ -472,6 +472,63 @@ static void test_libc_str(void) {
     check("strrchr first char", strrchr("abc", 'a') != NULL);
 }
 
+// ── dup / dup2 tests ──────────────────────────────────────────────────────
+
+static void test_dup(void) {
+    printf("-- dup / dup2\n");
+
+    // Create a file with known content, open it, dup the fd.
+    int fd = open("/tmp_dup_test", O_CREAT | O_WRONLY);
+    write(fd, "abcde", 5);
+    close(fd);
+
+    fd = open("/tmp_dup_test", O_RDONLY);
+    check("dup: open file", fd >= 0);
+
+    int fd2 = dup(fd);
+    check("dup returns new fd", fd2 >= 0 && fd2 != fd);
+
+    // Both fds share the same offset: reading fd advances fd2's position too.
+    char buf[4] = {0};
+    read(fd, buf, 2);            // read "ab", offset now 2
+    check("dup: read 2 via fd",  buf[0]=='a' && buf[1]=='b');
+
+    buf[0] = buf[1] = 0;
+    read(fd2, buf, 2);           // should continue from offset 2 → "cd"
+    check("dup: fd2 shares offset (reads 'cd')", buf[0]=='c' && buf[1]=='d');
+
+    // Closing fd doesn't break fd2.
+    close(fd);
+    buf[0] = 0;
+    read(fd2, buf, 1);           // should get 'e'
+    check("dup: fd2 still valid after close(fd)", buf[0]=='e');
+    close(fd2);
+
+    // dup of bad fd → EBADF
+    errno = 0;
+    int bad = dup(99);
+    check("dup(bad) == -1",   bad == -1);
+    check("errno == EBADF",   errno == EBADF);
+
+    // dup2: redirect fd to a specific number
+    fd = open("/tmp_dup_test", O_RDONLY);
+    int target = 10;
+    int r = dup2(fd, target);
+    check("dup2 returns target", r == target);
+
+    buf[0] = 0;
+    read(target, buf, 1);
+    check("dup2: read via target fd", buf[0] == 'a');
+
+    // dup2(fd, fd) == fd (no-op)
+    r = dup2(fd, fd);
+    check("dup2(fd,fd) == fd", r == fd);
+
+    close(fd);
+    close(target);
+    unlink("/tmp_dup_test", 13);
+}
+
 // ── Entry ─────────────────────────────────────────────────────────────────
 
 void _start(void) {
@@ -492,6 +549,7 @@ void _start(void) {
     test_lseek();
     test_waitpid_getppid();
     test_libc_str();
+    test_dup();
 
     printf("======================================\n");
     printf("Result: %d / %d passed\n", s_pass, s_run);
