@@ -403,13 +403,15 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (to_copy > remain_file) to_copy = remain_file;
 
         uint32_t blk = inode_get_block(&fd->inode, blk_idx);
-        if (!blk) break;
-
-        static uint8_t rd_buf[1024];
-        if (!read_block(blk, rd_buf)) return -1;
-
-        const uint8_t* src = rd_buf + off_in_blk;
-        for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
+        if (!blk) {
+            // Sparse hole: block not allocated, return zeros.
+            for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = 0;
+        } else {
+            static uint8_t rd_buf[1024];
+            if (!read_block(blk, rd_buf)) return -1;
+            const uint8_t* src = rd_buf + off_in_blk;
+            for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
+        }
 
         total        += to_copy;
         fd->cur_pos  += to_copy;
@@ -1113,8 +1115,87 @@ int ext2_mkdir(const char* path) {
     return 1;
 }
 
-// ── Suppress unused-function warnings for dir_remove_entry ────────────────
-// (It's part of the API but not called from within this file currently;
-//  shell.c could call ext2 internals via a future rm command.)
-static void ext2_unused_suppress(void) __attribute__((unused));
-static void ext2_unused_suppress(void) { (void)dir_remove_entry; (void)free_inode_num; }
+// ── ext2_unlink ───────────────────────────────────────────────────────────
+// Remove a regular file at `path`.  Returns 1 on success, 0 on failure.
+int ext2_unlink(const char* path) {
+    if (!s_mounted || !path) return 0;
+
+    uint32_t ino = path_to_inode(path);
+    if (!ino) return 0;
+
+    ext2_inode_t inode;
+    if (!read_inode(ino, &inode)) return 0;
+
+    // Refuse to unlink directories.
+    if ((inode.i_mode & 0xF000) == EXT2_S_IFDIR) return 0;
+
+    static char ul_parent[256];
+    const char* basename = path_split(path, ul_parent);
+    if (!basename || basename[0] == '\0') return 0;
+
+    uint32_t parent_ino = path_to_inode(ul_parent);
+    if (!parent_ino) return 0;
+
+    // Remove directory entry first.
+    if (!dir_remove_entry(parent_ino, basename)) return 0;
+
+    // Free all data blocks and the inode itself.
+    free_inode_blocks(&inode);
+    inode.i_dtime = 1;
+    inode.i_links_count = 0;
+    write_inode(ino, &inode);
+    free_inode_num(ino);
+
+    return 1;
+}
+
+// ── ext2_rename ───────────────────────────────────────────────────────────
+// Move/rename `src` to `dst`.  Returns 1 on success, 0 on failure.
+// If `dst` already exists as a regular file it is removed first.
+int ext2_rename(const char* src, const char* dst) {
+    if (!s_mounted || !src || !dst) return 0;
+
+    uint32_t src_ino = path_to_inode(src);
+    if (!src_ino) return 0;
+
+    ext2_inode_t src_inode;
+    if (!read_inode(src_ino, &src_inode)) return 0;
+
+    uint8_t is_dir = ((src_inode.i_mode & 0xF000) == EXT2_S_IFDIR);
+
+    // Resolve src parent/basename.
+    static char rn_src_parent[256];
+    const char* src_base = path_split(src, rn_src_parent);
+    if (!src_base || src_base[0] == '\0') return 0;
+    uint32_t src_parent_ino = path_to_inode(rn_src_parent);
+    if (!src_parent_ino) return 0;
+
+    // Resolve dst parent/basename.
+    static char rn_dst_parent[256];
+    const char* dst_base = path_split(dst, rn_dst_parent);
+    if (!dst_base || dst_base[0] == '\0') return 0;
+    uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
+    if (!dst_parent_ino) return 0;
+
+    // If dst exists as a regular file, unlink it.
+    uint32_t dst_ino = path_to_inode(dst);
+    if (dst_ino) {
+        ext2_inode_t dst_inode;
+        if (!read_inode(dst_ino, &dst_inode)) return 0;
+        if ((dst_inode.i_mode & 0xF000) == EXT2_S_IFDIR) return 0; // refuse dir collision
+        dir_remove_entry(dst_parent_ino, dst_base);
+        free_inode_blocks(&dst_inode);
+        dst_inode.i_links_count = 0;
+        write_inode(dst_ino, &dst_inode);
+        free_inode_num(dst_ino);
+    }
+
+    // Add new directory entry pointing at the same inode.
+    uint8_t ft = is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+    if (!dir_add_entry(dst_parent_ino, dst_base, src_ino, ft)) return 0;
+
+    // Remove old directory entry.
+    dir_remove_entry(src_parent_ino, src_base);
+
+    return 1;
+}
