@@ -141,35 +141,63 @@ static int read_line(char* buf, int max) {
 }
 
 // ── Path resolution helper ────────────────────────────────────────────────
-// Resolve `arg` relative to g_cwd into an absolute path in `out`.
+// Resolve `arg` relative to g_cwd, then normalize away . and .. components.
 static void resolve_path(const char* arg, char* out, uint32_t out_size) {
+    // Build raw (un-normalized) absolute path into out first.
     if (!arg || arg[0] == '\0') {
         kstrcpy(out, g_cwd, out_size);
-        return;
-    }
-
-    if (arg[0] == '/') {
-        // Already absolute.
+    } else if (arg[0] == '/') {
         kstrcpy(out, arg, out_size);
-        return;
+    } else {
+        uint32_t cwdlen = kstrlen(g_cwd);
+        uint32_t pos = 0;
+        for (uint32_t i = 0; i < cwdlen && pos + 1 < out_size; i++)
+            out[pos++] = g_cwd[i];
+        if (pos > 0 && out[pos-1] != '/' && pos + 1 < out_size)
+            out[pos++] = '/';
+        for (uint32_t i = 0; arg[i] && pos + 1 < out_size; i++)
+            out[pos++] = arg[i];
+        out[pos] = '\0';
     }
 
-    // Relative — prepend g_cwd.
-    uint32_t cwdlen = kstrlen(g_cwd);
-    uint32_t pos = 0;
+    // Normalize: split on '/', process . and .. components in-place.
+    // Use a small stack of component start positions.
+    char tmp[256];
+    const char* segs[64];  // pointers into tmp for each component
+    int  nseg = 0;
 
-    // Copy g_cwd.
-    for (uint32_t i = 0; i < cwdlen && pos + 1 < out_size; i++)
-        out[pos++] = g_cwd[i];
+    // Copy to tmp so we can tokenize it.
+    uint32_t tlen = 0;
+    for (; out[tlen] && tlen < 255; tlen++) tmp[tlen] = out[tlen];
+    tmp[tlen] = '\0';
 
-    // Add separator if needed.
-    if (pos > 0 && out[pos - 1] != '/' && pos + 1 < out_size)
-        out[pos++] = '/';
+    char* p = tmp;
+    if (*p == '/') p++;   // skip leading slash
 
-    // Append arg.
-    for (uint32_t i = 0; arg[i] && pos + 1 < out_size; i++)
-        out[pos++] = arg[i];
+    while (*p) {
+        char* start = p;
+        while (*p && *p != '/') p++;
+        if (*p == '/') *p++ = '\0';
 
+        if (start[0] == '\0' || (start[0] == '.' && start[1] == '\0')) {
+            // "." or empty — skip
+        } else if (start[0] == '.' && start[1] == '.' && start[2] == '\0') {
+            // ".." — pop last segment
+            if (nseg > 0) nseg--;
+        } else {
+            if (nseg < 64) segs[nseg++] = start;
+        }
+    }
+
+    // Reconstruct into out.
+    out[0] = '/';
+    uint32_t pos = 1;
+    for (int i = 0; i < nseg; i++) {
+        if (i > 0 && pos + 1 < out_size) out[pos++] = '/';
+        for (uint32_t j = 0; segs[i][j] && pos + 1 < out_size; j++)
+            out[pos++] = segs[i][j];
+    }
+    if (pos == 1) pos = 1;  // root stays "/"
     out[pos] = '\0';
 }
 
@@ -397,6 +425,49 @@ static void cmd_mkdir(int argc, char* argv[]) {
         term_set_color(0x0C);
         term_puts("mkdir: failed: ");
         term_puts(mkdir_path);
+        term_putc('\n');
+        term_set_color(0x0F);
+    }
+}
+
+static void cmd_rm(int argc, char* argv[]) {
+    if (argc < 2) {
+        term_set_color(0x0C);
+        term_puts("Usage: rm <path>\n");
+        term_set_color(0x0F);
+        return;
+    }
+
+    static char rm_path[256];
+    resolve_path(argv[1], rm_path, sizeof(rm_path));
+
+    if (!ext2_unlink(rm_path)) {
+        term_set_color(0x0C);
+        term_puts("rm: failed: ");
+        term_puts(rm_path);
+        term_putc('\n');
+        term_set_color(0x0F);
+    }
+}
+
+static void cmd_mv(int argc, char* argv[]) {
+    if (argc < 3) {
+        term_set_color(0x0C);
+        term_puts("Usage: mv <src> <dst>\n");
+        term_set_color(0x0F);
+        return;
+    }
+
+    static char mv_src[256], mv_dst[256];
+    resolve_path(argv[1], mv_src, sizeof(mv_src));
+    resolve_path(argv[2], mv_dst, sizeof(mv_dst));
+
+    if (!ext2_rename(mv_src, mv_dst)) {
+        term_set_color(0x0C);
+        term_puts("mv: failed: ");
+        term_puts(mv_src);
+        term_puts(" -> ");
+        term_puts(mv_dst);
         term_putc('\n');
         term_set_color(0x0F);
     }
@@ -642,6 +713,13 @@ void shell_fn(void) {
         else if (kstrcmp(argv[0], "edit")   == 0) cmd_edit(argc, argv);
         else if (kstrcmp(argv[0], "cd")     == 0) cmd_cd(argc, argv);
         else if (kstrcmp(argv[0], "mkdir")  == 0) cmd_mkdir(argc, argv);
+        else if (kstrcmp(argv[0], "rm")     == 0) cmd_rm(argc, argv);
+        else if (kstrcmp(argv[0], "mv")     == 0) cmd_mv(argc, argv);
+        else if (kstrcmp(argv[0], "hello")  == 0) {
+            extern void hello_embedded_fn(void);
+            task_t* t = task_create_kthread(hello_embedded_fn, pid_alloc());
+            if (t) { uint32_t p = t->pid; sched_add(t); sched_wait_pid(p); }
+        }
         else if (kstrcmp(argv[0], "about")  == 0) cmd_about();
         else if (kstrcmp(argv[0], "ps")     == 0) cmd_ps();
         else if (kstrcmp(argv[0], "reboot") == 0) cmd_reboot();

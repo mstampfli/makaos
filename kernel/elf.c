@@ -158,6 +158,8 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    t->cwd[0] = '/';
+    t->cwd[1] = '\0';
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
