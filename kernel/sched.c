@@ -23,6 +23,10 @@ task_t* g_current = NULL;
 static task_t* s_heads[MLFQ_LEVELS];
 static task_t* s_tails[MLFQ_LEVELS];
 
+// Singly-linked list of sleeping tasks (state == TASK_SLEEPING).
+// Uses task_t::next as the link field.
+static task_t* s_sleep_head = NULL;
+
 // Idle process — never put on a queue, runs when all queues are empty.
 static uint8_t      s_idle_stack[PAGE_SIZE];
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
@@ -188,6 +192,9 @@ void sched_sleep(void) {
         g_current->state = TASK_SLEEPING;
         // Refresh quantum so the task gets a full slice when woken.
         g_current->mlfq_ticks_left = s_quanta[g_current->mlfq_level];
+        // Add to sleeping list so sched_for_each can still find it.
+        g_current->next = s_sleep_head;
+        s_sleep_head = g_current;
     }
     s_reschedule = 0;
     do_switch(0);
@@ -196,6 +203,11 @@ void sched_sleep(void) {
 void sched_wake(task_t* proc) {
     if (!proc) return;
     if (proc->state != TASK_SLEEPING) return;
+    // Remove from sleeping list.
+    task_t** pp = &s_sleep_head;
+    while (*pp && *pp != proc) pp = &(*pp)->next;
+    if (*pp) *pp = proc->next;
+    proc->next = NULL;
     enqueue(proc);
 }
 
@@ -227,6 +239,12 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
             cb(t, data);
             t = t->next;
         }
+    }
+    // Also walk sleeping tasks so sched_wait_pid doesn't miss them.
+    task_t* t = s_sleep_head;
+    while (t) {
+        cb(t, data);
+        t = t->next;
     }
 }
 

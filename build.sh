@@ -69,10 +69,33 @@ USER_CFLAGS=(
 )
 
 nasm -f elf64 "$USER_DIR/entry.asm" -o "$BUILD_DIR/user_entry.o"
+gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/libc.c" -o "$BUILD_DIR/user_libc.o"
+
 gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_test_vmalloc.o" \
+ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_test_vmalloc.o" \
    -o "$BUILD_DIR/user_test_vmalloc.elf"
 objcopy -O binary "$BUILD_DIR/user_test_vmalloc.elf" "$BUILD_DIR/user_test_vmalloc.bin"
+
+gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/hello.c" -o "$BUILD_DIR/user_hello.o"
+ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_hello.o" \
+   -o "$BUILD_DIR/user_hello.elf"
+objcopy -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
+
+gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
+ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_helloraw.o" \
+   -o "$BUILD_DIR/user_helloraw.elf"
+objcopy -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
+
+# Embed hello binary as a kernel-side byte array.
+BIN_HELLO="$BUILD_DIR/user_hello.bin"
+SZ_HELLO=$(stat -c "%s" "$BIN_HELLO")
+{
+  echo "#pragma once"
+  echo "static const unsigned char g_user_hello[] = {"
+  xxd -i < "$BIN_HELLO"
+  echo "};"
+  echo "static const unsigned int g_user_hello_size = ${SZ_HELLO}U;"
+} > "$BUILD_DIR/user_hello.h"
 
 # Generate a C header that embeds the binary as a byte array.
 BIN="$BUILD_DIR/user_test_vmalloc.bin"
@@ -172,6 +195,12 @@ DEBUGFS_EOF
 # Copy user binaries to /bin if they exist.
 if [ -f "$BUILD_DIR/user_test_vmalloc.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_vmalloc.elf bin/vmalloc" > /dev/null 2>&1 || true
+fi
+if [ -f "$BUILD_DIR/user_hello.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_hello.elf bin/hello" > /dev/null 2>&1 || true
+fi
+if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_helloraw.elf bin/helloraw" > /dev/null 2>&1 || true
 fi
 
 # Copy any files from build/fs/ into root.
