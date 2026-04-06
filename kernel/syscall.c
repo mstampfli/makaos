@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include "errno.h"
+#include "pipe.h"
 #include "common.h"
 #include "sched.h"
 #include "signal.h"
@@ -32,6 +33,14 @@ uint8_t     g_exec_requested = 0;
 uint64_t    g_exec_entry     = 0;
 uint64_t    g_exec_rsp       = 0;
 phys_addr_t g_exec_pml4      = 0;
+
+// Signal delivery globals (read by syscall_entry.asm before sysretq).
+// g_signal_deliver: 1 = entering user handler, 2 = sigreturn restore.
+uint8_t  g_signal_deliver    = 0;
+uint64_t g_signal_rdi        = 0;  // signum passed to handler (rdi)
+// Set to 1 while syscall_dispatch is calling signal_deliver_pending so that
+// signal_deliver_pending knows it's safe to set up user-space signal frames.
+uint8_t  g_signal_in_syscall = 0;
 
 // ── MSR helpers ───────────────────────────────────────────────────────────
 #define MSR_EFER    0xC0000080
@@ -67,7 +76,8 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (!f) return (uint64_t)-EBADF;
     if (!f->write) return (uint64_t)-EBADF;
     int64_t r = vfs_write(f, (const void*)buf, len);
-    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+    if (r < 0) return (uint64_t)r; // propagate errno from driver (e.g. -EPIPE)
+    return (uint64_t)r;
 }
 
 // ── sys_read ──────────────────────────────────────────────────────────────
@@ -743,6 +753,36 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     return (uint64_t)newfd;
 }
 
+// ── sys_pipe ──────────────────────────────────────────────────────────────
+// pipe(fds_ptr): fills fds[0]=read, fds[1]=write. Returns 0 or -errno.
+static uint64_t sys_pipe(uint64_t fds_ptr) {
+    if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
+    int* fds = (int*)(uintptr_t)fds_ptr;
+
+    vfs_file_t* r;
+    vfs_file_t* w;
+    int err = pipe_create(&r, &w);
+    if (err) return (uint64_t)(int64_t)err;
+
+    // Allocate two fds.
+    int rfd = -1, wfd = -1;
+    for (uint32_t fd = 0; ; fd++) {
+        if (fd >= g_current->files_shared->fd_capacity)
+            if (!fd_table_grow(g_current->files_shared)) goto fail;
+        if (!g_current->files_shared->fd_table[fd]) {
+            if (rfd < 0) { rfd = (int)fd; g_current->files_shared->fd_table[fd] = r; }
+            else         { wfd = (int)fd; g_current->files_shared->fd_table[fd] = w; break; }
+        }
+    }
+    fds[0] = rfd;
+    fds[1] = wfd;
+    return 0;
+fail:
+    vfs_close(r);
+    vfs_close(w);
+    return (uint64_t)-ENFILE;
+}
+
 // ── sys_lseek ─────────────────────────────────────────────────────────────
 // lseek(fd, offset, whence) → new file offset, or -errno
 static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
@@ -754,6 +794,78 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
     int64_t r = f->seek(f, (int64_t)offset, (int)(int64_t)whence);
     if (r < 0) return (uint64_t)-EINVAL;
     return (uint64_t)r;
+}
+
+// ── sys_sigaction ─────────────────────────────────────────────────────────
+// sigaction(sig, act_ptr, oldact_ptr)
+// act_ptr / oldact_ptr point to a user-space struct matching k_sigaction_t.
+static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
+    if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
+    if (sig == SIGKILL || sig == SIGSEGV) return (uint64_t)-EINVAL;
+
+    k_sigaction_t* ka = &g_current->sigstate.handlers[sig];
+
+    if (oldact_ptr) {
+        k_sigaction_t* old = (k_sigaction_t*)oldact_ptr;
+        old->sa_handler  = ka->sa_handler;
+        old->sa_restorer = ka->sa_restorer;
+        old->sa_mask     = ka->sa_mask;
+        old->sa_flags    = ka->sa_flags;
+    }
+    if (act_ptr) {
+        k_sigaction_t* act = (k_sigaction_t*)act_ptr;
+        ka->sa_handler  = act->sa_handler;
+        ka->sa_restorer = act->sa_restorer;
+        ka->sa_mask     = act->sa_mask;
+        ka->sa_flags    = act->sa_flags;
+    }
+    return 0;
+}
+
+// ── sys_sigprocmask ───────────────────────────────────────────────────────
+// sigprocmask(how, set_ptr, oldset_ptr)
+// set_ptr / oldset_ptr point to uint32_t signal masks.
+static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_ptr) {
+    uint32_t* blocked = &g_current->sigstate.blocked;
+    if (oldset_ptr) *(uint32_t*)oldset_ptr = *blocked;
+    if (set_ptr) {
+        uint32_t set = *(uint32_t*)set_ptr;
+        set &= ~(1u << (SIGKILL - 1));  // SIGKILL can never be blocked
+        if (how == SIG_BLOCK)        *blocked |= set;
+        else if (how == SIG_UNBLOCK) *blocked &= ~set;
+        else if (how == SIG_SETMASK) *blocked = set;
+        else return (uint64_t)-EINVAL;
+    }
+    return 0;
+}
+
+// ── sys_sigreturn ─────────────────────────────────────────────────────────
+// Called by the restorer trampoline after a signal handler returns.
+// Restores the interrupted user context from the sigframe saved on the stack.
+static uint64_t sys_sigreturn(void) {
+    uint64_t frame_base = g_current->sigstate.sigframe_rsp;
+    if (!frame_base) return (uint64_t)-EINVAL;
+
+    sigframe_t* frame = (sigframe_t*)frame_base;
+
+    // Restore user register context via the globals that syscall_entry.asm reads.
+    g_syscall_user_rip    = frame->rip;
+    g_syscall_user_rsp    = frame->rsp;
+    g_syscall_user_rflags = frame->rflags;
+    g_syscall_user_rbp    = frame->rbp;
+    g_syscall_user_rbx    = frame->rbx;
+    g_syscall_user_r12    = frame->r12;
+    g_syscall_user_r13    = frame->r13;
+    g_syscall_user_r14    = frame->r14;
+    g_syscall_user_r15    = frame->r15;
+
+    // Restore the signal mask that was active before the handler ran.
+    g_current->sigstate.blocked = frame->blocked;
+    g_current->sigstate.sigframe_rsp = 0;
+
+    // Ask syscall_entry.asm to override rcx/r11/rsp/rbp/rbx/r12-r15 before sysretq.
+    g_signal_deliver = 2;
+    return 0;
 }
 
 // ── serial helper (debug only) ────────────────────────────────────────────
@@ -802,11 +914,18 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_CHDIR:   ret = sys_chdir(arg1, arg2);             break;
         case SYS_MKDIR:   ret = sys_mkdir(arg1, arg2);             break;
         case SYS_LSEEK:   ret = sys_lseek(arg1, arg2, arg3);      break;
-        case SYS_DUP:     ret = sys_dup(arg1);                    break;
-        case SYS_DUP2:    ret = sys_dup2(arg1, arg2);             break;
-        default:           ret = (uint64_t)-ENOSYS;               break;
+        case SYS_DUP:          ret = sys_dup(arg1);                       break;
+        case SYS_DUP2:         ret = sys_dup2(arg1, arg2);                break;
+        case SYS_PIPE:         ret = sys_pipe(arg1);                      break;
+        case SYS_SIGACTION:    ret = sys_sigaction(arg1, arg2, arg3);     break;
+        case SYS_SIGPROCMASK:  ret = sys_sigprocmask(arg1, arg2, arg3);   break;
+        case SYS_SIGRETURN:    ret = sys_sigreturn();                      break;
+        default:               ret = (uint64_t)-ENOSYS;                   break;
     }
-    // Deliver any signals that were queued during or before this syscall.
+    // Deliver any pending signals on the syscall return path.
+    // g_signal_in_syscall=1 tells signal_deliver_pending it may set up user frames.
+    g_signal_in_syscall = 1;
     signal_deliver_pending();
+    g_signal_in_syscall = 0;
     return ret;
 }

@@ -21,6 +21,7 @@
 #define ENOTEMPTY   39
 #define ENOSYS      38
 #define ENOEXEC      8
+#define EPIPE       32
 
 // ── errno global ──────────────────────────────────────────────────────────
 extern int errno;
@@ -74,6 +75,35 @@ typedef int64_t            ssize_t;
 
 #define SYS_READ_NONBLOCK 1
 
+// ── Signal numbers ────────────────────────────────────────────────────────
+#define SIGHUP    1
+#define SIGINT    2
+#define SIGQUIT   3
+#define SIGILL    4
+#define SIGABRT   6
+#define SIGBUS    7
+#define SIGFPE    8
+#define SIGKILL   9
+#define SIGUSR1   10
+#define SIGSEGV   11
+#define SIGUSR2   12
+#define SIGPIPE   13
+#define SIGALRM   14
+#define SIGTERM   15
+#define SIGCHLD   17
+
+// ── Signal action constants ───────────────────────────────────────────────
+#define SIG_DFL  ((void(*)(int))0)
+#define SIG_IGN  ((void(*)(int))1)
+
+// ── sigprocmask how values ────────────────────────────────────────────────
+#define SIG_BLOCK    0
+#define SIG_UNBLOCK  1
+#define SIG_SETMASK  2
+
+// ── sigaction flags ───────────────────────────────────────────────────────
+#define SA_RESTORER  0x04000000
+
 // ── Structures ────────────────────────────────────────────────────────────
 
 typedef struct {
@@ -82,6 +112,14 @@ typedef struct {
     uint32_t size;
     uint8_t  is_dir;
 } dirent_t;
+
+// Must match k_sigaction_t in kernel/signal.h exactly.
+typedef struct {
+    void     (*sa_handler)(int);
+    void     (*sa_restorer)(void);
+    uint32_t  sa_mask;
+    uint32_t  sa_flags;
+} struct_sigaction;
 
 typedef struct {
     uint32_t ino;
@@ -219,12 +257,38 @@ static inline uint64_t clock_ns(void) {
     return syscall0(SYS_CLOCK_NS);  // never fails
 }
 
+static inline int pipe(int fds[2]) {
+    return (int)__syscall_ret(syscall1(SYS_PIPE, (uint64_t)fds));
+}
+
 static inline int dup(int oldfd) {
     return (int)__syscall_ret(syscall1(SYS_DUP, (uint64_t)oldfd));
 }
 
 static inline int dup2(int oldfd, int newfd) {
     return (int)__syscall_ret(syscall2(SYS_DUP2, (uint64_t)oldfd, (uint64_t)newfd));
+}
+
+// ── Signals ───────────────────────────────────────────────────────────────
+
+// Restorer trampoline: signal handler executes `ret` into this, which calls
+// SYS_SIGRETURN to restore the interrupted context.  Must be non-static so
+// its address is stable and can be passed as sa_restorer.
+void __sigreturn_trampoline(void);
+
+static inline int sigaction(int sig, const struct_sigaction* act,
+                            struct_sigaction* oldact) {
+    return (int)__syscall_ret(syscall3(SYS_SIGACTION,
+                                       (uint64_t)(uint32_t)sig,
+                                       (uint64_t)act,
+                                       (uint64_t)oldact));
+}
+
+static inline int sigprocmask(int how, const uint32_t* set, uint32_t* oldset) {
+    return (int)__syscall_ret(syscall3(SYS_SIGPROCMASK,
+                                       (uint64_t)(uint32_t)how,
+                                       (uint64_t)set,
+                                       (uint64_t)oldset));
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────

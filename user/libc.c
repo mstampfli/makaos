@@ -4,6 +4,15 @@
 // Global error number — set by syscall wrappers on failure.
 int errno = 0;
 
+// ── Signal restorer trampoline ────────────────────────────────────────────
+// Called (via `ret`) when a signal handler returns.
+// Invokes SYS_SIGRETURN (28) to restore the interrupted user context.
+// Must be a real (non-inline) function so its address is stable.
+__attribute__((noreturn)) void __sigreturn_trampoline(void) {
+    syscall0(SYS_SIGRETURN);
+    for (;;);
+}
+
 // ── String functions ──────────────────────────────────────────────────────
 
 size_t strlen(const char* s) {

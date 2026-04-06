@@ -24,3 +24,4 @@
 #define ENOTEMPTY   39   // Directory not empty
 #define ENOSYS      38   // Function not implemented
 #define ENOEXEC      8   // Exec format error
+#define EPIPE       32   // Broken pipe

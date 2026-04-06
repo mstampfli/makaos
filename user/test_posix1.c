@@ -529,6 +529,191 @@ static void test_dup(void) {
     unlink("/tmp_dup_test", 13);
 }
 
+// ── pipe() tests ──────────────────────────────────────────────────────────
+
+static void test_pipe(void) {
+    printf("-- pipe\n");
+
+    int fds[2];
+    int r = pipe(fds);
+    check("pipe() == 0", r == 0);
+    check("pipe read fd >= 0",  fds[0] >= 0);
+    check("pipe write fd >= 0", fds[1] >= 0);
+    check("pipe fds differ",    fds[0] != fds[1]);
+
+    // Write then read within same process (non-blocking since buffer has space)
+    ssize_t n = write(fds[1], "hello", 5);
+    check("pipe write 5", n == 5);
+
+    char buf[8] = {0};
+    n = read(fds[0], buf, 5);
+    check("pipe read 5",    n == 5);
+    check("pipe content",   strncmp(buf, "hello", 5) == 0);
+
+    // pipe across fork: parent writes, child reads
+    write(fds[1], "world", 5);
+    int child = fork();
+    if (child == 0) {
+        close(fds[1]);           // child doesn't write
+        char b[8] = {0};
+        ssize_t got = read(fds[0], b, 5);
+        // exit with 0 if content correct, 1 otherwise
+        _exit((got == 5 && strncmp(b, "world", 5) == 0) ? 0 : 1);
+    }
+    close(fds[1]);  // parent closes write end so child sees EOF
+    int status = 0;
+    waitpid(child, &status, 0);
+    check("pipe fork child read 'world'", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(fds[0]);
+
+    // EOF: read returns 0 when write end closed
+    pipe(fds);
+    close(fds[1]);  // close write end immediately
+    n = read(fds[0], buf, 1);
+    check("pipe EOF when writer closed", n == 0);
+    close(fds[0]);
+
+    // EPIPE: write returns error when read end closed
+    pipe(fds);
+    close(fds[0]);  // close read end
+    errno = 0;
+    n = write(fds[1], "x", 1);
+    check("pipe write with reader closed == -1", n == -1);
+    check("errno == EPIPE", errno == EPIPE);
+    close(fds[1]);
+}
+
+// ── test_sigaction ────────────────────────────────────────────────────────
+
+static volatile int g_sig_received = 0;
+static volatile int g_sig_number   = 0;
+
+static void sig_handler(int sig) {
+    g_sig_received = 1;
+    g_sig_number   = sig;
+}
+
+static void test_sigaction(void) {
+    printf("-- sigaction\n");
+
+    // Install handler for SIGUSR1.
+    struct_sigaction act;
+    act.sa_handler  = sig_handler;
+    act.sa_restorer = __sigreturn_trampoline;
+    act.sa_mask     = 0;
+    act.sa_flags    = SA_RESTORER;
+    int r = sigaction(SIGUSR1, &act, NULL);
+    check("sigaction(SIGUSR1) == 0", r == 0);
+
+    // Send SIGUSR1 to self — delivered on next syscall return.
+    g_sig_received = 0;
+    g_sig_number   = 0;
+    kill(getpid(), SIGUSR1);
+    // A syscall boundary is needed for the kernel to deliver the signal.
+    // getpid() is the lightest available syscall.
+    getpid();
+    check("handler called",         g_sig_received == 1);
+    check("handler got SIGUSR1",    g_sig_number   == SIGUSR1);
+
+    // Restore default.
+    struct_sigaction dfl;
+    dfl.sa_handler  = SIG_DFL;
+    dfl.sa_restorer = __sigreturn_trampoline;
+    dfl.sa_mask     = 0;
+    dfl.sa_flags    = SA_RESTORER;
+    r = sigaction(SIGUSR1, &dfl, NULL);
+    check("sigaction(SIG_DFL) == 0", r == 0);
+
+    // Install SIG_IGN for SIGUSR2 and verify signal is swallowed.
+    struct_sigaction ign;
+    ign.sa_handler  = SIG_IGN;
+    ign.sa_restorer = __sigreturn_trampoline;
+    ign.sa_mask     = 0;
+    ign.sa_flags    = SA_RESTORER;
+    sigaction(SIGUSR2, &ign, NULL);
+    g_sig_received = 0;
+    kill(getpid(), SIGUSR2);
+    getpid();
+    check("SIG_IGN: handler not called", g_sig_received == 0);
+
+    // Restore SIGUSR2 to default.
+    sigaction(SIGUSR2, &dfl, NULL);
+
+    // getoldact: sigaction with NULL new act returns old handler.
+    sigaction(SIGUSR1, &act, NULL);     // install handler
+    struct_sigaction old;
+    sigaction(SIGUSR1, NULL, &old);     // query it
+    check("getoldact: handler correct",  old.sa_handler == sig_handler);
+    check("getoldact: restorer correct", old.sa_restorer == __sigreturn_trampoline);
+    sigaction(SIGUSR1, &dfl, NULL);     // restore default
+
+    // Handler re-entry: two signals in a row, both delivered.
+    sigaction(SIGUSR1, &act, NULL);
+    g_sig_received = 0;
+    kill(getpid(), SIGUSR1);
+    getpid();
+    int first = g_sig_received;
+    g_sig_received = 0;
+    kill(getpid(), SIGUSR1);
+    getpid();
+    int second = g_sig_received;
+    check("two consecutive signals delivered", first == 1 && second == 1);
+    sigaction(SIGUSR1, &dfl, NULL);
+}
+
+// ── test_sigprocmask ──────────────────────────────────────────────────────
+
+static void test_sigprocmask(void) {
+    printf("-- sigprocmask\n");
+
+    struct_sigaction act;
+    act.sa_handler  = sig_handler;
+    act.sa_restorer = __sigreturn_trampoline;
+    act.sa_mask     = 0;
+    act.sa_flags    = SA_RESTORER;
+    sigaction(SIGUSR1, &act, NULL);
+
+    // Block SIGUSR1, send it, verify not delivered yet.
+    uint32_t mask = (uint32_t)(1u << (SIGUSR1 - 1));
+    uint32_t old  = 0;
+    int r = sigprocmask(SIG_BLOCK, &mask, &old);
+    check("sigprocmask SIG_BLOCK == 0", r == 0);
+    check("old mask was 0",             old == 0);
+
+    g_sig_received = 0;
+    kill(getpid(), SIGUSR1);
+    getpid();
+    check("blocked: not delivered yet", g_sig_received == 0);
+
+    // Unblock — the pending signal should fire immediately.
+    r = sigprocmask(SIG_UNBLOCK, &mask, NULL);
+    check("sigprocmask SIG_UNBLOCK == 0", r == 0);
+    getpid();   // trigger delivery
+    check("unblocked: now delivered", g_sig_received == 1);
+
+    // SIG_SETMASK: set mask to SIGUSR1, verify, then clear.
+    r = sigprocmask(SIG_SETMASK, &mask, &old);
+    check("SIG_SETMASK == 0", r == 0);
+    uint32_t cur = 0;
+    sigprocmask(SIG_BLOCK, NULL, &cur);   // query current
+    // After SIG_SETMASK, current mask should have SIGUSR1 bit set.
+    // But passing NULL as set should be a no-op — just query.
+    // Actually our kernel treats set_ptr=0 as "no change", so:
+    check("SIG_SETMASK applied", (cur & mask) != 0);
+
+    // Clear mask so remaining tests are not affected.
+    uint32_t zero = 0;
+    sigprocmask(SIG_SETMASK, &zero, NULL);
+
+    // Restore default action.
+    struct_sigaction dfl;
+    dfl.sa_handler  = SIG_DFL;
+    dfl.sa_restorer = __sigreturn_trampoline;
+    dfl.sa_mask     = 0;
+    dfl.sa_flags    = SA_RESTORER;
+    sigaction(SIGUSR1, &dfl, NULL);
+}
+
 // ── Entry ─────────────────────────────────────────────────────────────────
 
 void _start(void) {
@@ -550,6 +735,9 @@ void _start(void) {
     test_waitpid_getppid();
     test_libc_str();
     test_dup();
+    test_pipe();
+    test_sigaction();
+    test_sigprocmask();
 
     printf("======================================\n");
     printf("Result: %d / %d passed\n", s_pass, s_run);
