@@ -701,6 +701,48 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     return ext2_mkdir(path) ? 0 : (uint64_t)-EIO;
 }
 
+// ── sys_dup ───────────────────────────────────────────────────────────────
+// dup(oldfd) → new fd sharing the same file description, or -errno.
+static uint64_t sys_dup(uint64_t oldfd) {
+    if (!g_current || oldfd >= g_current->files_shared->fd_capacity)
+        return (uint64_t)-EBADF;
+    vfs_file_t* f = g_current->files_shared->fd_table[oldfd];
+    if (!f) return (uint64_t)-EBADF;
+
+    // Find lowest free fd.
+    for (uint32_t fd = 0; ; fd++) {
+        if (fd >= g_current->files_shared->fd_capacity) {
+            if (!fd_table_grow(g_current->files_shared)) return (uint64_t)-ENFILE;
+        }
+        if (!g_current->files_shared->fd_table[fd]) {
+            g_current->files_shared->fd_table[fd] = vfs_dup(f);
+            return (uint64_t)fd;
+        }
+    }
+}
+
+// ── sys_dup2 ──────────────────────────────────────────────────────────────
+// dup2(oldfd, newfd) → newfd sharing oldfd's file description, or -errno.
+// If newfd == oldfd, returns newfd unchanged. Closes newfd if already open.
+static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
+    if (!g_current) return (uint64_t)-EBADF;
+    if (oldfd >= g_current->files_shared->fd_capacity) return (uint64_t)-EBADF;
+    vfs_file_t* f = g_current->files_shared->fd_table[oldfd];
+    if (!f) return (uint64_t)-EBADF;
+    if (oldfd == newfd) return (uint64_t)newfd;
+
+    // Grow fd table if needed.
+    while (newfd >= g_current->files_shared->fd_capacity)
+        if (!fd_table_grow(g_current->files_shared)) return (uint64_t)-ENFILE;
+
+    // Close whatever is currently at newfd.
+    vfs_file_t* old = g_current->files_shared->fd_table[newfd];
+    if (old) vfs_close(old);
+
+    g_current->files_shared->fd_table[newfd] = vfs_dup(f);
+    return (uint64_t)newfd;
+}
+
 // ── sys_lseek ─────────────────────────────────────────────────────────────
 // lseek(fd, offset, whence) → new file offset, or -errno
 static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
@@ -760,6 +802,8 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_CHDIR:   ret = sys_chdir(arg1, arg2);             break;
         case SYS_MKDIR:   ret = sys_mkdir(arg1, arg2);             break;
         case SYS_LSEEK:   ret = sys_lseek(arg1, arg2, arg3);      break;
+        case SYS_DUP:     ret = sys_dup(arg1);                    break;
+        case SYS_DUP2:    ret = sys_dup2(arg1, arg2);             break;
         default:           ret = (uint64_t)-ENOSYS;               break;
     }
     // Deliver any signals that were queued during or before this syscall.

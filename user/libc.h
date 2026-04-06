@@ -219,6 +219,14 @@ static inline uint64_t clock_ns(void) {
     return syscall0(SYS_CLOCK_NS);  // never fails
 }
 
+static inline int dup(int oldfd) {
+    return (int)__syscall_ret(syscall1(SYS_DUP, (uint64_t)oldfd));
+}
+
+static inline int dup2(int oldfd, int newfd) {
+    return (int)__syscall_ret(syscall2(SYS_DUP2, (uint64_t)oldfd, (uint64_t)newfd));
+}
+
 // ── Filesystem ───────────────────────────────────────────────────────────
 
 static inline int stat(const char* path, size_t pathlen, stat_t* st) {
