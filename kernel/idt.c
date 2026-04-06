@@ -108,8 +108,25 @@ static void user_signal_or_halt_noec(interrupt_frame_t* f, int sig, const char* 
     isr_general_exception_no_ec(msg, f);
 }
 
+static void idc_ser_c(char c) { while (!(inb(0x3F8+5)&0x20)); outb(0x3F8,(uint8_t)c); }
+static void idc_ser_hex(uint64_t v) {
+    const char* h="0123456789ABCDEF";
+    idc_ser_c('0'); idc_ser_c('x');
+    for(int i=0;i<16;i++) idc_ser_c(h[(v>>(60-i*4))&0xF]);
+}
+static void ser_dbg_ec(const char* tag, interrupt_frame_t* f, uint64_t ec) {
+    for(const char*p=tag;*p;p++) idc_ser_c(*p);
+    idc_ser_c(' '); idc_ser_c('e'); idc_ser_c('c'); idc_ser_c('=');
+    idc_ser_hex(ec);
+    idc_ser_c(' '); idc_ser_c('R'); idc_ser_c('I'); idc_ser_c('P'); idc_ser_c('=');
+    idc_ser_hex(f->ip);
+    idc_ser_c(' '); idc_ser_c('R'); idc_ser_c('S'); idc_ser_c('P'); idc_ser_c('=');
+    idc_ser_hex(f->sp); idc_ser_c('\n');
+}
+
 static void user_signal_or_halt_ec(interrupt_frame_t* f, uint64_t ec, int sig, const char* msg) {
     if (from_user(f)) {
+        ser_dbg_ec(msg, f, ec);
         signal_send(g_current, sig);
         signal_deliver_pending();
         return;
