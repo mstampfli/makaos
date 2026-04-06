@@ -137,6 +137,14 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max);
 // Returns 1 on success, 0 on failure.
 int ext2_write_file(const char* path, const uint8_t* data, uint32_t size);
 
+// Create an empty file at `path`.  Fails if the file already exists.
+// Returns 1 on success, 0 on failure (including EEXIST).
+int ext2_create(const char* path);
+
+// Truncate the file at `path` to zero bytes.
+// Returns 1 on success, 0 on failure.
+int ext2_truncate(const char* path);
+
 // Create a directory at `path` (parent must exist).
 // Returns 1 on success, 0 on failure.
 int ext2_mkdir(const char* path);

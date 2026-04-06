@@ -420,6 +420,19 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)total;
 }
 
+static int64_t ext2_vfs_seek(vfs_file_t* self, int64_t offset, int whence) {
+    ext2_fd_t* fd = (ext2_fd_t*)self->ctx;
+    if (!fd) return -1;
+    int64_t new_pos;
+    if (whence == 0 /*SEEK_SET*/) new_pos = offset;
+    else if (whence == 1 /*SEEK_CUR*/) new_pos = (int64_t)fd->cur_pos + offset;
+    else if (whence == 2 /*SEEK_END*/) new_pos = (int64_t)fd->file_size + offset;
+    else return -1;
+    if (new_pos < 0) return -1;
+    fd->cur_pos = (uint32_t)new_pos;
+    return new_pos;
+}
+
 static void ext2_vfs_close(vfs_file_t* self) {
     if (self->ctx) kfree(self->ctx);
     kfree(self);
@@ -455,6 +468,7 @@ vfs_file_t* ext2_open(const char* path) {
 
     f->read  = ext2_vfs_read;
     f->write = NULL;
+    f->seek  = ext2_vfs_seek;
     f->close = ext2_vfs_close;
     f->ctx   = fd;
     f->flags = 0;
@@ -1026,6 +1040,29 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     }
 
     return 1;
+}
+
+// ── ext2_create ───────────────────────────────────────────────────────────
+// Create an empty file.  Returns 0 if the file already exists.
+int ext2_create(const char* path) {
+    if (!s_mounted) return 0;
+    static char parent_path[256];
+    const char* basename = path_split(path, parent_path);
+    if (!basename || basename[0] == '\0') return 0;
+    uint32_t parent_ino = path_to_inode(parent_path);
+    if (!parent_ino) return 0;
+    ext2_inode_t parent_inode;
+    if (!read_inode(parent_ino, &parent_inode)) return 0;
+    // Fail if already exists.
+    if (dir_lookup(&parent_inode, basename, str_len(basename))) return 0;
+    // Create empty file via ext2_write_file.
+    return ext2_write_file(path, (const uint8_t*)"", 0);
+}
+
+// ── ext2_truncate ─────────────────────────────────────────────────────────
+// Truncate file to zero bytes.
+int ext2_truncate(const char* path) {
+    return ext2_write_file(path, (const uint8_t*)"", 0);
 }
 
 // ── ext2_mkdir ────────────────────────────────────────────────────────────
