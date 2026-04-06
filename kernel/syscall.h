@@ -5,7 +5,7 @@
 #define SYS_WRITE   0   // write(fd, buf, len)        → bytes written
 #define SYS_EXIT    1   // exit(code)                  → does not return
 #define SYS_READ    2   // read(fd, buf, len, flags)   → bytes read
-#define SYS_OPEN    3   // open(path_ptr, pathlen)     → fd, or -1 on error
+#define SYS_OPEN    3   // open(path_ptr, flags, mode)  → fd, or -errno on error
 #define SYS_CLOSE   4   // close(fd)                   → 0 or -1
 #define SYS_BRK     5   // brk(new_brk)               → new brk, or -1 on error
 #define SYS_KILL    6   // kill(pid, sig)              → 0 or -1
@@ -23,6 +23,7 @@
 #define SYS_GETCWD  18  // getcwd(buf_ptr, buflen)     → 0 or -1
 #define SYS_CHDIR   19  // chdir(path_ptr, pathlen)    → 0 or -1
 #define SYS_MKDIR   20  // mkdir(path_ptr, pathlen)    → 0 or -1
+#define SYS_LSEEK   21  // lseek(fd, offset, whence)   → new offset or -errno
 
 // ── stat_t (for SYS_STAT) ─────────────────────────────────────────────────
 typedef struct {

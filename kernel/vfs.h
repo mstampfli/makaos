@@ -13,6 +13,11 @@
 //   - vfs_close frees whatever the driver allocated for its context.
 //   - NULL function pointers mean "not supported" → returns -1.
 
+// lseek whence values (POSIX)
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
 typedef struct vfs_file_t {
     // Read up to `len` bytes into `buf`.  Returns bytes read, 0 on EOF, -1 on error.
     int64_t (*read )(struct vfs_file_t* self, void*       buf, uint64_t len);
@@ -20,6 +25,9 @@ typedef struct vfs_file_t {
     int64_t (*write)(struct vfs_file_t* self, const void* buf, uint64_t len);
     // Close and free any driver state.  Must not be NULL.
     void    (*close)(struct vfs_file_t* self);
+    // Seek to offset.  Returns new position, or -1 if not seekable.
+    // May be NULL for non-seekable files (devices, pipes).
+    int64_t (*seek )(struct vfs_file_t* self, int64_t offset, int whence);
 
     void*    ctx;    // driver-specific state (may be NULL for stateless drivers)
     uint32_t flags;  // VFS_FLAG_* (reserved for future use)
