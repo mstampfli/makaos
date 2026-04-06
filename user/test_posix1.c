@@ -168,6 +168,155 @@ static void test_wait_status_ptr_null(void) {
     check("wait(pid, NULL) returns pid", wpid == child);
 }
 
+// ── errno tests ───────────────────────────────────────────────────────────
+
+static void test_errno(void) {
+    printf("-- errno\n");
+
+    // open nonexistent file → ENOENT
+    errno = 0;
+    int fd = open("/does/not/exist", O_RDONLY);
+    check("open(nonexist) == -1",   fd == -1);
+    check("errno == ENOENT",        errno == ENOENT);
+
+    // read from bad fd → EBADF
+    errno = 0;
+    ssize_t r = read(99, (void*)0x400000, 1);
+    check("read(badfd) == -1",      r == (ssize_t)-1);
+    check("errno == EBADF (read)",  errno == EBADF);
+
+    // write to bad fd → EBADF
+    errno = 0;
+    r = write(99, "x", 1);
+    check("write(badfd) == -1",     r == (ssize_t)-1);
+    check("errno == EBADF (write)", errno == EBADF);
+
+    // write to read-only fd (stdin) → EBADF (no write handler)
+    errno = 0;
+    r = write(0, "x", 1);
+    check("write(stdin) == -1",     r == (ssize_t)-1);
+    check("errno == EBADF (ro fd)", errno == EBADF);
+
+    // close bad fd → EBADF
+    errno = 0;
+    int rc = close(99);
+    check("close(badfd) == -1",     rc == -1);
+    check("errno == EBADF (close)", errno == EBADF);
+
+    // kill with invalid signal → EINVAL
+    errno = 0;
+    rc = kill(1, 999);
+    check("kill(bad sig) == -1",    rc == -1);
+    check("errno == EINVAL (kill)", errno == EINVAL);
+
+    // lseek on bad fd → EBADF
+    errno = 0;
+    long off = lseek(99, 0, SEEK_SET);
+    check("lseek(badfd) == -1",     off == -1L);
+    check("errno == EBADF (lseek)", errno == EBADF);
+
+    // lseek on non-seekable fd (stdout = VGA) → EINVAL
+    errno = 0;
+    off = lseek(1, 0, SEEK_SET);
+    check("lseek(stdout) == -1",    off == -1L);
+    check("errno == EINVAL (lseek non-seek)", errno == EINVAL);
+
+    // errno is cleared on success: open a real file
+    errno = 99;
+    fd = open("/bin/test_posix1", O_RDONLY);
+    check("open(real) >= 0",        fd >= 0);
+    if (fd >= 0) close(fd);
+    // errno should be unchanged (still 99) — success doesn't touch errno
+    check("errno unchanged on success", errno == 99);
+}
+
+// ── open() flags tests ────────────────────────────────────────────────────
+
+static void test_open_flags(void) {
+    printf("-- open() flags\n");
+
+    // O_RDONLY: open existing file for reading
+    int fd = open("/bin/test_posix1", O_RDONLY);
+    check("O_RDONLY opens existing", fd >= 0);
+    if (fd >= 0) {
+        char buf[4] = {0};
+        ssize_t n = read(fd, buf, 4);
+        check("read after O_RDONLY works", n == 4);
+        close(fd);
+    }
+
+    // O_CREAT: create a new file that doesn't exist
+    fd = open("/tmp_creat_test", O_CREAT | O_WRONLY);
+    check("O_CREAT creates file", fd >= 0);
+    if (fd >= 0) close(fd);
+
+    // Open again without O_CREAT — file now exists, should work
+    fd = open("/tmp_creat_test", O_RDONLY);
+    check("O_RDONLY on just-created file", fd >= 0);
+    if (fd >= 0) close(fd);
+
+    // O_CREAT | O_EXCL on existing file → EEXIST
+    errno = 0;
+    fd = open("/tmp_creat_test", O_CREAT | O_EXCL | O_WRONLY);
+    check("O_CREAT|O_EXCL on existing == -1", fd == -1);
+    check("errno == EEXIST", errno == EEXIST);
+
+    // O_CREAT | O_EXCL on new file → succeeds
+    fd = open("/tmp_excl_test", O_CREAT | O_EXCL | O_WRONLY);
+    check("O_CREAT|O_EXCL on new file >= 0", fd >= 0);
+    if (fd >= 0) close(fd);
+
+    // Cleanup
+    unlink("/tmp_creat_test", 14);
+    unlink("/tmp_excl_test",  14);
+}
+
+// ── lseek tests ───────────────────────────────────────────────────────────
+
+static void test_lseek(void) {
+    printf("-- lseek\n");
+
+    // First write a small known file
+    // Use ext2_write_file via the shell? No — use open+write.
+    // write_file syscall isn't exposed; use spawn. Actually we can write via
+    // a child process. Simpler: use a file we know exists in /bin.
+    // /bin/test_posix1 starts with ELF magic: 0x7F 'E' 'L' 'F'
+
+    int fd = open("/bin/test_posix1", O_RDONLY);
+    check("lseek: open file", fd >= 0);
+    if (fd < 0) return;
+
+    // SEEK_SET to 0: read first 4 bytes (ELF magic)
+    long pos = lseek(fd, 0, SEEK_SET);
+    check("SEEK_SET 0 returns 0", pos == 0);
+
+    char magic[4] = {0};
+    read(fd, magic, 4);
+    check("ELF magic[0] = 0x7F", (unsigned char)magic[0] == 0x7F);
+    check("ELF magic[1] = 'E'",  magic[1] == 'E');
+
+    // SEEK_CUR: we're now at offset 4; advance by 0, get position
+    pos = lseek(fd, 0, SEEK_CUR);
+    check("SEEK_CUR 0 == 4", pos == 4);
+
+    // SEEK_SET to byte 1: re-read, should get 'E'
+    lseek(fd, 1, SEEK_SET);
+    char c = 0;
+    read(fd, &c, 1);
+    check("SEEK_SET 1 reads 'E'", c == 'E');
+
+    // SEEK_CUR with negative offset: go back 1 from current (offset 2)
+    pos = lseek(fd, -1, SEEK_CUR);
+    check("SEEK_CUR -1 from 2 == 1", pos == 1);
+
+    // SEEK_END to -4: last 4 bytes, position = file_size - 4
+    // Just check it doesn't return -1 and returns > 0
+    pos = lseek(fd, -4, SEEK_END);
+    check("SEEK_END -4 > 0", pos > 0);
+
+    close(fd);
+}
+
 // ── Entry ─────────────────────────────────────────────────────────────────
 
 void _start(void) {
@@ -182,6 +331,9 @@ void _start(void) {
     test_close_low_fd();
     test_exit_wait_codes();
     test_wait_status_ptr_null();
+    test_errno();
+    test_open_flags();
+    test_lseek();
 
     printf("======================================\n");
     printf("Result: %d / %d passed\n", s_pass, s_run);
