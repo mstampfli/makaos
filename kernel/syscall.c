@@ -496,11 +496,21 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
 }
 
 // ── sys_wait ──────────────────────────────────────────────────────────────
-// wait(pid, *status): wait for child pid to exit, fill *status with encoded
-// exit code (POSIX: (exit_code & 0xFF) << 8), return child pid.
-static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr) {
-    uint32_t pid = (uint32_t)pid_arg;
-    sched_wait_pid(pid);
+// waitpid(pid, *status, options):
+//   pid == -1: wait for any child.
+//   options & WNOHANG: return 0 immediately if no child has exited.
+// Returns child pid, 0 (WNOHANG + not ready), or -errno.
+static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options) {
+    // pid == -1 (any child) maps to internal pid=0.
+    int64_t signed_pid = (int64_t)pid_arg;
+    uint32_t pid = (signed_pid == -1) ? 0 : (uint32_t)pid_arg;
+
+    if (options & WNOHANG) {
+        if (!sched_poll_pid(pid)) return 0; // not ready
+    } else {
+        sched_wait_pid(pid);
+    }
+
     task_t* z = sched_reap_zombie(pid);
     if (z) {
         int32_t code = z->exit_code;
@@ -512,9 +522,14 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr) {
         }
         return (uint64_t)child_pid;
     }
-    // Killed by signal — no zombie, return pid with status=0.
+    // Child gone (killed by signal, no zombie).
     if (status_ptr) { int* sp = (int*)(uintptr_t)status_ptr; *sp = 0; }
-    return (uint64_t)pid;
+    return (signed_pid == -1) ? (uint64_t)-ECHILD : pid_arg;
+}
+
+// ── sys_getppid ───────────────────────────────────────────────────────────
+static uint64_t sys_getppid(void) {
+    return g_current ? (uint64_t)g_current->ppid : 0;
 }
 
 // ── sys_getpid ────────────────────────────────────────────────────────────
@@ -731,8 +746,9 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;
         case SYS_FORK:    ret = sys_fork();                         break;
         case SYS_EXEC:    ret = sys_exec(arg1, arg2);              break;
-        case SYS_WAIT:    ret = sys_wait(arg1, arg2);              break;
+        case SYS_WAIT:    ret = sys_wait(arg1, arg2, arg3);         break;
         case SYS_GETPID:  ret = sys_getpid();                      break;
+        case SYS_GETPPID: ret = sys_getppid();                     break;
         case SYS_READDIR: ret = sys_readdir(arg1, arg2, arg3, arg4); break;
         case SYS_SPAWN:   ret = sys_spawn(arg1, arg2);             break;
         case SYS_THREAD:   ret = sys_thread(arg1, arg2, arg3);     break;

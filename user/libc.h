@@ -60,8 +60,17 @@ typedef int64_t            ssize_t;
 #define SYS_RENAME   17
 #define SYS_GETCWD   18
 #define SYS_CHDIR    19
-#define SYS_MKDIR    20
-#define SYS_LSEEK    21
+#define SYS_MKDIR       20
+#define SYS_LSEEK       21
+#define SYS_GETPPID     22
+#define SYS_DUP         23
+#define SYS_DUP2        24
+#define SYS_PIPE        25
+#define SYS_SIGACTION   26
+#define SYS_SIGPROCMASK 27
+#define SYS_SIGRETURN   28
+
+#define WNOHANG 1
 
 #define SYS_READ_NONBLOCK 1
 
@@ -169,16 +178,33 @@ static inline int spawn(const char* path, size_t pathlen) {
     return (int)__syscall_ret(syscall2(SYS_SPAWN, (uint64_t)path, pathlen));
 }
 
-// Macros for decoding the status filled by wait().
+// Macros for decoding the status filled by wait/waitpid.
 #define WIFEXITED(s)   (((s) & 0xFF) == 0)
 #define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
 
-static inline int wait(int pid, int* status) {
-    return (int)__syscall_ret(syscall2(SYS_WAIT, (uint64_t)pid, (uint64_t)status));
+// POSIX waitpid: wait for pid (-1 = any child), fill *status, options (WNOHANG).
+static inline int waitpid(int pid, int* status, int options) {
+    return (int)__syscall_ret(syscall3(SYS_WAIT, (uint64_t)(int64_t)pid,
+                                       (uint64_t)status, (uint64_t)options));
+}
+
+// POSIX wait: wait for any child.
+static inline int wait(int* status) {
+    return waitpid(-1, status, 0);
 }
 
 static inline int getpid(void) {
-    return (int)syscall0(SYS_GETPID);  // never fails
+    return (int)syscall0(SYS_GETPID);   // never fails
+}
+
+static inline int getppid(void) {
+    return (int)syscall0(SYS_GETPPID);  // never fails
+}
+
+// _exit: same as exit (no stdio buffers to flush in our libc).
+__attribute__((noreturn)) static inline void _exit(int code) {
+    syscall1(SYS_EXIT, (uint64_t)code);
+    for (;;);
 }
 
 static inline int kill(int pid, int sig) {
@@ -247,8 +273,12 @@ int    strncmp(const char* a, const char* b, size_t n);
 char*  strcpy(char* dst, const char* src);
 char*  strncpy(char* dst, const char* src, size_t n);
 char*  strchr(const char* s, int c);
+char*  strrchr(const char* s, int c);
+char*  strstr(const char* haystack, const char* needle);
 char*  strdup(const char* s);
 char*  strndup(const char* s, size_t max);
+long   strtol(const char* s, char** endptr, int base);
+long   atoi(const char* s);
 
 // ── printf ────────────────────────────────────────────────────────────────
 

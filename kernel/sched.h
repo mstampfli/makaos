@@ -40,8 +40,12 @@ void sched_sleep(void);
 // Does nothing if the process is not PROC_SLEEPING.
 void sched_wake(task_t* proc);
 
-// Block current task until no task with the given pid is alive.
-void sched_wait_pid(uint32_t pid);
+// Block current task until a zombie with the given pid exists (0=any).
+// Returns 1 when zombie is ready, 1 if already gone.
+uint8_t sched_wait_pid(uint32_t pid);
+
+// Non-blocking: returns 1 if a zombie with the given pid (0=any) is ready.
+uint8_t sched_poll_pid(uint32_t pid);
 
 // Add a zombie task to the zombie list (call from sys_exit before yielding).
 void sched_add_zombie(task_t* t);
