@@ -86,6 +86,10 @@ ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/u
    -o "$BUILD_DIR/user_helloraw.elf"
 objcopy -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
 
+gcc "${USER_CFLAGS[@]}" -c "$USER_DIR/test_posix1.c" -o "$BUILD_DIR/user_test_posix1.o"
+ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_test_posix1.o" \
+   -o "$BUILD_DIR/user_test_posix1.elf"
+
 # Embed hello binary as a kernel-side byte array.
 BIN_HELLO="$BUILD_DIR/user_hello.bin"
 SZ_HELLO=$(stat -c "%s" "$BIN_HELLO")
@@ -201,6 +205,9 @@ if [ -f "$BUILD_DIR/user_hello.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_helloraw.elf bin/helloraw" > /dev/null 2>&1 || true
+fi
+if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_posix1.elf bin/test_posix1" > /dev/null 2>&1 || true
 fi
 
 # Copy any files from build/fs/ into root.

@@ -140,3 +140,11 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size);
 // Create a directory at `path` (parent must exist).
 // Returns 1 on success, 0 on failure.
 int ext2_mkdir(const char* path);
+
+// Remove a regular file at `path`.
+// Returns 1 on success, 0 on failure.
+int ext2_unlink(const char* path);
+
+// Rename/move `src` to `dst` (both must be on the same volume).
+// Returns 1 on success, 0 on failure.
+int ext2_rename(const char* src, const char* dst);

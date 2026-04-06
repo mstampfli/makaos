@@ -119,4 +119,8 @@ uint8_t fd_table_init(task_files_t* f, uint32_t cap);
 uint8_t fd_table_grow(task_files_t* f);
 
 // Fork the current user task.
-task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp);
+// user_rbp/rbx/r12-r15 are the callee-saved registers at the syscall site;
+// they must be restored in the child so it returns to user space correctly.
+task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp,
+                  uint64_t user_rbp, uint64_t user_rbx,
+                  uint64_t user_r12, uint64_t user_r13, uint64_t user_r14, uint64_t user_r15);

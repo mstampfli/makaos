@@ -687,6 +687,9 @@ void shell_fn(void) {
     term_set_color(0x0F);
     term_puts(" -- type 'help' for commands\n\n");
 
+    // AUTOTEST: run posix1 tests at startup.
+    { char* av[] = {(char*)"run", (char*)"/bin/test_posix1"}; cmd_run(2, av); }
+
     char line[256];
     char* argv[16];
 

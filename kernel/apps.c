@@ -7,6 +7,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "user_test_vmalloc.h"
+#include "user_hello.h"
 
 /* ── VGA ─────────────────────────────────────────────────────────────────── */
 #define VGA_W  80
@@ -370,6 +371,34 @@ void test_vmalloc_fn(void) {
     (void)ut_pid;
     fs_puts(0, "[TEST] done waiting — see rows above for pass/fail", ATTR(BLACK, LGREEN));
     for (;;) sched_yield();
+}
+
+/* ── Embedded hello binary launcher ─────────────────────────────────────── */
+// Launched via the shell "hello" command.
+// Uses the same raw-binary + task_create_user path as the vmalloc test —
+// completely bypasses ext2 and ELF loading so we can isolate issues.
+void hello_embedded_fn(void) {
+    uint32_t bin_size = g_user_hello_size;
+    uint32_t pages    = (bin_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    uint8_t order = 0;
+    while ((1u << order) < pages) order++;
+    phys_addr_t code_phys = pmm_buddy_alloc(order);
+    if (code_phys == PMM_INVALID_ADDR) {
+        for (;;) sched_yield();
+    }
+
+    uint8_t* dst = (uint8_t*)(code_phys + HHDM_OFFSET);
+    const uint8_t* src = g_user_hello;
+    for (uint32_t i = 0; i < bin_size; i++) dst[i] = src[i];
+    for (uint32_t i = bin_size; i < pages * PAGE_SIZE; i++) dst[i] = 0;
+
+    task_t* t = task_create_user(code_phys, pages, pid_alloc());
+    if (!t) { for (;;) sched_yield(); }
+
+    uint32_t child_pid = t->pid;
+    sched_add(t);
+    sched_wait_pid(child_pid);
 }
 
 /* ── FAT32/ATA init + self-test thread ──────────────────────────────────── */

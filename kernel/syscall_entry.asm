@@ -5,6 +5,12 @@ extern g_tss                  ; TSS struct in tss.c — RSP0 is at byte offset 4
 extern g_syscall_user_rsp     ; scratch qword in syscall.c to stash user RSP
 extern g_syscall_user_rip     ; scratch qword in syscall.c to stash user RIP
 extern g_syscall_user_rflags  ; scratch qword in syscall.c to stash user RFLAGS
+extern g_syscall_user_rbp     ; scratch qword in syscall.c to stash user RBP
+extern g_syscall_user_rbx     ; scratch qword in syscall.c to stash user RBX
+extern g_syscall_user_r12     ; scratch qword in syscall.c to stash user R12
+extern g_syscall_user_r13     ; scratch qword in syscall.c to stash user R13
+extern g_syscall_user_r14     ; scratch qword in syscall.c to stash user R14
+extern g_syscall_user_r15     ; scratch qword in syscall.c to stash user R15
 extern g_exec_requested       ; byte flag set by sys_exec
 extern g_exec_entry           ; new entry RIP for exec
 extern g_exec_rsp             ; new user RSP for exec
@@ -31,6 +37,13 @@ syscall_entry:
     mov [rel g_syscall_user_rsp],    rsp
     mov [rel g_syscall_user_rip],    rcx
     mov [rel g_syscall_user_rflags], r11
+    ; Save callee-saved regs so fork() can give the child a consistent state.
+    mov [rel g_syscall_user_rbp], rbp
+    mov [rel g_syscall_user_rbx], rbx
+    mov [rel g_syscall_user_r12], r12
+    mov [rel g_syscall_user_r13], r13
+    mov [rel g_syscall_user_r14], r14
+    mov [rel g_syscall_user_r15], r15
 
     ; 2. Switch to kernel stack (TSS.RSP0, byte offset 4 in tss_t).
     mov rsp, [rel g_tss + 4]

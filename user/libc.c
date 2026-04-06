@@ -1,5 +1,9 @@
 #include "libc.h"
 
+// ── errno ─────────────────────────────────────────────────────────────────
+// Global error number — set by syscall wrappers on failure.
+int errno = 0;
+
 // ── String functions ──────────────────────────────────────────────────────
 
 size_t strlen(const char* s) {

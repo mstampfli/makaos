@@ -30,3 +30,21 @@ vfs_file_t* fat32_open(const char* name83);
 
 // Mount-time LBA of the FAT32 partition (set by fat32_init).
 extern uint32_t g_fat32_part_lba;
+
+// ── Directory entry (user-visible) ────────────────────────────────────────
+typedef struct {
+    char     name[13];   // human-readable "filename.ext\0"
+    char     name83[11]; // raw 8.3 name (no null terminator)
+    uint32_t size;       // file size in bytes (0 for directories)
+    uint8_t  is_dir;     // 1 if directory, 0 if file
+} fat32_entry_t;
+
+// Enumerate the root directory.  Fills `entries` (up to max_entries).
+// Skips deleted (0xE5) and LFN entries.  Stops at first 0x00 entry.
+// Returns the number of entries written.
+int fat32_readdir(fat32_entry_t* entries, int max_entries);
+
+// Write (create or overwrite) a file in the root directory.
+// `name83` must be exactly 11 bytes, uppercase, space-padded (8.3 format).
+// Returns 1 on success, 0 on failure.
+int fat32_write_file(const char* name83, const uint8_t* data, uint32_t size);
