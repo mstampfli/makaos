@@ -271,6 +271,77 @@ static void test_open_flags(void) {
     unlink("/tmp_excl_test",  14);
 }
 
+// ── open() write-mode tests ───────────────────────────────────────────────
+
+static void test_open_write(void) {
+    printf("-- open() write modes\n");
+
+    // O_WRONLY: write to a file
+    int fd = open("/tmp_write_test", O_CREAT | O_WRONLY);
+    check("O_WRONLY open", fd >= 0);
+    if (fd >= 0) {
+        ssize_t n = write(fd, "hello", 5);
+        check("write 5 bytes", n == 5);
+        close(fd);
+    }
+
+    // O_RDONLY on written file: read back and verify
+    fd = open("/tmp_write_test", O_RDONLY);
+    check("O_RDONLY after write", fd >= 0);
+    if (fd >= 0) {
+        char buf[8] = {0};
+        ssize_t n = read(fd, buf, 8);
+        check("read back 5 bytes", n == 5);
+        check("content == 'hello'", strncmp(buf, "hello", 5) == 0);
+        close(fd);
+    }
+
+    // O_RDONLY: write should fail with EBADF
+    fd = open("/tmp_write_test", O_RDONLY);
+    if (fd >= 0) {
+        errno = 0;
+        ssize_t n = write(fd, "x", 1);
+        check("write to O_RDONLY == -1", n == -1);
+        check("errno == EBADF for O_RDONLY write", errno == EBADF);
+        close(fd);
+    }
+
+    // O_TRUNC: open existing file with O_TRUNC, it should be empty
+    fd = open("/tmp_write_test", O_WRONLY | O_TRUNC);
+    check("O_TRUNC open", fd >= 0);
+    if (fd >= 0) close(fd);
+    fd = open("/tmp_write_test", O_RDONLY);
+    if (fd >= 0) {
+        char buf[8] = {0};
+        ssize_t n = read(fd, buf, 8);
+        check("O_TRUNC makes file empty (read == 0)", n == 0);
+        close(fd);
+    }
+
+    // O_APPEND: writes always go to end of file
+    fd = open("/tmp_write_test", O_WRONLY);
+    if (fd >= 0) { write(fd, "abc", 3); close(fd); }
+    fd = open("/tmp_write_test", O_WRONLY | O_APPEND);
+    check("O_APPEND open", fd >= 0);
+    if (fd >= 0) {
+        // Even if we seek to 0, write should go to end
+        lseek(fd, 0, SEEK_SET);
+        write(fd, "xyz", 3);
+        close(fd);
+    }
+    fd = open("/tmp_write_test", O_RDONLY);
+    if (fd >= 0) {
+        char buf[8] = {0};
+        ssize_t n = read(fd, buf, 8);
+        check("O_APPEND appended (total 6 bytes)", n == 6);
+        check("O_APPEND content = 'abcxyz'", strncmp(buf, "abcxyz", 6) == 0);
+        close(fd);
+    }
+
+    // Cleanup
+    unlink("/tmp_write_test", 15);
+}
+
 // ── lseek tests ───────────────────────────────────────────────────────────
 
 static void test_lseek(void) {
@@ -333,6 +404,7 @@ void _start(void) {
     test_wait_status_ptr_null();
     test_errno();
     test_open_flags();
+    test_open_write();
     test_lseek();
 
     printf("======================================\n");

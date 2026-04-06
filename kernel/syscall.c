@@ -132,6 +132,12 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     if (!f) return (uint64_t)-ENOENT;
 
+    // Enforce access mode: strip write for O_RDONLY.
+    if ((flags & 3) == O_RDONLY) f->write = NULL;
+
+    // Propagate O_APPEND into vfs_file_t.flags for the write callback.
+    if (flags & O_APPEND) f->flags |= O_APPEND;
+
     // O_TRUNC: truncate to zero on open (write modes only).
     if ((flags & O_TRUNC) && (flags & (O_WRONLY | O_RDWR)))
         ext2_truncate(path);

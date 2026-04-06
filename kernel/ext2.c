@@ -374,6 +374,11 @@ static uint32_t path_to_inode(const char* path) {
     return cur_ino;
 }
 
+// Forward declarations for helpers used by ext2_vfs_write.
+static uint32_t alloc_block(void);
+static void     free_block(uint32_t blk);
+static uint8_t  inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_num);
+
 // ── File read VFS callbacks ────────────────────────────────────────────────
 
 typedef struct {
@@ -416,6 +421,57 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         total        += to_copy;
         fd->cur_pos  += to_copy;
     }
+
+    return (int64_t)total;
+}
+
+// Write `len` bytes from `buf` at fd->cur_pos, growing the file as needed.
+static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
+    ext2_fd_t* fd = (ext2_fd_t*)self->ctx;
+    if (!fd || !len) return 0;
+
+    // O_APPEND: move to end before writing.
+    if (self->flags & 0x400 /*O_APPEND*/) fd->cur_pos = fd->file_size;
+
+    const uint8_t* src = (const uint8_t*)buf;
+    uint64_t total = 0;
+
+    while (total < len) {
+        uint32_t blk_idx    = fd->cur_pos / s_block_size;
+        uint32_t off_in_blk = fd->cur_pos % s_block_size;
+        uint32_t to_write   = s_block_size - off_in_blk;
+        if (to_write > (uint32_t)(len - total))
+            to_write = (uint32_t)(len - total);
+
+        uint32_t blk = inode_get_block(&fd->inode, blk_idx);
+        if (!blk) {
+            blk = alloc_block();
+            if (!blk) break;
+            // Zero-initialize new block.
+            static uint8_t zb[1024];
+            for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
+            if (!write_block(blk, zb)) { free_block(blk); break; }
+            if (!inode_set_block(&fd->inode, blk_idx, blk)) { free_block(blk); break; }
+        }
+
+        // Read-modify-write if partial block.
+        static uint8_t wr_buf[1024];
+        if (off_in_blk != 0 || to_write != s_block_size) {
+            if (!read_block(blk, wr_buf)) break;
+        }
+        for (uint32_t i = 0; i < to_write; i++)
+            wr_buf[off_in_blk + i] = src[total + i];
+        if (!write_block(blk, wr_buf)) break;
+
+        total        += to_write;
+        fd->cur_pos  += to_write;
+        if (fd->cur_pos > fd->file_size) fd->file_size = fd->cur_pos;
+    }
+
+    // Persist updated inode (size + block pointers).
+    fd->inode.i_size   = fd->file_size;
+    fd->inode.i_blocks = ((fd->file_size + s_block_size - 1) / s_block_size) * (s_block_size / 512);
+    write_inode(fd->ino, &fd->inode);
 
     return (int64_t)total;
 }
@@ -467,7 +523,7 @@ vfs_file_t* ext2_open(const char* path) {
     if (!f) { kfree(fd); return NULL; }
 
     f->read  = ext2_vfs_read;
-    f->write = NULL;
+    f->write = ext2_vfs_write;   // always available; caller enforces O_RDONLY
     f->seek  = ext2_vfs_seek;
     f->close = ext2_vfs_close;
     f->ctx   = fd;
