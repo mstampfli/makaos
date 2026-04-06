@@ -15,6 +15,8 @@ extern g_exec_requested       ; byte flag set by sys_exec
 extern g_exec_entry           ; new entry RIP for exec
 extern g_exec_rsp             ; new user RSP for exec
 extern g_exec_pml4            ; new PML4 phys for exec
+extern g_signal_deliver       ; byte: 1=enter handler, 2=sigreturn restore
+extern g_signal_rdi           ; uint64_t: signum passed as rdi to handler
 
 global syscall_entry
 
@@ -103,9 +105,37 @@ syscall_entry:
     mov cr3, rax
 
 .sysret_normal:
-    ; 10. Disable interrupts before sysretq (mandatory).
+    ; 10. Check if a user signal handler is being delivered, or sigreturn.
+    ;     g_signal_deliver=1: entering handler (override rcx/r11/rsp + rdi=signum)
+    ;     g_signal_deliver=2: sigreturn    (override rcx/r11/rsp + all callee-saved)
+    ;     At this point rsp is already the user RSP (from pop rsp in step 8).
+    ;     The globals g_syscall_user_* hold the new values set by signal code.
+    cmp byte [rel g_signal_deliver], 0
+    je  .no_signal
+    ; Use r10 to read the mode — do NOT touch rax (it holds the syscall return value).
+    movzx r10d, byte [rel g_signal_deliver]
+    mov byte [rel g_signal_deliver], 0
+    mov rcx, [rel g_syscall_user_rip]
+    mov r11, [rel g_syscall_user_rflags]
+    mov rsp, [rel g_syscall_user_rsp]
+    cmp r10d, 1
+    jne .signal_restore
+    ; Mode 1: handler entry — set rdi = signum (first arg to handler).
+    mov rdi, [rel g_signal_rdi]
+    jmp .no_signal
+.signal_restore:
+    ; Mode 2: sigreturn — restore all callee-saved regs so the
+    ; interrupted C code sees its original register state.
+    mov rbp, [rel g_syscall_user_rbp]
+    mov rbx, [rel g_syscall_user_rbx]
+    mov r12, [rel g_syscall_user_r12]
+    mov r13, [rel g_syscall_user_r13]
+    mov r14, [rel g_syscall_user_r14]
+    mov r15, [rel g_syscall_user_r15]
+.no_signal:
+    ; 11. Disable interrupts before sysretq (mandatory).
     cli
 
-    ; 11. Return to user space.
+    ; 12. Return to user space.
     ;     o64 sysret = sysretq: RIP←rcx, RFLAGS←r11, CS←USER_CS, SS←USER_SS
     o64 sysret

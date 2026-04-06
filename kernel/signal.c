@@ -3,10 +3,26 @@
 #include "sched.h"
 #include "common.h"
 
+// ── Globals from syscall.c ────────────────────────────────────────────────
+// These are set here to redirect the syscall return path to a signal handler.
+extern uint64_t g_syscall_user_rsp;
+extern uint64_t g_syscall_user_rip;
+extern uint64_t g_syscall_user_rflags;
+extern uint64_t g_syscall_user_rbp;
+extern uint64_t g_syscall_user_rbx;
+extern uint64_t g_syscall_user_r12;
+extern uint64_t g_syscall_user_r13;
+extern uint64_t g_syscall_user_r14;
+extern uint64_t g_syscall_user_r15;
+// Set to 1 (handler entry) or 2 (sigreturn restore) by signal/syscall code.
+extern uint8_t  g_signal_deliver;
+// rdi value to pass to the signal handler (the signal number).
+extern uint64_t g_signal_rdi;
+// Set to 1 by syscall_dispatch while calling signal_deliver_pending.
+// Allows signal_deliver_pending to know it's safe to set up user frames.
+extern uint8_t  g_signal_in_syscall;
+
 // ── signal_send ───────────────────────────────────────────────────────────
-// Sets the pending bit for `sig` on task `t`.
-// SIGKILL cannot be blocked — we clear its blocked bit defensively.
-// Safe from IRQ context: only writes one bit atomically (single CPU).
 void signal_send(task_t* t, int sig) {
     if (!t) return;
     if (sig < 1 || sig >= NSIG) return;
@@ -15,24 +31,20 @@ void signal_send(task_t* t, int sig) {
     if (sig == SIGKILL)
         t->sigstate.blocked &= ~(1u << (uint32_t)(sig - 1));
 
-    // Enqueue into ring buffer.  If full, drop (same as classic bitmask overflow).
+    // Enqueue into ring buffer.  If full, drop.
     sigstate_t* ss = &t->sigstate;
     uint8_t next_tail = (ss->tail + 1) & (SIG_QUEUE_SIZE - 1);
-    if (next_tail != ss->head) {   // not full
+    if (next_tail != ss->head) {
         ss->queue[ss->tail] = (uint8_t)sig;
         ss->tail = next_tail;
     }
 
-    // Wake the task if it's sleeping so it processes the signal promptly.
+    // Wake the task if sleeping.
     if (t->state == TASK_SLEEPING)
         sched_wake(t);
 }
 
 // ── signal_send_group ─────────────────────────────────────────────────────
-// Sends `sig` to every task whose tgid matches.
-// Walks the run queue and also checks g_current.
-// NOTE: this only reaches tasks in the scheduler's queue + current task.
-// A task that is TASK_DEAD is skipped.
 typedef struct { uint32_t tgid; int sig; } sig_group_arg_t;
 
 static void sig_group_cb(task_t* t, void* data) {
@@ -48,19 +60,56 @@ void signal_send_group(uint32_t tgid, int sig) {
     sched_for_each(sig_group_cb, &a);
 }
 
+// ── signal_setup_frame ────────────────────────────────────────────────────
+// Build a sigframe_t on the user's stack and redirect the syscall return to
+// the handler.  Only call this when g_signal_in_syscall == 1.
+static void signal_setup_frame(int sig, k_sigaction_t* ka) {
+    uint64_t user_rsp = g_syscall_user_rsp;
+
+    // Place sigframe below current RSP, 16-byte aligned.
+    uint64_t frame_base = (user_rsp - sizeof(sigframe_t)) & ~(uint64_t)0xF;
+    sigframe_t* frame = (sigframe_t*)frame_base;
+
+    frame->rip    = g_syscall_user_rip;
+    frame->rsp    = user_rsp;
+    frame->rflags = g_syscall_user_rflags;
+    frame->rbp    = g_syscall_user_rbp;
+    frame->rbx    = g_syscall_user_rbx;
+    frame->r12    = g_syscall_user_r12;
+    frame->r13    = g_syscall_user_r13;
+    frame->r14    = g_syscall_user_r14;
+    frame->r15    = g_syscall_user_r15;
+    frame->blocked = g_current->sigstate.blocked;
+    frame->_pad   = 0;
+
+    // Remember where the frame is for sys_sigreturn.
+    g_current->sigstate.sigframe_rsp = frame_base;
+
+    // Block the signal itself + sa_mask during handler execution.
+    g_current->sigstate.blocked |= (1u << (uint32_t)(sig - 1));
+    g_current->sigstate.blocked |= ka->sa_mask;
+
+    // Push restorer address as the "return address" for the handler.
+    uint64_t new_rsp = frame_base - 8;
+    *(uint64_t*)new_rsp = ka->sa_restorer;
+
+    // Redirect syscall return to the handler.
+    g_syscall_user_rip    = ka->sa_handler;
+    g_syscall_user_rsp    = new_rsp;
+    g_syscall_user_rflags = 0x202;  // IF=1, reserved
+
+    // Tell syscall_entry.asm to load rdi=signum before sysretq.
+    g_signal_rdi     = (uint64_t)(uint32_t)sig;
+    g_signal_deliver = 1;
+}
+
 // ── signal_deliver_pending ────────────────────────────────────────────────
-// Processes all pending, unblocked signals for g_current.
-// Called on scheduler entry (before a task runs) and on syscall return.
-//
-// All signals currently terminate the task (no user-space handlers yet).
-// SIGTERM prints nothing (graceful). SIGSEGV/SIGFPE/SIGILL print a
-// one-line diagnostic to VGA row 0 before terminating.
 void signal_deliver_pending(void) {
     if (!g_current || g_current->state == TASK_DEAD) return;
 
     sigstate_t* ss = &g_current->sigstate;
 
-    // Dequeue the first unblocked signal from the ring buffer.
+    // Dequeue the first unblocked signal.
     int sig = 0;
     uint8_t scan = ss->head;
     while (scan != ss->tail) {
@@ -68,12 +117,9 @@ void signal_deliver_pending(void) {
         uint32_t bit = 1u << (uint32_t)(candidate - 1);
         if (!(ss->blocked & bit)) {
             sig = (int)candidate;
-            // Remove this entry by shifting the head past it.
-            // If it's not at head, compact the ring to close the gap.
             if (scan == ss->head) {
                 ss->head = (ss->head + 1) & (SIG_QUEUE_SIZE - 1);
             } else {
-                // Shift entries down to close the gap at `scan`.
                 uint8_t i = scan;
                 while (i != ss->tail) {
                     uint8_t next = (i + 1) & (SIG_QUEUE_SIZE - 1);
@@ -88,7 +134,21 @@ void signal_deliver_pending(void) {
     }
     if (!sig) return;
 
-    // Print diagnostic for fatal hardware signals.
+    k_sigaction_t* ka = &ss->handlers[sig < NSIG ? sig : 0];
+    uint64_t handler = (sig < NSIG) ? ka->sa_handler : (uint64_t)SIG_DFL;
+
+    // SIG_IGN: silently discard.
+    if (handler == (uint64_t)SIG_IGN) return;
+
+    // User handler: only deliverable on the syscall return path.
+    if (handler != (uint64_t)SIG_DFL && g_signal_in_syscall &&
+        !(g_current->flags & TASK_FLAG_KTHREAD)) {
+        signal_setup_frame(sig, ka);
+        return;
+    }
+
+    // SIG_DFL (or non-syscall path): print diagnostic for fatal hw signals,
+    // then terminate.
     extern volatile uint16_t* g_vga;
     if (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL) {
         static const char* names[] = {
@@ -98,21 +158,15 @@ void signal_deliver_pending(void) {
             [SIGILL]  = "SIGILL ",
         };
         const char* name = (sig < NSIG && names[sig]) ? names[sig] : "SIG???";
-        // Print "pid NNN: <SIGNAME> - killed" on VGA row 0, red on black.
         volatile uint16_t* v = g_vga;
-        const uint16_t attr = (uint16_t)(0x04 << 8); // red on black
+        const uint16_t attr = (uint16_t)(0x04 << 8);
         uint32_t col = 0;
-
-        // "pid "
         const char* prefix = "pid ";
         for (int i = 0; prefix[i]; i++) v[col++] = (uint16_t)(uint8_t)prefix[i] | attr;
-
-        // pid number
         uint32_t pid = g_current->pid;
         char pidbuf[12]; int pi = 11; pidbuf[pi] = 0;
         do { pidbuf[--pi] = '0' + (char)(pid % 10); pid /= 10; } while (pid);
         for (int i = pi; pidbuf[i]; i++) v[col++] = (uint16_t)(uint8_t)pidbuf[i] | attr;
-
         const char* mid = ": ";
         for (int i = 0; mid[i]; i++) v[col++] = (uint16_t)(uint8_t)mid[i] | attr;
         for (int i = 0; name[i]; i++) v[col++] = (uint16_t)(uint8_t)name[i] | attr;
@@ -120,9 +174,7 @@ void signal_deliver_pending(void) {
         for (int i = 0; suffix[i]; i++) v[col++] = (uint16_t)(uint8_t)suffix[i] | attr;
     }
 
-    // All signals: terminate the task.
     g_current->state = TASK_DEAD;
     sched_yield();
-    // Never reached.
     for (;;) __asm__ volatile("hlt");
 }
