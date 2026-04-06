@@ -123,7 +123,7 @@ static void test_close_low_fd(void) {
         exit((r0 == 0 && r2 == 0) ? 0 : 1);
     }
     int status = 0;
-    wait(child, &status);
+    waitpid(child, &status, 0);
     check("close(0) returns 0", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
@@ -145,7 +145,7 @@ static void test_exit_wait_codes(void) {
         if (child == 0) exit(expected);
 
         int status = 0;
-        int wpid = wait(child, &status);
+        int wpid = waitpid(child, &status, 0);
 
         char label[64];
         // Build label: "wait pid ok - exit(N)"
@@ -164,7 +164,7 @@ static void test_wait_status_ptr_null(void) {
     printf("-- wait() with NULL status\n");
     int child = fork();
     if (child == 0) exit(7);
-    int wpid = wait(child, NULL);  // should not crash
+    int wpid = waitpid(child, NULL, 0);  // should not crash
     check("wait(pid, NULL) returns pid", wpid == child);
 }
 
@@ -388,6 +388,90 @@ static void test_lseek(void) {
     close(fd);
 }
 
+// ── getppid / _exit / waitpid / wait tests ────────────────────────────────
+
+static void test_waitpid_getppid(void) {
+    printf("-- getppid / waitpid / wait\n");
+
+    int parent_pid = getpid();
+    check("getpid() > 0", parent_pid > 0);
+
+    // getppid: child's ppid should equal parent's pid
+    int child = fork();
+    if (child == 0) {
+        int ppid = getppid();
+        _exit(ppid == parent_pid ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    check("child getppid == parent pid", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    // _exit: same as exit for WEXITSTATUS purposes
+    child = fork();
+    if (child == 0) _exit(42);
+    status = 0;
+    waitpid(child, &status, 0);
+    check("_exit(42) WEXITSTATUS == 42", WIFEXITED(status) && WEXITSTATUS(status) == 42);
+
+    // wait(*status): waits for any child
+    child = fork();
+    if (child == 0) exit(7);
+    status = 0;
+    int wpid = wait(&status);
+    check("wait() returns child pid", wpid == child);
+    check("wait() WEXITSTATUS == 7", WIFEXITED(status) && WEXITSTATUS(status) == 7);
+
+    // WNOHANG: child not yet exited → returns 0
+    child = fork();
+    if (child == 0) { /* spin briefly then exit */ exit(0); }
+    // Try immediately — child may not have exited yet.
+    // We can't reliably test WNOHANG without sleep, so just verify the call
+    // doesn't crash and returns either 0 or child pid.
+    status = 0;
+    int r = waitpid(child, &status, WNOHANG);
+    check("WNOHANG returns >= 0", r >= 0);
+    // Clean up: wait properly
+    if (r == 0) waitpid(child, &status, 0);
+}
+
+// ── strtol / atoi / strstr / strrchr tests ────────────────────────────────
+
+static void test_libc_str(void) {
+    printf("-- strtol / atoi / strstr / strrchr\n");
+
+    // atoi
+    check("atoi \"0\"",    atoi("0")    == 0);
+    check("atoi \"42\"",   atoi("42")   == 42);
+    check("atoi \"-7\"",   atoi("-7")   == -7);
+    check("atoi \"  3\"",  atoi("  3")  == 3);
+
+    // strtol bases
+    char* end;
+    check("strtol dec",  strtol("255", &end, 10) == 255 && *end == '\0');
+    check("strtol hex",  strtol("0xFF", &end, 16) == 255 && *end == '\0');
+    check("strtol oct",  strtol("077", &end, 8) == 63 && *end == '\0');
+    check("strtol auto hex", strtol("0xFF", &end, 0) == 255);
+    check("strtol auto oct", strtol("010", &end, 0) == 8);
+    check("strtol neg",  strtol("-1", &end, 10) == -1);
+    // endptr stops at non-digit
+    strtol("12abc", &end, 10);
+    check("strtol endptr", *end == 'a');
+
+    // strstr
+    check("strstr found",     strstr("hello world", "world") != NULL);
+    check("strstr not found", strstr("hello", "xyz") == NULL);
+    check("strstr empty needle", strstr("hello", "") != NULL);
+    check("strstr at start", strstr("hello", "he") == (void*)"hello" - 0 + 0
+          || strncmp(strstr("hello", "he"), "hello", 2) == 0);
+
+    // strrchr
+    check("strrchr finds last", strrchr("hello", 'l') != NULL &&
+          strrchr("hello", 'l')[0] == 'l' &&
+          strrchr("hello", 'l')[1] == 'o');
+    check("strrchr not found", strrchr("hello", 'z') == NULL);
+    check("strrchr first char", strrchr("abc", 'a') != NULL);
+}
+
 // ── Entry ─────────────────────────────────────────────────────────────────
 
 void _start(void) {
@@ -406,6 +490,8 @@ void _start(void) {
     test_open_flags();
     test_open_write();
     test_lseek();
+    test_waitpid_getppid();
+    test_libc_str();
 
     printf("======================================\n");
     printf("Result: %d / %d passed\n", s_pass, s_run);
