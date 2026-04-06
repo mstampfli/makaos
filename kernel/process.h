@@ -20,6 +20,7 @@ typedef enum {
     TASK_RUNNING  = 1,
     TASK_DEAD     = 2,
     TASK_SLEEPING = 3,
+    TASK_ZOMBIE   = 4,  // exited, waiting for parent to reap via wait()
 } task_state_t;
 
 #define PROC_READY    TASK_READY
@@ -68,8 +69,12 @@ typedef struct task_t {
 
     sigstate_t    sigstate;
 
+    int32_t       exit_code;    // set by sys_exit, readable via wait()
+
     uint8_t       mlfq_level;
     uint8_t       mlfq_ticks_left;
+
+    char          cwd[256];     // current working directory (absolute path)
 
     struct task_t* next;
 } task_t;

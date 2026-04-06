@@ -21,6 +21,18 @@ void* memcpy(void* dst, const void* src, size_t n) {
     return dst;
 }
 
+void* memmove(void* dst, const void* src, size_t n) {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    if (d < s) {
+        while (n--) *d++ = *s++;
+    } else if (d > s) {
+        d += n; s += n;
+        while (n--) *--d = *--s;
+    }
+    return dst;
+}
+
 int strcmp(const char* a, const char* b) {
     while (*a && *a == *b) { a++; b++; }
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
@@ -43,6 +55,21 @@ char* strncpy(char* dst, const char* src, size_t n) {
     while (n && (*dst++ = *src++)) n--;
     while (n--) *dst++ = '\0';
     return r;
+}
+
+char* strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+char* strndup(const char* s, size_t max) {
+    size_t n = 0;
+    while (n < max && s[n]) n++;
+    char* p = malloc(n + 1);
+    if (p) { memcpy(p, s, n); p[n] = '\0'; }
+    return p;
 }
 
 char* strchr(const char* s, int c) {
@@ -115,7 +142,7 @@ static block_hdr_t* heap_alloc_raw(size_t size) {
 }
 
 void* malloc(size_t size) {
-    if (!size) return NULL;
+    if (!size) size = 1; // POSIX: malloc(0) returns a unique valid pointer
     size = ALIGN8(size);
 
     // Search free list for a fitting block.
@@ -231,10 +258,16 @@ static int vsnprintf_impl(char* buf, size_t size, const char* fmt, va_list ap) {
                 buf_puts(buf, size, &pos, tmp, (size_t)len);
                 break;
             }
+            case 'o': {
+                uint64_t v = (uint64_t)va_arg(ap, unsigned int);
+                int len = u64_to_dec(v, tmp, 8);
+                int pad = width - len;
+                for (int i = 0; i < pad; i++) buf_putc(buf, size, &pos, zero_pad ? '0' : ' ');
+                buf_puts(buf, size, &pos, tmp, (size_t)len);
+                break;
+            }
             case 'x': case 'X': {
-                uint64_t v;
-                // Check for 'l' modifier already consumed... we don't, so just read int.
-                v = (uint64_t)va_arg(ap, unsigned int);
+                uint64_t v = (uint64_t)va_arg(ap, unsigned int);
                 int len = u64_to_dec(v, tmp, 16);
                 int pad = width - len;
                 for (int i = 0; i < pad; i++) buf_putc(buf, size, &pos, zero_pad ? '0' : ' ');

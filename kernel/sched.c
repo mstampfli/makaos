@@ -27,6 +27,10 @@ static task_t* s_tails[MLFQ_LEVELS];
 // Uses task_t::next as the link field.
 static task_t* s_sleep_head = NULL;
 
+// Singly-linked list of zombie tasks (state == TASK_ZOMBIE).
+// Tasks stay here until the parent calls wait() to reap them.
+static task_t* s_zombie_head = NULL;
+
 // Idle process — never put on a queue, runs when all queues are empty.
 static uint8_t      s_idle_stack[PAGE_SIZE];
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
@@ -211,6 +215,28 @@ void sched_wake(task_t* proc) {
     enqueue(proc);
 }
 
+// Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
+void sched_add_zombie(task_t* t) {
+    t->next = s_zombie_head;
+    s_zombie_head = t;
+}
+
+// Remove and return the zombie with the given pid (0 = any).
+// Returns NULL if not found.  Caller must call process_destroy on result.
+task_t* sched_reap_zombie(uint32_t pid) {
+    task_t** pp = &s_zombie_head;
+    while (*pp) {
+        if (pid == 0 || (*pp)->pid == pid) {
+            task_t* z = *pp;
+            *pp = z->next;
+            z->next = NULL;
+            return z;
+        }
+        pp = &(*pp)->next;
+    }
+    return NULL;
+}
+
 // ── sched_wait_pid ────────────────────────────────────────────────────────
 
 typedef struct { uint32_t pid; uint8_t found; } wait_pid_arg_t;
@@ -222,6 +248,9 @@ static void find_pid_cb(task_t* t, void* data) {
 
 void sched_wait_pid(uint32_t pid) {
     for (;;) {
+        // Done if zombie (exited via sys_exit) or gone (killed).
+        task_t* z = s_zombie_head;
+        while (z) { if (z->pid == pid) return; z = z->next; }
         wait_pid_arg_t a = {pid, 0};
         sched_for_each(find_pid_cb, &a);
         if (!a.found) break;
@@ -240,12 +269,11 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
             t = t->next;
         }
     }
-    // Also walk sleeping tasks so sched_wait_pid doesn't miss them.
+    // Also walk sleeping and zombie tasks so sched_wait_pid doesn't miss them.
     task_t* t = s_sleep_head;
-    while (t) {
-        cb(t, data);
-        t = t->next;
-    }
+    while (t) { cb(t, data); t = t->next; }
+    t = s_zombie_head;
+    while (t) { cb(t, data); t = t->next; }
 }
 
 // ── sched_queue_head — removed: use sched_for_each instead ───────────────

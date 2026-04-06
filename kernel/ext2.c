@@ -1139,12 +1139,16 @@ int ext2_unlink(const char* path) {
     // Remove directory entry first.
     if (!dir_remove_entry(parent_ino, basename)) return 0;
 
-    // Free all data blocks and the inode itself.
-    free_inode_blocks(&inode);
-    inode.i_dtime = 1;
-    inode.i_links_count = 0;
-    write_inode(ino, &inode);
-    free_inode_num(ino);
+    // Decrement link count; only free inode/data when it reaches 0.
+    if (inode.i_links_count > 0) inode.i_links_count--;
+    if (inode.i_links_count == 0) {
+        free_inode_blocks(&inode);
+        inode.i_dtime = 1;
+        write_inode(ino, &inode);
+        free_inode_num(ino);
+    } else {
+        write_inode(ino, &inode);
+    }
 
     return 1;
 }

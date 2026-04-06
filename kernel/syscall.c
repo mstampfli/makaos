@@ -8,7 +8,7 @@
 #include "pmm.h"
 #include "kheap.h"
 #include "vfs.h"
-#include "fat32.h"
+#include "ext2.h"
 #include "elf.h"
 #include "tsc.h"
 
@@ -56,7 +56,7 @@ void syscall_init(void) {
 static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (!g_current || fd >= g_current->files_shared->fd_capacity) return (uint64_t)-1;
     vfs_file_t* f = g_current->files_shared->fd_table[fd];
-    if (!f) return (uint64_t)-1;
+    if (!f || !f->write) return (uint64_t)-1;
     int64_t r = vfs_write(f, (const void*)buf, len);
     return (r < 0) ? (uint64_t)-1 : (uint64_t)r;
 }
@@ -72,20 +72,35 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
 }
 
 // ── sys_open ──────────────────────────────────────────────────────────────
-// open(path, pathlen) → fd or -1
-// path: pointer to an 11-byte 8.3 name (uppercase, space-padded).
-// Allocates the lowest free fd in the calling task's fd_table.
-static uint64_t sys_open(uint64_t path, uint64_t pathlen) {
+// open(path_ptr, pathlen) → fd or -1
+// path: absolute path, e.g. "/bin/sh", "/dev/kbd", "/dev/vga".
+// Allocates the lowest free fd >= 3 in the calling task's fd_table.
+static uint64_t sys_open(uint64_t path_ptr, uint64_t pathlen) {
     if (!g_current) return (uint64_t)-1;
-    // Need exactly 11 bytes for an 8.3 name.
-    if (pathlen < 11) return (uint64_t)-1;
+    if (pathlen == 0 || pathlen > 255) return (uint64_t)-1;
 
-    const char* name = (const char*)path;
-    vfs_file_t* f = fat32_open(name);
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    vfs_file_t* f = NULL;
+
+    // /dev/ dispatch — map device names to built-in vfs_file_t objects.
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
+        const char* dev = path + 5;
+        uint8_t match_kbd = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
+        uint8_t match_vga = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
+        if      (match_kbd) f = vfs_kbd_open();
+        else if (match_vga) f = vfs_vga_open();
+        else return (uint64_t)-1;
+    } else {
+        f = ext2_open(path);
+    }
+
     if (!f) return (uint64_t)-1;
 
     // Find the lowest free fd (skip 0/1/2 which are stdin/stdout/stderr).
-    // Grow the table if all slots are occupied.
     for (uint32_t fd = 3; ; fd++) {
         if (fd >= g_current->files_shared->fd_capacity) {
             if (!fd_table_grow(g_current->files_shared)) {
@@ -104,7 +119,7 @@ static uint64_t sys_open(uint64_t path, uint64_t pathlen) {
 // close(fd) → 0 or -1
 static uint64_t sys_close(uint64_t fd) {
     if (!g_current) return (uint64_t)-1;
-    if (fd < 3 || fd >= g_current->files_shared->fd_capacity) return (uint64_t)-1;  // protect 0/1/2
+    if (fd >= g_current->files_shared->fd_capacity) return (uint64_t)-1;
     vfs_file_t* f = g_current->files_shared->fd_table[fd];
     if (!f) return (uint64_t)-1;
     vfs_close(f);
@@ -128,7 +143,7 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     // Query current brk.
     if (new_brk_raw == 0) return mm->brk;
 
-    virt_addr_t new_brk = new_brk_raw & ~PAGE_MASK; // page-align down
+    virt_addr_t new_brk = new_brk_raw; // exact value; demand-paging handles granularity
 
     // Reject below heap start.
     if (new_brk < mm->brk_start) return (uint64_t)-1;
@@ -206,8 +221,11 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 
 // ── sys_exit ──────────────────────────────────────────────────────────────
 static uint64_t sys_exit(uint64_t code) {
-    (void)code;
-    if (g_current) g_current->state = TASK_DEAD;
+    if (g_current) {
+        g_current->exit_code = (int32_t)(int)code;
+        g_current->state = TASK_ZOMBIE;
+        sched_add_zombie(g_current);
+    }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
     return 0;
@@ -271,60 +289,22 @@ static uint64_t sys_fork(void) {
     return (uint64_t)child->pid;
 }
 
-// ── helper: convert a filename to 8.3 format ──────────────────────────────
-static void filename_to_83(const char* name, char out[11]) {
-    for (int i = 0; i < 11; i++) out[i] = ' ';
-    // Find last dot.
-    int dot = -1;
-    for (int i = 0; name[i]; i++) if (name[i] == '.') dot = i;
-    // Name part (up to 8).
-    int n = (dot >= 0) ? dot : 0;
-    for (int i = 0; name[i] && i < n; i++) n = i + 1;
-    if (dot < 0) {
-        // no dot — whole name is the name part
-        n = 0;
-        for (int i = 0; name[i]; i++) n++;
-    }
-    if (n > 8) n = 8;
-    for (int i = 0; i < n; i++) {
-        char c = name[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        out[i] = c;
-    }
-    // Extension (up to 3).
-    if (dot >= 0) {
-        const char* ext = name + dot + 1;
-        for (int i = 0; i < 3 && ext[i]; i++) {
-            char c = ext[i];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            out[8 + i] = c;
-        }
-    }
-}
-
 // ── sys_exec ──────────────────────────────────────────────────────────────
-static uint64_t sys_exec(uint64_t name_ptr, uint64_t namelen) {
+// exec(path_ptr, pathlen) — replaces current address space with ELF at path.
+static uint64_t sys_exec(uint64_t path_ptr, uint64_t pathlen) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-1;
-    if (namelen == 0 || namelen > 64) return (uint64_t)-1;
+    if (pathlen == 0 || pathlen > 255) return (uint64_t)-1;
 
-    // Copy filename from user space.
-    char name_buf[65];
-    const char* uname = (const char*)name_ptr;
-    uint64_t len = namelen < 64 ? namelen : 64;
-    for (uint64_t i = 0; i < len; i++) name_buf[i] = uname[i];
-    name_buf[len] = '\0';
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
 
-    // Convert to 8.3.
-    char name83[11];
-    filename_to_83(name_buf, name83);
-
-    // Load ELF from FAT32 into a new address space.
     phys_addr_t new_pml4;
     mm_t*       new_mm;
     uint64_t    entry;
 
-    // Read the file.
-    vfs_file_t* f = fat32_open(name83);
+    vfs_file_t* f = ext2_open(path);
     if (!f) return (uint64_t)-1;
 
     const uint64_t MAX_ELF = 1024ULL * 1024ULL;
@@ -338,11 +318,9 @@ static uint64_t sys_exec(uint64_t name_ptr, uint64_t namelen) {
 
     uint8_t ok = elf_load_into(buf, (uint64_t)n, &new_pml4, &new_mm, &entry);
     kfree(buf);
-
     if (!ok) return (uint64_t)-1;
 
-    // Replace the current task's address space.
-    // Free old address space.
+    // Swap in the new address space.
     vmm_free_user(g_current->mm_shared->pml4_phys);
     pmm_buddy_free(g_current->mm_shared->pml4_phys, 0);
     mm_destroy(g_current->mm_shared->mm);
@@ -350,12 +328,10 @@ static uint64_t sys_exec(uint64_t name_ptr, uint64_t namelen) {
     g_current->mm_shared->pml4_phys = new_pml4;
     g_current->mm_shared->mm        = new_mm;
 
-    // Set exec globals so syscall_entry.asm redirects sysretq.
     g_exec_entry     = entry;
     g_exec_rsp       = VMM_USER_STACK_TOP;
     g_exec_pml4      = new_pml4;
     g_exec_requested = 1;
-
     return 0;
 }
 
@@ -468,9 +444,25 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
 }
 
 // ── sys_wait ──────────────────────────────────────────────────────────────
-static uint64_t sys_wait(uint64_t pid) {
-    sched_wait_pid((uint32_t)pid);
-    return 0;
+// wait(pid, *status): wait for child pid to exit, fill *status with encoded
+// exit code (POSIX: (exit_code & 0xFF) << 8), return child pid.
+static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr) {
+    uint32_t pid = (uint32_t)pid_arg;
+    sched_wait_pid(pid);
+    task_t* z = sched_reap_zombie(pid);
+    if (z) {
+        int32_t code = z->exit_code;
+        uint32_t child_pid = z->pid;
+        process_destroy(z);
+        if (status_ptr) {
+            int* sp = (int*)(uintptr_t)status_ptr;
+            *sp = (int)((code & 0xFF) << 8);
+        }
+        return (uint64_t)child_pid;
+    }
+    // Killed by signal — no zombie, return pid with status=0.
+    if (status_ptr) { int* sp = (int*)(uintptr_t)status_ptr; *sp = 0; }
+    return (uint64_t)pid;
 }
 
 // ── sys_getpid ────────────────────────────────────────────────────────────
@@ -479,21 +471,167 @@ static uint64_t sys_getpid(void) {
 }
 
 // ── sys_readdir ───────────────────────────────────────────────────────────
-static uint64_t sys_readdir(uint64_t buf_ptr, uint64_t max_entries) {
+// readdir(path_ptr, pathlen, buf_ptr, max) → entry count or -1
+// buf_ptr points to an array of ext2_entry_t in user space.
+static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
+                             uint64_t buf_ptr,  uint64_t max_entries) {
     if (!buf_ptr || max_entries == 0) return 0;
+    if (pathlen == 0 || pathlen > 255) return (uint64_t)-1;
     if (max_entries > 256) max_entries = 256;
 
-    fat32_entry_t* kbuf = kmalloc(max_entries * sizeof(fat32_entry_t));
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) return (uint64_t)-1;
 
-    int count = fat32_readdir(kbuf, (int)max_entries);
+    int count = ext2_readdir(path, kbuf, (int)max_entries);
+    if (count < 0) { kfree(kbuf); return (uint64_t)-1; }
 
-    // Copy to user buffer.
-    fat32_entry_t* ubuf = (fat32_entry_t*)buf_ptr;
+    ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
     for (int i = 0; i < count; i++) ubuf[i] = kbuf[i];
 
     kfree(kbuf);
     return (uint64_t)count;
+}
+
+// ── sys_stat ──────────────────────────────────────────────────────────────
+// stat(path_ptr, pathlen, stat_ptr) → 0 or -1
+// Finds the entry in the parent directory to get inode, size, and type.
+static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr) {
+    if (!g_current || pathlen == 0 || pathlen > 255 || !stat_ptr) return (uint64_t)-1;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    // Special case: root directory.
+    if (path[0] == '/' && path[1] == '\0') {
+        stat_t* st = (stat_t*)stat_ptr;
+        st->ino    = 2;
+        st->size   = 0;
+        st->mode   = 0x41ED;
+        st->is_dir = 1;
+        st->_pad   = 0;
+        return 0;
+    }
+
+    // Split into parent + basename, then scan parent entries.
+    // Find last '/' to get basename.
+    uint64_t last = 0;
+    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
+    const char* base = path + last + 1;
+    char parent[256];
+    if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
+    else { for (uint64_t i = 0; i < last; i++) parent[i] = path[i]; parent[last] = '\0'; }
+
+    ext2_entry_t* entries = kmalloc(256 * sizeof(ext2_entry_t));
+    if (!entries) return (uint64_t)-1;
+
+    int count = ext2_readdir(parent, entries, 256);
+    if (count < 0) { kfree(entries); return (uint64_t)-1; }
+
+    stat_t* st = (stat_t*)stat_ptr;
+    for (int i = 0; i < count; i++) {
+        // Compare entry name with basename.
+        const char* en = entries[i].name;
+        const char* bn = base;
+        while (*en && *en == *bn) { en++; bn++; }
+        if (*en == '\0' && *bn == '\0') {
+            st->ino    = entries[i].inode_num;
+            st->size   = entries[i].size;
+            st->mode   = entries[i].is_dir ? (uint16_t)0x41ED : (uint16_t)0x81A4;
+            st->is_dir = entries[i].is_dir;
+            st->_pad   = 0;
+            kfree(entries);
+            return 0;
+        }
+    }
+    kfree(entries);
+    return (uint64_t)-1;
+}
+
+// ── sys_unlink ────────────────────────────────────────────────────────────
+// unlink(path_ptr, pathlen) → 0 or -1
+static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
+    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-1;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    return ext2_unlink(path) ? 0 : (uint64_t)-1;
+}
+
+// ── sys_rename ────────────────────────────────────────────────────────────
+// rename(src_ptr, srclen, dst_ptr, dstlen) → 0 or -1
+static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
+                            uint64_t dst_ptr, uint64_t dstlen) {
+    if (!g_current) return (uint64_t)-1;
+    if (srclen == 0 || srclen > 255 || dstlen == 0 || dstlen > 255) return (uint64_t)-1;
+
+    char src[256], dst[256];
+    const char* usrc = (const char*)src_ptr;
+    const char* udst = (const char*)dst_ptr;
+    for (uint64_t i = 0; i < srclen; i++) src[i] = usrc[i];
+    src[srclen] = '\0';
+    for (uint64_t i = 0; i < dstlen; i++) dst[i] = udst[i];
+    dst[dstlen] = '\0';
+
+    return ext2_rename(src, dst) ? 0 : (uint64_t)-1;
+}
+
+// ── sys_getcwd ────────────────────────────────────────────────────────────
+// getcwd(buf_ptr, buflen) → 0 or -1
+static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
+    if (!g_current || !buf_ptr || buflen == 0) return (uint64_t)-1;
+
+    char* ubuf = (char*)buf_ptr;
+    const char* cwd = g_current->cwd;
+    uint64_t i = 0;
+    while (i + 1 < buflen && cwd[i]) { ubuf[i] = cwd[i]; i++; }
+    ubuf[i] = '\0';
+    return 0;
+}
+
+// ── sys_chdir ─────────────────────────────────────────────────────────────
+// chdir(path_ptr, pathlen) → 0 or -1
+static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
+    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-1;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    // Verify it's a valid directory.
+    ext2_entry_t tmp[1];
+    if (ext2_readdir(path, tmp, 1) < 0) return (uint64_t)-1;
+
+    for (uint32_t i = 0; i < 255 && path[i]; i++) g_current->cwd[i] = path[i];
+    g_current->cwd[255] = '\0';
+    // Ensure null terminator at the right place.
+    uint32_t len = 0;
+    while (len < 255 && path[len]) len++;
+    g_current->cwd[len] = '\0';
+    return 0;
+}
+
+// ── sys_mkdir ─────────────────────────────────────────────────────────────
+// mkdir(path_ptr, pathlen) → 0 or -1
+static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
+    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-1;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+
+    return ext2_mkdir(path) ? 0 : (uint64_t)-1;
 }
 
 // ── serial helper (debug only) ────────────────────────────────────────────
@@ -528,12 +666,18 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;
         case SYS_FORK:    ret = sys_fork();                         break;
         case SYS_EXEC:    ret = sys_exec(arg1, arg2);              break;
-        case SYS_WAIT:    ret = sys_wait(arg1);                    break;
+        case SYS_WAIT:    ret = sys_wait(arg1, arg2);              break;
         case SYS_GETPID:  ret = sys_getpid();                      break;
-        case SYS_READDIR: ret = sys_readdir(arg1, arg2);           break;
+        case SYS_READDIR: ret = sys_readdir(arg1, arg2, arg3, arg4); break;
         case SYS_SPAWN:   ret = sys_spawn(arg1, arg2);             break;
         case SYS_THREAD:   ret = sys_thread(arg1, arg2, arg3);     break;
         case SYS_CLOCK_NS: ret = tsc_read_ns();                    break;
+        case SYS_STAT:    ret = sys_stat(arg1, arg2, arg3);        break;
+        case SYS_UNLINK:  ret = sys_unlink(arg1, arg2);            break;
+        case SYS_RENAME:  ret = sys_rename(arg1, arg2, arg3, arg4); break;
+        case SYS_GETCWD:  ret = sys_getcwd(arg1, arg2);            break;
+        case SYS_CHDIR:   ret = sys_chdir(arg1, arg2);             break;
+        case SYS_MKDIR:   ret = sys_mkdir(arg1, arg2);             break;
         default:           ret = (uint64_t)-1;                     break;
     }
     // Deliver any signals that were queued during or before this syscall.

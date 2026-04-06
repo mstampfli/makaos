@@ -43,6 +43,13 @@ void sched_wake(task_t* proc);
 // Block current task until no task with the given pid is alive.
 void sched_wait_pid(uint32_t pid);
 
+// Add a zombie task to the zombie list (call from sys_exit before yielding).
+void sched_add_zombie(task_t* t);
+
+// Remove and return the zombie with the given pid (0 = any child).
+// Returns NULL if not found.  Caller is responsible for process_destroy.
+task_t* sched_reap_zombie(uint32_t pid);
+
 // Walk every task in every MLFQ level, calling cb(t, data) for each.
 void sched_for_each(void (*cb)(task_t*, void*), void* data);
 
