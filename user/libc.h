@@ -125,8 +125,12 @@ static inline int spawn(const char* path, size_t pathlen) {
     return (int)syscall2(SYS_SPAWN, (uint64_t)path, pathlen);
 }
 
-static inline int wait(int pid) {
-    return (int)syscall1(SYS_WAIT, (uint64_t)pid);
+// Macros for decoding the status filled by wait().
+#define WIFEXITED(s)   (((s) & 0xFF) == 0)
+#define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
+
+static inline int wait(int pid, int* status) {
+    return (int)syscall2(SYS_WAIT, (uint64_t)pid, (uint64_t)status);
 }
 
 static inline int getpid(void) {
@@ -184,11 +188,14 @@ static inline uint64_t brk(uint64_t new_brk) {
 size_t strlen(const char* s);
 void*  memset(void* dst, int c, size_t n);
 void*  memcpy(void* dst, const void* src, size_t n);
+void*  memmove(void* dst, const void* src, size_t n);
 int    strcmp(const char* a, const char* b);
 int    strncmp(const char* a, const char* b, size_t n);
 char*  strcpy(char* dst, const char* src);
 char*  strncpy(char* dst, const char* src, size_t n);
 char*  strchr(const char* s, int c);
+char*  strdup(const char* s);
+char*  strndup(const char* s, size_t max);
 
 // ── printf ────────────────────────────────────────────────────────────────
 
