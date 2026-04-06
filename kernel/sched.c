@@ -246,16 +246,33 @@ static void find_pid_cb(task_t* t, void* data) {
     if (t->pid == a->pid) a->found = 1;
 }
 
-void sched_wait_pid(uint32_t pid) {
+// Returns 1 if a matching zombie was found (or task is gone), 0 if still alive.
+// pid == 0 means "any child".
+uint8_t sched_wait_pid(uint32_t pid) {
     for (;;) {
-        // Done if zombie (exited via sys_exit) or gone (killed).
+        // Check zombie list.
         task_t* z = s_zombie_head;
-        while (z) { if (z->pid == pid) return; z = z->next; }
+        while (z) {
+            if (pid == 0 || z->pid == pid) return 1;
+            z = z->next;
+        }
+        if (pid == 0) { sched_yield(); continue; } // any: keep waiting
+        // Specific pid: check if still alive anywhere.
         wait_pid_arg_t a = {pid, 0};
         sched_for_each(find_pid_cb, &a);
-        if (!a.found) break;
+        if (!a.found) return 1; // gone (killed without zombie)
         sched_yield();
     }
+}
+
+// Non-blocking variant: returns 1 if zombie ready, 0 if not.
+uint8_t sched_poll_pid(uint32_t pid) {
+    task_t* z = s_zombie_head;
+    while (z) {
+        if (pid == 0 || z->pid == pid) return 1;
+        z = z->next;
+    }
+    return 0;
 }
 
 // ── sched_for_each ────────────────────────────────────────────────────────

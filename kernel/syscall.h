@@ -22,8 +22,18 @@
 #define SYS_RENAME  17  // rename(src_ptr,srclen,dst_ptr,dstlen) → 0 or -1
 #define SYS_GETCWD  18  // getcwd(buf_ptr, buflen)     → 0 or -1
 #define SYS_CHDIR   19  // chdir(path_ptr, pathlen)    → 0 or -1
-#define SYS_MKDIR   20  // mkdir(path_ptr, pathlen)    → 0 or -1
-#define SYS_LSEEK   21  // lseek(fd, offset, whence)   → new offset or -errno
+#define SYS_MKDIR    20  // mkdir(path_ptr, pathlen)            → 0 or -errno
+#define SYS_LSEEK    21  // lseek(fd, offset, whence)           → new offset or -errno
+#define SYS_GETPPID  22  // getppid()                           → parent pid
+#define SYS_DUP      23  // dup(oldfd)                          → new fd or -errno
+#define SYS_DUP2     24  // dup2(oldfd, newfd)                  → newfd or -errno
+#define SYS_PIPE     25  // pipe(fds[2])                        → 0 or -errno
+#define SYS_SIGACTION 26 // sigaction(sig, handler, old)        → 0 or -errno
+#define SYS_SIGPROCMASK 27 // sigprocmask(how, set, oldset)     → 0 or -errno
+#define SYS_SIGRETURN 28 // sigreturn() — restore after handler → (no return)
+
+// waitpid options
+#define WNOHANG 1
 
 // ── stat_t (for SYS_STAT) ─────────────────────────────────────────────────
 typedef struct {
