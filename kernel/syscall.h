@@ -5,7 +5,7 @@
 #define SYS_WRITE   0   // write(fd, buf, len)        → bytes written
 #define SYS_EXIT    1   // exit(code)                  → does not return
 #define SYS_READ    2   // read(fd, buf, len, flags)   → bytes read
-#define SYS_OPEN    3   // open(path, len)             → fd, or -1 on error
+#define SYS_OPEN    3   // open(path_ptr, pathlen)     → fd, or -1 on error
 #define SYS_CLOSE   4   // close(fd)                   → 0 or -1
 #define SYS_BRK     5   // brk(new_brk)               → new brk, or -1 on error
 #define SYS_KILL    6   // kill(pid, sig)              → 0 or -1
@@ -13,10 +13,25 @@
 #define SYS_EXEC    8   // exec(name, len)             → doesn't return on success
 #define SYS_WAIT    9   // wait(pid)                   → 0 when child exits
 #define SYS_GETPID  10  // getpid()                    → current pid
-#define SYS_READDIR 11  // readdir(buf, max)           → entry count
+#define SYS_READDIR 11  // readdir(path,pathlen,buf,max) → entry count or -1
 #define SYS_SPAWN   12  // spawn(path, pathlen)        → child pid, or -1
 #define SYS_THREAD  13  // thread(entry, stack_top)    → tid, or -1
 #define SYS_CLOCK_NS 14 // clock_ns()                  → nanoseconds since boot
+#define SYS_STAT    15  // stat(path_ptr, pathlen, stat_ptr) → 0 or -1
+#define SYS_UNLINK  16  // unlink(path_ptr, pathlen)   → 0 or -1
+#define SYS_RENAME  17  // rename(src_ptr,srclen,dst_ptr,dstlen) → 0 or -1
+#define SYS_GETCWD  18  // getcwd(buf_ptr, buflen)     → 0 or -1
+#define SYS_CHDIR   19  // chdir(path_ptr, pathlen)    → 0 or -1
+#define SYS_MKDIR   20  // mkdir(path_ptr, pathlen)    → 0 or -1
+
+// ── stat_t (for SYS_STAT) ─────────────────────────────────────────────────
+typedef struct {
+    uint32_t ino;
+    uint32_t size;
+    uint16_t mode;
+    uint8_t  is_dir;
+    uint8_t  _pad;
+} stat_t;
 
 #define SYS_READ_NONBLOCK 1
 

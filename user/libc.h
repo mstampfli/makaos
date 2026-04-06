@@ -1,5 +1,30 @@
 #pragma once
 
+// ── errno constants ───────────────────────────────────────────────────────
+#define EPERM        1
+#define ENOENT       2
+#define ESRCH        3
+#define EINTR        4
+#define EIO          5
+#define EBADF        9
+#define ECHILD      10
+#define EAGAIN      11
+#define ENOMEM      12
+#define EACCES      13
+#define EEXIST      17
+#define ENOTDIR     20
+#define EISDIR      21
+#define EINVAL      22
+#define ENFILE      23
+#define ENOSPC      28
+#define ERANGE      34
+#define ENOTEMPTY   39
+#define ENOSYS      38
+#define ENOEXEC      8
+
+// ── errno global ──────────────────────────────────────────────────────────
+extern int errno;
+
 // ── Basic types ───────────────────────────────────────────────────────────
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -84,26 +109,35 @@ static inline uint64_t syscall0(uint64_t nr) {
     return syscall4(nr, 0, 0, 0, 0);
 }
 
+// ── errno-aware return helper ─────────────────────────────────────────────
+// Kernel returns -(errno) on failure (Linux convention).
+// If the raw return value is in (-4096, 0), set errno and return -1.
+static inline long __syscall_ret(uint64_t r) {
+    long v = (long)r;
+    if (v < 0 && v > -4096) { errno = (int)-v; return -1; }
+    return v;
+}
+
 // ── I/O ──────────────────────────────────────────────────────────────────
 
 static inline ssize_t write(int fd, const void* buf, size_t len) {
-    return (ssize_t)syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, len);
+    return (ssize_t)__syscall_ret(syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, len));
 }
 
 static inline ssize_t read(int fd, void* buf, size_t len) {
-    return (ssize_t)syscall3(SYS_READ, (uint64_t)fd, (uint64_t)buf, len);
+    return (ssize_t)__syscall_ret(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)buf, len));
 }
 
 static inline ssize_t read_nonblock(int fd, void* buf, size_t len) {
-    return (ssize_t)syscall4(SYS_READ, (uint64_t)fd, (uint64_t)buf, len, SYS_READ_NONBLOCK);
+    return (ssize_t)__syscall_ret(syscall4(SYS_READ, (uint64_t)fd, (uint64_t)buf, len, SYS_READ_NONBLOCK));
 }
 
 static inline int open(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_OPEN, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_OPEN, (uint64_t)path, pathlen));
 }
 
 static inline int close(int fd) {
-    return (int)syscall1(SYS_CLOSE, (uint64_t)fd);
+    return (int)__syscall_ret(syscall1(SYS_CLOSE, (uint64_t)fd));
 }
 
 // ── Process ───────────────────────────────────────────────────────────────
@@ -114,15 +148,15 @@ __attribute__((noreturn)) static inline void exit(int code) {
 }
 
 static inline int fork(void) {
-    return (int)syscall0(SYS_FORK);
+    return (int)__syscall_ret(syscall0(SYS_FORK));
 }
 
 static inline int exec(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_EXEC, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, pathlen));
 }
 
 static inline int spawn(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_SPAWN, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_SPAWN, (uint64_t)path, pathlen));
 }
 
 // Macros for decoding the status filled by wait().
@@ -130,57 +164,57 @@ static inline int spawn(const char* path, size_t pathlen) {
 #define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
 
 static inline int wait(int pid, int* status) {
-    return (int)syscall2(SYS_WAIT, (uint64_t)pid, (uint64_t)status);
+    return (int)__syscall_ret(syscall2(SYS_WAIT, (uint64_t)pid, (uint64_t)status));
 }
 
 static inline int getpid(void) {
-    return (int)syscall0(SYS_GETPID);
+    return (int)syscall0(SYS_GETPID);  // never fails
 }
 
 static inline int kill(int pid, int sig) {
-    return (int)syscall2(SYS_KILL, (uint64_t)pid, (uint64_t)sig);
+    return (int)__syscall_ret(syscall2(SYS_KILL, (uint64_t)pid, (uint64_t)sig));
 }
 
 static inline uint64_t thread(uint64_t entry, uint64_t stack_top, uint64_t flags) {
-    return syscall3(SYS_THREAD, entry, stack_top, flags);
+    return (uint64_t)__syscall_ret(syscall3(SYS_THREAD, entry, stack_top, flags));
 }
 
 static inline uint64_t clock_ns(void) {
-    return syscall0(SYS_CLOCK_NS);
+    return syscall0(SYS_CLOCK_NS);  // never fails
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────
 
 static inline int stat(const char* path, size_t pathlen, stat_t* st) {
-    return (int)syscall3(SYS_STAT, (uint64_t)path, pathlen, (uint64_t)st);
+    return (int)__syscall_ret(syscall3(SYS_STAT, (uint64_t)path, pathlen, (uint64_t)st));
 }
 
 static inline int unlink(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_UNLINK, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_UNLINK, (uint64_t)path, pathlen));
 }
 
 static inline int rename(const char* src, size_t srclen, const char* dst, size_t dstlen) {
-    return (int)syscall4(SYS_RENAME, (uint64_t)src, srclen, (uint64_t)dst, dstlen);
+    return (int)__syscall_ret(syscall4(SYS_RENAME, (uint64_t)src, srclen, (uint64_t)dst, dstlen));
 }
 
 static inline int getcwd(char* buf, size_t buflen) {
-    return (int)syscall2(SYS_GETCWD, (uint64_t)buf, buflen);
+    return (int)__syscall_ret(syscall2(SYS_GETCWD, (uint64_t)buf, buflen));
 }
 
 static inline int chdir(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_CHDIR, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_CHDIR, (uint64_t)path, pathlen));
 }
 
 static inline int mkdir(const char* path, size_t pathlen) {
-    return (int)syscall2(SYS_MKDIR, (uint64_t)path, pathlen);
+    return (int)__syscall_ret(syscall2(SYS_MKDIR, (uint64_t)path, pathlen));
 }
 
 static inline int readdir(const char* path, size_t pathlen, dirent_t* buf, int max) {
-    return (int)syscall4(SYS_READDIR, (uint64_t)path, pathlen, (uint64_t)buf, (uint64_t)max);
+    return (int)__syscall_ret(syscall4(SYS_READDIR, (uint64_t)path, pathlen, (uint64_t)buf, (uint64_t)max));
 }
 
 static inline uint64_t brk(uint64_t new_brk) {
-    return syscall1(SYS_BRK, new_brk);
+    return syscall1(SYS_BRK, new_brk);  // returns address, not error code
 }
 
 // ── String functions ──────────────────────────────────────────────────────

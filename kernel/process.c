@@ -111,6 +111,8 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    t->cwd[0] = '/';
+    t->cwd[1] = '\0';
 }
 
 // ── task_create_kthread ───────────────────────────────────────────────────
@@ -210,7 +212,9 @@ void task_destroy(task_t* t) {
 }
 
 // ── task_fork ─────────────────────────────────────────────────────────────
-task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp) {
+task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp,
+                  uint64_t user_rbp, uint64_t user_rbx,
+                  uint64_t user_r12, uint64_t user_r13, uint64_t user_r14, uint64_t user_r15) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
 
@@ -254,6 +258,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    for (int _i = 0; _i < 256; _i++) t->cwd[_i] = parent->cwd[_i];
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
@@ -263,9 +268,14 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     *(--stk) = user_rflags;
     *(--stk) = user_rip;
     *(--stk) = (uint64_t)fork_trampoline;
-    *(--stk) = 0; *(--stk) = 0; // rbx, rbp
-    *(--stk) = 0; *(--stk) = 0; // r12, r13
-    *(--stk) = 0; *(--stk) = 0; // r14, r15
+    // context_switch pops: r15, r14, r13, r12, rbp, rbx (in that order).
+    // Restore the parent's user callee-saved regs so the child returns correctly.
+    *(--stk) = user_rbx;
+    *(--stk) = user_rbp;
+    *(--stk) = user_r12;
+    *(--stk) = user_r13;
+    *(--stk) = user_r14;
+    *(--stk) = user_r15;
     t->ctx.rsp = (uint64_t)stk;
 
     return t;

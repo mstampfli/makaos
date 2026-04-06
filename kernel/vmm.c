@@ -324,6 +324,20 @@ uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
 struct task_t;
 extern struct task_t* g_current;
 
+static void ser_hex64(uint64_t v) {
+    const char* h = "0123456789ABCDEF";
+    char buf[19]; buf[0]='0'; buf[1]='x';
+    for (int i = 0; i < 16; i++) buf[2+i] = h[(v >> (60 - i*4)) & 0xF];
+    buf[18] = '\n';
+    for (int i = 0; i < 19; i++) {
+        while (!(inb(0x3F8+5) & 0x20));
+        outb(0x3F8, (uint8_t)buf[i]);
+    }
+}
+static void ser_str(const char* s) {
+    for (; *s; s++) { while (!(inb(0x3F8+5) & 0x20)); outb(0x3F8, (uint8_t)*s); }
+}
+
 static void kill_current(void) {
     extern void signal_send(struct task_t* t, int sig);
     extern void signal_deliver_pending(void);
@@ -392,6 +406,25 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         return; // fault resolved
 
     kill:
+        ser_str("PF-KILL ec=");  ser_hex64(ec);
+        ser_str("  CR2=");       ser_hex64(fault_addr);
+        ser_str("  RIP=");       ser_hex64(f->ip);
+        ser_str("  RSP=");       ser_hex64(f->sp);
+        ser_str("  p="); ser_hex64(is_present);
+        ser_str("  w="); ser_hex64(is_write);
+        ser_str("  x="); ser_hex64(is_ifetch);
+        if (g_current) {
+            extern mm_t* task_get_mm(void*);
+            mm_t* dbg_mm = task_get_mm(g_current);
+            if (dbg_mm) {
+                ser_str("  VMAs:\n");
+                for (vma_t* v = dbg_mm->vmas; v; v = v->next) {
+                    ser_str("    ["); ser_hex64(v->start);
+                    ser_str(" - ");  ser_hex64(v->end);
+                    ser_str("] f="); ser_hex64(v->flags);
+                }
+            }
+        }
         kill_current();
         return;
     }
