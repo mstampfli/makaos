@@ -82,17 +82,29 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
 }
 
 // ── sys_open ──────────────────────────────────────────────────────────────
-// open(path_ptr, pathlen) → fd or -1
-// path: absolute path, e.g. "/bin/sh", "/dev/kbd", "/dev/vga".
-// Allocates the lowest free fd >= 3 in the calling task's fd_table.
-static uint64_t sys_open(uint64_t path_ptr, uint64_t pathlen) {
-    if (!g_current) return (uint64_t)-EINVAL;
-    if (pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+// open(path_ptr, flags, mode) → fd or -errno
+// path: null-terminated absolute path.
+// flags: O_RDONLY(0), O_WRONLY(1), O_RDWR(2), O_CREAT(0x40),
+//        O_EXCL(0x80), O_TRUNC(0x200), O_APPEND(0x400).
+// mode: ignored (no permission model yet).
+#define O_RDONLY  0
+#define O_WRONLY  1
+#define O_RDWR    2
+#define O_CREAT   0x040
+#define O_EXCL    0x080
+#define O_TRUNC   0x200
+#define O_APPEND  0x400
+static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
+    (void)mode;
+    if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
+    // Copy null-terminated path from user space.
     char path[256];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    uint64_t i = 0;
+    while (i < 255 && upath[i]) { path[i] = upath[i]; i++; }
+    path[i] = '\0';
+    if (i == 0) return (uint64_t)-EINVAL;
 
     vfs_file_t* f = NULL;
 
@@ -106,9 +118,23 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t pathlen) {
         else return (uint64_t)-ENOENT;
     } else {
         f = ext2_open(path);
+        if (f && (flags & O_CREAT) && (flags & O_EXCL)) {
+            // O_CREAT|O_EXCL: file must not already exist.
+            vfs_close(f);
+            return (uint64_t)-EEXIST;
+        }
+        if (!f && (flags & O_CREAT)) {
+            // Create empty file then open it.
+            if (!ext2_create(path)) return (uint64_t)-EIO;
+            f = ext2_open(path);
+        }
     }
 
     if (!f) return (uint64_t)-ENOENT;
+
+    // O_TRUNC: truncate to zero on open (write modes only).
+    if ((flags & O_TRUNC) && (flags & (O_WRONLY | O_RDWR)))
+        ext2_truncate(path);
 
     // Find the lowest free fd (skip 0/1/2 which are stdin/stdout/stderr).
     for (uint32_t fd = 3; ; fd++) {
@@ -654,6 +680,19 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     return ext2_mkdir(path) ? 0 : (uint64_t)-EIO;
 }
 
+// ── sys_lseek ─────────────────────────────────────────────────────────────
+// lseek(fd, offset, whence) → new file offset, or -errno
+static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
+    if (!g_current || fd >= g_current->files_shared->fd_capacity)
+        return (uint64_t)-EBADF;
+    vfs_file_t* f = g_current->files_shared->fd_table[fd];
+    if (!f) return (uint64_t)-EBADF;
+    if (!f->seek) return (uint64_t)-EINVAL;  // non-seekable (device, pipe)
+    int64_t r = f->seek(f, (int64_t)offset, (int)(int64_t)whence);
+    if (r < 0) return (uint64_t)-EINVAL;
+    return (uint64_t)r;
+}
+
 // ── serial helper (debug only) ────────────────────────────────────────────
 static void serial_putc(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
@@ -680,7 +719,7 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_WRITE:   ret = sys_write(arg1, arg2, arg3);      break;
         case SYS_EXIT:    ret = sys_exit(arg1);                    break;
         case SYS_READ:    ret = sys_read(arg1, arg2, arg3, arg4);  break;
-        case SYS_OPEN:    ret = sys_open(arg1, arg2);              break;
+        case SYS_OPEN:    ret = sys_open(arg1, arg2, arg3);         break;
         case SYS_CLOSE:   ret = sys_close(arg1);                   break;
         case SYS_BRK:     ret = sys_brk(arg1);                     break;
         case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;
@@ -698,7 +737,8 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETCWD:  ret = sys_getcwd(arg1, arg2);            break;
         case SYS_CHDIR:   ret = sys_chdir(arg1, arg2);             break;
         case SYS_MKDIR:   ret = sys_mkdir(arg1, arg2);             break;
-        default:           ret = (uint64_t)-1;                     break;
+        case SYS_LSEEK:   ret = sys_lseek(arg1, arg2, arg3);      break;
+        default:           ret = (uint64_t)-ENOSYS;               break;
     }
     // Deliver any signals that were queued during or before this syscall.
     signal_deliver_pending();

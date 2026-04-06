@@ -61,6 +61,7 @@ typedef int64_t            ssize_t;
 #define SYS_GETCWD   18
 #define SYS_CHDIR    19
 #define SYS_MKDIR    20
+#define SYS_LSEEK    21
 
 #define SYS_READ_NONBLOCK 1
 
@@ -132,8 +133,17 @@ static inline ssize_t read_nonblock(int fd, void* buf, size_t len) {
     return (ssize_t)__syscall_ret(syscall4(SYS_READ, (uint64_t)fd, (uint64_t)buf, len, SYS_READ_NONBLOCK));
 }
 
-static inline int open(const char* path, size_t pathlen) {
-    return (int)__syscall_ret(syscall2(SYS_OPEN, (uint64_t)path, pathlen));
+// open() flags (POSIX)
+#define O_RDONLY  0
+#define O_WRONLY  1
+#define O_RDWR    2
+#define O_CREAT   0x040
+#define O_EXCL    0x080
+#define O_TRUNC   0x200
+#define O_APPEND  0x400
+
+static inline int open(const char* path, int flags, ...) {
+    return (int)__syscall_ret(syscall3(SYS_OPEN, (uint64_t)path, (uint64_t)flags, 0));
 }
 
 static inline int close(int fd) {
@@ -215,6 +225,15 @@ static inline int readdir(const char* path, size_t pathlen, dirent_t* buf, int m
 
 static inline uint64_t brk(uint64_t new_brk) {
     return syscall1(SYS_BRK, new_brk);  // returns address, not error code
+}
+
+// lseek whence values
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+static inline long lseek(int fd, long offset, int whence) {
+    return (long)__syscall_ret(syscall3(SYS_LSEEK, (uint64_t)fd, (uint64_t)offset, (uint64_t)whence));
 }
 
 // ── String functions ──────────────────────────────────────────────────────
