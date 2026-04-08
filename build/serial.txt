@@ -1,0 +1,14 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00005 " from PciRoot(0x0)/Pci(0x3,0x0)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00005 " from PciRoot(0x0)/Pci(0x3,0x0)/Sata(0x0,0xFFFF,0x0)
+MakaOS UEFI bootloader starting
+GOP fb=0x0000000080000000
+    w=0x0000000000000500
+    h=0x0000000000000320
+kernel.bin size=0x0000000000039B78
+kernel_phys=0x000000000C000000
+kernel loaded, bytes=0x0000000000039B78
+phys_ceiling=0x0000010000000000
+pml4_phys=0x000000000DFFA000
+Calling ExitBootServices...
+ExitBootServices OK
+K

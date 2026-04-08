@@ -70,48 +70,29 @@ __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const v
 #define NULL ((void*)0)
 
 typedef struct __attribute__((packed)) boot_info_t {
-    uint32_t sig0;
-    uint32_t sig1;
-    uint32_t sig2;
-    uint32_t sig3;
+    uint32_t sig0;   /* 0xB007EF11 */
+    uint32_t sig1;   /* 0xCAFEF00D */
 
-    uint16_t e820_dbg_flags_before;
-    uint16_t e820_dbg_es;
-    uint16_t e820_dbg_di;
+    /* Memory map (translated to e820 format by UEFI bootloader) */
+    uint16_t      e820_count;
+    e820_entry_t  e820_map[E820_MAX];
 
-    uint32_t e820_dbg_eax_before;
-    uint32_t e820_dbg_ebx_before;
-    uint32_t e820_dbg_ecx_before;
-    uint32_t e820_dbg_edx_before;
+    /* GOP linear framebuffer */
+    uint64_t fb_phys;      /* physical base address */
+    uint32_t fb_width;     /* horizontal resolution in pixels */
+    uint32_t fb_height;    /* vertical resolution in pixels */
+    uint32_t fb_pitch;     /* bytes per scanline */
+    uint32_t fb_bpp;       /* bits per pixel (32 for BGRX) */
 
-    uint16_t e820_dbg_flags_after;
-    uint8_t  e820_dbg_cf_after;
-    uint8_t  _pad1;
-
-    uint32_t e820_dbg_eax_after;
-    uint32_t e820_dbg_ebx_after;
-    uint32_t e820_dbg_ecx_after;
-    uint32_t e820_dbg_edx_after;
-
-    uint16_t e820_count;
-    e820_entry_t e820_map[E820_MAX];
-
-    uint16_t vbe_dbg_ax_4f01;
-    uint16_t vbe_dbg_ax_4f02;
-
-    uint16_t vbe_mode;
-    uint16_t vbe_w;
-    uint16_t vbe_h;
-    uint16_t vbe_pitch;
-    uint8_t  vbe_bpp;
-    uint8_t  _pad0;
-    uint32_t vbe_fb;
-    uint8_t  vbe_mode_info[256];
-
+    /* Kernel placement */
     uint64_t kernel_phys_base;
     uint64_t phys_ceiling;
-    uint64_t hhdm_offset;
+
+    /* Page table root built by UEFI bootloader */
     uint64_t pml4_phys;
+
+    /* HHDM offset (constant = 0xFFFF800000000000) */
+    uint64_t hhdm_offset;
 } boot_info_t;
 
 extern phys_addr_t KERNEL_BASE_PHYS;

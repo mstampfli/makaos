@@ -70,6 +70,12 @@ typedef int64_t            ssize_t;
 #define SYS_SIGACTION   26
 #define SYS_SIGPROCMASK 27
 #define SYS_SIGRETURN   28
+#define SYS_MMAP        29
+#define SYS_MUNMAP      30
+#define SYS_NANOSLEEP   31
+#define SYS_GETTOD      32
+#define SYS_FB_BLIT     33
+#define SYS_FB_INFO     34
 
 #define WNOHANG 1
 
@@ -301,9 +307,14 @@ static inline int unlink(const char* path, size_t pathlen) {
     return (int)__syscall_ret(syscall2(SYS_UNLINK, (uint64_t)path, pathlen));
 }
 
-static inline int rename(const char* src, size_t srclen, const char* dst, size_t dstlen) {
+static inline int sys_rename(const char* src, size_t srclen, const char* dst, size_t dstlen) {
     return (int)__syscall_ret(syscall4(SYS_RENAME, (uint64_t)src, srclen, (uint64_t)dst, dstlen));
 }
+// Default rename macro: 4-arg form for our own code.
+// The doom include shim overrides this with a 2-arg POSIX version.
+#ifndef _DOOM_RENAME_OVERRIDE
+#define rename(src, srclen, dst, dstlen) sys_rename(src, srclen, dst, dstlen)
+#endif
 
 static inline int getcwd(char* buf, size_t buflen) {
     return (int)__syscall_ret(syscall2(SYS_GETCWD, (uint64_t)buf, buflen));
@@ -340,25 +351,87 @@ size_t strlen(const char* s);
 void*  memset(void* dst, int c, size_t n);
 void*  memcpy(void* dst, const void* src, size_t n);
 void*  memmove(void* dst, const void* src, size_t n);
+int    memcmp(const void* a, const void* b, size_t n);
 int    strcmp(const char* a, const char* b);
 int    strncmp(const char* a, const char* b, size_t n);
+int    strcasecmp(const char* a, const char* b);
+int    strncasecmp(const char* a, const char* b, size_t n);
 char*  strcpy(char* dst, const char* src);
 char*  strncpy(char* dst, const char* src, size_t n);
+char*  strcat(char* dst, const char* src);
+char*  strncat(char* dst, const char* src, size_t n);
 char*  strchr(const char* s, int c);
 char*  strrchr(const char* s, int c);
 char*  strstr(const char* haystack, const char* needle);
 char*  strdup(const char* s);
 char*  strndup(const char* s, size_t max);
 long   strtol(const char* s, char** endptr, int base);
+unsigned long strtoul(const char* s, char** endptr, int base);
 long   atoi(const char* s);
 
-// ── printf ────────────────────────────────────────────────────────────────
+// ── printf / scanf ────────────────────────────────────────────────────────
 
 int printf(const char* fmt, ...);
+int sprintf(char* buf, const char* fmt, ...);
 int snprintf(char* buf, size_t size, const char* fmt, ...);
+int vsnprintf(char* buf, size_t size, const char* fmt, __builtin_va_list ap);
+int sscanf(const char* str, const char* fmt, ...);
+int puts(const char* s);
+int putchar(int c);
 
 // ── malloc / free ─────────────────────────────────────────────────────────
 
 void* malloc(size_t size);
 void  free(void* ptr);
 void* realloc(void* ptr, size_t new_size);
+void* calloc(size_t nmemb, size_t size);
+
+// ── Math helpers ──────────────────────────────────────────────────────────
+
+int    abs(int x);
+long   labs(long x);
+long long llabs(long long x);
+
+// ── Random number generation ──────────────────────────────────────────────
+
+int  rand(void);
+void srand(unsigned int seed);
+#define RAND_MAX 0x7FFFFFFF
+
+// ── Sorting ───────────────────────────────────────────────────────────────
+
+void qsort(void* base, size_t nmemb, size_t size,
+           int (*cmp)(const void*, const void*));
+
+// ── Time ──────────────────────────────────────────────────────────────────
+
+typedef long long time_t;
+typedef long      clock_t;
+#define CLOCKS_PER_SEC 1000
+
+time_t  time(time_t* tloc);
+clock_t clock(void);
+
+// ── POSIX timespec / nanosleep ────────────────────────────────────────────
+
+typedef struct { uint64_t tv_sec; uint64_t tv_nsec; } timespec_t;
+
+int nanosleep(const timespec_t* req, timespec_t* rem);
+
+// ── mmap / munmap ─────────────────────────────────────────────────────────
+
+#define PROT_NONE  0
+#define PROT_READ  1
+#define PROT_WRITE 2
+#define PROT_EXEC  4
+
+#define MAP_SHARED  0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED   0x10
+#define MAP_ANON    0x20
+#define MAP_ANONYMOUS MAP_ANON
+
+#define MAP_FAILED ((void*)-1)
+
+void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off);
+int   munmap(void* addr, size_t len);

@@ -1,8 +1,10 @@
 #include "idt.h"
 #include "signal.h"
 #include "sched.h"
+#include "fb.h"
 
-volatile uint16_t* g_vga = (volatile uint16_t*)(VGA_ADDR + HHDM_OFFSET);
+/* Kept as NULL for UEFI boots — legacy symbol referenced by signal.c */
+volatile uint16_t* g_vga = (volatile uint16_t*)0;
 
 __attribute__((aligned(16)))
 static idt_gate_t idt[256] = {0};
@@ -12,38 +14,7 @@ static inline void lidt(void* base, uint16_t size_minus_1) {
     __asm__ __volatile__("lidt %0" : : "m"(idtr));
 }
 
-static void vga_hex_draw(volatile uint16_t* v, uint64_t value, int row) {
-    const char* hex_chars = "0123456789ABCDEF";
-    int offset = row * 80; // Standard 80-column VGA mode
-    
-    // Prefix "0x"
-    v[offset++] = (uint16_t)'0' | (0x07 << 8);
-    v[offset++] = (uint16_t)'x' | (0x07 << 8);
-
-    // Process 16 nibbles for 64-bit value
-    for (int i = 60; i >= 0; i -= 4) {
-        uint8_t nibble = (value >> i) & 0xF;
-        v[offset++] = (uint16_t)hex_chars[nibble] | (0x07 << 8);
-    }
-}
-
-void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame) {
-
-    volatile uint16_t* v = g_vga; //VGA
-                                               
-    //for (int i = 0; i < 80 * 25; i++) v[i] = (uint16_t)' ' | (0x07 << 8);
-
-    for (uint32_t i = 0; msg[i] != '\0'; i++) {
-        v[i] = (uint16_t)msg[i] | (uint16_t)(0x07 << 8);
-    }
-
-    vga_hex_draw(v, frame->ip, 2);
-    vga_hex_draw(v, frame->sp, 3);
-    vga_hex_draw(v, frame->flags, 4);
-
-    for (;;) { __asm__ __volatile__("cli; hlt"); }
-}
-
+/* ── Panic output helpers (serial + framebuffer) ─────────────────────────── */
 static void serial_putc_idt(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
     outb(0x3F8, (uint8_t)c);
@@ -59,34 +30,53 @@ static void serial_hex_idt(uint64_t v) {
     serial_putc_idt('\n');
 }
 
+/* Write a line to the framebuffer at a fixed row (panic context, no scroll) */
+static void fb_panic_str(uint32_t row, const char* s, uint32_t fg) {
+    if (!g_fb.base_virt) return;
+    for (uint32_t col = 0; s[col] && col < fb_cols(); col++)
+        fb_putc_at(col, row, s[col], fg, FB_BLACK);
+}
+
+static void fb_panic_hex(uint32_t row, uint32_t col_start, uint64_t v) {
+    if (!g_fb.base_virt) return;
+    const char* hex = "0123456789ABCDEF";
+    char buf[19]; /* "0x" + 16 digits + NUL */
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++)
+        buf[2 + i] = hex[(v >> (60 - i * 4)) & 0xF];
+    buf[18] = '\0';
+    for (uint32_t i = 0; buf[i] && col_start + i < fb_cols(); i++)
+        fb_putc_at(col_start + i, row, buf[i], FB_YELLOW, FB_BLACK);
+}
+
+void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame) {
+    fb_panic_str(0, msg,       FB_LRED);
+    fb_panic_str(1, "RIP=",    FB_GRAY); fb_panic_hex(1, 4, frame->ip);
+    fb_panic_str(2, "RSP=",    FB_GRAY); fb_panic_hex(2, 4, frame->sp);
+    fb_panic_str(3, "RFLAGS=", FB_GRAY); fb_panic_hex(3, 7, frame->flags);
+
+    serial_puts_idt("EXCEPTION: "); serial_puts_idt(msg); serial_putc_idt('\n');
+    serial_puts_idt("ip="); serial_hex_idt(frame->ip);
+    serial_puts_idt("sp="); serial_hex_idt(frame->sp);
+
+    for (;;) { __asm__ __volatile__("cli; hlt"); }
+}
+
 void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_t error_code) {
-    volatile uint16_t* v = g_vga; //VGA
-
-    // Print message
-    for (uint32_t i = 0; msg[i] != '\0'; i++) {
-        v[i] = (uint16_t)msg[i] | (0x07 << 8);
-    }
-
-    // Print error code and CR2
     uint64_t cr2;
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
-    vga_hex_draw(v, error_code, 1);  // Error code
-    vga_hex_draw(v, cr2, 2);          // CR2 (faulting address)
-    vga_hex_draw(v, frame->ip, 3);    // RIP
-    vga_hex_draw(v, (uint64_t)frame, 4); // Frame pointer itself
-    uint64_t rsp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
-    vga_hex_draw(v, rsp, 5);          // Current RSP
+    fb_panic_str(0, msg,      FB_LRED);
+    fb_panic_str(1, "ec=",    FB_GRAY); fb_panic_hex(1, 3, error_code);
+    fb_panic_str(2, "CR2=",   FB_GRAY); fb_panic_hex(2, 4, cr2);
+    fb_panic_str(3, "RIP=",   FB_GRAY); fb_panic_hex(3, 4, frame->ip);
+    fb_panic_str(4, "RSP=",   FB_GRAY); fb_panic_hex(4, 4, frame->sp);
 
-    // Also dump to serial for headless debugging.
-    serial_puts_idt("EXCEPTION: ");
-    serial_puts_idt(msg);
-    serial_putc_idt('\n');
+    serial_puts_idt("EXCEPTION: "); serial_puts_idt(msg); serial_putc_idt('\n');
     serial_puts_idt("ec="); serial_hex_idt(error_code);
-    serial_puts_idt("ip="); serial_hex_idt(frame->ip);
-    serial_puts_idt("cs="); serial_hex_idt(frame->cs);
-    serial_puts_idt("sp="); serial_hex_idt(frame->sp);
+    serial_puts_idt("CR2="); serial_hex_idt(cr2);
+    serial_puts_idt("RIP="); serial_hex_idt(frame->ip);
+    serial_puts_idt("RSP="); serial_hex_idt(frame->sp);
 
     for (;;) { __asm__ __volatile__("cli; hlt"); }
 }
@@ -108,25 +98,11 @@ static void user_signal_or_halt_noec(interrupt_frame_t* f, int sig, const char* 
     isr_general_exception_no_ec(msg, f);
 }
 
-static void idc_ser_c(char c) { while (!(inb(0x3F8+5)&0x20)); outb(0x3F8,(uint8_t)c); }
-static void idc_ser_hex(uint64_t v) {
-    const char* h="0123456789ABCDEF";
-    idc_ser_c('0'); idc_ser_c('x');
-    for(int i=0;i<16;i++) idc_ser_c(h[(v>>(60-i*4))&0xF]);
-}
-static void ser_dbg_ec(const char* tag, interrupt_frame_t* f, uint64_t ec) {
-    for(const char*p=tag;*p;p++) idc_ser_c(*p);
-    idc_ser_c(' '); idc_ser_c('e'); idc_ser_c('c'); idc_ser_c('=');
-    idc_ser_hex(ec);
-    idc_ser_c(' '); idc_ser_c('R'); idc_ser_c('I'); idc_ser_c('P'); idc_ser_c('=');
-    idc_ser_hex(f->ip);
-    idc_ser_c(' '); idc_ser_c('R'); idc_ser_c('S'); idc_ser_c('P'); idc_ser_c('=');
-    idc_ser_hex(f->sp); idc_ser_c('\n');
-}
-
 static void user_signal_or_halt_ec(interrupt_frame_t* f, uint64_t ec, int sig, const char* msg) {
     if (from_user(f)) {
-        ser_dbg_ec(msg, f, ec);
+        serial_puts_idt(msg); serial_putc_idt(' ');
+        serial_puts_idt("ec="); serial_hex_idt(ec);
+        serial_puts_idt("ip="); serial_hex_idt(f->ip);
         signal_send(g_current, sig);
         signal_deliver_pending();
         return;

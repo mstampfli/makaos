@@ -16,10 +16,34 @@
 bits 64
 section .text
 
+; cpu_ctx_t field offsets (must match process.h):
+;   rsp      = 0
+;   rbx      = 8
+;   rbp      = 16
+;   r12      = 24
+;   r13      = 32
+;   r14      = 40
+;   r15      = 48
+;   _pad     = 56
+;   fxsave   = 64   (512 bytes, 16-byte aligned because struct is aligned(16))
+
+%define CTX_RSP      0
+%define CTX_RBX      8
+%define CTX_RBP      16
+%define CTX_R12      24
+%define CTX_R13      32
+%define CTX_R14      40
+%define CTX_R15      48
+%define CTX_FXSAVE   64
+
 global context_switch
 context_switch:
-    ; ── Save current (from) context ──────────────────────────────────────
-    ; Push callee-saved regs onto the current kernel stack.
+    ; ── Save FPU/SSE state of the outgoing task ───────────────────────────
+    ; FXSAVE requires 16-byte aligned memory; cpu_ctx_t is aligned(16) so
+    ; fxsave_buf at offset 64 is always 16-byte aligned.
+    fxsave  [rdi + CTX_FXSAVE]
+
+    ; ── Save integer callee-saved registers ──────────────────────────────
     push    rbx
     push    rbp
     push    r12
@@ -27,34 +51,23 @@ context_switch:
     push    r14
     push    r15
 
-    ; Save the stack pointer into from->rsp  (rdi = from)
-    ; cpu_ctx_t layout: rsp at offset 0, then rbx, rbp, r12, r13, r14, r15
-    ; We already pushed rbx..r15 so rsp now points at r15 on the stack.
-    ; Save it into from->rsp.
-    mov     [rdi + 0], rsp      ; from->rsp = rsp
-
-    ; Also save the individual registers into the struct (for debugging /
-    ; future use by a debugger that inspects the PCB directly).
-    mov     [rdi + 8],  rbx
-    mov     [rdi + 16], rbp
-    mov     [rdi + 24], r12
-    mov     [rdi + 32], r13
-    mov     [rdi + 40], r14
-    mov     [rdi + 48], r15
+    mov     [rdi + CTX_RSP], rsp
+    mov     [rdi + CTX_RBX], rbx
+    mov     [rdi + CTX_RBP], rbp
+    mov     [rdi + CTX_R12], r12
+    mov     [rdi + CTX_R13], r13
+    mov     [rdi + CTX_R14], r14
+    mov     [rdi + CTX_R15], r15
 
     ; ── Switch address space ──────────────────────────────────────────────
-    ; Write new_pml4 (rdx) to CR3.  This flushes the TLB.
-    ; Do this BEFORE switching rsp so we are still on a mapped stack.
     test    rdx, rdx
-    jz      .skip_cr3           ; new_pml4 == 0 → same address space, skip
+    jz      .skip_cr3
     mov     cr3, rdx
 .skip_cr3:
 
     ; ── Restore next (to) context ─────────────────────────────────────────
-    ; Switch to the new process's kernel stack (rsi = to).
-    mov     rsp, [rsi + 0]      ; rsp = to->rsp
+    mov     rsp, [rsi + CTX_RSP]
 
-    ; Pop callee-saved registers from the new stack.
     pop     r15
     pop     r14
     pop     r13
@@ -62,13 +75,9 @@ context_switch:
     pop     rbp
     pop     rbx
 
-    ; `ret` pops the return address that was pushed when THIS process
-    ; last called context_switch — jumping back into that process's
-    ; execution right after its context_switch call site.
-    ;
-    ; For a brand-new process (first time it runs), the return address is
-    ; proc_trampoline (placed by process_create).  r12 was also set by
-    ; process_create to the actual entry function — proc_trampoline uses it.
+    ; ── Restore FPU/SSE state of the incoming task ────────────────────────
+    fxrstor [rsi + CTX_FXSAVE]
+
     ret
 
 ; ── proc_trampoline ───────────────────────────────────────────────────────

@@ -68,48 +68,55 @@ global isr_common_entry
 %endmacro
 
 ; common entry
-; rdi = c handler address
-; rsi = 0 -> handler(frame*)
-;       1 -> handler(frame*, ec)
 ; Stack on entry MUST be:
-;   [ec][ip][cs][flags][sp][ss]
+;   [has_ec: 0 or 1][c_handler_ptr][ec][ip][cs][flags][sp][ss]
+; has_ec and c_handler_ptr are pushed by the ISR_NOEC/ISR_EC macros below,
+; AFTER saving all GPRs so that rdi/rsi are not clobbered before PUSH_GPRS.
 isr_common_entry:
   PUSH_GPRS
 
-  ; rbx -> start of CPU interrupt frame
-  lea rbx, [rsp + 15*8]
+  ; After PUSH_GPRS the stack looks like (low → high addresses):
+  ;   [15 GPRs × 8] [has_ec] [handler] [ec] [ip] [cs] [flags] [sp] [ss]
+  ;    rsp+0..112    rsp+120   rsp+128  rsp+136  ...
+  ; We use rbx as a scratch pointer into the CPU frame area.
+  lea rbx, [rsp + 15*8]   ; rbx → &has_ec
 
   ; Allocate interrupt_frame_t (5 qwords)
   sub rsp, 5*8
 
+  ; CPU frame fields are at rbx+0(has_ec) rbx+8(handler) rbx+16(ec)
+  ;   rbx+24(ip) rbx+32(cs) rbx+40(flags) rbx+48(sp) rbx+56(ss)
+
   ; frame.ip
-  mov rax, [rbx + 8]
+  mov rax, [rbx + 24]
   mov [rsp + 0], rax
 
   ; frame.cs
-  mov rax, [rbx + 16]
+  mov rax, [rbx + 32]
   mov [rsp + 8], rax
 
   ; frame.flags
-  mov rax, [rbx + 24]
+  mov rax, [rbx + 40]
   mov [rsp + 16], rax
 
   ; frame.sp
-  mov rax, [rbx + 32]
+  mov rax, [rbx + 48]
   mov [rsp + 24], rax
 
   ; frame.ss
-  mov rax, [rbx + 40]
+  mov rax, [rbx + 56]
   mov [rsp + 32], rax
 
-  ; Call handler
-  mov rcx, rdi          ; rcx = handler
-  lea rdi, [rsp]        ; arg0 = &frame
+  ; load handler pointer and has_ec flag
+  mov rcx, [rbx + 8]     ; rcx = c handler address
+  mov rdx, [rbx + 0]     ; rdx = has_ec flag
 
-  test rsi, rsi
+  lea rdi, [rsp]          ; arg0 = &frame
+
+  test rdx, rdx
   jz .call_no_ec
 
-  mov rsi, [rbx + 0]    ; arg1 = ec
+  mov rsi, [rbx + 16]     ; arg1 = ec
   call rcx
   jmp .after_call
 
@@ -117,28 +124,30 @@ isr_common_entry:
   call rcx
 
 .after_call:
-  add rsp, 5*8          ; pop interrupt_frame_t
+  add rsp, 5*8            ; pop interrupt_frame_t
 
   POP_GPRS
 
-  add rsp, 8            ; drop ec
+  add rsp, 8*3            ; drop has_ec + handler + ec
   iretq
 
 ; IDT entry generators
+; Push has_ec and handler BEFORE touching rdi/rsi so PUSH_GPRS saves originals.
 %macro ISR_NOEC 2
   global isr%1_entry
   isr%1_entry:
-    push qword 0        ; ec = 0
-    mov rdi, %2
-    xor rsi, rsi
+    push qword 0          ; ec = 0 (placeholder)
+    push qword %2         ; c handler address
+    push qword 0          ; has_ec = 0
     jmp isr_common_entry
 %endmacro
 
 %macro ISR_EC 2
   global isr%1_entry
   isr%1_entry:
-    mov rdi, %2
-    mov rsi, 1
+    ; ec already on stack (pushed by CPU)
+    push qword %2         ; c handler address
+    push qword 1          ; has_ec = 1
     jmp isr_common_entry
 %endmacro
 
