@@ -78,3 +78,7 @@ vfs_file_t* vfs_vga_open(void);
 // Returns a vfs_file_t backed by the PS/2 keyboard (read-only, blocking).
 // Also static — do NOT call vfs_close() on it.
 vfs_file_t* vfs_kbd_open(void);
+
+// Returns a vfs_file_t that delivers raw PS/2 scancodes (non-blocking).
+// Includes E0 prefixes and break codes (make | 0x80).
+vfs_file_t* vfs_kbdraw_open(void);

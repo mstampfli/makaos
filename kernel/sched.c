@@ -2,6 +2,7 @@
 #include "process.h"
 #include "signal.h"
 #include "timer.h"
+#include "tsc.h"
 #include "tss.h"
 #include "common.h"
 
@@ -102,6 +103,21 @@ void sched_add(task_t* proc) {
 
 void sched_tick(void) {
     s_tick_count++;
+
+    // Wake any sleeping tasks whose deadline has passed.
+    uint64_t now = tsc_read_ns();
+    task_t** pp = &s_sleep_head;
+    while (*pp) {
+        task_t* t = *pp;
+        if (t->sleep_until_ns && now >= t->sleep_until_ns) {
+            *pp = t->next;
+            t->next = NULL;
+            t->sleep_until_ns = 0;
+            enqueue(t);
+        } else {
+            pp = &t->next;
+        }
+    }
 
     // Priority boost: move every task in levels 1-3 back to level 0.
     if (s_tick_count % BOOST_INTERVAL == 0) {
@@ -257,10 +273,12 @@ uint8_t sched_wait_pid(uint32_t pid) {
             z = z->next;
         }
         if (pid == 0) { sched_yield(); continue; } // any: keep waiting
-        // Specific pid: check if still alive anywhere.
+        // Specific pid: check if still alive anywhere (run queue, sleep, zombie)
+        // or is the currently running task.
         wait_pid_arg_t a = {pid, 0};
-        sched_for_each(find_pid_cb, &a);
-        if (!a.found) return 1; // gone (killed without zombie)
+        if (g_current && g_current->pid == pid) a.found = 1;
+        if (!a.found) sched_for_each(find_pid_cb, &a);
+        if (!a.found) return 1; // truly gone (killed without becoming zombie)
         sched_yield();
     }
 }

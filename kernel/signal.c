@@ -2,6 +2,7 @@
 #include "process.h"
 #include "sched.h"
 #include "common.h"
+#include "fb.h"
 
 // ── Globals from syscall.c ────────────────────────────────────────────────
 // These are set here to redirect the syscall return path to a signal handler.
@@ -149,7 +150,6 @@ void signal_deliver_pending(void) {
 
     // SIG_DFL (or non-syscall path): print diagnostic for fatal hw signals,
     // then terminate.
-    extern volatile uint16_t* g_vga;
     if (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL) {
         static const char* names[] = {
             [SIGSEGV] = "SIGSEGV",
@@ -158,20 +158,13 @@ void signal_deliver_pending(void) {
             [SIGILL]  = "SIGILL ",
         };
         const char* name = (sig < NSIG && names[sig]) ? names[sig] : "SIG???";
-        volatile uint16_t* v = g_vga;
-        const uint16_t attr = (uint16_t)(0x04 << 8);
-        uint32_t col = 0;
-        const char* prefix = "pid ";
-        for (int i = 0; prefix[i]; i++) v[col++] = (uint16_t)(uint8_t)prefix[i] | attr;
-        uint32_t pid = g_current->pid;
-        char pidbuf[12]; int pi = 11; pidbuf[pi] = 0;
-        do { pidbuf[--pi] = '0' + (char)(pid % 10); pid /= 10; } while (pid);
-        for (int i = pi; pidbuf[i]; i++) v[col++] = (uint16_t)(uint8_t)pidbuf[i] | attr;
-        const char* mid = ": ";
-        for (int i = 0; mid[i]; i++) v[col++] = (uint16_t)(uint8_t)mid[i] | attr;
-        for (int i = 0; name[i]; i++) v[col++] = (uint16_t)(uint8_t)name[i] | attr;
-        const char* suffix = " - killed";
-        for (int i = 0; suffix[i]; i++) v[col++] = (uint16_t)(uint8_t)suffix[i] | attr;
+        uint32_t saved_fg = g_fb_fg;
+        g_fb_fg = FB_LRED;
+        const char* prefix = "PF-KILL ";
+        for (int i = 0; prefix[i]; i++) fb_term_putc(prefix[i]);
+        for (int i = 0; name[i]; i++) fb_term_putc(name[i]);
+        fb_term_putc('\n');
+        g_fb_fg = saved_fg;
     }
 
     g_current->state = TASK_DEAD;
