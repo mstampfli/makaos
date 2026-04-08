@@ -13,6 +13,7 @@
 #include "ext2.h"
 #include "elf.h"
 #include "tsc.h"
+#include "fb.h"
 
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
@@ -27,6 +28,11 @@ uint64_t g_syscall_user_r12    = 0;
 uint64_t g_syscall_user_r13    = 0;
 uint64_t g_syscall_user_r14    = 0;
 uint64_t g_syscall_user_r15    = 0;
+
+// Extra syscall arguments for 6-argument syscalls (mmap).
+// Saved by syscall_entry.asm before calling syscall_dispatch.
+uint64_t g_syscall_arg5 = 0;   // r8  (mmap fd)
+uint64_t g_syscall_arg6 = 0;   // r9  (mmap offset)
 
 // Exec redirect globals (read by syscall_entry.asm after exec syscall).
 uint8_t     g_exec_requested = 0;
@@ -80,6 +86,63 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     return (uint64_t)r;
 }
 
+// ── user_buf_prefault ─────────────────────────────────────────────────────
+// Demand-page every not-yet-mapped page in [addr, addr+len) for the current
+// task.  This prevents kernel-mode page faults when vfs_read() writes directly
+// into a user buffer that spans pages not yet backed by physical frames.
+//
+// Must be called while the process's PML4 is active in CR3 (i.e. inside a
+// syscall handler, before any address-space switch).
+static void user_buf_prefault(virt_addr_t addr, size_t len) {
+    if (!len || !g_current) return;
+    mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
+    if (!mm) return;
+
+    virt_addr_t page = addr & ~(virt_addr_t)0xFFF;
+    virt_addr_t end  = (addr + len + 0xFFF) & ~(virt_addr_t)0xFFF;
+    phys_addr_t pml4 = vmm_current_pml4();  // current CR3 = this process's PML4
+
+    for (; page < end; page += 0x1000) {
+        // Walk VMA list — if no VMA covers this page it's not a valid mapping.
+        vma_t* vma = mm_vma_find(mm, page);
+        if (!vma) continue;
+
+        // Check if this page is already present.  vmm_page_unmap returns 0 and
+        // does nothing if the PTE is absent, so we use it safely as a probe only
+        // when we need to distinguish. Simpler: just try to map; if the PTE is
+        // already present vmm_page_map re-writes it with the same flags (harmless).
+        // But we must avoid allocating a frame when the page is already mapped.
+        // Use a volatile read of the PTE via the HHDM — walk the 4-level table.
+        {
+            // PT walk: PML4[39:47] → PDPT[30:38] → PD[21:29] → PT[12:20].
+            uint64_t* pml4v = (uint64_t*)(pml4 + HHDM_OFFSET);
+            uint64_t  e4 = pml4v[(page >> 39) & 0x1FF];
+            if (!(e4 & PAGE_PRESENT)) goto map_page;
+            uint64_t* pdpt = (uint64_t*)((e4 & PAGE_ADDR_MASK) + HHDM_OFFSET);
+            uint64_t  e3 = pdpt[(page >> 30) & 0x1FF];
+            if (!(e3 & PAGE_PRESENT)) goto map_page;
+            uint64_t* pd = (uint64_t*)((e3 & PAGE_ADDR_MASK) + HHDM_OFFSET);
+            uint64_t  e2 = pd[(page >> 21) & 0x1FF];
+            if (!(e2 & PAGE_PRESENT)) goto map_page;
+            uint64_t* pt = (uint64_t*)((e2 & PAGE_ADDR_MASK) + HHDM_OFFSET);
+            uint64_t  e1 = pt[(page >> 12) & 0x1FF];
+            if (e1 & PAGE_PRESENT) continue;  // already mapped — skip
+        }
+
+    map_page:;
+        // Allocate a frame, zero it, map it with the VMA's permissions.
+        phys_addr_t frame = pmm_buddy_alloc(0);
+        if (frame == PMM_INVALID_ADDR) break;  // OOM — abort prefault
+
+        uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
+        for (int i = 0; i < 512; i++) p[i] = 0;
+
+        if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
+            pmm_buddy_free(frame, 0);
+        }
+    }
+}
+
 // ── sys_read ──────────────────────────────────────────────────────────────
 static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags) {
     (void)flags;
@@ -87,6 +150,8 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         return (uint64_t)-EBADF;
     vfs_file_t* f = g_current->files_shared->fd_table[fd];
     if (!f) return (uint64_t)-EBADF;
+    // Pre-fault the user buffer so kernel writes into it don't kernel-panic.
+    user_buf_prefault((virt_addr_t)buf, (size_t)len);
     int64_t r = vfs_read(f, (void*)buf, len);
     return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
 }
@@ -108,23 +173,42 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     (void)mode;
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
-    // Copy null-terminated path from user space.
-    char path[256];
+    // Copy null-terminated path from user space (max 511 to leave room for cwd prefix).
+    char raw[512];
     const char* upath = (const char*)path_ptr;
     uint64_t i = 0;
-    while (i < 255 && upath[i]) { path[i] = upath[i]; i++; }
-    path[i] = '\0';
+    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
+    raw[i] = '\0';
     if (i == 0) return (uint64_t)-EINVAL;
+
+    // Resolve relative paths: prepend cwd if path does not start with '/'.
+    char path[512];
+    if (raw[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0;
+        while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        // Ensure cwd ends with '/'.
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
+    }
 
     vfs_file_t* f = NULL;
 
     // /dev/ dispatch — map device names to built-in vfs_file_t objects.
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
         const char* dev = path + 5;
-        uint8_t match_kbd = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
-        uint8_t match_vga = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
-        if      (match_kbd) f = vfs_kbd_open();
-        else if (match_vga) f = vfs_vga_open();
+        uint8_t match_kbd    = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
+        uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
+                             && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
+        uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
+        if      (match_kbdraw) f = vfs_kbdraw_open();
+        else if (match_kbd)    f = vfs_kbd_open();
+        else if (match_vga)    f = vfs_vga_open();
         else return (uint64_t)-ENOENT;
     } else {
         f = ext2_open(path);
@@ -285,6 +369,20 @@ static uint64_t sys_exit(uint64_t code) {
     return 0;
 }
 
+// ── sys_kill helpers (file-scope so clang accepts them) ───────────────────
+typedef struct { int64_t pid; task_t* result; } find_arg_t;
+
+static void kill_find_cb(task_t* t, void* data) {
+    find_arg_t* a = (find_arg_t*)data;
+    if (!a->result && (int64_t)t->pid == a->pid) a->result = t;
+}
+
+static int s_bcast_sig = 0;
+static void kill_bcast_cb(task_t* t, void* data) {
+    (void)data;
+    if (!(t->flags & TASK_FLAG_KTHREAD)) signal_send(t, s_bcast_sig);
+}
+
 // ── sys_kill ──────────────────────────────────────────────────────────────
 // kill(pid, sig): send signal `sig` to the task with the given pid.
 // pid > 0: send to the task with that pid.
@@ -297,18 +395,12 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     int64_t pid = (int64_t)pid_raw;
 
     if (pid > 0) {
-        // Find task by pid — check current then walk all queues.
         task_t* target = NULL;
         if (g_current && (int64_t)g_current->pid == pid)
             target = g_current;
         if (!target) {
-            typedef struct { int64_t pid; task_t* result; } find_arg_t;
-            void find_cb(task_t* t, void* data) {
-                find_arg_t* a = (find_arg_t*)data;
-                if (!a->result && (int64_t)t->pid == a->pid) a->result = t;
-            }
             find_arg_t a = {pid, NULL};
-            sched_for_each(find_cb, &a);
+            sched_for_each(kill_find_cb, &a);
             target = a.result;
         }
         if (!target) return (uint64_t)-ESRCH;
@@ -325,11 +417,8 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     // pid == -1: broadcast to all non-kernel tasks.
     if (g_current && !(g_current->flags & TASK_FLAG_KTHREAD))
         signal_send(g_current, sig);
-    void bcast_cb(task_t* t, void* data) {
-        (void)data;
-        if (!(t->flags & TASK_FLAG_KTHREAD)) signal_send(t, sig);
-    }
-    sched_for_each(bcast_cb, NULL);
+    s_bcast_sig = sig;
+    sched_for_each(kill_bcast_cb, NULL);
     return 0;
 }
 
@@ -369,7 +458,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t pathlen) {
     vfs_file_t* f = ext2_open(path);
     if (!f) return (uint64_t)-ENOENT;
 
-    const uint64_t MAX_ELF = 1024ULL * 1024ULL;
+    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB — large enough for doom
     uint8_t* buf = kmalloc(MAX_ELF);
     if (!buf) { vfs_close(f); return (uint64_t)-ENOMEM; }
 
@@ -868,6 +957,188 @@ static uint64_t sys_sigreturn(void) {
     return 0;
 }
 
+// ── sys_mmap ──────────────────────────────────────────────────────────────
+// mmap(addr, len, prot, flags, fd, off) → mapped address or -errno.
+// Only anonymous private mappings are supported (MAP_ANONYMOUS | MAP_PRIVATE).
+// fd must be -1 for anonymous mappings.  MAP_FIXED is supported.
+static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
+                         uint64_t flags, uint64_t fd, uint64_t off) {
+    (void)off;
+    if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
+    if (!len) return (uint64_t)-EINVAL;
+
+    // Only anonymous mappings for now.
+    if (!(flags & MAP_ANONYMOUS)) return (uint64_t)-ENOSYS;
+    if ((int64_t)fd != -1)        return (uint64_t)-ENOSYS;
+
+    mm_t* mm = g_current->mm_shared->mm;
+
+    // Round len up to page boundary.
+    len = (len + PAGE_MASK) & ~PAGE_MASK;
+
+    virt_addr_t vaddr;
+    if (flags & MAP_FIXED) {
+        if (!addr || (addr & PAGE_MASK)) return (uint64_t)-EINVAL;
+        // Unmap anything in the range first (POSIX requirement).
+        phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+        for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
+            phys_addr_t frame;
+            if (vmm_page_unmap(pml4, p, &frame))
+                pmm_buddy_free(frame, 0);
+        }
+        mm_vma_remove(mm, addr, addr + len);
+        vaddr = addr;
+    } else if (addr) {
+        // Use addr as a hint: if not free, find a free region anyway.
+        addr &= ~PAGE_MASK;
+        // Check if the hint region is free.
+        uint8_t free_hint = 1;
+        for (vma_t* v = mm->vmas; v; v = v->next) {
+            if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
+        }
+        vaddr = free_hint ? addr : mm_vma_find_free(mm, len);
+    } else {
+        vaddr = mm_vma_find_free(mm, len);
+    }
+
+    if (!vaddr) return (uint64_t)-ENOMEM;
+
+    // Convert PROT_* to VMA flags.
+    uint32_t vma_flags = VMA_ANON;
+    if (prot & PROT_READ)  vma_flags |= VMA_R;
+    if (prot & PROT_WRITE) vma_flags |= VMA_W;
+    if (prot & PROT_EXEC)  vma_flags |= VMA_X;
+    // At minimum allow read so the page-fault handler can map the page.
+    if (!vma_flags) vma_flags = VMA_ANON; // PROT_NONE: still need VMA entry
+
+    if (!mm_vma_add(mm, vaddr, vaddr + len, vma_flags))
+        return (uint64_t)-ENOMEM;
+
+    // Pages are demand-paged — do not allocate physical frames here.
+    return vaddr;
+}
+
+// ── sys_munmap ────────────────────────────────────────────────────────────
+static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
+    if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
+    if (!addr || (addr & PAGE_MASK))              return (uint64_t)-EINVAL;
+    if (!len)                                     return (uint64_t)-EINVAL;
+
+    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+    mm_t* mm = g_current->mm_shared->mm;
+
+    // Unmap physical pages and free frames.
+    for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
+        phys_addr_t frame;
+        if (vmm_page_unmap(pml4, p, &frame))
+            pmm_buddy_free(frame, 0);
+    }
+
+    // Remove VMA descriptors covering the range.
+    mm_vma_remove(mm, addr, addr + len);
+    return 0;
+}
+
+// ── sys_nanosleep ─────────────────────────────────────────────────────────
+// nanosleep(req, rem) — sleep for at least req->tv_sec * 1e9 + req->tv_nsec ns.
+// rem is ignored (no partial-sleep resume after signal for now).
+typedef struct { uint64_t tv_sec; uint64_t tv_nsec; } k_timespec_t;
+
+static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
+    (void)rem_ptr;
+    if (!req_ptr) return (uint64_t)-EINVAL;
+    k_timespec_t* req = (k_timespec_t*)req_ptr;
+    if (req->tv_nsec >= 1000000000ULL) return (uint64_t)-EINVAL;
+
+    uint64_t sleep_ns = req->tv_sec * 1000000000ULL + req->tv_nsec;
+    if (!sleep_ns) return 0;
+
+    uint64_t wake_ns = tsc_read_ns() + sleep_ns;
+
+    // Sleep until deadline: add to sleep list so timer tick can wake us.
+    while (tsc_read_ns() < wake_ns) {
+        g_current->sleep_until_ns = wake_ns;
+        sched_sleep();  // sets TASK_SLEEPING, adds to s_sleep_head, yields
+        g_current->sleep_until_ns = 0;
+    }
+    return 0;
+}
+
+// ── sys_gettimeofday ──────────────────────────────────────────────────────
+// gettimeofday(tv, tz) — fills struct timeval { tv_sec, tv_usec }.
+typedef struct { int64_t tv_sec; int64_t tv_usec; } k_timeval_t;
+
+static uint64_t sys_gettimeofday(uint64_t tv_ptr, uint64_t tz_ptr) {
+    (void)tz_ptr;
+    if (!tv_ptr) return (uint64_t)-EINVAL;
+    uint64_t ns = tsc_read_ns();
+    k_timeval_t* tv = (k_timeval_t*)tv_ptr;
+    tv->tv_sec  = (int64_t)(ns / 1000000000ULL);
+    tv->tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
+    return 0;
+}
+
+// ── sys_fb_blit ───────────────────────────────────────────────────────────
+// fb_blit(src_rgba, src_w, src_h, flags)
+// Scales src_w × src_h RGBA (0xRRGGBBAA) buffer to fill the screen.
+// Uses nearest-neighbour scaling.  src is a user-space pointer.
+static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
+                             uint64_t src_h, uint64_t flags) {
+    (void)flags;
+    if (!src_ptr || !src_w || !src_h) return (uint64_t)-EINVAL;
+    if (!g_fb.base_virt)              return (uint64_t)-EIO;
+
+    user_buf_prefault(src_ptr, src_w * src_h * 4);
+    const uint32_t* src   = (const uint32_t*)src_ptr;
+    uint32_t*       fb    = (uint32_t*)g_fb.base_virt;
+    uint32_t        dw    = g_fb.width;
+    uint32_t        dh    = g_fb.height;
+    uint32_t        pitch = g_fb.pitch / 4; // pitch in pixels
+
+    // Nearest-neighbour scale: for each destination pixel find source pixel.
+    // Use fixed-point 16.16 arithmetic for speed.
+    uint32_t step_x = (uint32_t)((src_w  << 16) / dw);
+    uint32_t step_y = (uint32_t)((src_h  << 16) / dh);
+    uint32_t sy = 0;
+    for (uint32_t y = 0; y < dh; y++, sy += step_y) {
+        uint32_t src_row = (sy >> 16) * (uint32_t)src_w;
+        uint32_t sx = 0;
+        for (uint32_t x = 0; x < dw; x++, sx += step_x) {
+            // Source pixel: 0xRRGGBBAA (R in highest byte).
+            uint32_t rgba = src[src_row + (sx >> 16)];
+            uint8_t r = (uint8_t)(rgba >> 24);
+            uint8_t g = (uint8_t)(rgba >> 16);
+            uint8_t b = (uint8_t)(rgba >>  8);
+            // BGRX: bytes B,G,R,X in memory = uint32 B|(G<<8)|(R<<16).
+            fb[y * pitch + x] = (uint32_t)b | ((uint32_t)g << 8) | ((uint32_t)r << 16);
+        }
+    }
+    return 0;
+}
+
+// ── sys_fb_info ───────────────────────────────────────────────────────────
+// fb_info(user_fb_info_t*) — fills user struct with framebuffer parameters.
+typedef struct {
+    uint64_t phys;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+} user_fb_info_t;
+
+static uint64_t sys_fb_info(uint64_t ptr) {
+    if (!ptr) return (uint64_t)-EINVAL;
+    if (!g_fb.base_virt) return (uint64_t)-EIO;
+    user_fb_info_t* info = (user_fb_info_t*)ptr;
+    info->phys   = g_fb.base_virt - HHDM_OFFSET;
+    info->width  = g_fb.width;
+    info->height = g_fb.height;
+    info->pitch  = g_fb.pitch;
+    info->bpp    = g_fb.bpp;
+    return 0;
+}
+
 // ── serial helper (debug only) ────────────────────────────────────────────
 static void serial_putc(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
@@ -881,15 +1152,11 @@ static void serial_puts(const char* s) {
 uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4) {
     uint64_t ret;
-    // For SYS_WRITE with fd=1, also echo to serial for visibility.
-    if (nr == SYS_WRITE && arg1 == 1 && arg3 > 0) {
+    // Mirror stdout/stderr writes to serial for debugging.
+    if (nr == SYS_WRITE && (arg1 == 1 || arg1 == 2) && arg3 > 0) {
         const char* s = (const char*)arg2;
         for (uint64_t i = 0; i < arg3; i++) serial_putc(s[i]);
     }
-    // Debug: log every syscall number.
-    serial_putc('[');
-    serial_putc('0' + (char)(nr % 10));
-    serial_putc(']');
     switch (nr) {
         case SYS_WRITE:   ret = sys_write(arg1, arg2, arg3);      break;
         case SYS_EXIT:    ret = sys_exit(arg1);                    break;
@@ -917,10 +1184,17 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_DUP:          ret = sys_dup(arg1);                       break;
         case SYS_DUP2:         ret = sys_dup2(arg1, arg2);                break;
         case SYS_PIPE:         ret = sys_pipe(arg1);                      break;
-        case SYS_SIGACTION:    ret = sys_sigaction(arg1, arg2, arg3);     break;
-        case SYS_SIGPROCMASK:  ret = sys_sigprocmask(arg1, arg2, arg3);   break;
-        case SYS_SIGRETURN:    ret = sys_sigreturn();                      break;
-        default:               ret = (uint64_t)-ENOSYS;                   break;
+        case SYS_SIGACTION:    ret = sys_sigaction(arg1, arg2, arg3);          break;
+        case SYS_SIGPROCMASK:  ret = sys_sigprocmask(arg1, arg2, arg3);        break;
+        case SYS_SIGRETURN:    ret = sys_sigreturn();                           break;
+        case SYS_MMAP:         ret = sys_mmap(arg1, arg2, arg3, arg4,
+                                              g_syscall_arg5, g_syscall_arg6);  break;
+        case SYS_MUNMAP:       ret = sys_munmap(arg1, arg2);                    break;
+        case SYS_NANOSLEEP:    ret = sys_nanosleep(arg1, arg2);                 break;
+        case SYS_GETTOD:       ret = sys_gettimeofday(arg1, arg2);              break;
+        case SYS_FB_BLIT:      ret = sys_fb_blit(arg1, arg2, arg3, arg4);      break;
+        case SYS_FB_INFO:      ret = sys_fb_info(arg1);                         break;
+        default:               ret = (uint64_t)-ENOSYS;                         break;
     }
     // Deliver any pending signals on the syscall return path.
     // g_signal_in_syscall=1 tells signal_deliver_pending it may set up user frames.

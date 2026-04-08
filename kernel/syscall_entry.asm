@@ -17,6 +17,8 @@ extern g_exec_rsp             ; new user RSP for exec
 extern g_exec_pml4            ; new PML4 phys for exec
 extern g_signal_deliver       ; byte: 1=enter handler, 2=sigreturn restore
 extern g_signal_rdi           ; uint64_t: signum passed as rdi to handler
+extern g_syscall_arg5         ; r8  — 5th argument (mmap fd)
+extern g_syscall_arg6         ; r9  — 6th argument (mmap offset)
 
 global syscall_entry
 
@@ -46,6 +48,9 @@ syscall_entry:
     mov [rel g_syscall_user_r13], r13
     mov [rel g_syscall_user_r14], r14
     mov [rel g_syscall_user_r15], r15
+    ; Save extra syscall arguments (r8=arg5, r9=arg6) for 6-arg syscalls (mmap).
+    mov [rel g_syscall_arg5], r8
+    mov [rel g_syscall_arg6], r9
 
     ; 2. Switch to kernel stack (TSS.RSP0, byte offset 4 in tss_t).
     mov rsp, [rel g_tss + 4]

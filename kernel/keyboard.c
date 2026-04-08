@@ -29,6 +29,13 @@ static const char s_shifted[88] = {
    '2',  '3',  '0',  '.',                                                                           // 0x50-0x53
 };
 
+// ── Grab state ───────────────────────────────────────────────────────────
+// When grabbed, translated chars are suppressed; only raw bytes flow.
+static volatile uint8_t s_grabbed = 0;
+
+void keyboard_grab(void)   { s_grabbed = 1; }
+void keyboard_ungrab(void) { s_grabbed = 0; }
+
 // ── Modifier state ────────────────────────────────────────────────────────
 static uint8_t s_shift = 0;
 static uint8_t s_ctrl  = 0;
@@ -110,11 +117,38 @@ static uint8_t sc_pop(void) {
     return sc;
 }
 
+// ── Raw scancode ring buffer (for /dev/kbdraw) ───────────────────────────
+// Stores raw bytes before any translation (including break codes / E0 prefix).
+// Used by doom for key press/release events.
+#define RAW_BUF_SIZE 256
+static volatile uint8_t s_raw_buf[RAW_BUF_SIZE];
+static volatile uint8_t s_raw_head = 0;
+static volatile uint8_t s_raw_tail = 0;
+
+static void raw_push(uint8_t sc) {
+    uint8_t next = (s_raw_tail + 1) & (RAW_BUF_SIZE - 1);
+    if (next == s_raw_head) return; // full — drop
+    s_raw_buf[s_raw_tail] = sc;
+    s_raw_tail = next;
+}
+
+// Non-blocking read of raw scancodes.  Returns bytes read (0 if empty).
+int keyboard_getraw(uint8_t* buf, int max) {
+    int n = 0;
+    while (n < max && s_raw_head != s_raw_tail) {
+        buf[n++] = s_raw_buf[s_raw_head];
+        s_raw_head = (s_raw_head + 1) & (RAW_BUF_SIZE - 1);
+    }
+    return n;
+}
+
 // ── IRQ1 handler — runs in interrupt context, minimal work ───────────────
 extern void irq1_entry(void);
 
 void keyboard_irq_handler(void) {
-    sc_push(inb(KB_DATA_PORT));
+    uint8_t sc = inb(KB_DATA_PORT);
+    raw_push(sc);  // push to raw buffer BEFORE any translation
+    sc_push(sc);
     irq_notify(1);
 }
 
@@ -133,7 +167,7 @@ static void keyboard_thread_fn(void) {
                 s_extended = 0;
                 if (sc == 0x1D) { s_ctrl = 1; continue; }
                 if (sc == 0x9D) { s_ctrl = 0; continue; }
-                if (!(sc & 0x80)) {
+                if (!s_grabbed && !(sc & 0x80)) {
                     char c = extended_key(sc);
                     if (c) buf_push(c);
                 }
@@ -146,7 +180,7 @@ static void keyboard_thread_fn(void) {
             if (sc == 0x9D) { s_ctrl = 0; continue; }
             if (sc & 0x80) continue;
 
-            if (sc < 88) {
+            if (!s_grabbed && sc < 88) {
                 char c = s_shift ? s_shifted[sc] : s_unshifted[sc];
                 if (c) {
                     if (s_ctrl && c >= 'a' && c <= 'z')

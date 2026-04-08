@@ -10,10 +10,10 @@
 #include "pic.h"
 #include "timer.h"
 #include "sched.h"
-#include "ata_poll.h"
 #include "ahci.h"
 #include "ext2.h"
 #include "tsc.h"
+#include "fb.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -28,14 +28,12 @@ extern void shell_fn(void);
 
 /* ── kmain ───────────────────────────────────────────────── */
 static void serial_init_and_say(void) {
-    // Init COM1 to 115200 baud, 8N1 (minimal setup for QEMU).
-    outb(0x3F8 + 1, 0x00); // Disable interrupts
-    outb(0x3F8 + 3, 0x80); // Enable DLAB
-    outb(0x3F8 + 0, 0x01); // Divisor lo (115200 baud)
-    outb(0x3F8 + 1, 0x00); // Divisor hi
-    outb(0x3F8 + 3, 0x03); // 8N1, disable DLAB
-    outb(0x3F8 + 2, 0xC7); // Enable FIFO
-    // Print "K\n" to serial.
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x80);
+    outb(0x3F8 + 0, 0x01);
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x03);
+    outb(0x3F8 + 2, 0xC7);
     while (!(inb(0x3F8 + 5) & 0x20));
     outb(0x3F8, 'K');
     while (!(inb(0x3F8 + 5) & 0x20));
@@ -62,6 +60,7 @@ void kmain(void) {
         __asm__ volatile("wrmsr" : : "a"(efer_lo), "d"(efer_hi), "c"(0xC0000080U));
     }
 
+    fb_init(info->fb_phys, info->fb_width, info->fb_height, info->fb_pitch);
     idt_init();
     pic_init(0x20, 0x28);  // remap PIC early so pic_unmask works in ahci_init
     tsc_init();
@@ -71,7 +70,6 @@ void kmain(void) {
     tss_init();
     syscall_init();
 
-    ata_poll_init();
     ahci_init();
     ext2_init(4096);  // ext2 partition starts at LBA 4096 on the single AHCI disk
 

@@ -2,17 +2,16 @@
 #include "keyboard.h"
 #include "sched.h"
 #include "timer.h"
-#include "fat32.h"
 #include "process.h"
 #include "pmm.h"
 #include "vmm.h"
 #include "user_test_vmalloc.h"
 #include "user_hello.h"
+#include "fb.h"
 
-/* ── VGA ─────────────────────────────────────────────────────────────────── */
-#define VGA_W  80
-#define VGA_H  25
-#define ATTR(bg,fg) ((uint16_t)(((bg)<<4)|(fg))<<8)
+/* ── Framebuffer drawing helpers (replaces VGA text mode) ───────────────── */
+/* ATTR(bg,fg) packs two VGA color nibbles — we convert to RGB via fb_vga_color */
+#define ATTR(bg,fg) (((uint8_t)(((bg)&0xF)<<4))|((uint8_t)((fg)&0xF)))
 
 #define BLACK   0x0
 #define BLUE    0x1
@@ -28,33 +27,37 @@
 #define WHITE   0xF
 #define YELLOW  0xE
 
-static volatile uint16_t* const vga =
-    (volatile uint16_t*)(VGA_ADDR + HHDM_OFFSET);
+/* Character cell dimensions derived from current framebuffer */
+static uint32_t fb_w(void) { return fb_cols(); }
+static uint32_t fb_h(void) { return fb_rows(); }
 
-static void vga_putc(uint32_t row, uint32_t col, char c, uint16_t attr) {
-    if (row < VGA_H && col < VGA_W)
-        vga[row * VGA_W + col] = (uint16_t)(uint8_t)c | attr;
+static void vga_putc(uint32_t row, uint32_t col, char c, uint8_t attr) {
+    if (row < fb_h() && col < fb_w())
+        fb_putc_at(col, row, c, fb_vga_color(attr & 0xF), fb_vga_color((attr>>4)&0xF));
 }
 
-static void vga_puts(uint32_t row, uint32_t col, const char* s, uint16_t attr) {
-    for (uint32_t i = 0; s[i] && col + i < VGA_W; i++)
-        vga[row * VGA_W + col + i] = (uint16_t)(uint8_t)s[i] | attr;
+static void vga_puts(uint32_t row, uint32_t col, const char* s, uint8_t attr) {
+    for (uint32_t i = 0; s[i] && col + i < fb_w(); i++)
+        vga_putc(row, col + i, s[i], attr);
 }
 
-static void vga_fill(uint16_t attr) {
-    for (uint32_t i = 0; i < VGA_W * VGA_H; i++)
-        vga[i] = (uint16_t)' ' | attr;
+static void vga_fill(uint8_t attr) {
+    uint32_t bg = fb_vga_color((attr >> 4) & 0xF);
+    uint32_t fg = fb_vga_color(attr & 0xF);
+    for (uint32_t r = 0; r < fb_h(); r++)
+        for (uint32_t c = 0; c < fb_w(); c++)
+            fb_putc_at(c, r, ' ', fg, bg);
 }
 
 static void vga_fill_region(uint32_t r0, uint32_t c0,
-                             uint32_t r1, uint32_t c1, uint16_t attr) {
-    for (uint32_t r = r0; r <= r1 && r < VGA_H; r++)
-        for (uint32_t c = c0; c <= c1 && c < VGA_W; c++)
+                             uint32_t r1, uint32_t c1, uint8_t attr) {
+    for (uint32_t r = r0; r <= r1 && r < fb_h(); r++)
+        for (uint32_t c = c0; c <= c1 && c < fb_w(); c++)
             vga_putc(r, c, ' ', attr);
 }
 
-static void vga_hline(uint32_t row, char ch, uint16_t attr) {
-    for (uint32_t c = 0; c < VGA_W; c++)
+static void vga_hline(uint32_t row, char ch, uint8_t attr) {
+    for (uint32_t c = 0; c < fb_w(); c++)
         vga_putc(row, c, ch, attr);
 }
 
@@ -62,9 +65,9 @@ static uint32_t kstrlen(const char* s) {
     uint32_t n = 0; while (s[n]) n++; return n;
 }
 
-static void vga_center(uint32_t row, const char* s, uint16_t attr) {
+static void vga_center(uint32_t row, const char* s, uint8_t attr) {
     uint32_t len = kstrlen(s);
-    uint32_t col = len < VGA_W ? (VGA_W - len) / 2 : 0;
+    uint32_t col = len < fb_w() ? (fb_w() - len) / 2 : 0;
     vga_puts(row, col, s, attr);
 }
 
@@ -114,9 +117,9 @@ static void draw_home(int sel) {
 
     for (int i = 0; i < MENU_ITEMS; i++) {
         uint8_t is_sel = (i == sel);
-        uint16_t attr  = is_sel ? ATTR(LBLUE, WHITE) : ATTR(BLACK, LGRAY);
+        uint8_t attr  = is_sel ? ATTR(LBLUE, WHITE) : ATTR(BLACK, LGRAY);
         uint32_t len   = kstrlen(s_menu_labels[i]);
-        uint32_t col   = len < VGA_W ? (VGA_W - len) / 2 : 0;
+        uint32_t col   = len < fb_w() ? (fb_w() - len) / 2 : 0;
         if (is_sel) vga_putc(20 + (uint32_t)i, col - 2, '>', ATTR(BLACK, YELLOW));
         vga_puts(20 + (uint32_t)i, col, s_menu_labels[i], attr);
     }
@@ -164,27 +167,27 @@ static uint32_t rand_next(void) {
 }
 
 static void draw_snake_border(void) {
-    uint16_t ba = ATTR(DGRAY, LGRAY);
-    for (uint32_t c = 0; c < VGA_W; c++) {
+    uint8_t ba = ATTR(DGRAY, LGRAY);
+    for (uint32_t c = 0; c < fb_w(); c++) {
         vga_putc(0,         c, '-', ba);
         vga_putc(PLAY_R1+1, c, '-', ba);
     }
     for (uint32_t r = 1; r <= PLAY_R1; r++) {
         vga_putc(r, 0,        '|', ba);
-        vga_putc(r, VGA_W-1, '|', ba);
+        vga_putc(r, fb_w()-1, '|', ba);
     }
     vga_putc(0, 0,               '+', ba);
-    vga_putc(0, VGA_W-1,        '+', ba);
+    vga_putc(0, fb_w()-1,        '+', ba);
     vga_putc(PLAY_R1+1, 0,      '+', ba);
-    vga_putc(PLAY_R1+1, VGA_W-1,'+', ba);
+    vga_putc(PLAY_R1+1, fb_w()-1,'+', ba);
 }
 
-static void draw_cell(pos_t p, char ch, uint16_t attr) {
+static void draw_cell(pos_t p, char ch, uint8_t attr) {
     vga_putc((uint32_t)(p.r + PLAY_R0), (uint32_t)(p.c + PLAY_C0), ch, attr);
 }
 
 static void draw_score_bar(void) {
-    vga_fill_region(24, 0, 24, VGA_W-1, ATTR(BLACK, LGRAY));
+    vga_fill_region(24, 0, 24, fb_w()-1, ATTR(BLACK, LGRAY));
     vga_puts(24, 2, "SCORE:", ATTR(BLACK, YELLOW));
     char buf[12]; buf[11] = '\0';
     uint32_t v = s_score; int32_t i = 10;
@@ -322,7 +325,9 @@ void snake_fn(void) {
 }
 
 /* ── Ring-3 vmalloc test launcher ───────────────────────────────────────── */
-static void fs_puts(uint32_t row, const char* s, uint16_t attr);
+static void fs_puts(uint32_t row, const char* s, uint8_t attr) {
+    vga_puts(row, 0, s, attr);
+}
 
 void test_vmalloc_fn(void) {
     fs_puts(0, "[TEST] launching ring-3 vmalloc test...", ATTR(BLACK, YELLOW));
@@ -401,60 +406,7 @@ void hello_embedded_fn(void) {
     sched_wait_pid(child_pid);
 }
 
-/* ── FAT32/ATA init + self-test thread ──────────────────────────────────── */
-
-static void fs_puts(uint32_t row, const char* s, uint16_t attr) {
-    for (uint32_t i = 0; s[i] && i < VGA_W; i++)
-        vga[row * VGA_W + i] = (uint16_t)(uint8_t)s[i] | attr;
-}
-
-static void fs_puthex8(uint32_t row, uint32_t col, uint8_t v) {
-    const char* hex = "0123456789ABCDEF";
-    vga[row * VGA_W + col + 0] = (uint16_t)hex[v >> 4]  | ATTR(BLACK, LCYAN);
-    vga[row * VGA_W + col + 1] = (uint16_t)hex[v & 0xF] | ATTR(BLACK, LCYAN);
-}
-
+/* ── FAT32/ATA self-test (disabled — FAT32 uses ATA which is excluded) ─── */
 void fs_init_fn(void) {
-    // Row 0: banner
-    fs_puts(0, "[FS] mounting FAT32 at LBA 4096...", ATTR(BLACK, YELLOW));
-
-    uint8_t ok = fat32_init(4096);
-    if (!ok) {
-        fs_puts(0, "[FS] fat32_init FAILED                              ", ATTR(RED, WHITE));
-        for (;;) sched_yield();
-    }
-    fs_puts(0, "[FS] fat32_init OK — opening TEST.TXT (11-byte 8.3)  ", ATTR(BLACK, LGREEN));
-
-    // 8.3 name: "TEST    TXT" — 8 chars name + 3 chars ext, space-padded
-    vfs_file_t* f = fat32_open("TEST    TXT");
-    if (!f) {
-        fs_puts(0, "[FS] fat32_open FAILED (file not found)              ", ATTR(RED, WHITE));
-        for (;;) sched_yield();
-    }
-    fs_puts(0, "[FS] file opened — reading 32 bytes...                ", ATTR(BLACK, LGREEN));
-
-    uint8_t buf[33];
-    for (int i = 0; i < 33; i++) buf[i] = 0;
-    int64_t n = vfs_read(f, buf, 32);
-    vfs_close(f);
-
-    if (n <= 0) {
-        fs_puts(0, "[FS] read FAILED                                     ", ATTR(RED, WHITE));
-        for (;;) sched_yield();
-    }
-
-    // Print raw bytes as hex on row 0 col 0 (overwrite banner with result)
-    fs_puts(0, "[FS] read OK bytes: ", ATTR(BLACK, LGREEN));
-    for (int64_t i = 0; i < n && i < 16; i++)
-        fs_puthex8(0, (uint32_t)(20 + i * 3), buf[i]);
-
-    // Print ASCII content on row 1
-    fs_puts(1, "[FS] content: ", ATTR(BLACK, LGRAY));
-    for (int64_t i = 0; i < n && 14 + i < VGA_W; i++) {
-        uint8_t c = buf[i];
-        if (c < 0x20 || c > 0x7E) c = '.';
-        vga[1 * VGA_W + 14 + i] = (uint16_t)c | ATTR(BLACK, WHITE);
-    }
-
     for (;;) sched_yield();
 }

@@ -6,18 +6,7 @@
 #include "process.h"
 #include "sched.h"
 #include "kheap.h"
-
-// ── VGA ──────────────────────────────────────────────────────────────────
-#define VGA_COLS 80
-#define VGA_ROWS 25
-
-// g_vga is defined in idt.c.
-extern volatile uint16_t* g_vga;
-
-// g_vga_row/g_vga_col are defined in vfs.c (exported).
-// Declared via vfs.h.
-
-static uint8_t s_attr = 0x0F; // white on black
+#include "fb.h"
 
 // ── String utilities ──────────────────────────────────────────────────────
 static uint32_t kstrlen(const char* s) {
@@ -37,42 +26,11 @@ static void kstrcpy(char* dst, const char* src, uint32_t max) {
     dst[i] = '\0';
 }
 
-// ── Terminal layer ────────────────────────────────────────────────────────
-static void term_scroll(void) {
-    for (uint32_t r = 0; r < VGA_ROWS - 1; r++)
-        for (uint32_t c = 0; c < VGA_COLS; c++)
-            g_vga[r * VGA_COLS + c] = g_vga[(r + 1) * VGA_COLS + c];
-    for (uint32_t c = 0; c < VGA_COLS; c++)
-        g_vga[(VGA_ROWS - 1) * VGA_COLS + c] = (uint16_t)' ' | ((uint16_t)s_attr << 8);
-    g_vga_row = VGA_ROWS - 1;
-}
-
+// ── Terminal layer (backed by framebuffer) ────────────────────────────────
 static void term_putc(char c) {
-    if (c == '\r') {
-        g_vga_col = 0;
-        return;
-    }
-    if (c == '\n') {
-        g_vga_col = 0;
-        g_vga_row++;
-        if (g_vga_row >= VGA_ROWS) term_scroll();
-        return;
-    }
-    if (c == '\b' || c == 127) {
-        // Backspace: move back, erase, move back again.
-        if (g_vga_col > 0) {
-            g_vga_col--;
-            g_vga[g_vga_row * VGA_COLS + g_vga_col] = (uint16_t)' ' | ((uint16_t)s_attr << 8);
-        }
-        return;
-    }
-    if (g_vga_col >= VGA_COLS) {
-        g_vga_col = 0;
-        g_vga_row++;
-        if (g_vga_row >= VGA_ROWS) term_scroll();
-    }
-    g_vga[g_vga_row * VGA_COLS + g_vga_col] = (uint16_t)(uint8_t)c | ((uint16_t)s_attr << 8);
-    g_vga_col++;
+    fb_term_putc(c);
+    g_vga_row = g_fb_row;
+    g_vga_col = g_fb_col;
 }
 
 static void term_puts(const char* s) {
@@ -103,17 +61,13 @@ static void term_putu32(uint32_t v) {
 }
 
 static void term_clear(void) {
-    uint8_t saved = s_attr;
-    s_attr = 0x07;
-    for (uint32_t i = 0; i < VGA_COLS * VGA_ROWS; i++)
-        g_vga[i] = (uint16_t)' ' | ((uint16_t)s_attr << 8);
+    fb_clear();
     g_vga_row = 0;
     g_vga_col = 0;
-    s_attr = saved;
 }
 
 static void term_set_color(uint8_t attr) {
-    s_attr = attr;
+    fb_set_attr(attr);
 }
 
 // ── Line input ────────────────────────────────────────────────────────────
@@ -363,21 +317,25 @@ static void cmd_run(int argc, char* argv[]) {
     }
 
     uint32_t child_pid = child->pid;
+
+    // Give the child exclusive control of screen + keyboard.
+    // The shell's keyboard_wait() will block (no chars fed to s_buf),
+    // and fb_term_putc/fb_clear become no-ops until we restore.
+    keyboard_grab();
+    g_fb_exclusive = 1;
+
     sched_add(child);
-
-    term_set_color(0x0A); // light green
-    term_puts("[Running PID ");
-    term_putu32(child_pid);
-    term_puts("]\n");
-    term_set_color(0x0F);
-
     sched_wait_pid(child_pid);
 
-    term_set_color(0x0A);
-    term_puts("[Done PID ");
-    term_putu32(child_pid);
-    term_puts("]\n");
-    term_set_color(0x0F);
+    // Child exited — restore shell ownership of screen and keyboard.
+    g_fb_exclusive = 0;
+    keyboard_ungrab();
+
+    // Clear the screen so doom's last frame doesn't bleed through,
+    // then redraw the shell prompt on the next loop iteration.
+    fb_clear();
+    g_vga_row = 0;
+    g_vga_col = 0;
 }
 
 static void cmd_cd(int argc, char* argv[]) {
@@ -686,9 +644,6 @@ void shell_fn(void) {
     term_puts("MakaOS Shell v0.2");
     term_set_color(0x0F);
     term_puts(" -- type 'help' for commands\n\n");
-
-    // AUTOTEST: run posix1 tests at startup.
-    { char* av[] = {(char*)"run", (char*)"/bin/test_posix1"}; cmd_run(2, av); }
 
     char line[256];
     char* argv[16];

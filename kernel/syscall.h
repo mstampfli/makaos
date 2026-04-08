@@ -31,6 +31,12 @@
 #define SYS_SIGACTION 26 // sigaction(sig, handler, old)        → 0 or -errno
 #define SYS_SIGPROCMASK 27 // sigprocmask(how, set, oldset)     → 0 or -errno
 #define SYS_SIGRETURN 28 // sigreturn() — restore after handler → (no return)
+#define SYS_MMAP     29  // mmap(addr,len,prot,flags,fd,off)  → addr or -errno
+#define SYS_MUNMAP   30  // munmap(addr,len)                   → 0 or -errno
+#define SYS_NANOSLEEP 31 // nanosleep(req,rem)                 → 0 or -errno
+#define SYS_GETTOD   32  // gettimeofday(tv,tz)                → 0
+#define SYS_FB_BLIT  33  // fb_blit(src,w,h,flags)            → 0 or -errno
+#define SYS_FB_INFO  34  // fb_info(fb_info_user_t*)           → 0
 
 // waitpid options
 #define WNOHANG 1
@@ -56,6 +62,8 @@ typedef struct {
 extern uint64_t    g_syscall_user_rsp;
 extern uint64_t    g_syscall_user_rip;
 extern uint64_t    g_syscall_user_rflags;
+extern uint64_t    g_syscall_arg5;
+extern uint64_t    g_syscall_arg6;
 extern uint8_t     g_exec_requested;
 extern uint64_t    g_exec_entry;
 extern uint64_t    g_exec_rsp;

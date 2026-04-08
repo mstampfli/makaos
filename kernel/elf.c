@@ -186,7 +186,7 @@ task_t* elf_load_from_ext2(const char* path, uint32_t pid) {
     if (!f) return NULL;
 
     // Read up to 1 MiB.
-    const uint64_t MAX_ELF = 1024ULL * 1024ULL;
+    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB — large enough for doom
     uint8_t* buf = kmalloc((uint64_t)MAX_ELF);
     if (!buf) { vfs_close(f); return NULL; }
 

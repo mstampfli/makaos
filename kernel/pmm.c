@@ -387,6 +387,7 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   // 2. Pop the block from the list
   phys_addr_t allocated_phys = free_list_pop(current_order);
   uint64_t frame_index = allocated_phys >> PAGE_SHIFT;
+
   uint64_t block_index = frame_index >> current_order;
 
   // 3. Toggle XOR bit to mark as allocated (state change)

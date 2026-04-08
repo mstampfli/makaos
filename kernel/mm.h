@@ -30,6 +30,7 @@ typedef struct {
     vma_t*      vmas;           // sorted linked list of VMAs
     virt_addr_t brk_start;      // base of the heap region (fixed at create time)
     virt_addr_t brk;            // current heap top (grows up via sys_brk)
+    virt_addr_t mmap_base;      // hint for next anonymous mmap (grows downward)
     uint32_t    refcount;       // threads sharing this mm (unused until threading)
 } mm_t;
 
@@ -56,3 +57,25 @@ uint64_t mm_vma_pte_flags(uint32_t vma_flags);
 // Clone a mm_t: allocate a new mm_t, copy brk_start/brk, copy VMA list.
 // Does NOT copy physical pages (use vmm_clone_user for that).
 mm_t* mm_clone(const mm_t* src);
+
+// Remove the VMA that covers exactly [start, end).  Returns 1 if found and
+// removed, 0 if no matching VMA exists.  Handles partial unmaps by splitting
+// or shrinking the existing VMA.
+// Does NOT unmap physical pages — caller must walk page tables first.
+uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end);
+
+// Find a free virtual address range of at least `len` bytes (page-aligned)
+// in the anonymous mmap region [VMM_MMAP_BASE, VMM_USER_STACK_TOP - stack_size).
+// Returns the start address, or 0 if no gap found.
+virt_addr_t mm_vma_find_free(mm_t* mm, size_t len);
+
+// mmap/prot flags (POSIX subset)
+#define PROT_NONE   0
+#define PROT_READ   1
+#define PROT_WRITE  2
+#define PROT_EXEC   4
+#define MAP_SHARED    1
+#define MAP_PRIVATE   2
+#define MAP_ANON      0x20
+#define MAP_ANONYMOUS 0x20
+#define MAP_FIXED     0x10

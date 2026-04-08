@@ -30,8 +30,14 @@ typedef enum {
 typedef task_state_t proc_state_t;
 
 // ── Saved CPU context ─────────────────────────────────────────────────────
-typedef struct {
+// The fxsave_buf must be 16-byte aligned (required by FXSAVE/FXRSTOR).
+// We put it after the integer fields; the struct itself is always allocated
+// via kmalloc which returns 8-byte-aligned memory, so we use __attribute__
+// aligned to ensure the buffer starts on a 16-byte boundary.
+typedef struct __attribute__((aligned(16))) {
     uint64_t rsp, rbx, rbp, r12, r13, r14, r15;
+    uint64_t _fxsave_pad;           // pad to 16-byte align fxsave_buf (7×8=56, +8=64)
+    uint8_t  fxsave_buf[512];       // FXSAVE state: x87 + SSE registers
 } cpu_ctx_t;
 
 // ── Shared address space (ref-counted) ───────────────────────────────────
@@ -70,6 +76,8 @@ typedef struct task_t {
     sigstate_t    sigstate;
 
     int32_t       exit_code;    // set by sys_exit, readable via wait()
+
+    uint64_t      sleep_until_ns; // wake time for nanosleep (TSC nanoseconds)
 
     uint8_t       mlfq_level;
     uint8_t       mlfq_ticks_left;
