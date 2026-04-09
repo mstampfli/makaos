@@ -73,6 +73,12 @@ void fb_term_putc(char c) {
     uint32_t cols = fb_cols();
     uint32_t rows = fb_rows();
 
+    if (c == '\f') {  // form-feed: clear screen
+        fb_clear();
+        g_fb_row = 0;
+        g_fb_col = 0;
+        return;
+    }
     if (c == '\r') {
         g_fb_col = 0;
         return;
