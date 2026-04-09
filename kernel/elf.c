@@ -12,8 +12,12 @@
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
 // Does NOT create a kstack or fd_table — those are for elf_load only.
+// All out_* params except out_pml4/out_mm/out_entry may be NULL.
 uint8_t elf_load_into(const uint8_t* data, uint64_t size,
-                      phys_addr_t* out_pml4, mm_t** out_mm, uint64_t* out_entry) {
+                      phys_addr_t* out_pml4, mm_t** out_mm, uint64_t* out_entry,
+                      uint64_t* out_phdr_vaddr,
+                      uint16_t* out_phnum,
+                      uint16_t* out_phent) {
     if (!data || size < sizeof(Elf64_Ehdr)) return 0;
 
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)data;
@@ -25,10 +29,49 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                    | ((uint32_t)ehdr->e_ident[3] << 24);
     if (magic != ELF_MAGIC)         return 0;
     if (ehdr->e_ident[4] != 2)      return 0; // ELFCLASS64
-    if (ehdr->e_type    != ET_EXEC)  return 0;
+    // Accept ET_EXEC (static) and ET_DYN (static PIE).
+    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return 0;
     if (ehdr->e_machine != EM_X86_64) return 0;
     if (ehdr->e_phnum   == 0)        return 0;
     if (ehdr->e_phoff + (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr) > size) return 0;
+
+    // For ET_DYN (static PIE), compute a load bias so the binary does not
+    // collide with the kernel or other fixed mappings.
+    // We place PIE at VMM_USER_CODE_BASE (4 MiB).  The ELF's p_vaddr values
+    // are relative offsets from 0; we add the bias to get the final VA.
+    virt_addr_t load_bias = (ehdr->e_type == ET_DYN) ? VMM_USER_CODE_BASE : 0;
+
+    // Compute phdr table virtual address for AT_PHDR.
+    // Preferred: use the PT_PHDR segment if the binary includes one.
+    // Fallback: the phdr table sits at file offset e_phoff; for ET_EXEC
+    // it lives inside the first PT_LOAD segment so we can derive its VA
+    // by finding that segment.
+    if (out_phdr_vaddr || out_phnum || out_phent) {
+        uint64_t phdr_va = 0;
+        // Scan for PT_PHDR first.
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr* ph = (const Elf64_Phdr*)(data + ehdr->e_phoff
+                                                        + (uint64_t)i * sizeof(Elf64_Phdr));
+            if (ph->p_type == 6 /*PT_PHDR*/) {
+                phdr_va = ph->p_vaddr + load_bias;
+                break;
+            }
+        }
+        // If no PT_PHDR, fall back to first PT_LOAD that contains the headers.
+        if (!phdr_va) {
+            for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+                const Elf64_Phdr* ph = (const Elf64_Phdr*)(data + ehdr->e_phoff
+                                                            + (uint64_t)i * sizeof(Elf64_Phdr));
+                if (ph->p_type == PT_LOAD && ph->p_offset == 0 && ph->p_filesz >= ehdr->e_phoff) {
+                    phdr_va = ph->p_vaddr + load_bias + ehdr->e_phoff;
+                    break;
+                }
+            }
+        }
+        if (out_phdr_vaddr) *out_phdr_vaddr = phdr_va;
+        if (out_phnum)      *out_phnum      = ehdr->e_phnum;
+        if (out_phent)      *out_phent      = ehdr->e_phentsize;
+    }
 
     // Allocate PML4.
     phys_addr_t pml4 = vmm_alloc_pml4();
@@ -53,8 +96,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         if (ph->p_flags & PF_W) vma_flags |= VMA_W;
         if (ph->p_flags & PF_X) vma_flags |= VMA_X;
 
-        virt_addr_t seg_start = ph->p_vaddr & ~PAGE_MASK;
-        virt_addr_t seg_end   = (ph->p_vaddr + ph->p_memsz + PAGE_MASK) & ~PAGE_MASK;
+        virt_addr_t seg_start = (ph->p_vaddr + load_bias) & ~PAGE_MASK;
+        virt_addr_t seg_end   = (ph->p_vaddr + load_bias + ph->p_memsz + PAGE_MASK) & ~PAGE_MASK;
 
         if (!mm_vma_add(mm, seg_start, seg_end, vma_flags)) {
             mm_destroy(mm);
@@ -81,15 +124,16 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
 
             // Copy file data that falls in this page.
             virt_addr_t page_end = page + PAGE_SIZE;
-            // File data range: [p_vaddr, p_vaddr + p_filesz)
-            virt_addr_t file_start_va = ph->p_vaddr;
-            virt_addr_t file_end_va   = ph->p_vaddr + ph->p_filesz;
+            // File data range: [p_vaddr+bias, p_vaddr+bias + p_filesz)
+            virt_addr_t file_start_va = ph->p_vaddr + load_bias;
+            virt_addr_t file_end_va   = ph->p_vaddr + load_bias + ph->p_filesz;
 
             if (file_start_va < page_end && file_end_va > page) {
                 virt_addr_t copy_start = (file_start_va > page) ? file_start_va : page;
                 virt_addr_t copy_end   = (file_end_va < page_end) ? file_end_va : page_end;
                 uint64_t    frame_off  = copy_start - page;
-                uint64_t    file_off   = ph->p_offset + (copy_start - ph->p_vaddr);
+                // file_off is relative to segment start in file, not biased VA
+                uint64_t    file_off   = ph->p_offset + (copy_start - file_start_va);
                 uint64_t    nbytes     = copy_end - copy_start;
 
                 if (file_off + nbytes <= size) {
@@ -118,8 +162,205 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
 
     *out_pml4  = pml4;
     *out_mm    = mm;
-    *out_entry = ehdr->e_entry;
+    *out_entry = ehdr->e_entry + load_bias;
     return 1;
+}
+
+// ── elf_setup_stack ────────────────────────────────────────────────────────
+// Build the SysV AMD64 initial user stack.
+//
+// We allocate a flat kernel buffer, fill it with the correct layout, then
+// copy it into the already-mapped user stack pages (which elf_load_into
+// registered in the mm VMA).  No page-table walk needed.
+//
+// Layout (low → high, RSP points to lowest word):
+//   argc          (uint64_t)
+//   argv[0..n-1]  (uint64_t pointers into string area above)
+//   NULL          (uint64_t 0)
+//   envp[0..m-1]  (uint64_t pointers)
+//   NULL          (uint64_t 0)
+//   auxv pairs    (pairs of uint64_t: type, value)
+//   AT_NULL pair  (0, 0)
+//   [padding to align RSP % 16 == 0 before argc]
+//   16-byte AT_RANDOM blob
+//   envp strings  (NUL-terminated, packed)
+//   argv strings  (NUL-terminated, packed)
+//       ← VMM_USER_STACK_TOP
+//
+// The stack pages are already mapped (elf_load_into created the VMA and
+// the demand-fault handler will fill them); we need to pre-populate the
+// initial pages.  We do this by allocating frames ourselves for the top
+// portion and mapping them into the new PML4.
+//
+// Returns the initial user RSP, or 0 on failure.
+
+uint64_t elf_setup_stack(phys_addr_t pml4,
+                          const char* const* argv, const char* const* envp,
+                          uint64_t entry,
+                          uint64_t phdr_vaddr, uint16_t phnum, uint16_t phent) {
+    // ── Count and measure ─────────────────────────────────────────────────
+    uint32_t argc = 0, envc = 0;
+    if (argv) while (argv[argc]) argc++;
+    if (envp) while (envp[envc]) envc++;
+
+    // String bytes (argv strings + envp strings + NUL terminators).
+    uint64_t str_bytes = 0;
+    for (uint32_t i = 0; i < argc; i++) {
+        uint64_t l = 0; while (argv[i][l]) l++; str_bytes += l + 1;
+    }
+    for (uint32_t i = 0; i < envc; i++) {
+        uint64_t l = 0; while (envp[i][l]) l++; str_bytes += l + 1;
+    }
+    str_bytes += 16; // AT_RANDOM 16-byte blob
+
+    // Auxv: 13 entries × 16 bytes = 208 bytes.
+    // Entries: PHDR, PHENT, PHNUM, PAGESZ, ENTRY, UID, EUID, GID, EGID,
+    //          HWCAP, CLKTCK, RANDOM, NULL.
+    const uint32_t N_AUXV = 13;
+    uint64_t ptr_words = 1            // argc
+                       + argc + 1    // argv[] + NULL
+                       + envc + 1    // envp[] + NULL
+                       + N_AUXV * 2; // auxv (key,val) pairs
+    uint64_t ptr_bytes = ptr_words * 8;
+
+    // Total bytes needed (add 16 for alignment slack).
+    uint64_t total = str_bytes + ptr_bytes + 16;
+
+    // ── Allocate and pre-populate stack pages ─────────────────────────────
+    // We allocate enough physical pages to hold `total` bytes just below
+    // VMM_USER_STACK_TOP, map them into the new PML4, and return a kernel
+    // pointer to write into.
+    uint64_t pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages == 0) pages = 1;
+    if (pages > VMM_USER_STACK_PAGES) return 0; // sanity
+
+    virt_addr_t utop   = VMM_USER_STACK_TOP;
+    virt_addr_t ubase  = utop - pages * PAGE_SIZE;
+
+    // Allocate frames and map them; keep a kernel-side shadow buffer.
+    uint8_t* kbuf = (uint8_t*)kmalloc(pages * PAGE_SIZE);
+    if (!kbuf) return 0;
+    // Zero the kernel shadow buffer.
+    for (uint64_t b = 0; b < pages * PAGE_SIZE; b++) kbuf[b] = 0;
+
+    // Map each page.
+    for (uint64_t p = 0; p < pages; p++) {
+        phys_addr_t frame = pmm_buddy_alloc(0);
+        if (frame == PMM_INVALID_ADDR) { kfree(kbuf); return 0; }
+        // Zero the physical frame.
+        uint8_t* fp = (uint8_t*)(frame + HHDM_OFFSET);
+        for (uint32_t j = 0; j < PAGE_SIZE; j++) fp[j] = 0;
+        vmm_page_map(pml4, ubase + p * PAGE_SIZE, frame, VMM_UDATA);
+    }
+
+    // ── Build stack content in the kernel shadow buffer ───────────────────
+    // The buffer covers [ubase, ubase + pages*PAGE_SIZE).
+    // Offset within buffer = user_va - ubase.
+
+    // Phase 1: write strings starting from the top of the buffer downward.
+    uint64_t off = pages * PAGE_SIZE; // offset from kbuf base (exclusive)
+
+    // AT_RANDOM blob.
+    off -= 16;
+    uint64_t at_random_va = ubase + off;
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t seed = ((uint64_t)hi << 32) | lo;
+        for (int b = 0; b < 16; b++) {
+            kbuf[off + (uint64_t)b] = (uint8_t)seed;
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+    }
+
+    // Allocate user-VA pointer arrays in kernel heap.
+    uint64_t* argv_va = (uint64_t*)kmalloc((argc + 1) * 8);
+    uint64_t* envp_va = (uint64_t*)kmalloc((envc + 1) * 8);
+    if (!argv_va || !envp_va) {
+        if (argv_va) kfree(argv_va);
+        if (envp_va) kfree(envp_va);
+        kfree(kbuf);
+        return 0;
+    }
+
+    // Write envp strings top-down (envp[0] nearest the pointer table).
+    for (int32_t i = (int32_t)envc - 1; i >= 0; i--) {
+        uint64_t l = 0; while (envp[i][l]) l++; l++;
+        off -= l;
+        const uint8_t* src = (const uint8_t*)envp[i];
+        for (uint64_t b = 0; b < l; b++) kbuf[off + b] = src[b];
+        envp_va[i] = ubase + off;
+    }
+    envp_va[envc] = 0;
+
+    // Write argv strings top-down.
+    for (int32_t i = (int32_t)argc - 1; i >= 0; i--) {
+        uint64_t l = 0; while (argv[i][l]) l++; l++;
+        off -= l;
+        const uint8_t* src = (const uint8_t*)argv[i];
+        for (uint64_t b = 0; b < l; b++) kbuf[off + b] = src[b];
+        argv_va[i] = ubase + off;
+    }
+    argv_va[argc] = 0;
+
+    // Phase 2: build the pointer table below the string area.
+    // Compute RSP: enough room for ptr_words × 8 bytes, aligned to 16.
+    uint64_t rsp = (ubase + off - ptr_bytes) & ~(uint64_t)0xF;
+    if (rsp < ubase) { kfree(argv_va); kfree(envp_va); kfree(kbuf); return 0; }
+
+    // Write words sequentially at rsp (user VA → kbuf offset).
+    uint64_t woff = rsp - ubase; // write offset in kbuf
+
+    // Macro: write one uint64_t word and advance woff.
+    #define WWORD(v) do { \
+        uint64_t _v = (uint64_t)(v); \
+        kbuf[woff]   = (uint8_t)(_v);       kbuf[woff+1] = (uint8_t)(_v>>8);  \
+        kbuf[woff+2] = (uint8_t)(_v>>16);   kbuf[woff+3] = (uint8_t)(_v>>24); \
+        kbuf[woff+4] = (uint8_t)(_v>>32);   kbuf[woff+5] = (uint8_t)(_v>>40); \
+        kbuf[woff+6] = (uint8_t)(_v>>48);   kbuf[woff+7] = (uint8_t)(_v>>56); \
+        woff += 8; \
+    } while (0)
+
+    WWORD(argc);
+    for (uint32_t i = 0; i < argc; i++) WWORD(argv_va[i]);
+    WWORD(0); // argv NULL
+    for (uint32_t i = 0; i < envc; i++) WWORD(envp_va[i]);
+    WWORD(0); // envp NULL
+    // auxv (key, value) pairs:
+    WWORD(AT_PHDR);   WWORD(phdr_vaddr);
+    WWORD(AT_PHENT);  WWORD(phent);
+    WWORD(AT_PHNUM);  WWORD(phnum);
+    WWORD(AT_PAGESZ); WWORD(PAGE_SIZE);
+    WWORD(AT_ENTRY);  WWORD(entry);
+    WWORD(AT_UID);    WWORD(0);
+    WWORD(AT_EUID);   WWORD(0);
+    WWORD(AT_GID);    WWORD(0);
+    WWORD(AT_EGID);   WWORD(0);
+    WWORD(AT_HWCAP);  WWORD(0);
+    WWORD(AT_CLKTCK); WWORD(100);
+    WWORD(AT_RANDOM); WWORD(at_random_va);
+    WWORD(AT_NULL);   WWORD(0);
+
+    #undef WWORD
+
+    // Phase 3: flush the shadow buffer into the physical frames.
+    // Each frame covers one page.  Copy the corresponding slice from kbuf.
+    for (uint64_t p = 0; p < pages; p++) {
+        // Find the frame mapped at ubase + p*PAGE_SIZE.
+        // We just mapped it above but didn't save the frame address.
+        // Walk the PML4 to recover it.
+        uint64_t va = ubase + p * PAGE_SIZE;
+        phys_addr_t frame = vmm_page_phys(pml4, va);
+        if (frame == PMM_INVALID_ADDR) { kfree(argv_va); kfree(envp_va); kfree(kbuf); return 0; }
+        uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
+        const uint8_t* src = kbuf + p * PAGE_SIZE;
+        for (uint32_t b = 0; b < PAGE_SIZE; b++) dst[b] = src[b];
+    }
+
+    kfree(argv_va);
+    kfree(envp_va);
+    kfree(kbuf);
+    return rsp;
 }
 
 // ── elf_load ──────────────────────────────────────────────────────────────
@@ -129,9 +370,87 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     mm_t*       mm;
     uint64_t    entry;
 
-    if (!elf_load_into(data, size, &pml4, &mm, &entry)) return NULL;
+    if (!elf_load_into(data, size, &pml4, &mm, &entry,
+                       NULL, NULL, NULL)) return NULL;
 
     // Allocate task + shared resources.
+    task_t* t = kmalloc(sizeof(task_t));
+    if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+
+    task_mm_t* tmm = task_mm_alloc(pml4, mm);
+    if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+
+    task_files_t* files = task_files_alloc();
+    if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
+    fd_table_init(files, 4);
+    // stdin/stdout/stderr default to keyboard and VGA console.
+    files->fd_table[0] = vfs_kbd_open();
+    files->fd_table[1] = vfs_vga_open();
+    files->fd_table[2] = vfs_vga_open();
+    // fd_flags default to 0 (no FD_CLOEXEC on stdio).
+
+    t->pid              = pid;
+    t->tgid             = pid;
+    t->ppid             = 0;
+    t->pgid             = pid;
+    t->sid              = pid;
+    t->flags            = 0;
+    t->state            = TASK_READY;
+    t->next             = NULL;
+    t->mm_shared        = tmm;
+    t->files_shared     = files;
+    t->mlfq_level       = 0;
+    t->mlfq_ticks_left  = 0;
+    t->sigstate.head    = 0;
+    t->sigstate.tail    = 0;
+    t->sigstate.blocked = 0;
+    t->umask            = 0022u;
+    t->exit_code        = 0;
+    t->sleep_until_ns   = 0;
+    t->cwd[0] = '/';
+    t->cwd[1] = '\0';
+
+    virt_addr_t kstack_top = kstack_alloc();
+    t->kstack_top = kstack_top;
+
+    uint64_t* stk = (uint64_t*)kstack_top;
+    *(--stk) = 0;
+    *(--stk) = (uint64_t)user_trampoline;
+    *(--stk) = 0;                  // rbx
+    *(--stk) = 0;                  // rbp
+    *(--stk) = entry;              // r12 = user RIP
+    *(--stk) = VMM_USER_STACK_TOP; // r13 = user RSP (no argv yet — elf_load path)
+    *(--stk) = 0;                  // r14
+    *(--stk) = 0;                  // r15
+    t->ctx.rsp = (uint64_t)stk;
+
+    return t;
+}
+
+// ── elf_load_with_argv ────────────────────────────────────────────────────
+// Like elf_load but also calls elf_setup_stack to build the SysV stack.
+// Required for Linux ABI binaries (bash, musl apps) that read argc/argv/envp.
+task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
+                           const char* const* argv, const char* const* envp) {
+    phys_addr_t pml4;
+    mm_t*       mm;
+    uint64_t    entry;
+    uint64_t phdr_vaddr = 0;
+    uint16_t phnum = 0, phent = 0;
+    if (!elf_load_into(data, size, &pml4, &mm, &entry,
+                       &phdr_vaddr, &phnum, &phent)) return NULL;
+
+    // Build the initial user stack with argc/argv/envp/auxv.
+    uint64_t user_rsp = elf_setup_stack(pml4, argv, envp, entry,
+                                         phdr_vaddr, phnum, phent);
+    if (!user_rsp) {
+        mm_destroy(mm);
+        vmm_free_user(pml4);
+        pmm_buddy_free(pml4, 0);
+        return NULL;
+    }
+
+    // Allocate task + shared resources (same as elf_load).
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
 
@@ -148,6 +467,8 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->pid              = pid;
     t->tgid             = pid;
     t->ppid             = 0;
+    t->pgid             = pid;
+    t->sid              = pid;
     t->flags            = 0;
     t->state            = TASK_READY;
     t->next             = NULL;
@@ -158,6 +479,9 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    t->umask            = 0022u;
+    t->exit_code        = 0;
+    t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
 
@@ -167,14 +491,34 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;
     *(--stk) = (uint64_t)user_trampoline;
-    *(--stk) = 0;                  // rbx
-    *(--stk) = 0;                  // rbp
-    *(--stk) = entry;              // r12 = user RIP
-    *(--stk) = VMM_USER_STACK_TOP; // r13 = user RSP
-    *(--stk) = 0;                  // r14
-    *(--stk) = 0;                  // r15
+    *(--stk) = 0;          // rbx
+    *(--stk) = 0;          // rbp
+    *(--stk) = entry;      // r12 = user RIP
+    *(--stk) = user_rsp;   // r13 = user RSP (points to argc on stack)
+    *(--stk) = 0;          // r14
+    *(--stk) = 0;          // r15
     t->ctx.rsp = (uint64_t)stk;
 
+    return t;
+}
+
+// ── elf_exec_from_ext2 ────────────────────────────────────────────────────
+task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
+                            const char* const* argv, const char* const* envp) {
+    vfs_file_t* f = ext2_open(path);
+    if (!f) return NULL;
+
+    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL;
+    uint8_t* buf = kmalloc(MAX_ELF);
+    if (!buf) { vfs_close(f); return NULL; }
+
+    int64_t n = vfs_read(f, buf, MAX_ELF);
+    vfs_close(f);
+
+    if (n <= 0) { kfree(buf); return NULL; }
+
+    task_t* t = elf_load_with_argv(buf, (uint64_t)n, pid, argv, envp);
+    kfree(buf);
     return t;
 }
 

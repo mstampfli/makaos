@@ -74,6 +74,10 @@ uint8_t vmm_page_map(phys_addr_t pml4_phys, virt_addr_t vaddr,
 uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr,
                        phys_addr_t* out_paddr);
 
+// Walk the page table and return the physical address mapped at vaddr.
+// Returns PMM_INVALID_ADDR if not mapped.
+phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr);
+
 // Allocate a physical frame, map it at vaddr in the CURRENT address space.
 void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags);
 

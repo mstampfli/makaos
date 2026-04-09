@@ -111,14 +111,14 @@ extern void hda_irq_entry(void);
 //     wraps back to it).
 //   • hda_write() is the application-facing API: it copies into the FIFO and
 //     returns.  It never touches DMA buffers directly.
-//   • Latency ≈ BUF_BYTES / (48000×2ch×2B).  At 512 B that is ~2.7 ms.
-//     IRQ fires ~370×/sec on QEMU TCG — small enough for low latency.
+//   • Latency ≈ BUF_BYTES / (48000×2ch×2B).  At 256 B that is ~1.3 ms.
+//     IRQ fires ~740×/sec via MSI → LAPIC, bypassing PIC routing entirely.
 //
 // BUF_BYTES must be a multiple of 4 (frame size) and ≥ 64.
 // BDL_ENTRIES must be a power of 2 ≥ 2.
 
-#define BDL_ENTRIES  8u          // 8 × 512 B = 4 KiB cyclic ring
-#define BUF_BYTES    512u        // ~2.7 ms per period
+#define BDL_ENTRIES  8u          // 8 × 256 B = 2 KiB cyclic ring
+#define BUF_BYTES    256u        // ~1.3 ms per period
 #define BUF_ORDER    0u          // 2^0 pages = 4 KiB phys alloc per slot
 
 // ── Software FIFO ─────────────────────────────────────────────────────────

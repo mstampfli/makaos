@@ -19,6 +19,12 @@
 #define SIGALRM   14   // alarm clock
 #define SIGTERM   15   // graceful shutdown request (can be caught/ignored)
 #define SIGCHLD   17   // child stopped or terminated
+#define SIGCONT   18   // continue if stopped
+#define SIGSTOP   19   // stop process (unblockable, uncatchable)
+#define SIGTSTP   20   // terminal stop (Ctrl-Z, catchable)
+#define SIGTTIN   21   // background read from terminal
+#define SIGTTOU   22   // background write to terminal
+#define SIGWINCH  28   // terminal window size changed
 
 #define NSIG      32   // total signal slots (bits in a uint32_t mask)
 

@@ -2,16 +2,6 @@
 // unistd.h shim
 #include "../../libc.h"
 
-// access() — stub: always returns -1 (not found) unless it's a try-open.
-static inline int access(const char* path, int mode) {
-    (void)mode;
-    // Try to open and immediately close.
-    int fd = open(path, O_RDONLY, 0);
-    if (fd < 0) return -1;
-    close(fd);
-    return 0;
-}
-
 // sleep() — seconds
 static inline unsigned int sleep(unsigned int secs) {
     timespec_t req = { (unsigned long long)secs, 0 };
