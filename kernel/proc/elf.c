@@ -462,9 +462,10 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    files->fd_table[0] = vfs_kbd_open();
-    files->fd_table[1] = vfs_vga_open();
-    files->fd_table[2] = vfs_vga_open();
+    // stdin/stdout/stderr all wire to tty0.
+    files->fd_table[0] = tty_open(0);
+    files->fd_table[1] = tty_open(0);
+    files->fd_table[2] = tty_open(0);
 
     t->pid              = pid;
     t->tgid             = pid;
