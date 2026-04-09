@@ -6,132 +6,120 @@
 #include "libc.h"
 #include "stdio.h"
 
-// ── Keyboard: Swiss German PS/2 set-1 scancode translation ───────────────
-// Supports shift, handles all common keys for shell use.
+// ── Keyboard: Swiss German (CH-DE) PS/2 set-1 scancode translation ───────
+//
+// Physical CH-DE layout (QWERTZ, standard ISO PC):
+//
+//  [§°] [1+] [2"] [3*] [4ç] [5%] [6&] [7/|] [8()] [9)] [0=] ['?~] [^`  ] [BS]
+//  [Tab][q  ][w  ][e  ][r  ][t  ][z  ][u  ][i  ][o  ][p  ][ü  ][¨! ]
+//  [Cap][a  ][s  ][d  ][f  ][g  ][h  ][j  ][k  ][l  ][ö  ][ä  ][$ £]  [Enter]
+//  [Sh ][< >][y  ][x  ][c  ][v  ][b  ][n  ][m  ][,; ][.: ][--_]       [Sh ]
+//
+// Unshift / Shift / AltGr per scancode.
+// Non-ASCII chars (ü,ö,ä,ç,§,°,¨) → skipped (0), terminal has no glyph.
+// Dead keys (^ ` ¨) → deliver the base char directly (no composition).
 
 static int g_kbd_fd = -1;
+static int g_shift  = 0;
+static int g_ctrl   = 0;
+static int g_altgr  = 0;
 
-// Modifier state.
-static int g_shift = 0;
-static int g_ctrl  = 0;
-// AltGr (Right Alt) — produces extended 0xE0 0x38; tracked via flag.
-static int g_altgr = 0;
-// Dead key state for ^ ` ~ etc (Swiss uses dead keys).
-static int g_dead  = 0;  // pending dead key char
+typedef struct { char u; char s; char a; } sc_map_t;  // unshift/shift/altgr
 
-// Swiss German scancode → unshifted/shifted char pairs.
-// Layout: CH-DE (Swiss German), standard PC keyboard.
-// [sc] = { unshifted, shifted }
-typedef struct { char unshift; char shift; char altgr; } sc_map_t;
-
-static const sc_map_t g_sc_map[0x60] = {
-    // 0x00
-    [0x01] = { 0,    0,    0    },  // ESC — handled specially
-    [0x02] = { '1',  '+',  0    },
-    [0x03] = { '2',  '"',  '@'  },
-    [0x04] = { '3',  '*',  '#'  },
-    [0x05] = { '4',  0xE7, 0    },  // 4 / ç (skip non-ASCII ç)
-    [0x06] = { '5',  '%',  0    },
-    [0x07] = { '6',  '&',  0    },
-    [0x08] = { '7',  '/',  '|'  },
-    [0x09] = { '8',  '(',  0    },
-    [0x0A] = { '9',  ')',  0    },
-    [0x0B] = { '0',  '=',  0    },
-    [0x0C] = { '\'', '?',  0    },  // ' / ?  (key right of 0)
-    [0x0D] = { '^',  '`',  '~'  },  // dead ^ / ` / ~
-    [0x0E] = { '\b', '\b', 0    },  // Backspace
-    [0x0F] = { '\t', '\t', 0    },  // Tab
-    // 0x10 row: q w e r t z u i o p ü
-    [0x10] = { 'q',  'Q',  0    },
-    [0x11] = { 'w',  'W',  0    },
-    [0x12] = { 'e',  'E',  0    },
-    [0x13] = { 'r',  'R',  0    },
-    [0x14] = { 't',  'T',  0    },
-    [0x15] = { 'z',  'Z',  0    },  // z (not y — Swiss layout)
-    [0x16] = { 'u',  'U',  0    },
-    [0x17] = { 'i',  'I',  0    },
-    [0x18] = { 'o',  'O',  0    },
-    [0x19] = { 'p',  'P',  0    },
-    [0x1A] = { 0,    0,    0    },  // ü — skip non-ASCII
-    [0x1B] = { '!',  0,    0    },  // ! / (dead tilde on some layouts)
-    [0x1C] = { '\n', '\n', 0    },  // Enter
-    // 0x1E row: a s d f g h j k l ö ä
-    [0x1E] = { 'a',  'A',  0    },
-    [0x1F] = { 's',  'S',  0    },
-    [0x20] = { 'd',  'D',  0    },
-    [0x21] = { 'f',  'F',  0    },
-    [0x22] = { 'g',  'G',  0    },
-    [0x23] = { 'h',  'H',  0    },
-    [0x24] = { 'j',  'J',  0    },
-    [0x25] = { 'k',  'K',  0    },
-    [0x26] = { 'l',  'L',  0    },
-    [0x27] = { 0,    0,    0    },  // ö — skip
-    [0x28] = { 0,    0,    0    },  // ä — skip
-    [0x29] = { 0,    0,    0    },  // § / ° — skip
-    [0x2A] = { 0,    0,    0    },  // Left Shift
-    [0x2B] = { '$',  0,    0    },  // $ (key left of Enter on CH layout)
-    // 0x2C row: y x c v b n m , . -
-    [0x2C] = { 'y',  'Y',  0    },  // y (not z)
-    [0x2D] = { 'x',  'X',  0    },
-    [0x2E] = { 'c',  'C',  0    },
-    [0x2F] = { 'v',  'V',  0    },
-    [0x30] = { 'b',  'B',  0    },
-    [0x31] = { 'n',  'N',  0    },
-    [0x32] = { 'm',  'M',  0    },
-    [0x33] = { ',',  ';',  0    },
-    [0x34] = { '.',  ':',  0    },
-    [0x35] = { '-',  '_',  0    },
-    [0x36] = { 0,    0,    0    },  // Right Shift
-    [0x39] = { ' ',  ' ',  0    },  // Space
+// Table indexed by base scancode (0x00–0x58).
+static const sc_map_t g_sc_map[0x59] = {
+    [0x01] = { 0,    0,    0   },  // ESC — handled separately
+    // Number row
+    [0x02] = { '1',  '+',  0   },
+    [0x03] = { '2',  '"',  '@' },
+    [0x04] = { '3',  '*',  '#' },
+    [0x05] = { '4',  0,    0   },  // 4 / ç (non-ASCII, skip)
+    [0x06] = { '5',  '%',  0   },
+    [0x07] = { '6',  '&',  0   },
+    [0x08] = { '7',  '/',  '|' },
+    [0x09] = { '8',  '(',  0   },
+    [0x0A] = { '9',  ')',  0   },
+    [0x0B] = { '0',  '=',  0   },
+    [0x0C] = { '\'', '?',  '~' },  // ' / ? / ~ (right of 0)
+    [0x0D] = { '^',  '`',  0   },  // ^ / `  (dead key — deliver as-is)
+    [0x0E] = { '\b', '\b', 0   },  // Backspace
+    [0x0F] = { '\t', '\t', 0   },  // Tab
+    // QWERTZ row
+    [0x10] = { 'q',  'Q',  0   },
+    [0x11] = { 'w',  'W',  0   },
+    [0x12] = { 'e',  'E',  0   },
+    [0x13] = { 'r',  'R',  0   },
+    [0x14] = { 't',  'T',  0   },
+    [0x15] = { 'z',  'Z',  0   },  // z (Swiss: z here, y on bottom row)
+    [0x16] = { 'u',  'U',  0   },
+    [0x17] = { 'i',  'I',  0   },
+    [0x18] = { 'o',  'O',  0   },
+    [0x19] = { 'p',  'P',  0   },
+    [0x1A] = { 0,    0,    '[' },  // ü / Ü / [ (AltGr)
+    [0x1B] = { '!',  0,    ']' },  // ¨! / ] (key right of ü; shift gives ¨ non-ASCII)
+    [0x1C] = { '\n', '\n', 0   },  // Enter
+    // Home row
+    [0x1E] = { 'a',  'A',  0   },
+    [0x1F] = { 's',  'S',  0   },
+    [0x20] = { 'd',  'D',  0   },
+    [0x21] = { 'f',  'F',  0   },
+    [0x22] = { 'g',  'G',  0   },
+    [0x23] = { 'h',  'H',  0   },
+    [0x24] = { 'j',  'J',  0   },
+    [0x25] = { 'k',  'K',  0   },
+    [0x26] = { 'l',  'L',  0   },
+    [0x27] = { 0,    0,    0   },  // ö / Ö
+    [0x28] = { 0,    0,    0   },  // ä / Ä
+    [0x29] = { 0,    0,    0   },  // § / ° (top-left, left of 1)
+    [0x2B] = { '$',  0,    0   },  // $ / £ (right of ä, left of Enter)
+    // Bottom row
+    [0x56] = { '<',  '>',  '\\'},  // < / > / \ (ISO extra key, left of y)
+    [0x2C] = { 'y',  'Y',  0   },  // y (Swiss: y here, z on QWERTZ row)
+    [0x2D] = { 'x',  'X',  0   },
+    [0x2E] = { 'c',  'C',  0   },
+    [0x2F] = { 'v',  'V',  0   },
+    [0x30] = { 'b',  'B',  0   },
+    [0x31] = { 'n',  'N',  0   },
+    [0x32] = { 'm',  'M',  0   },
+    [0x33] = { ',',  ';',  0   },
+    [0x34] = { '.',  ':',  0   },
+    [0x35] = { '-',  '_',  0   },
+    // Space
+    [0x39] = { ' ',  ' ',  0   },
 };
 
-// Translate one scancode to ASCII. Handles shift/altgr state.
-// Returns 0 for unmapped or modifier-only keys.
 static char sc_translate(uint8_t sc) {
-    if (sc >= 0x60) return 0;
+    if (sc >= 0x59) return 0;
     const sc_map_t* m = &g_sc_map[sc];
     char c;
-    if (g_altgr && m->altgr) c = m->altgr;
-    else if (g_shift)         c = m->shift;
-    else                      c = m->unshift;
-    // Drop non-ASCII (> 127) — we have no font support for them in the terminal.
-    if ((unsigned char)c > 127) c = '?';
+    if      (g_altgr && m->a) c = m->a;
+    else if (g_shift  && m->s) c = m->s;
+    else                       c = m->u;
+    if ((unsigned char)c > 127) return 0;  // drop non-ASCII
     return c;
 }
 
-// Blocking read: returns next meaningful ASCII character.
-// Updates modifier state as side effect.
 static char kbd_getchar(void) {
     for (;;) {
         uint8_t sc;
         if (read(g_kbd_fd, &sc, 1) <= 0) continue;
 
-        // Extended prefix byte — next byte is an extended scancode.
         if (sc == 0xE0) {
-            uint8_t esc;
-            if (read(g_kbd_fd, &esc, 1) <= 0) continue;
-            // Right Alt (AltGr) = 0xE0 0x38 press, 0xE0 0xB8 release.
-            if (esc == 0x38) { g_altgr = 1; continue; }
-            if (esc == 0xB8) { g_altgr = 0; continue; }
-            // All other extended keys (arrows, numpad, etc.) — ignore for now.
-            continue;
+            uint8_t ext;
+            if (read(g_kbd_fd, &ext, 1) <= 0) continue;
+            if (ext == 0x38) { g_altgr = 1; continue; }  // AltGr press
+            if (ext == 0xB8) { g_altgr = 0; continue; }  // AltGr release
+            continue;  // other extended keys (arrows, etc.) — ignore
         }
 
         int release = (sc & 0x80) != 0;
         uint8_t base = sc & 0x7F;
 
-        // Track shift keys.
         if (base == 0x2A || base == 0x36) { g_shift = !release; continue; }
-        // Track ctrl.
-        if (base == 0x1D) { g_ctrl = !release; continue; }
-
+        if (base == 0x1D)                 { g_ctrl  = !release; continue; }
         if (release) continue;
 
-        // ESC key.
-        if (base == 0x01) return 27;
-
-        // Ctrl+C → deliver as ETX (could later send SIGINT).
-        if (g_ctrl && base == 0x2E) return 3;
+        if (base == 0x01) return 27;  // ESC
 
         char c = sc_translate(base);
         if (c) return c;
