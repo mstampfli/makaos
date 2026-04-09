@@ -177,6 +177,12 @@ uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr,
     return 1;
 }
 
+phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr) {
+    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 0, 0);
+    if (!pte || !(*pte & PAGE_PRESENT)) return PMM_INVALID_ADDR;
+    return *pte & PAGE_ADDR_MASK;
+}
+
 // Allocate a physical frame, map it at vaddr in the CURRENT address space.
 void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags) {
     phys_addr_t frame = pmm_buddy_alloc(0);
@@ -423,6 +429,18 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                     ser_str(" - ");  ser_hex64(v->end);
                     ser_str("] f="); ser_hex64(v->flags);
                 }
+            }
+        }
+        // Print top of user stack safely via page table walk
+        ser_str("  STACK@RSP:\n");
+        {
+            uint64_t sp = f->sp;
+            for (int i = 0; i < 8; i++) {
+                uint64_t va = sp + (uint64_t)(i * 8);
+                phys_addr_t pg = vmm_page_phys(vmm_pml4_get(), va & ~0xFFFULL);
+                if (pg == PMM_INVALID_ADDR) { ser_str("    (unmapped)\n"); break; }
+                uint64_t* kp = (uint64_t*)((pg + HHDM_OFFSET) + (va & 0xFF8ULL));
+                ser_str("    "); ser_hex64(va); ser_str(": "); ser_hex64(*kp); ser_str("\n");
             }
         }
         kill_current();

@@ -31,19 +31,34 @@ void task_mm_release(task_mm_t* m) {
 uint8_t fd_table_init(task_files_t* f, uint32_t cap) {
     f->fd_table = kmalloc(cap * sizeof(vfs_file_t*));
     if (!f->fd_table) return 0;
-    for (uint32_t i = 0; i < cap; i++) f->fd_table[i] = NULL;
+    f->fd_flags = kmalloc(cap * sizeof(uint32_t));
+    if (!f->fd_flags) { kfree(f->fd_table); f->fd_table = NULL; return 0; }
+    for (uint32_t i = 0; i < cap; i++) { f->fd_table[i] = NULL; f->fd_flags[i] = 0; }
     f->fd_capacity = cap;
     return 1;
 }
 
 uint8_t fd_table_grow(task_files_t* f) {
     uint32_t new_cap = f->fd_capacity * 2;
+
     vfs_file_t** tbl = kmalloc(new_cap * sizeof(vfs_file_t*));
     if (!tbl) return 0;
-    for (uint32_t i = 0; i < f->fd_capacity; i++) tbl[i] = f->fd_table[i];
-    for (uint32_t i = f->fd_capacity; i < new_cap; i++) tbl[i] = NULL;
+    uint32_t* flg = kmalloc(new_cap * sizeof(uint32_t));
+    if (!flg) { kfree(tbl); return 0; }
+
+    for (uint32_t i = 0; i < f->fd_capacity; i++) {
+        tbl[i] = f->fd_table[i];
+        flg[i] = f->fd_flags[i];
+    }
+    for (uint32_t i = f->fd_capacity; i < new_cap; i++) {
+        tbl[i] = NULL;
+        flg[i] = 0;
+    }
+
     kfree(f->fd_table);
+    kfree(f->fd_flags);
     f->fd_table    = tbl;
+    f->fd_flags    = flg;
     f->fd_capacity = new_cap;
     return 1;
 }
@@ -52,6 +67,7 @@ task_files_t* task_files_alloc(void) {
     task_files_t* f = kmalloc(sizeof(task_files_t));
     if (!f) return NULL;
     f->fd_table    = NULL;
+    f->fd_flags    = NULL;
     f->fd_capacity = 0;
     f->refs        = 1;
     return f;
@@ -63,6 +79,7 @@ void task_files_release(task_files_t* f) {
     for (uint32_t i = 0; i < f->fd_capacity; i++)
         if (f->fd_table[i]) vfs_close(f->fd_table[i]);
     kfree(f->fd_table);
+    kfree(f->fd_flags);
     kfree(f);
 }
 
@@ -101,6 +118,8 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->pid              = pid;
     t->tgid             = pid;
     t->ppid             = 0;
+    t->pgid             = pid;   // new task is its own process group leader
+    t->sid              = pid;   // and its own session leader
     t->flags            = flags;
     t->state            = TASK_READY;
     t->next             = NULL;
@@ -111,6 +130,9 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    t->umask            = 0022u; // default umask: rwxr-xr-x
+    t->exit_code        = 0;
+    t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
 }
@@ -242,12 +264,18 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
     fd_table_init(files, parent->files_shared->fd_capacity);
-    for (uint32_t i = 0; i < parent->files_shared->fd_capacity; i++)
-        files->fd_table[i] = parent->files_shared->fd_table[i];
+    for (uint32_t i = 0; i < parent->files_shared->fd_capacity; i++) {
+        // dup each open file description so both parent and child share it
+        files->fd_table[i] = vfs_dup(parent->files_shared->fd_table[i]);
+        files->fd_flags[i] = parent->files_shared->fd_flags[i];
+    }
 
     t->pid              = pid_alloc();
     t->tgid             = t->pid;
     t->ppid             = parent->pid;
+    t->pgid             = parent->pgid;  // inherit process group
+    t->sid              = parent->sid;   // inherit session
+    t->umask            = parent->umask; // inherit umask
     t->flags            = 0;
     t->state            = TASK_READY;
     t->next             = NULL;

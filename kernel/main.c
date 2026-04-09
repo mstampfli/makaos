@@ -19,6 +19,7 @@
 #include "acpi.h"
 #include "lapic.h"
 #include "ioapic.h"
+#include "net/net.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -134,6 +135,7 @@ void kmain(void) {
     keyboard_init();
     mouse_init();
     hda_init();
+    net_init();
     sched_add(p_shell);
     timer_init(100);   // 100 Hz scheduler tick via LAPIC timer
 

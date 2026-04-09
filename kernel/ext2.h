@@ -156,3 +156,13 @@ int ext2_unlink(const char* path);
 // Rename/move `src` to `dst` (both must be on the same volume).
 // Returns 1 on success, 0 on failure.
 int ext2_rename(const char* src, const char* dst);
+
+// Truncate or extend file at `path` to exactly `length` bytes.
+// Returns 1 on success, 0 on failure.
+int ext2_truncate_to(const char* path, uint64_t length);
+
+// Resolve absolute path to inode number (0 = not found).
+uint32_t ext2_lookup_path(const char* path);
+
+// Read inode `ino` into `*out`.  Returns 1 on success, 0 on failure.
+uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out);

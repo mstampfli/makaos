@@ -137,3 +137,86 @@ static vfs_file_t s_dsp_file = {
 vfs_file_t* vfs_dsp_open(void) {
     return &s_dsp_file;
 }
+
+// ── /dev/null device ──────────────────────────────────────────────────────
+// Reads return 0 (EOF), writes consume silently.
+
+static int64_t null_read(vfs_file_t* self, void* buf, uint64_t len) {
+    (void)self; (void)buf; (void)len;
+    return 0; // EOF
+}
+
+static int64_t null_write(vfs_file_t* self, const void* buf, uint64_t len) {
+    (void)self; (void)buf;
+    return (int64_t)len; // swallow all
+}
+
+static vfs_file_t s_null_file = {
+    .read  = null_read,
+    .write = null_write,
+    .close = vga_noop_close,
+    .ctx   = NULL,
+    .flags = 0,
+};
+
+vfs_file_t* vfs_null_open(void) {
+    return &s_null_file;
+}
+
+// ── /dev/zero device ─────────────────────────────────────────────────────
+// Reads return zeroed bytes; writes are consumed silently.
+
+static int64_t zero_read(vfs_file_t* self, void* buf, uint64_t len) {
+    (void)self;
+    uint8_t* p = (uint8_t*)buf;
+    for (uint64_t i = 0; i < len; i++) p[i] = 0;
+    return (int64_t)len;
+}
+
+static vfs_file_t s_zero_file = {
+    .read  = zero_read,
+    .write = null_write, // reuse: consume silently
+    .close = vga_noop_close,
+    .ctx   = NULL,
+    .flags = 0,
+};
+
+vfs_file_t* vfs_zero_open(void) {
+    return &s_zero_file;
+}
+
+// ── /dev/urandom device ───────────────────────────────────────────────────
+// Returns TSC-seeded pseudo-random bytes.
+
+static uint64_t s_urandom_state = 0x123456789abcdef0ULL;
+
+static int64_t urandom_read(vfs_file_t* self, void* buf, uint64_t len) {
+    (void)self;
+    uint8_t* p = (uint8_t*)buf;
+    for (uint64_t i = 0; i < len; i++) {
+        // xorshift64
+        s_urandom_state ^= s_urandom_state << 13;
+        s_urandom_state ^= s_urandom_state >> 7;
+        s_urandom_state ^= s_urandom_state << 17;
+        p[i] = (uint8_t)s_urandom_state;
+    }
+    return (int64_t)len;
+}
+
+static vfs_file_t s_urandom_file = {
+    .read  = urandom_read,
+    .write = null_write, // consume silently
+    .close = vga_noop_close,
+    .ctx   = NULL,
+    .flags = 0,
+};
+
+vfs_file_t* vfs_urandom_open(void) {
+    // Seed with TSC on first call.
+    if (s_urandom_state == 0x123456789abcdef0ULL) {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        s_urandom_state ^= ((uint64_t)hi << 32) | lo;
+    }
+    return &s_urandom_file;
+}

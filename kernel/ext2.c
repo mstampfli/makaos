@@ -526,9 +526,16 @@ vfs_file_t* ext2_open(const char* path) {
     f->write    = ext2_vfs_write;   // caller enforces O_RDONLY by clearing this
     f->seek     = ext2_vfs_seek;
     f->close    = ext2_vfs_close;
+    f->poll     = NULL;             // ext2 files are always ready
     f->ctx      = fd;
     f->flags    = 0;
     f->refcount = 1;
+    // Store absolute path for fstat/ftruncate.
+    uint32_t pi = 0;
+    if (path) {
+        while (pi < 255 && path[pi]) { f->path[pi] = path[pi]; pi++; }
+    }
+    f->path[pi] = '\0';
     return f;
 }
 
@@ -1120,6 +1127,70 @@ int ext2_create(const char* path) {
 // Truncate file to zero bytes.
 int ext2_truncate(const char* path) {
     return ext2_write_file(path, (const uint8_t*)"", 0);
+}
+
+// ── ext2_truncate_to ──────────────────────────────────────────────────────
+// Truncate (or extend) a file to exactly `length` bytes.
+// If length > current size, the file is extended with zeros.
+// If length == 0, equivalent to ext2_truncate.
+// Returns 1 on success, 0 on failure.
+int ext2_truncate_to(const char* path, uint64_t length) {
+    if (!s_mounted) return 0;
+    if (length == 0) return ext2_truncate(path);
+
+    // For simplicity: read the current content, resize to `length`, write back.
+    // This is O(file_size) but correct and consistent with our write model.
+    uint32_t ino = path_to_inode(path);
+    if (!ino) return 0;
+    ext2_inode_t inode;
+    if (!read_inode(ino, &inode)) return 0;
+    uint32_t cur_size = inode.i_size;
+
+    if (length == cur_size) return 1;
+
+    // Clamp to 32-bit (we don't support >4GiB files).
+    if (length > 0xFFFFFFFFULL) return 0;
+    uint32_t new_size = (uint32_t)length;
+
+    if (new_size < cur_size) {
+        // Read current content, write back shorter version.
+        uint8_t* buf = kmalloc(new_size);
+        if (!buf) return 0;
+        vfs_file_t* f = ext2_open(path);
+        if (!f) { kfree(buf); return 0; }
+        int64_t n = vfs_read(f, buf, new_size);
+        vfs_close(f);
+        if (n < 0) { kfree(buf); return 0; }
+        int r = ext2_write_file(path, buf, new_size);
+        kfree(buf);
+        return r;
+    } else {
+        // Extend: read, zero-pad, write.
+        uint8_t* buf = kmalloc(new_size);
+        if (!buf) return 0;
+        vfs_file_t* f = ext2_open(path);
+        if (!f) { kfree(buf); return 0; }
+        int64_t n = vfs_read(f, buf, cur_size);
+        vfs_close(f);
+        if (n < 0) { kfree(buf); return 0; }
+        // Zero the extended region.
+        for (uint32_t i = cur_size; i < new_size; i++) buf[i] = 0;
+        int r = ext2_write_file(path, buf, new_size);
+        kfree(buf);
+        return r;
+    }
+}
+
+// ── ext2_lookup_path / ext2_read_inode ───────────────────────────────────
+// Public wrappers for internal path resolution and inode reading.
+// Used by fstat to get file metadata without opening a new fd.
+uint32_t ext2_lookup_path(const char* path) {
+    if (!s_mounted || !path) return 0;
+    return path_to_inode(path);
+}
+
+uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out) {
+    return read_inode(ino, out);
 }
 
 // ── ext2_mkdir ────────────────────────────────────────────────────────────

@@ -318,4 +318,19 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
     while (t) { cb(t, data); t = t->next; }
 }
 
+// ── sched_find_pid ────────────────────────────────────────────────────────
+// Find a task by pid, searching all queues.
+
+typedef struct { uint32_t pid; task_t* result; } find_pid_ctx_t;
+static void find_pid_visit(task_t* t, void* data) {
+    find_pid_ctx_t* ctx = (find_pid_ctx_t*)data;
+    if (!ctx->result && t->pid == ctx->pid) ctx->result = t;
+}
+
+task_t* sched_find_pid(uint32_t pid) {
+    find_pid_ctx_t ctx = { pid, NULL };
+    sched_for_each(find_pid_visit, &ctx);
+    return ctx.result;
+}
+
 // ── sched_queue_head — removed: use sched_for_each instead ───────────────

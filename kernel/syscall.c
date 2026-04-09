@@ -14,6 +14,8 @@
 #include "elf.h"
 #include "tsc.h"
 #include "fb.h"
+#include "net/socket.h"
+#include "net/net.h"
 
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
@@ -158,19 +160,9 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
 
 // ── sys_open ──────────────────────────────────────────────────────────────
 // open(path_ptr, flags, mode) → fd or -errno
-// path: null-terminated absolute path.
-// flags: O_RDONLY(0), O_WRONLY(1), O_RDWR(2), O_CREAT(0x40),
-//        O_EXCL(0x80), O_TRUNC(0x200), O_APPEND(0x400).
-// mode: ignored (no permission model yet).
-#define O_RDONLY  0
-#define O_WRONLY  1
-#define O_RDWR    2
-#define O_CREAT   0x040
-#define O_EXCL    0x080
-#define O_TRUNC   0x200
-#define O_APPEND  0x400
+// flags: O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NONBLOCK/O_CLOEXEC
+// mode: used for umask masking on O_CREAT.
 static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
-    (void)mode;
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
     // Copy null-terminated path from user space (max 511 to leave room for cwd prefix).
@@ -223,7 +215,8 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             return (uint64_t)-EEXIST;
         }
         if (!f && (flags & O_CREAT)) {
-            // Create empty file then open it.
+            // Apply umask to mode before creating.
+            mode &= ~(uint64_t)g_current->umask;
             if (!ext2_create(path)) return (uint64_t)-EIO;
             f = ext2_open(path);
         }
@@ -234,15 +227,16 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     // Enforce access mode: strip write for O_RDONLY.
     if ((flags & 3) == O_RDONLY) f->write = NULL;
 
-    // Propagate O_APPEND into vfs_file_t.flags for the write callback.
-    if (flags & O_APPEND) f->flags |= O_APPEND;
+    // Propagate O_APPEND/O_NONBLOCK into vfs_file_t.flags.
+    if (flags & O_APPEND)    f->flags |= O_APPEND;
+    if (flags & O_NONBLOCK)  f->flags |= O_NONBLOCK;
 
     // O_TRUNC: truncate to zero on open (write modes only).
     if ((flags & O_TRUNC) && (flags & (O_WRONLY | O_RDWR)))
         ext2_truncate(path);
 
-    // Find the lowest free fd (skip 0/1/2 which are stdin/stdout/stderr).
-    for (uint32_t fd = 3; ; fd++) {
+    // Find the lowest free fd.
+    for (uint32_t fd = 0; ; fd++) {
         if (fd >= g_current->files_shared->fd_capacity) {
             if (!fd_table_grow(g_current->files_shared)) {
                 vfs_close(f);
@@ -251,6 +245,8 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         }
         if (!g_current->files_shared->fd_table[fd]) {
             g_current->files_shared->fd_table[fd] = f;
+            // O_CLOEXEC: set FD_CLOEXEC atomically.
+            g_current->files_shared->fd_flags[fd] = (flags & O_CLOEXEC) ? FD_CLOEXEC : 0;
             return (uint64_t)fd;
         }
     }
@@ -265,6 +261,7 @@ static uint64_t sys_close(uint64_t fd) {
     if (!f) return (uint64_t)-EBADF;
     vfs_close(f);
     g_current->files_shared->fd_table[fd] = NULL;
+    g_current->files_shared->fd_flags[fd] = 0;
     return 0;
 }
 
@@ -445,38 +442,137 @@ static uint64_t sys_fork(void) {
     return (uint64_t)child->pid;
 }
 
-// ── sys_exec ──────────────────────────────────────────────────────────────
-// exec(path_ptr, pathlen) — replaces current address space with ELF at path.
-static uint64_t sys_exec(uint64_t path_ptr, uint64_t pathlen) {
+// ── sys_exec (execve) ─────────────────────────────────────────────────────
+// execve(path_ptr, argv_ptr, envp_ptr)
+//
+// path_ptr — user pointer to NUL-terminated path string
+// argv_ptr — user pointer to NULL-terminated array of user char* pointers
+// envp_ptr — user pointer to NULL-terminated array of user char* pointers
+//
+// Replaces the current address space with the ELF at path.
+// Closes all fds with FD_CLOEXEC set.
+// Inherits pgid, sid, cwd, umask.
+// On success does not return (triggers sysretq to new entry point via
+// g_exec_requested mechanism).
+static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
-    if (pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+    if (!path_ptr) return (uint64_t)-EINVAL;
 
-    char path[256];
+    // ── Copy path from user space ─────────────────────────────────────────
+    char path[512];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    uint64_t plen = 0;
+    while (plen < 511 && upath[plen]) { path[plen] = upath[plen]; plen++; }
+    path[plen] = '\0';
+    if (plen == 0) return (uint64_t)-EINVAL;
+
+    // Resolve relative path using cwd.
+    char resolved[512];
+    if (path[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) resolved[j] = cwd[j];
+        if (j > 0 && resolved[j-1] != '/') resolved[j++] = '/';
+        for (uint64_t k = 0; path[k] && j < 511; k++, j++) resolved[j] = path[k];
+        resolved[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= plen; k++) resolved[k] = path[k];
+    }
+
+    // ── Copy argv from user space (up to 256 args, 4KiB each) ────────────
+    #define MAX_ARGS  256
+    #define MAX_ARG_LEN 4096
+    char* k_argv[MAX_ARGS + 1];
+    uint32_t argc = 0;
+    if (argv_ptr) {
+        const uint64_t* uargv = (const uint64_t*)argv_ptr;
+        while (argc < MAX_ARGS) {
+            uint64_t ustr = uargv[argc];
+            if (!ustr) break;
+            const char* s = (const char*)ustr;
+            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
+            char* ks = kmalloc(l + 1);
+            if (!ks) goto oom;
+            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            ks[l] = '\0';
+            k_argv[argc++] = ks;
+        }
+    }
+    k_argv[argc] = NULL;
+
+    // ── Copy envp from user space (up to 512 vars) ────────────────────────
+    #define MAX_ENVS 512
+    char* k_envp[MAX_ENVS + 1];
+    uint32_t envc = 0;
+    if (envp_ptr) {
+        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
+        while (envc < MAX_ENVS) {
+            uint64_t ustr = uenvp[envc];
+            if (!ustr) break;
+            const char* s = (const char*)ustr;
+            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
+            char* ks = kmalloc(l + 1);
+            if (!ks) goto oom;
+            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            ks[l] = '\0';
+            k_envp[envc++] = ks;
+        }
+    }
+    k_envp[envc] = NULL;
+
+    // ── Load ELF ──────────────────────────────────────────────────────────
+    vfs_file_t* f = ext2_open(resolved);
+    if (!f) { goto enoent; }
+
+    const uint64_t MAX_ELF = 16ULL * 1024ULL * 1024ULL; // 16 MiB
+    uint8_t* buf = kmalloc(MAX_ELF);
+    if (!buf) { vfs_close(f); goto oom; }
+
+    int64_t n = vfs_read(f, buf, MAX_ELF);
+    vfs_close(f);
+    if (n <= 0) { kfree(buf); goto enoent; }
 
     phys_addr_t new_pml4;
     mm_t*       new_mm;
     uint64_t    entry;
+    uint64_t    phdr_vaddr = 0;
+    uint16_t    phnum = 0, phent = 0;
 
-    vfs_file_t* f = ext2_open(path);
-    if (!f) return (uint64_t)-ENOENT;
-
-    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB — large enough for doom
-    uint8_t* buf = kmalloc(MAX_ELF);
-    if (!buf) { vfs_close(f); return (uint64_t)-ENOMEM; }
-
-    int64_t n = vfs_read(f, buf, MAX_ELF);
-    vfs_close(f);
-
-    if (n <= 0) { kfree(buf); return (uint64_t)-EIO; }
-
-    uint8_t ok = elf_load_into(buf, (uint64_t)n, &new_pml4, &new_mm, &entry);
+    if (!elf_load_into(buf, (uint64_t)n, &new_pml4, &new_mm, &entry,
+                       &phdr_vaddr, &phnum, &phent)) {
+        kfree(buf);
+        goto enoexec;
+    }
     kfree(buf);
-    if (!ok) return (uint64_t)-ENOEXEC;
 
-    // Swap in the new address space.
+    // ── Build user stack with argv/envp/auxv ──────────────────────────────
+    uint64_t user_rsp = elf_setup_stack(new_pml4,
+                                         (const char* const*)k_argv,
+                                         (const char* const*)k_envp,
+                                         entry, phdr_vaddr, phnum, phent);
+    if (!user_rsp) {
+        vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); mm_destroy(new_mm);
+        goto oom;
+    }
+
+    // ── Free kernel copies of argv/envp ───────────────────────────────────
+    for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+
+    // ── Close FD_CLOEXEC fds ──────────────────────────────────────────────
+    {
+        task_files_t* files = g_current->files_shared;
+        for (uint32_t i = 0; i < files->fd_capacity; i++) {
+            if (files->fd_table[i] && (files->fd_flags[i] & FD_CLOEXEC)) {
+                vfs_close(files->fd_table[i]);
+                files->fd_table[i] = NULL;
+                files->fd_flags[i] = 0;
+            }
+        }
+    }
+
+    // ── Swap in new address space ─────────────────────────────────────────
     vmm_free_user(g_current->mm_shared->pml4_phys);
     pmm_buddy_free(g_current->mm_shared->pml4_phys, 0);
     mm_destroy(g_current->mm_shared->mm);
@@ -484,11 +580,35 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t pathlen) {
     g_current->mm_shared->pml4_phys = new_pml4;
     g_current->mm_shared->mm        = new_mm;
 
+    // Reset signal handlers to SIG_DFL (POSIX: exec clears custom handlers).
+    for (int si = 0; si < NSIG; si++) {
+        if (g_current->sigstate.handlers[si].sa_handler > SIG_IGN)
+            g_current->sigstate.handlers[si].sa_handler = SIG_DFL;
+        g_current->sigstate.handlers[si].sa_mask  = 0;
+        g_current->sigstate.handlers[si].sa_flags = 0;
+    }
+    // Unblock all signals (POSIX: exec resets the signal mask).
+    g_current->sigstate.blocked = 0;
+
+    // ── Trigger sysretq to new entry point ────────────────────────────────
     g_exec_entry     = entry;
-    g_exec_rsp       = VMM_USER_STACK_TOP;
+    g_exec_rsp       = user_rsp;
     g_exec_pml4      = new_pml4;
     g_exec_requested = 1;
     return 0;
+
+oom:
+    for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    return (uint64_t)-ENOMEM;
+enoent:
+    for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    return (uint64_t)-ENOENT;
+enoexec:
+    for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    return (uint64_t)-ENOEXEC;
 }
 
 // ── sys_spawn ─────────────────────────────────────────────────────────────
@@ -1144,6 +1264,717 @@ static uint64_t sys_fb_info(uint64_t ptr) {
     return 0;
 }
 
+// ── Socket syscalls ───────────────────────────────────────────────────────
+
+// Helper: allocate the lowest available fd ≥ 3 and assign f to it.
+static int64_t fd_install(vfs_file_t* f) {
+    if (!g_current) return -EBADF;
+    for (uint32_t fd = 3; ; fd++) {
+        if (fd >= g_current->files_shared->fd_capacity) {
+            if (!fd_table_grow(g_current->files_shared)) {
+                vfs_close(f);
+                return -ENFILE;
+            }
+        }
+        if (!g_current->files_shared->fd_table[fd]) {
+            g_current->files_shared->fd_table[fd] = f;
+            return (int64_t)fd;
+        }
+    }
+}
+
+static vfs_file_t* fd_to_file(uint64_t fd) {
+    if (!g_current) return NULL;
+    if (fd >= g_current->files_shared->fd_capacity) return NULL;
+    return g_current->files_shared->fd_table[fd];
+}
+
+// socket(domain, type, proto) → fd or -errno
+static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
+    (void)proto;
+    if (!net_ready()) return (uint64_t)-ENETDOWN;
+    vfs_file_t* f = socket_open((int)domain, (int)type);
+    if (!f) return (uint64_t)-ENOMEM;
+    int64_t fd = fd_install(f);
+    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
+}
+
+// bind(fd, sockaddr_in*, addrlen) → 0 or -errno
+static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
+    (void)addrlen;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
+    if (!sa) return (uint64_t)-EINVAL;
+    // Port is in network byte order in sockaddr_in; convert to host order.
+    uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
+    int r = socket_bind(f, port);
+    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+}
+
+// listen(fd, backlog) → 0 or -errno
+static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
+    (void)backlog;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    int r = socket_listen(f);
+    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+}
+
+// accept(fd, sockaddr_in*, addrlen*) → new fd or -errno
+static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
+    (void)addrlen_ptr;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;  // may be NULL
+    vfs_file_t* cf = socket_accept(f, peer);
+    if (!cf) return (uint64_t)-ECONNABORTED;
+    int64_t nfd = fd_install(cf);
+    return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+}
+
+// connect(fd, sockaddr_in*, addrlen) → 0 or -errno
+static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
+    (void)addrlen;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
+    if (!sa) return (uint64_t)-EINVAL;
+    uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
+    int r = socket_connect(f, sa->sin_addr, port);
+    return (r == 0) ? 0 : (uint64_t)-ECONNREFUSED;
+}
+
+// sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
+// For TCP sockets addr may be NULL.
+static uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
+                             uint64_t flags, uint64_t addr_ptr, uint64_t addrlen) {
+    (void)flags; (void)addrlen;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
+    int r;
+    if (sa) {
+        uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
+        r = socket_sendto(f, (const void*)buf_ptr, (uint32_t)len,
+                           sa->sin_addr, port);
+    } else {
+        r = socket_send(f, (const void*)buf_ptr, (uint32_t)len);
+    }
+    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+}
+
+// recvfrom(fd, buf, len, flags, addr, addrlen*) → bytes or -errno
+static uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
+                               uint64_t flags, uint64_t addr_ptr, uint64_t addrlen_ptr) {
+    (void)flags; (void)addrlen_ptr;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;  // may be NULL
+    int r;
+    if (sa) {
+        r = socket_recvfrom(f, (void*)buf_ptr, (uint32_t)len, sa);
+        // Convert port back to network byte order in the returned addr.
+        if (r >= 0 && sa)
+            sa->sin_port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
+    } else {
+        r = socket_recv(f, (void*)buf_ptr, (uint32_t)len);
+    }
+    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+}
+
+// setsockopt — stub (returns 0 for anything we don't understand)
+static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
+                                uint64_t val_ptr, uint64_t vallen) {
+    (void)fd; (void)level; (void)opt; (void)val_ptr; (void)vallen;
+    return 0;
+}
+
+// shutdown(fd, how) → 0 or -errno
+static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    int r = socket_shutdown(f, (int)how);
+    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+}
+
+// ── Global terminal state (shared across all processes using the tty) ─────
+// In a real kernel this lives in a struct tty; here we keep one global
+// terminal termios and window size. Both are readable/writable by any
+// process via TCGETS/TCSETS/TIOCGWINSZ/TIOCSWINSZ.
+
+static termios_t g_tty_termios = {
+    .c_iflag = ICRNL | IXON,
+    .c_oflag = OPOST | ONLCR,
+    .c_cflag = B38400 | CS8 | CREAD | HUPCL | CLOCAL,
+    .c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
+    .c_line  = 0,
+    .c_cc    = {
+        [VINTR]    = 3,    // ^C
+        [VQUIT]    = 28,   // backslash
+        [VERASE]   = 127,  // DEL
+        [VKILL]    = 21,   // ^U
+        [VEOF]     = 4,    // ^D
+        [VTIME]    = 0,
+        [VMIN]     = 1,
+        [VSWTC]    = 0,
+        [VSTART]   = 17,   // ^Q
+        [VSTOP]    = 19,   // ^S
+        [VSUSP]    = 26,   // ^Z
+        [VEOL]     = 0,
+        [VREPRINT] = 18,   // ^R
+        [VDISCARD] = 15,   // ^O
+        [VWERASE]  = 23,   // ^W
+        [VLNEXT]   = 22,   // ^V
+        [VEOL2]    = 0,
+    },
+};
+
+static winsize_t g_tty_winsize = {
+    .ws_row    = 25,
+    .ws_col    = 80,
+    .ws_xpixel = 0,
+    .ws_ypixel = 0,
+};
+
+// Foreground process group of the controlling terminal.
+static uint32_t g_tty_fg_pgid = 1;
+
+// ── Helper: copy bytes from user to kernel safely ─────────────────────────
+// Returns 0 on success, -EFAULT if the pointer is obviously bad.
+static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
+    if (!src_u) return -EFAULT;
+    user_buf_prefault((virt_addr_t)src_u, len);
+    const uint8_t* s = (const uint8_t*)src_u;
+    uint8_t* d = (uint8_t*)dst;
+    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    return 0;
+}
+
+static int copy_to_user(void* dst_u, const void* src, uint64_t len) {
+    if (!dst_u) return -EFAULT;
+    user_buf_prefault((virt_addr_t)dst_u, len);
+    const uint8_t* s = (const uint8_t*)src;
+    uint8_t* d = (uint8_t*)dst_u;
+    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    return 0;
+}
+
+// ── sys_fcntl ─────────────────────────────────────────────────────────────
+// fcntl(fd, cmd, arg) → varies
+static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* files = g_current->files_shared;
+    if (fd >= files->fd_capacity || !files->fd_table[fd])
+        return (uint64_t)-EBADF;
+
+    switch ((int)cmd) {
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        // Dup to lowest fd >= arg.
+        uint32_t start = (uint32_t)arg;
+        for (uint32_t nfd = start; ; nfd++) {
+            if (nfd >= files->fd_capacity) {
+                if (!fd_table_grow(files)) return (uint64_t)-EMFILE;
+            }
+            if (!files->fd_table[nfd]) {
+                vfs_file_t* orig = files->fd_table[fd];
+                vfs_dup(orig);
+                files->fd_table[nfd] = orig;
+                files->fd_flags[nfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+                return (uint64_t)nfd;
+            }
+        }
+    }
+    case F_GETFD:
+        return (uint64_t)files->fd_flags[fd];
+    case F_SETFD:
+        files->fd_flags[fd] = (uint32_t)(arg & FD_CLOEXEC);
+        return 0;
+    case F_GETFL: {
+        vfs_file_t* f = files->fd_table[fd];
+        uint64_t fl = 0;
+        if (f->write && f->read) fl = O_RDWR;
+        else if (f->write)       fl = O_WRONLY;
+        else                     fl = O_RDONLY;
+        if (f->flags & O_APPEND)   fl |= O_APPEND;
+        if (f->flags & O_NONBLOCK) fl |= O_NONBLOCK;
+        return fl;
+    }
+    case F_SETFL: {
+        vfs_file_t* f = files->fd_table[fd];
+        // Only O_APPEND and O_NONBLOCK are changeable after open.
+        if (arg & O_APPEND)   f->flags |= O_APPEND;
+        else                  f->flags &= ~(uint32_t)O_APPEND;
+        if (arg & O_NONBLOCK) f->flags |= O_NONBLOCK;
+        else                  f->flags &= ~(uint32_t)O_NONBLOCK;
+        return 0;
+    }
+    default:
+        return (uint64_t)-EINVAL;
+    }
+}
+
+// ── sys_fstat ─────────────────────────────────────────────────────────────
+// fstat(fd, stat_t*) → 0 or -errno
+static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
+    if (!g_current || !stat_ptr) return (uint64_t)-EINVAL;
+    task_files_t* files = g_current->files_shared;
+    if (fd >= files->fd_capacity || !files->fd_table[fd])
+        return (uint64_t)-EBADF;
+
+    vfs_file_t* f = files->fd_table[fd];
+    stat_t st = {0};
+
+    // If the file has a stat path stored, use ext2.
+    if (f->path[0]) {
+        // Try ext2 stat.
+        ext2_inode_t inode;
+        uint32_t inum = ext2_lookup_path(f->path);
+        if (inum && ext2_read_inode(inum, &inode)) {
+            st.ino    = inum;
+            st.size   = inode.i_size;
+            st.mode   = inode.i_mode;
+            st.is_dir = ((inode.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+        }
+    } else {
+        // Device/pipe/socket: fill in a minimal stat.
+        st.mode   = 0666;
+        st.is_dir = 0;
+    }
+
+    return (copy_to_user((void*)stat_ptr, &st, sizeof(st)) == 0) ? 0 : (uint64_t)-EFAULT;
+}
+
+// ── sys_access ────────────────────────────────────────────────────────────
+// access(path, mode) → 0 or -errno
+// We don't have a real permission model: if the file exists it's accessible.
+static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
+    if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
+    (void)amode;
+
+    char raw[512];
+    const char* upath = (const char*)path_ptr;
+    uint64_t i = 0;
+    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
+    raw[i] = '\0';
+
+    char path[512];
+    if (raw[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
+    }
+
+    // /dev/* always exists.
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/')
+        return 0;
+
+    vfs_file_t* f = ext2_open(path);
+    if (!f) return (uint64_t)-ENOENT;
+    vfs_close(f);
+    return 0;
+}
+
+// ── sys_uname ─────────────────────────────────────────────────────────────
+// uname(utsname*) → 0 or -errno
+static void strncpy_k(char* dst, const char* src, uint64_t n) {
+    uint64_t i = 0;
+    for (; i < n - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+static uint64_t sys_uname(uint64_t buf_ptr) {
+    if (!buf_ptr) return (uint64_t)-EINVAL;
+    utsname_t u;
+    strncpy_k(u.sysname,    "MakaOS",          65);
+    strncpy_k(u.nodename,   "makaos",          65);
+    strncpy_k(u.release,    "0.1.0",           65);
+    strncpy_k(u.version,    "#1 SMP",          65);
+    strncpy_k(u.machine,    "x86_64",          65);
+    strncpy_k(u.domainname, "(none)",          65);
+    return (copy_to_user((void*)buf_ptr, &u, sizeof(u)) == 0) ? 0 : (uint64_t)-EFAULT;
+}
+
+// ── sys_umask ─────────────────────────────────────────────────────────────
+// umask(mask) → old mask
+static uint64_t sys_umask(uint64_t mask) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    uint32_t old = g_current->umask;
+    g_current->umask = (uint16_t)(mask & 0777);
+    return (uint64_t)old;
+}
+
+// ── Identity syscalls (single-user OS: always uid=0, root) ───────────────
+static uint64_t sys_getuid(void)   { return 0; }
+static uint64_t sys_geteuid(void)  { return 0; }
+static uint64_t sys_getgid(void)   { return 0; }
+static uint64_t sys_getegid(void)  { return 0; }
+static uint64_t sys_getgroups(uint64_t size, uint64_t list_ptr) {
+    // We have one supplementary group: gid 0.
+    if ((int64_t)size < 0) return (uint64_t)-EINVAL;
+    if (size == 0) return 1; // just return count
+    uint32_t gid = 0;
+    if (copy_to_user((void*)list_ptr, &gid, sizeof(gid)) != 0)
+        return (uint64_t)-EFAULT;
+    return 1;
+}
+
+// ── Process group / session syscalls ─────────────────────────────────────
+
+// Find a task by pid. Returns NULL if not found.
+// We scan the scheduler's run queue. This is O(n) but correct.
+extern task_t* sched_find_pid(uint32_t pid);
+
+static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
+    uint32_t pid  = pid_arg  ? (uint32_t)pid_arg  : g_current->pid;
+    uint32_t pgid = pgid_arg ? (uint32_t)pgid_arg : pid;
+
+    task_t* t = (pid == g_current->pid) ? g_current : sched_find_pid(pid);
+    if (!t) return (uint64_t)-ESRCH;
+
+    // Can't change pgid of a session leader.
+    if (t->pid == t->sid) return (uint64_t)-EPERM;
+
+    t->pgid = pgid;
+    return 0;
+}
+
+static uint64_t sys_getpgid(uint64_t pid_arg) {
+    if (pid_arg == 0) return (uint64_t)g_current->pgid;
+    task_t* t = sched_find_pid((uint32_t)pid_arg);
+    if (!t) return (uint64_t)-ESRCH;
+    return (uint64_t)t->pgid;
+}
+
+static uint64_t sys_getpgrp(void) {
+    return (uint64_t)g_current->pgid;
+}
+
+static uint64_t sys_setsid(void) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    // If we're already a process group leader we can't create a new session.
+    if (g_current->pid == g_current->pgid) return (uint64_t)-EPERM;
+    g_current->sid  = g_current->pid;
+    g_current->pgid = g_current->pid;
+    // New session has no controlling terminal — set tty fg pgid to us.
+    g_tty_fg_pgid = g_current->pid;
+    return (uint64_t)g_current->sid;
+}
+
+static uint64_t sys_getsid(uint64_t pid_arg) {
+    if (pid_arg == 0) return (uint64_t)g_current->sid;
+    task_t* t = sched_find_pid((uint32_t)pid_arg);
+    if (!t) return (uint64_t)-ESRCH;
+    return (uint64_t)t->sid;
+}
+
+// ── tcgetpgrp / tcsetpgrp ─────────────────────────────────────────────────
+static uint64_t sys_tcgetpgrp(uint64_t fd) {
+    (void)fd; // we have one global tty
+    return (uint64_t)g_tty_fg_pgid;
+}
+
+static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
+    (void)fd;
+    g_tty_fg_pgid = (uint32_t)pgid;
+    return 0;
+}
+
+// ── sys_ioctl ─────────────────────────────────────────────────────────────
+// ioctl(fd, request, arg) → varies
+static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
+    if (!g_current) return (uint64_t)-EBADF;
+
+    // Validate fd (allow 0/1/2 which are tty fds).
+    if (fd < g_current->files_shared->fd_capacity &&
+        !g_current->files_shared->fd_table[fd] && fd > 2)
+        return (uint64_t)-EBADF;
+
+    switch (request) {
+    case TIOCGWINSZ:
+        return (copy_to_user((void*)arg, &g_tty_winsize, sizeof(g_tty_winsize)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    case TIOCSWINSZ:
+        return (copy_from_user(&g_tty_winsize, (const void*)arg, sizeof(g_tty_winsize)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    case TIOCGPGRP:
+        return (copy_to_user((void*)arg, &g_tty_fg_pgid, sizeof(g_tty_fg_pgid)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    case TIOCSPGRP: {
+        uint32_t pg = 0;
+        if (copy_from_user(&pg, (const void*)arg, sizeof(pg)) != 0)
+            return (uint64_t)-EFAULT;
+        g_tty_fg_pgid = pg;
+        return 0;
+    }
+    case TCGETS:
+        return (copy_to_user((void*)arg, &g_tty_termios, sizeof(g_tty_termios)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    case TCSETS:
+    case TCSETSW:
+    case TCSETSF:
+        return (copy_from_user(&g_tty_termios, (const void*)arg, sizeof(g_tty_termios)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    case TCSBRK:
+    case TCXONC:
+    case TCFLSH:
+    case TIOCEXCL:
+    case TIOCNXCL:
+        return 0;  // Acknowledged, no-op.
+    case TIOCSCTTY:
+        // Claim controlling terminal for this session.
+        g_tty_fg_pgid = g_current->pgid;
+        return 0;
+    case TIOCGSERIAL:
+        // Return all-zeros serial_struct — bash checks this on some paths.
+        if (arg) {
+            uint8_t* p = (uint8_t*)arg;
+            for (int i = 0; i < 60; i++) p[i] = 0; // sizeof(serial_struct) ≈ 60
+        }
+        return 0;
+    default:
+        return (uint64_t)-EINVAL;
+    }
+}
+
+// ── sys_select ────────────────────────────────────────────────────────────
+// select(nfds, readfds*, writefds*, exceptfds*, timeval*) → count or -errno
+// Simplified: we consider a fd readable if it has data waiting, writable
+// if it's not full, and we do not sleep — we just poll once.
+// A NULL fd_set means "don't care about this set".
+// timeval = {0,0} → non-blocking; NULL → block until at least one is ready.
+typedef struct { int64_t tv_sec; int64_t tv_usec; } timeval_t;
+
+static int fd_is_readable(vfs_file_t* f) {
+    if (!f || !f->read) return 0;
+    // Pipes: check if data is available without blocking.
+    if (f->poll) return f->poll(f, POLLIN);
+    return 1; // regular files and devices are always ready
+}
+
+static int fd_is_writable(vfs_file_t* f) {
+    if (!f || !f->write) return 0;
+    if (f->poll) return f->poll(f, POLLOUT);
+    return 1;
+}
+
+static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
+                            uint64_t eset_ptr, uint64_t tv_ptr) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (nfds > FD_SETSIZE) return (uint64_t)-EINVAL;
+
+    fd_set_t rset, wset, eset;
+    fd_set_t rout, wout, eout;
+    for (int i = 0; i < (int)(FD_SETSIZE/64); i++) {
+        rset.bits[i] = rset_ptr ? ((fd_set_t*)rset_ptr)->bits[i] : 0;
+        wset.bits[i] = wset_ptr ? ((fd_set_t*)wset_ptr)->bits[i] : 0;
+        eset.bits[i] = eset_ptr ? ((fd_set_t*)eset_ptr)->bits[i] : 0;
+        rout.bits[i] = wout.bits[i] = eout.bits[i] = 0;
+    }
+
+    // Determine timeout in nanoseconds (NULL = infinite).
+    uint64_t timeout_ns = UINT64_MAX;
+    if (tv_ptr) {
+        timeval_t tv;
+        copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv));
+        timeout_ns = (uint64_t)tv.tv_sec * 1000000000ULL
+                   + (uint64_t)tv.tv_usec * 1000ULL;
+    }
+
+    extern uint64_t tsc_read_ns(void);
+    uint64_t deadline = tsc_read_ns() + timeout_ns;
+    int count = 0;
+
+    do {
+        count = 0;
+        task_files_t* files = g_current->files_shared;
+        for (uint32_t fd = 0; fd < nfds; fd++) {
+            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (FD_ISSET(fd, &rset) && fd_is_readable(f)) {
+                rout.bits[fd/64] |= (1ULL << (fd%64)); count++;
+            }
+            if (FD_ISSET(fd, &wset) && fd_is_writable(f)) {
+                wout.bits[fd/64] |= (1ULL << (fd%64)); count++;
+            }
+            if (FD_ISSET(fd, &eset)) {
+                // No exceptional conditions in our model.
+            }
+        }
+        if (count > 0) break;
+        if (timeout_ns == 0) break;
+        // Yield and retry until timeout.
+        extern void sched_yield(void);
+        sched_yield();
+    } while (tsc_read_ns() < deadline);
+
+    // Write back output sets.
+    if (rset_ptr) copy_to_user((void*)rset_ptr, &rout, sizeof(rout));
+    if (wset_ptr) copy_to_user((void*)wset_ptr, &wout, sizeof(wout));
+    if (eset_ptr) copy_to_user((void*)eset_ptr, &eout, sizeof(eout));
+
+    return (uint64_t)(int64_t)count;
+}
+
+// ── sys_poll ──────────────────────────────────────────────────────────────
+// poll(pollfd_t*, nfds, timeout_ms) → count or -errno
+static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
+    if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
+    if (nfds > 1024) return (uint64_t)-EINVAL;
+
+    pollfd_t* ufds = (pollfd_t*)fds_ptr;
+    task_files_t* files = g_current->files_shared;
+
+    uint64_t timeout_ns = (timeout_ms == (uint64_t)-1) ? UINT64_MAX
+                        : (timeout_ms * 1000000ULL);
+    extern uint64_t tsc_read_ns(void);
+    uint64_t deadline = tsc_read_ns() + timeout_ns;
+    int count = 0;
+
+    do {
+        count = 0;
+        for (uint64_t i = 0; i < nfds; i++) {
+            ufds[i].revents = 0;
+            int fd = ufds[i].fd;
+            if (fd < 0) continue;
+            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (!f) { ufds[i].revents = POLLNVAL; count++; continue; }
+
+            uint16_t rev = 0;
+            if ((ufds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
+            if ((ufds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
+            if (rev) { ufds[i].revents = rev; count++; }
+        }
+        if (count > 0) break;
+        if (timeout_ms == 0) break;
+        extern void sched_yield(void);
+        sched_yield();
+    } while (tsc_read_ns() < deadline);
+
+    return (uint64_t)(int64_t)count;
+}
+
+// ── sys_readlink ──────────────────────────────────────────────────────────
+// readlink(path, buf, bufsz) → len or -errno
+// We have no real symlink support in ext2 yet; return EINVAL for everything
+// except /proc/self/exe which many programs query.
+static uint64_t sys_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t bufsz) {
+    if (!g_current || !path_ptr || !buf_ptr) return (uint64_t)-EINVAL;
+
+    const char* upath = (const char*)path_ptr;
+    // Match /proc/self/exe → return the last exec'd path (stored in cwd area).
+    // For now return a plausible path.
+    const char* target = "/bin/bash";
+    uint64_t tlen = 0; while (target[tlen]) tlen++;
+    if (tlen > bufsz) tlen = bufsz;
+    copy_to_user((void*)buf_ptr, target, tlen);
+    (void)upath;
+    return (uint64_t)tlen;
+}
+
+// ── sys_symlink / sys_link ────────────────────────────────────────────────
+// symlink and link are not fully supported; return EPERM for now so bash
+// degrades gracefully rather than crashing.
+static uint64_t sys_symlink(uint64_t target_ptr, uint64_t link_ptr) {
+    (void)target_ptr; (void)link_ptr;
+    return (uint64_t)-EPERM;
+}
+
+static uint64_t sys_link(uint64_t old_ptr, uint64_t new_ptr) {
+    (void)old_ptr; (void)new_ptr;
+    return (uint64_t)-EPERM;
+}
+
+// ── sys_chmod / sys_fchmod ────────────────────────────────────────────────
+// No permission enforcement; accept the call and return success.
+static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
+    (void)path_ptr; (void)mode;
+    return 0;
+}
+static uint64_t sys_fchmod(uint64_t fd, uint64_t mode) {
+    (void)fd; (void)mode;
+    return 0;
+}
+
+// ── sys_chown / sys_fchown ────────────────────────────────────────────────
+static uint64_t sys_chown(uint64_t path_ptr, uint64_t uid, uint64_t gid) {
+    (void)path_ptr; (void)uid; (void)gid;
+    return 0;
+}
+static uint64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid) {
+    (void)fd; (void)uid; (void)gid;
+    return 0;
+}
+
+// ── sys_truncate / sys_ftruncate ──────────────────────────────────────────
+// truncate(path, length) → 0 or -errno
+static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
+    if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
+    char raw[512];
+    const char* upath = (const char*)path_ptr;
+    uint64_t i = 0;
+    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
+    raw[i] = '\0';
+    char path[512];
+    if (raw[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
+    }
+    if (!ext2_truncate_to(path, length)) return (uint64_t)-EIO;
+    return 0;
+}
+
+// ftruncate(fd, length) → 0 or -errno
+static uint64_t sys_ftruncate(uint64_t fd, uint64_t length) {
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* files = g_current->files_shared;
+    if (fd >= files->fd_capacity || !files->fd_table[fd])
+        return (uint64_t)-EBADF;
+    vfs_file_t* f = files->fd_table[fd];
+    if (!f->path[0]) return (uint64_t)-EINVAL; // pipes/devices can't be truncated
+    if (!ext2_truncate_to(f->path, length)) return (uint64_t)-EIO;
+    return 0;
+}
+
+// ── sys_times ─────────────────────────────────────────────────────────────
+// times(tms*) → clock ticks since boot (or -errno)
+// Clock tick = 100 Hz (CLKTCK).
+static uint64_t sys_times(uint64_t buf_ptr) {
+    extern uint64_t tsc_read_ns(void);
+    uint64_t ns = tsc_read_ns();
+    uint64_t ticks = ns / 10000000ULL; // 100 Hz → 10 ms per tick
+
+    if (buf_ptr) {
+        tms_t tms = { ticks, 0, 0, 0 };
+        copy_to_user((void*)buf_ptr, &tms, sizeof(tms));
+    }
+    return ticks;
+}
+
+// ── sys_getrusage ─────────────────────────────────────────────────────────
+// getrusage(who, rusage*) → 0 or -errno
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+static uint64_t sys_getrusage(uint64_t who, uint64_t buf_ptr) {
+    (void)who;
+    if (!buf_ptr) return (uint64_t)-EINVAL;
+    rusage_t ru = {0};
+    return (copy_to_user((void*)buf_ptr, &ru, sizeof(ru)) == 0) ? 0 : (uint64_t)-EFAULT;
+}
+
 // ── serial helper (debug only) ────────────────────────────────────────────
 static void serial_putc(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
@@ -1153,9 +1984,10 @@ static void serial_puts(const char* s) {
     for (; *s; s++) serial_putc(*s);
 }
 
-// ── syscall_dispatch ──────────────────────────────────────────────────────
-uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
-                          uint64_t arg3, uint64_t arg4) {
+// ── native_syscall_dispatch ───────────────────────────────────────────────
+// Dispatches using our internal syscall numbers.
+uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
+                                  uint64_t arg3, uint64_t arg4) {
     uint64_t ret;
     // Mirror stdout/stderr writes to serial for debugging.
     if (nr == SYS_WRITE && (arg1 == 1 || arg1 == 2) && arg3 > 0) {
@@ -1171,7 +2003,7 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_BRK:     ret = sys_brk(arg1);                     break;
         case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;
         case SYS_FORK:    ret = sys_fork();                         break;
-        case SYS_EXEC:    ret = sys_exec(arg1, arg2);              break;
+        case SYS_EXEC:    ret = sys_exec(arg1, arg2, arg3);         break;
         case SYS_WAIT:    ret = sys_wait(arg1, arg2, arg3);         break;
         case SYS_GETPID:  ret = sys_getpid();                      break;
         case SYS_GETPPID: ret = sys_getppid();                     break;
@@ -1199,6 +2031,54 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETTOD:       ret = sys_gettimeofday(arg1, arg2);              break;
         case SYS_FB_BLIT:      ret = sys_fb_blit(arg1, arg2, arg3, arg4);      break;
         case SYS_FB_INFO:      ret = sys_fb_info(arg1);                         break;
+        case SYS_SOCKET:       ret = sys_socket(arg1, arg2, arg3);              break;
+        case SYS_BIND:         ret = sys_bind(arg1, arg2, arg3);                break;
+        case SYS_LISTEN:       ret = sys_listen(arg1, arg2);                    break;
+        case SYS_ACCEPT:       ret = sys_accept(arg1, arg2, arg3);              break;
+        case SYS_CONNECT:      ret = sys_connect(arg1, arg2, arg3);             break;
+        case SYS_SENDTO:       ret = sys_sendto(arg1, arg2, arg3, arg4,
+                                                g_syscall_arg5, g_syscall_arg6); break;
+        case SYS_RECVFROM:     ret = sys_recvfrom(arg1, arg2, arg3, arg4,
+                                                   g_syscall_arg5,
+                                                   g_syscall_arg6);              break;
+        case SYS_SETSOCKOPT:   ret = sys_setsockopt(arg1, arg2, arg3, arg4,
+                                                     g_syscall_arg5);            break;
+        case SYS_SHUTDOWN:     ret = sys_shutdown(arg1, arg2);                  break;
+
+        // ── POSIX bash-compat syscalls ────────────────────────────────────
+        case SYS_FCNTL:      ret = sys_fcntl(arg1, arg2, arg3);               break;
+        case SYS_FSTAT:      ret = sys_fstat(arg1, arg2);                     break;
+        case SYS_ACCESS:     ret = sys_access(arg1, arg2);                    break;
+        case SYS_UNAME:      ret = sys_uname(arg1);                           break;
+        case SYS_UMASK:      ret = sys_umask(arg1);                           break;
+        case SYS_GETUID:     ret = sys_getuid();                              break;
+        case SYS_GETEUID:    ret = sys_geteuid();                             break;
+        case SYS_GETGID:     ret = sys_getgid();                              break;
+        case SYS_GETEGID:    ret = sys_getegid();                             break;
+        case SYS_GETGROUPS:  ret = sys_getgroups(arg1, arg2);                break;
+        case SYS_SETPGID:    ret = sys_setpgid(arg1, arg2);                  break;
+        case SYS_GETPGID:    ret = sys_getpgid(arg1);                        break;
+        case SYS_GETPGRP:    ret = sys_getpgrp();                             break;
+        case SYS_SETSID:     ret = sys_setsid();                              break;
+        case SYS_GETSID:     ret = sys_getsid(arg1);                         break;
+        case SYS_IOCTL:      ret = sys_ioctl(arg1, arg2, arg3);              break;
+        case SYS_SELECT:     ret = sys_select(arg1, arg2, arg3, arg4,
+                                              g_syscall_arg5);                break;
+        case SYS_POLL:       ret = sys_poll(arg1, arg2, arg3);               break;
+        case SYS_READLINK:   ret = sys_readlink(arg1, arg2, arg3);           break;
+        case SYS_SYMLINK:    ret = sys_symlink(arg1, arg2);                  break;
+        case SYS_LINK:       ret = sys_link(arg1, arg2);                     break;
+        case SYS_CHMOD:      ret = sys_chmod(arg1, arg2);                    break;
+        case SYS_FCHMOD:     ret = sys_fchmod(arg1, arg2);                   break;
+        case SYS_CHOWN:      ret = sys_chown(arg1, arg2, arg3);              break;
+        case SYS_FCHOWN:     ret = sys_fchown(arg1, arg2, arg3);             break;
+        case SYS_TRUNCATE:   ret = sys_truncate(arg1, arg2);                 break;
+        case SYS_FTRUNCATE:  ret = sys_ftruncate(arg1, arg2);                break;
+        case SYS_TIMES:      ret = sys_times(arg1);                          break;
+        case SYS_GETRUSAGE:  ret = sys_getrusage(arg1, arg2);                break;
+        case SYS_TCGETPGRP:  ret = sys_tcgetpgrp(arg1);                      break;
+        case SYS_TCSETPGRP:  ret = sys_tcsetpgrp(arg1, arg2);                break;
+
         default:               ret = (uint64_t)-ENOSYS;                         break;
     }
     // Deliver any pending signals on the syscall return path.
@@ -1207,4 +2087,11 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
     signal_deliver_pending();
     g_signal_in_syscall = 0;
     return ret;
+}
+
+// ── syscall_dispatch ──────────────────────────────────────────────────────
+// Entry point from syscall_entry.asm.
+uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
+                          uint64_t arg3, uint64_t arg4) {
+    return native_syscall_dispatch(nr, arg1, arg2, arg3, arg4);
 }

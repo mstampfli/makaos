@@ -57,6 +57,10 @@ task_t* sched_reap_zombie(uint32_t pid);
 // Walk every task in every MLFQ level, calling cb(t, data) for each.
 void sched_for_each(void (*cb)(task_t*, void*), void* data);
 
+// Find a task by pid.  Searches run queues and zombie list.
+// Returns NULL if not found.
+task_t* sched_find_pid(uint32_t pid);
+
 // Called from the timer IRQ handler after sched_tick() if s_reschedule is set.
 // Performs a preemptive context switch — safe to call from IRQ context because
 // context_switch saves the IRQ stub's rsp; iretq in the stub restores it later.

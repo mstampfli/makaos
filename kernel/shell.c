@@ -305,8 +305,26 @@ static void cmd_run(int argc, char* argv[]) {
     static char run_path[256];
     resolve_path(argv[1], run_path, sizeof(run_path));
 
+    // Build argv for the child: argv[0] = path, rest from command line.
+    const char* child_argv[64];
+    child_argv[0] = run_path;
+    int ca = 1;
+    for (int i = 2; i < argc && ca < 63; i++) child_argv[ca++] = argv[i];
+    child_argv[ca] = NULL;
+
+    // Basic envp for Linux ABI binaries.
+    const char* child_envp[] = {
+        "PATH=/bin",
+        "HOME=/",
+        "TERM=linux",
+        "PS1=bash$ ",
+        NULL
+    };
+
     uint32_t pid = pid_alloc();
-    task_t* child = elf_load_from_ext2(run_path, pid);
+    // Use elf_exec_from_ext2 so Linux ABI binaries get argc/argv/envp/auxv.
+    task_t* child = elf_exec_from_ext2(run_path, pid,
+                                       child_argv, child_envp);
     if (!child) {
         term_set_color(0x0C);
         term_puts("run: failed to load: ");

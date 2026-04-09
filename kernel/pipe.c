@@ -57,6 +57,21 @@ static void pipe_write_close(vfs_file_t* self) {
     kfree(self);
 }
 
+// poll: check readiness without blocking.
+static int pipe_read_poll(vfs_file_t* self, int events) {
+    (void)events;
+    pipe_buf_t* p = (pipe_buf_t*)self->ctx;
+    // Readable if data available OR write end closed (EOF).
+    return (p->count > 0 || p->writer_refs == 0) ? 1 : 0;
+}
+
+static int pipe_write_poll(vfs_file_t* self, int events) {
+    (void)events;
+    pipe_buf_t* p = (pipe_buf_t*)self->ctx;
+    // Writable if space available and read end still open.
+    return (p->count < PIPE_BUF_SIZE && p->reader_refs > 0) ? 1 : 0;
+}
+
 // ── pipe_create ───────────────────────────────────────────────────────────
 
 int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
@@ -77,21 +92,25 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
         return -ENOMEM;
     }
 
-    r->read  = pipe_read;
-    r->write = NULL;         // read end is read-only
-    r->seek  = NULL;         // pipes are not seekable
-    r->close = pipe_read_close;
-    r->ctx   = p;
-    r->flags = 0;
+    r->read     = pipe_read;
+    r->write    = NULL;
+    r->seek     = NULL;
+    r->close    = pipe_read_close;
+    r->poll     = pipe_read_poll;
+    r->ctx      = p;
+    r->flags    = 0;
     r->refcount = 1;
+    r->path[0]  = '\0';
 
-    w->read  = NULL;         // write end is write-only
-    w->write = pipe_write;
-    w->seek  = NULL;
-    w->close = pipe_write_close;
-    w->ctx   = p;
-    w->flags = 0;
+    w->read     = NULL;
+    w->write    = pipe_write;
+    w->seek     = NULL;
+    w->close    = pipe_write_close;
+    w->poll     = pipe_write_poll;
+    w->ctx      = p;
+    w->flags    = 0;
     w->refcount = 1;
+    w->path[0]  = '\0';
 
     *read_end  = r;
     *write_end = w;
