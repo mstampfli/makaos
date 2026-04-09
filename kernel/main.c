@@ -14,6 +14,7 @@
 #include "sched.h"
 #include "ahci.h"
 #include "ext2.h"
+#include "elf.h"
 #include "tsc.h"
 #include "fb.h"
 #include "acpi.h"
@@ -25,38 +26,8 @@ phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
-/* ── Shell launcher kthread ─────────────────────────────── */
-// Loads /bin/shell as a user process, schedules it, then exits.
-#include "elf.h"
-
-static void shell_fn(void) {
-    static const char* argv[] = { "/bin/shell", NULL };
-    static const char* envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
-    uint32_t pid = pid_alloc();
-    task_t* t = elf_exec_from_ext2("/bin/shell", pid, argv, envp);
-    if (t) {
-        sched_add(t);
-    } else {
-        // /bin/shell missing — print to serial and hang.
-        const char* msg = "PANIC: /bin/shell not found\n";
-        for (const char* p = msg; *p; p++) {
-            while (!(inb(0x3F8 + 5) & 0x20));
-            outb(0x3F8, (uint8_t)*p);
-        }
-    }
-    // Exit this kthread.
-    if (g_current) {
-        g_current->exit_code = 0;
-        g_current->state = TASK_ZOMBIE;
-        sched_add_zombie(g_current);
-    }
-    for (;;) sched_yield();
-}
-
-/* ── Spurious LAPIC vector handler ──────────────────────── */
 extern void lapic_spurious_entry(void);
 
-/* ── kmain ───────────────────────────────────────────────── */
 static void serial_init_and_say(void) {
     outb(0x3F8 + 1, 0x00);
     outb(0x3F8 + 3, 0x80);
@@ -93,38 +64,20 @@ void kmain(void) {
     fb_init(info->fb_phys, info->fb_width, info->fb_height, info->fb_pitch);
     idt_init();
 
-    // ── Interrupt controller bringup ─────────────────────────────────────
-    //
-    // Order matters:
-    //  1. Remap the legacy 8259 PIC so its vectors don't collide with CPU
-    //     exceptions (0x00–0x1F).  We do this even though we're about to
-    //     disable the PIC, because spurious PIC interrupts can still fire
-    //     during the transition window and we need them to hit safe vectors.
-    //  2. Parse ACPI MADT to find LAPIC and IOAPIC addresses.
-    //  3. Init LAPIC (enables the local CPU's APIC).
-    //  4. Init IOAPIC (routes ISA IRQs → LAPIC vectors, masks everything else).
-    //  5. Disable the legacy PIC (mask all lines — it's now bypassed).
-    //  6. Register the LAPIC spurious vector in the IDT.
+    pic_init(0x20, 0x28);
 
-    pic_init(0x20, 0x28);   // remap PIC: IRQ0→0x20, IRQ8→0x28
-
-    // ACPI: OVMF passes the RSDP via the EFI configuration table.
-    // Our bootloader doesn't forward it yet, so pass 0 and let acpi_parse()
-    // search the legacy BIOS area (works for both SeaBIOS and OVMF on QEMU).
     acpi_info_t acpi = acpi_parse(0);
 
-    tsc_init();           // calibrate TSC (uses PIT ch2, no IRQs needed)
+    tsc_init();
 
     pmm_buddy_init_from_map(info->e820_map, info->e820_count);
     kheap_init();
     vmm_init(info->pml4_phys);
 
-    // LAPIC and IOAPIC require vmm_map_mmio, so init after vmm_init.
     if (acpi.ok) {
         lapic_init(acpi.lapic_phys);
         ioapic_init(&acpi);
     } else {
-        // Fallback: use default LAPIC/IOAPIC addresses (works on QEMU).
         acpi_info_t fallback = {
             .lapic_phys      = 0xFEE00000ULL,
             .ioapic_phys     = 0xFEC00000ULL,
@@ -136,30 +89,30 @@ void kmain(void) {
         ioapic_init(&fallback);
     }
 
-    pic_disable();   // mask all PIC lines — IOAPIC takes over ISA IRQs
-
-    // Register spurious LAPIC vector so a cancelled interrupt doesn't #GP.
+    pic_disable();
     idt_irq_register(VEC_LAPIC_SPURIOUS, (uint64_t)lapic_spurious_entry);
 
     tss_init();
     syscall_init();
 
     ahci_init();
-    ext2_init(4096);  // ext2 partition starts at LBA 4096 on the single AHCI disk
+    ext2_init(4096);
 
-    task_t* p_shell = process_create(shell_fn, pid_alloc());
-
-    if (!p_shell)
-        for (;;) __asm__ volatile("hlt");
+    // ── Launch /bin/shell as PID 1 ────────────────────────────────────────
+    static const char* sh_argv[] = { "/bin/shell", NULL };
+    static const char* sh_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    task_t* init = elf_exec_from_ext2("/bin/shell", pid_alloc(), sh_argv, sh_envp);
+    if (!init)
+        for (;;) __asm__ volatile("hlt");  // /bin/shell missing — halt
 
     sched_init();
     keyboard_init();
     mouse_init();
     hda_init();
     net_init();
-    sched_add(p_shell);
+    sched_add(init);
 
-    timer_init(100);   // 100 Hz scheduler tick via LAPIC timer
+    timer_init(100);
 
     __asm__ volatile("sti");
     for (;;)
