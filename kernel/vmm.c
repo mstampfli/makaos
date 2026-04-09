@@ -225,9 +225,15 @@ void vmm_free_user(phys_addr_t pml4_phys) {
 
             for (int k = 0; k < 512; k++) {
                 if (!(pd[k] & PAGE_PRESENT)) continue;
-                pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0); // free PT frame
+                uint64_t* pt = (uint64_t*)((pd[k] & PAGE_ADDR_MASK) + HHDM_OFFSET);
+
+                for (int l = 0; l < 512; l++) {
+                    if (!(pt[l] & PAGE_PRESENT)) continue;
+                    pmm_buddy_free(pt[l] & PAGE_ADDR_MASK, 0); // free leaf frame
+                }
+                pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0);     // free PT frame
             }
-            pmm_buddy_free(pdpt[j] & PAGE_ADDR_MASK, 0);   // free PD frame
+            pmm_buddy_free(pdpt[j] & PAGE_ADDR_MASK, 0);       // free PD frame
         }
         pmm_buddy_free(pml4[i] & PAGE_ADDR_MASK, 0);       // free PDPT frame
     }
