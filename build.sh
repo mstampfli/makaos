@@ -109,6 +109,10 @@ USER_RT=(
 
 USER_LINK="$USERLAND_DIR/link.ld"
 
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/home" -c "$USERLAND_DIR/apps/home/home.c" -o "$BUILD_DIR/user_home.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_home.o" \
+   -o "$BUILD_DIR/user_home.elf"
+
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_vmalloc/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_vmalloc.o" \
    -o "$BUILD_DIR/user_test_vmalloc.elf"
@@ -197,27 +201,6 @@ if [ -d "$DOOMGENERIC_DIR" ] && [ -n "$(ls -A "$DOOMGENERIC_DIR" 2>/dev/null)" ]
 else
     echo "[!] doomgeneric not found — skipping doom build"
 fi
-
-# ── Embed user binaries as kernel-side byte arrays ────────────────────────
-BIN_HELLO="$BUILD_DIR/user_hello.bin"
-SZ_HELLO=$(stat -c "%s" "$BIN_HELLO")
-{
-  echo "#pragma once"
-  echo "static const unsigned char g_user_hello[] = {"
-  xxd -i < "$BIN_HELLO"
-  echo "};"
-  echo "static const unsigned int g_user_hello_size = ${SZ_HELLO}U;"
-} > "$BUILD_DIR/user_hello.h"
-
-BIN="$BUILD_DIR/user_test_vmalloc.bin"
-SZ=$(stat -c "%s" "$BIN")
-{
-  echo "#pragma once"
-  echo "static const unsigned char g_user_test_vmalloc[] = {"
-  xxd -i < "$BIN"
-  echo "};"
-  echo "static const unsigned int g_user_test_vmalloc_size = ${SZ}U;"
-} > "$BUILD_DIR/user_test_vmalloc.h"
 
 echo "[+] Building kernel (clang + ld.lld)"
 
@@ -331,6 +314,9 @@ DEBUGFS_EOF
 
 if [ -f "$BUILD_DIR/user_test_vmalloc.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_vmalloc.elf bin/vmalloc" > /dev/null 2>&1 || true
+fi
+if [ -f "$BUILD_DIR/user_home.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_home.elf bin/home" > /dev/null 2>&1 || true
 fi
 if [ -f "$BUILD_DIR/user_hello.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_hello.elf bin/hello" > /dev/null 2>&1 || true
