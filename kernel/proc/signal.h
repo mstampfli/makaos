@@ -86,4 +86,5 @@ struct task_t;
 
 void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
+void signal_send_pgrp(uint32_t pgid, int sig);
 void signal_deliver_pending(void);

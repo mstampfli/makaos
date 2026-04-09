@@ -21,6 +21,7 @@
 #include "lapic.h"
 #include "ioapic.h"
 #include "net/net.h"
+#include "tty.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -120,6 +121,7 @@ void kmain(void) {
         for (;;) __asm__ volatile("hlt");  // /bin/shell missing — halt
 
     sched_init();
+    tty_init();
     keyboard_init();
     mouse_init();
     hda_init();
