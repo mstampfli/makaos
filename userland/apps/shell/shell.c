@@ -6,46 +6,134 @@
 #include "libc.h"
 #include "stdio.h"
 
-// ── Keyboard (raw scancodes, same as kernel shell) ────────────────────────
+// ── Keyboard: Swiss German PS/2 set-1 scancode translation ───────────────
+// Supports shift, handles all common keys for shell use.
 
 static int g_kbd_fd = -1;
 
-// PS/2 set-1 scancode → ASCII (press events only, sc < 0x80).
-static char sc_to_ascii(uint8_t sc) {
-    if (sc & 0x80) return 0;  // release event — ignore
-    static const char row1[] = "qwertyuiop";
-    static const char row2[] = "asdfghjkl";
-    static const char row3[] = "zxcvbnm";
-    switch (sc) {
-        case 0x1C: return '\n';
-        case 0x39: return ' ';
-        case 0x0E: return '\b';
-        case 0x01: return 27;   // ESC
-        // digits / symbols on top row
-        case 0x02: return '1'; case 0x03: return '2'; case 0x04: return '3';
-        case 0x05: return '4'; case 0x06: return '5'; case 0x07: return '6';
-        case 0x08: return '7'; case 0x09: return '8'; case 0x0A: return '9';
-        case 0x0B: return '0'; case 0x0C: return '-'; case 0x0D: return '=';
-        case 0x1A: return '['; case 0x1B: return ']';
-        case 0x27: return ';'; case 0x28: return '\'';
-        case 0x29: return '`'; case 0x2B: return '\\';
-        case 0x33: return ','; case 0x34: return '.'; case 0x35: return '/';
-        default: break;
-    }
-    if (sc >= 0x10 && sc <= 0x19) return row1[sc - 0x10];
-    if (sc >= 0x1E && sc <= 0x26) return row2[sc - 0x1E];
-    if (sc >= 0x2C && sc <= 0x32) return row3[sc - 0x2C];
-    return 0;
+// Modifier state.
+static int g_shift = 0;
+static int g_ctrl  = 0;
+// AltGr (Right Alt) — produces extended 0xE0 0x38; tracked via flag.
+static int g_altgr = 0;
+// Dead key state for ^ ` ~ etc (Swiss uses dead keys).
+static int g_dead  = 0;  // pending dead key char
+
+// Swiss German scancode → unshifted/shifted char pairs.
+// Layout: CH-DE (Swiss German), standard PC keyboard.
+// [sc] = { unshifted, shifted }
+typedef struct { char unshift; char shift; char altgr; } sc_map_t;
+
+static const sc_map_t g_sc_map[0x60] = {
+    // 0x00
+    [0x01] = { 0,    0,    0    },  // ESC — handled specially
+    [0x02] = { '1',  '+',  0    },
+    [0x03] = { '2',  '"',  '@'  },
+    [0x04] = { '3',  '*',  '#'  },
+    [0x05] = { '4',  0xE7, 0    },  // 4 / ç (skip non-ASCII ç)
+    [0x06] = { '5',  '%',  0    },
+    [0x07] = { '6',  '&',  0    },
+    [0x08] = { '7',  '/',  '|'  },
+    [0x09] = { '8',  '(',  0    },
+    [0x0A] = { '9',  ')',  0    },
+    [0x0B] = { '0',  '=',  0    },
+    [0x0C] = { '\'', '?',  0    },  // ' / ?  (key right of 0)
+    [0x0D] = { '^',  '`',  '~'  },  // dead ^ / ` / ~
+    [0x0E] = { '\b', '\b', 0    },  // Backspace
+    [0x0F] = { '\t', '\t', 0    },  // Tab
+    // 0x10 row: q w e r t z u i o p ü
+    [0x10] = { 'q',  'Q',  0    },
+    [0x11] = { 'w',  'W',  0    },
+    [0x12] = { 'e',  'E',  0    },
+    [0x13] = { 'r',  'R',  0    },
+    [0x14] = { 't',  'T',  0    },
+    [0x15] = { 'z',  'Z',  0    },  // z (not y — Swiss layout)
+    [0x16] = { 'u',  'U',  0    },
+    [0x17] = { 'i',  'I',  0    },
+    [0x18] = { 'o',  'O',  0    },
+    [0x19] = { 'p',  'P',  0    },
+    [0x1A] = { 0,    0,    0    },  // ü — skip non-ASCII
+    [0x1B] = { '!',  0,    0    },  // ! / (dead tilde on some layouts)
+    [0x1C] = { '\n', '\n', 0    },  // Enter
+    // 0x1E row: a s d f g h j k l ö ä
+    [0x1E] = { 'a',  'A',  0    },
+    [0x1F] = { 's',  'S',  0    },
+    [0x20] = { 'd',  'D',  0    },
+    [0x21] = { 'f',  'F',  0    },
+    [0x22] = { 'g',  'G',  0    },
+    [0x23] = { 'h',  'H',  0    },
+    [0x24] = { 'j',  'J',  0    },
+    [0x25] = { 'k',  'K',  0    },
+    [0x26] = { 'l',  'L',  0    },
+    [0x27] = { 0,    0,    0    },  // ö — skip
+    [0x28] = { 0,    0,    0    },  // ä — skip
+    [0x29] = { 0,    0,    0    },  // § / ° — skip
+    [0x2A] = { 0,    0,    0    },  // Left Shift
+    [0x2B] = { '$',  0,    0    },  // $ (key left of Enter on CH layout)
+    // 0x2C row: y x c v b n m , . -
+    [0x2C] = { 'y',  'Y',  0    },  // y (not z)
+    [0x2D] = { 'x',  'X',  0    },
+    [0x2E] = { 'c',  'C',  0    },
+    [0x2F] = { 'v',  'V',  0    },
+    [0x30] = { 'b',  'B',  0    },
+    [0x31] = { 'n',  'N',  0    },
+    [0x32] = { 'm',  'M',  0    },
+    [0x33] = { ',',  ';',  0    },
+    [0x34] = { '.',  ':',  0    },
+    [0x35] = { '-',  '_',  0    },
+    [0x36] = { 0,    0,    0    },  // Right Shift
+    [0x39] = { ' ',  ' ',  0    },  // Space
+};
+
+// Translate one scancode to ASCII. Handles shift/altgr state.
+// Returns 0 for unmapped or modifier-only keys.
+static char sc_translate(uint8_t sc) {
+    if (sc >= 0x60) return 0;
+    const sc_map_t* m = &g_sc_map[sc];
+    char c;
+    if (g_altgr && m->altgr) c = m->altgr;
+    else if (g_shift)         c = m->shift;
+    else                      c = m->unshift;
+    // Drop non-ASCII (> 127) — we have no font support for them in the terminal.
+    if ((unsigned char)c > 127) c = '?';
+    return c;
 }
 
-// Blocking: wait for next key press, return ASCII char (0 = unmapped/skip).
+// Blocking read: returns next meaningful ASCII character.
+// Updates modifier state as side effect.
 static char kbd_getchar(void) {
     for (;;) {
         uint8_t sc;
-        ssize_t n = read(g_kbd_fd, &sc, 1);
-        if (n <= 0) continue;
-        if (sc == 0xE0) continue;  // extended prefix — skip
-        char c = sc_to_ascii(sc);
+        if (read(g_kbd_fd, &sc, 1) <= 0) continue;
+
+        // Extended prefix byte — next byte is an extended scancode.
+        if (sc == 0xE0) {
+            uint8_t esc;
+            if (read(g_kbd_fd, &esc, 1) <= 0) continue;
+            // Right Alt (AltGr) = 0xE0 0x38 press, 0xE0 0xB8 release.
+            if (esc == 0x38) { g_altgr = 1; continue; }
+            if (esc == 0xB8) { g_altgr = 0; continue; }
+            // All other extended keys (arrows, numpad, etc.) — ignore for now.
+            continue;
+        }
+
+        int release = (sc & 0x80) != 0;
+        uint8_t base = sc & 0x7F;
+
+        // Track shift keys.
+        if (base == 0x2A || base == 0x36) { g_shift = !release; continue; }
+        // Track ctrl.
+        if (base == 0x1D) { g_ctrl = !release; continue; }
+
+        if (release) continue;
+
+        // ESC key.
+        if (base == 0x01) return 27;
+
+        // Ctrl+C → deliver as ETX (could later send SIGINT).
+        if (g_ctrl && base == 0x2E) return 3;
+
+        char c = sc_translate(base);
         if (c) return c;
     }
 }
@@ -361,29 +449,31 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
     puts_fd("-- EDITOR: "); puts_fd(path); puts_fd(" | Ctrl+S=save  ESC=quit --\n");
     if (len > 0) write(1, buf, len);
 
-    // Read raw scancodes directly; track Ctrl key state to detect Ctrl+S.
-    // Left Ctrl = scancode 0x1D (press), 0x9D (release).
-    int ctrl_held = 0;
+    // Use kbd_getchar() which handles all modifier state.
+    // Ctrl+S delivers 's' with g_ctrl==1; ESC delivers 27.
     for (;;) {
+        // Peek at g_ctrl before kbd_getchar consumes the key.
+        // We need raw access, so read one scancode at a time and check.
         uint8_t sc;
-        ssize_t n = read(g_kbd_fd, &sc, 1);
-        if (n <= 0) continue;
-        if (sc == 0xE0) continue;
+        if (read(g_kbd_fd, &sc, 1) <= 0) continue;
 
-        // Track Ctrl key.
-        if (sc == 0x1D) { ctrl_held = 1; continue; }
-        if (sc == 0x9D) { ctrl_held = 0; continue; }
-
-        if (sc & 0x80) continue;  // other release events — ignore
-
-        // ESC (scancode 0x01) — quit.
-        if (sc == 0x01) {
-            puts_fd("\n[Quit without saving]\n");
-            break;
+        if (sc == 0xE0) {
+            uint8_t esc; if (read(g_kbd_fd, &esc, 1) <= 0) continue;
+            if (esc == 0x38) { g_altgr = 1; continue; }
+            if (esc == 0xB8) { g_altgr = 0; continue; }
+            continue;
         }
+        int release = (sc & 0x80) != 0;
+        uint8_t base = sc & 0x7F;
+        if (base == 0x2A || base == 0x36) { g_shift = !release; continue; }
+        if (base == 0x1D) { g_ctrl  = !release; continue; }
+        if (release) continue;
 
-        // Ctrl+S (s = scancode 0x1F) — save.
-        if (ctrl_held && sc == 0x1F) {
+        // ESC — quit.
+        if (base == 0x01) { puts_fd("\n[Quit without saving]\n"); break; }
+
+        // Ctrl+S (s = scancode 0x1F in CH layout same as US).
+        if (g_ctrl && base == 0x1F) {
             int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0);
             int ok = 0;
             if (wfd >= 0) {
@@ -395,7 +485,7 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
             continue;
         }
 
-        char c = sc_to_ascii(sc);
+        char c = sc_translate(base);
         if (!c) continue;
 
         if (c == '\b') {
