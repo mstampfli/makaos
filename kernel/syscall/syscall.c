@@ -628,7 +628,9 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t pathlen) {
     uint32_t pid = pid_alloc();
     if (!pid) return (uint64_t)-ENOMEM;
 
-    task_t* child = elf_load_from_ext2(path, pid);
+    const char* argv[] = { path, NULL };
+    const char* envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    task_t* child = elf_exec_from_ext2(path, pid, argv, envp);
     if (!child) {
         pid_free(pid);
         return (uint64_t)-ENOENT;
