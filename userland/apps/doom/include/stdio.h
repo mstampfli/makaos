@@ -3,8 +3,8 @@
 // Define _DOOM_RENAME_OVERRIDE so libc.h does not install the 4-arg rename macro.
 #define _DOOM_RENAME_OVERRIDE
 
-#include "../../stdio.h"
-#include "../../libc.h"
+#include "../../../libc/stdio.h"
+#include "../../../libc/libc.h"
 
 // POSIX 2-arg rename using direct syscall (SYS_RENAME=17).
 #undef rename

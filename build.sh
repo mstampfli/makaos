@@ -2,8 +2,8 @@
 set -e
 
 KERNEL_DIR="kernel"
-USER_DIR="user"
-UEFI_DIR="uefi/boot"
+USERLAND_DIR="userland"
+BOOT_DIR="boot"
 BUILD_DIR="build"
 
 mkdir -p "$BUILD_DIR"
@@ -16,6 +16,26 @@ NASM="nasm"
 OBJCOPY="objcopy"
 
 # ── Kernel compile flags (clang, ELF64, freestanding) ─────────────────────
+KERNEL_INCLUDES=(
+  -I "$KERNEL_DIR"
+  -I "$KERNEL_DIR/include"
+  -I "$KERNEL_DIR/mm"
+  -I "$KERNEL_DIR/proc"
+  -I "$KERNEL_DIR/fs"
+  -I "$KERNEL_DIR/drivers/input"
+  -I "$KERNEL_DIR/drivers/video"
+  -I "$KERNEL_DIR/drivers/audio"
+  -I "$KERNEL_DIR/drivers/storage"
+  -I "$KERNEL_DIR/drivers/pci"
+  -I "$KERNEL_DIR/acpi"
+  -I "$KERNEL_DIR/time"
+  -I "$KERNEL_DIR/syscall"
+  -I "$KERNEL_DIR/shell"
+  -I "$KERNEL_DIR/net"
+  -I "$KERNEL_DIR/arch/x86_64"
+  -I "$BUILD_DIR"
+)
+
 KERNEL_CFLAGS=(
   -ffreestanding
   -m64
@@ -62,19 +82,23 @@ EFI_CFLAGS=(
   -O2
 )
 
-# ── ATA drivers to exclude from kernel build ───────────────────────────────
+# ── Kernel source files to exclude ────────────────────────────────────────
 KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c ac97.c"
 
 echo "[+] Building user binaries"
 
 # ── Common user object files ───────────────────────────────────────────────
-"$NASM" -f elf64 "$USER_DIR/entry.asm"   -o "$BUILD_DIR/user_entry.o"
-"$NASM" -f elf64 "$USER_DIR/setjmp.asm"  -o "$BUILD_DIR/user_setjmp.o"
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/libc.c"  -o "$BUILD_DIR/user_libc.o"
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/stdio.c" -o "$BUILD_DIR/user_stdio.o"
-"$CC" "${USER_CFLAGS[@]}" -msse2 -c "$USER_DIR/math.c" -o "$BUILD_DIR/user_math.o"
+"$NASM" -f elf64 "$USERLAND_DIR/entry/entry.asm"    -o "$BUILD_DIR/user_entry.o"
+"$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
-# Base runtime objects linked into every user binary that uses libc.
+USER_INCLUDES=(
+  -I "$USERLAND_DIR/libc"
+  -I "$USERLAND_DIR/include"
+)
+
 USER_RT=(
     "$BUILD_DIR/user_entry.o"
     "$BUILD_DIR/user_libc.o"
@@ -83,41 +107,42 @@ USER_RT=(
     "$BUILD_DIR/user_setjmp.o"
 )
 
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_test_vmalloc.o" \
+USER_LINK="$USERLAND_DIR/link.ld"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_vmalloc/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_vmalloc.o" \
    -o "$BUILD_DIR/user_test_vmalloc.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_test_vmalloc.elf" "$BUILD_DIR/user_test_vmalloc.bin"
 
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/hello.c" -o "$BUILD_DIR/user_hello.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_hello.o" \
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/hello/hello.c" -o "$BUILD_DIR/user_hello.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_hello.o" \
    -o "$BUILD_DIR/user_hello.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_helloraw.o" \
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
+ld -nostdlib -T "$USER_LINK" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
 
-"$CC" "${USER_CFLAGS[@]}" -c "$USER_DIR/test_posix1.c" -o "$BUILD_DIR/user_test_posix1.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_posix1/test_posix1.c" -o "$BUILD_DIR/user_test_posix1.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
-"$CC" "${USER_CFLAGS[@]}" -msse2 -c "$USER_DIR/tone.c" -o "$BUILD_DIR/user_tone.o"
-ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
-DOOM_DIR="$USER_DIR/doom"
+DOOM_DIR="$USERLAND_DIR/apps/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
 
-if [ ! -d "$DOOMGENERIC_DIR" ]; then
-    echo "[+] Cloning doomgeneric..."
-    git clone --depth=1 -c http.sslVerify=false \
-        https://github.com/ozkl/doomgeneric.git "$DOOMGENERIC_DIR" || \
-        echo "[!] git clone failed — place doomgeneric at $DOOMGENERIC_DIR manually"
+if [ ! -d "$DOOMGENERIC_DIR" ] || [ -z "$(ls -A "$DOOMGENERIC_DIR" 2>/dev/null)" ]; then
+    echo "[+] Initialising doomgeneric submodule..."
+    git -c http.sslVerify=false submodule update --init || \
+        echo "[!] submodule init failed — place doomgeneric at $DOOMGENERIC_DIR manually"
 fi
 
-if [ -d "$DOOMGENERIC_DIR" ]; then
+if [ -d "$DOOMGENERIC_DIR" ] && [ -n "$(ls -A "$DOOMGENERIC_DIR" 2>/dev/null)" ]; then
     echo "[+] Building doom"
 
     DOOM_CFLAGS=(
@@ -128,12 +153,10 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
         -O1 -g
         -DFEATURE_SOUND
         -DMAKAOS_NO_SDL_MIXER
-        # Include search order: our shim headers first, then doomgeneric internals.
         -nostdinc
         -I"$DOOM_DIR/include"
         -I"$DOOMGENERIC_DIR/doomgeneric"
-        -I"$USER_DIR"
-        # Suppress warnings from doom source we can't modify.
+        -I"$USERLAND_DIR/libc"
         -Wno-implicit-function-declaration
         -Wno-implicit-int
         -Wno-int-conversion
@@ -146,13 +169,8 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
         -Wno-unused-parameter
     )
 
-    DOOM_SRCS=()
     DOOM_OBJS=()
 
-    # Compile doomgeneric core sources (everything in doomgeneric/ except the
-    # platform-specific file doomgeneric_*.c which we replace with our own).
-    # i_sound.c is the sound dispatch layer — compile it with FEATURE_SOUND.
-    # SDL/Allegro/CD audio backends are replaced by i_sound_makaos.c.
     for src in "$DOOMGENERIC_DIR/doomgeneric/"*.c; do
         base=$(basename "$src")
         case "$base" in
@@ -165,14 +183,12 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
         DOOM_OBJS+=("$obj")
     done
 
-    # Compile our platform glue and AC97 software mixer.
     "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/doomgeneric_makaos.c" -o "$BUILD_DIR/doom_makaos.o"
     DOOM_OBJS+=("$BUILD_DIR/doom_makaos.o")
     "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/i_sound_makaos.c" -o "$BUILD_DIR/doom_i_sound_makaos.o"
     DOOM_OBJS+=("$BUILD_DIR/doom_i_sound_makaos.o")
 
-    # Link doom ELF.
-    ld -nostdlib -T "$USER_DIR/user_link.ld" \
+    ld -nostdlib -T "$USER_LINK" \
        "${USER_RT[@]}" \
        "${DOOM_OBJS[@]}" \
        -o "$BUILD_DIR/user_doom.elf"
@@ -182,7 +198,7 @@ else
     echo "[!] doomgeneric not found — skipping doom build"
 fi
 
-# Embed user binaries as kernel-side byte arrays
+# ── Embed user binaries as kernel-side byte arrays ────────────────────────
 BIN_HELLO="$BUILD_DIR/user_hello.bin"
 SZ_HELLO=$(stat -c "%s" "$BIN_HELLO")
 {
@@ -206,30 +222,42 @@ SZ=$(stat -c "%s" "$BIN")
 echo "[+] Building kernel (clang + ld.lld)"
 
 KERNEL_C_OBJS=()
-for src in "$KERNEL_DIR"/*.c; do
-  [ -e "$src" ] || continue
-  base=$(basename "$src")
-  # Skip ATA drivers
-  if [[ " $KERNEL_EXCLUDE " == *" $base "* ]]; then
-    echo "    [skip] $base"
-    continue
-  fi
-  obj="$BUILD_DIR/kernel_${base%.c}.o"
-  "$CLANG" "${KERNEL_CFLAGS[@]}" -I "$BUILD_DIR" -I "$KERNEL_DIR" -c "$src" -o "$obj"
-  KERNEL_C_OBJS+=("$obj")
-done
 
-# ── Kernel networking subsystem ────────────────────────────────────────────
-for src in "$KERNEL_DIR/net"/*.c; do
-  [ -e "$src" ] || continue
-  base=$(basename "$src")
-  obj="$BUILD_DIR/kernel_net_${base%.c}.o"
-  "$CLANG" "${KERNEL_CFLAGS[@]}" -I "$BUILD_DIR" -I "$KERNEL_DIR" -c "$src" -o "$obj"
-  KERNEL_C_OBJS+=("$obj")
+# Collect all .c files from all kernel subdirs (excluding KERNEL_EXCLUDE)
+KERNEL_SUBDIRS=(
+    "$KERNEL_DIR"
+    "$KERNEL_DIR/mm"
+    "$KERNEL_DIR/proc"
+    "$KERNEL_DIR/fs"
+    "$KERNEL_DIR/drivers/input"
+    "$KERNEL_DIR/drivers/video"
+    "$KERNEL_DIR/drivers/audio"
+    "$KERNEL_DIR/drivers/storage"
+    "$KERNEL_DIR/drivers/pci"
+    "$KERNEL_DIR/acpi"
+    "$KERNEL_DIR/time"
+    "$KERNEL_DIR/syscall"
+    "$KERNEL_DIR/shell"
+    "$KERNEL_DIR/arch/x86_64"
+    "$KERNEL_DIR/net"
+)
+
+for dir in "${KERNEL_SUBDIRS[@]}"; do
+  for src in "$dir"/*.c; do
+    [ -e "$src" ] || continue
+    base=$(basename "$src")
+    if [[ " $KERNEL_EXCLUDE " == *" $base "* ]]; then
+      echo "    [skip] $base"
+      continue
+    fi
+    obj="$BUILD_DIR/kernel_${base%.c}.o"
+    "$CLANG" "${KERNEL_CFLAGS[@]}" "${KERNEL_INCLUDES[@]}" -c "$src" -o "$obj"
+    KERNEL_C_OBJS+=("$obj")
+  done
 done
 
 KERNEL_ASM_OBJS=()
-for src in "$KERNEL_DIR"/*.asm; do
+for src in "$KERNEL_DIR/arch/x86_64"/*.asm; do
   [ -e "$src" ] || continue
   obj="$BUILD_DIR/kernel_$(basename "${src%.asm}").o"
   "$NASM" -f elf64 -g -F dwarf "$src" -o "$obj"
@@ -249,8 +277,8 @@ done
 echo "[+] Building UEFI bootloader (clang → PE32+)"
 
 "$CLANG" "${EFI_CFLAGS[@]}" \
-  -I "$UEFI_DIR" \
-  -c "$UEFI_DIR/main.c" \
+  -I "$BOOT_DIR/uefi" \
+  -c "$BOOT_DIR/uefi/main.c" \
   -o "$BUILD_DIR/uefi_main.o"
 
 lld-link /nodefaultlib \
@@ -268,20 +296,18 @@ echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
 EXT2_SECTORS=65536   # 32 MiB
-ESP_START=2048       # LBA 2048 (1 MiB aligned)
-ESP_END=4095         # LBA 4095 (just before ext2)
+ESP_START=2048
+ESP_END=4095
 
 DISK_SECTORS=$((EXT2_LBA + EXT2_SECTORS + 2048))
 truncate -s $((DISK_SECTORS * 512)) "$BUILD_DIR/disk.img"
 
-# Create GPT with one ESP partition (LBA 2048–4095)
 sgdisk --clear \
   --new=1:${ESP_START}:${ESP_END} \
   --typecode=1:ef00 \
   --change-name=1:"EFI System" \
   "$BUILD_DIR/disk.img" > /dev/null 2>&1
 
-# Format ESP as FAT32 using mtools (offset = ESP_START * 512 bytes)
 ESP_OFFSET=$((ESP_START * 512))
 mformat -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} -F -v "MAKAOS_ESP" ::
 mmd -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} ::/EFI
@@ -323,12 +349,9 @@ if [ -f "$BUILD_DIR/user_doom.elf" ]; then
     echo "[+] doom ELF installed at bin/doom"
 fi
 
-# Install doom1.wad if present (place next to the binary, or in /home).
-# The doom binary opens "doom1.wad" relative to cwd, which the shell sets to
-# the directory of the executable (/bin).  So we install it as /bin/doom1.wad.
 WAD_SEARCH=(
-    "$USER_DIR/doom/doom1.wad"
-    "$USER_DIR/doom/DOOM1.WAD"
+    "$DOOM_DIR/doom1.wad"
+    "$DOOM_DIR/DOOM1.WAD"
     "doom1.wad"
     "DOOM1.WAD"
     "$HOME/doom1.wad"
@@ -342,9 +365,8 @@ if [ -n "$WAD_FILE" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $WAD_FILE bin/doom1.wad" > /dev/null 2>&1 || true
     echo "[+] WAD installed: $WAD_FILE → /bin/doom1.wad"
 else
-    echo "[!] doom1.wad not found — place it at user/doom/doom1.wad before running"
+    echo "[!] doom1.wad not found — place it at $DOOM_DIR/doom1.wad before running"
 fi
-
 
 if [ -d "$BUILD_DIR/fs" ]; then
     for f in "$BUILD_DIR/fs"/*; do
@@ -352,7 +374,6 @@ if [ -d "$BUILD_DIR/fs" ]; then
     done
 fi
 
-# Write ext2 at LBA 4096 (after ESP partition)
 dd if="$BUILD_DIR/ext2.img" of="$BUILD_DIR/disk.img" bs=512 seek=$EXT2_LBA conv=notrunc status=none
 
 stat -c "%n %s" "$BUILD_DIR/disk.img"
@@ -363,7 +384,6 @@ OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_SRC="/usr/share/OVMF/OVMF_VARS_4M.fd"
 OVMF_VARS="$BUILD_DIR/OVMF_VARS.fd"
 
-# Copy VARS so OVMF can persist NVRAM across runs
 cp "$OVMF_VARS_SRC" "$OVMF_VARS"
 
 qemu-system-x86_64 \

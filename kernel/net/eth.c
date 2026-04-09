@@ -2,7 +2,7 @@
 #include "arp.h"
 #include "ipv4.h"
 #include "virtio_net.h"
-#include "../common.h"
+#include "common.h"
 
 const uint8_t eth_broadcast[ETH_ALEN] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 

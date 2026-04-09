@@ -1,6 +1,6 @@
 #pragma once
 // unistd.h shim
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 
 // sleep() — seconds
 static inline unsigned int sleep(unsigned int secs) {

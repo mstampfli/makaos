@@ -3,8 +3,8 @@
 #include "eth.h"
 #include "net.h"
 #include "socket.h"
-#include "../common.h"
-#include "../kheap.h"
+#include "common.h"
+#include "kheap.h"
 
 void udp_recv(skbuff_t* skb) {
     if (skb->len < UDP_HDR_LEN) { skb_free(skb); return; }

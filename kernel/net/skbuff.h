@@ -1,6 +1,6 @@
 #pragma once
-#include "../common.h"
-#include "../kheap.h"
+#include "common.h"
+#include "kheap.h"
 
 // ── Socket Buffer (skbuff) ────────────────────────────────────────────────
 // A socket buffer is the universal packet container used at every layer of

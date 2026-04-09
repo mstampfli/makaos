@@ -1,6 +1,6 @@
 #pragma once
 // sys/stat.h shim
-#include "../../libc.h"
+#include "../../../../libc/libc.h"
 
 // mode constants
 #define S_IRWXU 0700

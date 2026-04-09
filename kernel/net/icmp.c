@@ -1,8 +1,8 @@
 #include "icmp.h"
 #include "ipv4.h"
 #include "skbuff.h"
-#include "../common.h"
-#include "../kheap.h"
+#include "common.h"
+#include "kheap.h"
 
 typedef struct __attribute__((packed)) {
     uint8_t  type;

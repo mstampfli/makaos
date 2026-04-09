@@ -1,6 +1,6 @@
 #pragma once
-#include "../common.h"
-#include "../vfs.h"
+#include "common.h"
+#include "vfs.h"
 #include "skbuff.h"
 
 // ── BSD Socket abstraction ────────────────────────────────────────────────

@@ -4,10 +4,10 @@
 #include "arp.h"
 #include "tcp.h"
 #include "skbuff.h"
-#include "../process.h"
-#include "../sched.h"
-#include "../irq_wait.h"
-#include "../common.h"
+#include "process.h"
+#include "sched.h"
+#include "irq_wait.h"
+#include "common.h"
 
 // ── Serial helpers (inline, no serial.h needed) ───────────────────────────
 

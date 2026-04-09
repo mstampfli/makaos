@@ -3,10 +3,10 @@
 #include "eth.h"
 #include "net.h"
 #include "socket.h"
-#include "../common.h"
-#include "../kheap.h"
-#include "../sched.h"
-#include "../tsc.h"
+#include "common.h"
+#include "kheap.h"
+#include "sched.h"
+#include "tsc.h"
 
 // ── TCP constants ─────────────────────────────────────────────────────────
 #define TCP_RTO_NS        1000000000ULL   // retransmit timeout: 1 second

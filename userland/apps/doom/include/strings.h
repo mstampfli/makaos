@@ -1,4 +1,4 @@
 #pragma once
 // strings.h — POSIX string functions
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 // strcasecmp / strncasecmp already declared in libc.h

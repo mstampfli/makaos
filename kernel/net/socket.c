@@ -2,10 +2,10 @@
 #include "tcp.h"
 #include "udp.h"
 #include "skbuff.h"
-#include "../common.h"
-#include "../kheap.h"
-#include "../sched.h"
-#include "../process.h"
+#include "common.h"
+#include "kheap.h"
+#include "sched.h"
+#include "process.h"
 
 // ── UDP socket registry ───────────────────────────────────────────────────
 // Simple fixed-size table: maps local port → socket_t*.

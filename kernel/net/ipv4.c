@@ -5,8 +5,8 @@
 #include "tcp.h"
 #include "udp.h"
 #include "net.h"
-#include "../common.h"
-#include "../kheap.h"
+#include "common.h"
+#include "kheap.h"
 
 static uint16_t s_ip_id = 0;  // monotonically increasing packet ID
 
