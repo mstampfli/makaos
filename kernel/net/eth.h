@@ -1,5 +1,5 @@
 #pragma once
-#include "../common.h"
+#include "common.h"
 #include "skbuff.h"
 
 // ── Ethernet (IEEE 802.3) ─────────────────────────────────────────────────

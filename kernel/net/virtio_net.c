@@ -1,12 +1,12 @@
 #include "virtio_net.h"
-#include "../pci.h"
-#include "../vmm.h"
-#include "../pmm.h"
-#include "../kheap.h"
-#include "../idt.h"
-#include "../lapic.h"
-#include "../irq_wait.h"
-#include "../common.h"
+#include "pci.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "kheap.h"
+#include "idt.h"
+#include "lapic.h"
+#include "irq_wait.h"
+#include "common.h"
 
 extern void virtio_net_irq_entry(void);
 

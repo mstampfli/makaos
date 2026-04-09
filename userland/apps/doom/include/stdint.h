@@ -1,6 +1,6 @@
 #pragma once
 // stdint.h — provide standard integer types
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 // All basic types already defined in libc.h; just add the extras below.
 
 typedef int64_t  intptr_t;

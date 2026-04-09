@@ -1,6 +1,6 @@
 #pragma once
 // stdlib.h shim — redirects to our libc
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 
 // Additional stdlib functions provided by libc.c
 static inline void abort(void) { _exit(134); }

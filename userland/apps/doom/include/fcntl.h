@@ -1,6 +1,6 @@
 #pragma once
 // fcntl.h shim — provide O_* flags used by doom
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 
 // O_* flags are already in libc.h; add O_NONBLOCK and friends.
 #define O_NONBLOCK 0x800

@@ -1,6 +1,6 @@
 #pragma once
 // string.h shim — redirects to our libc
-#include "../../libc.h"
+#include "../../../libc/libc.h"
 
 // Additional string functions
 static inline char* strpbrk(const char* s, const char* accept) {
