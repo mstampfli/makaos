@@ -39,15 +39,26 @@ void keyboard_ungrab(void) { s_grabbed = 0; }
 static uint8_t s_shift = 0;
 static uint8_t s_ctrl  = 0;
 
-// ── Extended scancodes ────────────────────────────────────────────────────
-static char extended_key(uint8_t sc) {
+// ── Extended scancodes → ANSI escape sequences ────────────────────────────
+// Inject as ESC [ x so the TTY passes them through to userland correctly.
+// In ICANON mode these are buffered as regular chars (no special meaning).
+// In raw mode userland can parse them as arrow keys.
+static void extended_key_inject(uint8_t sc, tty_t* tty) {
+    const char* seq = NULL;
     switch (sc) {
-        case 0x48: return KEY_UP;
-        case 0x50: return KEY_DOWN;
-        case 0x4B: return KEY_LEFT;
-        case 0x4D: return KEY_RIGHT;
-        default:   return 0;
+        case 0x48: seq = "\x1b[A"; break;  // up
+        case 0x50: seq = "\x1b[B"; break;  // down
+        case 0x4B: seq = "\x1b[D"; break;  // left
+        case 0x4D: seq = "\x1b[C"; break;  // right
+        case 0x47: seq = "\x1b[H"; break;  // home
+        case 0x4F: seq = "\x1b[F"; break;  // end
+        case 0x49: seq = "\x1b[5~"; break; // page up
+        case 0x51: seq = "\x1b[6~"; break; // page down
+        case 0x53: seq = "\x1b[3~"; break; // delete
+        default:   return;
     }
+    for (int i = 0; seq[i]; i++)
+        tty_input_char(tty, seq[i]);
 }
 
 // ── Public API (legacy — backed by TTY; kept for /dev/kbd in vfs.c) ───────
@@ -138,10 +149,8 @@ static void keyboard_thread_fn(void) {
                 s_extended = 0;
                 if (sc == 0x1D) { s_ctrl = 1; continue; }
                 if (sc == 0x9D) { s_ctrl = 0; continue; }
-                if (!s_grabbed && !(sc & 0x80)) {
-                    char c = extended_key(sc);
-                    if (c) tty_input_char(&g_ttys[0], c);
-                }
+                if (!s_grabbed && !(sc & 0x80))
+                    extended_key_inject(sc, &g_ttys[0]);
                 continue;
             }
 
