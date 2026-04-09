@@ -25,8 +25,33 @@ phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
-/* ── Process entry points ───────────────────────────────── */
-extern void shell_fn(void);
+/* ── Shell launcher kthread ─────────────────────────────── */
+// Loads /bin/shell as a user process, schedules it, then exits.
+#include "elf.h"
+
+static void shell_fn(void) {
+    static const char* argv[] = { "/bin/shell", NULL };
+    static const char* envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    uint32_t pid = pid_alloc();
+    task_t* t = elf_exec_from_ext2("/bin/shell", pid, argv, envp);
+    if (t) {
+        sched_add(t);
+    } else {
+        // /bin/shell missing — print to serial and hang.
+        const char* msg = "PANIC: /bin/shell not found\n";
+        for (const char* p = msg; *p; p++) {
+            while (!(inb(0x3F8 + 5) & 0x20));
+            outb(0x3F8, (uint8_t)*p);
+        }
+    }
+    // Exit this kthread.
+    if (g_current) {
+        g_current->exit_code = 0;
+        g_current->state = TASK_ZOMBIE;
+        sched_add_zombie(g_current);
+    }
+    for (;;) sched_yield();
+}
 
 /* ── Spurious LAPIC vector handler ──────────────────────── */
 extern void lapic_spurious_entry(void);
