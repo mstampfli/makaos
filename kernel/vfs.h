@@ -82,3 +82,11 @@ vfs_file_t* vfs_kbd_open(void);
 // Returns a vfs_file_t that delivers raw PS/2 scancodes (non-blocking).
 // Includes E0 prefixes and break codes (make | 0x80).
 vfs_file_t* vfs_kbdraw_open(void);
+
+// Returns a vfs_file_t that delivers mouse_event_t structs (non-blocking).
+// Read in multiples of sizeof(mouse_event_t) = 5 bytes.
+vfs_file_t* vfs_mouse_open(void);
+
+// Returns a write-only vfs_file_t for the AC97 PCM output stream (/dev/dsp).
+// Write signed 16-bit stereo samples at AC97_SAMPLE_RATE Hz.
+vfs_file_t* vfs_dsp_open(void);
