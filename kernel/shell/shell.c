@@ -691,11 +691,6 @@ void shell_fn(void) {
         else if (kstrcmp(argv[0], "mkdir")  == 0) cmd_mkdir(argc, argv);
         else if (kstrcmp(argv[0], "rm")     == 0) cmd_rm(argc, argv);
         else if (kstrcmp(argv[0], "mv")     == 0) cmd_mv(argc, argv);
-        else if (kstrcmp(argv[0], "hello")  == 0) {
-            extern void hello_embedded_fn(void);
-            task_t* t = task_create_kthread(hello_embedded_fn, pid_alloc());
-            if (t) { uint32_t p = t->pid; sched_add(t); sched_wait_pid(p); }
-        }
         else if (kstrcmp(argv[0], "about")  == 0) cmd_about();
         else if (kstrcmp(argv[0], "ps")     == 0) cmd_ps();
         else if (kstrcmp(argv[0], "reboot") == 0) cmd_reboot();

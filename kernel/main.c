@@ -13,6 +13,7 @@
 #include "timer.h"
 #include "sched.h"
 #include "ahci.h"
+#include "elf.h"
 #include "ext2.h"
 #include "tsc.h"
 #include "fb.h"
@@ -26,10 +27,6 @@ uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
 /* ── Process entry points ───────────────────────────────── */
-extern void home_fn(void);
-extern void snake_fn(void);
-extern void fs_init_fn(void);
-extern void test_vmalloc_fn(void);
 extern void shell_fn(void);
 
 /* ── Spurious LAPIC vector handler ──────────────────────── */
@@ -137,6 +134,9 @@ void kmain(void) {
     hda_init();
     net_init();
     sched_add(p_shell);
+
+    task_t* p_home = elf_load_from_ext2("/bin/home", pid_alloc());
+    if (p_home) sched_add(p_home);
     timer_init(100);   // 100 Hz scheduler tick via LAPIC timer
 
     __asm__ volatile("sti");
