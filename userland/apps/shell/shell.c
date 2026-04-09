@@ -535,15 +535,12 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
         NULL
     };
 
-    int pid = fork();
-    if (pid < 0) { puts_fd("shell: fork failed\n"); return; }
-    if (pid == 0) {
-        execve(path, child_argv, child_envp);
-        puts_fd("shell: exec failed: "); puts_fd(path); putc_fd('\n');
-        exit(1);
-    }
+    // Use spawn (= elf_load_from_ext2 fresh task) rather than fork+exec.
+    // fork copies the shell's entire address space which causes corruption
+    // with some binaries (doom). Spawn creates a clean task from scratch.
+    int pid = spawn(path, strlen(path));
+    if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
-    // Parent: wait for child.
     int status = 0;
     waitpid(pid, &status, 0);
 }
