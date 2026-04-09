@@ -64,6 +64,20 @@ void kmain(void) {
     fb_init(info->fb_phys, info->fb_width, info->fb_height, info->fb_pitch);
     idt_init();
 
+    /* Enable SSE/SSE2 for userland: set CR4.OSFXSR (bit 9) and CR4.OSXMMEXCPT (bit 10),
+       and clear CR0.EM (bit 2) / CR0.TS (bit 3) so SSE doesn't trap. */
+    {
+        uint64_t cr0, cr4;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~((uint64_t)(1 << 2));  // clear EM
+        cr0 &= ~((uint64_t)(1 << 3));  // clear TS
+        __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 9);   // OSFXSR
+        cr4 |= (1ULL << 10);  // OSXMMEXCPT
+        __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+    }
+
     pic_init(0x20, 0x28);
 
     acpi_info_t acpi = acpi_parse(0);

@@ -16,11 +16,10 @@ _entry:
     mov  rdi, [rsp]        ; argc
     lea  rsi, [rsp+8]      ; argv
 
-    ; Align stack: rsp must be 16-byte aligned *before* the call instruction
-    ; pushes the return address. We entered with rsp pointing at argc, so
-    ; push a dummy return address slot to make the call site 16-byte aligned.
+    ; SysV ABI: RSP must be 16-byte aligned before the call.
+    ; elf_setup_stack already returns a 16-byte aligned RSP.
+    ; Just align down — the call instruction pushes the 8-byte return address.
     and  rsp, ~0xF
-    sub  rsp, 8            ; realign so call makes rsp 16-byte aligned
 
     call main
 
