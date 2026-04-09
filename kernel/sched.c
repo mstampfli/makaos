@@ -6,6 +6,7 @@
 #include "tss.h"
 #include "common.h"
 
+
 // ── MLFQ parameters ───────────────────────────────────────────────────────
 // 4 priority levels.  Level 0 is highest (interactive).
 // Quantum doubles at each level.  Boost every BOOST_INTERVAL ticks moves
@@ -276,9 +277,10 @@ uint8_t sched_wait_pid(uint32_t pid) {
         // Specific pid: check if still alive anywhere (run queue, sleep, zombie)
         // or is the currently running task.
         wait_pid_arg_t a = {pid, 0};
-        if (g_current && g_current->pid == pid) a.found = 1;
-        if (!a.found) sched_for_each(find_pid_cb, &a);
-        if (!a.found) return 1; // truly gone (killed without becoming zombie)
+        __asm__ volatile("cli");
+        sched_for_each(find_pid_cb, &a);
+        __asm__ volatile("sti");
+        if (!a.found) return 1;
         sched_yield();
     }
 }
@@ -297,6 +299,11 @@ uint8_t sched_poll_pid(uint32_t pid) {
 // Walks every task in every MLFQ level.
 
 void sched_for_each(void (*cb)(task_t*, void*), void* data) {
+    // Include g_current: it is dequeued while executing, so it won't appear
+    // in any of the lists below.  Callers (e.g. sched_wait_pid) need to see it.
+    if (g_current && g_current != &s_idle)
+        cb(g_current, data);
+
     for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
         task_t* t = s_heads[i];
         while (t) {

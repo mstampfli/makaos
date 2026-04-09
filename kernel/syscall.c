@@ -206,9 +206,14 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
                              && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
         uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
+        uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
+                             && dev[4]=='e' && dev[5]=='\0');
+        uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
         if      (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
+        else if (match_mouse)  f = vfs_mouse_open();
+        else if (match_dsp)    f = vfs_dsp_open();
         else return (uint64_t)-ENOENT;
     } else {
         f = ext2_open(path);

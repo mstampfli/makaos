@@ -1,5 +1,7 @@
 #include "vfs.h"
 #include "keyboard.h"
+#include "mouse.h"
+#include "hda.h"
 #include "common.h"
 #include "fb.h"
 
@@ -88,4 +90,50 @@ static vfs_file_t s_kbdraw_file = {
 
 vfs_file_t* vfs_kbdraw_open(void) {
     return &s_kbdraw_file;
+}
+
+// ── Mouse device (/dev/mouse) ─────────────────────────────────────────────
+// Returns packed mouse_event_t structs.  Non-blocking: returns 0 bytes if
+// no events are pending.  Callers should read in multiples of sizeof(mouse_event_t).
+
+static int64_t mouse_dev_read(vfs_file_t* self, void* buf, uint64_t len) {
+    (void)self;
+    if (!len) return 0;
+    int max = (int)(len / sizeof(mouse_event_t));
+    if (max == 0) return 0;
+    int n = mouse_read((mouse_event_t*)buf, max);
+    return (int64_t)(n * (int)sizeof(mouse_event_t));
+}
+
+static vfs_file_t s_mouse_file = {
+    .read  = mouse_dev_read,
+    .write = NULL,
+    .close = vga_noop_close,
+    .ctx   = NULL,
+    .flags = 0,
+};
+
+vfs_file_t* vfs_mouse_open(void) {
+    return &s_mouse_file;
+}
+
+// ── DSP device (/dev/dsp) ─────────────────────────────────────────────────
+// Write-only.  Accepts signed 16-bit stereo PCM at HDA_SAMPLE_RATE Hz.
+// Blocks (IRQ-driven) when the HDA DMA ring is full.
+
+static int64_t dsp_write(vfs_file_t* self, const void* buf, uint64_t len) {
+    (void)self;
+    return (int64_t)hda_write(buf, (uint32_t)len);
+}
+
+static vfs_file_t s_dsp_file = {
+    .read  = NULL,
+    .write = dsp_write,
+    .close = vga_noop_close,
+    .ctx   = NULL,
+    .flags = 0,
+};
+
+vfs_file_t* vfs_dsp_open(void) {
+    return &s_dsp_file;
 }

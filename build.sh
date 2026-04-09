@@ -63,7 +63,7 @@ EFI_CFLAGS=(
 )
 
 # ── ATA drivers to exclude from kernel build ───────────────────────────────
-KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c"
+KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c ac97.c"
 
 echo "[+] Building user binaries"
 
@@ -102,6 +102,10 @@ ld -nostdlib -T "$USER_DIR/user_link.ld" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/u
 ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
+"$CC" "${USER_CFLAGS[@]}" -msse2 -c "$USER_DIR/tone.c" -o "$BUILD_DIR/user_tone.o"
+ld -nostdlib -T "$USER_DIR/user_link.ld" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
+   -o "$BUILD_DIR/user_tone.elf"
+
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USER_DIR/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
@@ -122,6 +126,8 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
         -fno-stack-protector -fno-builtin
         -fno-asynchronous-unwind-tables -fno-unwind-tables
         -O1 -g
+        -DFEATURE_SOUND
+        -DMAKAOS_NO_SDL_MIXER
         # Include search order: our shim headers first, then doomgeneric internals.
         -nostdinc
         -I"$DOOM_DIR/include"
@@ -145,16 +151,13 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
 
     # Compile doomgeneric core sources (everything in doomgeneric/ except the
     # platform-specific file doomgeneric_*.c which we replace with our own).
+    # i_sound.c is the sound dispatch layer — compile it with FEATURE_SOUND.
+    # SDL/Allegro/CD audio backends are replaced by i_sound_makaos.c.
     for src in "$DOOMGENERIC_DIR/doomgeneric/"*.c; do
         base=$(basename "$src")
-        # Skip all platform-specific and audio/sound files:
-        # - doomgeneric_*.c: platform backends (SDL, xlib, allegro, etc.)
-        # - i_sound.c, i_sdlmusic.c, i_sdlsound.c: SDL audio (no audio on MakaOS)
-        # - i_allegromusic.c, i_allegrosound.c: Allegro audio
-        # - i_cdmus.c: CD audio
         case "$base" in
             doomgeneric_*.c) continue ;;
-            i_sound.c|i_sdlmusic.c|i_sdlsound.c) continue ;;
+            i_sdlmusic.c|i_sdlsound.c) continue ;;
             i_allegromusic.c|i_allegrosound.c|i_cdmus.c) continue ;;
         esac
         obj="$BUILD_DIR/doom_${base%.c}.o"
@@ -162,11 +165,11 @@ if [ -d "$DOOMGENERIC_DIR" ]; then
         DOOM_OBJS+=("$obj")
     done
 
-    # Compile our platform glue and audio stubs.
+    # Compile our platform glue and AC97 software mixer.
     "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/doomgeneric_makaos.c" -o "$BUILD_DIR/doom_makaos.o"
     DOOM_OBJS+=("$BUILD_DIR/doom_makaos.o")
-    "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/i_sound_stub.c" -o "$BUILD_DIR/doom_i_sound_stub.o"
-    DOOM_OBJS+=("$BUILD_DIR/doom_i_sound_stub.o")
+    "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/i_sound_makaos.c" -o "$BUILD_DIR/doom_i_sound_makaos.o"
+    DOOM_OBJS+=("$BUILD_DIR/doom_i_sound_makaos.o")
 
     # Link doom ELF.
     ld -nostdlib -T "$USER_DIR/user_link.ld" \
@@ -303,6 +306,9 @@ fi
 if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_posix1.elf bin/test_posix1" > /dev/null 2>&1 || true
 fi
+if [ -f "$BUILD_DIR/user_tone.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_tone.elf bin/tone" > /dev/null 2>&1 || true
+fi
 if [ -f "$BUILD_DIR/user_doom.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_doom.elf bin/doom" > /dev/null 2>&1 || true
     echo "[+] doom ELF installed at bin/doom"
@@ -363,6 +369,9 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display sdl \
+  -audiodev pipewire,id=snd0 \
+  -device intel-hda \
+  -device hda-duplex,audiodev=snd0 \
   -serial file:build/serial.txt \
   -monitor none \
   -gdb tcp::1234 \

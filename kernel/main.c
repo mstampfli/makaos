@@ -6,6 +6,8 @@
 #include "tss.h"
 #include "syscall.h"
 #include "keyboard.h"
+#include "mouse.h"
+#include "hda.h"
 #include "process.h"
 #include "pic.h"
 #include "timer.h"
@@ -80,6 +82,8 @@ void kmain(void) {
 
     sched_init();
     keyboard_init();
+    mouse_init();
+    hda_init();
     sched_add(p_shell);
     timer_init(100);
 

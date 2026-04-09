@@ -20,6 +20,18 @@
 #include "include/stdbool.h"
 #include "doomgeneric/doomgeneric/doomgeneric.h"
 #include "doomgeneric/doomgeneric/doomkeys.h"
+#include "doomgeneric/doomgeneric/d_event.h"
+
+// mouse_event_t mirrors the kernel struct exactly (packed, 5 bytes).
+typedef struct {
+    int16_t  dx;
+    int16_t  dy;
+    uint8_t  buttons;
+} __attribute__((packed)) mouse_event_t;
+
+#define MOUSE_BTN_LEFT   (1 << 0)
+#define MOUSE_BTN_RIGHT  (1 << 1)
+#define MOUSE_BTN_MIDDLE (1 << 2)
 
 // ── fb_blit syscall ───────────────────────────────────────────────────────
 // SYS_FB_BLIT = 33; arg1 = pointer to 320×200 RGBA buffer.
@@ -34,6 +46,7 @@ static inline void fb_blit(const void* buf) {
 // We translate PS/2 set-1 scancodes to doomgeneric key codes.
 
 static int s_kbdraw_fd = -1;
+static int s_mouse_fd  = -1;
 
 // Ring buffer for pending key events.
 #define KEY_BUF 256
@@ -60,14 +73,14 @@ static unsigned char scancode_to_doom(unsigned char sc) {
         case 0x4B: return KEY_LEFTARROW;
         case 0x4D: return KEY_RIGHTARROW;
         // Ctrl / Shift / Alt
-        case 0x1D: return KEY_RCTRL;   // Left Ctrl (same as Right Ctrl for Doom)
+        case 0x1D: return KEY_FIRE;    // Left Ctrl = fire
         case 0x2A: return KEY_RSHIFT;  // Left Shift
         case 0x36: return KEY_RSHIFT;  // Right Shift
         case 0x38: return KEY_LALT;    // Left Alt
         // Escape / Enter / Space / Tab
         case 0x01: return KEY_ESCAPE;
         case 0x1C: return KEY_ENTER;
-        case 0x39: return ' ';
+        case 0x39: return KEY_USE;
         case 0x0F: return KEY_TAB;
         // Backspace
         case 0x0E: return KEY_BACKSPACE;
@@ -130,23 +143,53 @@ static void poll_keyboard(void) {
     }
 }
 
+// ── Mouse input ───────────────────────────────────────────────────────────
+// Drains /dev/mouse and posts ev_mouse events directly to the Doom event
+// queue via D_PostEvent.  Doom accumulates mouse motion into its own tic
+// buffer, so we post one event per kernel packet rather than batching.
+//
+// Doom ev_mouse layout:
+//   data1: button bitmask (bit0=left, bit1=right, bit2=middle)
+//   data2: dx (turn left/right)
+//   data3: dy (move forward/backward — we ignore; mouse is turn-only by default)
+
+static void poll_mouse(void) {
+    if (s_mouse_fd < 0) return;
+
+    mouse_event_t evts[16];
+    ssize_t n_bytes = read_nonblock(s_mouse_fd, evts, sizeof(evts));
+    if (n_bytes <= 0) return;
+
+    int n = (int)(n_bytes / (int)sizeof(mouse_event_t));
+    for (int i = 0; i < n; i++) {
+        event_t dev;
+        dev.type  = ev_mouse;
+        dev.data1 = 0;
+        if (evts[i].buttons & MOUSE_BTN_LEFT)   dev.data1 |= 1;
+        if (evts[i].buttons & MOUSE_BTN_RIGHT)  dev.data1 |= 2;
+        if (evts[i].buttons & MOUSE_BTN_MIDDLE) dev.data1 |= 4;
+        dev.data2 = evts[i].dx;   // horizontal = turn
+        dev.data3 = evts[i].dy;   // vertical   = forward/back
+        dev.data4 = 0;
+        D_PostEvent(&dev);
+    }
+}
+
 // ── Tick counter ──────────────────────────────────────────────────────────
 static unsigned long long s_start_ns = 0;
 
 // ── DG_Init ───────────────────────────────────────────────────────────────
 void DG_Init(void) {
-    s_start_ns = clock_ns();
-    // Open raw keyboard device.
+    s_start_ns  = clock_ns();
     s_kbdraw_fd = open("/dev/kbdraw", O_RDONLY, 0);
-    // If open fails (e.g. device not present), keyboard just won't work.
+    s_mouse_fd  = open("/dev/mouse",  O_RDONLY, 0);
 }
 
 // ── DG_DrawFrame ──────────────────────────────────────────────────────────
 void DG_DrawFrame(void) {
-    // DG_ScreenBuffer is the 320×200 RGBA32 pixel array provided by doomgeneric.
     fb_blit(DG_ScreenBuffer);
-    // Also flush any pending key events so Doom gets timely input.
     poll_keyboard();
+    poll_mouse();
 }
 
 // ── DG_SleepMs ────────────────────────────────────────────────────────────
@@ -166,6 +209,7 @@ uint32_t DG_GetTicksMs(void) {
 // ── DG_GetKey ─────────────────────────────────────────────────────────────
 int DG_GetKey(int* pressed, unsigned char* doomkey) {
     poll_keyboard();
+    poll_mouse();
     if (s_kev_r == s_kev_w) return 0;
     *pressed = s_kevents[s_kev_r].pressed;
     *doomkey = s_kevents[s_kev_r].doomkey;

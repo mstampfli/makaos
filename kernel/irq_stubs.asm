@@ -24,8 +24,11 @@ default rel
 
 extern timer_irq_handler
 extern keyboard_irq_handler
+extern mouse_irq_handler
 extern ahci_irq_handler
+extern hda_irq_handler
 extern g_ahci_irq      ; uint8_t — IRQ line (0-15), set by ahci_init
+extern g_hda_irq       ; uint8_t — IRQ line (0-15), set by hda_init
 
 %macro PUSH_GPRS 0
     push r15
@@ -94,6 +97,22 @@ irq1_entry:
     POP_GPRS
     iretq
 
+; ── IRQ12: PS/2 mouse (vector 0x2C) ─────────────────────────────────────
+; IRQ12 is on the slave PIC (line 4 of slave = IRQ8+4=12).
+; Must send EOI to both slave (0xA0) and master (0x20).
+global irq12_entry
+irq12_entry:
+    PUSH_GPRS
+
+    mov al, 0x20
+    out 0xA0, al    ; slave EOI
+    out 0x20, al    ; master EOI (cascade)
+
+    call mouse_irq_handler
+
+    POP_GPRS
+    iretq
+
 ; ── AHCI: generic stub, IRQ line read from g_ahci_irq ────────────────────
 ; Slave IRQs (8-15): EOI to slave PIC (0xA0) then master (0x20).
 ; Master IRQs (0-7): EOI to master only.
@@ -110,6 +129,24 @@ ahci_irq_entry:
     out 0x20, al    ; master EOI
 
     call ahci_irq_handler
+
+    POP_GPRS
+    iretq
+
+; ── HDA audio: IRQ line from g_hda_irq (PCI-routed, master or slave) ────
+global hda_irq_entry
+hda_irq_entry:
+    PUSH_GPRS
+
+    mov al, 0x20
+    movzx ecx, byte [rel g_hda_irq]
+    cmp cl, 8
+    jl .master_only
+    out 0xA0, al    ; slave EOI
+.master_only:
+    out 0x20, al    ; master EOI
+
+    call hda_irq_handler
 
     POP_GPRS
     iretq
