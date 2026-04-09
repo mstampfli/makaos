@@ -61,6 +61,23 @@ void signal_send_group(uint32_t tgid, int sig) {
     sched_for_each(sig_group_cb, &a);
 }
 
+// ── signal_send_pgrp ─────────────────────────────────────────────────────
+// Send signal to every task in the given process group.
+typedef struct { uint32_t pgid; int sig; } sig_pgrp_arg_t;
+
+static void sig_pgrp_cb(task_t* t, void* data) {
+    sig_pgrp_arg_t* a = (sig_pgrp_arg_t*)data;
+    if (t->pgid == a->pgid && t->state != TASK_DEAD)
+        signal_send(t, a->sig);
+}
+
+void signal_send_pgrp(uint32_t pgid, int sig) {
+    if (g_current && g_current->pgid == pgid)
+        signal_send(g_current, sig);
+    sig_pgrp_arg_t a = {pgid, sig};
+    sched_for_each(sig_pgrp_cb, &a);
+}
+
 // ── signal_setup_frame ────────────────────────────────────────────────────
 // Build a sigframe_t on the user's stack and redirect the syscall return to
 // the handler.  Only call this when g_signal_in_syscall == 1.

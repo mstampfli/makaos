@@ -1,154 +1,10 @@
 // MakaOS userland shell
-// Input: reads raw PS/2 scancodes from /dev/kbdraw, does its own line editing.
-// Output: writes to fd 1 (kernel fb terminal).
-// No ANSI colors — kernel terminal does not interpret escape sequences.
+// Input: reads from stdin (fd 0) which is /dev/tty0 — the N_TTY TTY.
+// In canonical mode the TTY handles echo, backspace, ^C, ^Z, line buffering.
+// The editor switches to raw mode via tcsetattr to read individual keystrokes.
 
 #include "libc.h"
 #include "stdio.h"
-
-// ── Keyboard: Swiss German (CH-DE) PS/2 set-1 scancode translation ───────
-//
-// Physical CH-DE layout (QWERTZ, standard ISO PC):
-//
-//  [§°] [1+] [2"] [3*] [4ç] [5%] [6&] [7/|] [8()] [9)] [0=] ['?~] [^`  ] [BS]
-//  [Tab][q  ][w  ][e  ][r  ][t  ][z  ][u  ][i  ][o  ][p  ][ü  ][¨! ]
-//  [Cap][a  ][s  ][d  ][f  ][g  ][h  ][j  ][k  ][l  ][ö  ][ä  ][$ £]  [Enter]
-//  [Sh ][< >][y  ][x  ][c  ][v  ][b  ][n  ][m  ][,; ][.: ][--_]       [Sh ]
-//
-// Unshift / Shift / AltGr per scancode.
-// Non-ASCII chars (ü,ö,ä,ç,§,°,¨) → skipped (0), terminal has no glyph.
-// Dead keys (^ ` ¨) → deliver the base char directly (no composition).
-
-static int g_kbd_fd = -1;
-static int g_shift  = 0;
-static int g_ctrl   = 0;
-static int g_altgr  = 0;
-
-typedef struct { char u; char s; char a; } sc_map_t;  // unshift/shift/altgr
-
-// Table indexed by base scancode (0x00–0x58).
-static const sc_map_t g_sc_map[0x59] = {
-    [0x01] = { 0,    0,    0   },  // ESC — handled separately
-    // Number row
-    [0x02] = { '1',  '+',  0   },
-    [0x03] = { '2',  '"',  '@' },
-    [0x04] = { '3',  '*',  '#' },
-    [0x05] = { '4',  0,    0   },  // 4 / ç (non-ASCII, skip)
-    [0x06] = { '5',  '%',  0   },
-    [0x07] = { '6',  '&',  0   },
-    [0x08] = { '7',  '/',  '|' },
-    [0x09] = { '8',  '(',  0   },
-    [0x0A] = { '9',  ')',  0   },
-    [0x0B] = { '0',  '=',  0   },
-    [0x0C] = { '\'', '?',  '~' },  // ' / ? / ~ (right of 0)
-    [0x0D] = { '^',  '`',  0   },  // ^ / `  (dead key — deliver as-is)
-    [0x0E] = { '\b', '\b', 0   },  // Backspace
-    [0x0F] = { '\t', '\t', 0   },  // Tab
-    // QWERTZ row
-    [0x10] = { 'q',  'Q',  0   },
-    [0x11] = { 'w',  'W',  0   },
-    [0x12] = { 'e',  'E',  0   },
-    [0x13] = { 'r',  'R',  0   },
-    [0x14] = { 't',  'T',  0   },
-    [0x15] = { 'z',  'Z',  0   },  // z (Swiss: z here, y on bottom row)
-    [0x16] = { 'u',  'U',  0   },
-    [0x17] = { 'i',  'I',  0   },
-    [0x18] = { 'o',  'O',  0   },
-    [0x19] = { 'p',  'P',  0   },
-    [0x1A] = { 0,    0,    '[' },  // ü / Ü / [ (AltGr)
-    [0x1B] = { '!',  0,    ']' },  // ¨! / ] (key right of ü; shift gives ¨ non-ASCII)
-    [0x1C] = { '\n', '\n', 0   },  // Enter
-    // Home row
-    [0x1E] = { 'a',  'A',  0   },
-    [0x1F] = { 's',  'S',  0   },
-    [0x20] = { 'd',  'D',  0   },
-    [0x21] = { 'f',  'F',  0   },
-    [0x22] = { 'g',  'G',  0   },
-    [0x23] = { 'h',  'H',  0   },
-    [0x24] = { 'j',  'J',  0   },
-    [0x25] = { 'k',  'K',  0   },
-    [0x26] = { 'l',  'L',  0   },
-    [0x27] = { 0,    0,    0   },  // ö / Ö
-    [0x28] = { 0,    0,    0   },  // ä / Ä
-    [0x29] = { 0,    0,    0   },  // § / ° (top-left, left of 1)
-    [0x2B] = { '$',  0,    0   },  // $ / £ (right of ä, left of Enter)
-    // Bottom row
-    [0x56] = { '<',  '>',  '\\'},  // < / > / \ (ISO extra key, left of y)
-    [0x2C] = { 'y',  'Y',  0   },  // y (Swiss: y here, z on QWERTZ row)
-    [0x2D] = { 'x',  'X',  0   },
-    [0x2E] = { 'c',  'C',  0   },
-    [0x2F] = { 'v',  'V',  0   },
-    [0x30] = { 'b',  'B',  0   },
-    [0x31] = { 'n',  'N',  0   },
-    [0x32] = { 'm',  'M',  0   },
-    [0x33] = { ',',  ';',  0   },
-    [0x34] = { '.',  ':',  0   },
-    [0x35] = { '-',  '_',  0   },
-    // Space
-    [0x39] = { ' ',  ' ',  0   },
-};
-
-static char sc_translate(uint8_t sc) {
-    if (sc >= 0x59) return 0;
-    const sc_map_t* m = &g_sc_map[sc];
-    char c;
-    if      (g_altgr && m->a) c = m->a;
-    else if (g_shift  && m->s) c = m->s;
-    else                       c = m->u;
-    if ((unsigned char)c > 127) return 0;  // drop non-ASCII
-    return c;
-}
-
-static char kbd_getchar(void) {
-    for (;;) {
-        uint8_t sc;
-        if (read(g_kbd_fd, &sc, 1) <= 0) continue;
-
-        if (sc == 0xE0) {
-            uint8_t ext;
-            if (read(g_kbd_fd, &ext, 1) <= 0) continue;
-            if (ext == 0x38) { g_altgr = 1; continue; }  // AltGr press
-            if (ext == 0xB8) { g_altgr = 0; continue; }  // AltGr release
-            continue;  // other extended keys (arrows, etc.) — ignore
-        }
-
-        int release = (sc & 0x80) != 0;
-        uint8_t base = sc & 0x7F;
-
-        if (base == 0x2A || base == 0x36) { g_shift = !release; continue; }
-        if (base == 0x1D)                 { g_ctrl  = !release; continue; }
-        if (release) continue;
-
-        if (base == 0x01) return 27;  // ESC
-
-        char c = sc_translate(base);
-        if (c) return c;
-    }
-}
-
-// Read a full line from keyboard into buf (max-1 chars + NUL).
-// Echoes chars and handles backspace. Returns length (without NUL).
-static int read_line(char* buf, int max) {
-    int len = 0;
-    for (;;) {
-        char c = kbd_getchar();
-        if (c == '\n' || c == '\r') {
-            buf[len] = '\0';
-            write(1, "\n", 1);
-            return len;
-        }
-        if (c == '\b') {
-            if (len > 0) {
-                len--;
-                write(1, "\b \b", 3);  // erase on terminal
-            }
-            continue;
-        }
-        if ((unsigned char)c < 0x20 || len >= max - 1) continue;
-        buf[len++] = c;
-        write(1, &c, 1);  // echo
-    }
-}
 
 // ── Output helpers ────────────────────────────────────────────────────────
 
@@ -170,11 +26,21 @@ static void putu32(uint32_t v) {
     puts_fd(&buf[i]);
 }
 
+// ── read_line: canonical line from stdin ─────────────────────────────────
+// The TTY is in ICANON mode: it echoes chars, handles backspace, and returns
+// a full line (including the trailing '\n') on Enter.  Strip the '\n' here.
+
+static int read_line(char* buf, int max) {
+    ssize_t n = read(0, buf, max - 1);
+    if (n <= 0) return 0;
+    if (buf[n - 1] == '\n') n--;
+    buf[n] = '\0';
+    return (int)n;
+}
+
 // ── Path resolution ───────────────────────────────────────────────────────
-// Resolve arg relative to cwd, normalize . and .. components.
 
 static void resolve_path(const char* cwd, const char* arg, char* out, uint32_t outsz) {
-    // Build raw absolute path.
     char raw[512];
     if (!arg || arg[0] == '\0') {
         strncpy(raw, cwd, sizeof(raw) - 1);
@@ -189,7 +55,6 @@ static void resolve_path(const char* cwd, const char* arg, char* out, uint32_t o
                  arg);
     }
 
-    // Normalize: process . and .. components.
     const char* segs[64];
     int nseg = 0;
     char tmp[512];
@@ -207,14 +72,13 @@ static void resolve_path(const char* cwd, const char* arg, char* out, uint32_t o
             // skip
         } else if (start[0] == '.' && start[1] == '.' && start[2] == '\0') {
             if (nseg > 0) nseg--;
-        } else {
-            if (nseg < 64) segs[nseg++] = start;
+        } else if (nseg < 64) {
+            segs[nseg++] = start;
         }
     }
 
-    // Reconstruct.
-    out[0] = '/';
-    uint32_t pos = 1;
+    uint32_t pos = 0;
+    out[pos++] = '/';
     for (int i = 0; i < nseg && pos + 1 < outsz; i++) {
         if (i > 0 && pos + 1 < outsz) out[pos++] = '/';
         for (uint32_t j = 0; segs[i][j] && pos + 1 < outsz; j++)
@@ -259,8 +123,6 @@ static void cmd_help(void) {
 }
 
 static void cmd_clear(void) {
-    // Kernel fb_clear is not directly callable; write form-feed as hint.
-    // fb_term_putc handles '\f' as clear on our kernel terminal.
     putc_fd('\f');
 }
 
@@ -390,7 +252,7 @@ static void cmd_about(void) {
     puts_fd("  Boot     : UEFI + GOP framebuffer\n");
     puts_fd("  Features : PMM (buddy), VMM (demand paging), kheap,\n");
     puts_fd("             MLFQ scheduler, ext2, ring-3 ELF loader,\n");
-    puts_fd("             IOAPIC/MSI interrupts, HDA audio, virtio-net\n");
+    puts_fd("             N_TTY line discipline, IOAPIC/MSI, HDA, virtio-net\n");
 }
 
 static void cmd_reboot(void) {
@@ -400,8 +262,9 @@ static void cmd_reboot(void) {
 }
 
 // ── Editor ────────────────────────────────────────────────────────────────
-// Ctrl+S (0x13) = save, ESC (0x1B) = quit without saving.
-// Uses a heap-allocated buffer that doubles on overflow.
+// Switches stdin to raw mode (no echo, no line buffering) so individual
+// keystrokes are readable.  Ctrl+S (0x13) saves; ESC (0x1B) quits.
+// Restores canonical mode on exit.
 
 static void cmd_edit(const char* cwd, int argc, char* argv[]) {
     if (argc < 2) { puts_fd("Usage: edit <file>\n"); return; }
@@ -437,31 +300,27 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
     puts_fd("-- EDITOR: "); puts_fd(path); puts_fd(" | Ctrl+S=save  ESC=quit --\n");
     if (len > 0) write(1, buf, len);
 
-    // Use kbd_getchar() which handles all modifier state.
-    // Ctrl+S delivers 's' with g_ctrl==1; ESC delivers 27.
+    // Switch to raw mode: no ICANON, no ECHO, VMIN=1, VTIME=0.
+    termios_t saved, raw;
+    tcgetattr(0, &saved);
+    raw = saved;
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+    raw.c_cc[VMIN]  = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSETSF, &raw);
+
     for (;;) {
-        // Peek at g_ctrl before kbd_getchar consumes the key.
-        // We need raw access, so read one scancode at a time and check.
-        uint8_t sc;
-        if (read(g_kbd_fd, &sc, 1) <= 0) continue;
+        char c;
+        if (read(0, &c, 1) <= 0) continue;
 
-        if (sc == 0xE0) {
-            uint8_t esc; if (read(g_kbd_fd, &esc, 1) <= 0) continue;
-            if (esc == 0x38) { g_altgr = 1; continue; }
-            if (esc == 0xB8) { g_altgr = 0; continue; }
-            continue;
+        // ESC — quit without saving.
+        if ((unsigned char)c == 0x1B) {
+            puts_fd("\n[Quit without saving]\n");
+            break;
         }
-        int release = (sc & 0x80) != 0;
-        uint8_t base = sc & 0x7F;
-        if (base == 0x2A || base == 0x36) { g_shift = !release; continue; }
-        if (base == 0x1D) { g_ctrl  = !release; continue; }
-        if (release) continue;
 
-        // ESC — quit.
-        if (base == 0x01) { puts_fd("\n[Quit without saving]\n"); break; }
-
-        // Ctrl+S (s = scancode 0x1F in CH layout same as US).
-        if (g_ctrl && base == 0x1F) {
+        // Ctrl+S (0x13) — save.
+        if ((unsigned char)c == 0x13) {
             int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0);
             int ok = 0;
             if (wfd >= 0) {
@@ -473,40 +332,38 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
             continue;
         }
 
-        char c = sc_translate(base);
-        if (!c) continue;
-
-        if (c == '\b') {
+        // Backspace (0x08 or 0x7F).
+        if (c == '\b' || (unsigned char)c == 0x7F) {
             if (len > 0) { len--; write(1, "\b \b", 3); }
             continue;
         }
 
-        char to_append = 0;
-        if (c == '\n') to_append = '\n';
-        else if ((unsigned char)c >= 0x20) to_append = c;
-        if (!to_append) continue;
-
-        if (len + 1 >= buf_size) {
-            uint32_t new_size = buf_size * 2;
-            char* grown = realloc(buf, new_size);
-            if (!grown) { puts_fd("\n[OOM — save now!]\n"); continue; }
-            buf = grown;
-            buf_size = new_size;
+        // Regular printable or newline.
+        if ((unsigned char)c >= 0x20 || c == '\n' || c == '\r') {
+            char to_append = (c == '\r') ? '\n' : c;
+            if (len + 1 >= buf_size) {
+                uint32_t new_size = buf_size * 2;
+                char* grown = realloc(buf, new_size);
+                if (!grown) { puts_fd("\n[OOM -- save now!]\n"); continue; }
+                buf = grown;
+                buf_size = new_size;
+            }
+            buf[len++] = to_append;
+            write(1, &to_append, 1);
         }
-        buf[len++] = to_append;
-        write(1, &to_append, 1);
     }
+
+    // Restore canonical mode.
+    tcsetattr(0, TCSETSF, &saved);
     free(buf);
 }
 
 // ── Run a binary ──────────────────────────────────────────────────────────
 
 static void cmd_run(const char* cwd, int argc, char* argv[]) {
-    // argv[0] is the command — resolve to absolute path.
     char path[256];
     const char* cmd = argv[0];
 
-    // If bare name (no '/'), try /bin/<cmd> first.
     if (cmd[0] != '/') {
         snprintf(path, sizeof(path), "/bin/%s", cmd);
         stat_t st;
@@ -521,23 +378,9 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
         resolve_path(cwd, cmd, path, sizeof(path));
     }
 
-    // Build child argv: argv[0] = path, rest from command line.
-    const char* child_argv[64];
-    child_argv[0] = path;
-    int ca = 1;
-    for (int i = 1; i < argc && ca < 63; i++) child_argv[ca++] = argv[i];
-    child_argv[ca] = NULL;
+    (void)argc;
 
-    const char* child_envp[] = {
-        "PATH=/bin",
-        "HOME=/",
-        "TERM=linux",
-        NULL
-    };
-
-    // Use spawn (= elf_load_from_ext2 fresh task) rather than fork+exec.
-    // fork copies the shell's entire address space which causes corruption
-    // with some binaries (doom). Spawn creates a clean task from scratch.
+    // spawn: create a fresh task from the ELF, wait for it.
     int pid = spawn(path, strlen(path));
     if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
@@ -548,17 +391,18 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
 // ── Main loop ─────────────────────────────────────────────────────────────
 
 int main(void) {
-    g_kbd_fd = open("/dev/kbdraw", O_RDONLY, 0);
-    if (g_kbd_fd < 0) {
-        puts_fd("shell: failed to open /dev/kbdraw\n");
-        exit(1);
-    }
+    // stdin/stdout/stderr are already /dev/tty0 (set up by the ELF loader).
+    // tty0 starts in canonical+echo mode: the TTY handles line editing.
+
+    // Set ourselves as the controlling terminal's foreground process group.
+    uint32_t my_pgid = (uint32_t)getpgrp();
+    ioctl(0, TIOCSPGRP, &my_pgid);
 
     char cwd[256] = "/";
     getcwd(cwd, sizeof(cwd));
 
     cmd_clear();
-    puts_fd("MakaOS Shell v0.2 -- type 'help' for commands\n\n");
+    puts_fd("MakaOS Shell v0.3 -- type 'help' for commands\n\n");
 
     char line[256];
     char* argv[16];
@@ -569,7 +413,7 @@ int main(void) {
         puts_fd("> ");
 
         int n = read_line(line, sizeof(line));
-        if (n == 0) continue;
+        if (n <= 0) continue;
 
         int argc = parse_args(line, argv, 16);
         if (argc == 0) continue;
@@ -587,9 +431,6 @@ int main(void) {
         else if (strcmp(argv[0], "edit")  == 0) cmd_edit(cwd, argc, argv);
         else if (strcmp(argv[0], "about") == 0) cmd_about();
         else if (strcmp(argv[0], "reboot")== 0) cmd_reboot();
-        else {
-            // Try to run as a binary.
-            cmd_run(cwd, argc, argv);
-        }
+        else cmd_run(cwd, argc, argv);
     }
 }

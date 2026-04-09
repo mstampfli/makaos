@@ -8,6 +8,7 @@
 #include "process.h"
 #include "tss.h"
 #include "common.h"
+#include "tty.h"
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
@@ -383,10 +384,10 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    // stdin/stdout/stderr default to keyboard and VGA console.
-    files->fd_table[0] = vfs_kbd_open();
-    files->fd_table[1] = vfs_vga_open();
-    files->fd_table[2] = vfs_vga_open();
+    // stdin/stdout/stderr all wire to tty0 (canonical read + echo write).
+    files->fd_table[0] = tty_open(0);
+    files->fd_table[1] = tty_open(0);
+    files->fd_table[2] = tty_open(0);
     // fd_flags default to 0 (no FD_CLOEXEC on stdio).
 
     t->pid              = pid;

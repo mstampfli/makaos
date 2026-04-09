@@ -1,0 +1,94 @@
+#pragma once
+#include "common.h"
+#include "syscall.h"   // termios_t, winsize_t, ICANON, ECHO, ISIG, …
+
+// ── TTY subsystem ────────────────────────────────────────────────────────
+//
+// Architecture:
+//   keyboard IRQ → tty_input_char(tty, c)
+//                       ↓
+//                  N_TTY line discipline
+//                  ├── canonical: accumulate in line_buf, deliver on \n/EOF
+//                  │   handle BS (erase), ^U (kill), ^C/^Z (signal), ^D (EOF)
+//                  └── raw: push every char directly to read_buf
+//                       ↓
+//                  read_buf ring buffer
+//                       ↓
+//                  vfs_file_t read() → blocks via sched_sleep until data ready
+//
+// One tty_t per physical terminal (tty0 = framebuffer+PS/2 keyboard).
+// Future: serial ttys, ptys — all use the same struct and ops.
+
+// ── Buffer sizes ──────────────────────────────────────────────────────────
+#define TTY_READ_BUF_SIZE  4096   // power of 2; cooked output to readers
+#define TTY_LINE_BUF_SIZE  4096   // canonical line accumulation buffer
+
+// ── tty_t ─────────────────────────────────────────────────────────────────
+typedef struct tty_t {
+    // ── Termios (line discipline config) ─────────────────────────────────
+    termios_t termios;
+    winsize_t winsize;
+
+    // ── Foreground process group (job control) ───────────────────────────
+    uint32_t fg_pgid;
+
+    // ── Session this tty is the controlling terminal of ──────────────────
+    uint32_t session;
+
+    // ── Read buffer: data ready for userland read() ───────────────────────
+    // Ring buffer: [rd_head, rd_tail)
+    uint8_t  read_buf[TTY_READ_BUF_SIZE];
+    uint32_t rd_head;
+    uint32_t rd_tail;
+
+    // ── Canonical line buffer: accumulates until \n or EOF ────────────────
+    uint8_t  line_buf[TTY_LINE_BUF_SIZE];
+    uint32_t line_len;
+
+    // ── Sleeping reader ───────────────────────────────────────────────────
+    // Single-waiter model: one task blocked in read() at a time.
+    // Good enough for a single-CPU OS; replace with wait_queue for SMP.
+    struct task_t* reader;
+
+    // ── Output ops (tty→screen) ───────────────────────────────────────────
+    // Called by the line discipline to echo input or for tty write().
+    void (*write_char)(struct tty_t* tty, uint8_t c);
+
+    // ── TTY name (e.g. "tty0") ────────────────────────────────────────────
+    char name[16];
+} tty_t;
+
+// ── Global tty table ─────────────────────────────────────────────────────
+// tty0 = console (framebuffer + PS/2 keyboard). Index 0.
+#define TTY_COUNT 1
+extern tty_t g_ttys[TTY_COUNT];
+
+// ── API ───────────────────────────────────────────────────────────────────
+
+// Called once at boot (after fb_init and keyboard_init).
+void tty_init(void);
+
+// Called from keyboard IRQ handler with a single translated character.
+// Runs the N_TTY line discipline: echoes, buffers, signals, wakes readers.
+// c=0 is ignored.
+void tty_input_char(tty_t* tty, char c);
+
+// Called from keyboard IRQ with a raw scancode byte (before translation).
+// Used to detect Ctrl+C, Ctrl+Z at the IRQ level regardless of mode.
+// The keyboard driver calls tty_input_char with the translated char;
+// signal detection is done inside tty_input_char from c_cc.
+// (This function exists for extensibility — e.g. future raw-mode apps.)
+
+// Open /dev/tty or /dev/ttyN → returns a vfs_file_t backed by the tty.
+// Each open() returns a fresh vfs_file_t pointing to the same tty_t.
+struct vfs_file_t* tty_open(int idx);  // idx 0 = tty0
+
+// Get the tty that is the controlling terminal of the calling process.
+// Returns NULL if the process has no controlling terminal.
+tty_t* tty_get_ctty(void);
+
+// Assign tty as the controlling terminal of the current session.
+void tty_set_ctty(tty_t* tty);
+
+// Flush the read buffer and line buffer (e.g. on TCSETSF).
+void tty_flush_input(tty_t* tty);

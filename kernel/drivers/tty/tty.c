@@ -1,0 +1,332 @@
+// ── TTY subsystem — N_TTY line discipline + VFS glue ─────────────────────
+//
+// One tty_t (tty0) backed by the PS/2 keyboard and framebuffer.
+// Future ttys (serial, pty) slot in identically.
+
+#include "tty.h"
+#include "vfs.h"
+#include "kheap.h"
+#include "sched.h"
+#include "process.h"
+#include "signal.h"
+#include "fb.h"
+
+// ── Global tty table ─────────────────────────────────────────────────────
+tty_t g_ttys[TTY_COUNT];
+
+// ── Ring-buffer helpers ───────────────────────────────────────────────────
+
+static inline uint32_t rb_next(uint32_t i, uint32_t size) {
+    return (i + 1) & (size - 1);
+}
+
+static inline int rb_empty(uint32_t head, uint32_t tail) {
+    return head == tail;
+}
+
+static inline int rb_full(uint32_t head, uint32_t tail, uint32_t size) {
+    return rb_next(tail, size) == head;
+}
+
+static void rd_push(tty_t* tty, uint8_t c) {
+    if (rb_full(tty->rd_head, tty->rd_tail, TTY_READ_BUF_SIZE)) return; // drop
+    tty->read_buf[tty->rd_tail] = c;
+    tty->rd_tail = rb_next(tty->rd_tail, TTY_READ_BUF_SIZE);
+}
+
+static int rd_pop(tty_t* tty, uint8_t* out) {
+    if (rb_empty(tty->rd_head, tty->rd_tail)) return 0;
+    *out = tty->read_buf[tty->rd_head];
+    tty->rd_head = rb_next(tty->rd_head, TTY_READ_BUF_SIZE);
+    return 1;
+}
+
+// ── Echo a character to the terminal output ───────────────────────────────
+static void tty_echo(tty_t* tty, uint8_t c) {
+    if (tty->write_char) tty->write_char(tty, c);
+}
+
+// ── Erase one character from the canonical line buffer ───────────────────
+static void ldisc_erase_char(tty_t* tty) {
+    if (tty->line_len == 0) return;
+    tty->line_len--;
+    if (tty->termios.c_lflag & ECHO) {
+        tty_echo(tty, '\b');
+        tty_echo(tty, ' ');
+        tty_echo(tty, '\b');
+    }
+}
+
+// ── Flush canonical line buffer to read_buf, then wake reader ────────────
+static void ldisc_flush_line(tty_t* tty) {
+    for (uint32_t i = 0; i < tty->line_len; i++)
+        rd_push(tty, tty->line_buf[i]);
+    tty->line_len = 0;
+    // Wake blocked reader.
+    if (tty->reader) {
+        sched_wake(tty->reader);
+        tty->reader = NULL;
+    }
+}
+
+// ── N_TTY: process one input character ────────────────────────────────────
+void tty_input_char(tty_t* tty, char c) {
+    if (!c) return;
+
+    uint32_t lflag = tty->termios.c_lflag;
+    const uint8_t* cc = tty->termios.c_cc;
+
+    // ── Signal characters (ISIG) ─────────────────────────────────────────
+    if (lflag & ISIG) {
+        if ((uint8_t)c == cc[VINTR]) {   // ^C → SIGINT to fg pgrp
+            if (tty->fg_pgid) {
+                extern void signal_send_pgrp(uint32_t pgid, int sig);
+                signal_send_pgrp(tty->fg_pgid, SIGINT);
+            }
+            if (!(lflag & NOFLSH)) tty_flush_input(tty);
+            return;
+        }
+        if ((uint8_t)c == cc[VSUSP]) {   // ^Z → SIGTSTP to fg pgrp
+            if (tty->fg_pgid) {
+                extern void signal_send_pgrp(uint32_t pgid, int sig);
+                signal_send_pgrp(tty->fg_pgid, SIGTSTP);
+            }
+            if (!(lflag & NOFLSH)) tty_flush_input(tty);
+            return;
+        }
+        if ((uint8_t)c == cc[VQUIT]) {   // ^\ → SIGQUIT to fg pgrp
+            if (tty->fg_pgid) {
+                extern void signal_send_pgrp(uint32_t pgid, int sig);
+                signal_send_pgrp(tty->fg_pgid, SIGQUIT);
+            }
+            if (!(lflag & NOFLSH)) tty_flush_input(tty);
+            return;
+        }
+    }
+
+    // ── Canonical mode (ICANON) ──────────────────────────────────────────
+    if (lflag & ICANON) {
+        // Erase character (backspace / DEL).
+        if ((uint8_t)c == cc[VERASE] || c == '\b') {
+            ldisc_erase_char(tty);
+            return;
+        }
+        // Kill line (^U): erase entire current line.
+        if ((uint8_t)c == cc[VKILL]) {
+            while (tty->line_len > 0) ldisc_erase_char(tty);
+            if (lflag & ECHO) tty_echo(tty, '\n');
+            return;
+        }
+        // EOF (^D): flush line (even if empty — empty flush signals EOF).
+        if ((uint8_t)c == cc[VEOF]) {
+            ldisc_flush_line(tty);
+            return;
+        }
+        // Newline: accumulate then flush.
+        if (c == '\n' || (uint8_t)c == cc[VEOL] || (uint8_t)c == cc[VEOL2]) {
+            if (tty->line_len < TTY_LINE_BUF_SIZE - 1) {
+                if (lflag & ECHO) tty_echo(tty, '\n');
+                tty->line_buf[tty->line_len++] = '\n';
+            }
+            ldisc_flush_line(tty);
+            return;
+        }
+        // Carriage return → newline (ICRNL).
+        if (c == '\r' && (tty->termios.c_iflag & ICRNL)) {
+            tty_input_char(tty, '\n');
+            return;
+        }
+        // Regular character: accumulate.
+        if (tty->line_len < TTY_LINE_BUF_SIZE - 1) {
+            if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
+            tty->line_buf[tty->line_len++] = (uint8_t)c;
+        }
+        return;
+    }
+
+    // ── Raw mode ─────────────────────────────────────────────────────────
+    // CR→NL conversion even in raw mode if ICRNL is set.
+    if (c == '\r' && (tty->termios.c_iflag & ICRNL)) c = '\n';
+
+    if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
+    rd_push(tty, (uint8_t)c);
+    if (tty->reader) {
+        sched_wake(tty->reader);
+        tty->reader = NULL;
+    }
+}
+
+// ── Flush input buffers ───────────────────────────────────────────────────
+void tty_flush_input(tty_t* tty) {
+    tty->rd_head = tty->rd_tail = 0;
+    tty->line_len = 0;
+}
+
+// ── VFS operations for /dev/ttyN ─────────────────────────────────────────
+
+typedef struct {
+    tty_t* tty;
+} tty_ctx_t;
+
+static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
+    tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
+    tty_t* tty = ctx->tty;
+    if (!len) return 0;
+
+    uint8_t* out = (uint8_t*)buf;
+    uint64_t got = 0;
+
+    // In raw mode with VMIN/VTIME: we implement VMIN here.
+    uint32_t vmin = (tty->termios.c_lflag & ICANON) ? 1
+                  : tty->termios.c_cc[VMIN];
+    if (vmin == 0) vmin = 1; // always read at least 1
+
+    // Block until at least vmin bytes are available.
+    while (rb_empty(tty->rd_head, tty->rd_tail)) {
+        // Register as the sleeping reader and yield.
+        tty->reader = g_current;
+        sched_sleep();
+        // Woken by tty_input_char or signal delivery.
+        // If a signal was delivered, EINTR.
+        if (g_current->sigstate.head != g_current->sigstate.tail)
+            return -4; // -EINTR
+    }
+
+    // Drain up to len bytes.
+    while (got < len) {
+        uint8_t c;
+        if (!rd_pop(tty, &c)) break;
+        out[got++] = c;
+        // In canonical mode, stop at newline (one line per read).
+        if ((tty->termios.c_lflag & ICANON) && c == '\n') break;
+        // In raw mode, stop at VMIN.
+        if (!(tty->termios.c_lflag & ICANON) && got >= vmin) break;
+    }
+    return (int64_t)got;
+}
+
+static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
+    tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
+    tty_t* tty = ctx->tty;
+    const uint8_t* src = (const uint8_t*)buf;
+    for (uint64_t i = 0; i < len; i++) {
+        uint8_t c = src[i];
+        // OPOST + ONLCR: translate \n → \r\n on output.
+        if ((tty->termios.c_oflag & OPOST) && (tty->termios.c_oflag & ONLCR)
+            && c == '\n') {
+            tty->write_char(tty, '\r');
+        }
+        tty->write_char(tty, c);
+    }
+    return (int64_t)len;
+}
+
+static void tty_vfs_close(vfs_file_t* self) {
+    kfree(self->ctx);
+    kfree(self);
+}
+
+static int tty_vfs_poll(vfs_file_t* self, int events) {
+    tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
+    tty_t* tty = ctx->tty;
+    if (events & 1 /*POLLIN*/)
+        return !rb_empty(tty->rd_head, tty->rd_tail);
+    return 1;
+}
+
+// ── tty_open ─────────────────────────────────────────────────────────────
+vfs_file_t* tty_open(int idx) {
+    if (idx < 0 || idx >= TTY_COUNT) return NULL;
+    tty_t* tty = &g_ttys[idx];
+
+    tty_ctx_t* ctx = kmalloc(sizeof(tty_ctx_t));
+    if (!ctx) return NULL;
+    ctx->tty = tty;
+
+    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    if (!f) { kfree(ctx); return NULL; }
+
+    f->read     = tty_vfs_read;
+    f->write    = tty_vfs_write;
+    f->close    = tty_vfs_close;
+    f->seek     = NULL;   // ttys are not seekable
+    f->poll     = tty_vfs_poll;
+    f->ctx      = ctx;
+    f->flags    = 0;
+    f->refcount = 1;
+    f->path[0]  = '\0';
+
+    return f;
+}
+
+// ── tty_get_ctty / tty_set_ctty ──────────────────────────────────────────
+tty_t* tty_get_ctty(void) {
+    if (!g_current) return NULL;
+    for (int i = 0; i < TTY_COUNT; i++) {
+        if (g_ttys[i].session == g_current->sid)
+            return &g_ttys[i];
+    }
+    return NULL;
+}
+
+void tty_set_ctty(tty_t* tty) {
+    if (!g_current || !tty) return;
+    tty->session  = g_current->sid;
+    tty->fg_pgid  = g_current->pgid;
+}
+
+// ── Console write_char: write a byte to the framebuffer terminal ──────────
+static void console_write_char(tty_t* tty, uint8_t c) {
+    (void)tty;
+    extern void fb_term_putc(char c);
+    fb_term_putc((char)c);
+}
+
+// ── tty_init ─────────────────────────────────────────────────────────────
+void tty_init(void) {
+    tty_t* tty = &g_ttys[0];
+
+    // Default termios: canonical, echo, signals enabled.
+    tty->termios.c_iflag = ICRNL | IXON;
+    tty->termios.c_oflag = OPOST | ONLCR;
+    tty->termios.c_cflag = CS8 | CREAD | CLOCAL;
+    tty->termios.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK
+                         | ECHOCTL | ECHOKE | IEXTEN;
+    tty->termios.c_line  = 0;
+
+    uint8_t* cc = tty->termios.c_cc;
+    cc[VINTR]    = 3;    // ^C
+    cc[VQUIT]    = 28;   /* ^\ */
+    cc[VERASE]   = 127;  // DEL
+    cc[VKILL]    = 21;   // ^U
+    cc[VEOF]     = 4;    // ^D
+    cc[VTIME]    = 0;
+    cc[VMIN]     = 1;
+    cc[VSWTC]    = 0;
+    cc[VSTART]   = 17;   // ^Q
+    cc[VSTOP]    = 19;   // ^S
+    cc[VSUSP]    = 26;   // ^Z
+    cc[VEOL]     = 0;
+    cc[VREPRINT] = 18;   // ^R
+    cc[VDISCARD] = 15;   // ^O
+    cc[VWERASE]  = 23;   // ^W
+    cc[VLNEXT]   = 22;   // ^V
+    cc[VEOL2]    = 0;
+
+    tty->winsize.ws_row    = 50;   // matches our fb terminal rows
+    tty->winsize.ws_col    = 160;  // matches our fb terminal cols
+    tty->winsize.ws_xpixel = 0;
+    tty->winsize.ws_ypixel = 0;
+
+    tty->fg_pgid   = 1;
+    tty->session   = 1;
+    tty->rd_head   = 0;
+    tty->rd_tail   = 0;
+    tty->line_len  = 0;
+    tty->reader    = NULL;
+    tty->write_char = console_write_char;
+
+    for (int i = 0; i < 16; i++) tty->name[i] = 0;
+    tty->name[0] = 't'; tty->name[1] = 't'; tty->name[2] = 'y';
+    tty->name[3] = '0'; tty->name[4] = '\0';
+}
