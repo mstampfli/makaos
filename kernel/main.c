@@ -13,7 +13,6 @@
 #include "timer.h"
 #include "sched.h"
 #include "ahci.h"
-#include "elf.h"
 #include "ext2.h"
 #include "tsc.h"
 #include "fb.h"
@@ -135,8 +134,6 @@ void kmain(void) {
     net_init();
     sched_add(p_shell);
 
-    task_t* p_home = elf_load_from_ext2("/bin/home", pid_alloc());
-    if (p_home) sched_add(p_home);
     timer_init(100);   // 100 Hz scheduler tick via LAPIC timer
 
     __asm__ volatile("sti");

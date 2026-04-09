@@ -77,7 +77,7 @@ static void check(const char* name, int ok) {
 }
 
 // ── _start ────────────────────────────────────────────────────────────────
-void _start(void) {
+int main(void) {
     write_str("=== vmalloc ring-3 test ===\n");
 
     // ── Test 1: query current brk ─────────────────────────────────────────

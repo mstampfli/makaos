@@ -1,6 +1,6 @@
 #include "libc.h"
 
-void _start(void) {
+int main(void) {
     printf("Hello from user space!\n");
     printf("PID: %d\n", getpid());
 

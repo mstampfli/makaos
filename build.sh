@@ -124,7 +124,7 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_hello.o" \
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
-ld -nostdlib -T "$USER_LINK" "$BUILD_DIR/user_entry.o" "$BUILD_DIR/user_helloraw.o" \
+ld -nostdlib -T "$USER_LINK" "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
 
