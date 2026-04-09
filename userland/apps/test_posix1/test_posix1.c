@@ -716,7 +716,7 @@ static void test_sigprocmask(void) {
 
 // ── Entry ─────────────────────────────────────────────────────────────────
 
-void _start(void) {
+int main(void) {
     printf("========= POSIX-1 test suite =========\n");
 
     test_malloc_zero();

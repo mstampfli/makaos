@@ -225,7 +225,7 @@ void DG_SetWindowTitle(const char* title) {
 // ── _start ────────────────────────────────────────────────────────────────
 // Called from user/entry.asm.  We pass a minimal argc/argv to doomgeneric.
 // Doom will look for doom1.wad relative to cwd (/bin when launched from shell).
-void _start(void) {
+int main(void) {
     static char* argv[] = { "doom", "-iwad", "/bin/doom1.wad", "-mb", "16", (char*)0 };
     doomgeneric_Create(5, argv);
     // D_DoomMain returns after first frame setup — drive the game loop ourselves.
