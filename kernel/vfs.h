@@ -28,10 +28,14 @@ typedef struct vfs_file_t {
     // Seek to offset.  Returns new position, or -1 if not seekable.
     // May be NULL for non-seekable files (devices, pipes).
     int64_t (*seek )(struct vfs_file_t* self, int64_t offset, int whence);
+    // Poll: check readiness without blocking.  events is POLLIN or POLLOUT.
+    // Returns 1 if ready, 0 if not.  May be NULL (means always ready).
+    int     (*poll )(struct vfs_file_t* self, int events);
 
     void*    ctx;      // driver-specific state (may be NULL for stateless drivers)
-    uint32_t flags;    // open flags (O_APPEND etc.)
+    uint32_t flags;    // open flags (O_APPEND, O_NONBLOCK etc.)
     uint32_t refcount; // reference count; 0 = static object (never freed)
+    char     path[256]; // absolute path for ext2 files (empty for devices/pipes)
 } vfs_file_t;
 
 // ── Convenience wrappers ──────────────────────────────────────────────────
@@ -90,3 +94,12 @@ vfs_file_t* vfs_mouse_open(void);
 // Returns a write-only vfs_file_t for the AC97 PCM output stream (/dev/dsp).
 // Write signed 16-bit stereo samples at AC97_SAMPLE_RATE Hz.
 vfs_file_t* vfs_dsp_open(void);
+
+// /dev/null  — reads return 0 (EOF), writes are silently consumed.
+vfs_file_t* vfs_null_open(void);
+
+// /dev/zero  — reads return zero bytes, writes are silently consumed.
+vfs_file_t* vfs_zero_open(void);
+
+// /dev/urandom — reads return pseudo-random bytes (TSC-seeded xorshift64).
+vfs_file_t* vfs_urandom_open(void);

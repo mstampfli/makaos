@@ -219,6 +219,15 @@ for src in "$KERNEL_DIR"/*.c; do
   KERNEL_C_OBJS+=("$obj")
 done
 
+# ── Kernel networking subsystem ────────────────────────────────────────────
+for src in "$KERNEL_DIR/net"/*.c; do
+  [ -e "$src" ] || continue
+  base=$(basename "$src")
+  obj="$BUILD_DIR/kernel_net_${base%.c}.o"
+  "$CLANG" "${KERNEL_CFLAGS[@]}" -I "$BUILD_DIR" -I "$KERNEL_DIR" -c "$src" -o "$obj"
+  KERNEL_C_OBJS+=("$obj")
+done
+
 KERNEL_ASM_OBJS=()
 for src in "$KERNEL_DIR"/*.asm; do
   [ -e "$src" ] || continue
@@ -336,6 +345,7 @@ else
     echo "[!] doom1.wad not found — place it at user/doom/doom1.wad before running"
 fi
 
+
 if [ -d "$BUILD_DIR/fs" ]; then
     for f in "$BUILD_DIR/fs"/*; do
         [ -f "$f" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $f $(basename $f)" > /dev/null 2>&1 || true
@@ -372,6 +382,8 @@ qemu-system-x86_64 \
   -audiodev pipewire,id=snd0 \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
+  -netdev user,id=net0,hostfwd=tcp::5555-:80 \
+  -device virtio-net-pci,netdev=net0 \
   -serial file:build/serial.txt \
   -monitor none \
   -gdb tcp::1234 \

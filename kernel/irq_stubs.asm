@@ -27,6 +27,7 @@ extern keyboard_irq_handler
 extern mouse_irq_handler
 extern ahci_irq_handler
 extern hda_irq_handler
+extern virtio_net_irq_handler
 extern lapic_eoi          ; void lapic_eoi(void) — writes 0 to LAPIC EOI reg
 
 
@@ -117,6 +118,16 @@ hda_irq_entry:
     PUSH_GPRS
     call lapic_eoi
     call hda_irq_handler
+    POP_GPRS
+    iretq
+
+; ── VEC_VIRTIO_NET (0x34): virtio-net MSI ────────────────────────────────
+; Shared RX+TX vector.  MSI bypasses IOAPIC; EOI to LAPIC only.
+global virtio_net_irq_entry
+virtio_net_irq_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call virtio_net_irq_handler
     POP_GPRS
     iretq
 

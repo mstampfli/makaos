@@ -22,6 +22,7 @@
 #define VEC_LAPIC_TIMER     0x31   // LAPIC periodic timer (replaces PIT IRQ0)
 #define VEC_AHCI_MSI        0x32   // AHCI MSI
 #define VEC_HDA_MSI         0x33   // HDA MSI
+#define VEC_VIRTIO_NET      0x34   // virtio-net MSI (RX+TX shared vector)
 
 // Initialise the Local APIC.
 //   lapic_phys  — physical base from ACPI (or 0xFEE00000 as default)

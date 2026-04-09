@@ -7,8 +7,8 @@
 #include "vfs.h"
 
 // ── Task flags ────────────────────────────────────────────────────────────
-#define TASK_FLAG_KTHREAD  (1U << 0)  // kernel thread: runs at CPL=0
-#define TASK_FLAG_THREAD   (1U << 1)  // user thread: shares at least one of mm/files
+#define TASK_FLAG_KTHREAD   (1U << 0)  // kernel thread: runs at CPL=0
+#define TASK_FLAG_THREAD    (1U << 1)  // user thread: shares at least one of mm/files
 
 // ── Thread creation flags (sys_thread) ───────────────────────────────────
 #define THREAD_SHARE_MM    (1U << 0)  // share address space (pml4 + mm)
@@ -52,8 +52,17 @@ typedef struct {
 // ── Shared file descriptor table (ref-counted) ───────────────────────────
 // All tasks sharing the same fd table point to one task_files_t.
 // Freed when refs drops to 0.
+// ── fd-descriptor flags (per-descriptor, not per-file-description) ────────
+// FD_CLOEXEC: close this fd on execve.
+#define FD_CLOEXEC  1u
+
+// ── Shared file descriptor table (ref-counted) ────────────────────────────
+// fd_table[i]  — open file description (NULL = closed)
+// fd_flags[i]  — per-descriptor flags (FD_CLOEXEC etc.)
+// Both arrays are fd_capacity entries long and always grown together.
 typedef struct {
     vfs_file_t** fd_table;
+    uint32_t*    fd_flags;    // parallel array: FD_CLOEXEC per descriptor
     uint32_t     fd_capacity;
     uint32_t     refs;
 } task_files_t;
@@ -61,8 +70,10 @@ typedef struct {
 // ── Task Control Block ────────────────────────────────────────────────────
 typedef struct task_t {
     uint32_t      pid;
-    uint32_t      tgid;     // thread group ID
+    uint32_t      tgid;     // thread group ID (== pid for single-threaded)
     uint32_t      ppid;
+    uint32_t      pgid;     // process group ID (job control)
+    uint32_t      sid;      // session ID
     uint32_t      flags;    // TASK_FLAG_*
 
     task_state_t  state;
@@ -78,6 +89,9 @@ typedef struct task_t {
     int32_t       exit_code;    // set by sys_exit, readable via wait()
 
     uint64_t      sleep_until_ns; // wake time for nanosleep (TSC nanoseconds)
+
+    uint16_t      umask;        // file creation mask (default 022)
+
 
     uint8_t       mlfq_level;
     uint8_t       mlfq_ticks_left;
