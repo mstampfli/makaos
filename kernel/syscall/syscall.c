@@ -2078,6 +2078,10 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETRUSAGE:  ret = sys_getrusage(arg1, arg2);                break;
         case SYS_TCGETPGRP:  ret = sys_tcgetpgrp(arg1);                      break;
         case SYS_TCSETPGRP:  ret = sys_tcsetpgrp(arg1, arg2);                break;
+        case SYS_REBOOT:
+            outb(0x64, 0xFE);
+            for (;;) __asm__ volatile("cli; hlt");
+            break;
 
         default:               ret = (uint64_t)-ENOSYS;                         break;
     }

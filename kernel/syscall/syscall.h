@@ -81,6 +81,7 @@
 #define SYS_GETRUSAGE  72  // getrusage(who, rusage*)             → 0 or -errno
 #define SYS_TCGETPGRP  73  // tcgetpgrp(fd)                       → pgid or -errno
 #define SYS_TCSETPGRP  74  // tcsetpgrp(fd, pgid)                 → 0 or -errno
+#define SYS_REBOOT     75  // reboot()                            → does not return
 
 // waitpid options
 #define WNOHANG 1

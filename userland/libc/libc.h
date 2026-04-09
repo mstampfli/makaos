@@ -477,6 +477,7 @@ int   munmap(void* addr, size_t len);
 #define SYS_GETRUSAGE   72
 #define SYS_TCGETPGRP   73
 #define SYS_TCSETPGRP   74
+#define SYS_REBOOT      75
 
 // ── Extra errno values ────────────────────────────────────────────────────
 #define EFAULT      14
