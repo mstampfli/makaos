@@ -2,12 +2,9 @@
 #include "common.h"
 
 // ── Timer abstraction ─────────────────────────────────────────────────────
-// Currently backed by the 8253/8254 PIT (timer_pit.c).
-//
-// To add APIC timer support later:
-//   1. Write timer_apic.c implementing the same three functions below.
-//   2. In kmain, call timer_apic_init() instead of (or after disabling) PIT.
-//   3. The scheduler and everything above this layer is unchanged.
+// Backed by the LAPIC periodic timer (timer_pit.c).
+// The PIT is used only for TSC calibration at boot; scheduling ticks are
+// delivered at VEC_LAPIC_TIMER (0x31) by the LAPIC.
 //
 // The abstraction is intentionally minimal: one tick callback, one init call.
 

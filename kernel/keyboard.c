@@ -1,6 +1,5 @@
 #include "keyboard.h"
 #include "idt.h"
-#include "pic.h"
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
@@ -196,8 +195,9 @@ static void keyboard_thread_fn(void) {
 }
 
 void keyboard_init(void) {
+    // Vector 0x21 is already programmed into the IOAPIC by ioapic_init().
+    // We just register the IDT entry; the IOAPIC does the unmasking.
     idt_irq_register(0x21, (uint64_t)irq1_entry);
-    pic_unmask(1);
 
     task_t* t = task_create_kthread(keyboard_thread_fn, pid_alloc());
     if (t) sched_add(t);

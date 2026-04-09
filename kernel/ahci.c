@@ -4,7 +4,7 @@
 #include "pmm.h"
 #include "common.h"
 #include "idt.h"
-#include "pic.h"
+#include "lapic.h"
 #include "irq_wait.h"
 #include "sched.h"
 
@@ -381,40 +381,62 @@ uint8_t ahci_init(void) {
         // 6. Enable global HBA interrupt delivery.
         s_hba->ghc |= HBA_GHC_IE;
 
-        // 7. Program PIIX3 PIRQ routing and register the ISR.
+        // 7. Enable MSI and register the ISR.
         //
-        // QEMU's PIIX3 ISA bridge (bus=0,dev=1,fn=0) has 4 PIRQ lines A-D
-        // at config offsets 0x60-0x63.  They default to 0x80 (disabled).
-        // We must program them ourselves (no BIOS present).
-        //
-        // i440fx routing formula: pirq_idx = (slot + intpin - 2) % 4
-        //   where slot = PCI device number, intpin 1-based (INTA=1 … INTD=4)
-        #define PIRQ_IRQ  11u          // route everything to IRQ 11
-        #define PIIX3_BUS 0
-        #define PIIX3_DEV 1
-        #define PIIX3_FN  0
+        // MSI bypasses the IOAPIC and PIC entirely: the device writes a
+        // LAPIC-format message directly to memory when it needs attention.
+        // We locate the MSI capability, program the LAPIC address and vector,
+        // then enable MSI.  No PIIX3/PIRQ table programming needed.
         {
-            uint32_t cfg3c = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x3C);
-            uint8_t  int_pin = (uint8_t)((cfg3c >> 8) & 0xFF);
-            if (int_pin == 0 || int_pin > 4) int_pin = 1;
+            // Locate the MSI capability (ID = 0x05) in the PCI cap list.
+            uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
+                                                   0x34u) & 0xFCu);
+            int msi_found = 0;
+            while (cap) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
+                if ((dw & 0xFFu) == 0x05u) {  // MSI capability
+                    // Message Control register (bits [31:16] of dword at cap).
+                    // bit 16 = Enable, bits [19:17] = Multiple Message Enable.
+                    // We request single message (MME = 000).
+                    uint32_t mc = dw;
 
-            uint8_t pirq_idx = (uint8_t)((dev.dev + int_pin - 2u) % 4u);
+                    // Write MSI address (LAPIC address for BSP).
+                    uint64_t msi_addr = lapic_msi_addr();
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                    cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
 
-            // Program PIRQA-D dword (offsets 0x60-0x63 share one dword).
-            uint32_t pirq_dw = pci_cfg_read32(PIIX3_BUS, PIIX3_DEV, PIIX3_FN, 0x60);
-            uint32_t shift = pirq_idx * 8u;
-            pirq_dw = (pirq_dw & ~(0xFFu << shift)) | ((uint32_t)PIRQ_IRQ << shift);
-            pci_cfg_write32(PIIX3_BUS, PIIX3_DEV, PIIX3_FN, 0x60, pirq_dw);
+                    int is_64bit = (mc >> 23) & 1u;
+                    if (is_64bit) {
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                        cap + 8u, (uint32_t)(msi_addr >> 32));
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                        cap + 12u, lapic_msi_data(VEC_AHCI_MSI));
+                    } else {
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                        cap + 8u, lapic_msi_data(VEC_AHCI_MSI));
+                    }
 
-            // Update the device's Interrupt Line register so our code reads it back.
-            pci_cfg_write32(dev.bus, dev.dev, dev.fn, 0x3C,
-                            (cfg3c & ~0xFFu) | PIRQ_IRQ);
+                    // Enable MSI (bit 16), single message (MME=000).
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                                    (mc & ~(0x7u << 20)) | (1u << 16));
 
-            g_ahci_irq = PIRQ_IRQ;
-            uint8_t vec = (PIRQ_IRQ < 8u) ? (0x20u + PIRQ_IRQ)
-                                           : (0x28u + PIRQ_IRQ - 8u);
-            idt_irq_register(vec, (uint64_t)ahci_irq_entry);
-            pic_unmask(PIRQ_IRQ);
+                    msi_found = 1;
+                    break;
+                }
+                cap = (uint8_t)((dw >> 8) & 0xFCu);
+            }
+
+            // Register IDT entry and set the irq_wait key.
+            // g_ahci_irq is repurposed as a logical slot index for irq_wait().
+            // We reuse slot 11 (matches old PIIX3 IRQ) — irq_wait has 16 slots.
+            g_ahci_irq = 11u;
+            idt_irq_register(VEC_AHCI_MSI, (uint64_t)ahci_irq_entry);
+
+            if (!msi_found) {
+                // Fallback: should not happen on QEMU AHCI, but handle it.
+                // Without MSI the driver will never get IRQs — AHCI will poll.
+                g_ahci_irq = 0xFF;
+            }
         }
 
         return 1;

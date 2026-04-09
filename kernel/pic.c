@@ -1,8 +1,7 @@
 #include "pic.h"
 #include "idt.h"
 
-extern void spurious_irq7_entry(void);
-extern void spurious_irq15_entry(void);
+extern void lapic_spurious_entry(void);  // shared: just iretq, safe for PIC spurious too
 
 // Small I/O delay: writing to port 0x80 (POST diagnostic port) is safe on
 // all x86 hardware and gives enough time for old ISA devices to respond.
@@ -32,8 +31,8 @@ void pic_init(uint8_t base_master, uint8_t base_slave) {
     outb(PIC2_DATA, 0xFF);
 
     // Register spurious IRQ handlers so a stray IRQ7/IRQ15 doesn't GP-fault.
-    idt_irq_register(base_master + 7, (uint64_t)spurious_irq7_entry);
-    idt_irq_register(base_slave  + 7, (uint64_t)spurious_irq15_entry);
+    idt_irq_register(base_master + 7, (uint64_t)lapic_spurious_entry);
+    idt_irq_register(base_slave  + 7, (uint64_t)lapic_spurious_entry);
 }
 
 void pic_eoi(uint8_t irq) {
@@ -46,6 +45,13 @@ void pic_mask(uint8_t irq) {
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
     uint8_t  bit  = (irq < 8) ? irq : (irq - 8);
     outb(port, inb(port) | (uint8_t)(1u << bit));
+}
+
+void pic_disable(void) {
+    // Mask every IRQ on both PICs.
+    // We do NOT send EOI or reset the PIC — just pull the mask register high.
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
 }
 
 void pic_unmask(uint8_t irq) {

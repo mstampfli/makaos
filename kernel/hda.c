@@ -5,7 +5,7 @@
 #include "sched.h"
 #include "irq_wait.h"
 #include "idt.h"
-#include "pic.h"
+#include "lapic.h"
 #include "common.h"
 
 extern void hda_irq_entry(void);
@@ -140,14 +140,11 @@ typedef struct {
 // CORB/RIRB ring size
 #define RING_SZ  256u
 
-// ── IRQ routing ───────────────────────────────────────────────────────────
-// Use PIIX3 PIRQ routing, same technique as ahci.c.
-// Route to IRQ 10 (AHCI uses 11; keyboard=1, mouse=12, timer=0, HDA=10).
-
-#define HDA_IRQ      5u
-#define PIIX3_BUS    0u
-#define PIIX3_DEV    1u
-#define PIIX3_FN     0u
+// ── IRQ slot for irq_wait/irq_notify ─────────────────────────────────────
+// HDA uses MSI (no PIC, no IOAPIC).  We keep a logical slot index so the
+// irq_wait/irq_notify mechanism still works (it is slot-indexed, 0–15).
+// Slot 5 is free (old PIC IRQ5 = sound card, now unused).
+#define HDA_IRQ_SLOT  5u
 
 // ── Driver state ──────────────────────────────────────────────────────────
 
@@ -481,26 +478,42 @@ int hda_init(void) {
     // Tag=1, interrupts armed — but NOT RUN yet (started lazily by hda_write).
     sd_w32(SD_CTL,  SD_CTL_TAG(1) | SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE);
 
-    // 14. IRQ routing via PIIX3 (i440fx ISA bridge, same as ahci.c).
-    //     Route INTA# of the HDA device to IRQ 10 on the PIC.
+    // 14. Enable MSI and register the ISR.
+    //     MSI bypasses the PIC and IOAPIC entirely.  The HDA controller writes
+    //     a LAPIC-format message to memory when a stream completes.
     {
-        uint32_t cfg3c   = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x3Cu);
-        uint8_t  intpin  = (uint8_t)((cfg3c >> 8) & 0xFFu);
-        if (intpin == 0u || intpin > 4u) intpin = 1u;
-        uint8_t  pirq_idx = (uint8_t)((dev.dev + intpin - 2u) % 4u);
+        uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
+                                               0x34u) & 0xFCu);
+        while (cap) {
+            uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
+            if ((dw & 0xFFu) == 0x05u) {  // MSI capability
+                uint32_t mc = dw;
 
-        uint32_t pirq_dw = pci_cfg_read32(PIIX3_BUS, PIIX3_DEV, PIIX3_FN, 0x60u);
-        uint32_t shift   = pirq_idx * 8u;
-        pirq_dw = (pirq_dw & ~(0xFFu << shift)) | ((uint32_t)HDA_IRQ << shift);
-        pci_cfg_write32(PIIX3_BUS, PIIX3_DEV, PIIX3_FN, 0x60u, pirq_dw);
-        // Keep Interrupt Line register consistent so tools can read it.
-        pci_cfg_write32(dev.bus, dev.dev, dev.fn, 0x3Cu, (cfg3c & ~0xFFu) | HDA_IRQ);
+                uint64_t msi_addr = lapic_msi_addr();
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
 
-        g_hda_irq = HDA_IRQ;
-        uint8_t vec = (HDA_IRQ < 8u) ? (uint8_t)(0x20u + HDA_IRQ)
-                                      : (uint8_t)(0x28u + HDA_IRQ - 8u);
-        idt_irq_register(vec, (uint64_t)hda_irq_entry);
-        pic_unmask(HDA_IRQ);
+                int is_64bit = (int)((mc >> 23) & 1u);
+                if (is_64bit) {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                    cap + 8u, (uint32_t)(msi_addr >> 32));
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                    cap + 12u, lapic_msi_data(VEC_HDA_MSI));
+                } else {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                    cap + 8u, lapic_msi_data(VEC_HDA_MSI));
+                }
+
+                // Enable MSI, single message.
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                                (mc & ~(0x7u << 20)) | (1u << 16));
+                break;
+            }
+            cap = (uint8_t)((dw >> 8) & 0xFCu);
+        }
+
+        g_hda_irq = HDA_IRQ_SLOT;
+        idt_irq_register(VEC_HDA_MSI, (uint64_t)hda_irq_entry);
     }
 
     // 15. Enable global interrupt + stream interrupt for our output stream.

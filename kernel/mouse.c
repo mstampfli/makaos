@@ -1,6 +1,5 @@
 #include "mouse.h"
 #include "idt.h"
-#include "pic.h"
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
@@ -210,9 +209,10 @@ void mouse_init(void) {
     mouse_write(MOUSE_CMD_ENABLE_REPORT);
     mouse_read_byte();   // ACK
 
-    // 7. Register IRQ12 handler (vector 0x2C = 0x28 + 4, slave PIC line 4).
+    // 7. Register IRQ12 handler (vector 0x2C).
+    // The IOAPIC is already programmed and unmasked for GSI 12 → vector 0x2C
+    // by ioapic_init().  We just install the IDT entry here.
     idt_irq_register(0x2C, (uint64_t)irq12_entry);
-    pic_unmask(12);
 
     // 8. Spawn the driver thread so irq_wait(12) has a home.
     task_t* t = task_create_kthread(mouse_thread_fn, pid_alloc());

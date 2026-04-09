@@ -16,6 +16,9 @@
 #include "ext2.h"
 #include "tsc.h"
 #include "fb.h"
+#include "acpi.h"
+#include "lapic.h"
+#include "ioapic.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -27,6 +30,9 @@ extern void snake_fn(void);
 extern void fs_init_fn(void);
 extern void test_vmalloc_fn(void);
 extern void shell_fn(void);
+
+/* ── Spurious LAPIC vector handler ──────────────────────── */
+extern void lapic_spurious_entry(void);
 
 /* ── kmain ───────────────────────────────────────────────── */
 static void serial_init_and_say(void) {
@@ -64,11 +70,55 @@ void kmain(void) {
 
     fb_init(info->fb_phys, info->fb_width, info->fb_height, info->fb_pitch);
     idt_init();
-    pic_init(0x20, 0x28);  // remap PIC early so pic_unmask works in ahci_init
-    tsc_init();
+
+    // ── Interrupt controller bringup ─────────────────────────────────────
+    //
+    // Order matters:
+    //  1. Remap the legacy 8259 PIC so its vectors don't collide with CPU
+    //     exceptions (0x00–0x1F).  We do this even though we're about to
+    //     disable the PIC, because spurious PIC interrupts can still fire
+    //     during the transition window and we need them to hit safe vectors.
+    //  2. Parse ACPI MADT to find LAPIC and IOAPIC addresses.
+    //  3. Init LAPIC (enables the local CPU's APIC).
+    //  4. Init IOAPIC (routes ISA IRQs → LAPIC vectors, masks everything else).
+    //  5. Disable the legacy PIC (mask all lines — it's now bypassed).
+    //  6. Register the LAPIC spurious vector in the IDT.
+
+    pic_init(0x20, 0x28);   // remap PIC: IRQ0→0x20, IRQ8→0x28
+
+    // ACPI: OVMF passes the RSDP via the EFI configuration table.
+    // Our bootloader doesn't forward it yet, so pass 0 and let acpi_parse()
+    // search the legacy BIOS area (works for both SeaBIOS and OVMF on QEMU).
+    acpi_info_t acpi = acpi_parse(0);
+
+    tsc_init();           // calibrate TSC (uses PIT ch2, no IRQs needed)
+
     pmm_buddy_init_from_map(info->e820_map, info->e820_count);
     kheap_init();
     vmm_init(info->pml4_phys);
+
+    // LAPIC and IOAPIC require vmm_map_mmio, so init after vmm_init.
+    if (acpi.ok) {
+        lapic_init(acpi.lapic_phys);
+        ioapic_init(&acpi);
+    } else {
+        // Fallback: use default LAPIC/IOAPIC addresses (works on QEMU).
+        acpi_info_t fallback = {
+            .lapic_phys      = 0xFEE00000ULL,
+            .ioapic_phys     = 0xFEC00000ULL,
+            .ioapic_gsi_base = 0,
+            .override_count  = 0,
+            .ok              = 1,
+        };
+        lapic_init(fallback.lapic_phys);
+        ioapic_init(&fallback);
+    }
+
+    pic_disable();   // mask all PIC lines — IOAPIC takes over ISA IRQs
+
+    // Register spurious LAPIC vector so a cancelled interrupt doesn't #GP.
+    idt_irq_register(VEC_LAPIC_SPURIOUS, (uint64_t)lapic_spurious_entry);
+
     tss_init();
     syscall_init();
 
@@ -85,7 +135,7 @@ void kmain(void) {
     mouse_init();
     hda_init();
     sched_add(p_shell);
-    timer_init(100);
+    timer_init(100);   // 100 Hz scheduler tick via LAPIC timer
 
     __asm__ volatile("sti");
     for (;;)
