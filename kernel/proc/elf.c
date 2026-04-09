@@ -409,6 +409,7 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
@@ -484,6 +485,7 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;

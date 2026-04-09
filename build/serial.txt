@@ -5,10 +5,10 @@ GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
 kernel.bin size=0x000000000002D4E3
-kernel_phys=0x000000000BE00000
+kernel_phys=0x000000000C000000
 kernel loaded, bytes=0x000000000002D4E3
-phys_ceiling=0x0000010000000000
-pml4_phys=0x000000000DDFA000
+phys_ceiling=0x0000000100000000
+pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
 ExitBootServices OK
 K
@@ -19,7 +19,17 @@ K
 00007FFFFFFFDEC3
 MakaOS Shell v0.2 -- type 'help' for commands
 
-MakaOS:/> bin/doom
+MakaOS:/> ls
+[lost+found]          <DIR>
+[bin]                 <DIR>
+[etc]                 <DIR>
+[home]                <DIR>
+[tmp]                 <DIR>
+[dev]                 <DIR>
+TEST.TXT              26 bytes
+MakaOS:/> b doom/bin
+shell: command not found: doom/bin
+MakaOS:/> bn in/doom
 0000000000400003
 00007FFFFFFFDEC3
                            Doom Generic 0.1
