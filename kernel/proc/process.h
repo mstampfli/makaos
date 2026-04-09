@@ -68,7 +68,7 @@ typedef struct {
 } task_files_t;
 
 // ── Task Control Block ────────────────────────────────────────────────────
-typedef struct task_t {
+typedef struct __attribute__((aligned(16))) task_t {
     uint32_t      pid;
     uint32_t      tgid;     // thread group ID (== pid for single-threaded)
     uint32_t      ppid;

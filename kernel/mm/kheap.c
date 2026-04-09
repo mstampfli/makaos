@@ -58,7 +58,7 @@ void* kmalloc(size_t size) {
 
   uint8_t* raw = (uint8_t*)(phys + HHDM_OFFSET);
   *raw = order;
-  return (void*)(raw + 8);
+  return (void*)(raw + 16);  // 16-byte aligned (raw is page-aligned)
 }
 
 void kfree(void* addr) {
@@ -67,7 +67,7 @@ void kfree(void* addr) {
   if (pmm_is_slab_ptr(addr)) {
     pmm_slab_free(addr);
   } else {
-    uint8_t* raw = (uint8_t*)addr - 8;
+    uint8_t* raw = (uint8_t*)addr - 16;
     uint8_t order = *raw;
     phys_addr_t phys = (phys_addr_t)((virt_addr_t)raw - HHDM_OFFSET);
     pmm_buddy_free(phys, order);

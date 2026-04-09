@@ -136,6 +136,11 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+
+    // Initialize fxsave_buf with a valid FPU state.
+    // fxrstor on a zero buffer is invalid on real CPUs (KVM) — FCW must be set.
+    // Capture the current FPU state (which has a valid FCW=0x037F from UEFI/boot).
+    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 }
 
 // ── task_create_kthread ───────────────────────────────────────────────────
