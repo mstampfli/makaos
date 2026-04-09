@@ -156,7 +156,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     // Pre-fault the user buffer so kernel writes into it don't kernel-panic.
     user_buf_prefault((virt_addr_t)buf, (size_t)len);
     int64_t r = vfs_read(f, (void*)buf, len);
-    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+    return (uint64_t)r;  // pass errno through (r<0 is -errno already)
 }
 
 // ── sys_open ──────────────────────────────────────────────────────────────
