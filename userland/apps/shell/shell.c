@@ -1,9 +1,78 @@
 // MakaOS userland shell
-// Reads from fd 0 (cooked TTY), writes to fd 1 (kernel terminal).
-// All filesystem ops go through syscalls. No kernel internals.
+// Input: reads raw PS/2 scancodes from /dev/kbdraw, does its own line editing.
+// Output: writes to fd 1 (kernel fb terminal).
+// No ANSI colors — kernel terminal does not interpret escape sequences.
 
 #include "libc.h"
 #include "stdio.h"
+
+// ── Keyboard (raw scancodes, same as kernel shell) ────────────────────────
+
+static int g_kbd_fd = -1;
+
+// PS/2 set-1 scancode → ASCII (press events only, sc < 0x80).
+static char sc_to_ascii(uint8_t sc) {
+    if (sc & 0x80) return 0;  // release event — ignore
+    static const char row1[] = "qwertyuiop";
+    static const char row2[] = "asdfghjkl";
+    static const char row3[] = "zxcvbnm";
+    switch (sc) {
+        case 0x1C: return '\n';
+        case 0x39: return ' ';
+        case 0x0E: return '\b';
+        case 0x01: return 27;   // ESC
+        // digits / symbols on top row
+        case 0x02: return '1'; case 0x03: return '2'; case 0x04: return '3';
+        case 0x05: return '4'; case 0x06: return '5'; case 0x07: return '6';
+        case 0x08: return '7'; case 0x09: return '8'; case 0x0A: return '9';
+        case 0x0B: return '0'; case 0x0C: return '-'; case 0x0D: return '=';
+        case 0x1A: return '['; case 0x1B: return ']';
+        case 0x27: return ';'; case 0x28: return '\'';
+        case 0x29: return '`'; case 0x2B: return '\\';
+        case 0x33: return ','; case 0x34: return '.'; case 0x35: return '/';
+        default: break;
+    }
+    if (sc >= 0x10 && sc <= 0x19) return row1[sc - 0x10];
+    if (sc >= 0x1E && sc <= 0x26) return row2[sc - 0x1E];
+    if (sc >= 0x2C && sc <= 0x32) return row3[sc - 0x2C];
+    return 0;
+}
+
+// Blocking: wait for next key press, return ASCII char (0 = unmapped/skip).
+static char kbd_getchar(void) {
+    for (;;) {
+        uint8_t sc;
+        ssize_t n = read(g_kbd_fd, &sc, 1);
+        if (n <= 0) continue;
+        if (sc == 0xE0) continue;  // extended prefix — skip
+        char c = sc_to_ascii(sc);
+        if (c) return c;
+    }
+}
+
+// Read a full line from keyboard into buf (max-1 chars + NUL).
+// Echoes chars and handles backspace. Returns length (without NUL).
+static int read_line(char* buf, int max) {
+    int len = 0;
+    for (;;) {
+        char c = kbd_getchar();
+        if (c == '\n' || c == '\r') {
+            buf[len] = '\0';
+            write(1, "\n", 1);
+            return len;
+        }
+        if (c == '\b') {
+            if (len > 0) {
+                len--;
+                write(1, "\b \b", 3);  // erase on terminal
+            }
+            continue;
+        }
+        if ((unsigned char)c < 0x20 || len >= max - 1) continue;
+        buf[len++] = c;
+        write(1, &c, 1);  // echo
+    }
+}
 
 // ── Output helpers ────────────────────────────────────────────────────────
 
@@ -24,15 +93,6 @@ static void putu32(uint32_t v) {
     while (v && i > 0) { buf[--i] = '0' + (char)(v % 10); v /= 10; }
     puts_fd(&buf[i]);
 }
-
-// ANSI color helpers — kernel terminal interprets these.
-static void color(const char* ansi) { puts_fd(ansi); }
-#define COL_RESET  "\033[0m"
-#define COL_GREEN  "\033[32m"
-#define COL_CYAN   "\033[36m"
-#define COL_YELLOW "\033[33m"
-#define COL_RED    "\033[31m"
-#define COL_LBLUE  "\033[94m"
 
 // ── Path resolution ───────────────────────────────────────────────────────
 // Resolve arg relative to cwd, normalize . and .. components.
@@ -105,9 +165,7 @@ static int parse_args(char* line, char* argv[], int max_argc) {
 // ── Commands ──────────────────────────────────────────────────────────────
 
 static void cmd_help(void) {
-    color(COL_CYAN);
     puts_fd("Available commands:\n");
-    color(COL_RESET);
     puts_fd("  help           Show this help\n");
     puts_fd("  clear          Clear the screen\n");
     puts_fd("  echo [...]     Print arguments\n");
@@ -121,11 +179,13 @@ static void cmd_help(void) {
     puts_fd("  mv <src> <dst> Rename/move file\n");
     puts_fd("  about          About MakaOS\n");
     puts_fd("  reboot         Reboot the system\n");
-    puts_fd("  <path>         Run an ELF binary (bare name searches /bin/)\n");
+    puts_fd("  <name>         Run /bin/<name> or a path directly\n");
 }
 
 static void cmd_clear(void) {
-    puts_fd("\033[2J\033[H");
+    // Kernel fb_clear is not directly callable; write form-feed as hint.
+    // fb_term_putc handles '\f' as clear on our kernel terminal.
+    putc_fd('\f');
 }
 
 static void cmd_echo(int argc, char* argv[]) {
@@ -149,11 +209,9 @@ static void cmd_ls(const char* cwd, int argc, char* argv[]) {
 
     int count = readdir(path, strlen(path), entries, 64);
     if (count < 0) {
-        color(COL_RED);
         puts_fd("ls: cannot read: ");
         puts_fd(path);
         putc_fd('\n');
-        color(COL_RESET);
         free(entries);
         return;
     }
@@ -167,20 +225,16 @@ static void cmd_ls(const char* cwd, int argc, char* argv[]) {
         dirent_t* e = &entries[i];
         uint32_t nlen = (uint32_t)strlen(e->name);
         if (e->is_dir) {
-            color(COL_YELLOW);
             putc_fd('[');
             puts_fd(e->name);
             putc_fd(']');
-            color(COL_RESET);
             nlen += 2;
         } else {
             puts_fd(e->name);
         }
         for (uint32_t j = nlen; j < 22; j++) putc_fd(' ');
         if (e->is_dir) {
-            color(COL_YELLOW);
             puts_fd("<DIR>");
-            color(COL_RESET);
         } else {
             putu32(e->size);
             puts_fd(" bytes");
@@ -191,18 +245,13 @@ static void cmd_ls(const char* cwd, int argc, char* argv[]) {
 }
 
 static void cmd_cat(const char* cwd, int argc, char* argv[]) {
-    if (argc < 2) {
-        color(COL_RED); puts_fd("Usage: cat <file>\n"); color(COL_RESET);
-        return;
-    }
+    if (argc < 2) { puts_fd("Usage: cat <file>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
 
     int fd = open(path, O_RDONLY, 0);
     if (fd < 0) {
-        color(COL_RED);
         puts_fd("cat: not found: "); puts_fd(path); putc_fd('\n');
-        color(COL_RESET);
         return;
     }
 
@@ -221,9 +270,7 @@ static void cmd_cd(char* cwd, int argc, char* argv[]) {
 
     int r = chdir(resolved, strlen(resolved));
     if (r < 0) {
-        color(COL_RED);
         puts_fd("cd: not found: "); puts_fd(resolved); putc_fd('\n');
-        color(COL_RESET);
         return;
     }
     strncpy(cwd, resolved, 256);
@@ -236,55 +283,32 @@ static void cmd_pwd(const char* cwd) {
 }
 
 static void cmd_mkdir(const char* cwd, int argc, char* argv[]) {
-    if (argc < 2) {
-        color(COL_RED); puts_fd("Usage: mkdir <path>\n"); color(COL_RESET);
-        return;
-    }
+    if (argc < 2) { puts_fd("Usage: mkdir <path>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
     int r = mkdir(path, strlen(path));
-    if (r < 0) {
-        color(COL_RED);
-        puts_fd("mkdir: failed: "); puts_fd(path); putc_fd('\n');
-        color(COL_RESET);
-    }
+    if (r < 0) { puts_fd("mkdir: failed: "); puts_fd(path); putc_fd('\n'); }
 }
 
 static void cmd_rm(const char* cwd, int argc, char* argv[]) {
-    if (argc < 2) {
-        color(COL_RED); puts_fd("Usage: rm <path>\n"); color(COL_RESET);
-        return;
-    }
+    if (argc < 2) { puts_fd("Usage: rm <path>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
     int r = unlink(path, strlen(path));
-    if (r < 0) {
-        color(COL_RED);
-        puts_fd("rm: failed: "); puts_fd(path); putc_fd('\n');
-        color(COL_RESET);
-    }
+    if (r < 0) { puts_fd("rm: failed: "); puts_fd(path); putc_fd('\n'); }
 }
 
 static void cmd_mv(const char* cwd, int argc, char* argv[]) {
-    if (argc < 3) {
-        color(COL_RED); puts_fd("Usage: mv <src> <dst>\n"); color(COL_RESET);
-        return;
-    }
+    if (argc < 3) { puts_fd("Usage: mv <src> <dst>\n"); return; }
     char src[256], dst[256];
     resolve_path(cwd, argv[1], src, sizeof(src));
     resolve_path(cwd, argv[2], dst, sizeof(dst));
     int r = sys_rename(src, strlen(src), dst, strlen(dst));
-    if (r < 0) {
-        color(COL_RED);
-        puts_fd("mv: failed: "); puts_fd(src); puts_fd(" -> "); puts_fd(dst); putc_fd('\n');
-        color(COL_RESET);
-    }
+    if (r < 0) { puts_fd("mv: failed: "); puts_fd(src); puts_fd(" -> "); puts_fd(dst); putc_fd('\n'); }
 }
 
 static void cmd_about(void) {
-    color(COL_CYAN);
     puts_fd("MakaOS\n");
-    color(COL_RESET);
     puts_fd("  Version  : 0.2.0\n");
     puts_fd("  Arch     : x86-64\n");
     puts_fd("  Boot     : UEFI + GOP framebuffer\n");
@@ -304,16 +328,13 @@ static void cmd_reboot(void) {
 // Uses a heap-allocated buffer that doubles on overflow.
 
 static void cmd_edit(const char* cwd, int argc, char* argv[]) {
-    if (argc < 2) {
-        color(COL_RED); puts_fd("Usage: edit <file>\n"); color(COL_RESET);
-        return;
-    }
+    if (argc < 2) { puts_fd("Usage: edit <file>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
 
     uint32_t buf_size = 4096;
     char* buf = malloc(buf_size);
-    if (!buf) { color(COL_RED); puts_fd("edit: out of memory\n"); color(COL_RESET); return; }
+    if (!buf) { puts_fd("edit: out of memory\n"); return; }
     uint32_t len = 0;
 
     // Pre-load existing file.
@@ -337,37 +358,32 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
         close(rfd);
     }
 
-    // Print header + existing content.
-    color(COL_LBLUE);
     puts_fd("-- EDITOR: "); puts_fd(path); puts_fd(" | Ctrl+S=save  ESC=quit --\n");
-    color(COL_RESET);
     if (len > 0) write(1, buf, len);
 
-    // Edit loop (cooked mode — kernel delivers one line at a time on Enter,
-    // but we read single chars for Ctrl+S / ESC detection).
-    // Switch to raw mode for the editor so we can intercept Ctrl+S / ESC.
-    termios_t saved, raw;
-    tcgetattr(0, &saved);
-    raw = saved;
-    raw.c_lflag &= ~(uint32_t)(ICANON | ECHO);
-    raw.c_cc[VMIN]  = 1;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSANOW, &raw);
-
+    // Read raw scancodes directly; track Ctrl key state to detect Ctrl+S.
+    // Left Ctrl = scancode 0x1D (press), 0x9D (release).
+    int ctrl_held = 0;
     for (;;) {
-        char c;
-        ssize_t n = read(0, &c, 1);
+        uint8_t sc;
+        ssize_t n = read(g_kbd_fd, &sc, 1);
         if (n <= 0) continue;
+        if (sc == 0xE0) continue;
 
-        if (c == '\x1b') {
-            color(COL_YELLOW);
+        // Track Ctrl key.
+        if (sc == 0x1D) { ctrl_held = 1; continue; }
+        if (sc == 0x9D) { ctrl_held = 0; continue; }
+
+        if (sc & 0x80) continue;  // other release events — ignore
+
+        // ESC (scancode 0x01) — quit.
+        if (sc == 0x01) {
             puts_fd("\n[Quit without saving]\n");
-            color(COL_RESET);
             break;
         }
 
-        if (c == '\x13') {
-            // Save: open for write (create/trunc), write buffer, close.
+        // Ctrl+S (s = scancode 0x1F) — save.
+        if (ctrl_held && sc == 0x1F) {
             int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0);
             int ok = 0;
             if (wfd >= 0) {
@@ -375,44 +391,33 @@ static void cmd_edit(const char* cwd, int argc, char* argv[]) {
                 ok = (written == (ssize_t)len);
                 close(wfd);
             }
-            color(ok ? COL_GREEN : COL_RED);
             puts_fd(ok ? "\n[Saved]\n" : "\n[Save FAILED]\n");
-            color(COL_RESET);
             continue;
         }
 
-        if (c == '\b' || c == 127) {
-            if (len > 0) {
-                len--;
-                // Erase char on terminal: backspace, space, backspace.
-                write(1, "\b \b", 3);
-            }
+        char c = sc_to_ascii(sc);
+        if (!c) continue;
+
+        if (c == '\b') {
+            if (len > 0) { len--; write(1, "\b \b", 3); }
             continue;
         }
 
         char to_append = 0;
-        if (c == '\n' || c == '\r') to_append = '\n';
+        if (c == '\n') to_append = '\n';
         else if ((unsigned char)c >= 0x20) to_append = c;
         if (!to_append) continue;
 
         if (len + 1 >= buf_size) {
             uint32_t new_size = buf_size * 2;
             char* grown = realloc(buf, new_size);
-            if (!grown) {
-                color(COL_RED);
-                puts_fd("\n[Out of memory — save now!]\n");
-                color(COL_RESET);
-                continue;
-            }
+            if (!grown) { puts_fd("\n[OOM — save now!]\n"); continue; }
             buf = grown;
             buf_size = new_size;
         }
         buf[len++] = to_append;
         write(1, &to_append, 1);
     }
-
-    // Restore terminal.
-    tcsetattr(0, TCSANOW, &saved);
     free(buf);
 }
 
@@ -426,15 +431,11 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
     // If bare name (no '/'), try /bin/<cmd> first.
     if (cmd[0] != '/') {
         snprintf(path, sizeof(path), "/bin/%s", cmd);
-        // Check it exists.
         stat_t st;
         if (stat(path, strlen(path), &st) < 0) {
-            // Try relative to cwd.
             resolve_path(cwd, cmd, path, sizeof(path));
             if (stat(path, strlen(path), &st) < 0) {
-                color(COL_RED);
                 puts_fd("shell: command not found: "); puts_fd(cmd); putc_fd('\n');
-                color(COL_RESET);
                 return;
             }
         }
@@ -456,19 +457,11 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
         NULL
     };
 
-    // Fork + exec so the shell survives if exec fails or child exits.
     int pid = fork();
-    if (pid < 0) {
-        color(COL_RED); puts_fd("shell: fork failed\n"); color(COL_RESET);
-        return;
-    }
+    if (pid < 0) { puts_fd("shell: fork failed\n"); return; }
     if (pid == 0) {
-        // Child: exec the binary.
         execve(path, child_argv, child_envp);
-        // If we get here exec failed.
-        color(COL_RED);
         puts_fd("shell: exec failed: "); puts_fd(path); putc_fd('\n');
-        color(COL_RESET);
         exit(1);
     }
 
@@ -480,33 +473,27 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
 // ── Main loop ─────────────────────────────────────────────────────────────
 
 int main(void) {
-    char cwd[256] = "/";
+    g_kbd_fd = open("/dev/kbdraw", O_RDONLY, 0);
+    if (g_kbd_fd < 0) {
+        puts_fd("shell: failed to open /dev/kbdraw\n");
+        exit(1);
+    }
 
-    // Sync our local cwd with the kernel's (in case exec inherited a non-root cwd).
+    char cwd[256] = "/";
     getcwd(cwd, sizeof(cwd));
 
     cmd_clear();
-    color(COL_CYAN);
-    puts_fd("MakaOS Shell v0.2");
-    color(COL_RESET);
-    puts_fd(" -- type 'help' for commands\n\n");
+    puts_fd("MakaOS Shell v0.2 -- type 'help' for commands\n\n");
 
     char line[256];
     char* argv[16];
 
     for (;;) {
-        color(COL_GREEN);
         puts_fd("MakaOS:");
         puts_fd(cwd);
         puts_fd("> ");
-        color(COL_RESET);
 
-        ssize_t n = read(0, line, sizeof(line) - 1);
-        if (n <= 0) continue;
-
-        // Strip trailing newline.
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) n--;
-        line[n] = '\0';
+        int n = read_line(line, sizeof(line));
         if (n == 0) continue;
 
         int argc = parse_args(line, argv, 16);
