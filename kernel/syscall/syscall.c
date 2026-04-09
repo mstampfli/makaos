@@ -14,6 +14,7 @@
 #include "elf.h"
 #include "tsc.h"
 #include "fb.h"
+#include "tty.h"
 #include "net/socket.h"
 #include "net/net.h"
 
@@ -201,11 +202,22 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
                              && dev[4]=='e' && dev[5]=='\0');
         uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
-        if      (match_kbdraw) f = vfs_kbdraw_open();
+        uint8_t match_tty    = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='\0');
+        uint8_t match_tty0   = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='0' && dev[4]=='\0');
+        uint8_t match_null   = (dev[0]=='n' && dev[1]=='u' && dev[2]=='l' && dev[3]=='l' && dev[4]=='\0');
+        uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
+        uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
+                             && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+        if      (match_tty)    f = tty_open(0);
+        else if (match_tty0)   f = tty_open(0);
+        else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
         else if (match_mouse)  f = vfs_mouse_open();
         else if (match_dsp)    f = vfs_dsp_open();
+        else if (match_null)   f = vfs_null_open();
+        else if (match_zero)   f = vfs_zero_open();
+        else if (match_urnd)   f = vfs_urandom_open();
         else return (uint64_t)-ENOENT;
     } else {
         f = ext2_open(path);
@@ -1400,48 +1412,6 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
     return (r == 0) ? 0 : (uint64_t)-EINVAL;
 }
 
-// ── Global terminal state (shared across all processes using the tty) ─────
-// In a real kernel this lives in a struct tty; here we keep one global
-// terminal termios and window size. Both are readable/writable by any
-// process via TCGETS/TCSETS/TIOCGWINSZ/TIOCSWINSZ.
-
-static termios_t g_tty_termios = {
-    .c_iflag = ICRNL | IXON,
-    .c_oflag = OPOST | ONLCR,
-    .c_cflag = B38400 | CS8 | CREAD | HUPCL | CLOCAL,
-    .c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN,
-    .c_line  = 0,
-    .c_cc    = {
-        [VINTR]    = 3,    // ^C
-        [VQUIT]    = 28,   // backslash
-        [VERASE]   = 127,  // DEL
-        [VKILL]    = 21,   // ^U
-        [VEOF]     = 4,    // ^D
-        [VTIME]    = 0,
-        [VMIN]     = 1,
-        [VSWTC]    = 0,
-        [VSTART]   = 17,   // ^Q
-        [VSTOP]    = 19,   // ^S
-        [VSUSP]    = 26,   // ^Z
-        [VEOL]     = 0,
-        [VREPRINT] = 18,   // ^R
-        [VDISCARD] = 15,   // ^O
-        [VWERASE]  = 23,   // ^W
-        [VLNEXT]   = 22,   // ^V
-        [VEOL2]    = 0,
-    },
-};
-
-static winsize_t g_tty_winsize = {
-    .ws_row    = 25,
-    .ws_col    = 80,
-    .ws_xpixel = 0,
-    .ws_ypixel = 0,
-};
-
-// Foreground process group of the controlling terminal.
-static uint32_t g_tty_fg_pgid = 1;
-
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
 // Returns 0 on success, -EFAULT if the pointer is obviously bad.
 static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
@@ -1665,8 +1635,8 @@ static uint64_t sys_setsid(void) {
     if (g_current->pid == g_current->pgid) return (uint64_t)-EPERM;
     g_current->sid  = g_current->pid;
     g_current->pgid = g_current->pid;
-    // New session has no controlling terminal — set tty fg pgid to us.
-    g_tty_fg_pgid = g_current->pid;
+    // New session leader starts without a controlling terminal.
+    // The tty fg_pgid is updated when the shell calls TIOCSCTTY/TIOCSPGRP.
     return (uint64_t)g_current->sid;
 }
 
@@ -1679,13 +1649,17 @@ static uint64_t sys_getsid(uint64_t pid_arg) {
 
 // ── tcgetpgrp / tcsetpgrp ─────────────────────────────────────────────────
 static uint64_t sys_tcgetpgrp(uint64_t fd) {
-    (void)fd; // we have one global tty
-    return (uint64_t)g_tty_fg_pgid;
+    (void)fd;
+    tty_t* tty = tty_get_ctty();
+    if (!tty) tty = &g_ttys[0];
+    return (uint64_t)tty->fg_pgid;
 }
 
 static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
     (void)fd;
-    g_tty_fg_pgid = (uint32_t)pgid;
+    tty_t* tty = tty_get_ctty();
+    if (!tty) tty = &g_ttys[0];
+    tty->fg_pgid = (uint32_t)pgid;
     return 0;
 }
 
@@ -1699,31 +1673,44 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
         !g_current->files_shared->fd_table[fd] && fd > 2)
         return (uint64_t)-EBADF;
 
+    // Resolve which tty this fd refers to. For now tty0 is the only one.
+    tty_t* tty = &g_ttys[0];
+
     switch (request) {
     case TIOCGWINSZ:
-        return (copy_to_user((void*)arg, &g_tty_winsize, sizeof(g_tty_winsize)) == 0)
+        return (copy_to_user((void*)arg, &tty->winsize, sizeof(tty->winsize)) == 0)
                ? 0 : (uint64_t)-EFAULT;
-    case TIOCSWINSZ:
-        return (copy_from_user(&g_tty_winsize, (const void*)arg, sizeof(g_tty_winsize)) == 0)
-               ? 0 : (uint64_t)-EFAULT;
+    case TIOCSWINSZ: {
+        winsize_t ws;
+        if (copy_from_user(&ws, (const void*)arg, sizeof(ws)) != 0)
+            return (uint64_t)-EFAULT;
+        tty->winsize = ws;
+        // Notify foreground pgrp of window size change.
+        if (tty->fg_pgid) signal_send_pgrp(tty->fg_pgid, SIGWINCH);
+        return 0;
+    }
     case TIOCGPGRP:
-        return (copy_to_user((void*)arg, &g_tty_fg_pgid, sizeof(g_tty_fg_pgid)) == 0)
+        return (copy_to_user((void*)arg, &tty->fg_pgid, sizeof(tty->fg_pgid)) == 0)
                ? 0 : (uint64_t)-EFAULT;
     case TIOCSPGRP: {
         uint32_t pg = 0;
         if (copy_from_user(&pg, (const void*)arg, sizeof(pg)) != 0)
             return (uint64_t)-EFAULT;
-        g_tty_fg_pgid = pg;
+        tty->fg_pgid = pg;
         return 0;
     }
     case TCGETS:
-        return (copy_to_user((void*)arg, &g_tty_termios, sizeof(g_tty_termios)) == 0)
+        return (copy_to_user((void*)arg, &tty->termios, sizeof(tty->termios)) == 0)
                ? 0 : (uint64_t)-EFAULT;
     case TCSETS:
     case TCSETSW:
-    case TCSETSF:
-        return (copy_from_user(&g_tty_termios, (const void*)arg, sizeof(g_tty_termios)) == 0)
+        return (copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios)) == 0)
                ? 0 : (uint64_t)-EFAULT;
+    case TCSETSF: {
+        int r = copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios));
+        tty_flush_input(tty);
+        return (r == 0) ? 0 : (uint64_t)-EFAULT;
+    }
     case TCSBRK:
     case TCXONC:
     case TCFLSH:
@@ -1731,14 +1718,12 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TIOCNXCL:
         return 0;  // Acknowledged, no-op.
     case TIOCSCTTY:
-        // Claim controlling terminal for this session.
-        g_tty_fg_pgid = g_current->pgid;
+        tty_set_ctty(tty);
         return 0;
     case TIOCGSERIAL:
-        // Return all-zeros serial_struct — bash checks this on some paths.
         if (arg) {
             uint8_t* p = (uint8_t*)arg;
-            for (int i = 0; i < 60; i++) p[i] = 0; // sizeof(serial_struct) ≈ 60
+            for (int i = 0; i < 60; i++) p[i] = 0;
         }
         return 0;
     default:

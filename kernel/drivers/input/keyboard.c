@@ -3,7 +3,7 @@
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
-#include "kheap.h"
+#include "tty.h"
 
 #define KB_DATA_PORT 0x60
 
@@ -50,46 +50,18 @@ static char extended_key(uint8_t sc) {
     }
 }
 
-// ── Ring buffer ───────────────────────────────────────────────────────────
-#define KBUF_SIZE 64
-static char      s_buf[KBUF_SIZE];
-static uint32_t  s_head = 0;
-static uint32_t  s_tail = 0;
+// ── Public API (legacy — backed by TTY; kept for /dev/kbd in vfs.c) ───────
+// Translated chars now flow through the TTY line discipline; these stubs
+// exist so vfs.c's kbd_read compiles.  Use /dev/tty instead.
 
-// Single waiter: the one process sleeping on keyboard_wait().
-static task_t* s_waiter = NULL;
-
-static void buf_push(char c) {
-    uint32_t next = (s_tail + 1) % KBUF_SIZE;
-    if (next == s_head) return;  // full — drop
-    s_buf[s_tail] = c;
-    s_tail = next;
-    if (s_waiter) {
-        sched_wake(s_waiter);
-        s_waiter = NULL;
-    }
-}
-
-// ── Public API ────────────────────────────────────────────────────────────
-
-char keyboard_getchar(void) {
-    if (s_head == s_tail) return 0;
-    char c = s_buf[s_head];
-    s_head = (s_head + 1) % KBUF_SIZE;
-    return c;
-}
+char keyboard_getchar(void) { return 0; }
 
 char keyboard_wait(void) {
+    // Block via tty — just sleep until the tty has a char.
     for (;;) {
-        __asm__ volatile("cli");
         char c = keyboard_getchar();
-        if (c) {
-            __asm__ volatile("sti");
-            return c;
-        }
-        s_waiter = g_current;
-        sched_sleep();  /* do_switch re-enables interrupts */
-        s_waiter = NULL;
+        if (c) return c;
+        sched_sleep();
     }
 }
 
@@ -168,7 +140,7 @@ static void keyboard_thread_fn(void) {
                 if (sc == 0x9D) { s_ctrl = 0; continue; }
                 if (!s_grabbed && !(sc & 0x80)) {
                     char c = extended_key(sc);
-                    if (c) buf_push(c);
+                    if (c) tty_input_char(&g_ttys[0], c);
                 }
                 continue;
             }
@@ -182,12 +154,15 @@ static void keyboard_thread_fn(void) {
             if (!s_grabbed && sc < 88) {
                 char c = s_shift ? s_shifted[sc] : s_unshifted[sc];
                 if (c) {
+                    char out;
                     if (s_ctrl && c >= 'a' && c <= 'z')
-                        buf_push((char)(c - 'a' + 1));
+                        out = (char)(c - 'a' + 1);
                     else if (s_ctrl && c >= 'A' && c <= 'Z')
-                        buf_push((char)(c - 'A' + 1));
+                        out = (char)(c - 'A' + 1);
                     else
-                        buf_push(c);
+                        out = c;
+                    // Route through TTY line discipline.
+                    tty_input_char(&g_ttys[0], out);
                 }
             }
         }
