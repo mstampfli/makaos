@@ -6,8 +6,9 @@
 // At reset, master maps to vectors 8-15 (colliding with CPU exceptions).
 // pic_init() remaps them so IRQ0 → 0x20, IRQ8 → 0x28 (standard for BIOS).
 //
-// NOTE: When an APIC is available, the 8259A should be disabled (masked) and
-// the APIC used instead.  For now we use the PIC for simplicity.
+// When an APIC (LAPIC + IOAPIC) is available, the 8259A is disabled after
+// remapping by calling pic_disable().  The PIC must be remapped first so
+// its vectors don't collide with CPU exceptions even when masked.
 
 #define PIC1_CMD  0x20   // master PIC: command port
 #define PIC1_DATA 0x21   // master PIC: data / IMR (interrupt mask register)
@@ -28,3 +29,9 @@ void pic_mask(uint8_t irq);
 
 // Unmask (enable) a specific IRQ line.
 void pic_unmask(uint8_t irq);
+
+// Disable the 8259A PICs entirely by masking all lines.
+// Call this after the IOAPIC and LAPIC are initialised and all ISA IRQs have
+// been routed through the IOAPIC.  The PIC hardware remains present but will
+// never deliver another interrupt to the CPU.
+void pic_disable(void);
