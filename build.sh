@@ -136,6 +136,10 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_shell.o" \
+   -o "$BUILD_DIR/user_shell.elf"
+
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USERLAND_DIR/apps/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
@@ -329,6 +333,10 @@ if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_tone.elf bin/tone" > /dev/null 2>&1 || true
+fi
+if [ -f "$BUILD_DIR/user_shell.elf" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_shell.elf bin/shell" > /dev/null 2>&1 || true
+    echo "[+] shell ELF installed at bin/shell"
 fi
 if [ -f "$BUILD_DIR/user_doom.elf" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_doom.elf bin/doom" > /dev/null 2>&1 || true

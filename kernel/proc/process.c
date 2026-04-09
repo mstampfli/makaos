@@ -4,6 +4,7 @@
 #include "mm.h"
 #include "kheap.h"
 #include "vfs.h"
+#include "sched.h"
 
 // ── task_mm_t helpers ─────────────────────────────────────────────────────
 
@@ -117,7 +118,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
                               task_mm_t* mm, task_files_t* files) {
     t->pid              = pid;
     t->tgid             = pid;
-    t->ppid             = 0;
+    t->ppid             = g_current ? g_current->pid : 0;
     t->pgid             = pid;   // new task is its own process group leader
     t->sid              = pid;   // and its own session leader
     t->flags            = flags;

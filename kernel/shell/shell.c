@@ -655,20 +655,37 @@ preload_done:
     kfree(buf);
 }
 
-// ── Shell main loop ───────────────────────────────────────────────────────
+// ── Shell launcher ────────────────────────────────────────────────────────
+// Loads /bin/shell as a user process and schedules it.
+// Falls back to the built-in shell if /bin/shell is not found.
 void shell_fn(void) {
+    static const char* shell_argv[] = { "/bin/shell", NULL };
+    static const char* shell_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+
+    uint32_t pid = pid_alloc();
+    task_t* t = elf_exec_from_ext2("/bin/shell", pid, shell_argv, shell_envp);
+    if (t) {
+        sched_add(t);
+        // This kthread's job is done — mark zombie and yield forever.
+        if (g_current) {
+            g_current->exit_code = 0;
+            g_current->state = TASK_ZOMBIE;
+            sched_add_zombie(g_current);
+        }
+        for (;;) sched_yield();
+    }
+
+    // Fallback: /bin/shell not found — run the built-in kernel shell.
     term_clear();
-    term_set_color(0x0B);
-    term_puts("MakaOS Shell v0.2");
+    term_set_color(0x0C);
+    term_puts("[!] /bin/shell not found — running built-in shell\n");
     term_set_color(0x0F);
-    term_puts(" -- type 'help' for commands\n\n");
 
     char line[256];
     char* argv[16];
 
     for (;;) {
-        // Show cwd in prompt.
-        term_set_color(0x0A); // green
+        term_set_color(0x0A);
         term_puts("MakaOS:");
         term_puts(g_cwd);
         term_puts("> ");
