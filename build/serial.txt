@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x000000000004A4F3
+kernel.bin size=0x000000000004A4F7
 kernel_phys=0x000000000BE00000
-kernel loaded, bytes=0x000000000004A4F3
+kernel loaded, bytes=0x000000000004A4F7
 phys_ceiling=0x0000010000000000
 pml4_phys=0x000000000DDFA000
 Calling ExitBootServices...

@@ -3,8 +3,8 @@
 #include "net.h"
 #include "virtio_net.h"
 #include "skbuff.h"
-#include "../common.h"
-#include "../kheap.h"
+#include "common.h"
+#include "kheap.h"
 
 // ── ARP packet layout (RFC 826, §3) ──────────────────────────────────────
 typedef struct __attribute__((packed)) {
