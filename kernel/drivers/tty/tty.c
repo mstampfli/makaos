@@ -106,6 +106,20 @@ void tty_input_char(tty_t* tty, char c) {
 
     // ── Canonical mode (ICANON) ──────────────────────────────────────────
     if (lflag & ICANON) {
+        // ── ANSI escape sequence filter ───────────────────────────────────
+        // Strip CSI sequences (ESC [ ... letter) and OSC/SS3 sequences so
+        // arrow keys and other function keys don't appear as raw text.
+        if ((uint8_t)c == 0x1B) { tty->esc_state = 1; return; }
+        if (tty->esc_state == 1) {
+            tty->esc_state = ((uint8_t)c == '[' || (uint8_t)c == 'O') ? 2 : 0;
+            return;
+        }
+        if (tty->esc_state == 2) {
+            // Consume until final byte (0x40–0x7E).
+            if ((uint8_t)c >= 0x40 && (uint8_t)c <= 0x7E) tty->esc_state = 0;
+            return;
+        }
+
         // Erase character (backspace / DEL).
         if ((uint8_t)c == cc[VERASE] || c == '\b') {
             ldisc_erase_char(tty);

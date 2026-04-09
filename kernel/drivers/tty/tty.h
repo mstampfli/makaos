@@ -54,6 +54,10 @@ typedef struct tty_t {
     // Called by the line discipline to echo input or for tty write().
     void (*write_char)(struct tty_t* tty, uint8_t c);
 
+    // ── ANSI escape sequence filter state (canonical mode) ───────────────
+    // 0=normal, 1=saw ESC, 2=inside CSI (ESC [)
+    uint8_t esc_state;
+
     // ── TTY name (e.g. "tty0") ────────────────────────────────────────────
     char name[16];
 } tty_t;
