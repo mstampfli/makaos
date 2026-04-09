@@ -33,11 +33,11 @@ static short buf[CHUNK_FRAMES * CHANNELS];
 // pi approximation (we don't have M_PI from math.h guaranteed here).
 #define MY_PI 3.14159265358979323846
 
-void _start(void) {
+int main(void) {
     int fd = open("/dev/dsp", O_WRONLY, 0);
     if (fd < 0) {
         printf("tone: cannot open /dev/dsp\n");
-        return;
+        return 0;
     }
 
     int total_frames = SAMPLE_RATE * DURATION_SEC;

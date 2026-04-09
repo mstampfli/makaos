@@ -360,7 +360,7 @@ static void show_game_over(void) {
 
 // ── main ─────────────────────────────────────────────────────────────────
 
-void _start(void) {
+int main(void) {
     // Get framebuffer info
     syscall1(SYS_FB_INFO, (uint64_t)&g_fb);
     g_cols = g_fb.width  / 8;
