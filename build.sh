@@ -30,7 +30,6 @@ KERNEL_INCLUDES=(
   -I "$KERNEL_DIR/acpi"
   -I "$KERNEL_DIR/time"
   -I "$KERNEL_DIR/syscall"
-  -I "$KERNEL_DIR/shell"
   -I "$KERNEL_DIR/net"
   -I "$KERNEL_DIR/arch/x86_64"
   -I "$BUILD_DIR"
@@ -224,7 +223,6 @@ KERNEL_SUBDIRS=(
     "$KERNEL_DIR/acpi"
     "$KERNEL_DIR/time"
     "$KERNEL_DIR/syscall"
-    "$KERNEL_DIR/shell"
     "$KERNEL_DIR/arch/x86_64"
     "$KERNEL_DIR/net"
 )
