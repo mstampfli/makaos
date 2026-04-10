@@ -15,8 +15,16 @@
 #include "tsc.h"
 #include "fb.h"
 #include "tty.h"
+#include "evdev.h"
+#include "proc.h"
 #include "net/socket.h"
 #include "net/net.h"
+#include "cred.h"
+#include "rights.h"
+#include "pledge.h"
+#include "unveil.h"
+#include "perm.h"
+#include "ksec.h"
 
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
@@ -84,6 +92,11 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     vfs_file_t* f = g_current->files_shared->fd_table[fd];
     if (!f) return (uint64_t)-EBADF;
     if (!f->write) return (uint64_t)-EBADF;
+    // Rights check: only enforce if rights field is non-zero (stamped at open).
+    // Zero means the fd was opened before rights stamping existed (legacy path)
+    // or is a device opened via tty_open/evdev_open — treat as fully permitted.
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE))
+        return (uint64_t)-EACCES;
     int64_t r = vfs_write(f, (const void*)buf, len);
     if (r < 0) return (uint64_t)r; // propagate errno from driver (e.g. -EPIPE)
     return (uint64_t)r;
@@ -153,6 +166,9 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         return (uint64_t)-EBADF;
     vfs_file_t* f = g_current->files_shared->fd_table[fd];
     if (!f) return (uint64_t)-EBADF;
+    // Rights check: zero means legacy/device fd — treat as permitted.
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_READ))
+        return (uint64_t)-EACCES;
     // Pre-fault the user buffer so kernel writes into it don't kernel-panic.
     user_buf_prefault((virt_addr_t)buf, (size_t)len);
     int64_t r = vfs_read(f, (void*)buf, len);
@@ -192,6 +208,15 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     vfs_file_t* f = NULL;
 
+    // /proc/ dispatch — synthesize from kernel state, no disk I/O.
+    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
+        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
+        f = proc_open(path);
+        if (!f) return (uint64_t)-ENOENT;
+        // proc files are read-only; flags/cloexec still apply below.
+        goto got_file;
+    }
+
     // /dev/ dispatch — map device names to built-in vfs_file_t objects.
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
         const char* dev = path + 5;
@@ -208,9 +233,19 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
         uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
                              && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+        // /dev/input/event0
+        uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
+                             && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
+                             && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
+                             && dev[12]=='\0');
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
+        else if (match_event0) f = evdev_open();
+        // LEGACY: /dev/kbd — direct polling, no line discipline, never delivers input.
+        //   NEW PATH: open /dev/tty or /dev/tty0 for TTY input (N_TTY),
+        //             /dev/input/event0 for raw evdev streams,
+        //             /dev/kbdraw for raw PS/2 scancodes.
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
         else if (match_mouse)  f = vfs_mouse_open();
@@ -220,6 +255,61 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_urnd)   f = vfs_urandom_open();
         else return (uint64_t)-ENOENT;
     } else {
+        // ── DAC permission check on ext2 files ───────────────────────────
+        // Resolve the inode first so we can check mode bits before handing
+        // out the fd.  This runs before ext2_open so we never give the caller
+        // a file descriptor they're not allowed to have.
+        uint32_t check_ino = ext2_lookup_path(path);
+        if (check_ino) {
+            // File exists — check against caller's credentials.
+            ext2_inode_t check_inode;
+            if (ext2_read_inode(check_ino, &check_inode)) {
+                inode_perm_t ip = {
+                    .uid      = check_inode.i_uid,
+                    .gid      = check_inode.i_gid,
+                    .mode     = check_inode.i_mode & 0x1FF,  // rwxrwxrwx bits
+                    .inode_nr = check_ino,
+                    .dev      = 0,   // single ext2 partition, not nosuid
+                    .nosuid   = 0,
+                };
+                uint8_t need_perm = ACL_PERM_READ;
+                int oflags_acc = (int)(flags & 3);
+                if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR)
+                    need_perm |= ACL_PERM_WRITE;
+                int pr = vfs_check_perm(&ip, &g_current->cred, need_perm);
+                if (pr != 0) return (uint64_t)(int64_t)pr; // -EACCES
+            }
+        } else if (!(flags & O_CREAT)) {
+            // File does not exist and O_CREAT not requested.
+            return (uint64_t)-ENOENT;
+        } else {
+            // O_CREAT: check write permission on the parent directory.
+            // Find last '/' to get parent path.
+            char parent[512];
+            uint64_t plen = 0;
+            while (path[plen]) plen++;
+            uint64_t slash = plen;
+            while (slash > 0 && path[slash] != '/') slash--;
+            if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
+            else { for (uint64_t k = 0; k < slash; k++) parent[k] = path[k]; parent[slash] = '\0'; }
+            uint32_t dir_ino = ext2_lookup_path(parent);
+            if (dir_ino) {
+                ext2_inode_t dir_inode;
+                if (ext2_read_inode(dir_ino, &dir_inode)) {
+                    inode_perm_t ip = {
+                        .uid      = dir_inode.i_uid,
+                        .gid      = dir_inode.i_gid,
+                        .mode     = dir_inode.i_mode & 0x1FF,
+                        .inode_nr = dir_ino,
+                        .dev      = 0,
+                        .nosuid   = 0,
+                    };
+                    int pr = vfs_check_perm(&ip, &g_current->cred, ACL_PERM_WRITE);
+                    if (pr != 0) return (uint64_t)(int64_t)pr;
+                }
+            }
+        }
+
         f = ext2_open(path);
         if (f && (flags & O_CREAT) && (flags & O_EXCL)) {
             // O_CREAT|O_EXCL: file must not already exist.
@@ -236,7 +326,27 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     if (!f) return (uint64_t)-ENOENT;
 
-    // Enforce access mode: strip write for O_RDONLY.
+got_file:
+    // ── unveil check ─────────────────────────────────────────────────────
+    // Paths not in the unveil table return ENOENT (as if they don't exist).
+    // /dev/ and /proc/ are exempt (virtual, always accessible via this path).
+    if (g_current->unveil.count > 0 &&
+        !(path[1]=='d' && path[2]=='e' && path[3]=='v') &&
+        !(path[1]=='p' && path[2]=='r' && path[3]=='o' && path[4]=='c')) {
+        uint8_t need_u = UNVEIL_READ;
+        int oflags_acc = (int)(flags & 3);
+        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) need_u |= UNVEIL_WRITE;
+        if (flags & O_CREAT)                                 need_u |= UNVEIL_CREATE;
+        if (!unveil_check(&g_current->unveil, path, need_u)) {
+            vfs_close(f);
+            return (uint64_t)-ENOENT;
+        }
+    }
+
+    // ── Stamp fd rights from open flags ───────────────────────────────────
+    f->rights = rights_from_oflags((int)(flags & 3), 0 /* exec_ok: not checked here */);
+
+    // Enforce access mode: strip write for O_RDONLY (belt-and-suspenders).
     if ((flags & 3) == O_RDONLY) f->write = NULL;
 
     // Propagate O_APPEND/O_NONBLOCK into vfs_file_t.flags.
@@ -371,9 +481,27 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     return new_brk;
 }
 
+// ── sys_exit helpers ──────────────────────────────────────────────────────
+
+typedef struct { uint32_t dead_pid; uint32_t init_pid; } reparent_ctx_t;
+
+static void reparent_cb(task_t* t, void* data) {
+    reparent_ctx_t* ctx = (reparent_ctx_t*)data;
+    if (t->ppid == ctx->dead_pid)
+        t->ppid = ctx->init_pid;
+}
+
 // ── sys_exit ──────────────────────────────────────────────────────────────
+// Reparent all children to PID 1 (init/shell) before zombifying.
+// This matches POSIX: orphaned children are adopted by init, not killed.
+// init is responsible for reaping them (or they accumulate as zombies —
+// acceptable since init in our system is the shell which calls waitpid).
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
+        // Reparent children: walk every task and point ppid → 1.
+        reparent_ctx_t ctx = { g_current->pid, 1 };
+        sched_for_each(reparent_cb, &ctx);
+
         g_current->exit_code = (int32_t)(int)code;
         g_current->state = TASK_ZOMBIE;
         sched_add_zombie(g_current);
@@ -533,6 +661,25 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
     k_envp[envc] = NULL;
 
+    // ── Execute permission check ──────────────────────────────────────────
+    {
+        uint32_t exec_ino = ext2_lookup_path(resolved);
+        if (!exec_ino) goto enoent;
+        ext2_inode_t exec_inode;
+        if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
+        inode_perm_t exec_ip = {
+            .uid      = exec_inode.i_uid,
+            .gid      = exec_inode.i_gid,
+            .mode     = exec_inode.i_mode & 0x1FF,
+            .inode_nr = exec_ino,
+            .dev      = 0,
+            .nosuid   = 0,
+        };
+        uint32_t setuid_uid = 0xFFFFFFFFu;
+        if (vfs_check_exec(&exec_ip, &g_current->cred, &setuid_uid) != 0)
+            goto enoent;  // return EACCES but ENOENT is traditional for no-exec
+    }
+
     // ── Load ELF ──────────────────────────────────────────────────────────
     vfs_file_t* f = ext2_open(resolved);
     if (!f) { goto enoent; }
@@ -624,32 +771,113 @@ enoexec:
 }
 
 // ── sys_spawn ─────────────────────────────────────────────────────────────
-// spawn(path_ptr, pathlen) → child pid, or -1 on error.
+// spawn(path_ptr, argv_ptr, envp_ptr, stdio_ptr) → child pid, or -errno.
+//
 // Loads an ELF from the given absolute ext2 path into a brand-new address
 // space and schedules it.  Parent returns immediately with the child's pid.
-static uint64_t sys_spawn(uint64_t path_ptr, uint64_t pathlen) {
+//
+// path_ptr  — user pointer to NUL-terminated absolute path string
+// argv_ptr  — user pointer to NULL-terminated array of user char* (or 0 → {path, NULL})
+// envp_ptr  — user pointer to NULL-terminated array of user char* (or 0 → default env)
+// stdio_ptr — user pointer to int[3]: stdio fd specs for child's 0/1/2
+//               -1 = inherit that fd from parent
+//               >=0 = dup that specific parent fd
+//               0 (null ptr) = open /dev/tty0 for all three
+static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
+                           uint64_t envp_ptr, uint64_t stdio_ptr) {
     if (!g_current) return (uint64_t)-EINVAL;
-    if (pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+    if (!path_ptr)  return (uint64_t)-EINVAL;
 
-    // Copy path from user space.
+    // ── Copy path ─────────────────────────────────────────────────────────
     char path[256];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    uint64_t plen = 0;
+    while (plen < 255 && upath[plen]) { path[plen] = upath[plen]; plen++; }
+    path[plen] = '\0';
+    if (plen == 0) return (uint64_t)-EINVAL;
 
+    // ── Copy argv (up to 64 args) ─────────────────────────────────────────
+    #define SPAWN_MAX_ARGS 64
+    #define SPAWN_MAX_ARG_LEN 512
+    char* k_argv[SPAWN_MAX_ARGS + 1];
+    uint32_t argc = 0;
+    if (argv_ptr) {
+        const uint64_t* uargv = (const uint64_t*)argv_ptr;
+        while (argc < SPAWN_MAX_ARGS) {
+            uint64_t ustr = uargv[argc];
+            if (!ustr) break;
+            const char* s = (const char*)ustr;
+            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
+            char* ks = kmalloc(l + 1);
+            if (!ks) goto oom_argv;
+            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            ks[l] = '\0';
+            k_argv[argc++] = ks;
+        }
+    }
+    k_argv[argc] = NULL;
+    // If caller passed no argv, synthesise {path, NULL}.
+    if (argc == 0) { k_argv[0] = path; k_argv[1] = NULL; argc = 1; }
+
+    // ── Copy envp (up to 64 vars) ─────────────────────────────────────────
+    #define SPAWN_MAX_ENVS 64
+    char* k_envp[SPAWN_MAX_ENVS + 1];
+    uint32_t envc = 0;
+    if (envp_ptr) {
+        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
+        while (envc < SPAWN_MAX_ENVS) {
+            uint64_t ustr = uenvp[envc];
+            if (!ustr) break;
+            const char* s = (const char*)ustr;
+            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
+            char* ks = kmalloc(l + 1);
+            if (!ks) goto oom_envp;
+            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            ks[l] = '\0';
+            k_envp[envc++] = ks;
+        }
+    }
+    k_envp[envc] = NULL;
+    // Default env if caller passed nothing.
+    const char* def_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    const char* const* final_envp = envc ? (const char* const*)k_envp : def_envp;
+
+    // ── Resolve stdio spec ────────────────────────────────────────────────
+    // stdio_ptr points to int[3]; 0 = open tty0 for all.
+    int stdio[3] = { -1, -1, -1 }; // default: inherit
+    if (stdio_ptr) {
+        const int* us = (const int*)stdio_ptr;
+        stdio[0] = us[0]; stdio[1] = us[1]; stdio[2] = us[2];
+    }
+
+    // ── Launch ────────────────────────────────────────────────────────────
     uint32_t pid = pid_alloc();
-    if (!pid) return (uint64_t)-ENOMEM;
+    if (!pid) goto oom_envp;
 
-    const char* argv[] = { path, NULL };
-    const char* envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
-    task_t* child = elf_exec_from_ext2(path, pid, argv, envp);
+    task_t* child = elf_exec_from_ext2(path, pid,
+                                        (const char* const*)k_argv,
+                                        final_envp, stdio);
     if (!child) {
         pid_free(pid);
+        for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+        if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
         return (uint64_t)-ENOENT;
     }
 
+    // Wire parent-child relationship so waitpid works correctly.
+    child->ppid = g_current->pid;
+
     sched_add(child);
+
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
     return (uint64_t)pid;
+
+oom_envp:
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+oom_argv:
+    if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    return (uint64_t)-ENOMEM;
 }
 
 // ── sys_thread ────────────────────────────────────────────────────────────
@@ -735,34 +963,43 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
 
 // ── sys_wait ──────────────────────────────────────────────────────────────
 // waitpid(pid, *status, options):
-//   pid == -1: wait for any child.
-//   options & WNOHANG: return 0 immediately if no child has exited.
-// Returns child pid, 0 (WNOHANG + not ready), or -errno.
+//   pid > 0 : wait for that specific child (must be a child of the caller).
+//   pid == -1: wait for any child of the calling process.
+//   options & WNOHANG: return 0 immediately if no child ready.
+// Returns reaped child pid, 0 (WNOHANG + not ready), or -errno.
 static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options) {
-    // pid == -1 (any child) maps to internal pid=0.
-    int64_t signed_pid = (int64_t)pid_arg;
-    uint32_t pid = (signed_pid == -1) ? 0 : (uint32_t)pid_arg;
+    if (!g_current) return (uint64_t)-EINVAL;
 
-    if (options & WNOHANG) {
-        if (!sched_poll_pid(pid)) return 0; // not ready
-    } else {
-        sched_wait_pid(pid);
-    }
+    int64_t  signed_pid  = (int64_t)pid_arg;
+    uint32_t my_pid      = g_current->pid;
+    // target_pid: 0 = any child, >0 = specific child
+    uint32_t target_pid  = (signed_pid == -1) ? 0 : (uint32_t)signed_pid;
 
-    task_t* z = sched_reap_zombie(pid);
-    if (z) {
-        int32_t code = z->exit_code;
-        uint32_t child_pid = z->pid;
-        process_destroy(z);
-        if (status_ptr) {
-            int* sp = (int*)(uintptr_t)status_ptr;
-            *sp = (int)((code & 0xFF) << 8);
+    for (;;) {
+        // Try to reap a zombie child.
+        task_t* z = sched_reap_child_zombie(my_pid, target_pid);
+        if (z) {
+            int32_t  code      = z->exit_code;
+            uint32_t child_pid = z->pid;
+            process_destroy(z);
+            if (status_ptr) {
+                int* sp = (int*)(uintptr_t)status_ptr;
+                *sp = (int)((code & 0xFF) << 8);
+            }
+            return (uint64_t)child_pid;
         }
-        return (uint64_t)child_pid;
+
+        // No zombie child yet.
+        if (options & WNOHANG) return 0;
+
+        // Verify the target still exists as our child (otherwise ECHILD).
+        if (target_pid != 0) {
+            task_t* alive = sched_find_pid(target_pid);
+            if (!alive || alive->ppid != my_pid) return (uint64_t)-ECHILD;
+        }
+        // Otherwise yield and try again on the next schedule.
+        sched_yield();
     }
-    // Child gone (killed by signal, no zombie).
-    if (status_ptr) { int* sp = (int*)(uintptr_t)status_ptr; *sp = 0; }
-    return (signed_pid == -1) ? (uint64_t)-ECHILD : pid_arg;
 }
 
 // ── sys_getppid ───────────────────────────────────────────────────────────
@@ -792,7 +1029,37 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) return (uint64_t)-ENOMEM;
 
-    int count = ext2_readdir(path, kbuf, (int)max_entries);
+    int count;
+    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
+        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
+        count = proc_readdir(path, kbuf, (int)max_entries);
+    } else {
+        count = ext2_readdir(path, kbuf, (int)max_entries);
+        if (count < 0) { kfree(kbuf); return (uint64_t)-ENOENT; }
+        // Inject virtual top-level directories into root listing.
+        if (path[0] == '/' && path[1] == '\0') {
+            static const char* virt_dirs[] = { "proc", "dev", NULL };
+            for (int v = 0; virt_dirs[v] && count < (int)max_entries; v++) {
+                // Only inject if not already present on ext2 (shouldn't be, but be safe).
+                int already = 0;
+                for (int j = 0; j < count; j++) {
+                    const char* a = kbuf[j].name; const char* b = virt_dirs[v];
+                    while (*a && *b && *a == *b) { a++; b++; }
+                    if (*a == '\0' && *b == '\0') { already = 1; break; }
+                }
+                if (!already) {
+                    const char* n = virt_dirs[v];
+                    int ni = 0;
+                    while (n[ni]) { kbuf[count].name[ni] = n[ni]; ni++; }
+                    kbuf[count].name[ni]     = '\0';
+                    kbuf[count].inode_num    = 0xF0000000 + (uint32_t)v;
+                    kbuf[count].size         = 0;
+                    kbuf[count].is_dir       = 1;
+                    count++;
+                }
+            }
+        }
+    }
     if (count < 0) { kfree(kbuf); return (uint64_t)-ENOENT; }
 
     ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
@@ -822,6 +1089,14 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
         st->is_dir = 1;
         st->_pad   = 0;
         return 0;
+    }
+
+    // /proc/ paths — stat from kernel state.
+    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
+        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
+        stat_t* st = (stat_t*)stat_ptr;
+        int r = proc_stat(path, st);
+        return r == 0 ? 0 : (uint64_t)-ENOENT;
     }
 
     // Split into parent + basename, then scan parent entries.
@@ -1544,9 +1819,15 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
         for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
     }
 
-    // /dev/* always exists.
-    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/')
+    // /dev/* always exists (virtual device directory).
+    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v'
+        && (path[4]=='/' || path[4]=='\0'))
         return 0;
+
+    // /proc/* — stat from kernel state.
+    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
+        && path[4]=='c' && (path[5]=='/' || path[5]=='\0'))
+        return 0; // always exists (checked by sys_stat which calls proc_stat)
 
     vfs_file_t* f = ext2_open(path);
     if (!f) return (uint64_t)-ENOENT;
@@ -1583,19 +1864,261 @@ static uint64_t sys_umask(uint64_t mask) {
     return (uint64_t)old;
 }
 
-// ── Identity syscalls (single-user OS: always uid=0, root) ───────────────
-static uint64_t sys_getuid(void)   { return 0; }
-static uint64_t sys_geteuid(void)  { return 0; }
-static uint64_t sys_getgid(void)   { return 0; }
-static uint64_t sys_getegid(void)  { return 0; }
+// ── Identity syscalls ─────────────────────────────────────────────────────
+static uint64_t sys_getuid(void)  { return g_current ? g_current->cred.ruid : 0; }
+static uint64_t sys_geteuid(void) { return g_current ? g_current->cred.euid : 0; }
+static uint64_t sys_getgid(void)  { return g_current ? g_current->cred.rgid : 0; }
+static uint64_t sys_getegid(void) { return g_current ? g_current->cred.egid : 0; }
+
 static uint64_t sys_getgroups(uint64_t size, uint64_t list_ptr) {
-    // We have one supplementary group: gid 0.
+    if (!g_current) return (uint64_t)-EINVAL;
     if ((int64_t)size < 0) return (uint64_t)-EINVAL;
-    if (size == 0) return 1; // just return count
-    uint32_t gid = 0;
-    if (copy_to_user((void*)list_ptr, &gid, sizeof(gid)) != 0)
+    uint8_t n = g_current->cred.ngroups;
+    if (size == 0) return (uint64_t)n;
+    if (size < (uint64_t)n) return (uint64_t)-EINVAL;
+    if (copy_to_user((void*)list_ptr, g_current->cred.supplemental,
+                     n * sizeof(uint32_t)) != 0)
         return (uint64_t)-EFAULT;
-    return 1;
+    return (uint64_t)n;
+}
+
+// ── sys_setuid / seteuid / setgid / setegid / setreuid / setregid ─────────
+//
+// In-slot transitions (within the three POSIX slots) are handled directly.
+// Genuine escalation (new uid not in {ruid, euid, suid}) → ask ksec.
+
+static uint64_t sys_setuid(uint64_t uid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (cred_setuid(&g_current->cred, (uint32_t)uid) == 0) return 0;
+    // Escalation path: ask ksec.
+    if (!ksec_agent_present()) return (uint64_t)-EPERM;
+    ksec_request_t req = {0};
+    ksec_response_t resp = {0};
+    req.seq        = ksec_next_seq();
+    req.op         = KSEC_OP_SETUID;
+    req.caller_pid = g_current->pid;
+    req.caller_uid = g_current->cred.euid;
+    req.caller_gid = g_current->cred.egid;
+    req.target_uid = (uint32_t)uid;
+    if (ksec_request(&req, &resp) != 0) return (uint64_t)-EPERM;
+    if (resp.verdict != KSEC_VERDICT_ALLOW) return (uint64_t)-EPERM;
+    // Root-style: set all three.
+    g_current->cred.ruid = g_current->cred.euid = g_current->cred.suid =
+        resp.granted_euid;
+    return 0;
+}
+
+static uint64_t sys_seteuid(uint64_t euid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (cred_seteuid(&g_current->cred, (uint32_t)euid) == 0) return 0;
+    if (!ksec_agent_present()) return (uint64_t)-EPERM;
+    ksec_request_t req = {0};
+    ksec_response_t resp = {0};
+    req.seq        = ksec_next_seq();
+    req.op         = KSEC_OP_SETEUID;
+    req.caller_pid = g_current->pid;
+    req.caller_uid = g_current->cred.euid;
+    req.caller_gid = g_current->cred.egid;
+    req.target_uid = (uint32_t)euid;
+    if (ksec_request(&req, &resp) != 0) return (uint64_t)-EPERM;
+    if (resp.verdict != KSEC_VERDICT_ALLOW) return (uint64_t)-EPERM;
+    g_current->cred.euid = resp.granted_euid;
+    return 0;
+}
+
+static uint64_t sys_setgid(uint64_t gid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (cred_setgid(&g_current->cred, (uint32_t)gid) == 0) return 0;
+    return (uint64_t)-EPERM;   // group escalation not via ksec currently
+}
+
+static uint64_t sys_setegid(uint64_t egid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (cred_setegid(&g_current->cred, (uint32_t)egid) == 0) return 0;
+    return (uint64_t)-EPERM;
+}
+
+static uint64_t sys_setreuid(uint64_t ruid, uint64_t euid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    cred_t* c = &g_current->cred;
+    // POSIX: -1 means "leave unchanged".
+    uint32_t new_ruid = (ruid == (uint64_t)-1) ? c->ruid : (uint32_t)ruid;
+    uint32_t new_euid = (euid == (uint64_t)-1) ? c->euid : (uint32_t)euid;
+    // Root may set any combination.
+    if (!cred_is_root(c)) {
+        // Non-root: new_ruid must be in {ruid, euid}, new_euid must be in {ruid, euid, suid}.
+        int ruid_ok = (new_ruid == c->ruid || new_ruid == c->euid);
+        int euid_ok = (new_euid == c->ruid || new_euid == c->euid || new_euid == c->suid);
+        if (!ruid_ok || !euid_ok) return (uint64_t)-EPERM;
+    }
+    // If ruid changed or euid != old ruid, update suid.
+    if (new_ruid != c->ruid || new_euid != c->ruid)
+        c->suid = new_euid;
+    c->ruid = new_ruid;
+    c->euid = new_euid;
+    return 0;
+}
+
+static uint64_t sys_setregid(uint64_t rgid, uint64_t egid) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    cred_t* c = &g_current->cred;
+    uint32_t new_rgid = (rgid == (uint64_t)-1) ? c->rgid : (uint32_t)rgid;
+    uint32_t new_egid = (egid == (uint64_t)-1) ? c->egid : (uint32_t)egid;
+    if (!cred_is_root(c)) {
+        int rgid_ok = (new_rgid == c->rgid || new_rgid == c->egid);
+        int egid_ok = (new_egid == c->rgid || new_egid == c->egid || new_egid == c->sgid);
+        if (!rgid_ok || !egid_ok) return (uint64_t)-EPERM;
+    }
+    if (new_rgid != c->rgid || new_egid != c->rgid)
+        c->sgid = new_egid;
+    c->rgid = new_rgid;
+    c->egid = new_egid;
+    return 0;
+}
+
+static uint64_t sys_setgroups(uint64_t size, uint64_t list_ptr) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (!cred_is_root(&g_current->cred)) return (uint64_t)-EPERM;
+    if (size > CRED_NGROUPS_MAX) return (uint64_t)-EINVAL;
+    if (size > 0 && !list_ptr) return (uint64_t)-EFAULT;
+    uint32_t buf[CRED_NGROUPS_MAX];
+    if (size > 0 && copy_from_user(buf, (const void*)list_ptr,
+                                    size * sizeof(uint32_t)) != 0)
+        return (uint64_t)-EFAULT;
+    uint8_t i;
+    for (i = 0; i < (uint8_t)size; i++)
+        g_current->cred.supplemental[i] = buf[i];
+    g_current->cred.ngroups = (uint8_t)size;
+    return 0;
+}
+
+// ── sys_pledge ────────────────────────────────────────────────────────────
+// pledge(mask) → 0 or -errno
+// Restricts the process to the given syscall groups.  AND-only — irreversible.
+static uint64_t sys_pledge(uint64_t mask) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    g_current->pledge_mask = pledge_restrict(g_current->pledge_mask, (uint32_t)mask);
+    return 0;
+}
+
+// ── sys_unveil ────────────────────────────────────────────────────────────
+// unveil(path_ptr, pathlen, perms) → 0 or -errno
+static uint64_t sys_unveil(uint64_t path_ptr, uint64_t pathlen, uint64_t perms) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (pathlen == 0 || pathlen >= UNVEIL_PATH_MAX) return (uint64_t)-EINVAL;
+    char path[UNVEIL_PATH_MAX];
+    const char* upath = (const char*)path_ptr;
+    uint64_t i;
+    for (i = 0; i < pathlen; i++) path[i] = upath[i];
+    path[pathlen] = '\0';
+    int r = unveil_add(&g_current->unveil, path, (uint8_t)perms);
+    if (r != 0) return (uint64_t)(int64_t)r;
+    return 0;
+}
+
+// unveil_lock() → 0
+static uint64_t sys_unveil_lock(void) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    unveil_lock(&g_current->unveil);
+    return 0;
+}
+
+// ── sys_restrict_fd ───────────────────────────────────────────────────────
+// restrict_fd(fd, rights_mask) → 0 or -errno
+// ANDs the fd's rights bitmask with `rights_mask`.  Irrevocable downgrade.
+static uint64_t sys_restrict_fd(uint64_t fd, uint64_t rights_mask) {
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* files = g_current->files_shared;
+    if (fd >= files->fd_capacity || !files->fd_table[fd])
+        return (uint64_t)-EBADF;
+    files->fd_table[fd]->rights = rights_restrict(files->fd_table[fd]->rights,
+                                                    (uint32_t)rights_mask);
+    return 0;
+}
+
+// ── sys_sendfd ────────────────────────────────────────────────────────────
+// sendfd(sock_fd, target_fd, new_rights) → 0 or -errno
+// Transfers target_fd over the Unix socket sock_fd with at most `new_rights`
+// (which must be a subset of target_fd's current rights).
+// The receiving side calls sys_recvfd to get a new fd stamped with new_rights.
+//
+// Implementation note: real SCM_RIGHTS would go through the socket layer.
+// For now we implement a simplified kernel-mediated transfer via a pending
+// slot on the target task (looked up by socket peer pid).  Full SCM_RIGHTS
+// integration with the net/socket layer is the production path.
+static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
+                            uint64_t new_rights) {
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* files = g_current->files_shared;
+
+    // Validate sock_fd.
+    if (sock_fd >= files->fd_capacity || !files->fd_table[sock_fd])
+        return (uint64_t)-EBADF;
+    vfs_file_t* sock = files->fd_table[sock_fd];
+    if (!rights_check(sock->rights, RIGHT_SEND_FD))
+        return (uint64_t)-EPERM;
+
+    // Validate target_fd.
+    if (target_fd_num >= files->fd_capacity || !files->fd_table[target_fd_num])
+        return (uint64_t)-EBADF;
+    vfs_file_t* target_f = files->fd_table[target_fd_num];
+
+    // new_rights must be a subset of target_fd's rights.
+    if (!rights_check(target_f->rights, (uint32_t)new_rights &
+                       target_f->rights))
+        return (uint64_t)-EPERM;
+    if (((uint32_t)new_rights & ~target_f->rights) != 0)
+        return (uint64_t)-EPERM;
+
+    // Stamp the attenuated rights on the dup'd description.
+    // The actual transfer to the peer process is handled by the socket layer
+    // which reads this from the pending ancillary data queue.
+    // For correctness we stamp new_rights on a dup and attach to sock ctx.
+    // This requires socket layer cooperation — stubbed here with ENOSYS
+    // until the socket layer exposes an ancdata API.
+    // The rights subset enforcement is in place; the wire transfer is the
+    // only missing piece.
+    (void)sock;
+    return (uint64_t)-ENOSYS;   // wire transfer: needs socket ancdata support
+}
+
+// sys_recvfd — symmetric; stubbed same reason.
+static uint64_t sys_recvfd(uint64_t sock_fd) {
+    (void)sock_fd;
+    return (uint64_t)-ENOSYS;
+}
+
+// ── sys_register_policy_agent ─────────────────────────────────────────────
+// register_policy_agent(read_fd, write_fd) → 0 or -errno
+// Boot-only, uid=0 only.  Registers the ksec daemon as the policy agent.
+static uint64_t sys_register_policy_agent(uint64_t read_fd, uint64_t write_fd) {
+    if (!g_current) return (uint64_t)-EINVAL;
+
+    // Only uid=0 processes may register.
+    if (g_current->cred.euid != 0) return (uint64_t)-EPERM;
+
+    // Only allowed if no agent is registered yet (enforced inside ksec_register_agent).
+    task_files_t* files = g_current->files_shared;
+    if (read_fd  >= files->fd_capacity || !files->fd_table[read_fd])
+        return (uint64_t)-EBADF;
+    if (write_fd >= files->fd_capacity || !files->fd_table[write_fd])
+        return (uint64_t)-EBADF;
+
+    vfs_file_t* rp = vfs_dup(files->fd_table[read_fd]);
+    vfs_file_t* wp = vfs_dup(files->fd_table[write_fd]);
+
+    int r = ksec_register_agent(rp, wp);
+    if (r != 0) {
+        vfs_close(rp);
+        vfs_close(wp);
+        return (uint64_t)(int64_t)r;
+    }
+
+    // Start the ksec reader kernel thread.
+    task_t* reader = task_create_kthread(ksec_reader_thread, pid_alloc());
+    if (reader) sched_add(reader);
+
+    return 0;
 }
 
 // ── Process group / session syscalls ─────────────────────────────────────
@@ -1879,13 +2402,49 @@ static uint64_t sys_link(uint64_t old_ptr, uint64_t new_ptr) {
 }
 
 // ── sys_chmod / sys_fchmod ────────────────────────────────────────────────
-// No permission enforcement; accept the call and return success.
+// Sets file mode on ext2. If the setuid bit (04000) is being set by a root
+// process, notifies ksec so it can auto-create a policy entry.
+// The two-way invariant: bit set ⟺ ksec policy entry exists.
+#define S_ISUID_BIT 04000u
+
 static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
-    (void)path_ptr; (void)mode;
+    if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
+
+    // Only root may set the setuid bit (POSIX: non-root chmod silently clears it).
+    if (!cred_is_root(&g_current->cred))
+        mode &= ~(uint64_t)S_ISUID_BIT;
+
+    // TODO: call ext2_chmod(path, mode) when ext2 mode storage is implemented.
+    // For now: if setuid bit is being set and caller is root, notify ksec.
+    if ((mode & S_ISUID_BIT) && cred_is_root(&g_current->cred) &&
+        ksec_agent_present()) {
+        char raw[512]; const char* upath = (const char*)path_ptr;
+        uint64_t i = 0;
+        while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
+        raw[i] = '\0';
+
+        ksec_request_t req = {0};
+        req.seq        = ksec_next_seq();
+        req.op         = KSEC_OP_SETUID_BIT;
+        req.caller_pid = g_current->pid;
+        req.caller_uid = g_current->cred.euid;
+        req.caller_gid = g_current->cred.egid;
+        req.file_uid   = 0;   // TODO: read from inode when ext2 uids are stored
+        // resource field not used for SETUID_BIT (inode/dev used instead)
+        // inode/dev: not available until ext2_stat is wired — send 0 for now.
+        req.inode      = 0;
+        req.dev        = 0;
+        ksec_notify(&req);
+    }
     return 0;
 }
+
 static uint64_t sys_fchmod(uint64_t fd, uint64_t mode) {
+    if (!g_current) return (uint64_t)-EBADF;
+    if (!cred_is_root(&g_current->cred))
+        mode &= ~(uint64_t)S_ISUID_BIT;
     (void)fd; (void)mode;
+    // TODO: lookup path from fd->path, call ext2_chmod.
     return 0;
 }
 
@@ -1995,7 +2554,7 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETPID:  ret = sys_getpid();                      break;
         case SYS_GETPPID: ret = sys_getppid();                     break;
         case SYS_READDIR: ret = sys_readdir(arg1, arg2, arg3, arg4); break;
-        case SYS_SPAWN:   ret = sys_spawn(arg1, arg2);             break;
+        case SYS_SPAWN:   ret = sys_spawn(arg1, arg2, arg3, arg4); break;
         case SYS_THREAD:   ret = sys_thread(arg1, arg2, arg3);     break;
         case SYS_CLOCK_NS: ret = tsc_read_ns();                    break;
         case SYS_STAT:    ret = sys_stat(arg1, arg2, arg3);        break;
@@ -2070,6 +2629,23 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
             for (;;) __asm__ volatile("cli; hlt");
             break;
 
+        // ── Security syscalls ─────────────────────────────────────────────
+        case SYS_SETUID:     ret = sys_setuid(arg1);                         break;
+        case SYS_SETGID:     ret = sys_setgid(arg1);                         break;
+        case SYS_SETEUID:    ret = sys_seteuid(arg1);                        break;
+        case SYS_SETEGID:    ret = sys_setegid(arg1);                        break;
+        case SYS_SETREUID:   ret = sys_setreuid(arg1, arg2);                 break;
+        case SYS_SETREGID:   ret = sys_setregid(arg1, arg2);                 break;
+        case SYS_SETGROUPS:  ret = sys_setgroups(arg1, arg2);                break;
+        case SYS_PLEDGE:     ret = sys_pledge(arg1);                         break;
+        case SYS_UNVEIL:     ret = sys_unveil(arg1, arg2, arg3);             break;
+        case SYS_UNVEIL_LOCK: ret = sys_unveil_lock();                       break;
+        case SYS_RESTRICT_FD: ret = sys_restrict_fd(arg1, arg2);             break;
+        case SYS_SENDFD:     ret = sys_sendfd(arg1, arg2, arg3);             break;
+        case SYS_RECVFD:     ret = sys_recvfd(arg1);                         break;
+        case SYS_REGISTER_POLICY_AGENT:
+                             ret = sys_register_policy_agent(arg1, arg2);    break;
+
         default:               ret = (uint64_t)-ENOSYS;                         break;
     }
     // Deliver any pending signals on the syscall return path.
@@ -2082,7 +2658,63 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
 
 // ── syscall_dispatch ──────────────────────────────────────────────────────
 // Entry point from syscall_entry.asm.
+// Enforces pledge() before dispatching any handler.
 uint64_t syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                           uint64_t arg3, uint64_t arg4) {
+    // ── Pledge enforcement ────────────────────────────────────────────────
+    // Check before ANY handler runs.  Violation → SIGKILL (immediate, no
+    // handler, no audit trail beyond the kill event itself).
+    if (g_current && g_current->pledge_mask != PLEDGE_ALL) {
+        uint32_t need = pledge_group_for_syscall(nr);
+        if (need != 0 && !pledge_allowed(g_current->pledge_mask, need)) {
+            signal_send(g_current, SIGKILL);
+            // signal_deliver_pending will run on return; return a value that
+            // will never be observed (process is dying).
+            return (uint64_t)-EPERM;
+        }
+        // SYS_OPEN: finer-grained pledge check based on access mode.
+        if (nr == SYS_OPEN) {
+            int oflags = (int)(arg2 & 3);   // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+            int creat  = (arg2 & O_CREAT) != 0;
+            uint32_t need_open = 0;
+            if (oflags == O_RDONLY && !creat) need_open = PLEDGE_RPATH;
+            else if (creat)                   need_open = PLEDGE_CPATH;
+            else                              need_open = PLEDGE_WPATH;
+            if (!pledge_allowed(g_current->pledge_mask, need_open)) {
+                signal_send(g_current, SIGKILL);
+                return (uint64_t)-EPERM;
+            }
+        }
+        // SYS_MMAP: PROT_EXEC requires PLEDGE_PROT_EXEC.
+        if (nr == SYS_MMAP) {
+            uint64_t prot = arg3;
+            if ((prot & 4 /* PROT_EXEC */) &&
+                !pledge_allowed(g_current->pledge_mask, PLEDGE_PROT_EXEC)) {
+                signal_send(g_current, SIGKILL);
+                return (uint64_t)-EPERM;
+            }
+        }
+        // SYS_SOCKET: AF_INET vs AF_UNIX distinction.
+        if (nr == SYS_SOCKET) {
+            int domain = (int)arg1;
+            uint32_t need_sock = (domain == 1 /* AF_UNIX */) ? PLEDGE_UNIX : PLEDGE_INET;
+            if (!pledge_allowed(g_current->pledge_mask, need_sock)) {
+                signal_send(g_current, SIGKILL);
+                return (uint64_t)-EPERM;
+            }
+        }
+        // SYS_IOCTL: tty vs non-tty.
+        if (nr == SYS_IOCTL) {
+            // Requests ≥ 0x5400 are tty ioctls.
+            uint64_t req = arg2;
+            uint32_t need_ioctl = (req >= 0x5400 && req <= 0x54FF)
+                                  ? PLEDGE_TTY : PLEDGE_IOCTL;
+            if (!pledge_allowed(g_current->pledge_mask, need_ioctl)) {
+                signal_send(g_current, SIGKILL);
+                return (uint64_t)-EPERM;
+            }
+        }
+    }
+
     return native_syscall_dispatch(nr, arg1, arg2, arg3, arg4);
 }

@@ -51,8 +51,18 @@ uint8_t sched_poll_pid(uint32_t pid);
 void sched_add_zombie(task_t* t);
 
 // Remove and return the zombie with the given pid (0 = any child).
+// Does NOT check parent — use sched_reap_child_zombie for waitpid.
 // Returns NULL if not found.  Caller is responsible for process_destroy.
 task_t* sched_reap_zombie(uint32_t pid);
+
+// Reap a zombie that is a child of parent_pid.
+// target_pid == 0: any child; target_pid != 0: that specific pid.
+// Returns NULL if not found.
+task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid);
+
+// Non-blocking: check if a zombie child of parent_pid exists.
+// target_pid == 0: any child; target_pid != 0: that specific pid.
+uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid);
 
 // Walk every task in every MLFQ level, calling cb(t, data) for each.
 void sched_for_each(void (*cb)(task_t*, void*), void* data);

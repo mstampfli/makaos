@@ -100,6 +100,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     r->ctx      = p;
     r->flags    = 0;
     r->refcount = 1;
+    r->rights   = 0;
     r->path[0]  = '\0';
 
     w->read     = NULL;
@@ -110,6 +111,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     w->ctx      = p;
     w->flags    = 0;
     w->refcount = 1;
+    w->rights   = 0;
     w->path[0]  = '\0';
 
     *read_end  = r;

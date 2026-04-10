@@ -83,6 +83,22 @@
 #define SYS_TCSETPGRP  74  // tcsetpgrp(fd, pgid)                 → 0 or -errno
 #define SYS_REBOOT     75  // reboot()                            → does not return
 
+// ── Security syscalls ─────────────────────────────────────────────────────
+#define SYS_SETUID    76  // setuid(uid)                         → 0 or -errno
+#define SYS_SETGID    77  // setgid(gid)                         → 0 or -errno
+#define SYS_SETEUID   78  // seteuid(euid)                       → 0 or -errno
+#define SYS_SETEGID   79  // setegid(egid)                       → 0 or -errno
+#define SYS_SETREUID  80  // setreuid(ruid, euid)                → 0 or -errno
+#define SYS_SETREGID  81  // setregid(rgid, egid)                → 0 or -errno
+#define SYS_SETGROUPS 82  // setgroups(size, list)               → 0 or -errno
+#define SYS_PLEDGE    83  // pledge(mask)                        → 0 or -errno
+#define SYS_UNVEIL    84  // unveil(path, pathlen, perms)        → 0 or -errno
+#define SYS_UNVEIL_LOCK 85 // unveil_lock()                      → 0
+#define SYS_RESTRICT_FD 86 // restrict_fd(fd, rights_mask)       → 0 or -errno
+#define SYS_SENDFD    87  // sendfd(sock_fd, target_fd, rights)  → 0 or -errno
+#define SYS_RECVFD    88  // recvfd(sock_fd)                     → fd or -errno
+#define SYS_REGISTER_POLICY_AGENT 89 // register_policy_agent(rfd,wfd) → 0 or -errno
+
 // waitpid options
 #define WNOHANG 1
 

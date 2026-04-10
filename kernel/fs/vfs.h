@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "rights.h"
 
 // ── VFS — Virtual File System interface ──────────────────────────────────
 //
@@ -35,10 +36,16 @@ typedef struct vfs_file_t {
     void*    ctx;      // driver-specific state (may be NULL for stateless drivers)
     uint32_t flags;    // open flags (O_APPEND, O_NONBLOCK etc.)
     uint32_t refcount; // reference count; 0 = static object (never freed)
+    uint32_t rights;   // RIGHT_* bitmask; checked before every operation
     char     path[256]; // absolute path for ext2 files (empty for devices/pipes)
 } vfs_file_t;
 
 // ── Convenience wrappers ──────────────────────────────────────────────────
+// NOTE: vfs_read/vfs_write do NOT enforce fd rights — they are called from
+// kernel-internal paths (ksec reader thread, pipe internals, device drivers)
+// that should not be subject to per-fd rights checks.
+// Rights enforcement is done in sys_read/sys_write syscall handlers only,
+// where the caller is a userland process operating on an fd from its fd table.
 static inline int64_t vfs_read(vfs_file_t* f, void* buf, uint64_t len) {
     if (!f || !f->read) return -1;
     return f->read(f, buf, len);
@@ -74,13 +81,18 @@ extern char g_cwd[256];
 
 // ── Built-in device constructors ─────────────────────────────────────────
 
-// Returns a vfs_file_t backed by the VGA console (write-only).
-// The returned pointer is a pointer to a static object — do NOT call
-// vfs_close() on it (VGA is never freed).
+// LEGACY: /dev/vga — direct framebuffer write, bypasses TTY.
+//   Write-only, no line discipline, no OPOST/ONLCR translation.
+//   Static object — do NOT call vfs_close() on it.
+//   NEW PATH: use tty_open(0) for /dev/tty0 — output goes through
+//   tty_vfs_write (OPOST/ONLCR) → write_char → fb_term_putc.
 vfs_file_t* vfs_vga_open(void);
 
-// Returns a vfs_file_t backed by the PS/2 keyboard (read-only, blocking).
-// Also static — do NOT call vfs_close() on it.
+// LEGACY: /dev/kbd — direct keyboard polling, no line discipline.
+//   keyboard_wait()/keyboard_getchar() are now dead stubs.
+//   NEW PATH: use tty_open(0) for /dev/tty0 (N_TTY line discipline),
+//             evdev_open() for /dev/input/event0 (structured events),
+//             or vfs_kbdraw_open() for raw PS/2 scancodes.
 vfs_file_t* vfs_kbd_open(void);
 
 // Returns a vfs_file_t that delivers raw PS/2 scancodes (non-blocking).

@@ -380,8 +380,9 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
 
     (void)argc;
 
-    // spawn: create a fresh task from the ELF, wait for it.
-    int pid = spawn(path, strlen(path));
+    // spawn: create a fresh task — inherit our own stdin/stdout/stderr.
+    static const int inherit_stdio[3] = { -1, -1, -1 };
+    int pid = spawn(path, NULL, NULL, inherit_stdio);
     if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
     int status = 0;

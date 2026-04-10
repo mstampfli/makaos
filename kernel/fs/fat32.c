@@ -245,11 +245,16 @@ vfs_file_t* fat32_open(const char* name83) {
                 fd->bytes_read    = 0;
 
                 vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
-                f->read  = fat32_read;
-                f->write = NULL;
-                f->close = fat32_close;
-                f->ctx   = fd;
-                f->flags = 0;
+                f->read     = fat32_read;
+                f->write    = NULL;
+                f->close    = fat32_close;
+                f->seek     = NULL;
+                f->poll     = NULL;
+                f->ctx      = fd;
+                f->flags    = 0;
+                f->refcount = 1;
+                f->rights   = 0;
+                f->path[0]  = '\0';
                 return f;
             }
         }

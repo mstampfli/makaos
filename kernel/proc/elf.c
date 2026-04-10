@@ -9,6 +9,9 @@
 #include "tss.h"
 #include "common.h"
 #include "tty.h"
+#include "sched.h"
+#include "perm.h"
+#include "cred.h"
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
@@ -364,8 +367,34 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
     return rsp;
 }
 
+// ── stdio fd resolution ───────────────────────────────────────────────────
+// Resolves a stdio[3] spec into a vfs_file_t* for fd index i.
+//   spec[i] == -1  → dup from g_current's fd table (inherit)
+//   spec[i] >= 0   → dup that specific parent fd
+//   spec == NULL   → open tty0 (safe default for init process with no parent)
+static vfs_file_t* resolve_stdio(const int* spec, int i) {
+    if (!spec) return tty_open(0);
+    int fd = spec[i];
+    if (fd == -1) {
+        // Inherit from current process.
+        if (g_current && g_current->files_shared &&
+            (uint32_t)i < g_current->files_shared->fd_capacity &&
+            g_current->files_shared->fd_table[i]) {
+            return vfs_dup(g_current->files_shared->fd_table[i]);
+        }
+        return tty_open(0); // no parent fd — fall back to tty0
+    }
+    if (g_current && g_current->files_shared &&
+        (uint32_t)fd < g_current->files_shared->fd_capacity &&
+        g_current->files_shared->fd_table[fd]) {
+        return vfs_dup(g_current->files_shared->fd_table[fd]);
+    }
+    return tty_open(0); // requested fd doesn't exist — fall back to tty0
+}
+
 // ── elf_load ──────────────────────────────────────────────────────────────
 // Full task creation: address space + kstack + fd_table.
+// stdio: array of 3 fd specs (see resolve_stdio). Pass NULL to open tty0.
 task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     phys_addr_t pml4;
     mm_t*       mm;
@@ -384,11 +413,9 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    // stdin/stdout/stderr all wire to tty0 (canonical read + echo write).
-    files->fd_table[0] = tty_open(0);
+    files->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
     files->fd_table[1] = tty_open(0);
     files->fd_table[2] = tty_open(0);
-    // fd_flags default to 0 (no FD_CLOEXEC on stdio).
 
     t->pid              = pid;
     t->tgid             = pid;
@@ -410,6 +437,11 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    // Credentials: inherit from parent if present, otherwise root.
+    if (g_current && g_current->files_shared)
+        cred_copy(&t->cred, &g_current->cred);
+    else
+        cred_init_root(&t->cred);
     __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 
     virt_addr_t kstack_top = kstack_alloc();
@@ -418,6 +450,13 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;
     *(--stk) = (uint64_t)user_trampoline;
+    t->comm[0] = '\0'; // elf_load: no argv — comm unknown
+
+    // exec: reset pledge to PLEDGE_ALL and unveil to empty (full visibility).
+    // The new image sets its own restrictions.
+    t->pledge_mask = PLEDGE_ALL;
+    unveil_init(&t->unveil);
+
     *(--stk) = 0;                  // rbx
     *(--stk) = 0;                  // rbp
     *(--stk) = entry;              // r12 = user RIP
@@ -432,8 +471,14 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
 // ── elf_load_with_argv ────────────────────────────────────────────────────
 // Like elf_load but also calls elf_setup_stack to build the SysV stack.
 // Required for Linux ABI binaries (bash, musl apps) that read argc/argv/envp.
+//
+// stdio: array of 3 fd specs resolved via resolve_stdio().
+//   -1  = inherit the matching fd from the calling process (fork-like)
+//   >=0 = dup that specific fd from the calling process
+//   NULL = open tty0 for all three (safe for init process with no parent)
 task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
-                           const char* const* argv, const char* const* envp) {
+                           const char* const* argv, const char* const* envp,
+                           const int stdio[3]) {
     phys_addr_t pml4;
     mm_t*       mm;
     uint64_t    entry;
@@ -462,10 +507,9 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    // stdin/stdout/stderr all wire to tty0.
-    files->fd_table[0] = tty_open(0);
-    files->fd_table[1] = tty_open(0);
-    files->fd_table[2] = tty_open(0);
+    files->fd_table[0] = resolve_stdio(stdio, 0);
+    files->fd_table[1] = resolve_stdio(stdio, 1);
+    files->fd_table[2] = resolve_stdio(stdio, 2);
 
     t->pid              = pid;
     t->tgid             = pid;
@@ -487,6 +531,11 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    // Credentials: inherit from spawning process if present, otherwise root.
+    if (g_current && g_current->files_shared)
+        cred_copy(&t->cred, &g_current->cred);
+    else
+        cred_init_root(&t->cred);
     __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 
     virt_addr_t kstack_top = kstack_alloc();
@@ -495,6 +544,22 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;
     *(--stk) = (uint64_t)user_trampoline;
+    // Set comm: basename of argv[0], max 15 chars.
+    {
+        const char* name = (argv && argv[0]) ? argv[0] : "unknown";
+        const char* base = name;
+        for (const char* p = name; *p; p++) if (*p == '/') base = p + 1;
+        uint32_t ci = 0;
+        while (ci < 15 && base[ci]) { t->comm[ci] = base[ci]; ci++; }
+        t->comm[ci] = '\0';
+    }
+
+    // exec: reset pledge to PLEDGE_ALL and unveil to empty.
+    // Credentials are inherited (set above); pledge/unveil reset on exec
+    // so the new image can set its own restrictions.
+    t->pledge_mask = PLEDGE_ALL;
+    unveil_init(&t->unveil);
+
     *(--stk) = 0;          // rbx
     *(--stk) = 0;          // rbp
     *(--stk) = entry;      // r12 = user RIP
@@ -508,7 +573,39 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
 
 // ── elf_exec_from_ext2 ────────────────────────────────────────────────────
 task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
-                            const char* const* argv, const char* const* envp) {
+                            const char* const* argv, const char* const* envp,
+                            const int stdio[3]) {
+    // ── Execute permission check ──────────────────────────────────────────
+    // Must happen before reading the file so an unprivileged process cannot
+    // use exec to read a file it has no read+exec rights on.
+    {
+        uint32_t exec_ino = ext2_lookup_path(path);
+        if (!exec_ino) return NULL;   // file does not exist
+
+        ext2_inode_t exec_inode;
+        if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
+
+        inode_perm_t ip = {
+            .uid      = exec_inode.i_uid,
+            .gid      = exec_inode.i_gid,
+            .mode     = exec_inode.i_mode & 0x1FF,
+            .inode_nr = exec_ino,
+            .dev      = 0,
+            .nosuid   = 0,
+        };
+        // Caller credentials: use g_current if in process context, else root.
+        cred_t root_cred; cred_init_root(&root_cred);
+        const cred_t* c = (g_current && g_current->files_shared)
+                          ? &g_current->cred : &root_cred;
+
+        uint32_t setuid_uid = 0xFFFFFFFFu;
+        if (vfs_check_exec(&ip, c, &setuid_uid) != 0)
+            return NULL;  // -EACCES: caller has no execute permission
+        // setuid_uid handling (ksec flow) is deferred to when ksec is running.
+        // For now: if setuid bit is set and ksec not present, exec proceeds
+        // without privilege escalation (safe — no escalation = restricted).
+    }
+
     vfs_file_t* f = ext2_open(path);
     if (!f) return NULL;
 
@@ -521,7 +618,7 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
 
     if (n <= 0) { kfree(buf); return NULL; }
 
-    task_t* t = elf_load_with_argv(buf, (uint64_t)n, pid, argv, envp);
+    task_t* t = elf_load_with_argv(buf, (uint64_t)n, pid, argv, envp, stdio);
     kfree(buf);
     return t;
 }

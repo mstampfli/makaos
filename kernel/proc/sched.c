@@ -239,6 +239,7 @@ void sched_add_zombie(task_t* t) {
 }
 
 // Remove and return the zombie with the given pid (0 = any).
+// Does NOT check parent — use sched_reap_child_zombie for waitpid.
 // Returns NULL if not found.  Caller must call process_destroy on result.
 task_t* sched_reap_zombie(uint32_t pid) {
     task_t** pp = &s_zombie_head;
@@ -252,6 +253,39 @@ task_t* sched_reap_zombie(uint32_t pid) {
         pp = &(*pp)->next;
     }
     return NULL;
+}
+
+// Remove and return a zombie that is a child of `parent_pid`.
+// If target_pid == 0: reaps any child of parent_pid.
+// If target_pid != 0: reaps that specific pid only if its ppid == parent_pid.
+// Returns NULL if no matching child zombie found.
+task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
+    task_t** pp = &s_zombie_head;
+    while (*pp) {
+        task_t* z = *pp;
+        int pid_match  = (target_pid == 0) || (z->pid == target_pid);
+        int is_child   = (z->ppid == parent_pid);
+        if (pid_match && is_child) {
+            *pp = z->next;
+            z->next = NULL;
+            return z;
+        }
+        pp = &(*pp)->next;
+    }
+    return NULL;
+}
+
+// Check if any zombie child of parent_pid exists (non-blocking poll).
+// If target_pid != 0, checks specifically for that pid.
+uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
+    task_t* z = s_zombie_head;
+    while (z) {
+        int pid_match = (target_pid == 0) || (z->pid == target_pid);
+        int is_child  = (z->ppid == parent_pid);
+        if (pid_match && is_child) return 1;
+        z = z->next;
+    }
+    return 0;
 }
 
 // ── sched_wait_pid ────────────────────────────────────────────────────────

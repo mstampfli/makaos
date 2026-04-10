@@ -4,6 +4,7 @@
 // Future ttys (serial, pty) slot in identically.
 
 #include "tty.h"
+#include "input_core.h"
 #include "vfs.h"
 #include "kheap.h"
 #include "sched.h"
@@ -268,6 +269,7 @@ vfs_file_t* tty_open(int idx) {
     f->ctx      = ctx;
     f->flags    = 0;
     f->refcount = 1;
+    f->rights   = 0;   // device fd: no rights enforcement (checked as open by kernel)
     f->path[0]  = '\0';
 
     return f;
@@ -295,6 +297,9 @@ static void console_write_char(tty_t* tty, uint8_t c) {
     extern void fb_term_putc(char c);
     fb_term_putc((char)c);
 }
+
+// forward declaration — defined below tty_init
+static void tty_on_kbd_event(const kbd_event_t* ev, void* data);
 
 // ── tty_init ─────────────────────────────────────────────────────────────
 void tty_init(void) {
@@ -343,4 +348,59 @@ void tty_init(void) {
     for (int i = 0; i < 16; i++) tty->name[i] = 0;
     tty->name[0] = 't'; tty->name[1] = 't'; tty->name[2] = 'y';
     tty->name[3] = '0'; tty->name[4] = '\0';
+
+    // Register with input_core so keyboard events flow in via tty_on_kbd_event.
+    tty->input_handler.name  = tty->name;
+    tty->input_handler.event = tty_on_kbd_event;
+    tty->input_handler.data  = tty;
+    tty->input_handler.next  = NULL;
+    input_register_handler(&tty->input_handler);
+}
+
+// ── input_core handler: receive kbd_event_t, route to tty_input_char ─────
+// Extended keys inject ANSI escape sequences; printable keys go directly.
+// Key-release events (pressed=0) are ignored — TTY only cares about presses.
+
+static void tty_on_kbd_event(const kbd_event_t* ev, void* data) {
+    tty_t* tty = (tty_t*)data;
+
+    // Ignore key releases.
+    if (!ev->pressed) return;
+
+    // Extended navigation keys → ANSI CSI sequences (raw mode gets them as-is;
+    // canonical mode strips the ESC sequence via esc_state filter).
+    if (ev->keycode) {
+        const char* seq = NULL;
+        switch (ev->keycode) {
+            case KEY_UP:       seq = "\x1b[A";  break;
+            case KEY_DOWN:     seq = "\x1b[B";  break;
+            case KEY_RIGHT:    seq = "\x1b[C";  break;
+            case KEY_LEFT:     seq = "\x1b[D";  break;
+            case KEY_HOME:     seq = "\x1b[H";  break;
+            case KEY_END:      seq = "\x1b[F";  break;
+            case KEY_PAGEUP:   seq = "\x1b[5~"; break;
+            case KEY_PAGEDOWN: seq = "\x1b[6~"; break;
+            case KEY_DELETE:   seq = "\x1b[3~"; break;
+            case KEY_F1:       seq = "\x1b[11~";break;
+            case KEY_F2:       seq = "\x1b[12~";break;
+            case KEY_F3:       seq = "\x1b[13~";break;
+            case KEY_F4:       seq = "\x1b[14~";break;
+            case KEY_F5:       seq = "\x1b[15~";break;
+            case KEY_F6:       seq = "\x1b[17~";break;
+            case KEY_F7:       seq = "\x1b[18~";break;
+            case KEY_F8:       seq = "\x1b[19~";break;
+            case KEY_F9:       seq = "\x1b[20~";break;
+            case KEY_F10:      seq = "\x1b[21~";break;
+            case KEY_F11:      seq = "\x1b[23~";break;
+            case KEY_F12:      seq = "\x1b[24~";break;
+            default: break;
+        }
+        if (seq) {
+            for (int i = 0; seq[i]; i++) tty_input_char(tty, seq[i]);
+            return;
+        }
+    }
+
+    // Printable / control character.
+    if (ev->ascii) tty_input_char(tty, (char)ev->ascii);
 }

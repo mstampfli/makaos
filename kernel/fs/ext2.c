@@ -530,6 +530,7 @@ vfs_file_t* ext2_open(const char* path) {
     f->ctx      = fd;
     f->flags    = 0;
     f->refcount = 1;
+    f->rights   = 0;   // stamped by sys_open after open; zero for internal opens
     // Store absolute path for fstat/ftruncate.
     uint32_t pi = 0;
     if (path) {

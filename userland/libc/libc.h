@@ -77,6 +77,32 @@ typedef int64_t            ssize_t;
 #define SYS_FB_BLIT     33
 #define SYS_FB_INFO     34
 
+// ── Security syscall numbers (match kernel/syscall/syscall.h) ─────────────
+#define SYS_SETUID      76
+#define SYS_SETGID      77
+#define SYS_SETEUID     78
+#define SYS_SETEGID     79
+#define SYS_SETREUID    80
+#define SYS_SETREGID    81
+#define SYS_SETGROUPS   82
+#define SYS_PLEDGE      83
+#define SYS_UNVEIL      84
+#define SYS_UNVEIL_LOCK 85
+#define SYS_RESTRICT_FD 86
+#define SYS_SENDFD      87
+#define SYS_RECVFD      88
+#define SYS_REGISTER_POLICY_AGENT 89
+
+// ── Misc syscall numbers ──────────────────────────────────────────────────
+#define SYS_GETUID      49
+#define SYS_GETEUID     50
+#define SYS_GETGID      51
+#define SYS_GETEGID     52
+#define SYS_GETGROUPS   53
+#define SYS_UMASK       48
+#define SYS_CHMOD       65
+#define SYS_CHOWN       67
+
 #define WNOHANG 1
 
 #define SYS_READ_NONBLOCK 1
@@ -218,13 +244,107 @@ static inline int exec(const char* path, size_t pathlen) {
     return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, pathlen));
 }
 
-static inline int spawn(const char* path, size_t pathlen) {
-    return (int)__syscall_ret(syscall2(SYS_SPAWN, (uint64_t)path, pathlen));
+// spawn(path, argv, envp, stdio) → child pid or -errno.
+//   argv: NULL-terminated array of char* (NULL → synthesise {path, NULL})
+//   envp: NULL-terminated array of char* (NULL → kernel default env)
+//   stdio: int[3] fd specs for child's stdin/stdout/stderr
+//     -1 = inherit that fd from this process
+//     >=0 = dup that specific fd into the child
+//     NULL → open /dev/tty0 for all three
+static inline int spawn(const char* path, const char* const* argv,
+                        const char* const* envp, const int stdio[3]) {
+    return (int)__syscall_ret(syscall4(SYS_SPAWN, (uint64_t)path,
+                                       (uint64_t)argv, (uint64_t)envp,
+                                       (uint64_t)stdio));
 }
 
 // Macros for decoding the status filled by wait/waitpid.
 #define WIFEXITED(s)   (((s) & 0xFF) == 0)
 #define WEXITSTATUS(s) (((s) >> 8) & 0xFF)
+
+// ── Credential transitions ────────────────────────────────────────────────
+static inline int setuid(uint32_t uid) {
+    return (int)__syscall_ret(syscall1(SYS_SETUID, uid));
+}
+static inline int seteuid(uint32_t euid) {
+    return (int)__syscall_ret(syscall1(SYS_SETEUID, euid));
+}
+static inline int setgid(uint32_t gid) {
+    return (int)__syscall_ret(syscall1(SYS_SETGID, gid));
+}
+static inline int setegid(uint32_t egid) {
+    return (int)__syscall_ret(syscall1(SYS_SETEGID, egid));
+}
+static inline int setreuid(uint32_t ruid, uint32_t euid) {
+    return (int)__syscall_ret(syscall2(SYS_SETREUID, ruid, euid));
+}
+static inline int setregid(uint32_t rgid, uint32_t egid) {
+    return (int)__syscall_ret(syscall2(SYS_SETREGID, rgid, egid));
+}
+static inline int setgroups(size_t n, const uint32_t* list) {
+    return (int)__syscall_ret(syscall2(SYS_SETGROUPS, n, (uint64_t)list));
+}
+
+// ── pledge() — irrevocable syscall restriction ────────────────────────────
+// PLEDGE_* bitmask constants (must match kernel/security/pledge.h):
+#define PLEDGE_STDIO      (1u <<  0)
+#define PLEDGE_RPATH      (1u <<  1)
+#define PLEDGE_WPATH      (1u <<  2)
+#define PLEDGE_CPATH      (1u <<  3)
+#define PLEDGE_EXEC       (1u <<  4)
+#define PLEDGE_PROC       (1u <<  5)
+#define PLEDGE_INET       (1u <<  6)
+#define PLEDGE_UNIX       (1u <<  7)
+#define PLEDGE_SIGNAL     (1u <<  8)
+#define PLEDGE_THREAD     (1u <<  9)
+#define PLEDGE_PROT_EXEC  (1u << 10)
+#define PLEDGE_SETUID     (1u << 11)
+#define PLEDGE_CHOWN      (1u << 12)
+#define PLEDGE_CHMOD      (1u << 13)
+#define PLEDGE_TTY        (1u << 14)
+#define PLEDGE_IOCTL      (1u << 15)
+#define PLEDGE_SENDFD     (1u << 16)
+#define PLEDGE_ALL        (~0u)
+
+static inline int pledge(uint32_t mask) {
+    return (int)__syscall_ret(syscall1(SYS_PLEDGE, mask));
+}
+
+// ── unveil() — per-process filesystem view restriction ────────────────────
+#define UNVEIL_READ    (1u << 0)
+#define UNVEIL_WRITE   (1u << 1)
+#define UNVEIL_EXEC    (1u << 2)
+#define UNVEIL_CREATE  (1u << 3)
+
+static inline int unveil(const char* path, uint8_t perms) {
+    size_t plen = 0; while (path[plen]) plen++;
+    return (int)__syscall_ret(syscall3(SYS_UNVEIL, (uint64_t)path, plen, perms));
+}
+static inline int unveil_lock(void) {
+    return (int)__syscall_ret(syscall0(SYS_UNVEIL_LOCK));
+}
+
+// ── fd rights restriction ─────────────────────────────────────────────────
+#define RIGHT_READ    (1u << 0)
+#define RIGHT_WRITE   (1u << 1)
+#define RIGHT_EXEC    (1u << 2)
+#define RIGHT_SEEK    (1u << 3)
+#define RIGHT_POLL    (1u << 4)
+#define RIGHT_MMAP_R  (1u << 5)
+#define RIGHT_MMAP_W  (1u << 6)
+#define RIGHT_MMAP_X  (1u << 7)
+#define RIGHT_IOCTL   (1u << 8)
+#define RIGHT_SEND_FD (1u << 9)
+
+static inline int restrict_fd(int fd, uint32_t rights_mask) {
+    return (int)__syscall_ret(syscall2(SYS_RESTRICT_FD, (uint64_t)fd, rights_mask));
+}
+
+// ── Policy agent registration (ksec daemon only) ──────────────────────────
+static inline int register_policy_agent(int read_fd, int write_fd) {
+    return (int)__syscall_ret(syscall2(SYS_REGISTER_POLICY_AGENT,
+                                       (uint64_t)read_fd, (uint64_t)write_fd));
+}
 
 // POSIX waitpid: wait for pid (-1 = any child), fill *status, options (WNOHANG).
 static inline int waitpid(int pid, int* status, int options) {

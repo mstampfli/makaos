@@ -127,6 +127,7 @@ vfs_file_t* socket_open(int domain, int type) {
     f->ctx      = s;
     f->flags    = 0;
     f->refcount = 1;
+    f->rights   = 0;
     f->path[0]  = '\0';
 
     return f;
@@ -208,6 +209,7 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     cf->ctx      = cs;
     cf->flags    = 0;
     cf->refcount = 1;
+    cf->rights   = 0;
     cf->path[0]  = '\0';
     return cf;
 }

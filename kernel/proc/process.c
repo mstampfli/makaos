@@ -136,6 +136,17 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sleep_until_ns   = 0;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    t->comm[0] = '\0'; // set by elf_load_with_argv or task_fork
+
+    // Security: always start with root credentials and full permissions.
+    // fork() (task_fork) explicitly copies cred/pledge/unveil from the parent
+    // after calling task_init_common, overriding these defaults.
+    // task_create_kthread and task_create_user (spawn path) start unrestricted
+    // and gain restrictions via sys_pledge/sys_unveil or credential drops in
+    // the process itself (e.g. login dropping from uid=0 to uid=N).
+    cred_init_root(&t->cred);
+    t->pledge_mask = PLEDGE_ALL;
+    unveil_init(&t->unveil);
 
     // Initialize fxsave_buf with a valid FPU state.
     // fxrstor on a zero buffer is invalid on real CPUs (KVM) — FCW must be set.
@@ -154,9 +165,8 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(mm); kfree(t); return NULL; }
     fd_table_init(files, FD_INITIAL_CAP);
-    files->fd_table[0] = vfs_kbd_open();
-    files->fd_table[1] = vfs_vga_open();
-    files->fd_table[2] = vfs_vga_open();
+    // Kernel threads have no stdio — fd 0/1/2 are NULL.
+    // They don't do userspace I/O; any kernel-side printing goes direct to fb.
 
     task_init_common(t, pid, TASK_FLAG_KTHREAD, mm, files);
 
@@ -187,9 +197,9 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
     fd_table_init(files, FD_INITIAL_CAP);
-    files->fd_table[0] = vfs_kbd_open();
-    files->fd_table[1] = vfs_vga_open();
-    files->fd_table[2] = vfs_vga_open();
+    // fd 0/1/2 are NULL — raw blob processes have no TTY by default.
+    // Caller assigns stdio if needed (e.g. elf_load_with_argv opens tty0
+    // for the sys_spawn path; fork inherits from parent).
 
     virt_addr_t code_start = VMM_USER_CODE_BASE;
     virt_addr_t code_end   = code_start + (virt_addr_t)code_pages * PAGE_SIZE;
@@ -292,7 +302,11 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
-    for (int _i = 0; _i < 256; _i++) t->cwd[_i] = parent->cwd[_i];
+    for (int _i = 0; _i < 256; _i++) t->cwd[_i]  = parent->cwd[_i];
+    for (int _i = 0; _i < 16;  _i++) t->comm[_i] = parent->comm[_i];
+    cred_copy(&t->cred, &parent->cred);
+    t->pledge_mask = parent->pledge_mask;
+    unveil_copy(&t->unveil, &parent->unveil);
 
     virt_addr_t kstack_top = kstack_alloc();
     t->kstack_top = kstack_top;
