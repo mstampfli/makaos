@@ -18,9 +18,9 @@
 // vfs_check_perm() walks entries in order; first match wins.
 //
 // ACL permission bits (independent from the mode field, same semantics):
-#define ACL_PERM_READ   (1u << 0)   // r
-#define ACL_PERM_WRITE  (1u << 1)   // w
-#define ACL_PERM_EXEC   (1u << 2)   // x
+#define ACL_PERM_READ   4u   // r — matches Unix rwx bit ordering (r=4,w=2,x=1)
+#define ACL_PERM_WRITE  2u   // w
+#define ACL_PERM_EXEC   1u   // x
 
 // ACL entry tag: what the qualifier field means.
 #define ACL_TAG_USER    0   // qualifier = uid  (0xFFFFFFFF = any user)
@@ -43,21 +43,10 @@ typedef struct __attribute__((packed)) {
 // uid/gid are the inode's owner uid and gid.
 static inline void acl_from_mode(acl_entry_t out[3],
                                   uint32_t uid, uint32_t gid, uint16_t mode) {
-    // owner
-    out[0].tag       = ACL_TAG_USER;
-    out[0].qualifier = uid;
-    out[0].perms     = (uint8_t)((mode >> 6) & 7);
-    out[0]._pad      = 0;
-    // owning group
-    out[1].tag       = ACL_TAG_GROUP;
-    out[1].qualifier = gid;
-    out[1].perms     = (uint8_t)((mode >> 3) & 7);
-    out[1]._pad      = 0;
-    // other
-    out[2].tag       = ACL_TAG_OTHER;
-    out[2].qualifier = ACL_WILDCARD;
-    out[2].perms     = (uint8_t)(mode & 7);
-    out[2]._pad      = 0;
+    // ACL_PERM_* matches Unix r=4,w=2,x=1 so raw mode bits map directly.
+    out[0].tag = ACL_TAG_USER;  out[0].qualifier = uid;          out[0].perms = (mode >> 6) & 7; out[0]._pad = 0;
+    out[1].tag = ACL_TAG_GROUP; out[1].qualifier = gid;          out[1].perms = (mode >> 3) & 7; out[1]._pad = 0;
+    out[2].tag = ACL_TAG_OTHER; out[2].qualifier = ACL_WILDCARD; out[2].perms = (mode)      & 7; out[2]._pad = 0;
 }
 
 // Check whether credentials `c` satisfy `need` (ACL_PERM_* bits) given

@@ -575,35 +575,23 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
 task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
                             const char* const* argv, const char* const* envp,
                             const int stdio[3]) {
-    // ── Execute permission check ──────────────────────────────────────────
-    // Must happen before reading the file so an unprivileged process cannot
-    // use exec to read a file it has no read+exec rights on.
+    // ── Execute permission check (path-aware walk + exec bit) ────────────
     {
-        uint32_t exec_ino = ext2_lookup_path(path);
-        if (!exec_ino) return NULL;   // file does not exist
-
-        ext2_inode_t exec_inode;
-        if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
-
-        inode_perm_t ip = {
-            .uid      = exec_inode.i_uid,
-            .gid      = exec_inode.i_gid,
-            .mode     = exec_inode.i_mode & 0x1FF,
-            .inode_nr = exec_ino,
-            .dev      = 0,
-            .nosuid   = 0,
-        };
-        // Caller credentials: use g_current if in process context, else root.
         cred_t root_cred; cred_init_root(&root_cred);
         const cred_t* c = (g_current && g_current->files_shared)
                           ? &g_current->cred : &root_cred;
-
+        int exec_err = 0;
+        uint32_t exec_ino = ext2_lookup_path_checked(path, c, &exec_err);
+        if (!exec_ino) return NULL;
+        ext2_inode_t exec_inode;
+        if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
+        inode_perm_t ip = {
+            .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
+            .mode = exec_inode.i_mode & 0x1FF,
+            .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
+        };
         uint32_t setuid_uid = 0xFFFFFFFFu;
-        if (vfs_check_exec(&ip, c, &setuid_uid) != 0)
-            return NULL;  // -EACCES: caller has no execute permission
-        // setuid_uid handling (ksec flow) is deferred to when ksec is running.
-        // For now: if setuid bit is set and ksec not present, exec proceeds
-        // without privilege escalation (safe — no escalation = restricted).
+        if (vfs_check_exec(&ip, c, &setuid_uid) != 0) return NULL;
     }
 
     vfs_file_t* f = ext2_open(path);
