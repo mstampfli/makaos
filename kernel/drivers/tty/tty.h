@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
-#include "syscall.h"   // termios_t, winsize_t, ICANON, ECHO, ISIG, …
+#include "syscall.h"    // termios_t, winsize_t, ICANON, ECHO, ISIG, …
+#include "input_core.h" // input_handler_t, kbd_event_t
 
 // ── TTY subsystem ────────────────────────────────────────────────────────
 //
@@ -57,6 +58,10 @@ typedef struct tty_t {
     // ── ANSI escape sequence filter state (canonical mode) ───────────────
     // 0=normal, 1=saw ESC, 2=inside CSI (ESC [)
     uint8_t esc_state;
+
+    // ── input_core handler (registered at tty_init) ───────────────────────
+    // Embedded directly in tty_t so no separate allocation is needed.
+    input_handler_t input_handler;
 
     // ── TTY name (e.g. "tty0") ────────────────────────────────────────────
     char name[16];

@@ -31,6 +31,7 @@ KERNEL_INCLUDES=(
   -I "$KERNEL_DIR/acpi"
   -I "$KERNEL_DIR/time"
   -I "$KERNEL_DIR/syscall"
+  -I "$KERNEL_DIR/security"
   -I "$KERNEL_DIR/net"
   -I "$KERNEL_DIR/arch/x86_64"
   -I "$BUILD_DIR"
@@ -140,6 +141,14 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
 
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ksec/ksec.c" -o "$BUILD_DIR/user_ksec.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
+   -o "$BUILD_DIR/user_ksec.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ps/ps.c" -o "$BUILD_DIR/user_ps.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
+   -o "$BUILD_DIR/user_ps.elf"
+
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USERLAND_DIR/apps/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
@@ -225,6 +234,7 @@ KERNEL_SUBDIRS=(
     "$KERNEL_DIR/acpi"
     "$KERNEL_DIR/time"
     "$KERNEL_DIR/syscall"
+    "$KERNEL_DIR/security"
     "$KERNEL_DIR/arch/x86_64"
     "$KERNEL_DIR/net"
 )
@@ -308,39 +318,79 @@ echo "[+] Building ext2 filesystem"
 dd if=/dev/zero of="$BUILD_DIR/ext2.img" bs=512 count=$EXT2_SECTORS status=none
 mkfs.ext2 -b 1024 -L "MakaOS" "$BUILD_DIR/ext2.img" > /dev/null 2>&1
 
+# Helper: set inode mode + uid + gid via debugfs.
+# Usage: ext2_chmod <img> <path> <octal_mode_with_type> <uid> <gid>
+# mode_with_type example: 0100755 (regular file, rwxr-xr-x)
+#                         0040755 (directory,    rwxr-xr-x)
+#                         0100644 (regular file, rw-r--r--)
+ext2_setperm() {
+    local img="$1" path="$2" mode="$3" uid="$4" gid="$5"
+    debugfs -w "$img" -R "set_inode_field $path mode $mode"    > /dev/null 2>&1 || true
+    debugfs -w "$img" -R "set_inode_field $path uid $uid"      > /dev/null 2>&1 || true
+    debugfs -w "$img" -R "set_inode_field $path gid $gid"      > /dev/null 2>&1 || true
+}
+
+# Create directory tree.
+# Directories: root-owned, 0755 (rwxr-xr-x) except /root (0700) and /tmp (1777).
 debugfs -w "$BUILD_DIR/ext2.img" <<'DEBUGFS_EOF' > /dev/null 2>&1
 mkdir bin
 mkdir etc
 mkdir home
 mkdir tmp
 mkdir dev
+mkdir root
 DEBUGFS_EOF
 
+# Set directory permissions (type bits: 0040000 = directory).
+ext2_setperm "$BUILD_DIR/ext2.img" /         0040755 0 0   # / root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /bin      0040755 0 0   # /bin root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /etc      0040755 0 0   # /etc root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /home     0040755 0 0   # /home root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /tmp      0041777 0 0   # /tmp root:root rwxrwxrwx + sticky
+ext2_setperm "$BUILD_DIR/ext2.img" /dev      0040755 0 0   # /dev root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /root     0040700 0 0   # /root root:root rwx------
+
+# Install binaries with execute permissions (0755 = rwxr-xr-x, type 0100000 = regular file).
+# All binaries: root:root 0755 — any user can execute, only root can write.
+ext2_install_bin() {
+    local img="$1" src="$2" dst="$3"
+    debugfs -w "$img" -R "write $src $dst" > /dev/null 2>&1 || true
+    ext2_setperm "$img" "/$dst" 0100755 0 0
+}
+
 if [ -f "$BUILD_DIR/user_test_vmalloc.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_vmalloc.elf bin/vmalloc" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_vmalloc.elf" bin/vmalloc
 fi
 if [ -f "$BUILD_DIR/user_home.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_home.elf bin/home" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_home.elf" bin/home
 fi
 if [ -f "$BUILD_DIR/user_hello.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_hello.elf bin/hello" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_hello.elf" bin/hello
 fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_helloraw.elf bin/helloraw" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_helloraw.elf" bin/helloraw
 fi
 if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_test_posix1.elf bin/test_posix1" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_posix1.elf" bin/test_posix1
 fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_tone.elf bin/tone" > /dev/null 2>&1 || true
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
 fi
 if [ -f "$BUILD_DIR/user_shell.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_shell.elf bin/shell" > /dev/null 2>&1 || true
-    echo "[+] shell ELF installed at bin/shell"
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_shell.elf" bin/shell
+    echo "[+] shell ELF installed at bin/shell (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_ps.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ps.elf" bin/ps
+    echo "[+] ps ELF installed at bin/ps (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_ksec.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ksec.elf" bin/ksec
+    echo "[+] ksec ELF installed at bin/ksec (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_doom.elf" ]; then
-    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/user_doom.elf bin/doom" > /dev/null 2>&1 || true
-    echo "[+] doom ELF installed at bin/doom"
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_doom.elf" bin/doom
+    echo "[+] doom ELF installed at bin/doom (root:root 0755)"
 fi
 
 WAD_SEARCH=(
@@ -357,7 +407,9 @@ for w in "${WAD_SEARCH[@]}"; do
 done
 if [ -n "$WAD_FILE" ]; then
     debugfs -w "$BUILD_DIR/ext2.img" -R "write $WAD_FILE bin/doom1.wad" > /dev/null 2>&1 || true
-    echo "[+] WAD installed: $WAD_FILE → /bin/doom1.wad"
+    # WAD is a data file: root:root 0644 (readable by all, no exec needed)
+    ext2_setperm "$BUILD_DIR/ext2.img" /bin/doom1.wad 0100644 0 0
+    echo "[+] WAD installed: $WAD_FILE → /bin/doom1.wad (root:root 0644)"
 else
     echo "[!] doom1.wad not found — place it at $DOOM_DIR/doom1.wad before running"
 fi
@@ -397,7 +449,7 @@ qemu-system-x86_64 \
   -audiodev pipewire,id=snd0 \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
-  -netdev user,id=net0,hostfwd=tcp::5555-:80 \
+  -netdev user,id=net0,hostfwd=tcp::18080-:80 \
   -device virtio-net-pci,netdev=net0 \
   -serial file:build/serial.txt \
   -monitor none \

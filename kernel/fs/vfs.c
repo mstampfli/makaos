@@ -1,14 +1,22 @@
 #include "vfs.h"
 #include "keyboard.h"
+#include "evdev.h"
 #include "mouse.h"
 #include "hda.h"
 #include "common.h"
 #include "fb.h"
 
-// ── Framebuffer console device ────────────────────────────────────────────
+// ── [LEGACY] Framebuffer console device (/dev/vga) ───────────────────────
+// LEGACY: Direct write to framebuffer terminal, bypasses TTY entirely.
+//   No read support, no line discipline, no OPOST/ONLCR translation.
+//   NEW PATH: open /dev/tty0 (tty_open(0)) — writes go through tty_vfs_write
+//   which applies OPOST/ONLCR (\n → \r\n) and calls write_char → fb_term_putc.
+//   /dev/vga is kept for process.c fd 1/2 fallback and any kernel code that
+//   writes directly to the console before tty_init() runs.
 
-/* Legacy cursor globals — kept for compatibility with shell.c which reads them.
-   They are kept in sync with g_fb_row / g_fb_col after every write. */
+/* LEGACY cursor globals — kept for compatibility with shell.c which reads them.
+   Synced with g_fb_row / g_fb_col after every vga_write.
+   NEW PATH: shell should query cursor position via TTY ioctl (TIOCGWINSZ). */
 uint32_t g_vga_row = 0;
 uint32_t g_vga_col = 0;
 
@@ -39,18 +47,30 @@ vfs_file_t* vfs_vga_open(void) {
     return &s_vga_file;
 }
 
-// ── Keyboard device ───────────────────────────────────────────────────────
+// ── [LEGACY] /dev/kbd raw keyboard device ────────────────────────────────
+// LEGACY: Direct keyboard polling via keyboard_wait()/keyboard_getchar().
+//   keyboard_wait() is now a stub that sleeps forever (returns nothing).
+//   keyboard_getchar() is now a stub that always returns 0.
+//
+// NEW PATH: Open /dev/tty or /dev/tty0 instead.
+//   Input flows: PS/2 IRQ → keyboard thread → input_emit() → tty_on_kbd_event()
+//   → N_TTY line discipline → tty_vfs_read() → userland read(fd, ...).
+//   For raw evdev events use /dev/input/event0 (input_event_t structs).
+//   For raw PS/2 scancodes use /dev/kbdraw (evdev_getraw()).
+//
+// This device and vfs_kbd_open() are kept only so that process.c's
+// fallback fd_table init compiles.  Nothing should open /dev/kbd in
+// new code.  Remove once process.c is updated to always use tty_open(0).
 
 static int64_t kbd_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
     if (len == 0) return 0;
     char* dst = (char*)buf;
     uint64_t i = 0;
-    // Block until first character.
+    // LEGACY: keyboard_wait() is now a dead stub — blocks forever.
     dst[i++] = keyboard_wait();
-    // Drain any further buffered characters without blocking.
     while (i < len) {
-        char c = keyboard_getchar();
+        char c = keyboard_getchar(); // LEGACY: always returns 0
         if (!c) break;
         dst[i++] = c;
     }
@@ -59,24 +79,24 @@ static int64_t kbd_read(vfs_file_t* self, void* buf, uint64_t len) {
 
 static vfs_file_t s_kbd_file = {
     .read  = kbd_read,
-    .write = NULL,         // read-only device
+    .write = NULL,
     .close = vga_noop_close,
     .ctx   = NULL,
     .flags = 0,
 };
 
+// LEGACY — see block comment above.  Use tty_open(0) for new code.
 vfs_file_t* vfs_kbd_open(void) {
     return &s_kbd_file;
 }
 
 // ── Raw scancode device (/dev/kbdraw) ────────────────────────────────────
-// Returns raw PS/2 scancodes including E0 prefixes and break codes.
-// Reads are non-blocking: returns 0 bytes if the buffer is empty.
+// Backed by evdev's raw scancode buffer.  Non-blocking: returns 0 if empty.
 
 static int64_t kbdraw_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
     if (!len) return 0;
-    int n = keyboard_getraw((uint8_t*)buf, (int)len);
+    int n = evdev_getraw((uint8_t*)buf, (int)len);
     return (int64_t)n;
 }
 

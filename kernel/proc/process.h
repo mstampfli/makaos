@@ -5,6 +5,9 @@
 #include "signal.h"
 #include "tss.h"
 #include "vfs.h"
+#include "cred.h"
+#include "pledge.h"
+#include "unveil.h"
 
 // ── Task flags ────────────────────────────────────────────────────────────
 #define TASK_FLAG_KTHREAD   (1U << 0)  // kernel thread: runs at CPL=0
@@ -97,6 +100,12 @@ typedef struct __attribute__((aligned(16))) task_t {
     uint8_t       mlfq_ticks_left;
 
     char          cwd[256];     // current working directory (absolute path)
+    char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
+
+    // ── Security ──────────────────────────────────────────────────────────
+    cred_t        cred;         // uid/gid/euid/egid/suid/sgid + supplemental groups
+    uint32_t      pledge_mask;  // PLEDGE_* bitmask; starts as PLEDGE_ALL (no restriction)
+    unveil_table_t unveil;      // per-process filesystem view restriction
 
     struct task_t* next;
 } task_t;
