@@ -255,36 +255,33 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_urnd)   f = vfs_urandom_open();
         else return (uint64_t)-ENOENT;
     } else {
-        // ── DAC permission check on ext2 files ───────────────────────────
-        // Resolve the inode first so we can check mode bits before handing
-        // out the fd.  This runs before ext2_open so we never give the caller
-        // a file descriptor they're not allowed to have.
-        uint32_t check_ino = ext2_lookup_path(path);
+        // ── DAC permission check via permission-aware path walk ───────────
+        // ext2_lookup_path_checked checks execute on every directory component
+        // AND returns the final inode so we can check the file's own mode.
+        int path_err = 0;
+        uint32_t check_ino = ext2_lookup_path_checked(path, &g_current->cred, &path_err);
+
         if (check_ino) {
-            // File exists — check against caller's credentials.
+            // File exists — check the file's own read/write permission.
             ext2_inode_t check_inode;
             if (ext2_read_inode(check_ino, &check_inode)) {
                 inode_perm_t ip = {
-                    .uid      = check_inode.i_uid,
-                    .gid      = check_inode.i_gid,
-                    .mode     = check_inode.i_mode & 0x1FF,  // rwxrwxrwx bits
-                    .inode_nr = check_ino,
-                    .dev      = 0,   // single ext2 partition, not nosuid
-                    .nosuid   = 0,
+                    .uid = check_inode.i_uid, .gid = check_inode.i_gid,
+                    .mode = check_inode.i_mode & 0x1FF,
+                    .inode_nr = check_ino, .dev = 0, .nosuid = 0,
                 };
                 uint8_t need_perm = ACL_PERM_READ;
                 int oflags_acc = (int)(flags & 3);
                 if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR)
                     need_perm |= ACL_PERM_WRITE;
                 int pr = vfs_check_perm(&ip, &g_current->cred, need_perm);
-                if (pr != 0) return (uint64_t)(int64_t)pr; // -EACCES
+                if (pr != 0) return (uint64_t)(int64_t)pr;
             }
-        } else if (!(flags & O_CREAT)) {
-            // File does not exist and O_CREAT not requested.
-            return (uint64_t)-ENOENT;
-        } else {
-            // O_CREAT: check write permission on the parent directory.
-            // Find last '/' to get parent path.
+            if ((flags & O_CREAT) && (flags & O_EXCL)) {
+                return (uint64_t)-EEXIST;
+            }
+        } else if (flags & O_CREAT) {
+            // File doesn't exist — check write+exec on parent directory.
             char parent[512];
             uint64_t plen = 0;
             while (path[plen]) plen++;
@@ -292,22 +289,22 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             while (slash > 0 && path[slash] != '/') slash--;
             if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
             else { for (uint64_t k = 0; k < slash; k++) parent[k] = path[k]; parent[slash] = '\0'; }
-            uint32_t dir_ino = ext2_lookup_path(parent);
-            if (dir_ino) {
-                ext2_inode_t dir_inode;
-                if (ext2_read_inode(dir_ino, &dir_inode)) {
-                    inode_perm_t ip = {
-                        .uid      = dir_inode.i_uid,
-                        .gid      = dir_inode.i_gid,
-                        .mode     = dir_inode.i_mode & 0x1FF,
-                        .inode_nr = dir_ino,
-                        .dev      = 0,
-                        .nosuid   = 0,
-                    };
-                    int pr = vfs_check_perm(&ip, &g_current->cred, ACL_PERM_WRITE);
-                    if (pr != 0) return (uint64_t)(int64_t)pr;
-                }
+            int dir_err = 0;
+            uint32_t dir_ino = ext2_lookup_path_checked(parent, &g_current->cred, &dir_err);
+            if (!dir_ino) return dir_err ? (uint64_t)(int64_t)dir_err : (uint64_t)-ENOENT;
+            ext2_inode_t dir_inode;
+            if (ext2_read_inode(dir_ino, &dir_inode)) {
+                inode_perm_t ip = {
+                    .uid = dir_inode.i_uid, .gid = dir_inode.i_gid,
+                    .mode = dir_inode.i_mode & 0x1FF,
+                    .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
+                };
+                int pr = vfs_check_perm(&ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+                if (pr != 0) return (uint64_t)(int64_t)pr;
             }
+        } else {
+            // File doesn't exist, no O_CREAT — propagate the error from the walk.
+            return path_err ? (uint64_t)(int64_t)path_err : (uint64_t)-ENOENT;
         }
 
         f = ext2_open(path);
@@ -661,23 +658,21 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
     k_envp[envc] = NULL;
 
-    // ── Execute permission check ──────────────────────────────────────────
+    // ── Execute permission check (path-aware walk + exec bit) ────────────
     {
-        uint32_t exec_ino = ext2_lookup_path(resolved);
-        if (!exec_ino) goto enoent;
+        int exec_err = 0;
+        uint32_t exec_ino = ext2_lookup_path_checked(resolved, &g_current->cred, &exec_err);
+        if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
         inode_perm_t exec_ip = {
-            .uid      = exec_inode.i_uid,
-            .gid      = exec_inode.i_gid,
-            .mode     = exec_inode.i_mode & 0x1FF,
-            .inode_nr = exec_ino,
-            .dev      = 0,
-            .nosuid   = 0,
+            .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
+            .mode = exec_inode.i_mode & 0x1FF,
+            .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
         };
         uint32_t setuid_uid = 0xFFFFFFFFu;
         if (vfs_check_exec(&exec_ip, &g_current->cred, &setuid_uid) != 0)
-            goto enoent;  // return EACCES but ENOENT is traditional for no-exec
+            goto enoent;
     }
 
     // ── Load ELF ──────────────────────────────────────────────────────────
@@ -1034,6 +1029,20 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
         && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
         count = proc_readdir(path, kbuf, (int)max_entries);
     } else {
+        // Check read+execute permission on the directory (path-aware walk).
+        int rd_err = 0;
+        uint32_t rd_ino = ext2_lookup_path_checked(path, &g_current->cred, &rd_err);
+        if (!rd_ino) { kfree(kbuf); return rd_err ? (uint64_t)(int64_t)rd_err : (uint64_t)-ENOENT; }
+        ext2_inode_t rd_inode;
+        if (ext2_read_inode(rd_ino, &rd_inode)) {
+            inode_perm_t rd_ip = {
+                .uid = rd_inode.i_uid, .gid = rd_inode.i_gid,
+                .mode = rd_inode.i_mode & 0x1FF,
+                .inode_nr = rd_ino, .dev = 0, .nosuid = 0,
+            };
+            int rpr = vfs_check_perm(&rd_ip, &g_current->cred, ACL_PERM_READ | ACL_PERM_EXEC);
+            if (rpr != 0) { kfree(kbuf); return (uint64_t)(int64_t)rpr; }
+        }
         count = ext2_readdir(path, kbuf, (int)max_entries);
         if (count < 0) { kfree(kbuf); return (uint64_t)-ENOENT; }
         // Inject virtual top-level directories into root listing.
@@ -1099,39 +1108,21 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
         return r == 0 ? 0 : (uint64_t)-ENOENT;
     }
 
-    // Split into parent + basename, then scan parent entries.
-    // Find last '/' to get basename.
-    uint64_t last = 0;
-    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
-    const char* base = path + last + 1;
-    char parent[256];
-    if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
-    else { for (uint64_t i = 0; i < last; i++) parent[i] = path[i]; parent[last] = '\0'; }
+    // Permission-aware path resolution (checks exec on every directory component).
+    int st_err = 0;
+    uint32_t st_ino = ext2_lookup_path_checked(path, &g_current->cred, &st_err);
+    if (!st_ino) return st_err ? (uint64_t)(int64_t)st_err : (uint64_t)-ENOENT;
 
-    ext2_entry_t* entries = kmalloc(256 * sizeof(ext2_entry_t));
-    if (!entries) return (uint64_t)-ENOMEM;
-
-    int count = ext2_readdir(parent, entries, 256);
-    if (count < 0) { kfree(entries); return (uint64_t)-ENOENT; }
+    ext2_inode_t st_inode;
+    if (!ext2_read_inode(st_ino, &st_inode)) return (uint64_t)-ENOENT;
 
     stat_t* st = (stat_t*)stat_ptr;
-    for (int i = 0; i < count; i++) {
-        // Compare entry name with basename.
-        const char* en = entries[i].name;
-        const char* bn = base;
-        while (*en && *en == *bn) { en++; bn++; }
-        if (*en == '\0' && *bn == '\0') {
-            st->ino    = entries[i].inode_num;
-            st->size   = entries[i].size;
-            st->mode   = entries[i].is_dir ? (uint16_t)0x41ED : (uint16_t)0x81A4;
-            st->is_dir = entries[i].is_dir;
-            st->_pad   = 0;
-            kfree(entries);
-            return 0;
-        }
-    }
-    kfree(entries);
-    return (uint64_t)-ENOENT;
+    st->ino    = st_ino;
+    st->size   = st_inode.i_size;
+    st->mode   = st_inode.i_mode;
+    st->is_dir = ((st_inode.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+    st->_pad   = 0;
+    return 0;
 }
 
 // ── sys_unlink ────────────────────────────────────────────────────────────
@@ -1143,6 +1134,27 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     const char* upath = (const char*)path_ptr;
     for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
     path[pathlen] = '\0';
+
+    // Check write permission on the file's parent directory.
+    // Find parent path.
+    uint64_t last = 0;
+    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
+    char parent[256];
+    if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
+    else { for (uint64_t i = 0; i < last; i++) parent[i] = path[i]; parent[last] = '\0'; }
+
+    int ul_err = 0;
+    uint32_t par_ino = ext2_lookup_path_checked(parent, &g_current->cred, &ul_err);
+    if (!par_ino) return ul_err ? (uint64_t)(int64_t)ul_err : (uint64_t)-ENOENT;
+    ext2_inode_t par_inode;
+    if (!ext2_read_inode(par_ino, &par_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t par_ip = {
+        .uid = par_inode.i_uid, .gid = par_inode.i_gid,
+        .mode = par_inode.i_mode & 0x1FF,
+        .inode_nr = par_ino, .dev = 0, .nosuid = 0,
+    };
+    int upr = vfs_check_perm(&par_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+    if (upr != 0) return (uint64_t)(int64_t)upr;
 
     return ext2_unlink(path) ? 0 : (uint64_t)-ENOENT;
 }
@@ -1161,6 +1173,26 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     src[srclen] = '\0';
     for (uint64_t i = 0; i < dstlen; i++) dst[i] = udst[i];
     dst[dstlen] = '\0';
+
+    // Require write+exec on src parent directory.
+    uint64_t src_last = 0;
+    for (uint64_t i = 0; i < srclen; i++) if (src[i] == '/') src_last = i;
+    char src_parent[256];
+    if (src_last == 0) { src_parent[0] = '/'; src_parent[1] = '\0'; }
+    else { for (uint64_t i = 0; i < src_last; i++) src_parent[i] = src[i]; src_parent[src_last] = '\0'; }
+
+    int rn_err = 0;
+    uint32_t sp_ino = ext2_lookup_path_checked(src_parent, &g_current->cred, &rn_err);
+    if (!sp_ino) return rn_err ? (uint64_t)(int64_t)rn_err : (uint64_t)-ENOENT;
+    ext2_inode_t sp_inode;
+    if (!ext2_read_inode(sp_ino, &sp_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t sp_ip = {
+        .uid = sp_inode.i_uid, .gid = sp_inode.i_gid,
+        .mode = sp_inode.i_mode & 0x1FF,
+        .inode_nr = sp_ino, .dev = 0, .nosuid = 0,
+    };
+    int spr = vfs_check_perm(&sp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+    if (spr != 0) return (uint64_t)(int64_t)spr;
 
     return ext2_rename(src, dst) ? 0 : (uint64_t)-ENOENT;
 }
@@ -1188,9 +1220,25 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
     for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
     path[pathlen] = '\0';
 
-    // Verify it's a valid directory.
+    // Resolve path with full permission-aware walk (checks exec on every component).
+    int cd_err = 0;
+    uint32_t dir_ino = ext2_lookup_path_checked(path, &g_current->cred, &cd_err);
+    if (!dir_ino) return cd_err ? (uint64_t)(int64_t)cd_err : (uint64_t)-ENOENT;
+
+    // Check execute permission on the target directory itself.
+    ext2_inode_t dir_inode;
+    if (!ext2_read_inode(dir_ino, &dir_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t dir_ip = {
+        .uid = dir_inode.i_uid, .gid = dir_inode.i_gid,
+        .mode = dir_inode.i_mode & 0x1FF,
+        .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
+    };
+    int cpr = vfs_check_perm(&dir_ip, &g_current->cred, ACL_PERM_EXEC);
+    if (cpr != 0) return (uint64_t)(int64_t)cpr;
+
+    // Verify it's actually a directory.
     ext2_entry_t tmp[1];
-    if (ext2_readdir(path, tmp, 1) < 0) return (uint64_t)-ENOENT;
+    if (ext2_readdir(path, tmp, 1) < 0) return (uint64_t)-ENOTDIR;
 
     for (uint32_t i = 0; i < 255 && path[i]; i++) g_current->cwd[i] = path[i];
     g_current->cwd[255] = '\0';
@@ -1210,6 +1258,26 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     const char* upath = (const char*)path_ptr;
     for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
     path[pathlen] = '\0';
+
+    // Require write+exec on parent directory.
+    uint64_t mk_last = 0;
+    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') mk_last = i;
+    char mk_parent[256];
+    if (mk_last == 0) { mk_parent[0] = '/'; mk_parent[1] = '\0'; }
+    else { for (uint64_t i = 0; i < mk_last; i++) mk_parent[i] = path[i]; mk_parent[mk_last] = '\0'; }
+
+    int mk_err = 0;
+    uint32_t mkp_ino = ext2_lookup_path_checked(mk_parent, &g_current->cred, &mk_err);
+    if (!mkp_ino) return mk_err ? (uint64_t)(int64_t)mk_err : (uint64_t)-ENOENT;
+    ext2_inode_t mkp_inode;
+    if (!ext2_read_inode(mkp_ino, &mkp_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t mkp_ip = {
+        .uid = mkp_inode.i_uid, .gid = mkp_inode.i_gid,
+        .mode = mkp_inode.i_mode & 0x1FF,
+        .inode_nr = mkp_ino, .dev = 0, .nosuid = 0,
+    };
+    int mkpr = vfs_check_perm(&mkp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+    if (mkpr != 0) return (uint64_t)(int64_t)mkpr;
 
     return ext2_mkdir(path) ? 0 : (uint64_t)-EIO;
 }
@@ -1795,10 +1863,9 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
 
 // ── sys_access ────────────────────────────────────────────────────────────
 // access(path, mode) → 0 or -errno
-// We don't have a real permission model: if the file exists it's accessible.
+// Checks real UID/GID permissions (F_OK, R_OK, W_OK, X_OK).
 static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
-    (void)amode;
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
@@ -1819,20 +1886,37 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
         for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
     }
 
-    // /dev/* always exists (virtual device directory).
+    // /dev/* and /proc/* — always accessible.
     if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v'
         && (path[4]=='/' || path[4]=='\0'))
         return 0;
-
-    // /proc/* — stat from kernel state.
     if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
         && path[4]=='c' && (path[5]=='/' || path[5]=='\0'))
-        return 0; // always exists (checked by sys_stat which calls proc_stat)
+        return 0;
 
-    vfs_file_t* f = ext2_open(path);
-    if (!f) return (uint64_t)-ENOENT;
-    vfs_close(f);
-    return 0;
+    // Permission-aware path resolution (checks exec on every directory component).
+    int ac_err = 0;
+    uint32_t ac_ino = ext2_lookup_path_checked(path, &g_current->cred, &ac_err);
+    if (!ac_ino) return ac_err ? (uint64_t)(int64_t)ac_err : (uint64_t)-ENOENT;
+
+    // F_OK (0) — existence only, already confirmed above.
+    if (amode == 0) return 0;
+
+    // Build requested permission mask.
+    uint8_t need = 0;
+    if (amode & 4) need |= ACL_PERM_READ;
+    if (amode & 2) need |= ACL_PERM_WRITE;
+    if (amode & 1) need |= ACL_PERM_EXEC;
+
+    ext2_inode_t ac_inode;
+    if (!ext2_read_inode(ac_ino, &ac_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t ac_ip = {
+        .uid = ac_inode.i_uid, .gid = ac_inode.i_gid,
+        .mode = ac_inode.i_mode & 0x1FF,
+        .inode_nr = ac_ino, .dev = 0, .nosuid = 0,
+    };
+    int apr = vfs_check_perm(&ac_ip, &g_current->cred, need);
+    return apr == 0 ? 0 : (uint64_t)(int64_t)apr;
 }
 
 // ── sys_uname ─────────────────────────────────────────────────────────────
@@ -2479,6 +2563,20 @@ static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     } else {
         for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
     }
+    // Require write permission on the file itself.
+    int tr_err = 0;
+    uint32_t tr_ino = ext2_lookup_path_checked(path, &g_current->cred, &tr_err);
+    if (!tr_ino) return tr_err ? (uint64_t)(int64_t)tr_err : (uint64_t)-ENOENT;
+    ext2_inode_t tr_inode;
+    if (!ext2_read_inode(tr_ino, &tr_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t tr_ip = {
+        .uid = tr_inode.i_uid, .gid = tr_inode.i_gid,
+        .mode = tr_inode.i_mode & 0x1FF,
+        .inode_nr = tr_ino, .dev = 0, .nosuid = 0,
+    };
+    int tpr = vfs_check_perm(&tr_ip, &g_current->cred, ACL_PERM_WRITE);
+    if (tpr != 0) return (uint64_t)(int64_t)tpr;
+
     if (!ext2_truncate_to(path, length)) return (uint64_t)-EIO;
     return 0;
 }

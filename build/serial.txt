@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x0000000000035E5B
+kernel.bin size=0x0000000000036E6B
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x0000000000035E5B
+kernel loaded, bytes=0x0000000000036E6B
 phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
@@ -15,6 +15,11 @@ K
 [net] IP 10.0.2.15 GW 10.0.2.2
 [net] MAC 52:54:00:12:34:56
 [net] ready
+0000000000400003
+00007FFFFFFFDEB3
+
+Kore login: Password: 
+Welcome, maka!
 0000000000400003
 00007FFFFFFFDEC3
 MakaOS Shell v0.3 -- type 'help' for commands
@@ -28,4 +33,14 @@ MakaOS:/> [lost+found]          <DIR>
 [root]                <DIR>
 TEST.TXT              26 bytes
 [proc]                <DIR>
+MakaOS:/> 0000000000400003
+00007FFFFFFFDEC3
+PID   PPID  STATE     NAME
+----  ----  --------  ----
+15    14    running   ps
+14    10    runnable  shell
+10    0     runnable  login
+11    0     sleeping  (unknown)
+12    0     sleeping  (unknown)
+13    0     sleeping  (unknown)
 MakaOS:/> 

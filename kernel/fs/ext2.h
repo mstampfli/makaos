@@ -162,7 +162,16 @@ int ext2_rename(const char* src, const char* dst);
 int ext2_truncate_to(const char* path, uint64_t length);
 
 // Resolve absolute path to inode number (0 = not found).
+// No permission checks — use only for kernel-internal paths (boot, ksec).
 uint32_t ext2_lookup_path(const char* path);
+
+// Permission-checked path resolution.
+// Walks every directory component and checks execute (search) permission
+// against `cred` using standard POSIX DAC rules.
+// Returns inode number on success.
+// Returns 0 and sets *err_out to -ENOENT or -EACCES on failure.
+// err_out may be NULL (error code discarded).
+uint32_t ext2_lookup_path_checked(const char* path, const void* cred, int* err_out);
 
 // Read inode `ino` into `*out`.  Returns 1 on success, 0 on failure.
 uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out);
