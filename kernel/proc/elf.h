@@ -97,13 +97,21 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
 // Equivalent to elf_load but calls elf_setup_stack so argv[0] etc. are
 // correctly passed to the program.  For Linux ABI binaries (bash, musl apps).
 // argv and envp are NULL-terminated kernel-side pointer arrays.
+//
+// stdio: array of 3 fd specs for the child's stdin/stdout/stderr.
+//   stdio[i] == -1  → dup fd i from the calling process (inherit)
+//   stdio[i] >= 0   → dup that specific fd from the calling process
+//   stdio == NULL   → open /dev/tty0 for all three (safe for init)
+//
 // Returns fully-initialised task_t* (ready to sched_add), or NULL.
 task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
-                           const char* const* argv, const char* const* envp);
+                           const char* const* argv, const char* const* envp,
+                           const int stdio[3]);
 
 // Convenience: read the ext2 file at `path`, then elf_load_with_argv.
 task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
-                            const char* const* argv, const char* const* envp);
+                            const char* const* argv, const char* const* envp,
+                            const int stdio[3]);
 
 // Build the SysV AMD64 initial user stack for a newly exec'd process.
 // Maps a fresh stack page into `pml4`, copies argv/envp strings onto it,

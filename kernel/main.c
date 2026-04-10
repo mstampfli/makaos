@@ -22,6 +22,7 @@
 #include "ioapic.h"
 #include "net/net.h"
 #include "tty.h"
+#include "evdev.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -116,12 +117,13 @@ void kmain(void) {
     // ── Launch /bin/shell as PID 1 ────────────────────────────────────────
     static const char* sh_argv[] = { "/bin/shell", NULL };
     static const char* sh_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
-    task_t* init = elf_exec_from_ext2("/bin/shell", pid_alloc(), sh_argv, sh_envp);
+    task_t* init = elf_exec_from_ext2("/bin/shell", pid_alloc(), sh_argv, sh_envp, NULL);
     if (!init)
         for (;;) __asm__ volatile("hlt");  // /bin/shell missing — halt
 
     sched_init();
     tty_init();
+    evdev_init();
     keyboard_init();
     mouse_init();
     hda_init();
