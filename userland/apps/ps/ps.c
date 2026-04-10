@@ -73,8 +73,8 @@ int main(void) {
     write(1, "----  ----  --------  ----\n", 27);
 
     // Read /proc directory — one entry per PID.
-    dirent_t entries[256];
-    int count = readdir("/proc", 5, entries, 256);
+    k_dirent_t entries[256];
+    int count = _sys_readdir("/proc", 5, entries, 256);
     if (count < 0) {
         write(1, "ps: cannot read /proc\n", 22);
         return 1;

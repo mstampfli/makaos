@@ -345,13 +345,26 @@ typedef struct {
 #define FD_ISSET(fd, setp) \
     (((setp)->bits[(fd)/64] >> ((fd)%64)) & 1)
 
-// ── stat_t (for SYS_STAT) ─────────────────────────────────────────────────
-typedef struct {
-    uint32_t ino;
-    uint32_t size;
-    uint16_t mode;
-    uint8_t  is_dir;
-    uint8_t  _pad;
+// ── stat_t / struct stat (POSIX, for SYS_STAT / SYS_FSTAT) ──────────────
+// Filled by sys_stat / sys_fstat and written to userspace.
+// Layout must match stat_t / struct stat in userland/libc/libc.h exactly.
+// Matches userland struct stat exactly (st_atim etc. are struct { int64 sec; int64 nsec }).
+typedef struct k_timespec { int64_t tv_sec; int64_t tv_nsec; } k_timespec_t;
+typedef struct stat {
+    uint64_t     st_ino;
+    uint64_t     st_nlink;
+    uint32_t     st_mode;
+    uint32_t     st_uid;
+    uint32_t     st_gid;
+    uint32_t     _pad0;
+    uint64_t     st_size;
+    k_timespec_t st_atim;
+    k_timespec_t st_mtim;
+    k_timespec_t st_ctim;
+    uint64_t     st_blksize;
+    int64_t      st_blocks;
+    int32_t      st_dev;
+    int32_t      st_rdev;
 } stat_t;
 
 #define SYS_READ_NONBLOCK 1

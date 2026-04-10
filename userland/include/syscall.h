@@ -324,13 +324,6 @@ typedef struct {
 #define FD_ISSET(fd, setp) \
     (((setp)->bits[(fd)/64] >> ((fd)%64)) & 1)
 
-// ── stat_t ────────────────────────────────────────────────────────────────
-typedef struct {
-    uint32_t ino;
-    uint32_t size;
-    uint16_t mode;
-    uint8_t  is_dir;
-    uint8_t  _pad;
-} stat_t;
+// stat_t removed — use struct stat (POSIX) from libc.h
 
 #define SYS_READ_NONBLOCK 1

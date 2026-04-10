@@ -161,17 +161,18 @@ int ext2_rename(const char* src, const char* dst);
 // Returns 1 on success, 0 on failure.
 int ext2_truncate_to(const char* path, uint64_t length);
 
-// Resolve absolute path to inode number (0 = not found).
-// No permission checks — use only for kernel-internal paths (boot, ksec).
-uint32_t ext2_lookup_path(const char* path);
-
 // Permission-checked path resolution.
-// Walks every directory component and checks execute (search) permission
-// against `cred` using standard POSIX DAC rules.
-// Returns inode number on success.
-// Returns 0 and sets *err_out to -ENOENT or -EACCES on failure.
-// err_out may be NULL (error code discarded).
-uint32_t ext2_lookup_path_checked(const char* path, const void* cred, int* err_out);
+// Permission-checked path walk — for syscall handlers acting on behalf of a user.
+// Checks execute (search) on every directory component against `cred`.
+// Returns inode number on success, 0 on failure (*err_out set to -ENOENT/-EACCES).
+uint32_t ext2_lookup_path(const char* path, const void* cred, int* err_out);
+
+// Unchecked path walk — for kernel-internal callers that already hold an open
+// fd (e.g. fstat) or run in a kthread with no user context (no cred to check).
+// Never use this from a syscall handler on a fresh path.
+static inline uint32_t ext2_lookup_path_raw(const char* path) {
+    return ext2_lookup_path(path, (void*)0, (void*)0);
+}
 
 // Read inode `ino` into `*out`.  Returns 1 on success, 0 on failure.
 uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out);

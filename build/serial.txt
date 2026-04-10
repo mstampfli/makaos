@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x0000000000036E6B
+kernel.bin size=0x0000000000037ECB
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x0000000000036E6B
+kernel loaded, bytes=0x0000000000037ECB
 phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
@@ -17,30 +17,29 @@ K
 [net] ready
 0000000000400003
 00007FFFFFFFDEB3
+[open] pid=0000000a /etc/passwd -> fd=00000003
+[open] pid=0000000a /etc/shadow -> fd=00000003
 
 Kore login: Password: 
-Welcome, maka!
+Welcome, root!
 0000000000400003
-00007FFFFFFFDEC3
+00007FFFFFFFDEA3
+[ioctl] pid=0000000e fd=00000000 req=00005410 -> 00000000
 MakaOS Shell v0.3 -- type 'help' for commands
 
-MakaOS:/> [lost+found]          <DIR>
-[bin]                 <DIR>
-[etc]                 <DIR>
-[home]                <DIR>
-[tmp]                 <DIR>
-[dev]                 <DIR>
-[root]                <DIR>
-TEST.TXT              26 bytes
-[proc]                <DIR>
 MakaOS:/> 0000000000400003
-00007FFFFFFFDEC3
-PID   PPID  STATE     NAME
-----  ----  --------  ----
-15    14    running   ps
-14    10    runnable  shell
-10    0     runnable  login
-11    0     sleeping  (unknown)
-12    0     sleeping  (unknown)
-13    0     sleeping  (unknown)
-MakaOS:/> 
+00007FFFFFFFDEA3
+[open] pid=0000000f /dev/tty -> fd=00000003
+[shell: exited with code 0]
+MakaOS:/> [open] pid=0000000f /etc/passwd -> fd=00000003
+[ioctl] pid=0000000f fd=00000002 req=00005401 -> 00000000
+[ioctl] pid=0000000f fd=000000ff req=00005401 -> 00000000
+[ioctl] pid=0000000f fd=000000ff req=00005413 -> 00000000
+[open] pid=0000000f /root/.bashrc -> ERR 00000002
+[open] pid=0000000f /root/.bash_history -> ERR 00000002
+[ioctl] pid=0000000f fd=000000ff req=00005401 -> 00000000
+[ioctl] pid=0000000f fd=000000ff req=00005413 -> 00000000
+bash-5.2# [access] pid=0000000f /bin/ls -> 00000000
+[access] pid=0000000f /bin/ls -> 00000000
+[fork] pid=0000000f -> child=00000010
+[exec] pid=00000010 

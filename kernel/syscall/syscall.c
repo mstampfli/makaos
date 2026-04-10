@@ -25,6 +25,7 @@
 #include "unveil.h"
 #include "perm.h"
 #include "ksec.h"
+#include "virtfs.h"
 
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
@@ -208,75 +209,69 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     vfs_file_t* f = NULL;
 
-    // /proc/ dispatch — synthesize from kernel state, no disk I/O.
-    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
-        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
-        f = proc_open(path);
-        if (!f) return (uint64_t)-ENOENT;
-        // proc files are read-only; flags/cloexec still apply below.
-        goto got_file;
+    // ── Permission check via unified fs_lookup ────────────────────────────
+    // Covers both virtfs (/proc, /dev) and ext2 in one call.
+    // For O_CREAT on a new file we only need to check the parent dir later,
+    // so a ENOENT here is only fatal if O_CREAT is not set.
+    {
+        uint8_t open_need = ACL_PERM_READ;
+        int oflags_acc = (int)(flags & 3);
+        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) open_need |= ACL_PERM_WRITE;
+        fs_node_t fsn;
+        int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
+        if (fsr == 0 && (flags & O_CREAT) && (flags & O_EXCL))
+            return (uint64_t)-EEXIST;
+        if (fsr != 0 && fsr != -ENOENT) return (uint64_t)(int64_t)fsr;
+        if (fsr == -ENOENT && !(flags & O_CREAT)) return (uint64_t)-ENOENT;
+
+        // Virtual path — dispatch to backend; permission already checked.
+        if (fsr == 0 && fsn.is_virtual) {
+            if (path[0]=='/' && path[1]=='p') {
+                // /proc
+                f = proc_open(path);
+                if (!f) return (uint64_t)-ENOENT;
+                goto got_file;
+            }
+            // /dev — dispatch by device name
+            const char* dev = path + 5; // skip "/dev/"
+            uint8_t match_kbd    = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
+            uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
+                                 && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
+            uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
+            uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
+                                 && dev[4]=='e' && dev[5]=='\0');
+            uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
+            uint8_t match_tty    = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='\0');
+            uint8_t match_tty0   = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='0' && dev[4]=='\0');
+            uint8_t match_null   = (dev[0]=='n' && dev[1]=='u' && dev[2]=='l' && dev[3]=='l' && dev[4]=='\0');
+            uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
+            uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
+                                 && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+            uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
+                                 && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
+                                 && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
+                                 && dev[12]=='\0');
+            if      (match_tty)    f = tty_open(0);
+            else if (match_tty0)   f = tty_open(0);
+            else if (match_kbdraw) f = vfs_kbdraw_open();
+            else if (match_event0) f = evdev_open();
+            else if (match_kbd)    f = vfs_kbd_open();
+            else if (match_vga)    f = vfs_vga_open();
+            else if (match_mouse)  f = vfs_mouse_open();
+            else if (match_dsp)    f = vfs_dsp_open();
+            else if (match_null)   f = vfs_null_open();
+            else if (match_zero)   f = vfs_zero_open();
+            else if (match_urnd)   f = vfs_urandom_open();
+            else return (uint64_t)-ENOENT;
+            // fall through to got_file
+        }
     }
 
-    // /dev/ dispatch — map device names to built-in vfs_file_t objects.
-    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
-        const char* dev = path + 5;
-        uint8_t match_kbd    = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
-        uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
-                             && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
-        uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
-        uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
-                             && dev[4]=='e' && dev[5]=='\0');
-        uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
-        uint8_t match_tty    = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='\0');
-        uint8_t match_tty0   = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='0' && dev[4]=='\0');
-        uint8_t match_null   = (dev[0]=='n' && dev[1]=='u' && dev[2]=='l' && dev[3]=='l' && dev[4]=='\0');
-        uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
-        uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
-                             && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
-        // /dev/input/event0
-        uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
-                             && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
-                             && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
-                             && dev[12]=='\0');
-        if      (match_tty)    f = tty_open(0);
-        else if (match_tty0)   f = tty_open(0);
-        else if (match_kbdraw) f = vfs_kbdraw_open();
-        else if (match_event0) f = evdev_open();
-        // LEGACY: /dev/kbd — direct polling, no line discipline, never delivers input.
-        //   NEW PATH: open /dev/tty or /dev/tty0 for TTY input (N_TTY),
-        //             /dev/input/event0 for raw evdev streams,
-        //             /dev/kbdraw for raw PS/2 scancodes.
-        else if (match_kbd)    f = vfs_kbd_open();
-        else if (match_vga)    f = vfs_vga_open();
-        else if (match_mouse)  f = vfs_mouse_open();
-        else if (match_dsp)    f = vfs_dsp_open();
-        else if (match_null)   f = vfs_null_open();
-        else if (match_zero)   f = vfs_zero_open();
-        else if (match_urnd)   f = vfs_urandom_open();
-        else return (uint64_t)-ENOENT;
-    } else {
-        // ── DAC permission check via permission-aware path walk ───────────
-        // ext2_lookup_path_checked checks execute on every directory component
-        // AND returns the final inode so we can check the file's own mode.
+    if (!f) {
+        // ext2 path: file exists (or O_CREAT on new file).
         int path_err = 0;
-        uint32_t check_ino = ext2_lookup_path_checked(path, &g_current->cred, &path_err);
-
+        uint32_t check_ino = ext2_lookup_path(path, &g_current->cred, &path_err);
         if (check_ino) {
-            // File exists — check the file's own read/write permission.
-            ext2_inode_t check_inode;
-            if (ext2_read_inode(check_ino, &check_inode)) {
-                inode_perm_t ip = {
-                    .uid = check_inode.i_uid, .gid = check_inode.i_gid,
-                    .mode = check_inode.i_mode & 0x1FF,
-                    .inode_nr = check_ino, .dev = 0, .nosuid = 0,
-                };
-                uint8_t need_perm = ACL_PERM_READ;
-                int oflags_acc = (int)(flags & 3);
-                if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR)
-                    need_perm |= ACL_PERM_WRITE;
-                int pr = vfs_check_perm(&ip, &g_current->cred, need_perm);
-                if (pr != 0) return (uint64_t)(int64_t)pr;
-            }
             if ((flags & O_CREAT) && (flags & O_EXCL)) {
                 return (uint64_t)-EEXIST;
             }
@@ -290,7 +285,7 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
             else { for (uint64_t k = 0; k < slash; k++) parent[k] = path[k]; parent[slash] = '\0'; }
             int dir_err = 0;
-            uint32_t dir_ino = ext2_lookup_path_checked(parent, &g_current->cred, &dir_err);
+            uint32_t dir_ino = ext2_lookup_path(parent, &g_current->cred, &dir_err);
             if (!dir_ino) return dir_err ? (uint64_t)(int64_t)dir_err : (uint64_t)-ENOENT;
             ext2_inode_t dir_inode;
             if (ext2_read_inode(dir_ino, &dir_inode)) {
@@ -661,7 +656,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // ── Execute permission check (path-aware walk + exec bit) ────────────
     {
         int exec_err = 0;
-        uint32_t exec_ino = ext2_lookup_path_checked(resolved, &g_current->cred, &exec_err);
+        uint32_t exec_ino = ext2_lookup_path(resolved, &g_current->cred, &exec_err);
         if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
@@ -834,7 +829,7 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     }
     k_envp[envc] = NULL;
     // Default env if caller passed nothing.
-    const char* def_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
+    const char* def_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", "PWD=/", NULL };
     const char* const* final_envp = envc ? (const char* const*)k_envp : def_envp;
 
     // ── Resolve stdio spec ────────────────────────────────────────────────
@@ -861,6 +856,16 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
 
     // Wire parent-child relationship so waitpid works correctly.
     child->ppid = g_current->pid;
+
+    // Job control: if the child inherits the parent's tty (stdio[0]==-1),
+    // give the terminal to the child's process group immediately.
+    // This is what a proper shell does after fork+exec: tcsetpgrp(tty, child_pgid).
+    // Without this, bash detects it's not in the foreground and spins on SIGTTOU.
+    if (!stdio_ptr || (((const int*)stdio_ptr)[0] == -1)) {
+        tty_t* tty = tty_get_ctty();
+        if (!tty) tty = &g_ttys[0];
+        tty->fg_pgid = child->pgid;
+    }
 
     sched_add(child);
 
@@ -976,7 +981,17 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
         if (z) {
             int32_t  code      = z->exit_code;
             uint32_t child_pid = z->pid;
+            uint32_t child_pgid = z->pgid;
             process_destroy(z);
+
+            // Job control: if the dead child was the terminal's foreground
+            // process group, hand the terminal back to the waiting parent.
+            // This is what a job-control shell does implicitly after waitpid.
+            tty_t* tty = tty_get_ctty();
+            if (!tty) tty = &g_ttys[0];
+            if (tty && tty->fg_pgid == child_pgid)
+                tty->fg_pgid = g_current->pgid;
+
             if (status_ptr) {
                 int* sp = (int*)(uintptr_t)status_ptr;
                 *sp = (int)((code & 0xFF) << 8);
@@ -1013,116 +1028,159 @@ static uint64_t sys_getpid(void) {
 static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
                              uint64_t buf_ptr,  uint64_t max_entries) {
     if (!buf_ptr || max_entries == 0) return 0;
-    if (pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+    if (pathlen == 0 || pathlen > 511) return (uint64_t)-EINVAL;
     if (max_entries > 256) max_entries = 256;
 
-    char path[256];
+    char* raw  = kmalloc(512);
+    char* path = kmalloc(512);
+    if (!raw || !path) { kfree(raw); kfree(path); return (uint64_t)-ENOMEM; }
+
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    raw[pathlen] = '\0';
+
+    if (raw[0] != '/') {
+        const char* cwd = g_current ? g_current->cwd : "/";
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
+    }
+    kfree(raw);
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
-    if (!kbuf) return (uint64_t)-ENOMEM;
+    if (!kbuf) { kfree(path); return (uint64_t)-ENOMEM; }
 
     int count;
-    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
-        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
-        count = proc_readdir(path, kbuf, (int)max_entries);
-    } else {
-        // Check read+execute permission on the directory (path-aware walk).
-        int rd_err = 0;
-        uint32_t rd_ino = ext2_lookup_path_checked(path, &g_current->cred, &rd_err);
-        if (!rd_ino) { kfree(kbuf); return rd_err ? (uint64_t)(int64_t)rd_err : (uint64_t)-ENOENT; }
-        ext2_inode_t rd_inode;
-        if (ext2_read_inode(rd_ino, &rd_inode)) {
-            inode_perm_t rd_ip = {
-                .uid = rd_inode.i_uid, .gid = rd_inode.i_gid,
-                .mode = rd_inode.i_mode & 0x1FF,
-                .inode_nr = rd_ino, .dev = 0, .nosuid = 0,
-            };
-            int rpr = vfs_check_perm(&rd_ip, &g_current->cred, ACL_PERM_READ | ACL_PERM_EXEC);
-            if (rpr != 0) { kfree(kbuf); return (uint64_t)(int64_t)rpr; }
-        }
-        count = ext2_readdir(path, kbuf, (int)max_entries);
-        if (count < 0) { kfree(kbuf); return (uint64_t)-ENOENT; }
-        // Inject virtual top-level directories into root listing.
-        if (path[0] == '/' && path[1] == '\0') {
-            static const char* virt_dirs[] = { "proc", "dev", NULL };
-            for (int v = 0; virt_dirs[v] && count < (int)max_entries; v++) {
-                // Only inject if not already present on ext2 (shouldn't be, but be safe).
-                int already = 0;
-                for (int j = 0; j < count; j++) {
-                    const char* a = kbuf[j].name; const char* b = virt_dirs[v];
-                    while (*a && *b && *a == *b) { a++; b++; }
-                    if (*a == '\0' && *b == '\0') { already = 1; break; }
-                }
-                if (!already) {
-                    const char* n = virt_dirs[v];
+    {
+        fs_node_t fsn;
+        int fsr = fs_lookup(path, &g_current->cred, ACL_PERM_READ | ACL_PERM_EXEC, &fsn);
+        if (fsr != 0) { kfree(kbuf); kfree(path); return (uint64_t)(int64_t)fsr; }
+        if (fsn.type != FS_TYPE_DIR) { kfree(kbuf); kfree(path); return (uint64_t)-ENOTDIR; }
+
+        if (fsn.is_virtual) {
+            if (path[0]=='/' && path[1]=='p') {
+                count = proc_readdir(path, kbuf, (int)max_entries);
+            } else {
+                // /dev — synthesize directory listing of known devices.
+                static const char* s_dev_entries[] = {
+                    "tty", "tty0", "kbd", "kbdraw", "vga", "mouse",
+                    "dsp", "null", "zero", "urandom", "input", NULL
+                };
+                count = 0;
+                for (int di = 0; s_dev_entries[di] && count < (int)max_entries; di++) {
+                    const char* n = s_dev_entries[di];
                     int ni = 0;
                     while (n[ni]) { kbuf[count].name[ni] = n[ni]; ni++; }
-                    kbuf[count].name[ni]     = '\0';
-                    kbuf[count].inode_num    = 0xF0000000 + (uint32_t)v;
-                    kbuf[count].size         = 0;
-                    kbuf[count].is_dir       = 1;
+                    kbuf[count].name[ni] = '\0';
+                    kbuf[count].inode_num = 0xE0000000 + (uint32_t)di;
+                    kbuf[count].size      = 0;
+                    kbuf[count].is_dir    = 0;
                     count++;
+                }
+            }
+        } else {
+            // ext2: permissions already checked by fs_lookup above.
+            count = ext2_readdir(path, kbuf, (int)max_entries);
+            if (count < 0) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
+            // Inject virtual top-level directories into root listing.
+            if (path[0] == '/' && path[1] == '\0') {
+                static const char* virt_dirs[] = { "proc", "dev", NULL };
+                for (int v = 0; virt_dirs[v] && count < (int)max_entries; v++) {
+                    int already = 0;
+                    for (int j = 0; j < count; j++) {
+                        const char* a = kbuf[j].name; const char* b = virt_dirs[v];
+                        while (*a && *b && *a == *b) { a++; b++; }
+                        if (*a == '\0' && *b == '\0') { already = 1; break; }
+                    }
+                    if (!already) {
+                        const char* n = virt_dirs[v];
+                        int ni = 0;
+                        while (n[ni]) { kbuf[count].name[ni] = n[ni]; ni++; }
+                        kbuf[count].name[ni]     = '\0';
+                        kbuf[count].inode_num    = 0xF0000000 + (uint32_t)v;
+                        kbuf[count].size         = 0;
+                        kbuf[count].is_dir       = 1;
+                        count++;
+                    }
                 }
             }
         }
     }
-    if (count < 0) { kfree(kbuf); return (uint64_t)-ENOENT; }
+    if (count < 0) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
 
     ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
     for (int i = 0; i < count; i++) ubuf[i] = kbuf[i];
 
     kfree(kbuf);
+    kfree(path);
     return (uint64_t)count;
 }
 
+// Forward declarations for copy helpers (defined later in this file).
+static int copy_to_user(void* dst_u, const void* src, uint64_t len);
+static int copy_from_user(void* dst, const void* src_u, uint64_t len);
+
 // ── sys_stat ──────────────────────────────────────────────────────────────
-// stat(path_ptr, pathlen, stat_ptr) → 0 or -1
-// Finds the entry in the parent directory to get inode, size, and type.
+// stat(path_ptr, pathlen, stat_ptr) → 0 or -errno
+// Fills a POSIX struct stat in userspace directly.
 static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr) {
-    if (!g_current || pathlen == 0 || pathlen > 255 || !stat_ptr) return (uint64_t)-EINVAL;
+    if (!g_current || pathlen == 0 || pathlen > 511 || !stat_ptr) return (uint64_t)-EINVAL;
 
-    char path[256];
+    char raw[512];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    raw[pathlen] = '\0';
 
-    // Special case: root directory.
-    if (path[0] == '/' && path[1] == '\0') {
-        stat_t* st = (stat_t*)stat_ptr;
-        st->ino    = 2;
-        st->size   = 0;
-        st->mode   = 0x41ED;
-        st->is_dir = 1;
-        st->_pad   = 0;
-        return 0;
+    char path[512];
+    if (raw[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
     }
 
-    // /proc/ paths — stat from kernel state.
-    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
-        && path[4]=='c' && (path[5]=='/' || path[5]=='\0')) {
-        stat_t* st = (stat_t*)stat_ptr;
-        int r = proc_stat(path, st);
-        return r == 0 ? 0 : (uint64_t)-ENOENT;
+    struct stat kst;
+    __builtin_memset(&kst, 0, sizeof(kst));
+
+    fs_node_t fsn;
+    // stat needs no permission on the file itself — only parent dir traversal,
+    // which ext2_lookup_path already checks on every component.
+    int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);
+    if (fsr != 0) return (uint64_t)(int64_t)fsr;
+
+    if (fsn.is_virtual) {
+        if (path[0]=='/' && path[1]=='p') {
+            int r = proc_stat(path, &kst);
+            if (r != 0) return (uint64_t)-ENOENT;
+        } else {
+            kst.st_ino     = fsn.inode_nr ? fsn.inode_nr : 0xE0000001;
+            kst.st_mode    = fsn.mode;
+            kst.st_nlink   = (fsn.type == FS_TYPE_DIR) ? 2 : 1;
+            kst.st_uid     = fsn.uid;
+            kst.st_gid     = fsn.gid;
+            kst.st_blksize = 4096;
+        }
+    } else {
+        kst.st_ino     = fsn.inode_nr;
+        kst.st_mode    = fsn.mode;
+        kst.st_size    = (int64_t)fsn.size;
+        kst.st_uid     = fsn.uid;
+        kst.st_gid     = fsn.gid;
+        kst.st_nlink   = (fsn.type == FS_TYPE_DIR) ? 2 : 1;
+        kst.st_blksize = 4096;
+        kst.st_blocks  = (int64_t)((fsn.size + 511) / 512);
     }
-
-    // Permission-aware path resolution (checks exec on every directory component).
-    int st_err = 0;
-    uint32_t st_ino = ext2_lookup_path_checked(path, &g_current->cred, &st_err);
-    if (!st_ino) return st_err ? (uint64_t)(int64_t)st_err : (uint64_t)-ENOENT;
-
-    ext2_inode_t st_inode;
-    if (!ext2_read_inode(st_ino, &st_inode)) return (uint64_t)-ENOENT;
-
-    stat_t* st = (stat_t*)stat_ptr;
-    st->ino    = st_ino;
-    st->size   = st_inode.i_size;
-    st->mode   = st_inode.i_mode;
-    st->is_dir = ((st_inode.i_mode & 0xF000) == 0x4000) ? 1 : 0;
-    st->_pad   = 0;
-    return 0;
+    return (copy_to_user((void*)stat_ptr, &kst, sizeof(kst)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 
 // ── sys_unlink ────────────────────────────────────────────────────────────
@@ -1144,7 +1202,7 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     else { for (uint64_t i = 0; i < last; i++) parent[i] = path[i]; parent[last] = '\0'; }
 
     int ul_err = 0;
-    uint32_t par_ino = ext2_lookup_path_checked(parent, &g_current->cred, &ul_err);
+    uint32_t par_ino = ext2_lookup_path(parent, &g_current->cred, &ul_err);
     if (!par_ino) return ul_err ? (uint64_t)(int64_t)ul_err : (uint64_t)-ENOENT;
     ext2_inode_t par_inode;
     if (!ext2_read_inode(par_ino, &par_inode)) return (uint64_t)-ENOENT;
@@ -1182,7 +1240,7 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     else { for (uint64_t i = 0; i < src_last; i++) src_parent[i] = src[i]; src_parent[src_last] = '\0'; }
 
     int rn_err = 0;
-    uint32_t sp_ino = ext2_lookup_path_checked(src_parent, &g_current->cred, &rn_err);
+    uint32_t sp_ino = ext2_lookup_path(src_parent, &g_current->cred, &rn_err);
     if (!sp_ino) return rn_err ? (uint64_t)(int64_t)rn_err : (uint64_t)-ENOENT;
     ext2_inode_t sp_inode;
     if (!ext2_read_inode(sp_ino, &sp_inode)) return (uint64_t)-ENOENT;
@@ -1198,53 +1256,116 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
 }
 
 // ── sys_getcwd ────────────────────────────────────────────────────────────
-// getcwd(buf_ptr, buflen) → 0 or -1
+// getcwd(buf_ptr, buflen) → buf_ptr on success, -errno on error.
+// Linux extension: buf_ptr==NULL && buflen==0 → kernel allocates via mmap,
+// returns pointer to user-space buffer (caller must free with munmap).
 static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
-    if (!g_current || !buf_ptr || buflen == 0) return (uint64_t)-EINVAL;
+    if (!g_current) return (uint64_t)-EINVAL;
+
+    const char* cwd = g_current->cwd;
+    uint64_t cwdlen = 0;
+    while (cwd[cwdlen]) cwdlen++;
+    cwdlen++; // include NUL
+
+    // Linux extension: NULL buf with size 0 → kernel allocates a buffer.
+    // We extend the heap (brk) by one page so the returned address is always
+    // in the low user address space (< 0x80000000).  Bash does movslq on the
+    // return value; addresses above 2GB would be sign-extended to negative.
+    // We also eagerly allocate and map the physical frame (kernel writes to the
+    // buffer before returning, so demand-paging from kernel context is avoided).
+    if (!buf_ptr && buflen == 0) {
+        mm_t* mm = g_current->mm_shared->mm;
+
+        // Allocate a physical frame for the buffer.
+        phys_addr_t frame = pmm_buddy_alloc(0);
+        if (frame == PMM_INVALID_ADDR) return (uint64_t)-ENOMEM;
+
+        // Use current brk as the buffer VA (it's in the low 2GB for typical ELFs).
+        virt_addr_t uva = (mm->brk + PAGE_MASK) & ~PAGE_MASK; // page-align up
+        virt_addr_t uva_end = uva + PAGE_SIZE;
+
+        // Extend heap VMA to cover the new page.
+        virt_addr_t heap_start = mm->brk_start;
+        vma_t* prev = NULL;
+        vma_t* v = mm->vmas;
+        while (v) {
+            if (v->start == heap_start) {
+                if (prev) prev->next = v->next; else mm->vmas = v->next;
+                kfree(v);
+                break;
+            }
+            prev = v; v = v->next;
+        }
+        if (!mm_vma_add(mm, heap_start, uva_end, VMA_R | VMA_W | VMA_ANON)) {
+            pmm_buddy_free(frame, 0);
+            return (uint64_t)-ENOMEM;
+        }
+        mm->brk = uva_end;
+
+        // Eagerly map the frame (kernel writes into it next).
+        uint64_t pte_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NX;
+        if (!vmm_page_map(vmm_current_pml4(), uva, frame, pte_flags)) {
+            pmm_buddy_free(frame, 0);
+            return (uint64_t)-ENOMEM;
+        }
+
+        // Zero the frame and write the cwd string.
+        uint8_t* kbuf = (uint8_t*)(frame + HHDM_OFFSET);
+        for (int i = 0; i < (int)PAGE_SIZE; i++) kbuf[i] = 0;
+        for (uint64_t i = 0; i < cwdlen; i++) kbuf[i] = (uint8_t)cwd[i];
+
+        return uva;
+    }
+
+    if (!buf_ptr || buflen == 0) return (uint64_t)-EINVAL;
+    if (cwdlen > buflen) return (uint64_t)-ERANGE;
 
     char* ubuf = (char*)buf_ptr;
-    const char* cwd = g_current->cwd;
-    uint64_t i = 0;
-    while (i + 1 < buflen && cwd[i]) { ubuf[i] = cwd[i]; i++; }
-    ubuf[i] = '\0';
-    return 0;
+    for (uint64_t i = 0; i < cwdlen; i++) ubuf[i] = cwd[i];
+    return buf_ptr;
 }
 
 // ── sys_chdir ─────────────────────────────────────────────────────────────
 // chdir(path_ptr, pathlen) → 0 or -1
 static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
-    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+    if (!g_current || pathlen == 0 || pathlen > 511) return (uint64_t)-EINVAL;
 
-    char path[256];
+    char raw[512];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
-    path[pathlen] = '\0';
+    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    raw[pathlen] = '\0';
 
-    // Resolve path with full permission-aware walk (checks exec on every component).
-    int cd_err = 0;
-    uint32_t dir_ino = ext2_lookup_path_checked(path, &g_current->cred, &cd_err);
-    if (!dir_ino) return cd_err ? (uint64_t)(int64_t)cd_err : (uint64_t)-ENOENT;
+    // Resolve relative paths against cwd.
+    char path[512];
+    if (raw[0] != '/') {
+        const char* cwd = g_current->cwd;
+        uint64_t clen = 0; while (cwd[clen]) clen++;
+        uint64_t j = 0;
+        for (; j < clen && j < 510; j++) path[j] = cwd[j];
+        if (j > 0 && path[j-1] != '/') path[j++] = '/';
+        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
+        path[j] = '\0';
+    } else {
+        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
+    }
 
-    // Check execute permission on the target directory itself.
-    ext2_inode_t dir_inode;
-    if (!ext2_read_inode(dir_ino, &dir_inode)) return (uint64_t)-ENOENT;
-    inode_perm_t dir_ip = {
-        .uid = dir_inode.i_uid, .gid = dir_inode.i_gid,
-        .mode = dir_inode.i_mode & 0x1FF,
-        .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
-    };
-    int cpr = vfs_check_perm(&dir_ip, &g_current->cred, ACL_PERM_EXEC);
-    if (cpr != 0) return (uint64_t)(int64_t)cpr;
+    // Unified lookup — covers both virtfs and ext2.
+    {
+        fs_node_t fsn;
+        int fsr = fs_lookup(path, &g_current->cred, ACL_PERM_EXEC, &fsn);
+        if (fsr != 0) return (uint64_t)(int64_t)fsr;
+        if (fsn.type != FS_TYPE_DIR) return (uint64_t)-ENOTDIR;
+        if (fsn.is_virtual) {
+            uint32_t len = 0;
+            while (len < 255 && path[len]) { g_current->cwd[len] = path[len]; len++; }
+            g_current->cwd[len] = '\0';
+            return 0;
+        }
+    }
 
-    // Verify it's actually a directory.
-    ext2_entry_t tmp[1];
-    if (ext2_readdir(path, tmp, 1) < 0) return (uint64_t)-ENOTDIR;
-
-    for (uint32_t i = 0; i < 255 && path[i]; i++) g_current->cwd[i] = path[i];
-    g_current->cwd[255] = '\0';
-    // Ensure null terminator at the right place.
+    // ext2: fs_lookup already verified existence, type, and permissions.
     uint32_t len = 0;
-    while (len < 255 && path[len]) len++;
+    while (len < 255 && path[len]) { g_current->cwd[len] = path[len]; len++; }
     g_current->cwd[len] = '\0';
     return 0;
 }
@@ -1267,7 +1388,7 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     else { for (uint64_t i = 0; i < mk_last; i++) mk_parent[i] = path[i]; mk_parent[mk_last] = '\0'; }
 
     int mk_err = 0;
-    uint32_t mkp_ino = ext2_lookup_path_checked(mk_parent, &g_current->cred, &mk_err);
+    uint32_t mkp_ino = ext2_lookup_path(mk_parent, &g_current->cred, &mk_err);
     if (!mkp_ino) return mk_err ? (uint64_t)(int64_t)mk_err : (uint64_t)-ENOENT;
     ext2_inode_t mkp_inode;
     if (!ext2_read_inode(mkp_ino, &mkp_inode)) return (uint64_t)-ENOENT;
@@ -1525,8 +1646,6 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
 // ── sys_nanosleep ─────────────────────────────────────────────────────────
 // nanosleep(req, rem) — sleep for at least req->tv_sec * 1e9 + req->tv_nsec ns.
 // rem is ignored (no partial-sleep resume after signal for now).
-typedef struct { uint64_t tv_sec; uint64_t tv_nsec; } k_timespec_t;
-
 static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     (void)rem_ptr;
     if (!req_ptr) return (uint64_t)-EINVAL;
@@ -1549,16 +1668,17 @@ static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
 
 // ── sys_gettimeofday ──────────────────────────────────────────────────────
 // gettimeofday(tv, tz) — fills struct timeval { tv_sec, tv_usec }.
+// Must match the struct timeval layout in userland/libc/libc.h exactly.
 typedef struct { int64_t tv_sec; int64_t tv_usec; } k_timeval_t;
 
 static uint64_t sys_gettimeofday(uint64_t tv_ptr, uint64_t tz_ptr) {
     (void)tz_ptr;
     if (!tv_ptr) return (uint64_t)-EINVAL;
     uint64_t ns = tsc_read_ns();
-    k_timeval_t* tv = (k_timeval_t*)tv_ptr;
-    tv->tv_sec  = (int64_t)(ns / 1000000000ULL);
-    tv->tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
-    return 0;
+    k_timeval_t ktv;
+    ktv.tv_sec  = (int64_t)(ns / 1000000000ULL);
+    ktv.tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
+    return (copy_to_user((void*)tv_ptr, &ktv, sizeof(ktv)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 
 // ── sys_fb_blit ───────────────────────────────────────────────────────────
@@ -1831,7 +1951,7 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 }
 
 // ── sys_fstat ─────────────────────────────────────────────────────────────
-// fstat(fd, stat_t*) → 0 or -errno
+// fstat(fd, struct stat*) → 0 or -errno
 static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
     if (!g_current || !stat_ptr) return (uint64_t)-EINVAL;
     task_files_t* files = g_current->files_shared;
@@ -1839,26 +1959,32 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
         return (uint64_t)-EBADF;
 
     vfs_file_t* f = files->fd_table[fd];
-    stat_t st = {0};
+    struct stat kst;
+    __builtin_memset(&kst, 0, sizeof(kst));
 
-    // If the file has a stat path stored, use ext2.
+    // If the file has a stat path stored, look up ext2.
     if (f->path[0]) {
-        // Try ext2 stat.
         ext2_inode_t inode;
-        uint32_t inum = ext2_lookup_path(f->path);
+        uint32_t inum = ext2_lookup_path_raw(f->path);
         if (inum && ext2_read_inode(inum, &inode)) {
-            st.ino    = inum;
-            st.size   = inode.i_size;
-            st.mode   = inode.i_mode;
-            st.is_dir = ((inode.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+            int is_dir = ((inode.i_mode & 0xF000) == 0x4000);
+            kst.st_ino     = inum;
+            kst.st_mode    = inode.i_mode;
+            kst.st_size    = inode.i_size;
+            kst.st_uid     = inode.i_uid;
+            kst.st_gid     = inode.i_gid;
+            kst.st_nlink   = is_dir ? 2 : 1;
+            kst.st_blksize = 4096;
+            kst.st_blocks  = (int64_t)((inode.i_size + 511) / 512);
         }
     } else {
-        // Device/pipe/socket: fill in a minimal stat.
-        st.mode   = 0666;
-        st.is_dir = 0;
+        // Device/pipe/socket/tty: fill minimal stat (char device, rw).
+        kst.st_mode    = 0020666; // S_IFCHR | 0666
+        kst.st_nlink   = 1;
+        kst.st_blksize = 4096;
     }
 
-    return (copy_to_user((void*)stat_ptr, &st, sizeof(st)) == 0) ? 0 : (uint64_t)-EFAULT;
+    return (copy_to_user((void*)stat_ptr, &kst, sizeof(kst)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 
 // ── sys_access ────────────────────────────────────────────────────────────
@@ -1886,37 +2012,22 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
         for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
     }
 
-    // /dev/* and /proc/* — always accessible.
-    if (path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v'
-        && (path[4]=='/' || path[4]=='\0'))
-        return 0;
-    if (path[0]=='/' && path[1]=='p' && path[2]=='r' && path[3]=='o'
-        && path[4]=='c' && (path[5]=='/' || path[5]=='\0'))
-        return 0;
+    // Unified lookup for both virtfs and ext2.
+    {
+        uint8_t ac_need = 0;
+        if (amode & 4) ac_need |= ACL_PERM_READ;
+        if (amode & 2) ac_need |= ACL_PERM_WRITE;
+        if (amode & 1) ac_need |= ACL_PERM_EXEC;
+        // F_OK (amode==0): existence check only — no permission needed on the file itself.
+        // The path walk in ext2_lookup_path checks exec on parent dirs, which is correct.
+        fs_node_t fsn;
+        int fsr = fs_lookup(path, &g_current->cred, ac_need, &fsn);
+        if (fsr != 0) return (uint64_t)(int64_t)fsr;
+        if (fsn.is_virtual) return 0; // already fully checked
+    }
 
-    // Permission-aware path resolution (checks exec on every directory component).
-    int ac_err = 0;
-    uint32_t ac_ino = ext2_lookup_path_checked(path, &g_current->cred, &ac_err);
-    if (!ac_ino) return ac_err ? (uint64_t)(int64_t)ac_err : (uint64_t)-ENOENT;
-
-    // F_OK (0) — existence only, already confirmed above.
-    if (amode == 0) return 0;
-
-    // Build requested permission mask.
-    uint8_t need = 0;
-    if (amode & 4) need |= ACL_PERM_READ;
-    if (amode & 2) need |= ACL_PERM_WRITE;
-    if (amode & 1) need |= ACL_PERM_EXEC;
-
-    ext2_inode_t ac_inode;
-    if (!ext2_read_inode(ac_ino, &ac_inode)) return (uint64_t)-ENOENT;
-    inode_perm_t ac_ip = {
-        .uid = ac_inode.i_uid, .gid = ac_inode.i_gid,
-        .mode = ac_inode.i_mode & 0x1FF,
-        .inode_nr = ac_ino, .dev = 0, .nosuid = 0,
-    };
-    int apr = vfs_check_perm(&ac_ip, &g_current->cred, need);
-    return apr == 0 ? 0 : (uint64_t)(int64_t)apr;
+    // ext2: fs_lookup already checked existence and permissions.
+    return 0;
 }
 
 // ── sys_uname ─────────────────────────────────────────────────────────────
@@ -2344,8 +2455,6 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
 // if it's not full, and we do not sleep — we just poll once.
 // A NULL fd_set means "don't care about this set".
 // timeval = {0,0} → non-blocking; NULL → block until at least one is ready.
-typedef struct { int64_t tv_sec; int64_t tv_usec; } timeval_t;
-
 static int fd_is_readable(vfs_file_t* f) {
     if (!f || !f->read) return 0;
     // Pipes: check if data is available without blocking.
@@ -2376,7 +2485,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     // Determine timeout in nanoseconds (NULL = infinite).
     uint64_t timeout_ns = UINT64_MAX;
     if (tv_ptr) {
-        timeval_t tv;
+        k_timeval_t tv;
         copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv));
         timeout_ns = (uint64_t)tv.tv_sec * 1000000000ULL
                    + (uint64_t)tv.tv_usec * 1000ULL;
@@ -2565,7 +2674,7 @@ static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     }
     // Require write permission on the file itself.
     int tr_err = 0;
-    uint32_t tr_ino = ext2_lookup_path_checked(path, &g_current->cred, &tr_err);
+    uint32_t tr_ino = ext2_lookup_path(path, &g_current->cred, &tr_err);
     if (!tr_ino) return tr_err ? (uint64_t)(int64_t)tr_err : (uint64_t)-ENOENT;
     ext2_inode_t tr_inode;
     if (!ext2_read_inode(tr_ino, &tr_inode)) return (uint64_t)-ENOENT;
@@ -2627,6 +2736,10 @@ static void serial_putc(char c) {
 static void serial_puts(const char* s) {
     for (; *s; s++) serial_putc(*s);
 }
+static void serial_hex_u32(uint32_t v) {
+    const char* h = "0123456789abcdef";
+    for (int i = 28; i >= 0; i -= 4) serial_putc(h[(v >> i) & 0xF]);
+}
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────
 // Dispatches using our internal syscall numbers.
@@ -2640,9 +2753,26 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
     }
     switch (nr) {
         case SYS_WRITE:   ret = sys_write(arg1, arg2, arg3);      break;
-        case SYS_EXIT:    ret = sys_exit(arg1);                    break;
+        case SYS_EXIT:
+            if (g_current && g_current->pid > 2) {
+                serial_puts("[exit] pid="); serial_hex_u32((uint32_t)g_current->pid);
+                serial_puts(" code="); serial_hex_u32((uint32_t)arg1);
+                serial_putc('\n');
+            }
+            ret = sys_exit(arg1);
+            break;
         case SYS_READ:    ret = sys_read(arg1, arg2, arg3, arg4);  break;
-        case SYS_OPEN:    ret = sys_open(arg1, arg2, arg3);         break;
+        case SYS_OPEN:    ret = sys_open(arg1, arg2, arg3);
+            if (g_current && g_current->pid > 2) {
+                serial_puts("[open] pid="); serial_hex_u32((uint32_t)g_current->pid);
+                serial_putc(' ');
+                serial_puts((const char*)arg1);
+                serial_puts(" -> ");
+                if ((int64_t)ret < 0) { serial_puts("ERR "); serial_hex_u32((uint32_t)(-(int64_t)ret)); }
+                else { serial_puts("fd="); serial_hex_u32((uint32_t)ret); }
+                serial_putc('\n');
+            }
+            break;
         case SYS_CLOSE:   ret = sys_close(arg1);                   break;
         case SYS_BRK:     ret = sys_brk(arg1);                     break;
         case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;

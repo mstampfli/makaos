@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="kernel"
 USERLAND_DIR="userland"
 BOOT_DIR="boot"
@@ -141,6 +142,18 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
 
+# ── Bash 5.2 (optional — requires /tmp/bash-5.2 source tree) ──────────────
+BASH_SRC="${BASH_SRC:-/tmp/bash-5.2}"
+if [ -d "$BASH_SRC" ]; then
+    if [ "$BASH_SRC/builtins/mkbuiltins" -nt "$BUILD_DIR/user_bash.elf" ] || \
+       [ ! -f "$BUILD_DIR/user_bash.elf" ]; then
+        echo "[+] Building bash 5.2"
+        BASH_SRC="$BASH_SRC" "$SCRIPT_DIR/build_bash.sh" "$BASH_SRC" 2>&1 | grep -E "^\[|error:" || true
+    else
+        echo "[+] bash ELF up to date"
+    fi
+fi
+
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ksec/ksec.c" -o "$BUILD_DIR/user_ksec.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
    -o "$BUILD_DIR/user_ksec.elf"
@@ -149,9 +162,14 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
    -o "$BUILD_DIR/user_ps.elf"
 
+
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/login/login.c" -o "$BUILD_DIR/user_login.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_login.o" \
    -o "$BUILD_DIR/user_login.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/ls" -c "$USERLAND_DIR/apps/ls/ls.c" -o "$BUILD_DIR/user_ls.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ls.o" \
+   -o "$BUILD_DIR/user_ls.elf"
 
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USERLAND_DIR/apps/doom"
@@ -423,6 +441,7 @@ if [ -f "$BUILD_DIR/user_ps.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ps.elf" bin/ps
     echo "[+] ps ELF installed at bin/ps (root:root 0755)"
 fi
+
 if [ -f "$BUILD_DIR/user_ksec.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ksec.elf" bin/ksec
     echo "[+] ksec ELF installed at bin/ksec (root:root 0755)"
@@ -431,9 +450,18 @@ if [ -f "$BUILD_DIR/user_login.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_login.elf" bin/login
     echo "[+] login ELF installed at bin/login (root:root 0755)"
 fi
+if [ -f "$BUILD_DIR/user_ls.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ls.elf" bin/ls
+    echo "[+] ls ELF installed at bin/ls (root:root 0755)"
+fi
 if [ -f "$BUILD_DIR/user_doom.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_doom.elf" bin/doom
     echo "[+] doom ELF installed at bin/doom (root:root 0755)"
+fi
+
+if [ -f "$BUILD_DIR/user_bash.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/bash
+    echo "[+] bash ELF installed at bin/bash (root:root 0755)"
 fi
 
 WAD_SEARCH=(

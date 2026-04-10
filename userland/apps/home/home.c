@@ -155,8 +155,8 @@ static char kbd_wait(void) {
 // ── Timing ────────────────────────────────────────────────────────────────
 
 static void sleep_ms(uint64_t ms) {
-    timespec_t req = { ms/1000, (ms%1000)*1000000ULL };
-    nanosleep(&req, 0);
+    struct timespec req = { (int64_t)(ms/1000), (int64_t)((ms%1000)*1000000ULL) };
+    nanosleep(&req, NULL);
 }
 
 // ── Home menu ─────────────────────────────────────────────────────────────

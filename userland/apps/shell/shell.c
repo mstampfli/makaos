@@ -142,10 +142,10 @@ static void cmd_ls(const char* cwd, int argc, char* argv[]) {
         strncpy(path, cwd, sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
 
-    dirent_t* entries = malloc(64 * sizeof(dirent_t));
+    k_dirent_t* entries = malloc(64 * sizeof(k_dirent_t));
     if (!entries) { puts_fd("ls: out of memory\n"); return; }
 
-    int count = readdir(path, strlen(path), entries, 64);
+    int count = _sys_readdir(path, strlen(path), entries, 64);
     if (count < 0) {
         puts_fd("ls: cannot read: ");
         puts_fd(path);
@@ -160,7 +160,7 @@ static void cmd_ls(const char* cwd, int argc, char* argv[]) {
     }
 
     for (int i = 0; i < count; i++) {
-        dirent_t* e = &entries[i];
+        k_dirent_t* e = &entries[i];
         uint32_t nlen = (uint32_t)strlen(e->name);
         if (e->is_dir) {
             putc_fd('[');
@@ -206,7 +206,7 @@ static void cmd_cd(char* cwd, int argc, char* argv[]) {
     char resolved[256];
     resolve_path(cwd, target, resolved, sizeof(resolved));
 
-    int r = chdir(resolved, strlen(resolved));
+    int r = chdir(resolved);
     if (r < 0) {
         puts_fd("cd: not found: "); puts_fd(resolved); putc_fd('\n');
         return;
@@ -224,7 +224,7 @@ static void cmd_mkdir(const char* cwd, int argc, char* argv[]) {
     if (argc < 2) { puts_fd("Usage: mkdir <path>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
-    int r = mkdir(path, strlen(path));
+    int r = mkdir(path, 0755);
     if (r < 0) { puts_fd("mkdir: failed: "); puts_fd(path); putc_fd('\n'); }
 }
 
@@ -232,7 +232,7 @@ static void cmd_rm(const char* cwd, int argc, char* argv[]) {
     if (argc < 2) { puts_fd("Usage: rm <path>\n"); return; }
     char path[256];
     resolve_path(cwd, argv[1], path, sizeof(path));
-    int r = unlink(path, strlen(path));
+    int r = unlink(path);
     if (r < 0) { puts_fd("rm: failed: "); puts_fd(path); putc_fd('\n'); }
 }
 
@@ -241,7 +241,7 @@ static void cmd_mv(const char* cwd, int argc, char* argv[]) {
     char src[256], dst[256];
     resolve_path(cwd, argv[1], src, sizeof(src));
     resolve_path(cwd, argv[2], dst, sizeof(dst));
-    int r = sys_rename(src, strlen(src), dst, strlen(dst));
+    int r = rename(src, dst);
     if (r < 0) { puts_fd("mv: failed: "); puts_fd(src); puts_fd(" -> "); puts_fd(dst); putc_fd('\n'); }
 }
 
@@ -366,10 +366,10 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
 
     if (cmd[0] != '/') {
         snprintf(path, sizeof(path), "/bin/%s", cmd);
-        stat_t st;
-        if (stat(path, strlen(path), &st) < 0) {
+        struct stat st;
+        if (stat(path, &st) < 0) {
             resolve_path(cwd, cmd, path, sizeof(path));
-            if (stat(path, strlen(path), &st) < 0) {
+            if (stat(path, &st) < 0) {
                 puts_fd("shell: command not found: "); puts_fd(cmd); putc_fd('\n');
                 return;
             }
@@ -381,12 +381,28 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
     (void)argc;
 
     // spawn: create a fresh task — inherit our own stdin/stdout/stderr.
+    // Pass -i to force interactive mode (bash checks isatty but our tty
+    // detection may not be perfect, so be explicit).
     static const int inherit_stdio[3] = { -1, -1, -1 };
-    int pid = spawn(path, NULL, NULL, inherit_stdio);
+    const char* bash_argv[] = { path, "-i", NULL };
+    // Only pass -i if the binary looks like bash; otherwise pass NULL argv.
+    int is_bash = 0;
+    { const char* p = path; while (*p) p++; while (p > path && *p != '/') p--; if (*p == '/') p++;
+      is_bash = (p[0]=='b' && p[1]=='a' && p[2]=='s' && p[3]=='h' && !p[4]); }
+    int pid = spawn(path, is_bash ? bash_argv : NULL, NULL, inherit_stdio);
     if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
     int status = 0;
     waitpid(pid, &status, 0);
+    // Debug: print exit status so we can see why a program exited immediately
+    if (WIFEXITED(status)) {
+        puts_fd("[shell: exited with code ");
+        char nbuf[12]; int n = WEXITSTATUS(status); int pos = 0;
+        if (n == 0) { nbuf[pos++] = '0'; }
+        else { int tmp = n; int digits = 0; while (tmp) { tmp /= 10; digits++; } pos = digits; tmp = n; while (tmp) { nbuf[--pos] = '0' + (tmp % 10); tmp /= 10; } pos = digits; }
+        for (int i = 0; i < pos; i++) putc_fd(nbuf[i]);
+        puts_fd("]\n");
+    }
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────

@@ -1182,15 +1182,8 @@ int ext2_truncate_to(const char* path, uint64_t length) {
     }
 }
 
-// ── ext2_lookup_path / ext2_read_inode ───────────────────────────────────
-// Public wrappers for internal path resolution and inode reading.
-// Used by fstat to get file metadata without opening a new fd.
-uint32_t ext2_lookup_path(const char* path) {
-    if (!s_mounted || !path) return 0;
-    return path_to_inode(path);
-}
 
-// ── ext2_lookup_path_checked ──────────────────────────────────────────────
+// ── ext2_lookup_path ──────────────────────────────────────────────
 // Permission-aware path walk.  Checks execute (search) on every directory
 // component traversed.  Uses the same walk as path_to_inode internally.
 // cred is a const cred_t* — typed as void* to avoid the ext2.h → cred.h
@@ -1199,7 +1192,7 @@ uint32_t ext2_lookup_path(const char* path) {
 #include "cred.h"
 #include "errno.h"
 
-uint32_t ext2_lookup_path_checked(const char* path, const void* cred, int* err_out) {
+uint32_t ext2_lookup_path(const char* path, const void* cred, int* err_out) {
     if (err_out) *err_out = 0;
     if (!s_mounted || !path || path[0] != '/') {
         if (err_out) *err_out = -ENOENT;

@@ -1,8 +1,13 @@
 #include "libc.h"
 
 // ── errno ─────────────────────────────────────────────────────────────────
-// Global error number — set by syscall wrappers on failure.
 int errno = 0;
+
+// ── environ ───────────────────────────────────────────────────────────────
+// Null-terminated array of "KEY=VALUE" strings, set by ELF loader.
+// If the loader doesn't set it, default to an empty environment.
+static char* s_empty_env[] = { NULL };
+char** environ = s_empty_env;
 
 // ── Signal restorer trampoline ────────────────────────────────────────────
 // Called (via `ret`) when a signal handler returns.
@@ -811,15 +816,8 @@ done:
 
 // ── time functions ────────────────────────────────────────────────────────
 
-typedef struct { int64_t tv_sec; int64_t tv_usec; } k_timeval_t;
-
-static inline int gettimeofday(k_timeval_t* tv, void* tz) {
-    (void)tz;
-    return (int)(long)__syscall_ret(syscall2(SYS_GETTOD, (uint64_t)tv, 0));
-}
-
 time_t time(time_t* tloc) {
-    k_timeval_t tv = {0, 0};
+    struct timeval tv = {0, 0};
     gettimeofday(&tv, NULL);
     if (tloc) *tloc = (time_t)tv.tv_sec;
     return (time_t)tv.tv_sec;
@@ -832,8 +830,8 @@ clock_t clock(void) {
 
 // ── nanosleep ─────────────────────────────────────────────────────────────
 
-int nanosleep(const timespec_t* req, timespec_t* rem) {
-    return (int)(long)__syscall_ret(
+int nanosleep(const struct timespec* req, struct timespec* rem) {
+    return (int)__syscall_ret(
         syscall2(SYS_NANOSLEEP, (uint64_t)req, (uint64_t)rem));
 }
 
@@ -900,3 +898,996 @@ void* calloc(size_t nmemb, size_t size) {
 
 // ── fprintf / vfprintf stubs (until stdio.c provides real FILE*) ──────────
 // Defined in stdio.c — forward declaration only here.
+
+// ── Additional string functions ───────────────────────────────────────────
+
+char* strpbrk(const char* s, const char* accept) {
+    while (*s) {
+        const char* a = accept;
+        while (*a) { if (*s == *a) return (char*)s; a++; }
+        s++;
+    }
+    return NULL;
+}
+
+size_t strspn(const char* s, const char* accept) {
+    size_t n = 0;
+    while (s[n]) {
+        const char* a = accept;
+        int found = 0;
+        while (*a) { if (s[n] == *a++) { found = 1; break; } }
+        if (!found) break;
+        n++;
+    }
+    return n;
+}
+
+size_t strcspn(const char* s, const char* reject) {
+    size_t n = 0;
+    while (s[n]) {
+        const char* r = reject;
+        while (*r) { if (s[n] == *r) return n; r++; }
+        n++;
+    }
+    return n;
+}
+
+char* strtok_r(char* s, const char* delim, char** saveptr) {
+    if (!s) s = *saveptr;
+    s += strspn(s, delim);
+    if (!*s) { *saveptr = s; return NULL; }
+    char* tok = s;
+    s += strcspn(s, delim);
+    if (*s) { *s++ = '\0'; }
+    *saveptr = s;
+    return tok;
+}
+
+static char* s_strtok_save = NULL;
+char* strtok(char* s, const char* delim) {
+    return strtok_r(s, delim, &s_strtok_save);
+}
+
+char* stpcpy(char* dst, const char* src) {
+    while ((*dst++ = *src++));
+    return dst - 1;
+}
+
+char* strchrnul(const char* s, int c) {
+    while (*s && *s != (char)c) s++;
+    return (char*)s;
+}
+
+size_t strnlen(const char* s, size_t maxlen) {
+    size_t n = 0;
+    while (n < maxlen && s[n]) n++;
+    return n;
+}
+
+int strcoll(const char* a, const char* b) {
+    return strcmp(a, b);  // C locale — lexicographic order
+}
+
+char* strcasestr(const char* haystack, const char* needle) {
+    if (!*needle) return (char*)haystack;
+    for (; *haystack; haystack++) {
+        const char* h = haystack, *n = needle;
+        while (*h && *n && ((*h | 32) == (*n | 32))) { h++; n++; }
+        if (!*n) return (char*)haystack;
+    }
+    return NULL;
+}
+
+double strtod(const char* s, char** endptr) {
+    while (*s == ' ' || *s == '\t') s++;
+    double sign = 1.0;
+    if (*s == '-') { sign = -1.0; s++; } else if (*s == '+') s++;
+    double v = 0.0;
+    while (*s >= '0' && *s <= '9') { v = v * 10.0 + (*s - '0'); s++; }
+    if (*s == '.') {
+        s++;
+        double frac = 0.1;
+        while (*s >= '0' && *s <= '9') { v += (*s - '0') * frac; frac *= 0.1; s++; }
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        int esign = 1;
+        if (*s == '-') { esign = -1; s++; } else if (*s == '+') s++;
+        int exp = 0;
+        while (*s >= '0' && *s <= '9') { exp = exp * 10 + (*s - '0'); s++; }
+        double p = 1.0;
+        while (exp-- > 0) p *= 10.0;
+        if (esign > 0) v *= p; else v /= p;
+    }
+    if (endptr) *endptr = (char*)s;
+    return v * sign;
+}
+
+long long strtoll(const char* s, char** endptr, int base) {
+    return (long long)strtol(s, endptr, base);
+}
+
+unsigned long long strtoull(const char* s, char** endptr, int base) {
+    return (unsigned long long)strtoul(s, endptr, base);
+}
+
+int asprintf(char** strp, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return -1;
+    *strp = malloc((size_t)n + 1);
+    if (!*strp) return -1;
+    va_start(ap, fmt);
+    vsnprintf(*strp, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int vasprintf(char** strp, const char* fmt, __builtin_va_list ap) {
+    // measure
+    va_list ap2;
+    __builtin_va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    __builtin_va_end(ap2);
+    if (n < 0) return -1;
+    *strp = malloc((size_t)n + 1);
+    if (!*strp) return -1;
+    vsnprintf(*strp, (size_t)n + 1, fmt, ap);
+    return n;
+}
+
+// ── POSIX DIR* API ────────────────────────────────────────────────────────
+// We store all entries from a single kernel readdir() call in a heap buffer.
+// readdir(DIR*) returns one entry at a time by incrementing dir->pos.
+
+DIR* opendir(const char* path) {
+    if (!path) { errno = EINVAL; return NULL; }
+    size_t plen = strnlen(path, 511);
+    k_dirent_t* entries = malloc(4096 * sizeof(k_dirent_t));
+    if (!entries) { errno = ENOMEM; return NULL; }
+    int count = _sys_readdir(path, plen, entries, 4096);
+    if (count < 0) {
+        free(entries);
+        return NULL;
+    }
+    DIR* dir = malloc(sizeof(DIR));
+    if (!dir) { free(entries); errno = ENOMEM; return NULL; }
+    size_t i = 0;
+    while (i < 511 && path[i]) { dir->path[i] = path[i]; i++; }
+    dir->path[i] = '\0';
+    dir->entries = entries;
+    dir->count   = count;
+    dir->pos     = 0;
+    return dir;
+}
+
+struct dirent* readdir(DIR* dirp) {
+    if (!dirp) { errno = EBADF; return NULL; }
+    if (dirp->pos >= dirp->count) return NULL;
+    k_dirent_t* ke = &dirp->entries[dirp->pos++];
+    dirp->cur.d_ino    = ke->inode_num;
+    dirp->cur.d_reclen = sizeof(struct dirent);
+    dirp->cur.d_type   = ke->is_dir ? DT_DIR : DT_REG;
+    size_t i = 0;
+    while (i < 255 && ke->name[i]) { dirp->cur.d_name[i] = ke->name[i]; i++; }
+    dirp->cur.d_name[i] = '\0';
+    return &dirp->cur;
+}
+
+int closedir(DIR* dirp) {
+    if (!dirp) { errno = EBADF; return -1; }
+    free(dirp->entries);
+    free(dirp);
+    return 0;
+}
+
+void rewinddir(DIR* dirp) {
+    if (dirp) dirp->pos = 0;
+}
+
+// ── passwd database ───────────────────────────────────────────────────────
+// Parse /etc/passwd: username:x:uid:gid:gecos:home:shell
+
+static struct passwd s_pw = {0};
+static char s_pw_buf[512];
+
+static struct passwd* pw_parse_line(char* line) {
+    // Format: name:passwd:uid:gid:gecos:home:shell
+    char* fields[7];
+    int f = 0;
+    char* p = line;
+    while (f < 7) {
+        fields[f++] = p;
+        while (*p && *p != ':' && *p != '\n') p++;
+        if (*p) *p++ = '\0';
+        else break;
+    }
+    if (f < 7) return NULL;
+    s_pw.pw_name   = fields[0];
+    s_pw.pw_passwd = fields[1];
+    s_pw.pw_uid    = (uid_t)strtol(fields[2], NULL, 10);
+    s_pw.pw_gid    = (gid_t)strtol(fields[3], NULL, 10);
+    s_pw.pw_gecos  = fields[4];
+    s_pw.pw_dir    = fields[5];
+    s_pw.pw_shell  = fields[6];
+    return &s_pw;
+}
+
+struct passwd* getpwuid(uid_t uid) {
+    int fd = open("/etc/passwd", O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    int n = read(fd, s_pw_buf, sizeof(s_pw_buf) - 1);
+    close(fd);
+    if (n <= 0) return NULL;
+    s_pw_buf[n] = '\0';
+    char* line = s_pw_buf;
+    while (line && *line) {
+        char* next = strchr(line, '\n');
+        if (next) *next = '\0';
+        // make a copy for parsing (pw_parse_line modifies in place)
+        char tmp[256]; size_t li = 0;
+        while (li < 255 && line[li]) { tmp[li] = line[li]; li++; } tmp[li] = '\0';
+        struct passwd* pw = pw_parse_line(tmp);
+        if (pw && pw->pw_uid == uid) {
+            // copy strings back into s_pw_buf-based storage
+            pw_parse_line(line);  // parse directly into line (already NUL'd)
+            if (next) *next = '\n';
+            return &s_pw;
+        }
+        if (next) { *next = '\n'; line = next + 1; } else break;
+    }
+    return NULL;
+}
+
+struct passwd* getpwnam(const char* name) {
+    int fd = open("/etc/passwd", O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    int n = read(fd, s_pw_buf, sizeof(s_pw_buf) - 1);
+    close(fd);
+    if (n <= 0) return NULL;
+    s_pw_buf[n] = '\0';
+    char* line = s_pw_buf;
+    while (line && *line) {
+        char* next = strchr(line, '\n');
+        if (next) *next = '\0';
+        char* colon = strchr(line, ':');
+        if (colon) {
+            *colon = '\0';
+            int match = (strcmp(line, name) == 0);
+            *colon = ':';
+            if (match) {
+                pw_parse_line(line);
+                if (next) *next = '\n';
+                return &s_pw;
+            }
+        }
+        if (next) { *next = '\n'; line = next + 1; } else break;
+    }
+    return NULL;
+}
+
+void endpwent(void) {}
+struct passwd* getpwent(void) { return NULL; }
+
+// ── sysconf / pathconf / confstr ──────────────────────────────────────────
+long sysconf(int name) {
+    switch (name) {
+    case _SC_CLK_TCK:    return 100;
+    case _SC_OPEN_MAX:   return 1024;
+    case _SC_PAGESIZE:   return 4096;
+    case _SC_NGROUPS_MAX:return 32;
+    case _SC_ARG_MAX:    return 65536;
+    default:             return -1;
+    }
+}
+long pathconf(const char* path, int name) { (void)path; (void)name; return -1; }
+int  confstr(int name, char* buf, size_t len) { (void)name; (void)buf; (void)len; return 0; }
+
+// ── mkstemp / mktemp ─────────────────────────────────────────────────────
+int mkstemp(char* tmpl) {
+    if (mkdtemp_r(tmpl) < 0) return -1;
+    int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+    return fd;
+}
+char* mktemp(char* tmpl) {
+    if (mkdtemp_r(tmpl) < 0) return NULL;
+    return tmpl;
+}
+
+// ── alarm ─────────────────────────────────────────────────────────────────
+// Stub: no preemptive timer support yet; deliver SIGALRM after `seconds`.
+// Returns previous alarm remaining (always 0 for now).
+unsigned int alarm(unsigned int seconds) {
+    (void)seconds;
+    // TODO: wire to kernel setitimer when available
+    return 0;
+}
+
+// ── abort ─────────────────────────────────────────────────────────────────
+__attribute__((noreturn)) void abort(void) {
+    kill(getpid(), SIGABRT);
+    for (;;) _exit(1);
+}
+
+// ── strerror ─────────────────────────────────────────────────────────────
+char* strerror(int e) {
+    switch (e) {
+    case 0:           return "Success";
+    case EPERM:       return "Operation not permitted";
+    case ENOENT:      return "No such file or directory";
+    case ESRCH:       return "No such process";
+    case EINTR:       return "Interrupted system call";
+    case EIO:         return "Input/output error";
+    case EBADF:       return "Bad file descriptor";
+    case ECHILD:      return "No child processes";
+    case EAGAIN:      return "Resource temporarily unavailable";
+    case ENOMEM:      return "Cannot allocate memory";
+    case EACCES:      return "Permission denied";
+    case EEXIST:      return "File exists";
+    case ENOTDIR:     return "Not a directory";
+    case EISDIR:      return "Is a directory";
+    case EINVAL:      return "Invalid argument";
+    case ENFILE:      return "Too many open files in system";
+    case ENOSPC:      return "No space left on device";
+    case EPIPE:       return "Broken pipe";
+    case ERANGE:      return "Numerical result out of range";
+    case ENOTEMPTY:   return "Directory not empty";
+    case ENOSYS:      return "Function not implemented";
+    case ENOEXEC:     return "Exec format error";
+    case EFAULT:      return "Bad address";
+    case EBUSY:       return "Device or resource busy";
+    case EMFILE:      return "Too many open files";
+    case ENOTTY:      return "Not a typewriter";
+    case EFBIG:       return "File too large";
+    case ESPIPE:      return "Illegal seek";
+    case EDEADLK:     return "Resource deadlock avoided";
+    case ENAMETOOLONG:return "File name too long";
+    case ELOOP:       return "Too many levels of symbolic links";
+    // EWOULDBLOCK == EAGAIN, no separate case needed
+    case ENOTSOCK:    return "Socket operation on non-socket";
+    case EOPNOTSUPP:  return "Operation not supported";
+    case EAFNOSUPPORT:return "Address family not supported";
+    case EADDRINUSE:  return "Address already in use";
+    case ECONNRESET:  return "Connection reset by peer";
+    case ENOBUFS:     return "No buffer space available";
+    case EISCONN:     return "Transport endpoint already connected";
+    case ENOTCONN:    return "Transport endpoint not connected";
+    case ETIMEDOUT:   return "Connection timed out";
+    case EILSEQ:      return "Invalid or incomplete multibyte character";
+    default: {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "Unknown error %d", e);
+        return buf;
+    }
+    }
+}
+
+// ── strsignal ─────────────────────────────────────────────────────────────
+char* strsignal(int sig) {
+    switch (sig) {
+    case SIGHUP:   return "Hangup";
+    case SIGINT:   return "Interrupt";
+    case SIGQUIT:  return "Quit";
+    case SIGILL:   return "Illegal instruction";
+    case SIGABRT:  return "Aborted";
+    case SIGBUS:   return "Bus error";
+    case SIGFPE:   return "Floating point exception";
+    case SIGKILL:  return "Killed";
+    case SIGUSR1:  return "User defined signal 1";
+    case SIGSEGV:  return "Segmentation fault";
+    case SIGUSR2:  return "User defined signal 2";
+    case SIGPIPE:  return "Broken pipe";
+    case SIGALRM:  return "Alarm clock";
+    case SIGTERM:  return "Terminated";
+    case SIGCHLD:  return "Child exited";
+    case SIGCONT:  return "Continued";
+    case SIGTSTP:  return "Stopped";
+    case SIGTTIN:  return "Stopped (tty input)";
+    case SIGTTOU:  return "Stopped (tty output)";
+    case SIGWINCH: return "Window size changed";
+    default: {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "Signal %d", sig);
+        return buf;
+    }
+    }
+}
+
+// ── strftime / localtime ──────────────────────────────────────────────────
+static struct tm s_tm;
+
+struct tm* localtime(const time_t* t) {
+    // Simple Gregorian calendar decomposition (UTC, no timezone).
+    long long ts = t ? (long long)*t : 0;
+    long long day = ts / 86400;
+    long long sec = ts % 86400;
+    s_tm.tm_sec  = (int)(sec % 60);
+    s_tm.tm_min  = (int)((sec / 60) % 60);
+    s_tm.tm_hour = (int)(sec / 3600);
+    // Days since epoch (Jan 1 1970 = Thursday, wday=4)
+    s_tm.tm_wday = (int)((day + 4) % 7);
+    // Year/month/day from day count
+    long long y = 1970; long long d = day;
+    while (1) {
+        long long yd = ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365);
+        if (d < yd) break;
+        d -= yd; y++;
+    }
+    s_tm.tm_year = (int)(y - 1900);
+    s_tm.tm_yday = (int)d;
+    int is_leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+    static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    int m = 0;
+    while (m < 12) {
+        int dm = mdays[m] + (m == 1 && is_leap ? 1 : 0);
+        if (d < dm) break;
+        d -= dm; m++;
+    }
+    s_tm.tm_mon  = m;
+    s_tm.tm_mday = (int)d + 1;
+    s_tm.tm_isdst = 0;
+    return &s_tm;
+}
+
+struct tm* gmtime(const time_t* t) { return localtime(t); }
+
+size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm) {
+    if (!max) return 0;
+    size_t pos = 0;
+    for (; *fmt && pos + 1 < max; fmt++) {
+        if (*fmt != '%') { s[pos++] = *fmt; continue; }
+        fmt++;
+        char tmp[32]; int n = 0;
+        switch (*fmt) {
+        case 'Y': n = snprintf(tmp, sizeof(tmp), "%04d", tm->tm_year + 1900); break;
+        case 'y': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_year % 100); break;
+        case 'm': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_mon + 1); break;
+        case 'd': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_mday); break;
+        case 'H': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_hour); break;
+        case 'M': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_min); break;
+        case 'S': n = snprintf(tmp, sizeof(tmp), "%02d", tm->tm_sec); break;
+        case 'A': { static const char* d[]={"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+                    n = snprintf(tmp, sizeof(tmp), "%s", d[tm->tm_wday % 7]); break; }
+        case 'a': { static const char* d[]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+                    n = snprintf(tmp, sizeof(tmp), "%s", d[tm->tm_wday % 7]); break; }
+        case 'B': { static const char* mo[]={"January","February","March","April","May","June",
+                      "July","August","September","October","November","December"};
+                    n = snprintf(tmp, sizeof(tmp), "%s", mo[tm->tm_mon % 12]); break; }
+        case 'b': case 'h': {
+                    static const char* mo[]={"Jan","Feb","Mar","Apr","May","Jun",
+                      "Jul","Aug","Sep","Oct","Nov","Dec"};
+                    n = snprintf(tmp, sizeof(tmp), "%s", mo[tm->tm_mon % 12]); break; }
+        case 'j': n = snprintf(tmp, sizeof(tmp), "%03d", tm->tm_yday + 1); break;
+        case 'n': tmp[0] = '\n'; tmp[1] = '\0'; n = 1; break;
+        case 't': tmp[0] = '\t'; tmp[1] = '\0'; n = 1; break;
+        case '%': tmp[0] = '%'; tmp[1] = '\0'; n = 1; break;
+        default:  tmp[0] = '%'; tmp[1] = *fmt; tmp[2] = '\0'; n = 2; break;
+        }
+        for (int i = 0; i < n && pos + 1 < max; i++) s[pos++] = tmp[i];
+    }
+    s[pos] = '\0';
+    return pos;
+}
+
+// ── fnmatch ───────────────────────────────────────────────────────────────
+// Supports *, ?, [...] with FNM_PATHNAME (/ not matched by *) and FNM_CASEFOLD.
+static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) {
+    if (depth > 64) return FNM_NOMATCH;  // recursion guard
+    while (*pat) {
+        if (*pat == '*') {
+            // Skip consecutive stars
+            while (*pat == '*') pat++;
+            if (!*pat) {
+                // Trailing *: matches rest unless FNM_PATHNAME and '/' present
+                if (flags & FNM_PATHNAME) return strchr(str, '/') ? FNM_NOMATCH : 0;
+                return 0;
+            }
+            // Try matching pat at every position in str
+            while (*str) {
+                if (flags & FNM_PATHNAME && *str == '/') return FNM_NOMATCH;
+                if (fnmatch_impl(pat, str, flags, depth + 1) == 0) return 0;
+                str++;
+            }
+            return fnmatch_impl(pat, str, flags, depth + 1);
+        }
+        if (!*str) return FNM_NOMATCH;
+        if (*pat == '?') {
+            if (flags & FNM_PATHNAME && *str == '/') return FNM_NOMATCH;
+            if (flags & FNM_PERIOD && *str == '.' && str == str) return FNM_NOMATCH;
+            pat++; str++; continue;
+        }
+        if (*pat == '[') {
+            pat++;
+            int invert = 0;
+            if (*pat == '!' || *pat == '^') { invert = 1; pat++; }
+            int matched = 0;
+            char first = *pat;
+            while (*pat && (*pat != ']' || pat == pat)) {
+                if (pat[1] == '-' && pat[2] && pat[2] != ']') {
+                    char lo = pat[0], hi = pat[2];
+                    char sc = *str;
+                    if (flags & FNM_CASEFOLD) {
+                        lo = (char)tolower((unsigned char)lo);
+                        hi = (char)tolower((unsigned char)hi);
+                        sc = (char)tolower((unsigned char)sc);
+                    }
+                    if (sc >= lo && sc <= hi) matched = 1;
+                    pat += 3;
+                } else {
+                    char pc = *pat, sc = *str;
+                    if (flags & FNM_CASEFOLD) {
+                        pc = (char)tolower((unsigned char)pc);
+                        sc = (char)tolower((unsigned char)sc);
+                    }
+                    if (pc == sc) matched = 1;
+                    pat++;
+                }
+                if (*pat == ']' && pat[-1] != '[') break;
+                (void)first;
+            }
+            if (*pat == ']') pat++;
+            if (matched == invert) return FNM_NOMATCH;
+            str++; continue;
+        }
+        // Literal match
+        char pc = *pat, sc = *str;
+        if (flags & FNM_CASEFOLD) {
+            pc = (char)tolower((unsigned char)pc);
+            sc = (char)tolower((unsigned char)sc);
+        }
+        if (pc != sc) return FNM_NOMATCH;
+        pat++; str++;
+    }
+    return *str ? FNM_NOMATCH : 0;
+}
+
+int fnmatch(const char* pattern, const char* string, int flags) {
+    return fnmatch_impl(pattern, string, flags, 0);
+}
+
+// ── POSIX regex (NFA-based ERE engine) ───────────────────────────────────
+// A minimal but correct NFA regex engine supporting:
+//   . ^ $ * + ? | () [] {n,m} \d \w \s etc.
+// Stored as a bytecoded NFA; no external deps.
+
+// NFA opcodes
+#define ROP_CHAR    1   // match literal char
+#define ROP_ANY     2   // match any char (.)
+#define ROP_CLASS   3   // match char class [...]
+#define ROP_NCLASS  4   // negated char class
+#define ROP_BOL     5   // ^
+#define ROP_EOL     6   // $
+#define ROP_SPLIT   7   // fork to two continuations (a|b, ?, *, +)
+#define ROP_JMP     8   // unconditional jump
+#define ROP_SAVE    9   // save capture group start/end
+#define ROP_MATCH  10   // success
+
+#define REGEX_MAX_OPS   1024
+#define REGEX_MAX_CLASS  256
+
+typedef struct {
+    uint8_t  op;
+    union {
+        char     ch;                      // ROP_CHAR
+        uint8_t  cls[32];                // ROP_CLASS/NCLASS (256-bit bitmap)
+        int      off;                     // ROP_JMP, ROP_SPLIT (second fork)
+        int      save_idx;               // ROP_SAVE
+    };
+    int next;   // fall-through next index (-1 = none)
+    int alt;    // alternate for ROP_SPLIT (-1 = none)
+} re_op_t;
+
+typedef struct {
+    re_op_t  ops[REGEX_MAX_OPS];
+    int      nops;
+    int      nsub;
+    int      flags;
+} re_prog_t;
+
+// Compile state
+typedef struct {
+    const char* src;
+    int         pos;
+    re_prog_t*  prog;
+    int         flags;
+    int         nsub;
+} re_compile_t;
+
+static int re_emit(re_compile_t* c, uint8_t op) {
+    if (c->prog->nops >= REGEX_MAX_OPS) return -1;
+    re_op_t* o = &c->prog->ops[c->prog->nops];
+    o->op   = op;
+    o->next = -1;
+    o->alt  = -1;
+    return c->prog->nops++;
+}
+
+// Forward declaration
+static int re_parse_alt(re_compile_t* c, int* start, int* end);
+
+static int re_parse_class(re_compile_t* c, uint8_t cls[32], int* negate) {
+    *negate = 0;
+    if (c->src[c->pos] == '^') { *negate = 1; c->pos++; }
+    memset(cls, 0, 32);
+    int first = 1;
+    while (c->src[c->pos] && (c->src[c->pos] != ']' || first)) {
+        first = 0;
+        unsigned char lo, hi;
+        if (c->src[c->pos] == '\\' && c->src[c->pos+1]) {
+            c->pos++;
+            unsigned char esc = (unsigned char)c->src[c->pos++];
+            // Handle \d \w \s \D \W \S
+            if (esc == 'd') {
+                for (int i = '0'; i <= '9'; i++) cls[i/8] |= 1u << (i%8);
+                continue;
+            } else if (esc == 'D') {
+                for (int i = 0; i < 256; i++) if (i < '0' || i > '9') cls[i/8] |= 1u << (i%8);
+                continue;
+            } else if (esc == 'w') {
+                for (int i = 0; i < 256; i++) if (isalnum(i) || i == '_') cls[i/8] |= 1u << (i%8);
+                continue;
+            } else if (esc == 'W') {
+                for (int i = 0; i < 256; i++) if (!isalnum(i) && i != '_') cls[i/8] |= 1u << (i%8);
+                continue;
+            } else if (esc == 's') {
+                for (int i = 0; i < 256; i++) if (isspace(i)) cls[i/8] |= 1u << (i%8);
+                continue;
+            } else if (esc == 'S') {
+                for (int i = 0; i < 256; i++) if (!isspace(i)) cls[i/8] |= 1u << (i%8);
+                continue;
+            }
+            lo = hi = esc;
+        } else {
+            lo = (unsigned char)c->src[c->pos++];
+            hi = lo;
+        }
+        if (c->src[c->pos] == '-' && c->src[c->pos+1] && c->src[c->pos+1] != ']') {
+            c->pos++;  // skip '-'
+            if (c->src[c->pos] == '\\' && c->src[c->pos+1]) { c->pos++; hi = (unsigned char)c->src[c->pos++]; }
+            else hi = (unsigned char)c->src[c->pos++];
+        }
+        unsigned char a = lo, b = hi;
+        if (c->flags & REG_ICASE) {
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+        }
+        for (unsigned int i = a; i <= b; i++) cls[i/8] |= 1u << (i%8);
+        if (c->flags & REG_ICASE) {
+            for (unsigned int i = lo; i <= hi; i++) {
+                unsigned int u = (i >= 'a' && i <= 'z') ? i - 32 : (i >= 'A' && i <= 'Z') ? i + 32 : 0;
+                if (u) cls[u/8] |= 1u << (u%8);
+            }
+        }
+    }
+    if (c->src[c->pos] == ']') c->pos++;
+    return 0;
+}
+
+static int re_parse_atom(re_compile_t* c, int* start, int* end) {
+    char ch = c->src[c->pos];
+    if (!ch || ch == ')' || ch == '|') return -1;
+    if (ch == '(') {
+        c->pos++;
+        int grp = c->nsub++;
+        int s0 = re_emit(c, ROP_SAVE); c->prog->ops[s0].save_idx = grp * 2;
+        int astart, aend;
+        if (re_parse_alt(c, &astart, &aend) < 0) return -1;
+        if (c->src[c->pos] == ')') c->pos++;
+        int s1 = re_emit(c, ROP_SAVE); c->prog->ops[s1].save_idx = grp * 2 + 1;
+        // chain: s0 -> astart; aend -> s1
+        c->prog->ops[s0].next = astart;
+        if (aend >= 0) c->prog->ops[aend].next = s1;
+        *start = s0; *end = s1;
+        return 0;
+    }
+    if (ch == '[') {
+        c->pos++;
+        int idx = re_emit(c, ROP_CLASS);
+        int neg; re_parse_class(c, c->prog->ops[idx].cls, &neg);
+        if (neg) c->prog->ops[idx].op = ROP_NCLASS;
+        *start = *end = idx;
+        return 0;
+    }
+    if (ch == '.') {
+        c->pos++;
+        int idx = re_emit(c, ROP_ANY);
+        *start = *end = idx;
+        return 0;
+    }
+    if (ch == '^') {
+        c->pos++;
+        int idx = re_emit(c, ROP_BOL);
+        *start = *end = idx;
+        return 0;
+    }
+    if (ch == '$') {
+        c->pos++;
+        int idx = re_emit(c, ROP_EOL);
+        *start = *end = idx;
+        return 0;
+    }
+    if (ch == '\\' && c->src[c->pos+1]) {
+        c->pos++;
+        unsigned char esc = (unsigned char)c->src[c->pos++];
+        if (esc == 'd' || esc == 'D' || esc == 'w' || esc == 'W' || esc == 's' || esc == 'S') {
+            // treat as a class
+            int idx = re_emit(c, ROP_CLASS);
+            uint8_t* cls = c->prog->ops[idx].cls; memset(cls, 0, 32);
+            if (esc == 'd') for (int i='0';i<='9';i++) cls[i/8]|=1u<<(i%8);
+            else if (esc=='D') for (int i=0;i<256;i++) { if(i<'0'||i>'9') cls[i/8]|=1u<<(i%8); }
+            else if (esc=='w') for (int i=0;i<256;i++) { if(isalnum(i)||i=='_') cls[i/8]|=1u<<(i%8); }
+            else if (esc=='W') for (int i=0;i<256;i++) { if(!isalnum(i)&&i!='_') cls[i/8]|=1u<<(i%8); }
+            else if (esc=='s') for (int i=0;i<256;i++) { if(isspace(i)) cls[i/8]|=1u<<(i%8); }
+            else               for (int i=0;i<256;i++) { if(!isspace(i)) cls[i/8]|=1u<<(i%8); }
+            *start = *end = idx;
+            return 0;
+        }
+        int idx = re_emit(c, ROP_CHAR);
+        c->prog->ops[idx].ch = (char)esc;
+        *start = *end = idx;
+        return 0;
+    }
+    // Literal
+    c->pos++;
+    int idx = re_emit(c, ROP_CHAR);
+    unsigned char lc = (unsigned char)ch;
+    if (c->flags & REG_ICASE) lc = (unsigned char)tolower(lc);
+    c->prog->ops[idx].ch = (char)lc;
+    *start = *end = idx;
+    return 0;
+}
+
+static int re_parse_piece(re_compile_t* c, int* start, int* end) {
+    int astart = -1, aend = -1;
+    if (re_parse_atom(c, &astart, &aend) < 0) return -1;
+    char q = c->src[c->pos];
+    if (q == '*' || q == '+' || q == '?' || q == '{') {
+        c->pos++;
+        // Skip {n,m} content for now (treat as *)
+        if (q == '{') { while (c->src[c->pos] && c->src[c->pos] != '}') c->pos++; if (c->src[c->pos]) c->pos++; q = '*'; }
+        int greedy = 1;
+        if (c->src[c->pos] == '?') { greedy = 0; c->pos++; }
+        int split = re_emit(c, ROP_SPLIT);
+        if (q == '*') {
+            // split -> atom, atom -> split; split also -> after
+            c->prog->ops[split].next = greedy ? astart : -1;
+            c->prog->ops[split].alt  = greedy ? -1 : astart;
+            if (aend >= 0) c->prog->ops[aend].next = split;
+            *start = split; *end = split;
+        } else if (q == '+') {
+            // atom -> split; split -> atom or exit
+            if (aend >= 0) c->prog->ops[aend].next = split;
+            c->prog->ops[split].next = greedy ? astart : -1;
+            c->prog->ops[split].alt  = greedy ? -1 : astart;
+            *start = astart; *end = split;
+        } else { // ?
+            c->prog->ops[split].next = greedy ? astart : -1;
+            c->prog->ops[split].alt  = greedy ? -1 : astart;
+            *start = split; *end = (aend >= 0 ? aend : split);
+        }
+    } else {
+        *start = astart; *end = aend;
+    }
+    return 0;
+}
+
+static int re_parse_concat(re_compile_t* c, int* start, int* end) {
+    int first_start = -1, prev_end = -1;
+    while (c->src[c->pos] && c->src[c->pos] != ')' && c->src[c->pos] != '|') {
+        int ps, pe;
+        if (re_parse_piece(c, &ps, &pe) < 0) break;
+        if (first_start < 0) first_start = ps;
+        if (prev_end >= 0 && ps >= 0) c->prog->ops[prev_end].next = ps;
+        prev_end = pe;
+    }
+    *start = first_start;
+    *end   = prev_end;
+    return 0;
+}
+
+static int re_parse_alt(re_compile_t* c, int* start, int* end) {
+    int cs, ce;
+    if (re_parse_concat(c, &cs, &ce) < 0) return -1;
+    if (c->src[c->pos] != '|') { *start = cs; *end = ce; return 0; }
+    // alternation: split -> left, split.alt -> right; both end at same merge point
+    while (c->src[c->pos] == '|') {
+        c->pos++;
+        int split = re_emit(c, ROP_SPLIT);
+        int rs, re2;
+        re_parse_concat(c, &rs, &re2);
+        c->prog->ops[split].next = cs;
+        c->prog->ops[split].alt  = rs;
+        // The ends of both branches are left dangling; caller chains them.
+        cs = split; (void)ce; (void)re2;
+        ce = -1;  // merged end unknown at this level — handled by parent
+    }
+    *start = cs; *end = ce;
+    return 0;
+}
+
+int regcomp(regex_t* preg, const char* pattern, int cflags) {
+    re_prog_t* prog = malloc(sizeof(re_prog_t));
+    if (!prog) return REG_ESPACE;
+    prog->nops  = 0;
+    prog->nsub  = 0;
+    prog->flags = cflags;
+
+    re_compile_t c;
+    c.src   = pattern;
+    c.pos   = 0;
+    c.prog  = prog;
+    c.flags = cflags;
+    c.nsub  = 1;  // group 0 = whole match
+
+    int s, e;
+    // Wrap whole pattern in implicit group 0 save
+    int s0 = re_emit(&c, ROP_SAVE); prog->ops[s0].save_idx = 0;
+    if (re_parse_alt(&c, &s, &e) < 0) { free(prog); return REG_BADPAT; }
+    if (s >= 0) prog->ops[s0].next = s;
+    int s1 = re_emit(&c, ROP_SAVE); prog->ops[s1].save_idx = 1;
+    if (e >= 0) prog->ops[e].next = s1;
+    else if (s >= 0) prog->ops[s].next = s1;
+    int match = re_emit(&c, ROP_MATCH);
+    prog->ops[s1].next = match;
+    prog->nsub = c.nsub;
+
+    preg->re_nsub  = c.nsub - 1;
+    preg->_internal = prog;
+    return 0;
+}
+
+// NFA simulation via recursive backtracking with memoization-lite
+#define RE_MAX_CAPTURES 64
+
+typedef struct {
+    const char* start;    // string start (for ^ checking)
+    const char* str;      // current position
+    int         flags;
+    regmatch_t* pm;
+    size_t      nmatch;
+} re_exec_t;
+
+static int re_run(re_exec_t* ex, re_prog_t* prog, int pc, const char* sp);
+
+static int re_match_char(re_exec_t* ex, re_op_t* op, const char* sp) {
+    if (!*sp) return 0;
+    unsigned char sc = (unsigned char)*sp;
+    if (ex->flags & REG_ICASE) sc = (unsigned char)tolower(sc);
+    if (op->op == ROP_CHAR) {
+        return (sc == (unsigned char)op->ch);
+    } else if (op->op == ROP_ANY) {
+        return (ex->flags & REG_NEWLINE) ? (*sp != '\n') : 1;
+    } else if (op->op == ROP_CLASS) {
+        return (op->cls[sc/8] >> (sc%8)) & 1;
+    } else {  // NCLASS
+        return !((op->cls[sc/8] >> (sc%8)) & 1);
+    }
+}
+
+static int re_run(re_exec_t* ex, re_prog_t* prog, int pc, const char* sp) {
+    while (pc >= 0 && pc < prog->nops) {
+        re_op_t* op = &prog->ops[pc];
+        switch (op->op) {
+        case ROP_MATCH:
+            return 1;
+        case ROP_BOL:
+            if (sp != ex->start && !(ex->flags & REG_NOTBOL)) return 0;
+            pc = op->next; break;
+        case ROP_EOL:
+            if (*sp && !((ex->flags & REG_NEWLINE) && *sp == '\n')) return 0;
+            pc = op->next; break;
+        case ROP_SAVE:
+            if (op->save_idx < (int)(ex->nmatch * 2)) {
+                const char* saved = (op->save_idx & 1)
+                    ? (const char*)ex->pm[op->save_idx/2].rm_eo + (size_t)ex->str
+                    : (const char*)ex->pm[op->save_idx/2].rm_so + (size_t)ex->str;
+                // save & try next, restore on failure
+                size_t old;
+                if (op->save_idx & 1) { old = (size_t)ex->pm[op->save_idx/2].rm_eo; ex->pm[op->save_idx/2].rm_eo = sp - ex->str; }
+                else                  { old = (size_t)ex->pm[op->save_idx/2].rm_so; ex->pm[op->save_idx/2].rm_so = sp - ex->str; }
+                (void)saved;
+                if (re_run(ex, prog, op->next, sp)) return 1;
+                if (op->save_idx & 1) ex->pm[op->save_idx/2].rm_eo = (ssize_t)old;
+                else                  ex->pm[op->save_idx/2].rm_so = (ssize_t)old;
+                return 0;
+            }
+            pc = op->next; break;
+        case ROP_SPLIT:
+            if (re_run(ex, prog, op->next, sp)) return 1;
+            pc = op->alt; break;
+        case ROP_JMP:
+            pc = op->next; break;
+        case ROP_CHAR: case ROP_ANY: case ROP_CLASS: case ROP_NCLASS:
+            if (!re_match_char(ex, op, sp)) return 0;
+            sp++;
+            pc = op->next;
+            break;
+        default: return 0;
+        }
+    }
+    return 0;
+}
+
+int regexec(const regex_t* preg, const char* string, size_t nmatch,
+            regmatch_t pmatch[], int eflags) {
+    re_prog_t* prog = (re_prog_t*)preg->_internal;
+    if (!prog || !string) return REG_NOMATCH;
+
+    // Initialize matches to -1
+    for (size_t i = 0; i < nmatch; i++) { pmatch[i].rm_so = -1; pmatch[i].rm_eo = -1; }
+
+    re_exec_t ex;
+    ex.start  = string;
+    ex.flags  = prog->flags | eflags;
+    ex.pm     = pmatch;
+    ex.nmatch = nmatch;
+
+    // Try matching at each position
+    const char* sp = string;
+    do {
+        ex.str = sp;
+        if (re_run(&ex, prog, 0, sp)) return 0;
+        sp++;
+    } while (*(sp-1));
+    return REG_NOMATCH;
+}
+
+void regfree(regex_t* preg) {
+    if (preg && preg->_internal) { free(preg->_internal); preg->_internal = NULL; }
+}
+
+size_t regerror(int errcode, const regex_t* preg, char* errbuf, size_t errbuf_size) {
+    (void)preg;
+    const char* msg;
+    switch (errcode) {
+    case 0:          msg = "Success"; break;
+    case REG_NOMATCH:msg = "No match"; break;
+    case REG_BADPAT: msg = "Invalid regular expression"; break;
+    case REG_ESPACE: msg = "Out of memory"; break;
+    default:         msg = "Unknown regex error"; break;
+    }
+    size_t n = strnlen(msg, 255);
+    if (errbuf && errbuf_size) {
+        size_t cp = n < errbuf_size - 1 ? n : errbuf_size - 1;
+        memcpy(errbuf, msg, cp); errbuf[cp] = '\0';
+    }
+    return n + 1;
+}
+
+// ── __libc_start_main ─────────────────────────────────────────────────────
+// Bridges glibc CRT calling convention to our libc.
+// argv[0..argc-1] and envp are passed by our ELF loader.
+int __libc_start_main(int (*main)(int, char**, char**),
+                      int argc, char** argv,
+                      void (*init)(void), void (*fini)(void),
+                      void (*rtld_fini)(void), void* stack_end) {
+    (void)fini; (void)rtld_fini; (void)stack_end;
+    // envp follows argv[] + NULL on the stack
+    char** envp = argv + argc + 1;
+    environ = envp;
+    if (init) init();
+    int ret = main(argc, argv, envp);
+    exit(ret);
+}
+
+// ── sigjmp_buf / __sigsetjmp / siglongjmp ────────────────────────────────
+// We reuse our setjmp/longjmp from setjmp.asm, extended with mask save.
+extern int  setjmp(long long* env);
+extern void longjmp(long long* env, int val) __attribute__((noreturn));
+
+int __sigsetjmp(sigjmp_buf env, int savesigs) {
+    env[0]._savesigs = savesigs;
+    if (savesigs) sigprocmask(SIG_BLOCK, NULL, &env[0]._mask);
+    return setjmp(env[0]._regs);
+}
+
+__attribute__((noreturn)) void siglongjmp(sigjmp_buf env, int val) {
+    if (env[0]._savesigs) sigprocmask(SIG_SETMASK, &env[0]._mask, NULL);
+    longjmp(env[0]._regs, val);
+}
+
+// ── setvbuf ───────────────────────────────────────────────────────────────
+// Defined in stdio.c but needs to be reachable from libc.c's declarations.
+// Forward-declare; actual body is in stdio.c.

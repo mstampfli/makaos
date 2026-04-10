@@ -194,10 +194,10 @@ void DG_DrawFrame(void) {
 
 // ── DG_SleepMs ────────────────────────────────────────────────────────────
 void DG_SleepMs(uint32_t ms) {
-    timespec_t req;
+    struct timespec req;
     req.tv_sec  = ms / 1000;
-    req.tv_nsec = (unsigned long long)(ms % 1000) * 1000000ULL;
-    nanosleep(&req, (timespec_t*)0);
+    req.tv_nsec = (int64_t)((ms % 1000) * 1000000ULL);
+    nanosleep(&req, NULL);
 }
 
 // ── DG_GetTicksMs ─────────────────────────────────────────────────────────
