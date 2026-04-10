@@ -243,10 +243,9 @@ int main(void) {
         setuid(pw->uid);
 
         // ── Change to home directory ─────────────────────────────────────
-        int homelen = s_strlen(pw->home);
-        if (chdir(pw->home, (size_t)homelen) < 0) {
+        if (chdir(pw->home) < 0) {
             // Fall back to / if home doesn't exist yet.
-            chdir("/", 1);
+            chdir("/");
         }
 
         // ── Print welcome ────────────────────────────────────────────────
