@@ -149,6 +149,10 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
    -o "$BUILD_DIR/user_ps.elf"
 
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/login/login.c" -o "$BUILD_DIR/user_login.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_login.o" \
+   -o "$BUILD_DIR/user_login.elf"
+
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USERLAND_DIR/apps/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
@@ -331,6 +335,22 @@ ext2_setperm() {
 }
 
 # Create directory tree.
+# ── User database files ───────────────────────────────────────────────────
+# Generate /etc/passwd and /etc/shadow into a temp staging dir.
+mkdir -p "$BUILD_DIR/etc_stage"
+
+cat > "$BUILD_DIR/etc_stage/passwd" <<'PASSWD_EOF'
+root:0:0:/root:/bin/shell
+maka:1000:1000:/home/maka:/bin/shell
+PASSWD_EOF
+
+# /etc/shadow — plaintext passwords for now (no crypto).
+# root password: "toor", maka password: "maka"
+cat > "$BUILD_DIR/etc_stage/shadow" <<'SHADOW_EOF'
+root:toor
+maka:maka
+SHADOW_EOF
+
 # Directories: root-owned, 0755 (rwxr-xr-x) except /root (0700) and /tmp (1777).
 debugfs -w "$BUILD_DIR/ext2.img" <<'DEBUGFS_EOF' > /dev/null 2>&1
 mkdir bin
@@ -342,13 +362,32 @@ mkdir root
 DEBUGFS_EOF
 
 # Set directory permissions (type bits: 0040000 = directory).
-ext2_setperm "$BUILD_DIR/ext2.img" /         0040755 0 0   # / root:root rwxr-xr-x
-ext2_setperm "$BUILD_DIR/ext2.img" /bin      0040755 0 0   # /bin root:root rwxr-xr-x
-ext2_setperm "$BUILD_DIR/ext2.img" /etc      0040755 0 0   # /etc root:root rwxr-xr-x
-ext2_setperm "$BUILD_DIR/ext2.img" /home     0040755 0 0   # /home root:root rwxr-xr-x
-ext2_setperm "$BUILD_DIR/ext2.img" /tmp      0041777 0 0   # /tmp root:root rwxrwxrwx + sticky
-ext2_setperm "$BUILD_DIR/ext2.img" /dev      0040755 0 0   # /dev root:root rwxr-xr-x
-ext2_setperm "$BUILD_DIR/ext2.img" /root     0040700 0 0   # /root root:root rwx------
+ext2_setperm "$BUILD_DIR/ext2.img" /         0040755 0 0      # / root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /bin      0040755 0 0      # /bin root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /etc      0040755 0 0      # /etc root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /home     0040755 0 0      # /home root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /tmp      0041777 0 0      # /tmp root:root rwxrwxrwx + sticky
+ext2_setperm "$BUILD_DIR/ext2.img" /dev      0040755 0 0      # /dev root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /root     0040700 0 0      # /root root:root rwx------
+
+# /home/maka — uid=1000 gid=1000, 0700 (private home)
+debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir home/maka" > /dev/null 2>&1 || true
+ext2_setperm "$BUILD_DIR/ext2.img" /home/maka 0040700 1000 1000
+
+# Install /etc/passwd (root:root 0644 — world-readable, no sensitive data)
+debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/passwd etc/passwd" > /dev/null 2>&1 || true
+ext2_setperm "$BUILD_DIR/ext2.img" /etc/passwd 0100644 0 0
+
+# Install /etc/shadow (root:root 0600 — root-only, contains passwords)
+debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/shadow etc/shadow" > /dev/null 2>&1 || true
+ext2_setperm "$BUILD_DIR/ext2.img" /etc/shadow 0100600 0 0
+
+# Put a secret file in /root to test permission enforcement
+echo "root's secret — maka cannot read this" > "$BUILD_DIR/etc_stage/root_secret.txt"
+debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/root_secret.txt root/secret.txt" > /dev/null 2>&1 || true
+ext2_setperm "$BUILD_DIR/ext2.img" /root/secret.txt 0100600 0 0
+
+echo "[+] /etc/passwd and /etc/shadow installed"
 
 # Install binaries with execute permissions (0755 = rwxr-xr-x, type 0100000 = regular file).
 # All binaries: root:root 0755 — any user can execute, only root can write.
@@ -387,6 +426,10 @@ fi
 if [ -f "$BUILD_DIR/user_ksec.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ksec.elf" bin/ksec
     echo "[+] ksec ELF installed at bin/ksec (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_login.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_login.elf" bin/login
+    echo "[+] login ELF installed at bin/login (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_doom.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_doom.elf" bin/doom

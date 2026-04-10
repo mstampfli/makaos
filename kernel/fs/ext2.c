@@ -1190,6 +1190,73 @@ uint32_t ext2_lookup_path(const char* path) {
     return path_to_inode(path);
 }
 
+// ── ext2_lookup_path_checked ──────────────────────────────────────────────
+// Permission-aware path walk.  Checks execute (search) on every directory
+// component traversed.  Uses the same walk as path_to_inode internally.
+// cred is a const cred_t* — typed as void* to avoid the ext2.h → cred.h
+// dependency (cred.h is a security layer header, not an fs header).
+#include "perm.h"
+#include "cred.h"
+#include "errno.h"
+
+uint32_t ext2_lookup_path_checked(const char* path, const void* cred, int* err_out) {
+    if (err_out) *err_out = 0;
+    if (!s_mounted || !path || path[0] != '/') {
+        if (err_out) *err_out = -ENOENT;
+        return 0;
+    }
+
+    const cred_t* c = (const cred_t*)cred;
+    uint32_t cur_ino = EXT2_ROOT_INO;
+    uint32_t i = 1; // skip leading '/'
+
+    while (path[i] != '\0') {
+        uint32_t start = i;
+        while (path[i] != '\0' && path[i] != '/') i++;
+        uint32_t comp_len = i - start;
+        if (comp_len == 0) {
+            if (path[i] == '/') { i++; continue; }
+            break;
+        }
+
+        // Check execute (search) permission on the current directory.
+        ext2_inode_t cur_inode;
+        if (!read_inode(cur_ino, &cur_inode)) {
+            if (err_out) *err_out = -ENOENT;
+            return 0;
+        }
+        if (!(cur_inode.i_mode & EXT2_S_IFDIR)) {
+            if (err_out) *err_out = -ENOENT;
+            return 0;
+        }
+        if (c) {
+            inode_perm_t ip = {
+                .uid      = cur_inode.i_uid,
+                .gid      = cur_inode.i_gid,
+                .mode     = cur_inode.i_mode & 0x1FF,
+                .inode_nr = cur_ino,
+                .dev      = 0,
+                .nosuid   = 0,
+            };
+            int pr = vfs_check_perm(&ip, c, ACL_PERM_EXEC);
+            if (pr != 0) {
+                if (err_out) *err_out = pr;  // -EACCES
+                return 0;
+            }
+        }
+
+        cur_ino = dir_lookup(&cur_inode, path + start, comp_len);
+        if (!cur_ino) {
+            if (err_out) *err_out = -ENOENT;
+            return 0;
+        }
+
+        if (path[i] == '/') i++;
+    }
+
+    return cur_ino;
+}
+
 uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out) {
     return read_inode(ino, out);
 }

@@ -114,12 +114,20 @@ void kmain(void) {
     ahci_init();
     ext2_init(4096);
 
-    // ── Launch /bin/shell as PID 1 ────────────────────────────────────────
-    static const char* sh_argv[] = { "/bin/shell", NULL };
-    static const char* sh_envp[] = { "PATH=/bin", "HOME=/", "TERM=linux", NULL };
-    task_t* init = elf_exec_from_ext2("/bin/shell", pid_alloc(), sh_argv, sh_envp, NULL);
+    // ── Launch /bin/login as PID 1 (init process) ────────────────────────
+    // login reads /etc/passwd + /etc/shadow, authenticates the user,
+    // drops credentials to the appropriate uid/gid, and exec-spawns the shell.
+    // Falls back to /bin/shell if login binary is missing (recovery mode).
+    static const char* init_argv[] = { "/bin/login", NULL };
+    static const char* init_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", NULL };
+    task_t* init = elf_exec_from_ext2("/bin/login", pid_alloc(), init_argv, init_envp, NULL);
+    if (!init) {
+        // Fallback: boot directly to root shell (recovery mode).
+        static const char* sh_argv[] = { "/bin/shell", NULL };
+        init = elf_exec_from_ext2("/bin/shell", pid_alloc(), sh_argv, init_envp, NULL);
+    }
     if (!init)
-        for (;;) __asm__ volatile("hlt");  // /bin/shell missing — halt
+        for (;;) __asm__ volatile("hlt");  // nothing works — halt
 
     sched_init();
     tty_init();
