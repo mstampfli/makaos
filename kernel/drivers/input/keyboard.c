@@ -129,8 +129,7 @@ extern void irq1_entry(void);
 
 void keyboard_irq_handler(void) {
     uint8_t sc = inb(KB_DATA_PORT);
-    raw_push(sc);  // push to raw buffer BEFORE any translation
-    sc_push(sc);
+    sc_push(sc);    // single FIFO — keyboard thread fans out from here
     irq_notify(1);
 }
 
@@ -142,6 +141,11 @@ static void keyboard_thread_fn(void) {
         irq_wait(1);
         while (s_sc_head != s_sc_tail) {
             uint8_t sc = sc_pop();
+
+            // ── Fan out to raw consumers (/dev/kbdraw) ────────────────────
+            // Every byte before translation goes to the raw ring buffer.
+            // This is the single source — ISR no longer fans out.
+            raw_push(sc);
 
             if (sc == 0xE0) { s_extended = 1; continue; }
 
