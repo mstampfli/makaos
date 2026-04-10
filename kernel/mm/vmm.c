@@ -372,38 +372,29 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     // Reserved-bit violation: always unrecoverable.
     if (is_reserved) goto kernel_panic;
 
-    if (is_user) {
-        // ── User-mode fault ──────────────────────────────────────────────
-        // Get the mm for the current task.
-        mm_t* mm = NULL;
-        if (g_current) {
-            // mm is at a fixed offset in task_t — read via the pointer.
-            // We include process.h indirectly via mm.h, so use g_current directly.
-            // Cast: task_t* → get mm field.
-            // task_t layout: pid(4) tgid(4) ppid(4) flags(4) state(4) pad(4)
-            //                pml4_phys(8) mm*(8) ...
-            // Rather than casting with offsets (fragile), include the type properly.
-            extern mm_t* task_get_mm(void* task);
-            mm = task_get_mm(g_current);
-        }
+    if (is_user || (!is_user && g_current && fault_addr < 0x8000000000000000ULL)) {
+        // ── User-mode fault OR kernel touching a user VMA (e.g. sys_getcwd) ─
+        extern mm_t* task_get_mm(void* task);
+        mm_t* mm = g_current ? task_get_mm(g_current) : NULL;
 
-        if (!mm) goto kill;
+        if (!mm) goto kernel_panic;
 
-        // Protection violation (present page, wrong permissions) → always kill.
-        if (is_present) goto kill;
+        // Protection violation (present page, wrong permissions).
+        // For user faults → kill. For kernel faults → panic (shouldn't happen).
+        if (is_present) { if (is_user) goto kill; else goto kernel_panic; }
 
         vma_t* vma = mm_vma_find(mm, fault_addr);
-        if (!vma) goto kill;                              // no VMA: segfault
+        if (!vma) { if (is_user) goto kill; else goto kernel_panic; }
 
-        // Write to read-only mapping → segfault.
-        if (is_write && !(vma->flags & VMA_W)) goto kill;
+        // Write to read-only mapping.
+        if (is_write && !(vma->flags & VMA_W)) { if (is_user) goto kill; else goto kernel_panic; }
 
-        // Instruction fetch on non-executable mapping → segfault.
-        if (is_ifetch && !(vma->flags & VMA_X)) goto kill;
+        // Instruction fetch on non-executable mapping.
+        if (is_ifetch && !(vma->flags & VMA_X)) { if (is_user) goto kill; else goto kernel_panic; }
 
         // Demand-page: allocate a physical frame, zero it, map it.
         phys_addr_t frame = pmm_buddy_alloc(0);
-        if (frame == PMM_INVALID_ADDR) goto kill; // OOM → kill
+        if (frame == PMM_INVALID_ADDR) { if (is_user) goto kill; else goto kernel_panic; }
 
         // Zero the frame (security: never expose old data to user).
         uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
@@ -413,7 +404,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         if (!vmm_page_map(vmm_pml4_get(), page, frame,
                           mm_vma_pte_flags(vma->flags))) {
             pmm_buddy_free(frame, 0);
-            goto kill;
+            if (is_user) goto kill; else goto kernel_panic;
         }
         return; // fault resolved
 

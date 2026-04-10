@@ -75,4 +75,12 @@ int    vprintf(const char* fmt, va_list ap);
 #define putc(c,f)  fputc(c,f)
 
 // ── EOF sentinel ──────────────────────────────────────────────────────────
+#ifndef EOF
 #define EOF (-1)
+#endif
+
+// ── fileno ────────────────────────────────────────────────────────────────
+static inline int fileno(FILE* f) {
+    if (!f) { extern int errno; errno = 9 /*EBADF*/; return -1; }
+    return f->fd;
+}

@@ -1,27 +1,15 @@
 #pragma once
-// unistd.h shim
+// unistd.h shim — core functions now in libc.h
 #include "../../../libc/libc.h"
 
-// sleep() — seconds
-static inline unsigned int sleep(unsigned int secs) {
-    timespec_t req = { (unsigned long long)secs, 0 };
-    nanosleep(&req, (timespec_t*)0);
-    return 0;
-}
-
-// usleep() — microseconds
+// usleep() — microseconds (not yet in libc.h)
 static inline int usleep(unsigned int usec) {
-    timespec_t req = { usec / 1000000ULL, (unsigned long long)(usec % 1000000) * 1000ULL };
-    nanosleep(&req, (timespec_t*)0);
+    struct timespec req = { (int64_t)(usec / 1000000ULL),
+                            (int64_t)((usec % 1000000) * 1000ULL) };
+    nanosleep(&req, NULL);
     return 0;
 }
-
-// getpid / getppid — already in libc.h
 
 #define STDIN_FILENO  0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
-#define F_OK 0
-#define R_OK 4
-#define W_OK 2
-#define X_OK 1

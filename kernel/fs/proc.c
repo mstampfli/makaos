@@ -495,16 +495,16 @@ int proc_readdir(const char* path, ext2_entry_t* out, int max) {
     return -1;
 }
 
-int proc_stat(const char* path, stat_t* out) {
+int proc_stat(const char* path, struct stat* out) {
     const char* rest = proc_strip_prefix(path);
 
     // "/proc" itself
     if (rest[0] == '\0' || (rest[0] == '/' && rest[1] == '\0')) {
-        out->ino    = 0x10000;
-        out->size   = 0;
-        out->mode   = 0x41ED; // drwxr-xr-x
-        out->is_dir = 1;
-        out->_pad   = 0;
+        out->st_ino    = 0x10000;
+        out->st_size   = 0;
+        out->st_mode   = 0x41ED; // S_IFDIR | 0755
+        out->st_nlink  = 2;
+        out->st_blksize= 4096;
         return 0;
     }
 
@@ -524,11 +524,11 @@ int proc_stat(const char* path, stat_t* out) {
     // /proc/<pid>  (directory)
     if (!after_pid || after_pid[0] == '\0' ||
         (after_pid[0] == '/' && after_pid[1] == '\0')) {
-        out->ino    = pid;
-        out->size   = 0;
-        out->mode   = 0x41ED;
-        out->is_dir = 1;
-        out->_pad   = 0;
+        out->st_ino    = pid;
+        out->st_size   = 0;
+        out->st_mode   = 0x41ED; // S_IFDIR | 0755
+        out->st_nlink  = 2;
+        out->st_blksize= 4096;
         return 0;
     }
 
@@ -536,11 +536,11 @@ int proc_stat(const char* path, stat_t* out) {
 
     // /proc/<pid>/fd  or  /proc/<pid>/fd/
     if (sub[0]=='f' && sub[1]=='d' && (sub[2]=='/' || sub[2]=='\0')) {
-        out->ino    = pid + 0x20000;
-        out->size   = 0;
-        out->mode   = 0x41ED;
-        out->is_dir = 1;
-        out->_pad   = 0;
+        out->st_ino    = pid + 0x20000;
+        out->st_size   = 0;
+        out->st_mode   = 0x41ED; // S_IFDIR | 0755
+        out->st_nlink  = 2;
+        out->st_blksize= 4096;
         return 0;
     }
 
@@ -549,22 +549,22 @@ int proc_stat(const char* path, stat_t* out) {
         uint32_t n = str_to_uint(sub + 3);
         if (!t->files_shared || n >= t->files_shared->fd_capacity
             || !t->files_shared->fd_table[n]) return -1;
-        out->ino    = pid + 0x30000 + n;
-        out->size   = 0;
-        out->mode   = 0x81A4; // regular file
-        out->is_dir = 0;
-        out->_pad   = 0;
+        out->st_ino    = pid + 0x30000 + n;
+        out->st_size   = 0;
+        out->st_mode   = 0x81A4; // S_IFREG | 0644
+        out->st_nlink  = 1;
+        out->st_blksize= 4096;
         return 0;
     }
 
     // /proc/<pid>/<known file>
     for (int i = 0; s_proc_pid_files[i].suffix; i++) {
         if (str_eq(sub, s_proc_pid_files[i].suffix)) {
-            out->ino    = pid + 0x10000 + (uint32_t)i;
-            out->size   = 0; // synthesized — size unknown without generating
-            out->mode   = 0x81A4; // regular file, 644
-            out->is_dir = 0;
-            out->_pad   = 0;
+            out->st_ino    = pid + 0x10000 + (uint32_t)i;
+            out->st_size   = 0; // synthesized — size unknown without generating
+            out->st_mode   = 0x81A4; // S_IFREG | 0644
+            out->st_nlink  = 1;
+            out->st_blksize= 4096;
             return 0;
         }
     }

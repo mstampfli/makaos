@@ -267,8 +267,8 @@ static void test_open_flags(void) {
     if (fd >= 0) close(fd);
 
     // Cleanup
-    unlink("/tmp_creat_test", 14);
-    unlink("/tmp_excl_test",  14);
+    unlink("/tmp_creat_test");
+    unlink("/tmp_excl_test");
 }
 
 // ── open() write-mode tests ───────────────────────────────────────────────
@@ -339,7 +339,7 @@ static void test_open_write(void) {
     }
 
     // Cleanup
-    unlink("/tmp_write_test", 15);
+    unlink("/tmp_write_test");
 }
 
 // ── lseek tests ───────────────────────────────────────────────────────────
@@ -526,7 +526,7 @@ static void test_dup(void) {
 
     close(fd);
     close(target);
-    unlink("/tmp_dup_test", 13);
+    unlink("/tmp_dup_test");
 }
 
 // ── pipe() tests ──────────────────────────────────────────────────────────

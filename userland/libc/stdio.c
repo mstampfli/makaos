@@ -355,3 +355,9 @@ int fprintf(FILE* f, const char* fmt, ...) {
 int vprintf(const char* fmt, va_list ap) {
     return vfprintf(stdout, fmt, ap);
 }
+
+int setvbuf(FILE* f, char* buf, int mode, size_t size) {
+    (void)f; (void)buf; (void)mode; (void)size;
+    return 0;  /* no buffering control — all writes go through immediately */
+}
+

@@ -581,7 +581,7 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
         const cred_t* c = (g_current && g_current->files_shared)
                           ? &g_current->cred : &root_cred;
         int exec_err = 0;
-        uint32_t exec_ino = ext2_lookup_path_checked(path, c, &exec_err);
+        uint32_t exec_ino = ext2_lookup_path(path, c, &exec_err);
         if (!exec_ino) return NULL;
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;

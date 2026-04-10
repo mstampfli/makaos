@@ -39,4 +39,4 @@ int proc_readdir(const char* path, ext2_entry_t* out, int max);
 
 // stat a /proc path.  Called from sys_stat when path starts with "/proc".
 // Returns 0 on success, -1 on error.
-int proc_stat(const char* path, stat_t* out);
+int proc_stat(const char* path, struct stat* out);
