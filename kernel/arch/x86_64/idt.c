@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "signal.h"
 #include "sched.h"
+#include "tss.h"
 #include "fb.h"
 
 /* Kept as NULL for UEFI boots — legacy symbol referenced by signal.c */
@@ -77,6 +78,28 @@ void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_
     serial_puts_idt("CR2="); serial_hex_idt(cr2);
     serial_puts_idt("RIP="); serial_hex_idt(frame->ip);
     serial_puts_idt("RSP="); serial_hex_idt(frame->sp);
+    serial_puts_idt("CS="); serial_hex_idt(frame->cs);
+    serial_puts_idt("SS="); serial_hex_idt(frame->ss);
+    serial_puts_idt("FLAGS="); serial_hex_idt(frame->flags);
+
+    // Dump 8 qwords at the faulting RSP (the iretq frame if #GP at iretq)
+    serial_puts_idt("STACK@RSP:\n");
+    uint64_t* stk = (uint64_t*)frame->sp;
+    for (int i = 0; i < 8; i++) {
+        serial_hex_idt(stk[i]);
+    }
+
+    // Dump TSS.RSP0
+    extern tss_t g_tss;
+    serial_puts_idt("TSS.RSP0="); serial_hex_idt(g_tss.rsp[0]);
+
+    // Dump g_current info
+    serial_puts_idt("g_current="); serial_hex_idt((uint64_t)g_current);
+    if (g_current) {
+        serial_puts_idt("cur.pid="); serial_hex_idt((uint64_t)g_current->pid);
+        serial_puts_idt("cur.kstack_top="); serial_hex_idt(g_current->kstack_top);
+        serial_puts_idt("cur.state="); serial_hex_idt((uint64_t)g_current->state);
+    }
 
     for (;;) { __asm__ __volatile__("cli; hlt"); }
 }

@@ -362,6 +362,19 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     virt_addr_t fault_addr;
     __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
 
+    // DEBUG: Check if the CPU pushed a wrong SS for user-mode faults.
+    // If the user was running with SS=0x20 (missing RPL=3), catch it here
+    // BEFORE isr_common_entry's iretq triggers #GP.
+    if ((f->cs & 3) == 3 && f->ss != 0x23) {
+        ser_str("PF-BAD-SS! ss="); ser_hex64(f->ss);
+        ser_str("  cs=");          ser_hex64(f->cs);
+        ser_str("  ip=");          ser_hex64(f->ip);
+        ser_str("  sp=");          ser_hex64(f->sp);
+        ser_str("  cr2=");         ser_hex64(fault_addr);
+        ser_str("  ec=");          ser_hex64(ec);
+        // Don't halt — let it continue and see if #GP follows
+    }
+
     uint8_t is_present  = (ec >> 0) & 1;  // protection violation (not just missing)
     uint8_t is_write    = (ec >> 1) & 1;
     uint8_t is_user     = (ec >> 2) & 1;

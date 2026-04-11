@@ -184,7 +184,12 @@ void signal_deliver_pending(void) {
         g_fb_fg = saved_fg;
     }
 
-    g_current->state = TASK_DEAD;
+    // Use TASK_EXITING so do_switch transitions the task through TASK_ZOMBIE.
+    // This keeps the parent's children list consistent: sys_wait will find the
+    // zombie, reap it, and call process_destroy — instead of process_destroy
+    // being called from do_switch while the task is still in the children list.
+    g_current->exit_code = -(int32_t)sig;
+    g_current->state = TASK_EXITING;
     sched_yield();
     for (;;) __asm__ volatile("hlt");
 }

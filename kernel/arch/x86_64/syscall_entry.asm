@@ -138,9 +138,23 @@ syscall_entry:
     mov r14, [rel g_syscall_user_r14]
     mov r15, [rel g_syscall_user_r15]
 .no_signal:
-    ; 11. Disable interrupts before sysretq (mandatory).
+    ; 11. Disable interrupts before return to user (mandatory).
     cli
 
-    ; 12. Return to user space.
-    ;     o64 sysret = sysretq: RIP←rcx, RFLAGS←r11, CS←USER_CS, SS←USER_SS
-    o64 sysret
+    ; 12. Return to user space via iretq (diagnostic: sysretq may have an SS bug).
+    ;     Build iretq frame: push SS, RSP, RFLAGS, CS, RIP.
+    ;     rcx=user RIP, r11=user RFLAGS, rsp=user RSP.
+    ;     We need a temporary kernel stack to build the frame.
+    ;     Save the user values, switch to a temp stack area, build frame, iretq.
+    ;
+    ;     Use the kstack for this: load TSS.RSP0 into a scratch register.
+    mov r10, rsp            ; save user RSP in r10
+    mov rsp, [rel g_tss + 4] ; switch to kstack top (TSS.RSP0)
+
+    push qword 0x23         ; SS = user data64 with RPL=3
+    push r10                 ; RSP = saved user RSP
+    push r11                 ; RFLAGS = user RFLAGS
+    push qword 0x2B          ; CS = user code64 with RPL=3
+    push rcx                 ; RIP = user RIP
+
+    iretq

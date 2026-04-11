@@ -17,11 +17,21 @@
 // NULL means the idle process (kmain's hlt loop) is running.
 extern task_t* g_current;
 
+// The first user process (login/init).  Orphaned children are reparented here.
+// Set automatically by sched_add() when the first non-kthread task is added.
+extern task_t* g_init_task;
+
 // Initialise the scheduler data structures.  Call before timer_init().
 void sched_init(void);
 
 // Add a PROC_READY process to the tail of the run queue.
 void sched_add(task_t* proc);
+
+// ── Per-task child list helpers ───────────────────────────────────────────
+// Call task_child_add(parent, child) immediately after creating a child task.
+// Call task_child_remove(parent, child) when the parent reaps the child.
+void task_child_add   (task_t* parent, task_t* child);
+void task_child_remove(task_t* parent, task_t* child);
 
 // Called on every timer tick (by timer_irq_handler via timer_register_tick).
 // Picks the next PROC_READY process and context-switches into it.
@@ -40,29 +50,10 @@ void sched_sleep(void);
 // Does nothing if the process is not PROC_SLEEPING.
 void sched_wake(task_t* proc);
 
-// Block current task until a zombie with the given pid exists (0=any).
-// Returns 1 when zombie is ready, 1 if already gone.
-uint8_t sched_wait_pid(uint32_t pid);
-
-// Non-blocking: returns 1 if a zombie with the given pid (0=any) is ready.
-uint8_t sched_poll_pid(uint32_t pid);
-
-// Add a zombie task to the zombie list (call from sys_exit before yielding).
-void sched_add_zombie(task_t* t);
-
-// Remove and return the zombie with the given pid (0 = any child).
-// Does NOT check parent — use sched_reap_child_zombie for waitpid.
+// Remove and return the zombie with the given pid from the global zombie list.
 // Returns NULL if not found.  Caller is responsible for process_destroy.
+// (sched_add_zombie is now internal to sched.c — do not call from outside.)
 task_t* sched_reap_zombie(uint32_t pid);
-
-// Reap a zombie that is a child of parent_pid.
-// target_pid == 0: any child; target_pid != 0: that specific pid.
-// Returns NULL if not found.
-task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid);
-
-// Non-blocking: check if a zombie child of parent_pid exists.
-// target_pid == 0: any child; target_pid != 0: that specific pid.
-uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid);
 
 // Walk every task in every MLFQ level, calling cb(t, data) for each.
 void sched_for_each(void (*cb)(task_t*, void*), void* data);

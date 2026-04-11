@@ -393,9 +393,12 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
     if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
     int status = 0;
-    waitpid(pid, &status, 0);
-    // Debug: print exit status so we can see why a program exited immediately
-    if (WIFEXITED(status)) {
+    int waited = waitpid(pid, &status, 0);
+    // Debug: print exit status so we can see why a program exited immediately.
+    // Only print if waitpid actually reaped the child (waited > 0); a return of
+    // -1 (e.g. ECHILD from a transient kernel race) means status was never
+    // written, and WIFEXITED(0) would be a false positive.
+    if (waited > 0 && WIFEXITED(status)) {
         puts_fd("[shell: exited with code ");
         char nbuf[12]; int n = WEXITSTATUS(status); int pos = 0;
         if (n == 0) { nbuf[pos++] = '0'; }

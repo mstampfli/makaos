@@ -19,7 +19,8 @@ static const uint8_t s_quanta[MLFQ_LEVELS] = {2, 4, 8, 16};
 
 // ── Globals ───────────────────────────────────────────────────────────────
 
-task_t* g_current = NULL;
+task_t* g_current   = NULL;
+task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
 // Per-level FIFO queues.
 static task_t* s_heads[MLFQ_LEVELS];
@@ -52,6 +53,9 @@ static task_t s_idle = {
 
 static volatile uint32_t s_tick_count  = 0;
 static volatile uint8_t  s_reschedule  = 0;
+
+// ── Forward declarations ──────────────────────────────────────────────────
+static void sched_add_zombie(task_t* t);
 
 // ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -96,7 +100,30 @@ void sched_init(void) {
 }
 
 void sched_add(task_t* proc) {
+    // Register the first user process as the init/orphan-reaper task.
+    if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
+        g_init_task = proc;
     enqueue(proc);
+}
+
+// ── Per-task child list ───────────────────────────────────────────────────
+// Prepend child to parent's children list.
+void task_child_add(task_t* parent, task_t* child) {
+    child->child_next  = parent->children;
+    parent->children   = child;
+}
+
+// Remove child from parent's children list (O(n) — n is number of children).
+void task_child_remove(task_t* parent, task_t* child) {
+    task_t** pp = &parent->children;
+    while (*pp) {
+        if (*pp == child) {
+            *pp = child->child_next;
+            child->child_next = NULL;
+            return;
+        }
+        pp = &(*pp)->child_next;
+    }
 }
 
 // ── sched_tick ────────────────────────────────────────────────────────────
@@ -170,17 +197,29 @@ static void do_switch(uint8_t preempted) {
     }
 
     task_t* prev = g_current;
-    if (prev != &s_idle && prev->state == TASK_RUNNING) {
-        if (preempted) {
-            // Used full quantum → demote.
-            if (prev->mlfq_level < MLFQ_LEVELS - 1)
-                prev->mlfq_level++;
-            prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
-        } else {
-            // Voluntary — stay at same level, refresh quantum.
-            prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+    if (prev != &s_idle) {
+        if (prev->state == TASK_EXITING) {
+            // sys_exit set TASK_EXITING and called sched_yield().  Complete the
+            // transition here — both state write and zombie-list insertion happen
+            // in one place with no window between them.  Because this runs either
+            // from the timer ISR (IF=0) or from sched_yield (single CPU, no other
+            // task running), there is no preemption risk.
+            prev->state = TASK_ZOMBIE;
+            sched_add_zombie(prev);
+            // Do not re-enqueue — task is now a zombie.
+        } else if (prev->state == TASK_RUNNING) {
+            if (preempted) {
+                // Used full quantum → demote.
+                if (prev->mlfq_level < MLFQ_LEVELS - 1)
+                    prev->mlfq_level++;
+                prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+            } else {
+                // Voluntary — stay at same level, refresh quantum.
+                prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+            }
+            enqueue(prev);
         }
-        enqueue(prev);
+        // TASK_SLEEPING, TASK_ZOMBIE, TASK_DEAD: already handled elsewhere.
     }
 
     next->state = TASK_RUNNING;
@@ -190,10 +229,6 @@ static void do_switch(uint8_t preempted) {
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
     signal_deliver_pending();
-
-    if (prev != &s_idle && prev->state == TASK_DEAD)
-        process_destroy(prev);
-
     __asm__ volatile("sti");
 }
 
@@ -232,14 +267,14 @@ void sched_wake(task_t* proc) {
     enqueue(proc);
 }
 
-// Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
-void sched_add_zombie(task_t* t) {
+// Add a zombie task to the global zombie list.
+// Only called from do_switch — internal to sched.c.
+static void sched_add_zombie(task_t* t) {
     t->next = s_zombie_head;
     s_zombie_head = t;
 }
 
-// Remove and return the zombie with the given pid (0 = any).
-// Does NOT check parent — use sched_reap_child_zombie for waitpid.
+// Remove and return the zombie with the given pid from the global zombie list.
 // Returns NULL if not found.  Caller must call process_destroy on result.
 task_t* sched_reap_zombie(uint32_t pid) {
     task_t** pp = &s_zombie_head;
@@ -255,86 +290,10 @@ task_t* sched_reap_zombie(uint32_t pid) {
     return NULL;
 }
 
-// Remove and return a zombie that is a child of `parent_pid`.
-// If target_pid == 0: reaps any child of parent_pid.
-// If target_pid != 0: reaps that specific pid only if its ppid == parent_pid.
-// Returns NULL if no matching child zombie found.
-task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    task_t** pp = &s_zombie_head;
-    while (*pp) {
-        task_t* z = *pp;
-        int pid_match  = (target_pid == 0) || (z->pid == target_pid);
-        int is_child   = (z->ppid == parent_pid);
-        if (pid_match && is_child) {
-            *pp = z->next;
-            z->next = NULL;
-            return z;
-        }
-        pp = &(*pp)->next;
-    }
-    return NULL;
-}
-
-// Check if any zombie child of parent_pid exists (non-blocking poll).
-// If target_pid != 0, checks specifically for that pid.
-uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    task_t* z = s_zombie_head;
-    while (z) {
-        int pid_match = (target_pid == 0) || (z->pid == target_pid);
-        int is_child  = (z->ppid == parent_pid);
-        if (pid_match && is_child) return 1;
-        z = z->next;
-    }
-    return 0;
-}
-
-// ── sched_wait_pid ────────────────────────────────────────────────────────
-
-typedef struct { uint32_t pid; uint8_t found; } wait_pid_arg_t;
-
-static void find_pid_cb(task_t* t, void* data) {
-    wait_pid_arg_t* a = (wait_pid_arg_t*)data;
-    if (t->pid == a->pid) a->found = 1;
-}
-
-// Returns 1 if a matching zombie was found (or task is gone), 0 if still alive.
-// pid == 0 means "any child".
-uint8_t sched_wait_pid(uint32_t pid) {
-    for (;;) {
-        // Check zombie list.
-        task_t* z = s_zombie_head;
-        while (z) {
-            if (pid == 0 || z->pid == pid) return 1;
-            z = z->next;
-        }
-        if (pid == 0) { sched_yield(); continue; } // any: keep waiting
-        // Specific pid: check if still alive anywhere (run queue, sleep, zombie)
-        // or is the currently running task.
-        wait_pid_arg_t a = {pid, 0};
-        __asm__ volatile("cli");
-        sched_for_each(find_pid_cb, &a);
-        __asm__ volatile("sti");
-        if (!a.found) return 1;
-        sched_yield();
-    }
-}
-
-// Non-blocking variant: returns 1 if zombie ready, 0 if not.
-uint8_t sched_poll_pid(uint32_t pid) {
-    task_t* z = s_zombie_head;
-    while (z) {
-        if (pid == 0 || z->pid == pid) return 1;
-        z = z->next;
-    }
-    return 0;
-}
-
 // ── sched_for_each ────────────────────────────────────────────────────────
 // Walks every task in every MLFQ level.
 
 void sched_for_each(void (*cb)(task_t*, void*), void* data) {
-    // Include g_current: it is dequeued while executing, so it won't appear
-    // in any of the lists below.  Callers (e.g. sched_wait_pid) need to see it.
     if (g_current && g_current != &s_idle)
         cb(g_current, data);
 
@@ -345,7 +304,7 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
             t = t->next;
         }
     }
-    // Also walk sleeping and zombie tasks so sched_wait_pid doesn't miss them.
+    // Also walk sleeping and zombie tasks.
     task_t* t = s_sleep_head;
     while (t) { cb(t, data); t = t->next; }
     t = s_zombie_head;

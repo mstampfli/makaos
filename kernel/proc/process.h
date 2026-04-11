@@ -24,6 +24,7 @@ typedef enum {
     TASK_DEAD     = 2,
     TASK_SLEEPING = 3,
     TASK_ZOMBIE   = 4,  // exited, waiting for parent to reap via wait()
+    TASK_EXITING  = 5,  // sys_exit called; do_switch completes → ZOMBIE atomically
 } task_state_t;
 
 #define PROC_READY    TASK_READY
@@ -107,7 +108,15 @@ typedef struct __attribute__((aligned(16))) task_t {
     uint32_t      pledge_mask;  // PLEDGE_* bitmask; starts as PLEDGE_ALL (no restriction)
     unveil_table_t unveil;      // per-process filesystem view restriction
 
-    struct task_t* next;
+    struct task_t* next;        // scheduler / sleep / zombie list link
+
+    // ── Per-task child list (Linux-style) ─────────────────────────────────
+    // children: singly-linked list of direct children (head pointer).
+    // child_next: this task's link in its parent's children list.
+    // A child is added on fork/spawn and removed only when the parent reaps it.
+    // sys_wait walks this list — no global queue search, no ECHILD race.
+    struct task_t* children;    // head of direct-children list
+    struct task_t* child_next;  // next sibling in parent's children list
 } task_t;
 
 typedef task_t process_t;
