@@ -90,10 +90,45 @@ int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
     return 0;
 }
 
+// ── Path normalization ────────────────────────────────────────────────────
+
+void normalize_path(char* path) {
+    if (!path || path[0] != '/') return;
+
+    // Two-pointer in-place: read from `src` (past leading '/'), write to `dst`.
+    // We never read ahead of where we write, because we skip components (making
+    // dst <= src always), so in-place is safe.
+    char* dst = path + 1;
+    const char* src = path + 1;
+    int offs[128], depth = 0;
+
+    while (*src) {
+        if (*src == '/') { src++; continue; }          // collapse "//"
+        int len = 0;
+        while (src[len] && src[len] != '/') len++;
+        if (len == 1 && src[0] == '.') {               // skip "."
+            src += len; continue;
+        }
+        if (len == 2 && src[0] == '.' && src[1] == '.') {  // handle ".."
+            if (depth > 0) { depth--; dst = path + offs[depth]; }
+            src += len; continue;
+        }
+        if (depth < 128) offs[depth++] = (int)(dst - path);
+        for (int i = 0; i < len; i++) *dst++ = src[i];
+        src += len;
+        if (*src) *dst++ = '/';                        // separator (not trailing)
+    }
+    if (dst == path + 1) { /* root */ }
+    else if (dst[-1] == '/') dst--;                    // strip trailing '/'
+    *dst = '\0';
+}
+
 // ── Global entry point ────────────────────────────────────────────────────
 
-int fs_lookup(const char* path, const cred_t* cred, uint8_t need,
+int fs_lookup(char* path, const cred_t* cred, uint8_t need,
               fs_node_t* out) {
+    normalize_path(path);
+
     // Route to virtfs first; if not a virtual path, fall through to ext2.
     if (virtfs_is_virtual(path))
         return virtfs_lookup(path, cred, need, out);

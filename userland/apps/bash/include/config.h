@@ -10,7 +10,10 @@
 #define ALIAS                   1
 #define PUSHD_AND_POPD          1
 #define BRACE_EXPANSION         1
-#define READLINE                1
+/* Disabled: our framebuffer terminal has no ANSI escape parser, so
+   readline's raw-mode editing produces garbage.  Canonical mode (kernel
+   TTY line editing) works fine. */
+/* #undef READLINE */
 #define BANG_HISTORY            1
 #define HISTORY                 1
 #define HELP_BUILTIN            1

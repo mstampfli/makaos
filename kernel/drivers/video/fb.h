@@ -52,7 +52,8 @@ static inline uint32_t fb_rows(void) { return g_fb.height / 16; }
 
 /* ── Exclusive mode ─────────────────────────────────────────────────────────── */
 // When set, fb_term_putc / fb_clear are no-ops so a fullscreen app owns the FB.
-extern int g_fb_exclusive;
+extern int      g_fb_exclusive;
+extern uint64_t g_fb_owner_pid;  // pid of process that last called fb_blit
 
 /* ── API ────────────────────────────────────────────────────────────────────── */
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch);

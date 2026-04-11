@@ -477,6 +477,13 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // Reparent direct children to g_init_task before zombifying.
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
+        // Release framebuffer if this process owned it.
+        if (g_fb_exclusive && g_current->pid == g_fb_owner_pid) {
+            g_fb_exclusive = 0;
+            g_fb_owner_pid = 0;
+            fb_clear();
+        }
+
         // Move all children to init's children list and update their ppid.
         task_t* child = g_current->children;
         while (child) {
@@ -1081,38 +1088,6 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
         for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
     }
     kfree(raw);
-
-    // Normalize: resolve ".", "..", "//", trailing "/" so virtual mount
-    // matching and root-injection checks see clean paths.
-    {
-        char* tmp = kmalloc(512);
-        if (tmp) {
-            uint64_t pi = 0;
-            while (path[pi]) { tmp[pi] = path[pi]; pi++; }
-            tmp[pi] = '\0';
-            char* dst = path;
-            const char* src = tmp + 1; // skip leading '/'
-            int offs[128], depth = 0;
-            *dst++ = '/';
-            while (*src) {
-                if (*src == '/') { src++; continue; }
-                int len = 0;
-                while (src[len] && src[len] != '/') len++;
-                if (len == 1 && src[0] == '.') { src += len; continue; }
-                if (len == 2 && src[0] == '.' && src[1] == '.') {
-                    if (depth > 0) { depth--; dst = path + offs[depth]; }
-                    src += len; continue;
-                }
-                if (depth < 128) offs[depth++] = (int)(dst - path);
-                for (int i = 0; i < len; i++) *dst++ = src[i];
-                *dst++ = '/';
-                src += len;
-            }
-            if (dst > path + 1 && dst[-1] == '/') dst--;
-            *dst = '\0';
-            kfree(tmp);
-        }
-    }
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) { kfree(path); return (uint64_t)-ENOMEM; }
@@ -1753,6 +1728,9 @@ static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
     (void)flags;
     if (!src_ptr || !src_w || !src_h) return (uint64_t)-EINVAL;
     if (!g_fb.base_virt)              return (uint64_t)-EIO;
+
+    g_fb_exclusive = 1;
+    g_fb_owner_pid = g_current ? g_current->pid : 0;
 
     user_buf_prefault(src_ptr, src_w * src_h * 4);
     const uint32_t* src   = (const uint32_t*)src_ptr;
