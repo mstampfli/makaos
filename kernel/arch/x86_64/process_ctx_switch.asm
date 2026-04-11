@@ -212,6 +212,15 @@ fork_trampoline:
     xor  rax, rax        ; child returns 0 from fork
     pop  rcx             ; user RIP
     pop  r11             ; user RFLAGS
-    pop  rsp             ; user RSP (switches to user stack — must be last)
+    pop  r10             ; user RSP (into r10, NOT rsp — we need kstack for iretq frame)
+
+    ; Use iretq instead of sysretq — sysretq has a KVM/CPU bug where
+    ; SS doesn't get RPL=3 OR'd in, giving SS=0x20 instead of 0x23.
     cli
-    o64 sysret
+    push qword 0x23      ; SS = user data64 with RPL=3
+    push r10             ; RSP = user RSP
+    push r11             ; RFLAGS
+    push qword 0x2B      ; CS = user code64 with RPL=3
+    push rcx             ; RIP
+
+    iretq

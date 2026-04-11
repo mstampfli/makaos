@@ -517,7 +517,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display sdl \
-  -audiodev pipewire,id=snd0 \
+  -audiodev pa,id=snd0,server=unix:/mnt/wslg/PulseServer \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \
