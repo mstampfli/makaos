@@ -5,19 +5,9 @@ int main(int argc, char** argv) {
     const char* path = ".";
     if (argc > 1) path = argv[1];
 
-    // Resolve "." to actual cwd if needed
-    char cwdbuf[512];
-    const char* dirpath = path;
-    if (path[0] == '.' && path[1] == '\0') {
-        char* cwd = getcwd(NULL, 0);
-        if (cwd) {
-            dirpath = cwd;
-        }
-    }
-
-    DIR* dir = opendir(dirpath);
+    DIR* dir = opendir(path);
     if (!dir) {
-        fprintf(stderr, "ls: cannot open '%s'\n", dirpath);
+        fprintf(stderr, "ls: cannot open '%s'\n", path);
         return 1;
     }
 

@@ -171,6 +171,14 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_login.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ls.o" \
    -o "$BUILD_DIR/user_ls.elf"
 
+# ── Coreutils (cat, echo, mkdir, rm, mv, clear, reboot) ─────────────────
+for util in cat echo mkdir rm mv clear reboot; do
+    "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+        -c "$USERLAND_DIR/apps/$util/$util.c" -o "$BUILD_DIR/user_${util}.o"
+    ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_${util}.o" \
+       -o "$BUILD_DIR/user_${util}.elf"
+done
+
 # ── Doom (doomgeneric) ────────────────────────────────────────────────────
 DOOM_DIR="$USERLAND_DIR/apps/doom"
 DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
@@ -358,8 +366,8 @@ ext2_setperm() {
 mkdir -p "$BUILD_DIR/etc_stage"
 
 cat > "$BUILD_DIR/etc_stage/passwd" <<'PASSWD_EOF'
-root:0:0:/root:/bin/shell
-maka:1000:1000:/home/maka:/bin/shell
+root:0:0:/root:/bin/bash
+maka:1000:1000:/home/maka:/bin/bash
 PASSWD_EOF
 
 # /etc/shadow — plaintext passwords for now (no crypto).
@@ -463,6 +471,14 @@ if [ -f "$BUILD_DIR/user_bash.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/bash
     echo "[+] bash ELF installed at bin/bash (root:root 0755)"
 fi
+
+# ── Coreutils ────────────────────────────────────────────────────────────
+for util in cat echo mkdir rm mv clear reboot; do
+    if [ -f "$BUILD_DIR/user_${util}.elf" ]; then
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_${util}.elf" "bin/$util"
+        echo "[+] $util ELF installed at bin/$util (root:root 0755)"
+    fi
+done
 
 WAD_SEARCH=(
     "$DOOM_DIR/doom1.wad"

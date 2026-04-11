@@ -12,6 +12,7 @@ ENTRY="$REPO/userland/entry"
 USERLAND="$REPO/userland"
 BUILD="$REPO/build"
 STUBS_DIR="$REPO/userland/apps/bash"
+SHIM_INC="$STUBS_DIR/include"
 OBJ_DIR="/tmp/bash_build_objs"
 RT_DIR="/tmp/bash_build_rt"
 
@@ -23,10 +24,10 @@ LD=x86_64-linux-gnu-ld
 CFLAGS=(
   -O2 -ffreestanding -nostdinc -nostdlib
   -fno-stack-protector -fno-builtin
-  -I/tmp/bash-makaos-include
+  -I"$SHIM_INC"
   -I"$BASH_SRC" -I"$BASH_SRC/include" -I"$BASH_SRC/lib"
   -I"$LIBC"
-  -DMAKAOS -DHAVE_CONFIG_H -DSHELL -DPREFER_STDARG
+  -DMAKAOS -DHAVE_CONFIG_H -DSHELL -DPREFER_STDARG -DOLD_ALIAS_HACK
   -Wno-implicit-function-declaration -Wno-int-conversion
   -Wno-incompatible-pointer-types -Wno-unused-value
   -Wno-pointer-sign -Wno-discarded-qualifiers
@@ -39,34 +40,70 @@ BUILTIN_CFLAGS=(
   -include "$BASH_SRC/include/stdc.h"
 )
 
+# Exclude files that conflict or aren't needed per-directory
 EXCLUDE=(array2.c gen-helpfiles.c glob_loop.c gm_loop.c sm_loop.c getenv.c
   netconn.c netopen.c fnxform.c unicode.c random.c emacs_keymap.c vi_keymap.c
   mkbuiltins.c mksyntax.c nojobs.c memset.c strcasestr.c strchrnul.c strdup.c
-  strftime.c strstr.c)
+  strftime.c strstr.c xfree.c oslib.c gettimeofday.c)
+# Readline has its own shell.c, tilde.c, xmalloc.c that duplicate bash's
+RL_EXCLUDE=(shell.c xmalloc.c xfree.c emacs_keymap.c vi_keymap.c)
 
 echo "[+] Generating builtin .c files from .def"
 if [ ! -f "$BASH_SRC/builtins/mkbuiltins" ]; then
-  gcc -DHAVE_CONFIG_H -I. -I.. -I../include \
+  # mkbuiltins runs on the HOST — give it a minimal config.h, not our full shim set
+  _mkb_tmp=$(mktemp -d)
+  cat > "$_mkb_tmp/config.h" << 'MKCFG'
+#define HAVE_STDLIB_H 1
+#define HAVE_STRING_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_LIMITS_H 1
+MKCFG
+  gcc -DHAVE_CONFIG_H -DHAVE_RENAME -I"$_mkb_tmp" -I"$BASH_SRC" -I"$BASH_SRC/include" \
     -o "$BASH_SRC/builtins/mkbuiltins" "$BASH_SRC/builtins/mkbuiltins.c"
+  rm -rf "$_mkb_tmp"
 fi
-(cd "$BASH_SRC/builtins" && ./mkbuiltins -externfile builtins.h -structfile builtins.c *.def) 2>/dev/null || true
+(cd "$BASH_SRC/builtins" && ./mkbuiltins \
+    -externfile builtext.h -includefile builtext.h \
+    -structfile builtins.c *.def) 2>/dev/null || true
+
+echo "[+] Generating syntax.c"
+if [ ! -f "$BASH_SRC/mksyntax" ]; then
+  _mkb_tmp=$(mktemp -d)
+  cat > "$_mkb_tmp/config.h" << 'MKCFG'
+#define HAVE_STDLIB_H 1
+#define HAVE_STRING_H 1
+#define HAVE_UNISTD_H 1
+MKCFG
+  gcc -DHAVE_CONFIG_H -I"$_mkb_tmp" -I"$BASH_SRC" -I"$BASH_SRC/include" \
+    -o "$BASH_SRC/mksyntax" "$BASH_SRC/mksyntax.c" 2>/dev/null
+  rm -rf "$_mkb_tmp"
+fi
+[ ! -f "$BASH_SRC/syntax.c" ] && (cd "$BASH_SRC" && ./mksyntax -o syntax.c)
 
 rm -f "$OBJ_DIR"/*.o
 
 echo "[+] Compiling bash main sources"
 errors=0
-for f in "$BASH_SRC"/*.c "$BASH_SRC"/lib/sh/*.c \
-          "$BASH_SRC"/lib/readline/*.c "$BASH_SRC"/lib/glob/*.c \
-          "$BASH_SRC"/lib/tilde/*.c; do
-    [[ ! -f "$f" ]] && continue
-    name=$(basename "$f" .c)
-    skip=0
-    for ex in "${EXCLUDE[@]}"; do [[ "$name.c" == "$ex" ]] && skip=1 && break; done
-    [[ $skip -eq 1 ]] && continue
-    "$CC" "${CFLAGS[@]}" -c "$f" -o "$OBJ_DIR/${name}.o" 2>/dev/null || errors=$((errors+1))
-done
-# Recompile bash's shell.c and input.c with unique names to avoid readline conflicts
-"$CC" "${CFLAGS[@]}" -c "$BASH_SRC/input.c" -o "$OBJ_DIR/bash_input.o"
+compile_dir() {
+    local dir="$1" prefix="$2"
+    shift 2
+    local extra_excl=("$@")
+    for f in "$dir"/*.c; do
+        [[ ! -f "$f" ]] && continue
+        local name=$(basename "$f" .c)
+        local skip=0
+        for ex in "${EXCLUDE[@]}"; do [[ "$name.c" == "$ex" ]] && skip=1 && break; done
+        for ex in "${extra_excl[@]}"; do [[ "$name.c" == "$ex" ]] && skip=1 && break; done
+        [[ $skip -eq 1 ]] && continue
+        "$CC" "${CFLAGS[@]}" -c "$f" -o "$OBJ_DIR/${prefix}${name}.o" 2>/dev/null \
+            || errors=$((errors+1))
+    done
+}
+compile_dir "$BASH_SRC"               ""
+compile_dir "$BASH_SRC/lib/sh"        "sh_"
+compile_dir "$BASH_SRC/lib/readline"  "rl_"  "${RL_EXCLUDE[@]}"
+compile_dir "$BASH_SRC/lib/glob"      "gl_"
+# tilde is already in readline; skip standalone lib/tilde to avoid dupes
 
 echo "[+] Compiling builtins"
 for f in "$BASH_SRC"/builtins/alias.c "$BASH_SRC"/builtins/bind.c \
@@ -105,12 +142,12 @@ typedef struct word_list WORD_LIST;
 int mapfile_builtin(WORD_LIST *l) { (void)l; return 1; }
 EOF
 "$CC" -O2 -ffreestanding -nostdinc -nostdlib -fno-stack-protector -fno-builtin \
-  -I/tmp/bash-makaos-include -I"$LIBC" -DMAKAOS \
+  -I"$SHIM_INC" -I"$LIBC" -DMAKAOS \
   -c /tmp/_mapfile_stub.c -o "$OBJ_DIR/def_mapfile.o" 2>/dev/null
 
 # misc stubs (termcap, random, progcomp, etc.)
 "$CC" -O2 -ffreestanding -nostdinc -nostdlib -fno-stack-protector -fno-builtin \
-  -I/tmp/bash-makaos-include -I"$LIBC" -DMAKAOS \
+  -I"$SHIM_INC" -I"$LIBC" -DMAKAOS \
   -c "$STUBS_DIR/bash_stubs.c" -o "$OBJ_DIR/bash_stubs.o"
 
 echo "[+] Building runtime objects"

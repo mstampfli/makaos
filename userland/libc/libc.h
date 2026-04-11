@@ -167,7 +167,9 @@ typedef _Bool              bool;
 #define SYS_CHMOD       65
 #define SYS_CHOWN       67
 
-#define WNOHANG 1
+#define WNOHANG    1
+#define WUNTRACED  2
+#define WCONTINUED 8
 
 #define SYS_READ_NONBLOCK 1
 
@@ -454,6 +456,14 @@ void __sigreturn_trampoline(void);
 
 static inline int sigaction(int sig, const struct_sigaction* act,
                             struct_sigaction* oldact) {
+    struct_sigaction fixed;
+    if (act) {
+        fixed = *act;
+        // Always install the sigreturn trampoline as restorer so that
+        // the signal handler can return normally via 'ret'.
+        fixed.sa_restorer = __sigreturn_trampoline;
+        act = &fixed;
+    }
     return (int)__syscall_ret(syscall3(SYS_SIGACTION,
                                        (uint64_t)(uint32_t)sig,
                                        (uint64_t)act,
@@ -529,6 +539,8 @@ void*  memset(void* dst, int c, size_t n);
 void*  memcpy(void* dst, const void* src, size_t n);
 void*  memmove(void* dst, const void* src, size_t n);
 int    memcmp(const void* a, const void* b, size_t n);
+static inline void  bcopy(const void* src, void* dst, size_t n) { memmove(dst, src, n); }
+static inline void  bzero(void* s, size_t n) { memset(s, 0, n); }
 int    strcmp(const char* a, const char* b);
 int    strncmp(const char* a, const char* b, size_t n);
 int    strcasecmp(const char* a, const char* b);
@@ -965,9 +977,10 @@ typedef struct { uint64_t bits[FD_SETSIZE/64]; } fd_set;
 
 static inline int select(int nfds, fd_set* rfds, fd_set* wfds,
                           fd_set* efds, struct timeval* tv) {
-    // Pass 5th arg via r8 (g_syscall_arg5 in kernel).
+    // Syscall ABI: rdi=nfds, rsi=rfds, rdx=wfds, r10=efds, r8=tv
     uint64_t ret;
     __asm__ volatile(
+        "mov %5, %%r10\n\t"
         "mov %6, %%r8\n\t"
         "syscall"
         : "=a"(ret)
@@ -975,7 +988,7 @@ static inline int select(int nfds, fd_set* rfds, fd_set* wfds,
           "D"((uint64_t)nfds), "S"((uint64_t)rfds),
           "d"((uint64_t)wfds), "r"((uint64_t)efds),
           "r"((uint64_t)tv)
-        : "rcx", "r11", "r8", "memory"
+        : "rcx", "r11", "r10", "r8", "memory"
     );
     return (int)__syscall_ret(ret);
 }
@@ -1163,6 +1176,10 @@ static inline char* getenv(const char* name) {
     return NULL;
 }
 
+int    setenv(const char* name, const char* value, int overwrite);
+int    unsetenv(const char* name);
+int    putenv(char* string);
+
 // ── POSIX stat / lstat / fstat ────────────────────────────────────────────
 // The kernel fills struct stat directly — no bridge needed.
 static inline int stat(const char* path, struct stat* st) {
@@ -1257,6 +1274,8 @@ static inline int iscntrl(int c)  { return (c >= 0 && c < 0x20) || c == 0x7F; }
 static inline int ispunct(int c)  { return isprint(c) && !isalnum(c) && c != ' '; }
 static inline int isxdigit(int c) { return isdigit(c) || (c>='a'&&c<='f') || (c>='A'&&c<='F'); }
 static inline int isblank(int c)  { return c == ' ' || c == '\t'; }
+static inline int isascii(int c)  { return (unsigned)c < 128; }
+static inline int isgraph(int c)  { return c > 0x20 && c < 0x7F; }
 static inline int toupper(int c)  { return islower(c) ? c - 32 : c; }
 static inline int tolower(int c)  { return isupper(c) ? c + 32 : c; }
 static inline void* memchr(const void* s, int c, size_t n) {
@@ -1320,6 +1339,7 @@ struct passwd {
 
 struct passwd* getpwuid(uid_t uid);
 struct passwd* getpwnam(const char* name);
+void           setpwent(void);
 void           endpwent(void);
 struct passwd* getpwent(void);
 
@@ -1404,11 +1424,12 @@ static inline long arc4random(void) {
     return (long)((t >> 1) & 0x7FFFFFFF);
 }
 
-// mkstemp / mktemp
+// mkstemp / mktemp / mkdtemp
 int mkstemp(char* tmpl);
 char* mktemp(char* tmpl);
+char* mkdtemp(char* tmpl);
 static inline int mkdtemp_r(char* tmpl) {
-    // Replace trailing XXXXXX with random chars, then mkdir
+    // Replace trailing XXXXXX with random chars
     size_t len = 0; while (tmpl[len]) len++;
     if (len < 6) { errno = EINVAL; return -1; }
     uint64_t r = (uint64_t)clock_ns();
@@ -1823,5 +1844,19 @@ static inline int getaddrinfo(const char* h, const char* s,
 }
 static inline void freeaddrinfo(struct addrinfo* ai) { (void)ai; }
 static inline const char* gai_strerror(int e) { (void)e; return "name resolution not supported"; }
+
+// ── termcap ──────────────────────────────────────────────────────────────
+// Minimal but real termcap implementation for VT100/linux terminals.
+// Returns actual ANSI escape sequences rather than stubs.
+extern char PC;        // pad character (NUL)
+extern char* BC;       // backspace-if-not-^H
+extern char* UP;       // move cursor up one line
+
+int   tgetent(char* bp, const char* name);
+int   tgetflag(const char* id);
+int   tgetnum(const char* id);
+char* tgetstr(const char* id, char** area);
+char* tgoto(const char* cap, int col, int row);
+int   tputs(const char* str, int affcnt, int (*putc_fn)(int));
 
 // (rename / unlink / chdir / mkdir / stat / lstat / fstat defined earlier)

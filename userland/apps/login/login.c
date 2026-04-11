@@ -256,7 +256,7 @@ int main(void) {
         // ── Exec shell as this user ──────────────────────────────────────
         // spawn inherits our (now-dropped) credentials via cred_copy in
         // elf_exec_from_ext2.  The child shell runs as uid=pw->uid.
-        const char* sh_argv[] = { pw->shell, (char*)0 };
+        const char* sh_argv[] = { pw->shell, "--noediting", (char*)0 };
         int inherit_stdio[3] = { -1, -1, -1 };
         int pid = spawn(pw->shell, sh_argv, (void*)0, inherit_stdio);
         if (pid < 0) {

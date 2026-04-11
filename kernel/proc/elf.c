@@ -425,6 +425,8 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->flags            = 0;
     t->state            = TASK_READY;
     t->next             = NULL;
+    t->children         = NULL;
+    t->child_next       = NULL;
     t->mm_shared        = tmm;
     t->files_shared     = files;
     t->mlfq_level       = 0;
@@ -519,6 +521,8 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->flags            = 0;
     t->state            = TASK_READY;
     t->next             = NULL;
+    t->children         = NULL;
+    t->child_next       = NULL;
     t->mm_shared        = tmm;
     t->files_shared     = files;
     t->mlfq_level       = 0;

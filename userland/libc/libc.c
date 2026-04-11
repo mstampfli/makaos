@@ -9,6 +9,80 @@ int errno = 0;
 static char* s_empty_env[] = { NULL };
 char** environ = s_empty_env;
 
+// Count entries in environ
+static int _env_count(void) {
+    int n = 0;
+    if (environ) while (environ[n]) n++;
+    return n;
+}
+
+// Find index of NAME= in environ, returns -1 if not found
+static int _env_find(const char* name, size_t nlen) {
+    if (!environ) return -1;
+    for (int i = 0; environ[i]; i++) {
+        if (strncmp(environ[i], name, nlen) == 0 && environ[i][nlen] == '=')
+            return i;
+    }
+    return -1;
+}
+
+int setenv(const char* name, const char* value, int overwrite) {
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    size_t nlen = strlen(name);
+    int idx = _env_find(name, nlen);
+    if (idx >= 0 && !overwrite) return 0;
+
+    size_t vlen = strlen(value);
+    char* entry = malloc(nlen + 1 + vlen + 1);
+    if (!entry) { errno = ENOMEM; return -1; }
+    memcpy(entry, name, nlen);
+    entry[nlen] = '=';
+    memcpy(entry + nlen + 1, value, vlen + 1);
+
+    if (idx >= 0) {
+        environ[idx] = entry;
+    } else {
+        int n = _env_count();
+        char** newenv = malloc((n + 2) * sizeof(char*));
+        if (!newenv) { free(entry); errno = ENOMEM; return -1; }
+        for (int i = 0; i < n; i++) newenv[i] = environ[i];
+        newenv[n] = entry;
+        newenv[n + 1] = NULL;
+        environ = newenv;
+    }
+    return 0;
+}
+
+int unsetenv(const char* name) {
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    size_t nlen = strlen(name);
+    int idx = _env_find(name, nlen);
+    if (idx < 0) return 0;
+    int n = _env_count();
+    for (int i = idx; i < n; i++) environ[i] = environ[i + 1];
+    return 0;
+}
+
+int putenv(char* string) {
+    if (!string) { errno = EINVAL; return -1; }
+    char* eq = strchr(string, '=');
+    if (!eq) return unsetenv(string);
+    size_t nlen = (size_t)(eq - string);
+    int idx = _env_find(string, nlen);
+    if (idx >= 0) {
+        environ[idx] = string;
+    } else {
+        int n = _env_count();
+        char** newenv = malloc((n + 2) * sizeof(char*));
+        if (!newenv) { errno = ENOMEM; return -1; }
+        for (int i = 0; i < n; i++) newenv[i] = environ[i];
+        newenv[n] = string;
+        newenv[n + 1] = NULL;
+        environ = newenv;
+    }
+    return 0;
+}
+
 // ── Signal restorer trampoline ────────────────────────────────────────────
 // Called (via `ret`) when a signal handler returns.
 // Invokes SYS_SIGRETURN (28) to restore the interrupted user context.
@@ -1168,8 +1242,51 @@ struct passwd* getpwnam(const char* name) {
     return NULL;
 }
 
-void endpwent(void) {}
-struct passwd* getpwent(void) { return NULL; }
+// ── setpwent / getpwent / endpwent — iterating /etc/passwd ───────────────
+// POSIX requires these to iterate through the password database.
+// setpwent() opens/rewinds, getpwent() returns next entry, endpwent() closes.
+static int    s_pw_fd  = -1;
+static char   s_pw_iter_buf[4096]; // full file buffer for iteration
+static int    s_pw_iter_len = 0;
+static char*  s_pw_iter_pos = NULL;
+
+void setpwent(void) {
+    if (s_pw_fd >= 0) close(s_pw_fd);
+    s_pw_fd = open("/etc/passwd", O_RDONLY, 0);
+    if (s_pw_fd >= 0) {
+        s_pw_iter_len = (int)read(s_pw_fd, s_pw_iter_buf, sizeof(s_pw_iter_buf) - 1);
+        close(s_pw_fd);
+        s_pw_fd = -1;
+        if (s_pw_iter_len > 0) {
+            s_pw_iter_buf[s_pw_iter_len] = '\0';
+            s_pw_iter_pos = s_pw_iter_buf;
+        } else {
+            s_pw_iter_pos = NULL;
+        }
+    } else {
+        s_pw_iter_pos = NULL;
+    }
+}
+
+struct passwd* getpwent(void) {
+    if (!s_pw_iter_pos || !*s_pw_iter_pos) return NULL;
+    char* line = s_pw_iter_pos;
+    char* next = strchr(line, '\n');
+    if (next) *next = '\0';
+    // Skip blank lines
+    if (!*line) {
+        s_pw_iter_pos = next ? next + 1 : NULL;
+        return getpwent();
+    }
+    struct passwd* pw = pw_parse_line(line);
+    s_pw_iter_pos = next ? next + 1 : NULL;
+    return pw;
+}
+
+void endpwent(void) {
+    s_pw_iter_pos = NULL;
+    s_pw_iter_len = 0;
+}
 
 // ── sysconf / pathconf / confstr ──────────────────────────────────────────
 long sysconf(int name) {
@@ -1193,6 +1310,11 @@ int mkstemp(char* tmpl) {
 }
 char* mktemp(char* tmpl) {
     if (mkdtemp_r(tmpl) < 0) return NULL;
+    return tmpl;
+}
+char* mkdtemp(char* tmpl) {
+    if (mkdtemp_r(tmpl) < 0) return NULL;
+    if (mkdir(tmpl, 0700) < 0) return NULL;
     return tmpl;
 }
 
@@ -1886,6 +2008,172 @@ int __sigsetjmp(sigjmp_buf env, int savesigs) {
 __attribute__((noreturn)) void siglongjmp(sigjmp_buf env, int val) {
     if (env[0]._savesigs) sigprocmask(SIG_SETMASK, &env[0]._mask, NULL);
     longjmp(env[0]._regs, val);
+}
+
+// ── termcap ──────────────────────────────────────────────────────────────
+// Real termcap implementation for VT100/ANSI/linux terminals.
+// Uses a built-in capability table rather than reading /etc/termcap.
+// All escape sequences follow the ANSI X3.64 / ECMA-48 standard.
+
+char  PC = '\0';
+char* BC = NULL;
+char* UP = NULL;
+
+// Capability database — strings stored in a static arena.
+// tgetstr copies into *area if non-NULL, else returns from the arena.
+static char s_tc_arena[1024];
+static int  s_tc_arena_pos = 0;
+
+static char* tc_store(const char* s) {
+    int len = 0; while (s[len]) len++;
+    if (s_tc_arena_pos + len + 1 > (int)sizeof(s_tc_arena))
+        return NULL;
+    char* p = &s_tc_arena[s_tc_arena_pos];
+    for (int i = 0; i <= len; i++) p[i] = s[i];
+    s_tc_arena_pos += len + 1;
+    return p;
+}
+
+// Terminal size (queried once in tgetent, used by tgetnum)
+static int s_tc_lines = 25;
+static int s_tc_cols  = 80;
+
+int tgetent(char* bp, const char* name) {
+    (void)bp; (void)name;
+    // Query actual terminal size via TIOCGWINSZ if available
+    struct winsize ws;
+    if (ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+        s_tc_lines = ws.ws_row;
+        s_tc_cols  = ws.ws_col;
+    }
+    // Set global termcap variables
+    BC = tc_store("\b");
+    UP = tc_store("\033[A");
+    return 1; // success
+}
+
+int tgetflag(const char* id) {
+    if (!id) return 0;
+    // am: auto-margins (terminal wraps at right edge)
+    if (id[0] == 'a' && id[1] == 'm') return 1;
+    // bs: can backspace with ^H
+    if (id[0] == 'b' && id[1] == 's') return 1;
+    return 0;
+}
+
+int tgetnum(const char* id) {
+    if (!id) return -1;
+    // li: lines on screen
+    if (id[0] == 'l' && id[1] == 'i') return s_tc_lines;
+    // co: columns on screen
+    if (id[0] == 'c' && id[1] == 'o') return s_tc_cols;
+    // sg: standout glitch width (0 = no glitch)
+    if (id[0] == 's' && id[1] == 'g') return 0;
+    return -1;
+}
+
+// String capability lookup table — only capabilities the raw framebuffer
+// terminal actually supports (no ANSI escape sequences).
+// Readline falls back to full-line redraws when cursor-motion/insert/delete
+// capabilities are absent, which works correctly on the dumb fb terminal.
+static const struct { char id[3]; const char* seq; } s_tc_strings[] = {
+    {"le", "\b"},              // cursor left
+    {"cr", "\r"},              // carriage return
+    {"nw", "\r\n"},            // newline
+    {"sf", "\n"},              // scroll forward
+    {"bl", "\007"},            // audible bell
+    {"bc", "\b"},              // backspace character
+    {"pc", ""},                // pad character
+    {"im", ""},                // enter insert mode (no-op)
+    {"ei", ""},                // exit insert mode (no-op)
+
+    {"", NULL}, // sentinel
+};
+
+char* tgetstr(const char* id, char** area) {
+    if (!id) return NULL;
+    for (int i = 0; s_tc_strings[i].seq; i++) {
+        if (s_tc_strings[i].id[0] == id[0] && s_tc_strings[i].id[1] == id[1]) {
+            const char* seq = s_tc_strings[i].seq;
+            if (area && *area) {
+                // Copy into caller's buffer and advance pointer
+                char* dst = *area;
+                int j = 0;
+                while (seq[j]) { dst[j] = seq[j]; j++; }
+                dst[j] = '\0';
+                *area = dst + j + 1;
+                return dst;
+            }
+            // Return from static arena
+            return tc_store(seq);
+        }
+    }
+    return NULL;
+}
+
+// tgoto: substitute parameters into a cursor-addressing string.
+// Handles the %d, %i, %+, %., %> format codes from termcap.
+static char s_tgoto_buf[64];
+
+char* tgoto(const char* cap, int col, int row) {
+    if (!cap) return NULL;
+    char* out = s_tgoto_buf;
+    int pos = 0;
+    int args[2] = {row, col};
+    int argidx = 0;
+    int one_based = 0;
+
+    while (*cap && pos < 60) {
+        if (*cap == '%') {
+            cap++;
+            switch (*cap) {
+            case 'd': {
+                int v = args[argidx++] + one_based;
+                if (v >= 100) out[pos++] = '0' + v / 100;
+                if (v >= 10)  out[pos++] = '0' + (v / 10) % 10;
+                out[pos++] = '0' + v % 10;
+                cap++;
+                break;
+            }
+            case 'i':
+                one_based = 1;
+                cap++;
+                break;
+            case '+':
+                cap++;
+                out[pos++] = (char)(args[argidx++] + *cap);
+                cap++;
+                break;
+            case '.':
+                out[pos++] = (char)args[argidx++];
+                cap++;
+                break;
+            case '%':
+                out[pos++] = '%';
+                cap++;
+                break;
+            default:
+                out[pos++] = '%';
+                out[pos++] = *cap++;
+                break;
+            }
+        } else {
+            out[pos++] = *cap++;
+        }
+    }
+    out[pos] = '\0';
+    return s_tgoto_buf;
+}
+
+int tputs(const char* str, int affcnt, int (*putc_fn)(int)) {
+    (void)affcnt;
+    if (!str) return 0;
+    // Skip leading padding specification (digits and optional '.' and '*')
+    while ((*str >= '0' && *str <= '9') || *str == '.' || *str == '*')
+        str++;
+    while (*str)
+        putc_fn((unsigned char)*str++);
+    return 0;
 }
 
 // ── setvbuf ───────────────────────────────────────────────────────────────

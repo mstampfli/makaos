@@ -17,11 +17,18 @@
 // NULL means the idle process (kmain's hlt loop) is running.
 extern task_t* g_current;
 
+// The first user process (login/init).  Orphaned children are reparented here.
+extern task_t* g_init_task;
+
 // Initialise the scheduler data structures.  Call before timer_init().
 void sched_init(void);
 
 // Add a PROC_READY process to the tail of the run queue.
 void sched_add(task_t* proc);
+
+// ── Per-task child list helpers ───────────────────────────────────────────
+void task_child_add   (task_t* parent, task_t* child);
+void task_child_remove(task_t* parent, task_t* child);
 
 // Called on every timer tick (by timer_irq_handler via timer_register_tick).
 // Picks the next PROC_READY process and context-switches into it.

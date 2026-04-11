@@ -107,7 +107,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     uint32_t      pledge_mask;  // PLEDGE_* bitmask; starts as PLEDGE_ALL (no restriction)
     unveil_table_t unveil;      // per-process filesystem view restriction
 
-    struct task_t* next;
+    struct task_t* next;        // scheduler / sleep / zombie list link
+
+    // ── Per-task child list ───────────────────────────────────────────────
+    // children: singly-linked list of direct children (head pointer).
+    // child_next: this task's link in its parent's children list.
+    struct task_t* children;    // head of direct-children list
+    struct task_t* child_next;  // next sibling in parent's children list
 } task_t;
 
 typedef task_t process_t;

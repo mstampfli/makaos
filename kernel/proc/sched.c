@@ -19,7 +19,8 @@ static const uint8_t s_quanta[MLFQ_LEVELS] = {2, 4, 8, 16};
 
 // ── Globals ───────────────────────────────────────────────────────────────
 
-task_t* g_current = NULL;
+task_t* g_current   = NULL;
+task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
 // Per-level FIFO queues.
 static task_t* s_heads[MLFQ_LEVELS];
@@ -96,7 +97,29 @@ void sched_init(void) {
 }
 
 void sched_add(task_t* proc) {
+    // Register the first user process as the init/orphan-reaper task.
+    if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
+        g_init_task = proc;
     enqueue(proc);
+}
+
+// ── Per-task child list ───────────────────────────────────────────────────
+
+void task_child_add(task_t* parent, task_t* child) {
+    child->child_next  = parent->children;
+    parent->children   = child;
+}
+
+void task_child_remove(task_t* parent, task_t* child) {
+    task_t** pp = &parent->children;
+    while (*pp) {
+        if (*pp == child) {
+            *pp = child->child_next;
+            child->child_next = NULL;
+            return;
+        }
+        pp = &(*pp)->child_next;
+    }
 }
 
 // ── sched_tick ────────────────────────────────────────────────────────────
@@ -172,13 +195,21 @@ static void do_switch(uint8_t preempted) {
     task_t* prev = g_current;
     if (prev != &s_idle && prev->state == TASK_RUNNING) {
         if (preempted) {
-            // Used full quantum → demote.
+            // Timer preemption — quantum expired, demote.
             if (prev->mlfq_level < MLFQ_LEVELS - 1)
                 prev->mlfq_level++;
             prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
         } else {
-            // Voluntary — stay at same level, refresh quantum.
-            prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+            // Voluntary yield — charge one tick so spin-yielders get
+            // demoted.  I/O tasks use sched_sleep (which refreshes the
+            // quantum), so they keep their priority.
+            if (prev->mlfq_ticks_left > 0)
+                prev->mlfq_ticks_left--;
+            if (prev->mlfq_ticks_left == 0) {
+                if (prev->mlfq_level < MLFQ_LEVELS - 1)
+                    prev->mlfq_level++;
+                prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
+            }
         }
         enqueue(prev);
     }
