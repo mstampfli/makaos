@@ -119,6 +119,7 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     // Tell syscall_entry.asm to load rdi=signum before sysretq.
     g_signal_rdi     = (uint64_t)(uint32_t)sig;
     g_signal_deliver = 1;
+
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────
@@ -184,7 +185,16 @@ void signal_deliver_pending(void) {
         g_fb_fg = saved_fg;
     }
 
-    g_current->state = TASK_DEAD;
+    // Zombie instead of TASK_DEAD so the parent can reap via waitpid.
+    g_current->exit_code = -(int32_t)sig;
+    g_current->state = TASK_ZOMBIE;
+    sched_add_zombie(g_current);
+
+    // Wake parent if it's sleeping in sys_wait.
+    task_t* parent = sched_find_pid(g_current->ppid);
+    if (parent && parent->state == TASK_SLEEPING)
+        sched_wake(parent);
+
     sched_yield();
     for (;;) __asm__ volatile("hlt");
 }

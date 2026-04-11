@@ -124,6 +124,8 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->flags            = flags;
     t->state            = TASK_READY;
     t->next             = NULL;
+    t->children         = NULL;
+    t->child_next       = NULL;
     t->mm_shared        = mm;
     t->files_shared     = files;
     t->mlfq_level       = 0;
@@ -295,6 +297,8 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->flags            = 0;
     t->state            = TASK_READY;
     t->next             = NULL;
+    t->children         = NULL;
+    t->child_next       = NULL;
     t->mm_shared        = tmm;
     t->files_shared     = files;
     t->mlfq_level       = 0;
@@ -325,6 +329,11 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     *(--stk) = user_r14;
     *(--stk) = user_r15;
     t->ctx.rsp = (uint64_t)stk;
+
+    // Copy parent's FPU/SSE state so fxrstor on the child doesn't #GP
+    // on invalid MXCSR bits from uninitialized memory.
+    for (int _i = 0; _i < 512; _i++)
+        t->ctx.fxsave_buf[_i] = parent->ctx.fxsave_buf[_i];
 
     return t;
 }

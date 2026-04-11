@@ -473,30 +473,33 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     return new_brk;
 }
 
-// ── sys_exit helpers ──────────────────────────────────────────────────────
-
-typedef struct { uint32_t dead_pid; uint32_t init_pid; } reparent_ctx_t;
-
-static void reparent_cb(task_t* t, void* data) {
-    reparent_ctx_t* ctx = (reparent_ctx_t*)data;
-    if (t->ppid == ctx->dead_pid)
-        t->ppid = ctx->init_pid;
-}
-
 // ── sys_exit ──────────────────────────────────────────────────────────────
-// Reparent all children to PID 1 (init/shell) before zombifying.
-// This matches POSIX: orphaned children are adopted by init, not killed.
-// init is responsible for reaping them (or they accumulate as zombies —
-// acceptable since init in our system is the shell which calls waitpid).
+// Reparent direct children to g_init_task before zombifying.
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
-        // Reparent children: walk every task and point ppid → 1.
-        reparent_ctx_t ctx = { g_current->pid, 1 };
-        sched_for_each(reparent_cb, &ctx);
+        // Move all children to init's children list and update their ppid.
+        task_t* child = g_current->children;
+        while (child) {
+            task_t* next_child = child->child_next;
+            if (g_init_task && g_init_task != g_current) {
+                child->ppid = g_init_task->pid;
+                task_child_add(g_init_task, child);
+            } else {
+                child->ppid = 0;
+                child->child_next = NULL;
+            }
+            child = next_child;
+        }
+        g_current->children = NULL;
 
         g_current->exit_code = (int32_t)(int)code;
         g_current->state = TASK_ZOMBIE;
         sched_add_zombie(g_current);
+
+        // Wake parent if it's sleeping in sys_wait.
+        task_t* parent = sched_find_pid(g_current->ppid);
+        if (parent && parent->state == TASK_SLEEPING)
+            sched_wake(parent);
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
@@ -570,6 +573,7 @@ static uint64_t sys_fork(void) {
                               g_syscall_user_r14,
                               g_syscall_user_r15);
     if (!child) return (uint64_t)-ENOMEM;
+    task_child_add(g_current, child);
     sched_add(child);
     return (uint64_t)child->pid;
 }
@@ -867,6 +871,7 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
         tty->fg_pgid = child->pgid;
     }
 
+    task_child_add(g_current, child);
     sched_add(child);
 
     for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
@@ -963,30 +968,58 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
 
 // ── sys_wait ──────────────────────────────────────────────────────────────
 // waitpid(pid, *status, options):
-//   pid > 0 : wait for that specific child (must be a child of the caller).
-//   pid == -1: wait for any child of the calling process.
+//   pid > 0 : wait for that specific child (must be a direct child).
+//   pid == -1: wait for any direct child.
 //   options & WNOHANG: return 0 immediately if no child ready.
 // Returns reaped child pid, 0 (WNOHANG + not ready), or -errno.
+//
+// Uses the per-task children list instead of a global queue walk.
 static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options) {
     if (!g_current) return (uint64_t)-EINVAL;
 
-    int64_t  signed_pid  = (int64_t)pid_arg;
-    uint32_t my_pid      = g_current->pid;
-    // target_pid: 0 = any child, >0 = specific child
-    uint32_t target_pid  = (signed_pid == -1) ? 0 : (uint32_t)signed_pid;
+    int64_t  signed_pid = (int64_t)pid_arg;
+    uint32_t target_pid = (signed_pid == -1) ? 0 : (uint32_t)signed_pid;
 
     for (;;) {
-        // Try to reap a zombie child.
-        task_t* z = sched_reap_child_zombie(my_pid, target_pid);
-        if (z) {
-            int32_t  code      = z->exit_code;
-            uint32_t child_pid = z->pid;
-            uint32_t child_pgid = z->pgid;
-            process_destroy(z);
+        // No children at all → ECHILD.
+        if (!g_current->children) return (uint64_t)-ECHILD;
 
-            // Job control: if the dead child was the terminal's foreground
-            // process group, hand the terminal back to the waiting parent.
-            // This is what a job-control shell does implicitly after waitpid.
+        // Walk children list looking for a zombie to reap.
+        task_t*  prev        = NULL;
+        task_t*  child       = g_current->children;
+        task_t*  zombie      = NULL;
+        task_t*  zombie_prev = NULL;
+        uint8_t  found_target = 0;
+
+        while (child) {
+            if (target_pid == 0 || child->pid == target_pid) {
+                found_target = 1;
+                if (child->state == TASK_ZOMBIE && !zombie) {
+                    zombie      = child;
+                    zombie_prev = prev;
+                }
+            }
+            prev  = child;
+            child = child->child_next;
+        }
+
+        // Specific pid not in our children list → ECHILD.
+        if (target_pid != 0 && !found_target) return (uint64_t)-ECHILD;
+
+        if (zombie) {
+            // Remove from children list.
+            if (zombie_prev) zombie_prev->child_next = zombie->child_next;
+            else             g_current->children     = zombie->child_next;
+            zombie->child_next = NULL;
+
+            // Also remove from global zombie list.
+            sched_reap_zombie(zombie->pid);
+
+            int32_t  code       = zombie->exit_code;
+            uint32_t child_pid  = zombie->pid;
+            uint32_t child_pgid = zombie->pgid;
+
+            // Job control: return terminal to parent's process group.
             tty_t* tty = tty_get_ctty();
             if (!tty) tty = &g_ttys[0];
             if (tty && tty->fg_pgid == child_pgid)
@@ -996,19 +1029,16 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
                 int* sp = (int*)(uintptr_t)status_ptr;
                 *sp = (int)((code & 0xFF) << 8);
             }
+
+            process_destroy(zombie);
             return (uint64_t)child_pid;
         }
 
-        // No zombie child yet.
+        // No zombie yet.
         if (options & WNOHANG) return 0;
 
-        // Verify the target still exists as our child (otherwise ECHILD).
-        if (target_pid != 0) {
-            task_t* alive = sched_find_pid(target_pid);
-            if (!alive || alive->ppid != my_pid) return (uint64_t)-ECHILD;
-        }
-        // Otherwise yield and try again on the next schedule.
-        sched_yield();
+        // Block until a child exits and wakes us (see sys_exit / signal.c).
+        sched_sleep();
     }
 }
 
@@ -1536,6 +1566,7 @@ static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_
 // Restores the interrupted user context from the sigframe saved on the stack.
 static uint64_t sys_sigreturn(void) {
     uint64_t frame_base = g_current->sigstate.sigframe_rsp;
+
     if (!frame_base) return (uint64_t)-EINVAL;
 
     sigframe_t* frame = (sigframe_t*)frame_base;

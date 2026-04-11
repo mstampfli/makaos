@@ -1,7 +1,10 @@
 #include "idt.h"
 #include "signal.h"
 #include "sched.h"
+#include "tss.h"
 #include "fb.h"
+
+extern tss_t g_tss;
 
 /* Kept as NULL for UEFI boots — legacy symbol referenced by signal.c */
 volatile uint16_t* g_vga = (volatile uint16_t*)0;
@@ -132,8 +135,56 @@ void isr11_seg_np(interrupt_frame_t* f, uint64_t ec)
     { user_signal_or_halt_ec(f, ec, SIGSEGV, "#NP Segment Not Present"); }
 void isr12_stack_fault(interrupt_frame_t* f, uint64_t ec)
     { user_signal_or_halt_ec(f, ec, SIGSEGV, "#SS Stack Fault"); }
-void isr13_gp(interrupt_frame_t* f, uint64_t ec)
-    { user_signal_or_halt_ec(f, ec, SIGSEGV, "#GP General Protection"); }
+void isr13_gp(interrupt_frame_t* f, uint64_t ec) {
+    // Rich GP diagnostics — always dump to serial regardless of user/kernel.
+    serial_puts_idt("\n=== #GP FAULT ===\n");
+    serial_puts_idt("ec=");   serial_hex_idt(ec);
+    serial_puts_idt("RIP=");  serial_hex_idt(f->ip);
+    serial_puts_idt("CS=");   serial_hex_idt(f->cs);
+    serial_puts_idt("FLG=");  serial_hex_idt(f->flags);
+    serial_puts_idt("RSP=");  serial_hex_idt(f->sp);
+    serial_puts_idt("SS=");   serial_hex_idt(f->ss);
+    serial_puts_idt("RSP0="); serial_hex_idt(g_tss.rsp[0]);
+
+    // Error code breakdown: [15:3]=selector index, [2]=TI, [1]=IDT, [0]=EXT
+    if (ec) {
+        serial_puts_idt("ec.idx="); serial_hex_idt((ec >> 3) & 0x1FFF);
+        serial_puts_idt("ec.TI=");  serial_hex_idt((ec >> 2) & 1);
+        serial_puts_idt("ec.IDT="); serial_hex_idt((ec >> 1) & 1);
+        serial_puts_idt("ec.EXT="); serial_hex_idt(ec & 1);
+    }
+
+    // Process info
+    if (g_current) {
+        serial_puts_idt("PID=");  serial_hex_idt(g_current->pid);
+        serial_puts_idt("PPID="); serial_hex_idt(g_current->ppid);
+        serial_puts_idt("KSTK="); serial_hex_idt(g_current->kstack_top);
+        serial_puts_idt("CMD=");
+        serial_puts_idt(g_current->comm);
+        serial_putc_idt('\n');
+    }
+
+    // Dump 8 qwords at the faulting RSP (if accessible)
+    serial_puts_idt("STACK@RSP:\n");
+    uint64_t* stk = (uint64_t*)f->sp;
+    for (int i = 0; i < 8; i++) {
+        serial_hex_idt(stk[i]);
+    }
+    serial_puts_idt("=== END #GP ===\n");
+
+    if (from_user(f)) {
+        signal_send(g_current, SIGSEGV);
+        signal_deliver_pending();
+        return;
+    }
+    // Kernel GP — halt
+    fb_panic_str(0, "#GP General Protection", FB_LRED);
+    fb_panic_str(1, "ec=",  FB_GRAY); fb_panic_hex(1, 3, ec);
+    fb_panic_str(2, "RIP=", FB_GRAY); fb_panic_hex(2, 4, f->ip);
+    fb_panic_str(3, "RSP=", FB_GRAY); fb_panic_hex(3, 4, f->sp);
+    fb_panic_str(4, "SS=",  FB_GRAY); fb_panic_hex(4, 3, f->ss);
+    for (;;) { __asm__ __volatile__("cli; hlt"); }
+}
 // Vector 14: page fault — handled in vmm.c (sends SIGSEGV via kill_current)
 void isr16_x87_fp(interrupt_frame_t* f)
     { user_signal_or_halt_noec(f, SIGFPE,  "#MF x87 FPU FP Error"); }
