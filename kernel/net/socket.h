@@ -20,9 +20,11 @@
 
 // ── Address family / socket type constants ────────────────────────────────
 // Kept POSIX-compatible.
+#define AF_UNIX     1
+#define AF_LOCAL    AF_UNIX
 #define AF_INET     2
-#define SOCK_STREAM 1   // TCP
-#define SOCK_DGRAM  2   // UDP
+#define SOCK_STREAM 1   // TCP (AF_INET) / byte-stream (AF_UNIX)
+#define SOCK_DGRAM  2   // UDP (AF_INET) / datagram (AF_UNIX)
 
 // ── sockaddr_in (IPv4) ────────────────────────────────────────────────────
 typedef struct __attribute__((packed)) {

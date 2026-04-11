@@ -99,6 +99,10 @@
 #define SYS_RECVFD    88  // recvfd(sock_fd)                     → fd or -errno
 #define SYS_REGISTER_POLICY_AGENT 89 // register_policy_agent(rfd,wfd) → 0 or -errno
 
+// ── Shared memory syscalls ───────────────────────────────────────────────
+#define SYS_SHM_OPEN   90  // shm_open(name,namelen,oflags,mode)  → fd or -errno
+#define SYS_SHM_UNLINK 91  // shm_unlink(name,namelen)            → 0 or -errno
+
 // waitpid options
 #define WNOHANG 1
 

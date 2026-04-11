@@ -20,9 +20,11 @@ task_mm_t* task_mm_alloc(phys_addr_t pml4, mm_t* mm) {
 void task_mm_release(task_mm_t* m) {
     if (!m) return;
     if (--m->refs > 0) return;
-    vmm_free_user(m->pml4_phys);
+    // Use VMA-aware free: skip freeing physical frames for shared VMAs
+    // (shmem owns those frames — they're freed when the shmem refcount hits 0).
+    vmm_free_user_ex(m->pml4_phys, m->mm);
     pmm_buddy_free(m->pml4_phys, 0);
-    if (m->mm) mm_destroy(m->mm);
+    if (m->mm) mm_destroy(m->mm);  // also unrefs shmem objects in each VMA
     kfree(m);
 }
 
@@ -262,7 +264,8 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     phys_addr_t new_pml4 = vmm_alloc_pml4();
     if (new_pml4 == PMM_INVALID_ADDR) { kfree(t); return NULL; }
 
-    if (!vmm_clone_user(new_pml4, parent->mm_shared->pml4_phys)) {
+    if (!vmm_clone_user_ex(new_pml4, parent->mm_shared->pml4_phys,
+                           parent->mm_shared->mm)) {
         vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
         return NULL;
     }

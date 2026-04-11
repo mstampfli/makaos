@@ -1,4 +1,5 @@
 #include "mm.h"
+#include "shmem.h"
 #include "kheap.h"
 #include "vmm.h"
 #include "common.h"
@@ -60,10 +61,12 @@ uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags)
 
     vma_t* vma = kmalloc(sizeof(vma_t));
     if (!vma) return 0;
-    vma->start = start;
-    vma->end   = end;
-    vma->flags = flags;
-    vma->next  = NULL;
+    vma->start      = start;
+    vma->end        = end;
+    vma->flags      = flags;
+    vma->next       = NULL;
+    vma->shmem      = NULL;
+    vma->shmem_pgoff = 0;
 
     // Insert sorted by start address.
     if (!mm->vmas || start < mm->vmas->start) {
@@ -97,6 +100,7 @@ void mm_destroy(mm_t* mm) {
     vma_t* v = mm->vmas;
     while (v) {
         vma_t* next = v->next;
+        if (v->shmem) shmem_unref(v->shmem);
         kfree(v);
         v = next;
     }
@@ -114,11 +118,20 @@ mm_t* mm_clone(const mm_t* src) {
     dst->brk       = src->brk;
     dst->mmap_base = src->mmap_base;
     dst->refcount  = 1;
-    // Copy each VMA.
+    // Copy each VMA.  Shared VMAs get the same shmem_t (bump refcount).
     for (vma_t* v = src->vmas; v; v = v->next) {
         if (!mm_vma_add(dst, v->start, v->end, v->flags)) {
             mm_destroy(dst);
             return NULL;
+        }
+        if (v->shmem) {
+            // Find the just-added VMA in dst (it's the one at the same address).
+            vma_t* dv = mm_vma_find(dst, v->start);
+            if (dv) {
+                dv->shmem       = v->shmem;
+                dv->shmem_pgoff = v->shmem_pgoff;
+                shmem_ref(v->shmem);
+            }
         }
     }
     return dst;
@@ -145,6 +158,7 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
         if (v->start >= start && v->end <= end) {
             // Case 1: entirely covered — remove.
             *pp = v->next;
+            if (v->shmem) shmem_unref(v->shmem);
             kfree(v);
             continue;
         }
@@ -152,12 +166,17 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
             // Case 4: split — create a new right fragment.
             vma_t* right = kmalloc(sizeof(vma_t));
             if (!right) { pp = &v->next; continue; }
-            right->start = end;
-            right->end   = v->end;
-            right->flags = v->flags;
-            right->next  = v->next;
-            v->end       = start;
-            v->next      = right;
+            right->start      = end;
+            right->end        = v->end;
+            right->flags      = v->flags;
+            right->next       = v->next;
+            right->shmem      = v->shmem;
+            right->shmem_pgoff = v->shmem_pgoff +
+                (uint32_t)((end - v->start) / PAGE_SIZE);
+            // Both halves reference the same shmem — bump refcount for the new one.
+            if (right->shmem) shmem_ref(right->shmem);
+            v->end  = start;
+            v->next = right;
             pp = &right->next;
             continue;
         }

@@ -6,6 +6,7 @@
 #include "signal.h"
 #include "process.h"
 #include "mm.h"
+#include "shmem.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -18,6 +19,7 @@
 #include "evdev.h"
 #include "proc.h"
 #include "net/socket.h"
+#include "net/unix_sock.h"
 #include "net/net.h"
 #include "cred.h"
 #include "rights.h"
@@ -1584,22 +1586,31 @@ static uint64_t sys_sigreturn(void) {
 
 // ── sys_mmap ──────────────────────────────────────────────────────────────
 // mmap(addr, len, prot, flags, fd, off) → mapped address or -errno.
-// Only anonymous private mappings are supported (MAP_ANONYMOUS | MAP_PRIVATE).
-// fd must be -1 for anonymous mappings.  MAP_FIXED is supported.
+// Supports MAP_PRIVATE | MAP_ANONYMOUS, MAP_SHARED | MAP_ANONYMOUS,
+// and MAP_SHARED with fd (shmem fd from shm_open).  MAP_FIXED is supported.
 static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t off) {
-    (void)off;
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
     if (!len) return (uint64_t)-EINVAL;
 
-    // Only anonymous mappings for now.
-    if (!(flags & MAP_ANONYMOUS)) return (uint64_t)-ENOSYS;
-    if ((int64_t)fd != -1)        return (uint64_t)-ENOSYS;
+    int is_anon   = !!(flags & MAP_ANONYMOUS);
+    int is_shared = !!(flags & MAP_SHARED);
+    int has_fd    = ((int64_t)fd != -1);
+
+    // Validate flag combinations.
+    // MAP_SHARED | MAP_ANONYMOUS → anonymous shared (for fork-inherited shm)
+    // MAP_SHARED with fd         → named shmem (shm_open fd)
+    // MAP_PRIVATE | MAP_ANONYMOUS → private anonymous (existing behavior)
+    // MAP_PRIVATE with fd        → not supported yet (file-backed mmap)
+    if (!is_anon && !has_fd) return (uint64_t)-EINVAL;
+    if (!is_shared && has_fd) return (uint64_t)-ENOSYS; // MAP_PRIVATE + fd: TODO
+    if (is_anon && has_fd) return (uint64_t)-EINVAL;    // anon + fd: nonsensical
 
     mm_t* mm = g_current->mm_shared->mm;
 
     // Round len up to page boundary.
     len = (len + PAGE_MASK) & ~PAGE_MASK;
+    uint32_t npages = (uint32_t)(len / PAGE_SIZE);
 
     virt_addr_t vaddr;
     if (flags & MAP_FIXED) {
@@ -1608,15 +1619,17 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
         for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
             phys_addr_t frame;
-            if (vmm_page_unmap(pml4, p, &frame))
-                pmm_buddy_free(frame, 0);
+            if (vmm_page_unmap(pml4, p, &frame)) {
+                // Only free the frame if the VMA at this address is private.
+                vma_t* old_vma = mm_vma_find(mm, p);
+                if (!old_vma || !old_vma->shmem)
+                    pmm_buddy_free(frame, 0);
+            }
         }
         mm_vma_remove(mm, addr, addr + len);
         vaddr = addr;
     } else if (addr) {
-        // Use addr as a hint: if not free, find a free region anyway.
         addr &= ~PAGE_MASK;
-        // Check if the hint region is free.
         uint8_t free_hint = 1;
         for (vma_t* v = mm->vmas; v; v = v->next) {
             if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
@@ -1633,14 +1646,65 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (prot & PROT_READ)  vma_flags |= VMA_R;
     if (prot & PROT_WRITE) vma_flags |= VMA_W;
     if (prot & PROT_EXEC)  vma_flags |= VMA_X;
-    // At minimum allow read so the page-fault handler can map the page.
-    if (!vma_flags) vma_flags = VMA_ANON; // PROT_NONE: still need VMA entry
+    if (is_shared) vma_flags |= VMA_SHARED;
 
     if (!mm_vma_add(mm, vaddr, vaddr + len, vma_flags))
         return (uint64_t)-ENOMEM;
 
+    // ── Attach shmem backing ─────────────────────────────────────────────
+    if (is_shared) {
+        shmem_t* shm = NULL;
+
+        if (has_fd) {
+            // MAP_SHARED with fd: the fd must be a shmem fd.
+            if (fd >= g_current->files_shared->fd_capacity)
+                goto fail_unmap;
+            vfs_file_t* f = g_current->files_shared->fd_table[fd];
+            if (!f) goto fail_unmap;
+            // Identify shmem fds by checking for the shmem_close callback.
+            // (set when shm_open creates the fd — see shmem fd implementation)
+            extern void shmem_fd_close(vfs_file_t*);
+            if (f->close != shmem_fd_close) {
+                // Not a shmem fd.
+                goto fail_unmap;
+            }
+            shm = (shmem_t*)f->ctx;
+            if (!shm) goto fail_unmap;
+
+            // Validate offset and size.
+            uint32_t pg_off = (uint32_t)(off / PAGE_SIZE);
+            if (pg_off + npages > shm->npages) goto fail_unmap;
+
+            shmem_ref(shm);
+
+            vma_t* vma = mm_vma_find(mm, vaddr);
+            if (vma) {
+                vma->shmem       = shm;
+                vma->shmem_pgoff = pg_off;
+            }
+        } else {
+            // MAP_SHARED | MAP_ANONYMOUS: create a new anonymous shmem.
+            shm = shmem_create(npages,
+                               g_current->cred.euid,
+                               g_current->cred.egid,
+                               0600);
+            if (!shm) goto fail_unmap;
+
+            vma_t* vma = mm_vma_find(mm, vaddr);
+            if (vma) {
+                vma->shmem       = shm;
+                vma->shmem_pgoff = 0;
+            }
+            // shm starts with refcount=1 (owned by this VMA)
+        }
+    }
+
     // Pages are demand-paged — do not allocate physical frames here.
     return vaddr;
+
+fail_unmap:
+    mm_vma_remove(mm, vaddr, vaddr + len);
+    return (uint64_t)-EINVAL;
 }
 
 // ── sys_munmap ────────────────────────────────────────────────────────────
@@ -1653,15 +1717,159 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
     mm_t* mm = g_current->mm_shared->mm;
 
-    // Unmap physical pages and free frames.
+    // Unmap physical pages.  Only free frames for private VMAs —
+    // shared frames are owned by the shmem_t and freed when its
+    // refcount drops to zero.
     for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
+        vma_t* vma = mm_vma_find(mm, p);
         phys_addr_t frame;
-        if (vmm_page_unmap(pml4, p, &frame))
-            pmm_buddy_free(frame, 0);
+        if (vmm_page_unmap(pml4, p, &frame)) {
+            if (!vma || !vma->shmem)
+                pmm_buddy_free(frame, 0);
+            // Shared frames: just unmap the PTE, don't free the physical page.
+        }
     }
 
-    // Remove VMA descriptors covering the range.
+    // Remove VMA descriptors covering the range (this also unrefs shmem).
     mm_vma_remove(mm, addr, addr + len);
+    return 0;
+}
+
+// ── sys_shm_open ─────────────────────────────────────────────────────────
+// shm_open(name, namelen, oflags, mode) → fd or -errno
+//
+// POSIX shared memory: opens (or creates) a named shmem object and returns
+// a file descriptor suitable for mmap() and ftruncate().
+//
+// oflags: O_CREAT, O_EXCL, O_RDONLY/O_WRONLY/O_RDWR, O_TRUNC.
+// mode: permission bits (only used when creating, masked by umask).
+// Name must start with '/' and contain no further slashes (POSIX requirement).
+static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
+                              uint64_t oflags, uint64_t mode) {
+    if (!g_current || !name_ptr) return (uint64_t)-EINVAL;
+    if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
+
+    // Copy name from userspace.
+    char name[SHMEM_NAME_MAX + 1];
+    const char* uname = (const char*)name_ptr;
+    for (uint64_t i = 0; i < namelen; i++) name[i] = uname[i];
+    name[namelen] = '\0';
+
+    // POSIX: name must start with '/' and contain no embedded slashes.
+    if (name[0] != '/') return (uint64_t)-EINVAL;
+    for (uint64_t i = 1; i < namelen; i++)
+        if (name[i] == '/') return (uint64_t)-EINVAL;
+
+    // Use the part after the leading '/' as the internal name.
+    const char* iname = name + 1;
+    if (!iname[0]) return (uint64_t)-EINVAL; // name was just "/"
+
+    int access_mode = (int)(oflags & 3); // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    int creating    = !!(oflags & O_CREAT);
+    int exclusive   = !!(oflags & O_EXCL);
+    int truncating  = !!(oflags & O_TRUNC);
+
+    shmem_t* shm = shmem_ns_find(iname);
+
+    if (shm) {
+        // Object already exists.
+        if (creating && exclusive) return (uint64_t)-EEXIST;
+
+        // Permission check.
+        int rc = shmem_check_access(shm, &g_current->cred, access_mode);
+        if (rc) return (uint64_t)rc;
+
+        // O_TRUNC: resize to 0 (only if writable).
+        if (truncating && (access_mode == 1 || access_mode == 2))
+            shmem_resize(shm, 0);
+    } else {
+        // Object does not exist.
+        if (!creating) return (uint64_t)-ENOENT;
+
+        // Apply umask to mode.
+        uint16_t effective_mode = (uint16_t)(mode & ~g_current->umask & 0777);
+
+        // Create a zero-size object (caller uses ftruncate to set size).
+        shm = shmem_create(0, g_current->cred.euid, g_current->cred.egid,
+                           effective_mode);
+        if (!shm) return (uint64_t)-ENOMEM;
+
+        // Copy name into the object.
+        uint64_t ilen = 0;
+        while (iname[ilen] && ilen < SHMEM_NAME_MAX) {
+            shm->name[ilen] = iname[ilen];
+            ilen++;
+        }
+        shm->name[ilen] = '\0';
+
+        // Insert into namespace.  On failure, the object is orphaned — free it.
+        int rc = shmem_ns_insert(shm);
+        if (rc) {
+            shmem_unref(shm);
+            return (uint64_t)rc;
+        }
+    }
+
+    // Create the fd wrapping this shmem object.
+    vfs_file_t* f = shmem_fd_create(shm);
+    if (!f) return (uint64_t)-ENOMEM;
+
+    // Allocate an fd slot.
+    task_files_t* files = g_current->files_shared;
+    for (uint32_t i = 0; i < files->fd_capacity; i++) {
+        if (!files->fd_table[i]) {
+            files->fd_table[i] = f;
+            files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+            return i;
+        }
+    }
+    // Table full — try to grow.
+    if (fd_table_grow(files)) {
+        for (uint32_t i = 0; i < files->fd_capacity; i++) {
+            if (!files->fd_table[i]) {
+                files->fd_table[i] = f;
+                files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+                return i;
+            }
+        }
+    }
+    vfs_close(f);
+    return (uint64_t)-EMFILE;
+}
+
+// ── sys_shm_unlink ───────────────────────────────────────────────────────
+// shm_unlink(name, namelen) → 0 or -errno
+//
+// Remove a named shmem object from the namespace.  The object and its
+// pages persist until all fds and mmap references are dropped.
+static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
+    if (!g_current || !name_ptr) return (uint64_t)-EINVAL;
+    if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
+
+    char name[SHMEM_NAME_MAX + 1];
+    const char* uname = (const char*)name_ptr;
+    for (uint64_t i = 0; i < namelen; i++) name[i] = uname[i];
+    name[namelen] = '\0';
+
+    if (name[0] != '/') return (uint64_t)-EINVAL;
+    const char* iname = name + 1;
+    if (!iname[0]) return (uint64_t)-EINVAL;
+
+    shmem_t* shm = shmem_ns_find(iname);
+    if (!shm) return (uint64_t)-ENOENT;
+
+    // Permission check: only owner or root can unlink.
+    if (g_current->cred.euid != 0 && g_current->cred.euid != shm->uid)
+        return (uint64_t)-EACCES;
+
+    // Remove from namespace (makes it invisible for future shm_open calls).
+    // The shmem_t itself survives if there are still fd/VMA references.
+    shmem_ns_remove(shm);
+    shm->name[0] = '\0'; // prevent double-remove in shmem_unref
+
+    // Drop the namespace's implicit reference.  If there are no fd/VMA
+    // references, this will free the object immediately.
+    shmem_unref(shm);
     return 0;
 }
 
@@ -1794,21 +2002,42 @@ static vfs_file_t* fd_to_file(uint64_t fd) {
 // socket(domain, type, proto) → fd or -errno
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
     (void)proto;
-    if (!net_ready()) return (uint64_t)-ENETDOWN;
-    vfs_file_t* f = socket_open((int)domain, (int)type);
+    vfs_file_t* f;
+
+    if (domain == AF_UNIX) {
+        f = unix_sock_open((int)type);
+    } else if (domain == AF_INET) {
+        if (!net_ready()) return (uint64_t)-ENETDOWN;
+        f = socket_open((int)domain, (int)type);
+    } else {
+        return (uint64_t)-EAFNOSUPPORT;
+    }
+
     if (!f) return (uint64_t)-ENOMEM;
     int64_t fd = fd_install(f);
     return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
 }
 
-// bind(fd, sockaddr_in*, addrlen) → 0 or -errno
+// Helper: is this vfs_file_t a unix socket?
+static inline int is_unix_sock(vfs_file_t* f) {
+    return f && f->close == unix_sock_close;
+}
+
+// bind(fd, sockaddr*, addrlen) → 0 or -errno
 static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
+    if (!addr_ptr) return (uint64_t)-EINVAL;
+
+    if (is_unix_sock(f)) {
+        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
+        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
+        return (uint64_t)(int64_t)unix_sock_bind(f, sa->sun_path);
+    }
+
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     if (!sa) return (uint64_t)-EINVAL;
-    // Port is in network byte order in sockaddr_in; convert to host order.
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     int r = socket_bind(f, port);
     return (r == 0) ? 0 : (uint64_t)-EINVAL;
@@ -1816,44 +2045,74 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
 
 // listen(fd, backlog) → 0 or -errno
 static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
-    (void)backlog;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
+
+    if (is_unix_sock(f))
+        return (uint64_t)(int64_t)unix_sock_listen(f, (int)backlog);
+
+    (void)backlog;
     int r = socket_listen(f);
     return (r == 0) ? 0 : (uint64_t)-EINVAL;
 }
 
-// accept(fd, sockaddr_in*, addrlen*) → new fd or -errno
+// accept(fd, sockaddr*, addrlen*) → new fd or -errno
 static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)addrlen_ptr;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
-    sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;  // may be NULL
+
+    if (is_unix_sock(f)) {
+        vfs_file_t* cf = unix_sock_accept(f);
+        if (!cf) return (uint64_t)-ECONNABORTED;
+        int64_t nfd = fd_install(cf);
+        return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+    }
+
+    sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
     vfs_file_t* cf = socket_accept(f, peer);
     if (!cf) return (uint64_t)-ECONNABORTED;
     int64_t nfd = fd_install(cf);
     return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
 }
 
-// connect(fd, sockaddr_in*, addrlen) → 0 or -errno
+// connect(fd, sockaddr*, addrlen) → 0 or -errno
 static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
+    if (!addr_ptr) return (uint64_t)-EINVAL;
+
+    if (is_unix_sock(f)) {
+        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
+        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
+        return (uint64_t)(int64_t)unix_sock_connect(f, sa->sun_path);
+    }
+
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
-    if (!sa) return (uint64_t)-EINVAL;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     int r = socket_connect(f, sa->sin_addr, port);
     return (r == 0) ? 0 : (uint64_t)-ECONNREFUSED;
 }
 
 // sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
-// For TCP sockets addr may be NULL.
 static uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                              uint64_t flags, uint64_t addr_ptr, uint64_t addrlen) {
     (void)flags; (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
     if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+
+    if (is_unix_sock(f)) {
+        if (addr_ptr) {
+            const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
+            int r = unix_sock_sendto(f, (const void*)buf_ptr, (uint32_t)len,
+                                      sa->sun_path);
+            return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+        }
+        int r = unix_sock_send(f, (const void*)buf_ptr, (uint32_t)len);
+        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+    }
+
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -1872,11 +2131,16 @@ static uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     (void)flags; (void)addrlen_ptr;
     vfs_file_t* f = fd_to_file(fd);
     if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
-    sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;  // may be NULL
+
+    if (is_unix_sock(f)) {
+        int r = unix_sock_recv(f, (void*)buf_ptr, (uint32_t)len);
+        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+    }
+
+    sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
         r = socket_recvfrom(f, (void*)buf_ptr, (uint32_t)len, sa);
-        // Convert port back to network byte order in the returned addr.
         if (r >= 0 && sa)
             sa->sin_port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     } else {
@@ -1896,6 +2160,10 @@ static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
 static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
+
+    if (is_unix_sock(f))
+        return (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
+
     int r = socket_shutdown(f, (int)how);
     return (r == 0) ? 0 : (uint64_t)-EINVAL;
 }
@@ -2258,23 +2526,19 @@ static uint64_t sys_restrict_fd(uint64_t fd, uint64_t rights_mask) {
 
 // ── sys_sendfd ────────────────────────────────────────────────────────────
 // sendfd(sock_fd, target_fd, new_rights) → 0 or -errno
-// Transfers target_fd over the Unix socket sock_fd with at most `new_rights`
-// (which must be a subset of target_fd's current rights).
+// Transfers target_fd over the Unix socket sock_fd via SCM_RIGHTS.
+// new_rights must be a subset of target_fd's current rights (attenuation).
 // The receiving side calls sys_recvfd to get a new fd stamped with new_rights.
-//
-// Implementation note: real SCM_RIGHTS would go through the socket layer.
-// For now we implement a simplified kernel-mediated transfer via a pending
-// slot on the target task (looked up by socket peer pid).  Full SCM_RIGHTS
-// integration with the net/socket layer is the production path.
 static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
                             uint64_t new_rights) {
     if (!g_current) return (uint64_t)-EBADF;
     task_files_t* files = g_current->files_shared;
 
-    // Validate sock_fd.
+    // Validate sock_fd — must be a connected unix socket.
     if (sock_fd >= files->fd_capacity || !files->fd_table[sock_fd])
         return (uint64_t)-EBADF;
     vfs_file_t* sock = files->fd_table[sock_fd];
+    if (!is_unix_sock(sock)) return (uint64_t)-ENOTSOCK;
     if (!rights_check(sock->rights, RIGHT_SEND_FD))
         return (uint64_t)-EPERM;
 
@@ -2283,29 +2547,31 @@ static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
         return (uint64_t)-EBADF;
     vfs_file_t* target_f = files->fd_table[target_fd_num];
 
-    // new_rights must be a subset of target_fd's rights.
-    if (!rights_check(target_f->rights, (uint32_t)new_rights &
-                       target_f->rights))
-        return (uint64_t)-EPERM;
+    // new_rights must be a subset of target_fd's current rights.
     if (((uint32_t)new_rights & ~target_f->rights) != 0)
         return (uint64_t)-EPERM;
 
-    // Stamp the attenuated rights on the dup'd description.
-    // The actual transfer to the peer process is handled by the socket layer
-    // which reads this from the pending ancillary data queue.
-    // For correctness we stamp new_rights on a dup and attach to sock ctx.
-    // This requires socket layer cooperation — stubbed here with ENOSYS
-    // until the socket layer exposes an ancdata API.
-    // The rights subset enforcement is in place; the wire transfer is the
-    // only missing piece.
-    (void)sock;
-    return (uint64_t)-ENOSYS;   // wire transfer: needs socket ancdata support
+    int r = unix_sock_sendfd(sock, target_f, (uint32_t)new_rights);
+    return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
-// sys_recvfd — symmetric; stubbed same reason.
+// ── sys_recvfd ───────────────────────────────────────────────────────────
+// recvfd(sock_fd) → new fd or -errno
+// Dequeues a file descriptor sent via sendfd() over a Unix socket.
 static uint64_t sys_recvfd(uint64_t sock_fd) {
-    (void)sock_fd;
-    return (uint64_t)-ENOSYS;
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* files = g_current->files_shared;
+
+    if (sock_fd >= files->fd_capacity || !files->fd_table[sock_fd])
+        return (uint64_t)-EBADF;
+    vfs_file_t* sock = files->fd_table[sock_fd];
+    if (!is_unix_sock(sock)) return (uint64_t)-ENOTSOCK;
+
+    vfs_file_t* received = unix_sock_recvfd(sock);
+    if (!received) return (uint64_t)-EAGAIN;
+
+    int64_t fd = fd_install(received);
+    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
 }
 
 // ── sys_register_policy_agent ─────────────────────────────────────────────
@@ -2722,6 +2988,18 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length) {
     if (fd >= files->fd_capacity || !files->fd_table[fd])
         return (uint64_t)-EBADF;
     vfs_file_t* f = files->fd_table[fd];
+
+    // shmem fd: resize the shmem object.
+    extern void shmem_fd_close(vfs_file_t*);
+    if (f->close == shmem_fd_close) {
+        shmem_t* shm = (shmem_t*)f->ctx;
+        if (!shm) return (uint64_t)-EINVAL;
+        uint32_t npages = (uint32_t)((length + PAGE_SIZE - 1) / PAGE_SIZE);
+        int rc = shmem_resize(shm, npages);
+        return (rc < 0) ? (uint64_t)rc : 0;
+    }
+
+    // Regular file.
     if (!f->path[0]) return (uint64_t)-EINVAL; // pipes/devices can't be truncated
     if (!ext2_truncate_to(f->path, length)) return (uint64_t)-EIO;
     return 0;
@@ -2898,6 +3176,10 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_RECVFD:     ret = sys_recvfd(arg1);                         break;
         case SYS_REGISTER_POLICY_AGENT:
                              ret = sys_register_policy_agent(arg1, arg2);    break;
+
+        // ── Shared memory ─────────────────────────────────────────────────
+        case SYS_SHM_OPEN:   ret = sys_shm_open(arg1, arg2, arg3, arg4);    break;
+        case SYS_SHM_UNLINK: ret = sys_shm_unlink(arg1, arg2);              break;
 
         default:               ret = (uint64_t)-ENOSYS;                         break;
     }

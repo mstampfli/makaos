@@ -3,10 +3,11 @@
 #include "vmm.h"
 
 // ── VMA flags (protection bits) ───────────────────────────────────────────
-#define VMA_R    (1U << 0)   // readable
-#define VMA_W    (1U << 1)   // writable
-#define VMA_X    (1U << 2)   // executable
-#define VMA_ANON (1U << 3)   // anonymous (backed by zero pages)
+#define VMA_R      (1U << 0)   // readable
+#define VMA_W      (1U << 1)   // writable
+#define VMA_X      (1U << 2)   // executable
+#define VMA_ANON   (1U << 3)   // anonymous (backed by zero pages)
+#define VMA_SHARED (1U << 4)   // shared mapping (backed by shmem_t)
 // W^X enforced: kernel refuses to create a VMA with both VMA_W and VMA_X.
 
 // ── Virtual Memory Area ───────────────────────────────────────────────────
@@ -14,11 +15,20 @@
 // Backed by physical frames allocated on demand (first access triggers #PF).
 //
 // Linux equivalent: struct vm_area_struct
+struct shmem;  // forward declaration — defined in shmem.h
+
 typedef struct vma_t {
     virt_addr_t     start;      // inclusive, page-aligned
     virt_addr_t     end;        // exclusive, page-aligned  (end - start = region size)
-    uint32_t        flags;      // VMA_R | VMA_W | VMA_X | VMA_ANON
+    uint32_t        flags;      // VMA_R | VMA_W | VMA_X | VMA_ANON | VMA_SHARED
     struct vma_t*   next;       // intrusive singly-linked list, sorted by start
+
+    // Shared memory backing (NULL for private anonymous VMAs).
+    // When non-NULL, physical pages come from the shmem object rather than
+    // being privately allocated.  Multiple VMAs (across processes) can point
+    // to the same shmem_t.  The shmem's refcount tracks all references.
+    struct shmem*   shmem;      // backing shared memory object
+    uint32_t        shmem_pgoff;// page offset into the shmem object
 } vma_t;
 
 // ── Memory descriptor ─────────────────────────────────────────────────────
@@ -26,7 +36,7 @@ typedef struct vma_t {
 // Kernel threads have mm == NULL.
 //
 // Linux equivalent: struct mm_struct
-typedef struct {
+typedef struct mm_t {
     vma_t*      vmas;           // sorted linked list of VMAs
     virt_addr_t brk_start;      // base of the heap region (fixed at create time)
     virt_addr_t brk;            // current heap top (grows up via sys_brk)
