@@ -138,9 +138,18 @@ syscall_entry:
     mov r14, [rel g_syscall_user_r14]
     mov r15, [rel g_syscall_user_r15]
 .no_signal:
-    ; 11. Disable interrupts before sysretq (mandatory).
+    ; 11. Disable interrupts before return to user (mandatory).
     cli
 
-    ; 12. Return to user space.
-    ;     o64 sysret = sysretq: RIP←rcx, RFLAGS←r11, CS←USER_CS, SS←USER_SS
-    o64 sysret
+    ; 12. Return to user space via iretq (sysretq has a KVM bug where
+    ;     SS doesn't get RPL=3 OR'd in, giving SS=0x20 instead of 0x23).
+    mov r10, rsp            ; save user RSP in r10
+    mov rsp, [rel g_tss + 4] ; switch to kstack top (TSS.RSP0)
+
+    push qword 0x23         ; SS = user data64 with RPL=3
+    push r10                 ; RSP = saved user RSP
+    push r11                 ; RFLAGS = user RFLAGS
+    push qword 0x2B          ; CS = user code64 with RPL=3
+    push rcx                 ; RIP = user RIP
+
+    iretq
