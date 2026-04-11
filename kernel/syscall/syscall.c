@@ -1082,6 +1082,38 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     }
     kfree(raw);
 
+    // Normalize: resolve ".", "..", "//", trailing "/" so virtual mount
+    // matching and root-injection checks see clean paths.
+    {
+        char* tmp = kmalloc(512);
+        if (tmp) {
+            uint64_t pi = 0;
+            while (path[pi]) { tmp[pi] = path[pi]; pi++; }
+            tmp[pi] = '\0';
+            char* dst = path;
+            const char* src = tmp + 1; // skip leading '/'
+            int offs[128], depth = 0;
+            *dst++ = '/';
+            while (*src) {
+                if (*src == '/') { src++; continue; }
+                int len = 0;
+                while (src[len] && src[len] != '/') len++;
+                if (len == 1 && src[0] == '.') { src += len; continue; }
+                if (len == 2 && src[0] == '.' && src[1] == '.') {
+                    if (depth > 0) { depth--; dst = path + offs[depth]; }
+                    src += len; continue;
+                }
+                if (depth < 128) offs[depth++] = (int)(dst - path);
+                for (int i = 0; i < len; i++) *dst++ = src[i];
+                *dst++ = '/';
+                src += len;
+            }
+            if (dst > path + 1 && dst[-1] == '/') dst--;
+            *dst = '\0';
+            kfree(tmp);
+        }
+    }
+
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) { kfree(path); return (uint64_t)-ENOMEM; }
 
