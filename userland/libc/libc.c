@@ -936,6 +936,80 @@ int munmap(void* addr, size_t len) {
         syscall2(SYS_MUNMAP, (uint64_t)addr, (uint64_t)len));
 }
 
+// ── POSIX shared memory ─────────────────────────────────────────────────
+
+int shm_open(const char* name, int oflag, int mode) {
+    size_t len = 0;
+    while (name[len]) len++;
+    long ret = (long)syscall4(SYS_SHM_OPEN, (uint64_t)name, (uint64_t)len,
+                               (uint64_t)oflag, (uint64_t)mode);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int shm_unlink(const char* name) {
+    size_t len = 0;
+    while (name[len]) len++;
+    return (int)(long)__syscall_ret(
+        syscall2(SYS_SHM_UNLINK, (uint64_t)name, (uint64_t)len));
+}
+
+// ── BSD Sockets ──────────────────────────────────────────────────────────
+
+int socket(int domain, int type, int protocol) {
+    return (int)(long)__syscall_ret(
+        syscall3(SYS_SOCKET, (uint64_t)domain, (uint64_t)type, (uint64_t)protocol));
+}
+
+int bind(int fd, const struct sockaddr* addr, socklen_t addrlen) {
+    return (int)(long)__syscall_ret(
+        syscall3(SYS_BIND, (uint64_t)fd, (uint64_t)addr, (uint64_t)addrlen));
+}
+
+int listen(int fd, int backlog) {
+    return (int)(long)__syscall_ret(
+        syscall2(SYS_LISTEN, (uint64_t)fd, (uint64_t)backlog));
+}
+
+int accept(int fd, struct sockaddr* addr, socklen_t* addrlen) {
+    return (int)(long)__syscall_ret(
+        syscall3(SYS_ACCEPT, (uint64_t)fd, (uint64_t)addr, (uint64_t)addrlen));
+}
+
+int connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
+    return (int)(long)__syscall_ret(
+        syscall3(SYS_CONNECT, (uint64_t)fd, (uint64_t)addr, (uint64_t)addrlen));
+}
+
+ssize_t send(int fd, const void* buf, size_t len, int flags) {
+    return (ssize_t)__syscall_ret(
+        syscall4(SYS_SENDTO, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags));
+}
+
+ssize_t recv(int fd, void* buf, size_t len, int flags) {
+    return (ssize_t)__syscall_ret(
+        syscall4(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags));
+}
+
+int shutdown(int fd, int how) {
+    return (int)(long)__syscall_ret(
+        syscall2(SYS_SHUTDOWN, (uint64_t)fd, (uint64_t)how));
+}
+
+int sendfd(int sock_fd, int target_fd, unsigned int rights) {
+    return (int)(long)__syscall_ret(
+        syscall3(SYS_SENDFD, (uint64_t)sock_fd, (uint64_t)target_fd,
+                  (uint64_t)rights));
+}
+
+int recvfd(int sock_fd) {
+    long ret = (long)syscall1(SYS_RECVFD, (uint64_t)sock_fd);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
 // ── strtoul ───────────────────────────────────────────────────────────────
 unsigned long strtoul(const char* s, char** endptr, int base) {
     while (*s == ' ' || *s == '\t') s++;

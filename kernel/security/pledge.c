@@ -133,6 +133,11 @@ uint32_t pledge_group_for_syscall(uint64_t nr) {
     // ── PLEDGE_KSEC ───────────────────────────────────────────────────────
     // SYS_REGISTER_POLICY_AGENT handled in handler.
 
+    // ── PLEDGE_SHM ────────────────────────────────────────────────────────
+    case SYS_SHM_OPEN:
+    case SYS_SHM_UNLINK:
+        return PLEDGE_SHM;
+
     // ── FB / graphics — no pledge group yet (always allowed if fd open) ──
     case SYS_FB_BLIT:
     case SYS_FB_INFO:

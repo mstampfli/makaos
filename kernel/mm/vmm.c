@@ -2,6 +2,7 @@
 #include "pmm.h"
 #include "idt.h"
 #include "mm.h"
+#include "shmem.h"
 
 // Physical address of the kernel's own PML4.
 // Set by vmm_init(); used by vmm_alloc_pml4() to clone kernel entries.
@@ -212,7 +213,12 @@ void vmm_switch(phys_addr_t pml4_phys) {
 // Walks PML4[0..255] → frees every PDPT, PD, PT frame it finds.
 // Does NOT free the physical pages the process had mapped (its data/code/stack).
 // Does NOT free the PML4 frame itself — caller does that.
-void vmm_free_user(phys_addr_t pml4_phys) {
+// Free all user-space page table structures and leaf frames.
+// For shared VMAs (backed by shmem_t), leaf frames are NOT freed here —
+// they are owned by the shmem object and freed when its refcount hits 0.
+// If mm is NULL, ALL leaf frames are freed (legacy behavior for error paths
+// where no shmem could have been attached).
+void vmm_free_user_ex(phys_addr_t pml4_phys, mm_t* mm) {
     uint64_t* pml4 = (uint64_t*)(pml4_phys + HHDM_OFFSET);
 
     for (int i = 0; i < 256; i++) {
@@ -229,31 +235,51 @@ void vmm_free_user(phys_addr_t pml4_phys) {
 
                 for (int l = 0; l < 512; l++) {
                     if (!(pt[l] & PAGE_PRESENT)) continue;
-                    pmm_buddy_free(pt[l] & PAGE_ADDR_MASK, 0); // free leaf frame
+                    phys_addr_t leaf = pt[l] & PAGE_ADDR_MASK;
+
+                    // Reconstruct the virtual address to look up the VMA.
+                    virt_addr_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30)
+                                   | ((uint64_t)k << 21) | ((uint64_t)l << 12);
+
+                    int is_shared = 0;
+                    if (mm) {
+                        vma_t* vma = mm_vma_find(mm, va);
+                        if (vma && vma->shmem) is_shared = 1;
+                    }
+
+                    if (!is_shared)
+                        pmm_buddy_free(leaf, 0);
                 }
                 pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0);     // free PT frame
             }
             pmm_buddy_free(pdpt[j] & PAGE_ADDR_MASK, 0);       // free PD frame
         }
-        pmm_buddy_free(pml4[i] & PAGE_ADDR_MASK, 0);       // free PDPT frame
+        pmm_buddy_free(pml4[i] & PAGE_ADDR_MASK, 0);           // free PDPT frame
     }
     // Caller frees the PML4 frame itself
 }
 
+// Legacy wrapper: frees all leaf frames unconditionally.
+// Safe for error-cleanup paths where no shmem could exist.
+void vmm_free_user(phys_addr_t pml4_phys) {
+    vmm_free_user_ex(pml4_phys, NULL);
+}
+
 // ── vmm_clone_user ────────────────────────────────────────────────────────
-// Deep-copy all user (lower half) page table entries from src to dst PML4.
-// For each present leaf PTE: allocate a new frame, memcpy 4096 bytes via HHDM,
-// and map it into dst with the same flags.
-// Also allocates new intermediate table frames (PDPT/PD/PT) as needed.
+// Clone all user (lower half) page table entries from src to dst PML4.
+// For private pages: allocate a new frame and deep-copy 4096 bytes.
+// For shared pages (VMA has shmem backing): map the SAME physical frame
+// (no copy — both parent and child see the same memory).
+// If src_mm is NULL, all pages are treated as private (legacy behavior).
 // Returns 1 on success, 0 on OOM.
-uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
+uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
+                          mm_t* src_mm) {
     uint64_t* src_pml4v = (uint64_t*)(src_pml4 + HHDM_OFFSET);
     uint64_t* dst_pml4v = (uint64_t*)(dst_pml4 + HHDM_OFFSET);
 
     for (int pi = 0; pi < 256; pi++) {
         if (!(src_pml4v[pi] & PAGE_PRESENT)) continue;
 
-        // Allocate new PDPT frame for dst.
         phys_addr_t dst_pdpt_phys = pmm_buddy_alloc(0);
         if (dst_pdpt_phys == PMM_INVALID_ADDR) return 0;
         zero_page(dst_pdpt_phys + HHDM_OFFSET);
@@ -294,21 +320,41 @@ uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
                     if (!(src_pt[si] & PAGE_PRESENT)) continue;
 
                     phys_addr_t src_frame = src_pt[si] & PAGE_ADDR_MASK;
-                    phys_addr_t dst_frame = pmm_buddy_alloc(0);
-                    if (dst_frame == PMM_INVALID_ADDR) return 0;
-
-                    // memcpy 4096 bytes via HHDM.
-                    uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
-                    uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
-                    for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
-
                     uint64_t leaf_flags = src_pt[si] & ~PAGE_ADDR_MASK;
-                    dst_pt[si] = dst_frame | leaf_flags;
+
+                    // Check if this page is in a shared VMA.
+                    virt_addr_t va = ((uint64_t)pi << 39) | ((uint64_t)qi << 30)
+                                   | ((uint64_t)ri << 21) | ((uint64_t)si << 12);
+                    int is_shared = 0;
+                    if (src_mm) {
+                        vma_t* vma = mm_vma_find(src_mm, va);
+                        if (vma && vma->shmem) is_shared = 1;
+                    }
+
+                    if (is_shared) {
+                        // Shared: map the SAME physical frame (no copy).
+                        dst_pt[si] = src_frame | leaf_flags;
+                    } else {
+                        // Private: allocate a new frame and deep-copy.
+                        phys_addr_t dst_frame = pmm_buddy_alloc(0);
+                        if (dst_frame == PMM_INVALID_ADDR) return 0;
+
+                        uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
+                        uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
+                        for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+
+                        dst_pt[si] = dst_frame | leaf_flags;
+                    }
                 }
             }
         }
     }
     return 1;
+}
+
+// Legacy wrapper: treats all pages as private (deep-copy everything).
+uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
+    return vmm_clone_user_ex(dst_pml4, src_pml4, NULL);
 }
 
 // ── Page-fault handler (vector 14) ───────────────────────────────────────
@@ -392,18 +438,35 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         // Instruction fetch on non-executable mapping.
         if (is_ifetch && !(vma->flags & VMA_X)) { if (is_user) goto kill; else goto kernel_panic; }
 
-        // Demand-page: allocate a physical frame, zero it, map it.
-        phys_addr_t frame = pmm_buddy_alloc(0);
-        if (frame == PMM_INVALID_ADDR) { if (is_user) goto kill; else goto kernel_panic; }
-
-        // Zero the frame (security: never expose old data to user).
-        uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
-        for (int i = 0; i < 512; i++) p[i] = 0;
-
+        // Demand-page: resolve the physical frame.
         virt_addr_t page = fault_addr & ~PAGE_MASK;
+        phys_addr_t frame;
+
+        if (vma->shmem) {
+            // Shared mapping: get/allocate the page from the shmem object.
+            // The shmem object owns the physical frame — do NOT free it
+            // when unmapping this VMA.
+            uint32_t pg_idx = (uint32_t)((page - vma->start) / PAGE_SIZE)
+                              + vma->shmem_pgoff;
+            frame = shmem_get_page(vma->shmem, pg_idx);
+            if (frame == PMM_INVALID_ADDR) {
+                if (is_user) goto kill; else goto kernel_panic;
+            }
+        } else {
+            // Private anonymous: allocate a fresh zeroed frame.
+            frame = pmm_buddy_alloc(0);
+            if (frame == PMM_INVALID_ADDR) {
+                if (is_user) goto kill; else goto kernel_panic;
+            }
+            // Zero the frame (security: never expose old data to user).
+            uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
+            for (int i = 0; i < 512; i++) p[i] = 0;
+        }
+
         if (!vmm_page_map(vmm_pml4_get(), page, frame,
                           mm_vma_pte_flags(vma->flags))) {
-            pmm_buddy_free(frame, 0);
+            // Only free the frame if it's private (shmem owns shared frames).
+            if (!vma->shmem) pmm_buddy_free(frame, 0);
             if (is_user) goto kill; else goto kernel_panic;
         }
         return; // fault resolved
