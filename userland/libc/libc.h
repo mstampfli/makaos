@@ -159,6 +159,10 @@ typedef _Bool              bool;
 #define SYS_RECVFD      88
 #define SYS_REGISTER_POLICY_AGENT 89
 
+// ── Shared memory syscall numbers ────────────────────────────────────────
+#define SYS_SHM_OPEN    90
+#define SYS_SHM_UNLINK  91
+
 // ── Misc syscall numbers ──────────────────────────────────────────────────
 #define SYS_GETUID      49
 #define SYS_GETEUID     50
@@ -634,6 +638,58 @@ int nanosleep(const struct timespec* req, struct timespec* rem);
 
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off);
 int   munmap(void* addr, size_t len);
+
+// ── POSIX shared memory ─────────────────────────────────────────────────
+int shm_open(const char* name, int oflag, int mode);
+int shm_unlink(const char* name);
+
+// ── BSD Sockets ──────────────────────────────────────────────────────────
+
+#define AF_UNIX     1
+#define AF_LOCAL    AF_UNIX
+#define AF_INET     2
+
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+
+#define SHUT_RD     0
+#define SHUT_WR     1
+#define SHUT_RDWR   2
+
+#define UNIX_PATH_MAX 108
+
+typedef struct sockaddr {
+    uint16_t sa_family;
+    char     sa_data[14];
+} sockaddr_t;
+
+typedef struct sockaddr_un {
+    uint16_t sun_family;
+    char     sun_path[UNIX_PATH_MAX];
+} sockaddr_un_t;
+
+typedef struct sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;      // network byte order
+    uint32_t sin_addr;      // network byte order
+    uint8_t  sin_zero[8];
+} sockaddr_in_t;
+
+typedef uint32_t socklen_t;
+
+static inline uint16_t htons(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
+static inline uint16_t ntohs(uint16_t v) { return htons(v); }
+
+int socket(int domain, int type, int protocol);
+int bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
+int listen(int fd, int backlog);
+int accept(int fd, struct sockaddr* addr, socklen_t* addrlen);
+int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
+ssize_t send(int fd, const void* buf, size_t len, int flags);
+ssize_t recv(int fd, void* buf, size_t len, int flags);
+int shutdown(int fd, int how);
+int sendfd(int sock_fd, int target_fd, unsigned int rights);
+int recvfd(int sock_fd);
 
 // ── New syscall numbers ───────────────────────────────────────────────────
 #define SYS_SOCKET      35

@@ -87,10 +87,16 @@ void vmm_page_free(virt_addr_t vaddr);
 // Switch address space: writes pml4_phys to CR3, flushing the TLB.
 void vmm_switch(phys_addr_t pml4_phys);
 
-// Free all lower-half (user-space) page TABLE frames in a PML4.
-// Does NOT free the physical pages the process had mapped (data/code/stack).
+// Free all lower-half (user-space) page table structures and leaf frames.
 // Does NOT free the PML4 frame itself — caller frees it.
+// Legacy version: frees ALL leaf frames unconditionally (safe for error paths
+// where no shmem objects could exist).
 void vmm_free_user(phys_addr_t pml4_phys);
+
+// VMA-aware version: skips freeing leaf frames for shared VMAs (shmem-backed).
+// Pass mm=NULL for the legacy "free everything" behavior.
+struct mm_t;
+void vmm_free_user_ex(phys_addr_t pml4_phys, struct mm_t* mm);
 
 // Return the physical address of the kernel's own PML4 (set by vmm_init).
 // Use this when you need to map pages into the kernel address space
@@ -113,3 +119,8 @@ phys_addr_t vmm_current_pml4(void);
 // Allocates new PDPT/PD/PT frames and new data frames for each present leaf PTE.
 // Returns 1 on success, 0 on OOM.
 uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4);
+
+// VMA-aware clone: shared (shmem-backed) pages map the same physical frame
+// instead of being deep-copied.  Pass src_mm=NULL for legacy deep-copy behavior.
+uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
+                          struct mm_t* src_mm);
