@@ -47,10 +47,18 @@ int virtfs_is_virtual(const char* path);
 int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
                   fs_node_t* out);
 
+// ── Path normalization ────────────────────────────────────────────────────
+
+// Normalize an absolute path in-place: resolve ".", "..", collapse "//",
+// strip trailing "/".  E.g. "/dev/./foo/../bar//" → "/dev/bar".
+// `path` must be a mutable buffer with an absolute path (starts with '/').
+void normalize_path(char* path);
+
 // ── Global entry point ────────────────────────────────────────────────────
 
 // Routes to virtfs_lookup or ext2_lookup_path based on path prefix.
+// Normalizes the path in-place before routing.
 // Returns 0 on success (fills *out), negative errno on failure.
 // Every syscall handler should call this instead of the backends directly.
-int fs_lookup(const char* path, const cred_t* cred, uint8_t need,
+int fs_lookup(char* path, const cred_t* cred, uint8_t need,
               fs_node_t* out);
