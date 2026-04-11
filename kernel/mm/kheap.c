@@ -9,16 +9,8 @@ static const size_t g_kmalloc_sizes[KMALLOC_CACHE_COUNT] = {
     // to satisfy SLAB_MIN_OBJECTS=8, which is wasteful and often fails).
 };
 
-static inline uint64_t align_down(virt_addr_t addr) {
-    return (addr & ~(PAGE_SIZE - 1));
-}
-
 static inline uint64_t align_up(virt_addr_t addr) {
     return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-}
-
-static inline bool is_heap_address(virt_addr_t addr) {
-  return !(addr < g_kheap.base || addr > g_kheap.end);
 }
 
 static inline size_t pick_cache_idx(size_t size) {

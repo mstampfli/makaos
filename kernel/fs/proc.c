@@ -46,11 +46,6 @@ static int str_eq(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
-static int str_starts(const char* s, const char* prefix) {
-    while (*prefix) { if (*s++ != *prefix++) return 0; }
-    return 1;
-}
-
 static uint64_t str_len(const char* s) {
     uint64_t n = 0; while (s[n]) n++; return n;
 }

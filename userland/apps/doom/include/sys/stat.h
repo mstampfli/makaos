@@ -9,7 +9,9 @@
 #define S_IXUSR 0100
 #define S_IRWXG 0070
 #define S_IRWXO 0007
+#ifndef S_ISDIR
 #define S_ISDIR(m) (0)  // we don't expose full stat mode bits
+#endif
 
 // mkdir with mode (m_misc.c uses mkdir(path, 0755))
 // Our libc mkdir doesn't take a mode, so ignore it.

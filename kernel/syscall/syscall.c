@@ -310,7 +310,9 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         }
         if (!f && (flags & O_CREAT)) {
             // Apply umask to mode before creating.
+            // TODO: pass mode to ext2_create when it supports permissions
             mode &= ~(uint64_t)g_current->umask;
+            (void)mode;
             if (!ext2_create(path)) return (uint64_t)-EIO;
             f = ext2_open(path);
         }
@@ -1670,7 +1672,7 @@ static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     (void)rem_ptr;
     if (!req_ptr) return (uint64_t)-EINVAL;
     k_timespec_t* req = (k_timespec_t*)req_ptr;
-    if (req->tv_nsec >= 1000000000ULL) return (uint64_t)-EINVAL;
+    if (req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return (uint64_t)-EINVAL;
 
     uint64_t sleep_ns = req->tv_sec * 1000000000ULL + req->tv_nsec;
     if (!sleep_ns) return 0;
