@@ -1103,22 +1103,7 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
             if (path[0]=='/' && path[1]=='p') {
                 count = proc_readdir(path, kbuf, (int)max_entries);
             } else {
-                // /dev — synthesize directory listing of known devices.
-                static const char* s_dev_entries[] = {
-                    "tty", "tty0", "kbd", "kbdraw", "vga", "mouse",
-                    "dsp", "null", "zero", "urandom", "input", NULL
-                };
-                count = 0;
-                for (int di = 0; s_dev_entries[di] && count < (int)max_entries; di++) {
-                    const char* n = s_dev_entries[di];
-                    int ni = 0;
-                    while (n[ni]) { kbuf[count].name[ni] = n[ni]; ni++; }
-                    kbuf[count].name[ni] = '\0';
-                    kbuf[count].inode_num = 0xE0000000 + (uint32_t)di;
-                    kbuf[count].size      = 0;
-                    kbuf[count].is_dir    = 0;
-                    count++;
-                }
+                count = dev_readdir(kbuf, (int)max_entries);
             }
         } else {
             // ext2: permissions already checked by fs_lookup above.
@@ -1196,17 +1181,14 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     if (fsr != 0) return (uint64_t)(int64_t)fsr;
 
     if (fsn.is_virtual) {
-        if (path[0]=='/' && path[1]=='p') {
-            int r = proc_stat(path, &kst);
-            if (r != 0) return (uint64_t)-ENOENT;
-        } else {
-            kst.st_ino     = fsn.inode_nr ? fsn.inode_nr : 0xE0000001;
-            kst.st_mode    = fsn.mode;
-            kst.st_nlink   = (fsn.type == FS_TYPE_DIR) ? 2 : 1;
-            kst.st_uid     = fsn.uid;
-            kst.st_gid     = fsn.gid;
-            kst.st_blksize = 4096;
-        }
+        // All virtual nodes (both /dev and /proc) now have per-node
+        // uid/gid/mode from fs_lookup → virtfs_lookup → virt_resolve.
+        kst.st_ino     = fsn.inode_nr ? fsn.inode_nr : 0xE0000001;
+        kst.st_mode    = fsn.mode;
+        kst.st_nlink   = (fsn.type == FS_TYPE_DIR) ? 2 : 1;
+        kst.st_uid     = fsn.uid;
+        kst.st_gid     = fsn.gid;
+        kst.st_blksize = 4096;
     } else {
         kst.st_ino     = fsn.inode_nr;
         kst.st_mode    = fsn.mode;

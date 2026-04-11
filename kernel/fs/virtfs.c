@@ -2,32 +2,67 @@
 #include "acl.h"
 #include "errno.h"
 #include "ext2.h"
+#include "sched.h"
 
-// ── Virtual mount table ───────────────────────────────────────────────────
+// ── Per-node device table ────────────────────────────────────────────────
+// Single source of truth for all /dev nodes: name, ownership, permissions.
+
+typedef struct {
+    const char* name;
+    uint32_t    uid;
+    uint32_t    gid;
+    uint16_t    mode;    // permission bits only (no type bits)
+    int         type;    // FS_TYPE_CHAR etc.
+} dev_node_t;
+
+static const dev_node_t s_dev_nodes[] = {
+    { "tty",     0, 0, 0666, FS_TYPE_CHAR },
+    { "tty0",    0, 0, 0620, FS_TYPE_CHAR },  // owner+group rw, no other
+    { "kbd",     0, 0, 0660, FS_TYPE_CHAR },
+    { "kbdraw",  0, 0, 0660, FS_TYPE_CHAR },
+    { "vga",     0, 0, 0660, FS_TYPE_CHAR },
+    { "mouse",   0, 0, 0666, FS_TYPE_CHAR },
+    { "dsp",     0, 0, 0666, FS_TYPE_CHAR },
+    { "null",    0, 0, 0666, FS_TYPE_CHAR },
+    { "zero",    0, 0, 0666, FS_TYPE_CHAR },
+    { "urandom", 0, 0, 0444, FS_TYPE_CHAR },  // read-only
+    { "input",   0, 0, 0660, FS_TYPE_CHAR },
+    { NULL, 0, 0, 0, 0 }
+};
+
+static const dev_node_t* dev_find_node(const char* name) {
+    for (int i = 0; s_dev_nodes[i].name; i++) {
+        const char* a = s_dev_nodes[i].name;
+        const char* b = name;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == '\0' && *b == '\0') return &s_dev_nodes[i];
+    }
+    return NULL;
+}
+
+// ── Virtual mount table ──────────────────────────────────────────────────
+// Mount-level metadata for the directory nodes themselves (/dev, /proc).
 
 typedef struct {
     const char* prefix;
     uint8_t     prefix_len;
-    // Mount-root directory: uid, gid, mode
     uint32_t    dir_uid;
     uint32_t    dir_gid;
     uint16_t    dir_mode;
-    // Files/nodes inside the mount: uid, gid, mode
-    uint32_t    file_uid;
-    uint32_t    file_gid;
-    uint16_t    file_mode;
-    int         file_type;   // FS_TYPE_DIR or FS_TYPE_FILE or FS_TYPE_CHAR
 } virtmount_t;
 
 static const virtmount_t s_mounts[] = {
-    // /proc — root:root, dir 0555, files 0444 (world-readable, no write)
-    { "/proc", 5,  0, 0, 0555,  0, 0, 0444, FS_TYPE_FILE },
-    // /dev  — root:root, dir 0755, char nodes 0666
-    { "/dev",  4,  0, 0, 0755,  0, 0, 0666, FS_TYPE_CHAR },
+    { "/proc", 5,  0, 0, 0555 },
+    { "/dev",  4,  0, 0, 0755 },
 };
 #define N_MOUNTS ((int)(sizeof(s_mounts)/sizeof(s_mounts[0])))
 
-// ── Internal helpers ──────────────────────────────────────────────────────
+// ── Internal helpers ─────────────────────────────────────────────────────
+
+static int s_streq(const char* a, const char* b) {
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == '\0' && *b == '\0';
+}
 
 static const virtmount_t* find_mount(const char* path) {
     for (int i = 0; i < N_MOUNTS; i++) {
@@ -40,29 +75,125 @@ static const virtmount_t* find_mount(const char* path) {
         if (match && (path[n] == '/' || path[n] == '\0'))
             return m;
     }
-    return (void*)0;
+    return NULL;
 }
 
-static int perm_check(const virtmount_t* m, const char* path,
-                      const cred_t* cred, uint8_t need) {
-    if (cred->euid == 0) return 0;  // root bypasses
-
+// Resolve per-node uid/gid/mode/type for any virtual path.
+// For directory-level paths (/dev, /proc), uses mount defaults.
+// For nodes inside, looks up per-node metadata.
+static int virt_resolve(const char* path, const virtmount_t* m,
+                        uint32_t* out_uid, uint32_t* out_gid,
+                        uint16_t* out_mode, int* out_type) {
     int n = (int)m->prefix_len;
-    int is_dir = (path[n] == '\0' || (path[n] == '/' && path[n+1] == '\0'));
+    int is_dir = (path[n] == '\0');
 
-    uint32_t uid  = is_dir ? m->dir_uid  : m->file_uid;
-    uint32_t gid  = is_dir ? m->dir_gid  : m->file_gid;
-    uint16_t mode = is_dir ? m->dir_mode : m->file_mode;
+    if (is_dir) {
+        // Mount root directory itself
+        *out_uid  = m->dir_uid;
+        *out_gid  = m->dir_gid;
+        *out_mode = m->dir_mode;
+        *out_type = FS_TYPE_DIR;
+        return 0;
+    }
 
-    acl_entry_t acl[3];
-    acl_from_mode(acl, uid, gid, mode);
-    return acl_check(acl, 3, cred, need) ? 0 : -EACCES;
+    // path[n] == '/', node name starts at path[n+1]
+    const char* node_name = path + n + 1;
+    if (node_name[0] == '\0') {
+        // Trailing slash: still the directory
+        *out_uid  = m->dir_uid;
+        *out_gid  = m->dir_gid;
+        *out_mode = m->dir_mode;
+        *out_type = FS_TYPE_DIR;
+        return 0;
+    }
+
+    // /dev/<node>
+    if (s_streq(m->prefix, "/dev")) {
+        const dev_node_t* dn = dev_find_node(node_name);
+        if (!dn) return -ENOENT;
+        *out_uid  = dn->uid;
+        *out_gid  = dn->gid;
+        *out_mode = dn->mode;
+        *out_type = dn->type;
+        return 0;
+    }
+
+    // /proc — per-node permissions based on what's being accessed
+    if (s_streq(m->prefix, "/proc")) {
+        // /proc/self, /proc/<pid> — directories owned by the process
+        // /proc/<pid>/<file> — files owned by the process
+        // We need to figure out the pid to get its uid.
+
+        // Skip to the first component after /proc/
+        const char* p = node_name;
+
+        // Check for "self"
+        int is_self = (p[0]=='s' && p[1]=='e' && p[2]=='l' && p[3]=='f'
+                       && (p[4]=='/' || p[4]=='\0'));
+
+        uint32_t pid = 0;
+        const char* after = p;
+
+        if (is_self) {
+            pid = g_current ? g_current->pid : 0;
+            after = p + 4;
+        } else {
+            // Parse numeric pid
+            while (*after >= '0' && *after <= '9') {
+                pid = pid * 10 + (uint32_t)(*after - '0');
+                after++;
+            }
+        }
+
+        if (pid) {
+            task_t* t = sched_find_pid(pid);
+            uint32_t owner_uid = t ? t->cred.euid : 0;
+            uint32_t owner_gid = t ? t->cred.egid : 0;
+
+            if (after[0] == '\0' || (after[0] == '/' && after[1] == '\0')) {
+                // /proc/<pid> directory
+                *out_uid  = owner_uid;
+                *out_gid  = owner_gid;
+                *out_mode = 0555;
+                *out_type = FS_TYPE_DIR;
+                return 0;
+            }
+            // /proc/<pid>/fd is a directory
+            if (after[0] == '/' && after[1] == 'f' && after[2] == 'd'
+                && (after[3] == '\0' || after[3] == '/')) {
+                if (after[3] == '\0' || (after[3] == '/' && after[4] == '\0')) {
+                    *out_uid  = owner_uid;
+                    *out_gid  = owner_gid;
+                    *out_mode = 0500;
+                    *out_type = FS_TYPE_DIR;
+                    return 0;
+                }
+                // /proc/<pid>/fd/<n> — file
+                *out_uid  = owner_uid;
+                *out_gid  = owner_gid;
+                *out_mode = 0400;
+                *out_type = FS_TYPE_FILE;
+                return 0;
+            }
+            // /proc/<pid>/<file> (status, cmdline, maps, etc.)
+            *out_uid  = owner_uid;
+            *out_gid  = owner_gid;
+            *out_mode = 0444;
+            *out_type = FS_TYPE_FILE;
+            return 0;
+        }
+
+        // Unknown /proc path — return not found
+        return -ENOENT;
+    }
+
+    return -ENOENT;
 }
 
-// ── virtfs public API ─────────────────────────────────────────────────────
+// ── virtfs public API ────────────────────────────────────────────────────
 
 int virtfs_is_virtual(const char* path) {
-    return find_mount(path) != (void*)0;
+    return find_mount(path) != NULL;
 }
 
 int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
@@ -70,27 +201,55 @@ int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
     const virtmount_t* m = find_mount(path);
     if (!m) return -ENOENT;
 
-    int r = perm_check(m, path, cred, need);
+    uint32_t uid, gid;
+    uint16_t mode;
+    int type;
+    int r = virt_resolve(path, m, &uid, &gid, &mode, &type);
     if (r != 0) return r;
 
+    // Permission check
+    if (cred->euid != 0) {
+        acl_entry_t acl[3];
+        uint16_t full_mode;
+        if (type == FS_TYPE_DIR)       full_mode = 0x4000 | mode;
+        else if (type == FS_TYPE_CHAR) full_mode = 0x2000 | mode;
+        else                           full_mode = 0x8000 | mode;
+        acl_from_mode(acl, uid, gid, full_mode);
+        if (!acl_check(acl, 3, cred, need)) return -EACCES;
+    }
+
     if (out) {
-        int n = (int)m->prefix_len;
-        int is_dir = (path[n] == '\0' || (path[n] == '/' && path[n+1] == '\0'));
         out->is_virtual = 1;
-        out->type       = is_dir ? FS_TYPE_DIR : m->file_type;
-        out->uid        = is_dir ? m->dir_uid  : m->file_uid;
-        out->gid        = is_dir ? m->dir_gid  : m->file_gid;
-        out->mode       = is_dir ? (0x4000 | m->dir_mode)
-                                 : (m->file_type == FS_TYPE_CHAR
-                                        ? (0x2000 | m->file_mode)
-                                        : (0x8000 | m->file_mode));
+        out->type       = type;
+        out->uid        = uid;
+        out->gid        = gid;
         out->inode_nr   = 0;
         out->size       = 0;
+        if (type == FS_TYPE_DIR)       out->mode = 0x4000 | mode;
+        else if (type == FS_TYPE_CHAR) out->mode = 0x2000 | mode;
+        else                           out->mode = 0x8000 | mode;
     }
     return 0;
 }
 
-// ── Path normalization ────────────────────────────────────────────────────
+// ── /dev readdir ─────────────────────────────────────────────────────────
+
+int dev_readdir(ext2_entry_t* out, int max) {
+    int count = 0;
+    for (int i = 0; s_dev_nodes[i].name && count < max; i++) {
+        const char* n = s_dev_nodes[i].name;
+        int ni = 0;
+        while (n[ni]) { out[count].name[ni] = n[ni]; ni++; }
+        out[count].name[ni] = '\0';
+        out[count].inode_num = 0xE0000000 + (uint32_t)i;
+        out[count].size      = 0;
+        out[count].is_dir    = 0;
+        count++;
+    }
+    return count;
+}
+
+// ── Path normalization ───────────────────────────────────────────────────
 
 void normalize_path(char* path) {
     if (!path || path[0] != '/') return;
@@ -123,7 +282,7 @@ void normalize_path(char* path) {
     *dst = '\0';
 }
 
-// ── Global entry point ────────────────────────────────────────────────────
+// ── Global entry point ───────────────────────────────────────────────────
 
 int fs_lookup(char* path, const cred_t* cred, uint8_t need,
               fs_node_t* out) {

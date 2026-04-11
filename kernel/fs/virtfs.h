@@ -2,6 +2,7 @@
 #include "common.h"
 #include "cred.h"
 #include "perm.h"
+#include "ext2.h"
 
 // ── Virtual Filesystem Layer ──────────────────────────────────────────────
 //
@@ -46,6 +47,12 @@ int virtfs_is_virtual(const char* path);
 // Returns 0 on success (fills *out), -ENOENT if not virtual, -EACCES if denied.
 int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
                   fs_node_t* out);
+
+// ── /dev readdir ─────────────────────────────────────────────────────────
+
+// List all device nodes.  Fills `out` with up to `max` entries.
+// Returns count.  Called from sys_readdir for /dev.
+int dev_readdir(ext2_entry_t* out, int max);
 
 // ── Path normalization ────────────────────────────────────────────────────
 
