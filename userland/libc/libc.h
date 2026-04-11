@@ -285,7 +285,12 @@ static inline int close(int fd) {
 
 // ── Process ───────────────────────────────────────────────────────────────
 
+// _flush_all: flush stdout/stderr before exit.  Implemented in stdio.c.
+// We can't forward-declare fflush(FILE*) here because FILE isn't defined yet.
+void _flush_all(void);
+
 __attribute__((noreturn)) static inline void exit(int code) {
+    _flush_all();
     syscall1(SYS_EXIT, (uint64_t)code);
     for (;;);
 }
@@ -556,6 +561,7 @@ char*  strrchr(const char* s, int c);
 char*  strstr(const char* haystack, const char* needle);
 char*  strdup(const char* s);
 char*  strndup(const char* s, size_t max);
+char*  strerror(int errnum);
 long   strtol(const char* s, char** endptr, int base);
 unsigned long strtoul(const char* s, char** endptr, int base);
 long   atoi(const char* s);

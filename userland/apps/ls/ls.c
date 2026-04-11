@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
 
     DIR* dir = opendir(path);
     if (!dir) {
-        fprintf(stderr, "ls: cannot open '%s'\n", path);
+        fprintf(stderr, "ls: cannot open '%s': %s\n", path, strerror(errno));
         return 1;
     }
 

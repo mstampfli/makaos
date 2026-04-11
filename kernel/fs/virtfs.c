@@ -215,7 +215,41 @@ int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
         else if (type == FS_TYPE_CHAR) full_mode = 0x2000 | mode;
         else                           full_mode = 0x8000 | mode;
         acl_from_mode(acl, uid, gid, full_mode);
-        if (!acl_check(acl, 3, cred, need)) return -EACCES;
+        if (!acl_check(acl, 3, cred, need)) {
+            // Middle-ground: return EACCES only if the user can already
+            // see this node exists (has read+exec on the parent directory).
+            // Otherwise return ENOENT to avoid leaking file existence.
+            int n = (int)m->prefix_len;
+            // Find the parent path (everything up to last '/')
+            int last_slash = 0;
+            for (int i = 0; path[i]; i++)
+                if (path[i] == '/') last_slash = i;
+
+            if (last_slash > 0 && last_slash > n) {
+                // Nested path (e.g. /proc/1/fd/3) — resolve parent
+                char parent[256];
+                for (int i = 0; i < last_slash && i < 255; i++)
+                    parent[i] = path[i];
+                parent[last_slash] = '\0';
+
+                uint32_t puid, pgid;
+                uint16_t pmode;
+                int ptype;
+                if (virt_resolve(parent, m, &puid, &pgid, &pmode, &ptype) == 0) {
+                    acl_entry_t pacl[3];
+                    acl_from_mode(pacl, puid, pgid, 0x4000 | pmode);
+                    if (acl_check(pacl, 3, cred, ACL_PERM_READ | ACL_PERM_EXEC))
+                        return -EACCES;
+                }
+            } else {
+                // Direct child of mount root (e.g. /dev/kbd) — check mount dir
+                acl_entry_t pacl[3];
+                acl_from_mode(pacl, m->dir_uid, m->dir_gid, 0x4000 | m->dir_mode);
+                if (acl_check(pacl, 3, cred, ACL_PERM_READ | ACL_PERM_EXEC))
+                    return -EACCES;
+            }
+            return -ENOENT;
+        }
     }
 
     if (out) {

@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         int fd = open(argv[i], O_RDONLY, 0);
         if (fd < 0) {
-            fprintf(stderr, "cat: %s: No such file\n", argv[i]);
+            fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno));
             continue;
         }
         ssize_t n;
