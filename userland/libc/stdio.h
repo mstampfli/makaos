@@ -24,6 +24,7 @@ typedef struct FILE {
 #define _FILE_WRITE 0x02
 #define _FILE_ERR   0x04
 #define _FILE_EOF   0x08
+#define _FILE_UNBUF 0x10  // unbuffered: flush after every write (POSIX stderr)
 
 // ── Standard streams ──────────────────────────────────────────────────────
 extern FILE* stdin;

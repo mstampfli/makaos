@@ -18,7 +18,7 @@ int vsnprintf(char* buf, size_t size, const char* fmt, va_list ap);
 
 static FILE s_stdin_file  = { .fd = 0, .flags = _FILE_READ,  .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
 static FILE s_stdout_file = { .fd = 1, .flags = _FILE_WRITE, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
-static FILE s_stderr_file = { .fd = 2, .flags = _FILE_WRITE, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
+static FILE s_stderr_file = { .fd = 2, .flags = _FILE_WRITE | _FILE_UNBUF, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
 
 FILE* stdin  = &s_stdin_file;
 FILE* stdout = &s_stdout_file;
@@ -159,6 +159,13 @@ int fclose(FILE* f) {
     return err;
 }
 
+// ── _flush_all — called by exit() before SYS_EXIT ────────────────────────
+
+void _flush_all(void) {
+    flush_write(stdout);
+    flush_write(stderr);
+}
+
 // ── fflush ────────────────────────────────────────────────────────────────
 
 int fflush(FILE* f) {
@@ -196,7 +203,7 @@ int fputc(int c, FILE* f) {
     if (!(f->flags & _FILE_WRITE)) { f->flags |= _FILE_ERR; return EOF; }
     if (f->flags & _FILE_ERR) return EOF;
     f->wbuf[f->wpos++] = (uint8_t)c;
-    if (f->wpos >= STDIO_BUFSIZ || c == '\n') {
+    if (f->wpos >= STDIO_BUFSIZ || c == '\n' || (f->flags & _FILE_UNBUF)) {
         if (flush_write(f) == EOF) return EOF;
     }
     return (unsigned char)c;
@@ -281,7 +288,7 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* f) {
         f->wpos += (int)put;
         done    += put;
 
-        if (f->wpos >= STDIO_BUFSIZ) {
+        if (f->wpos >= STDIO_BUFSIZ || (f->flags & _FILE_UNBUF)) {
             if (flush_write(f) == EOF) break;
         }
     }
