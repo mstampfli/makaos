@@ -8,6 +8,7 @@ uint32_t g_fb_row = 0;
 uint32_t g_fb_fg  = 0x00FFFFFF; /* white */
 uint32_t g_fb_bg  = 0x00000000; /* black */
 int      g_fb_exclusive = 0;
+uint64_t g_fb_owner_pid = 0;
 
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
     g_fb.base_virt = fb_phys + HHDM_OFFSET;
