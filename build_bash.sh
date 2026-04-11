@@ -110,7 +110,7 @@ for f in "$BASH_SRC"/builtins/alias.c "$BASH_SRC"/builtins/bind.c \
           "$BASH_SRC"/builtins/break.c "$BASH_SRC"/builtins/builtin.c \
           "$BASH_SRC"/builtins/caller.c "$BASH_SRC"/builtins/cd.c \
           "$BASH_SRC"/builtins/colon.c "$BASH_SRC"/builtins/command.c \
-          "$BASH_SRC"/builtins/complete.c "$BASH_SRC"/builtins/declare.c \
+          "$BASH_SRC"/builtins/declare.c \
           "$BASH_SRC"/builtins/echo.c "$BASH_SRC"/builtins/enable.c \
           "$BASH_SRC"/builtins/eval.c "$BASH_SRC"/builtins/exec.c \
           "$BASH_SRC"/builtins/exit.c "$BASH_SRC"/builtins/fc.c \

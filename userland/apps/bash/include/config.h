@@ -30,7 +30,8 @@
 #define CASEMOD_ATTRS           1
 #define CASEMOD_EXPANSIONS      1
 #define COPROCESS_SUPPORT       1
-#define PROGRAMMABLE_COMPLETION 1
+/* Disabled: requires readline */
+/* #undef PROGRAMMABLE_COMPLETION */
 
 /* Job control */
 #define JOB_CONTROL             1
