@@ -36,6 +36,7 @@ uint32_t inet_pseudo_partial(uint32_t src_ip_be, uint32_t dst_ip_be,
     return sum;
 }
 
+__attribute__((unused))
 static uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
                                     uint8_t proto, const void* data, uint16_t len) {
     uint32_t pseudo = inet_pseudo_partial(src_be, dst_be, proto, len);

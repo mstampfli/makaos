@@ -89,6 +89,7 @@ static int            s_policy_count = 0;
 
 // ── String helpers ────────────────────────────────────────────────────────
 
+__attribute__((unused))
 static int s_strlen(const char* s) {
     int n = 0; while (s[n]) n++; return n;
 }
@@ -107,6 +108,7 @@ static int s_strncmp(const char* a, const char* b, int n) {
     return 0;
 }
 
+__attribute__((unused))
 static void s_strcpy(char* dst, const char* src, int max) {
     int i = 0;
     while (i < max - 1 && src[i]) { dst[i] = src[i]; i++; }
@@ -124,6 +126,7 @@ static int s_skip_ws(const char* s, int i) {
 }
 
 // Glob match: '*' matches any sequence including empty.
+__attribute__((unused))
 static int glob_match(const char* pattern, const char* str) {
     while (*pattern && *str) {
         if (*pattern == '*') {

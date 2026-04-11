@@ -584,7 +584,7 @@ int virtio_net_init(void) {
     __asm__ volatile("mfence" ::: "memory");
 
     // 6. Read MAC address from device config.
-    for (int i = 0; i < ETH_ALEN; i++)
+    for (uint32_t i = 0; i < ETH_ALEN; i++)
         s_mac[i] = s_devcfg->mac[i];
 
     // 7. Pre-populate RX ring.

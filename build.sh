@@ -126,7 +126,7 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_hello.o" \
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
-ld -nostdlib -T "$USER_LINK" "$BUILD_DIR/user_helloraw.o" \
+ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
 
@@ -214,6 +214,8 @@ if [ -d "$DOOMGENERIC_DIR" ] && [ -n "$(ls -A "$DOOMGENERIC_DIR" 2>/dev/null)" ]
         -Wno-unused-variable
         -Wno-unused-function
         -Wno-unused-parameter
+        -Wno-pointer-to-int-cast
+        -Wno-macro-redefined
     )
 
     DOOM_OBJS=()

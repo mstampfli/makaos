@@ -98,7 +98,9 @@ typedef _Bool              bool;
 #define _IOLBF      1
 #define _IONBF      2
 #define LOCALEDIR   "/usr/share/locale"
+#ifndef PACKAGE
 #define PACKAGE     "bash"
+#endif
 
 #define NULL ((void*)0)
 #define EXIT_SUCCESS 0
@@ -1547,7 +1549,8 @@ static inline size_t wcslen(const wchar_t* s) {
     size_t n = 0; while (s[n]) n++; return n;
 }
 static inline wchar_t* wcschr(const wchar_t* s, wchar_t c) {
-    while (*s && *s != c) s++; return (*s == c) ? (wchar_t*)s : NULL;
+    while (*s && *s != c) s++;
+    return (*s == c) ? (wchar_t*)s : NULL;
 }
 static inline int wcscmp(const wchar_t* a, const wchar_t* b) {
     while (*a && *a == *b) { a++; b++; }
@@ -1555,7 +1558,8 @@ static inline int wcscmp(const wchar_t* a, const wchar_t* b) {
 }
 static inline int wcsncmp(const wchar_t* a, const wchar_t* b, size_t n) {
     while (n && *a && *a == *b) { a++; b++; n--; }
-    if (!n) return 0; return (int)*a - (int)*b;
+    if (!n) return 0;
+    return (int)*a - (int)*b;
 }
 static inline wchar_t* wcsdup(const wchar_t* s) {
     size_t n = wcslen(s) + 1;
@@ -1600,7 +1604,8 @@ static inline int wctomb(char* s, wchar_t wc) {
     if (s) { *s = (char)(wc & 0x7F); return 1; } return 0;
 }
 static inline int mblen(const char* s, size_t n) {
-    if (!s) return 0; if (!n) return -1;
+    if (!s) return 0;
+    if (!n) return -1;
     return (*s == '\0') ? 0 : 1;
 }
 

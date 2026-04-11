@@ -70,3 +70,6 @@ _longjmp:
     ; anything; instead push then ret, which is the standard idiom.
     push r11
     ret
+
+; Mark stack as non-executable (suppresses ld warning).
+section .note.GNU-stack noalloc noexec nowrite progbits

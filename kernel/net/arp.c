@@ -38,13 +38,13 @@ static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
     // Update existing entry if present.
     for (uint8_t i = 0; i < ARP_CACHE_SIZE; i++) {
         if (s_cache[i].ip_be == ip_be) {
-            for (int j = 0; j < ETH_ALEN; j++) s_cache[i].mac[j] = mac[j];
+            for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[i].mac[j] = mac[j];
             return;
         }
     }
     // Insert into next eviction slot.
     s_cache[s_cache_next].ip_be = ip_be;
-    for (int j = 0; j < ETH_ALEN; j++) s_cache[s_cache_next].mac[j] = mac[j];
+    for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[s_cache_next].mac[j] = mac[j];
     s_cache_next = (uint8_t)((s_cache_next + 1u) % ARP_CACHE_SIZE);
 }
 
@@ -67,9 +67,9 @@ static void arp_send(uint16_t oper, const uint8_t* tha,
     pkt->hlen  = ETH_ALEN;
     pkt->plen  = 4;
     pkt->oper  = hton16(oper);
-    for (int i = 0; i < ETH_ALEN; i++) pkt->sha[i] = our_mac[i];
+    for (uint32_t i = 0; i < ETH_ALEN; i++) pkt->sha[i] = our_mac[i];
     pkt->spa = our_ip;
-    for (int i = 0; i < ETH_ALEN; i++) pkt->tha[i] = tha[i];
+    for (uint32_t i = 0; i < ETH_ALEN; i++) pkt->tha[i] = tha[i];
     pkt->tpa = tpa_be;
 
     eth_send(skb, dst_mac, ETHERTYPE_ARP);

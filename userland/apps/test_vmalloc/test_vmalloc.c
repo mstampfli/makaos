@@ -93,7 +93,6 @@ int main(void) {
 
     // ── Test 3: write to demand-paged page ────────────────────────────────
     // The page was not physically mapped yet — first write triggers #PF.
-    uint8_t* heap = (uint8_t*)brk0;
     // align heap pointer up to page boundary
     uint64_t heap_addr = (brk0 + page - 1) & ~(page - 1);
     uint8_t* p = (uint8_t*)heap_addr;
