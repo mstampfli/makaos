@@ -1495,7 +1495,8 @@ size_t strftime(char* s, size_t max, const char* fmt, const struct tm* tm) {
 
 // ── fnmatch ───────────────────────────────────────────────────────────────
 // Supports *, ?, [...] with FNM_PATHNAME (/ not matched by *) and FNM_CASEFOLD.
-static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) {
+static int fnmatch_impl(const char* pat, const char* str, int flags,
+                        int depth, const char* str_start) {
     if (depth > 64) return FNM_NOMATCH;  // recursion guard
     while (*pat) {
         if (*pat == '*') {
@@ -1509,15 +1510,15 @@ static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) 
             // Try matching pat at every position in str
             while (*str) {
                 if (flags & FNM_PATHNAME && *str == '/') return FNM_NOMATCH;
-                if (fnmatch_impl(pat, str, flags, depth + 1) == 0) return 0;
+                if (fnmatch_impl(pat, str, flags, depth + 1, str_start) == 0) return 0;
                 str++;
             }
-            return fnmatch_impl(pat, str, flags, depth + 1);
+            return fnmatch_impl(pat, str, flags, depth + 1, str_start);
         }
         if (!*str) return FNM_NOMATCH;
         if (*pat == '?') {
             if (flags & FNM_PATHNAME && *str == '/') return FNM_NOMATCH;
-            if (flags & FNM_PERIOD && *str == '.' && str == str) return FNM_NOMATCH;
+            if (flags & FNM_PERIOD && *str == '.' && str == str_start) return FNM_NOMATCH;
             pat++; str++; continue;
         }
         if (*pat == '[') {
@@ -1525,8 +1526,8 @@ static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) 
             int invert = 0;
             if (*pat == '!' || *pat == '^') { invert = 1; pat++; }
             int matched = 0;
-            char first = *pat;
-            while (*pat && (*pat != ']' || pat == pat)) {
+            const char* bracket_start = pat;
+            while (*pat && (*pat != ']' || pat == bracket_start)) {
                 if (pat[1] == '-' && pat[2] && pat[2] != ']') {
                     char lo = pat[0], hi = pat[2];
                     char sc = *str;
@@ -1547,7 +1548,7 @@ static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) 
                     pat++;
                 }
                 if (*pat == ']' && pat[-1] != '[') break;
-                (void)first;
+                (void)bracket_start;
             }
             if (*pat == ']') pat++;
             if (matched == invert) return FNM_NOMATCH;
@@ -1566,7 +1567,7 @@ static int fnmatch_impl(const char* pat, const char* str, int flags, int depth) 
 }
 
 int fnmatch(const char* pattern, const char* string, int flags) {
-    return fnmatch_impl(pattern, string, flags, 0);
+    return fnmatch_impl(pattern, string, flags, 0, string);
 }
 
 // ── POSIX regex (NFA-based ERE engine) ───────────────────────────────────

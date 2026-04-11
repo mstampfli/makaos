@@ -35,7 +35,7 @@ int eth_send(skbuff_t* skb, const uint8_t* dst, uint16_t ethertype) {
     if (!hdr) return -1;
 
     const uint8_t* mac = virtio_net_mac();
-    for (int i = 0; i < ETH_ALEN; i++) {
+    for (uint32_t i = 0; i < ETH_ALEN; i++) {
         hdr->dst[i] = dst[i];
         hdr->src[i] = mac[i];
     }

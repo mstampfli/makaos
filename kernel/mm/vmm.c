@@ -347,7 +347,7 @@ static void ser_hex64(uint64_t v) {
     }
 }
 static void ser_str(const char* s) {
-    for (; *s; s++) { while (!(inb(0x3F8+5) & 0x20)); outb(0x3F8, (uint8_t)*s); }
+    for (; *s; s++) { while (!(inb(0x3F8+5) & 0x20)) {} outb(0x3F8, (uint8_t)*s); }
 }
 
 static void kill_current(void) {
