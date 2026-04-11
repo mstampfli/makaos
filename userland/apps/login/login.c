@@ -181,6 +181,8 @@ static int read_password(char* buf, int max) {
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main(void) {
+    write(1, "\f", 1);  // clear screen on entry
+
     static char passwd_buf[4096];
     static char shadow_buf[4096];
 
@@ -247,6 +249,9 @@ int main(void) {
             // Fall back to / if home doesn't exist yet.
             chdir("/");
         }
+
+        // ── Clear screen before shell ────────────────────────────────────
+        write(1, "\f", 1);
 
         // ── Print welcome ────────────────────────────────────────────────
         write(1, "Welcome, ", 9);
