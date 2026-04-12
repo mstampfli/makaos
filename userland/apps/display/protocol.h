@@ -41,12 +41,21 @@ typedef struct __attribute__((packed)) {
 #define MD_DISPLAY_GET_SEAT     1   // → server creates seat proxy, replies with id
 #define MD_DISPLAY_SYNC         2   // → server replies with MD_DISPLAY_DONE
 #define MD_DISPLAY_CREATE_BUFFER 3  // → create buffer (+ sendfd for shmem), replies with id
+#define MD_DISPLAY_PONG         4   // → reply to server PING (liveness)
 
 // Server → Client events
 #define MD_DISPLAY_ERROR        0   // error notification
 #define MD_DISPLAY_GLOBAL_INFO  1   // fb_width, fb_height, fb_format
 #define MD_DISPLAY_OBJECT_ID    2   // newly allocated object id (response to get_*)
 #define MD_DISPLAY_DONE         3   // sync complete
+#define MD_DISPLAY_PING         4   // liveness probe — client must reply MD_DISPLAY_PONG with same serial
+
+// ping / pong payload (shared by request and event)
+typedef struct __attribute__((packed)) {
+    md_msg_header_t hdr;
+    uint32_t serial;    // compositor-chosen, echoed back verbatim by client
+    uint32_t _pad;
+} md_display_ping_t;
 
 // get_surface: no payload beyond header
 // get_seat:    no payload beyond header
@@ -216,7 +225,7 @@ typedef struct __attribute__((packed)) {
 
 #define MD_MAX_SURFACES     32      // per client
 #define MD_MAX_BUFFERS      64      // per client
-#define MD_MAX_CLIENTS      16      // total connections
+#define MD_MAX_CLIENTS      64      // total connections
 #define MD_MAX_MSG_SIZE     256     // max single message size
 #define MD_TITLE_MAX        63      // max title string length
 
@@ -238,6 +247,7 @@ typedef struct __attribute__((packed)) {
 #define MD_COLOR_BORDER             0x00606060  // medium gray
 #define MD_COLOR_CLOSE_BTN          0x000000CC  // red (BGRX: CC,00,00)
 #define MD_COLOR_CLOSE_BTN_HOVER    0x000000FF  // bright red
+#define MD_COLOR_MAXIMIZE_BTN       0x0000AA00  // green (BGRX: 00,AA,00)
 #define MD_COLOR_BACKGROUND         0x00302820  // desktop background (dark blue-gray)
 
 // ── Helper: build a header ───────────────────────────────────────────────

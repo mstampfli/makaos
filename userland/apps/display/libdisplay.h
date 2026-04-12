@@ -22,6 +22,7 @@
 typedef struct md_display        md_display_t;
 typedef struct md_client_surface md_client_surface_t;
 typedef struct md_client_buffer  md_client_buffer_t;
+typedef struct md_dbuf           md_dbuf_t;
 
 // ── Event callbacks ──────────────────────────────────────────────────────
 
@@ -110,6 +111,62 @@ uint32_t md_buffer_stride(md_client_buffer_t* buf);
 
 // Set a callback for when the compositor releases a buffer.
 void md_buffer_on_release(md_client_buffer_t* buf, md_buffer_release_handler_t handler);
+
+// ── Resize helper ────────────────────────────────────────────────────────
+//
+// Atomically swap a surface's buffer for one of the requested new size:
+//   1. Allocate a fresh buffer sized `width x height`.
+//   2. Call `render(buf, userdata)` so the client can paint it (the render
+//      callback is where the client decides whether to reflow, scale, or
+//      re-render at the new native resolution).
+//   3. Attach + full-surface damage + commit the new buffer.
+//   4. Destroy the old buffer (if any).
+//   5. Overwrite `*inout_buf` with the new buffer pointer.
+//
+// Returns 0 on success, -1 if buffer allocation failed (the old buffer is
+// left untouched in that case).
+//
+// This is the standard path for MD_SURFACE_CONFIGURE handlers. Keeping the
+// allocate/render/commit/destroy steps in one helper means clients never
+// race with the compositor's "buffer still in use" state: the new buffer is
+// already attached and committed before the old one is released.
+typedef void (*md_resize_render_fn)(md_client_buffer_t* buf, void* userdata);
+
+int md_surface_resize_commit(md_client_surface_t* surf,
+                             md_client_buffer_t** inout_buf,
+                             uint32_t width, uint32_t height,
+                             md_resize_render_fn render, void* userdata);
+
+// ── Double-buffering helper (md_dbuf) ────────────────────────────────────
+//
+// Wraps two md_client_buffers and tracks which is in-flight at the
+// compositor. Typical render loop:
+//
+//     md_client_buffer_t* buf = md_dbuf_acquire(db);  // may block
+//     paint(buf);
+//     md_dbuf_present(db);
+//
+// acquire() blocks (dispatching events) until a buffer is free, so the
+// client never stomps on a frame the compositor is still reading.
+// present() attaches + damages the full surface + commits.
+
+md_dbuf_t* md_dbuf_create(md_client_surface_t* surf,
+                          uint32_t width, uint32_t height);
+void       md_dbuf_destroy(md_dbuf_t* db);
+
+// Destroy the old pair and allocate two new buffers at the given size.
+// Returns 0 on success, -1 if allocation failed (db is left unusable).
+int        md_dbuf_resize(md_dbuf_t* db, uint32_t width, uint32_t height);
+
+// Block (dispatching events) until a back buffer is free, and return it.
+// Returns NULL on connection loss.
+md_client_buffer_t* md_dbuf_acquire(md_dbuf_t* db);
+
+// Attach/damage/commit the buffer most recently returned by acquire().
+void md_dbuf_present(md_dbuf_t* db);
+
+uint32_t md_dbuf_width(md_dbuf_t* db);
+uint32_t md_dbuf_height(md_dbuf_t* db);
 
 // ── Event handler registration ───────────────────────────────────────────
 

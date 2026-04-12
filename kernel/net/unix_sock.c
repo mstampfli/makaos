@@ -4,6 +4,13 @@
 #include "sched.h"
 #include "process.h"
 
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0x800
+#endif
+#ifndef EAGAIN
+#define EAGAIN 11
+#endif
+
 // ── Bind namespace ───────────────────────────────────────────────────────
 // Flat table mapping path → unix_sock_t*.  Protected by the single-threaded
 // kernel (add spinlock when SMP arrives).
@@ -305,6 +312,12 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
     server->state = UNIX_STATE_CONNECTED;
     client->state = UNIX_STATE_CONNECTED;
 
+    // Stamp trusted peer pids. The server side's peer is the connecting
+    // process (whose pid was recorded on the client sock during connect()).
+    // The client side's peer is the accepting process (g_current).
+    server->peer_pid = client->peer_pid;   // connector pid (set in connect())
+    client->peer_pid = g_current->pid;     // acceptor pid
+
     // Wake the client blocked in connect().
     unix_wake(client);
 
@@ -334,6 +347,11 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     if (target->type != SOCK_STREAM) return -ECONNREFUSED;
     if (target->state != UNIX_STATE_LISTENING) return -ECONNREFUSED;
     if (target->backlog_count >= target->backlog_max) return -ECONNREFUSED;
+
+    // Stash our own pid on the client sock so accept() can propagate it to
+    // the server side as the trusted peer pid (accept() overwrites our copy
+    // with the acceptor's pid right after).
+    s->peer_pid = g_current->pid;
 
     // Enqueue ourselves.
     unix_pending_t* pend = kmalloc(sizeof(unix_pending_t));
@@ -401,9 +419,12 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
                 unix_poll_wake(peer);
             }
 
-            // If we couldn't write everything, block until space.
+            // If we couldn't write everything, either return EAGAIN
+            // (nonblocking) or block until space.
             if (total < len) {
                 if (peer->buf_count >= UNIX_BUF_SIZE) {
+                    if (f->flags & O_NONBLOCK)
+                        return total > 0 ? (int)total : -EAGAIN;
                     s->waiter = g_current;
                     sched_sleep();
                 }
@@ -429,6 +450,7 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
         // Block until data available or peer disconnects.
         while (s->buf_count == 0) {
             if (s->state == UNIX_STATE_DISCONNECTED) return 0; // EOF
+            if (f->flags & O_NONBLOCK) return -EAGAIN;
             s->waiter = g_current;
             sched_sleep();
         }
@@ -444,6 +466,7 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
     // SOCK_DGRAM: dequeue one message.
     while (!s->dgram_head) {
         if (s->state == UNIX_STATE_DISCONNECTED) return 0;
+        if (f->flags & O_NONBLOCK) return -EAGAIN;
         s->waiter = g_current;
         sched_sleep();
     }

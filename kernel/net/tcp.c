@@ -7,6 +7,9 @@
 #include "kheap.h"
 #include "sched.h"
 #include "tsc.h"
+#include "errno.h"
+#include "vfs.h"
+#include "syscall.h"  // POLLIN / POLLOUT / POLLHUP / POLLERR
 
 // ── TCP constants ─────────────────────────────────────────────────────────
 #define TCP_RTO_NS        1000000000ULL   // retransmit timeout: 1 second
@@ -67,8 +70,16 @@ struct tcp_pcb {
     // Waiter: the task sleeping on recv or connect.
     task_t* waiter;
 
+    // Backpointer to the vfs_file_t wrapping this PCB on the socket layer.
+    // Used by pcb_wake() to also wake any task sleeping in poll()/select()
+    // on this socket's fd.  NULL for PCBs that do not have a socket fd yet
+    // (e.g. SYN_RCVD children before accept()).  Stored as void* to avoid
+    // dragging vfs.h into tcp.h.
+    void*    sock_file;
+
     uint8_t  fin_sent;   // 1 if FIN has been queued for sending
     uint8_t  fin_rcvd;   // 1 if remote FIN received
+    uint8_t  reset;      // 1 if the connection was aborted by RST
     uint64_t timewait_start; // when TIME_WAIT was entered
 };
 
@@ -95,12 +106,24 @@ static uint32_t seq32(void) {
 #define SEQ_GT(a,b)  ((int32_t)((a)-(b)) > 0)
 #define SEQ_GE(a,b)  ((int32_t)((a)-(b)) >= 0)
 
-// Wake a task sleeping on this PCB.
+// Wake any task blocked on this PCB: the blocking waiter (in recv/send/
+// connect/accept) and any poll()/select() waiter camped on the socket fd.
+// Both are fire-and-forget — a blocking task might be sleeping in recv
+// while another one is polling the same fd (e.g. libdisplay-style event
+// loops), and we must wake them both.
 static void pcb_wake(tcp_pcb_t* pcb) {
     if (pcb->waiter) {
         task_t* t = pcb->waiter;
         pcb->waiter = NULL;
         sched_wake(t);
+    }
+    if (pcb->sock_file) {
+        vfs_file_t* f = (vfs_file_t*)pcb->sock_file;
+        if (f->poll_waiter) {
+            task_t* pw = (task_t*)f->poll_waiter;
+            f->poll_waiter = NULL;
+            sched_wake(pw);
+        }
     }
 }
 
@@ -260,6 +283,7 @@ void tcp_recv(skbuff_t* skb) {
 
     if (flags & TCP_RST) {
         if (pcb->state != TCP_LISTEN && pcb->state != TCP_CLOSED) {
+            pcb->reset = 1;
             pcb->state = TCP_CLOSED;
             pcb_wake(pcb);
         }
@@ -476,14 +500,21 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
 }
 
 int tcp_connect(tcp_pcb_t* pcb, uint32_t dst_ip_be, uint16_t dst_port) {
+    if (!pcb) return -EINVAL;
+    if (pcb->state != TCP_CLOSED) return -EISCONN;
     pcb->remote_ip   = dst_ip_be;
     pcb->remote_port = dst_port;
     pcb->iss         = seq32();
     pcb->snd_una     = pcb->iss;
     pcb->snd_nxt     = pcb->iss;
     pcb->snd_wnd     = TCP_WINDOW;
+    pcb->reset       = 0;
     pcb->state       = TCP_SYN_SENT;
-    return tcp_send_segment(pcb, TCP_SYN, NULL, 0);
+    if (tcp_send_segment(pcb, TCP_SYN, NULL, 0) < 0) {
+        pcb->state = TCP_CLOSED;
+        return -ENOBUFS;
+    }
+    return 0;
 }
 
 int tcp_listen(tcp_pcb_t* pcb) {
@@ -499,9 +530,17 @@ tcp_pcb_t* tcp_accept(tcp_pcb_t* listener) {
     return child;
 }
 
-int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len) {
-    if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT)
-        return -1;
+int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock) {
+    if (!pcb || !data) return -EINVAL;
+    if (pcb->reset) return -ECONNRESET;
+    // CLOSE_WAIT is valid for sending until the app calls close() — the peer
+    // has half-closed its receive side, but we may still have data to send.
+    if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT) {
+        if (pcb->state == TCP_CLOSED) return -EPIPE;
+        return -ENOTCONN;
+    }
+    if (pcb->fin_sent) return -EPIPE;      // app already shut down the send side
+    if (len == 0) return 0;
 
     const uint8_t* src  = (const uint8_t*)data;
     uint32_t       done = 0;
@@ -509,9 +548,14 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len) {
     while (done < len) {
         // Wait for space in the send buffer.
         while (pcb->txbuf_used >= TCP_TXBUF_SIZE) {
+            if (done > 0) return (int)done;    // return partial progress
+            if (nonblock) return -EAGAIN;
             pcb->waiter = g_current;
             sched_sleep();
-            if (pcb->state != TCP_ESTABLISHED) return -1;
+            if (pcb->reset) return -ECONNRESET;
+            if (pcb->state == TCP_CLOSED) return -EPIPE;
+            if (pcb->state != TCP_ESTABLISHED && pcb->state != TCP_CLOSE_WAIT)
+                return -ENOTCONN;
         }
 
         uint32_t space = TCP_TXBUF_SIZE - pcb->txbuf_used;
@@ -538,31 +582,31 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len) {
     return (int)done;
 }
 
-int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len) {
+int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len, int nonblock) {
+    if (!pcb || !buf) return -EINVAL;
+    if (len == 0) return 0;
     uint8_t* dst = (uint8_t*)buf;
-    uint32_t done = 0;
 
-    while (done < len) {
-        while (pcb->rxbuf_used == 0) {
-            if (pcb->fin_rcvd) return (int)done;  // graceful EOF
-            if (pcb->state == TCP_CLOSED) return -1;
-            pcb->waiter = g_current;
-            sched_sleep();
-        }
-        uint32_t avail = pcb->rxbuf_used;
-        uint32_t copy  = len - done;
-        if (copy > avail) copy = avail;
-        for (uint32_t i = 0; i < copy; i++)
-            dst[done + i] = pcb->rxbuf[(pcb->rxbuf_head + i) & TCP_RXBUF_MASK];
-        pcb->rxbuf_head  = (pcb->rxbuf_head + copy) & TCP_RXBUF_MASK;
-        pcb->rxbuf_used -= copy;
-        pcb->rcv_wnd    += copy;
-        done            += copy;
-        // Send window update ACK.
-        tcp_send_segment(pcb, TCP_ACK, NULL, 0);
-        break;  // return what we have rather than blocking for `len` exactly
+    while (pcb->rxbuf_used == 0) {
+        // Already at EOF — return 0 bytes so the caller sees end-of-stream.
+        if (pcb->fin_rcvd) return 0;
+        if (pcb->reset)    return -ECONNRESET;
+        if (pcb->state == TCP_CLOSED) return -ENOTCONN;
+        if (nonblock)      return -EAGAIN;
+        pcb->waiter = g_current;
+        sched_sleep();
     }
-    return (int)done;
+
+    uint32_t avail = pcb->rxbuf_used;
+    uint32_t copy  = len < avail ? len : avail;
+    for (uint32_t i = 0; i < copy; i++)
+        dst[i] = pcb->rxbuf[(pcb->rxbuf_head + i) & TCP_RXBUF_MASK];
+    pcb->rxbuf_head  = (pcb->rxbuf_head + copy) & TCP_RXBUF_MASK;
+    pcb->rxbuf_used -= copy;
+    pcb->rcv_wnd    += copy;
+    // Send window update ACK so the peer can resume sending.
+    tcp_send_segment(pcb, TCP_ACK, NULL, 0);
+    return (int)copy;
 }
 
 void tcp_close(tcp_pcb_t* pcb) {
@@ -581,6 +625,28 @@ tcp_state_t tcp_pcb_state(const tcp_pcb_t* pcb) { return pcb->state; }
 
 void tcp_pcb_set_waiter(tcp_pcb_t* pcb, void* waiter) {
     pcb->waiter = (task_t*)waiter;
+}
+
+void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file) {
+    if (pcb) pcb->sock_file = file;
+}
+
+uint32_t tcp_pcb_rx_used(const tcp_pcb_t* pcb) {
+    return pcb ? pcb->rxbuf_used : 0;
+}
+
+uint32_t tcp_pcb_tx_space(const tcp_pcb_t* pcb) {
+    if (!pcb) return 0;
+    return TCP_TXBUF_SIZE - pcb->txbuf_used;
+}
+
+int tcp_pcb_eof(const tcp_pcb_t* pcb) {
+    if (!pcb) return 1;
+    return pcb->fin_rcvd ? 1 : 0;
+}
+
+int tcp_pcb_has_accept(const tcp_pcb_t* pcb) {
+    return (pcb && pcb->state == TCP_LISTEN && pcb->accept_count > 0) ? 1 : 0;
 }
 
 uint16_t tcp_ephemeral_port(void) {

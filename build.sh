@@ -95,6 +95,7 @@ echo "[+] Building user binaries"
 "$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
 USER_INCLUDES=(
@@ -106,6 +107,7 @@ USER_RT=(
     "$BUILD_DIR/user_entry.o"
     "$BUILD_DIR/user_libc.o"
     "$BUILD_DIR/user_stdio.o"
+    "$BUILD_DIR/user_dns.o"
     "$BUILD_DIR/user_math.o"
     "$BUILD_DIR/user_setjmp.o"
 )
@@ -162,6 +164,14 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ps/ps.c" -o "$BUILD_DIR/user_ps.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
    -o "$BUILD_DIR/user_ps.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/dhcpcd/dhcpcd.c" -o "$BUILD_DIR/user_dhcpcd.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_dhcpcd.o" \
+   -o "$BUILD_DIR/user_dhcpcd.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_http_get.o" \
+   -o "$BUILD_DIR/user_http_get.elf"
 
 
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/login/login.c" -o "$BUILD_DIR/user_login.o"
@@ -401,6 +411,14 @@ fi
 if [ -f "$BUILD_DIR/user_ps.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ps.elf" bin/ps
     echo "[+] ps ELF installed at bin/ps (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_dhcpcd.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dhcpcd.elf" bin/dhcpcd
+    echo "[+] dhcpcd ELF installed at bin/dhcpcd (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_http_get.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_http_get.elf" bin/http_get
+    echo "[+] http_get ELF installed at bin/http_get (root:root 0755)"
 fi
 
 if [ -f "$BUILD_DIR/user_ksec.elf" ]; then

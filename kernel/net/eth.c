@@ -7,6 +7,7 @@
 const uint8_t eth_broadcast[ETH_ALEN] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 void eth_recv(skbuff_t* skb) {
+    serial_puts_dbg("[eth]rx\n");
     if (skb->len < ETH_HDR_LEN) { skb_free(skb); return; }
 
     eth_hdr_t* hdr = (eth_hdr_t*)skb->data;

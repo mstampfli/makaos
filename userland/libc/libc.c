@@ -970,6 +970,10 @@ int openpty(int fds[2]) {
     return (int)(long)__syscall_ret(syscall1(93 /* SYS_OPENPTY */, (uint64_t)fds));
 }
 
+int getpeerpid(int fd) {
+    return (int)(long)__syscall_ret(syscall1(94 /* SYS_GETPEERPID */, (uint64_t)fd));
+}
+
 // ── BSD Sockets ──────────────────────────────────────────────────────────
 
 int socket(int domain, int type, int protocol) {
@@ -998,15 +1002,108 @@ int connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
 }
 
 ssize_t send(int fd, const void* buf, size_t len, int flags) {
+    // SYS_SENDTO takes 6 args (fd, buf, len, flags, addr, addrlen).  We
+    // must explicitly zero the addr/addrlen slots so the kernel does not
+    // read stale r8/r9 values from the caller's register file.
     return (ssize_t)__syscall_ret(
-        syscall4(SYS_SENDTO, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
-                  (uint64_t)flags));
+        syscall6(SYS_SENDTO, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags, 0, 0));
 }
 
 ssize_t recv(int fd, void* buf, size_t len, int flags) {
     return (ssize_t)__syscall_ret(
-        syscall4(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
-                  (uint64_t)flags));
+        syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags, 0, 0));
+}
+
+ssize_t sendto(int fd, const void* buf, size_t len, int flags,
+                const struct sockaddr* dst, socklen_t dstlen) {
+    return (ssize_t)__syscall_ret(
+        syscall6(SYS_SENDTO, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags, (uint64_t)dst, (uint64_t)dstlen));
+}
+
+ssize_t recvfrom(int fd, void* buf, size_t len, int flags,
+                  struct sockaddr* src, socklen_t* srclen) {
+    return (ssize_t)__syscall_ret(
+        syscall6(SYS_RECVFROM, (uint64_t)fd, (uint64_t)buf, (uint64_t)len,
+                  (uint64_t)flags, (uint64_t)src, (uint64_t)srclen));
+}
+
+int setsockopt(int fd, int level, int optname,
+                const void* optval, socklen_t optlen) {
+    return (int)__syscall_ret(
+        syscall5(SYS_SETSOCKOPT, (uint64_t)fd, (uint64_t)level,
+                  (uint64_t)optname, (uint64_t)optval, (uint64_t)optlen));
+}
+
+int net_ifconfig(const ifcfg_t* cfg) {
+    return (int)__syscall_ret(
+        syscall2(SYS_NET_IFCONFIG, (uint64_t)cfg, (uint64_t)sizeof(*cfg)));
+}
+
+int net_mac(uint8_t out[6]) {
+    return (int)__syscall_ret(syscall1(SYS_NET_MAC, (uint64_t)out));
+}
+
+// ── inet_pton / inet_ntop — IPv4 only ────────────────────────────────────
+int inet_pton(int family, const char* src, void* out) {
+    if (family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+    if (!src || !out) return 0;
+
+    uint32_t parts[4] = {0,0,0,0};
+    int      idx = 0;
+    int      seen_digit = 0;
+    const char* p = src;
+
+    while (*p) {
+        if (*p >= '0' && *p <= '9') {
+            uint32_t v = (uint32_t)(parts[idx] * 10u + (uint32_t)(*p - '0'));
+            if (v > 255) return 0;
+            parts[idx] = v;
+            seen_digit = 1;
+        } else if (*p == '.') {
+            if (!seen_digit) return 0;
+            idx++;
+            if (idx > 3) return 0;
+            seen_digit = 0;
+        } else {
+            return 0;
+        }
+        p++;
+    }
+    if (idx != 3 || !seen_digit) return 0;
+
+    uint8_t* dst = (uint8_t*)out;
+    dst[0] = (uint8_t)parts[0];
+    dst[1] = (uint8_t)parts[1];
+    dst[2] = (uint8_t)parts[2];
+    dst[3] = (uint8_t)parts[3];
+    return 1;
+}
+
+const char* inet_ntop(int family, const void* src, char* dst, socklen_t dst_len) {
+    if (family != AF_INET) { errno = EAFNOSUPPORT; return NULL; }
+    if (!src || !dst) { errno = EINVAL; return NULL; }
+
+    const uint8_t* ip = (const uint8_t*)src;
+    char tmp[16];   // "255.255.255.255\0"
+    int  n = 0;
+    for (int i = 0; i < 4; i++) {
+        uint8_t v = ip[i];
+        if (v >= 100) { tmp[n++] = (char)('0' + v / 100); v %= 100;
+                         tmp[n++] = (char)('0' + v / 10);  v %= 10;
+                         tmp[n++] = (char)('0' + v); }
+        else if (v >= 10) { tmp[n++] = (char)('0' + v / 10); v %= 10;
+                             tmp[n++] = (char)('0' + v); }
+        else tmp[n++] = (char)('0' + v);
+        if (i < 3) tmp[n++] = '.';
+    }
+    tmp[n++] = '\0';
+
+    if ((socklen_t)n > dst_len) { errno = ENOSPC; return NULL; }
+    for (int i = 0; i < n; i++) dst[i] = tmp[i];
+    return dst;
 }
 
 int shutdown(int fd, int how) {

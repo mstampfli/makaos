@@ -43,6 +43,7 @@ typedef struct skbuff {
     // Routing / interface metadata.
     uint32_t src_ip_be;  // source IPv4 address (network byte order)
     uint32_t dst_ip_be;  // destination IPv4 address (network byte order)
+    uint16_t src_port_be;// source L4 port for UDP (stamped at udp_recv), net order
     uint8_t  protocol;   // IP protocol (IPPROTO_TCP, IPPROTO_UDP, IPPROTO_ICMP)
 
     uint32_t refcount;   // reference count (1 after alloc, skb_free when 0)
@@ -73,6 +74,7 @@ static inline skbuff_t* skb_alloc(uint32_t data_len) {
     skb->trans_hdr = NULL;
     skb->src_ip_be = 0;
     skb->dst_ip_be = 0;
+    skb->src_port_be = 0;
     skb->protocol  = 0;
     skb->refcount  = 1;
     skb->next      = NULL;
@@ -96,6 +98,7 @@ static inline skbuff_t* skb_wrap(uint8_t* data, uint32_t len) {
     skb->trans_hdr = NULL;
     skb->src_ip_be = 0;
     skb->dst_ip_be = 0;
+    skb->src_port_be = 0;
     skb->protocol  = 0;
     skb->refcount  = 1;
     skb->next      = NULL;

@@ -159,6 +159,13 @@ void signal_deliver_pending(void) {
     // SIG_IGN: silently discard.
     if (handler == (uint64_t)SIG_IGN) return;
 
+    // Signals whose POSIX default action is "ignore" — swallow them even when
+    // the process never installed a handler. Terminating on SIGWINCH was
+    // killing every client that did TIOCSWINSZ on its pty.
+    if (handler == (uint64_t)SIG_DFL &&
+        (sig == SIGWINCH || sig == SIGCHLD))
+        return;
+
     // User handler: only deliverable on the syscall return path.
     if (handler != (uint64_t)SIG_DFL && g_signal_in_syscall &&
         !(g_current->flags & TASK_FLAG_KTHREAD)) {
@@ -183,6 +190,28 @@ void signal_deliver_pending(void) {
         for (int i = 0; name[i]; i++) fb_term_putc(name[i]);
         fb_term_putc('\n');
         g_fb_fg = saved_fg;
+    }
+
+    // Reparent any children to init before we vanish.
+    extern task_t* g_init_task;
+    task_t* child = g_current->children;
+    while (child) {
+        task_t* next_child = child->child_next;
+        if (g_init_task && g_init_task != g_current) {
+            child->ppid = g_init_task->pid;
+            task_child_add(g_init_task, child);
+        } else {
+            child->ppid = 0;
+            child->child_next = NULL;
+        }
+        child = next_child;
+    }
+    g_current->children = NULL;
+
+    // Drop the fd table now so peers see EOF immediately (matching sys_exit).
+    if (g_current->files_shared) {
+        task_files_release(g_current->files_shared);
+        g_current->files_shared = NULL;
     }
 
     // Zombie instead of TASK_DEAD so the parent can reap via waitpid.
