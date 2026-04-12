@@ -68,11 +68,20 @@ static void zero_mem(void* p, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) b[i] = 0;
 }
 
-// Wake a task sleeping on a socket.
+// Wake a task sleeping on a socket (blocking recv/accept/connect).
 static void unix_wake(unix_sock_t* s) {
     if (s->waiter) {
         task_t* w = (task_t*)s->waiter;
         s->waiter = NULL;
+        sched_wake(w);
+    }
+}
+
+// Wake a task sleeping in poll/select on this socket's vfs_file.
+static void unix_poll_wake(unix_sock_t* s) {
+    if (s->file && s->file->poll_waiter) {
+        task_t* w = (task_t*)s->file->poll_waiter;
+        s->file->poll_waiter = NULL;
         sched_wake(w);
     }
 }
@@ -151,6 +160,7 @@ void unix_sock_close(vfs_file_t* self) {
         s->peer->peer = NULL;
         s->peer->state = UNIX_STATE_DISCONNECTED;
         unix_wake(s->peer);
+        unix_poll_wake(s->peer);
     }
 
     // Free pending connections in backlog.
@@ -200,16 +210,20 @@ vfs_file_t* unix_sock_open(int type) {
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(s); return NULL; }
 
-    f->read     = unix_vfs_read;
-    f->write    = unix_vfs_write;
-    f->close    = unix_sock_close;
-    f->seek     = NULL;
-    f->poll     = unix_vfs_poll;
-    f->ctx      = s;
-    f->flags    = 0;
-    f->refcount = 1;
-    f->rights   = 0xFFFFFFFF;
-    f->path[0]  = '\0';
+    f->read        = unix_vfs_read;
+    f->write       = unix_vfs_write;
+    f->close       = unix_sock_close;
+    f->seek        = NULL;
+    f->poll        = unix_vfs_poll;
+    f->ioctl       = NULL;
+    f->ctx         = s;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
+    f->rights      = 0xFFFFFFFF;
+    f->path[0]     = '\0';
+
+    s->file = f;  // back-pointer for poll wakeups
 
     return f;
 }
@@ -337,8 +351,9 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
 
     s->state = UNIX_STATE_CONNECTING;
 
-    // Wake the listener if it's blocked in accept().
+    // Wake the listener if it's blocked in accept() or poll().
     unix_wake(target);
+    unix_poll_wake(target);
 
     // Block until accept() completes the pairing (or listener closes).
     while (s->state == UNIX_STATE_CONNECTING) {
@@ -380,8 +395,11 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
                                          len - total);
             total += wrote;
 
-            // Wake peer if it was blocked in recv.
-            if (wrote > 0) unix_wake(peer);
+            // Wake peer if it was blocked in recv or poll.
+            if (wrote > 0) {
+                unix_wake(peer);
+                unix_poll_wake(peer);
+            }
 
             // If we couldn't write everything, block until space.
             if (total < len) {
@@ -482,8 +500,9 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     target->dgram_tail = msg;
     target->dgram_count++;
 
-    // Wake receiver.
+    // Wake receiver (blocking recv or poll).
     unix_wake(target);
+    unix_poll_wake(target);
 
     return (int)len;
 }
@@ -502,7 +521,10 @@ int unix_sock_shutdown(vfs_file_t* f, int how) {
     if (how == 1 || how == 2) {
         s->shutdown_wr = 1;
         // Notify peer that we won't write anymore → they see EOF on recv.
-        if (s->peer) unix_wake(s->peer);
+        if (s->peer) {
+            unix_wake(s->peer);
+            unix_poll_wake(s->peer);
+        }
     }
 
     return 0;
@@ -530,8 +552,9 @@ int unix_sock_sendfd(vfs_file_t* sock, vfs_file_t* file, uint32_t rights) {
     anc->tail = (anc->tail + 1) % UNIX_ANCILLARY_MAX;
     anc->count++;
 
-    // Wake peer in case it's blocked in recvfd.
+    // Wake peer in case it's blocked in recvfd or poll.
     unix_wake(s->peer);
+    unix_poll_wake(s->peer);
 
     return 0;
 }

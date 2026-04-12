@@ -40,6 +40,14 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
         p->tail = (p->tail + 1) & (PIPE_BUF_SIZE - 1);
         p->count++;
     }
+
+    // Wake reader polling on this pipe.
+    if (p->read_file && p->read_file->poll_waiter) {
+        task_t* w = (task_t*)p->read_file->poll_waiter;
+        p->read_file->poll_waiter = NULL;
+        sched_wake(w);
+    }
+
     return (int64_t)total;
 }
 
@@ -92,27 +100,34 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
         return -ENOMEM;
     }
 
-    r->read     = pipe_read;
-    r->write    = NULL;
-    r->seek     = NULL;
-    r->close    = pipe_read_close;
-    r->poll     = pipe_read_poll;
-    r->ctx      = p;
-    r->flags    = 0;
-    r->refcount = 1;
-    r->rights   = 0;
-    r->path[0]  = '\0';
+    r->read        = pipe_read;
+    r->write       = NULL;
+    r->seek        = NULL;
+    r->close       = pipe_read_close;
+    r->poll        = pipe_read_poll;
+    r->ioctl       = NULL;
+    r->ctx         = p;
+    r->poll_waiter = NULL;
+    r->flags       = 0;
+    r->refcount    = 1;
+    r->rights      = 0;
+    r->path[0]     = '\0';
 
-    w->read     = NULL;
-    w->write    = pipe_write;
-    w->seek     = NULL;
-    w->close    = pipe_write_close;
-    w->poll     = pipe_write_poll;
-    w->ctx      = p;
-    w->flags    = 0;
-    w->refcount = 1;
-    w->rights   = 0;
-    w->path[0]  = '\0';
+    w->read        = NULL;
+    w->write       = pipe_write;
+    w->seek        = NULL;
+    w->close       = pipe_write_close;
+    w->poll        = pipe_write_poll;
+    w->ioctl       = NULL;
+    w->ctx         = p;
+    w->poll_waiter = NULL;
+    w->flags       = 0;
+    w->refcount    = 1;
+    w->rights      = 0;
+    w->path[0]     = '\0';
+
+    p->read_file  = r;
+    p->write_file = w;
 
     *read_end  = r;
     *write_end = w;

@@ -912,6 +912,7 @@ int nanosleep(const struct timespec* req, struct timespec* rem) {
 // ── mmap / munmap ─────────────────────────────────────────────────────────
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
     uint64_t ret;
+    register long r10 __asm__("r10") = (long)(uint64_t)flags;
     register long r8  __asm__("r8")  = (long)fd;
     register long r9  __asm__("r9")  = off;
     __asm__ volatile(
@@ -921,10 +922,10 @@ void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
           "D"((uint64_t)addr),
           "S"((uint64_t)len),
           "d"((uint64_t)prot),
-          "r"((uint64_t)flags),
+          "r"(r10),
           "r"(r8),
           "r"(r9)
-        : "rcx", "r10", "r11", "memory"
+        : "rcx", "r11", "memory"
     );
     long r = (long)ret;
     if (r < 0 && r > -4096) { errno = (int)-r; return (void*)-1; }
@@ -952,6 +953,21 @@ int shm_unlink(const char* name) {
     while (name[len]) len++;
     return (int)(long)__syscall_ret(
         syscall2(SYS_SHM_UNLINK, (uint64_t)name, (uint64_t)len));
+}
+
+// ── Framebuffer mapping ──────────────────────────────────────────────────
+
+void* fb_map(void) {
+    uint64_t r = syscall0(SYS_FB_MAP);
+    long v = (long)r;
+    if (v < 0 && v > -4096) { errno = (int)-v; return (void*)-1L; }
+    return (void*)r;
+}
+
+// ── Pseudo-terminal ─────────────────────────────────────────────────────
+
+int openpty(int fds[2]) {
+    return (int)(long)__syscall_ret(syscall1(93 /* SYS_OPENPTY */, (uint64_t)fds));
 }
 
 // ── BSD Sockets ──────────────────────────────────────────────────────────

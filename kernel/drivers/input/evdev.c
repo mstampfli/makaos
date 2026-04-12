@@ -21,6 +21,7 @@ typedef struct evdev_client_t {
     uint32_t         head;           // reader advances this
     uint32_t         tail;           // writer advances this
     struct task_t*   reader;         // task sleeping in read(), or NULL
+    struct vfs_file_t* file;         // back-pointer for poll wakeups
     struct evdev_client_t* next;     // intrusive list — all open clients
 } evdev_client_t;
 
@@ -98,10 +99,15 @@ static void evdev_on_event(const kbd_event_t* kbd, void* data) {
         // Also push EV_SYN so clients can detect event boundaries.
         input_event_t syn = { .time_ns = ev.time_ns, .type = EV_SYN, .code = 0, .value = 0 };
         ring_push(c, &syn);
-        // Wake any sleeping reader.
+        // Wake any sleeping reader (blocking read or poll).
         if (c->reader) {
             sched_wake(c->reader);
             c->reader = NULL;
+        }
+        if (c->file && c->file->poll_waiter) {
+            task_t* w = (task_t*)c->file->poll_waiter;
+            c->file->poll_waiter = NULL;
+            sched_wake(w);
         }
     }
 }
@@ -162,6 +168,7 @@ vfs_file_t* evdev_open(void) {
     c->head   = 0;
     c->tail   = 0;
     c->reader = NULL;
+    c->file   = NULL;
     // Prepend to client list.
     c->next   = s_clients;
     s_clients = c;
@@ -176,12 +183,17 @@ vfs_file_t* evdev_open(void) {
     f->write    = NULL;
     f->close    = evdev_vfs_close;
     f->seek     = NULL;
-    f->poll     = evdev_vfs_poll;
-    f->ctx      = c;
-    f->flags    = 0;
-    f->refcount = 1;
-    f->rights   = 0;
-    f->path[0]  = '\0';
+    f->poll        = evdev_vfs_poll;
+    f->ioctl       = NULL;
+    f->ctx         = c;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
+    f->rights      = 0;
+    f->path[0]     = '\0';
+
+    c->file = f;  // back-pointer for poll wakeups
+
     return f;
 }
 

@@ -130,6 +130,7 @@ void kmain(void) {
         for (;;) __asm__ volatile("hlt");  // nothing works — halt
 
     sched_init();
+    ahci_start_io_thread();
     tty_init();
     evdev_init();
     keyboard_init();
@@ -138,7 +139,7 @@ void kmain(void) {
     net_init();
     sched_add(init);
 
-    timer_init(100);
+    timer_init(1000);
 
     __asm__ volatile("sti");
     for (;;)
