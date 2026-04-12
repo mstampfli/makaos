@@ -14,7 +14,7 @@
 
 typedef struct { char u; char s; } key_ascii_t;
 
-static const key_ascii_t s_keymap[88] = {
+static const key_ascii_t s_keymap[128] = {
 //       unshifted  shifted
 /* 00 */ { 0,       0      },
 /* 01 */ { '\x1b',  '\x1b' },   // ESC
@@ -109,8 +109,8 @@ static const key_ascii_t s_keymap[88] = {
 // ── PS/2 set-1 base scancode → Linux KEY_* ───────────────────────────────
 // For extended (E0-prefixed) scancodes, the base byte maps differently;
 // those are handled in ext_to_keycode() below.
-// Indices 0x00–0x57 cover the AT keyboard set.
-static const uint16_t s_sc_to_key[88] = {
+// Indices 0x00–0x58 cover the AT keyboard set (plus F12 at 0x58).
+static const uint16_t s_sc_to_key[128] = {
     [0x01] = KEY_ESC,       [0x02] = KEY_1,         [0x03] = KEY_2,
     [0x04] = KEY_3,         [0x05] = KEY_4,         [0x06] = KEY_5,
     [0x07] = KEY_6,         [0x08] = KEY_7,         [0x09] = KEY_8,
@@ -137,6 +137,7 @@ static const uint16_t s_sc_to_key[88] = {
     [0x4D] = KEY_KP6,       [0x4E] = KEY_KPPLUS,    [0x4F] = KEY_KP1,
     [0x50] = KEY_KP2,       [0x51] = KEY_KP3,       [0x52] = KEY_KP0,
     [0x53] = KEY_KPDOT,     [0x56] = KEY_102ND,     [0x57] = KEY_F11,
+    [0x58] = KEY_F12,
 };
 
 static uint16_t ext_to_keycode(uint8_t sc) {
@@ -213,7 +214,7 @@ static void keyboard_thread_fn(void) {
                 s_extended = 0;
                 keycode = ext_to_keycode(base);
             } else {
-                keycode = (base < 88) ? s_sc_to_key[base] : 0;
+                keycode = (base < 128) ? s_sc_to_key[base] : 0;
             }
 
             // ── Update modifier state ─────────────────────────────────────
@@ -234,7 +235,7 @@ static void keyboard_thread_fn(void) {
             // Extended keys: no direct ASCII (handlers inject ANSI sequences).
             // Base keys: use keymap, apply ctrl folding.
             uint8_t ascii = 0;
-            if (!s_extended && base < 88 && pressed) {
+            if (!s_extended && base < 128 && pressed) {
                 char c = s_shift ? s_keymap[base].s : s_keymap[base].u;
                 if (c) {
                     if (s_ctrl && c >= 'a' && c <= 'z')
