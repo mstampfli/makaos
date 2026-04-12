@@ -32,6 +32,11 @@
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
 
+// Forward declarations for serial debug helpers (defined near bottom of file).
+static void serial_putc(char c);
+static void serial_puts(const char* s);
+static void serial_hex_u32(uint32_t v);
+
 // Scratch storage for the user register state saved at syscall entry.
 uint64_t g_syscall_user_rsp    = 0;
 uint64_t g_syscall_user_rip    = 0;
@@ -481,13 +486,6 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // Reparent direct children to g_init_task before zombifying.
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
-        // Release framebuffer if this process owned it.
-        if (g_fb_exclusive && g_current->pid == g_fb_owner_pid) {
-            g_fb_exclusive = 0;
-            g_fb_owner_pid = 0;
-            fb_clear();
-        }
-
         // Move all children to init's children list and update their ppid.
         task_t* child = g_current->children;
         while (child) {
@@ -689,7 +687,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     vfs_file_t* f = ext2_open(resolved);
     if (!f) { goto enoent; }
 
-    const uint64_t MAX_ELF = 16ULL * 1024ULL * 1024ULL; // 16 MiB
+    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB
     uint8_t* buf = kmalloc(MAX_ELF);
     if (!buf) { vfs_close(f); goto oom; }
 
@@ -790,6 +788,7 @@ enoexec:
 //               0 (null ptr) = open /dev/tty0 for all three
 static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
                            uint64_t envp_ptr, uint64_t stdio_ptr) {
+    serial_puts_dbg("[spawn] path="); serial_puts_dbg((const char*)path_ptr); serial_putc_dbg('\n');
     if (!g_current) return (uint64_t)-EINVAL;
     if (!path_ptr)  return (uint64_t)-EINVAL;
 
@@ -1465,6 +1464,7 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     if (old) vfs_close(old);
 
     g_current->files_shared->fd_table[newfd] = vfs_dup(f);
+    g_current->files_shared->fd_flags[newfd] = 0;  // POSIX: dup2 clears FD_CLOEXEC
     return (uint64_t)newfd;
 }
 
@@ -1746,7 +1746,8 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
 // Name must start with '/' and contain no further slashes (POSIX requirement).
 static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
                               uint64_t oflags, uint64_t mode) {
-    if (!g_current || !name_ptr) return (uint64_t)-EINVAL;
+    serial_puts_dbg("[shm_open] namelen="); serial_hex_dbg(namelen);
+    if (!g_current || !name_ptr) { serial_puts_dbg("[shm_open] EINVAL\n"); return (uint64_t)-EINVAL; }
     if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
 
     // Copy name from userspace.
@@ -1820,6 +1821,7 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
         if (!files->fd_table[i]) {
             files->fd_table[i] = f;
             files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+            serial_puts_dbg("[shm_open] fd="); serial_hex_dbg((uint64_t)i);
             return i;
         }
     }
@@ -1921,9 +1923,6 @@ static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
     if (!src_ptr || !src_w || !src_h) return (uint64_t)-EINVAL;
     if (!g_fb.base_virt)              return (uint64_t)-EIO;
 
-    g_fb_exclusive = 1;
-    g_fb_owner_pid = g_current ? g_current->pid : 0;
-
     user_buf_prefault(src_ptr, src_w * src_h * 4);
     const uint32_t* src   = (const uint32_t*)src_ptr;
     uint32_t*       fb    = (uint32_t*)g_fb.base_virt;
@@ -1974,6 +1973,77 @@ static uint64_t sys_fb_info(uint64_t ptr) {
     return 0;
 }
 
+// ── sys_fb_map ────────────────────────────────────────────────────────────
+// fb_map() → maps physical framebuffer into calling process's user space.
+// Root only.  Returns virtual address or -errno.
+static uint64_t sys_fb_map(void) {
+    serial_puts_dbg("[fb_map] enter\n");
+    if (!g_current) { serial_puts_dbg("[fb_map] no current\n"); return (uint64_t)-ESRCH; }
+    if (g_current->cred.euid != 0) { serial_puts_dbg("[fb_map] not root\n"); return (uint64_t)-EPERM; }
+    if (!g_fb.base_virt) { serial_puts_dbg("[fb_map] no fb\n"); return (uint64_t)-EIO; }
+
+    uint64_t fb_phys = g_fb.base_virt - HHDM_OFFSET;
+    uint64_t fb_size = (uint64_t)g_fb.pitch * g_fb.height;
+
+    mm_t* mm = g_current->mm_shared->mm;
+    if (!mm) return (uint64_t)-EINVAL;
+
+    virt_addr_t vaddr = vmm_map_physical_user(
+        mm, g_current->mm_shared->pml4_phys, fb_phys, fb_size);
+    serial_puts_dbg("[fb_map] vaddr="); serial_hex_dbg(vaddr);
+    if (!vaddr) return (uint64_t)-ENOMEM;
+
+    // Compositor takes ownership — detach TTY0 console output
+    extern tty_t g_ttys[];
+    g_ttys[0].write_char = NULL;
+
+    return vaddr;
+}
+
+// ── sys_openpty ──────────────────────────────────────────────────────────
+// openpty(int fds[2]) → 0 or -errno
+// Allocates a PTY master/slave pair.  fds[0] = master, fds[1] = slave.
+#include "pty.h"
+static int64_t fd_install(vfs_file_t* f);  // forward decl
+
+static uint64_t sys_openpty(uint64_t user_fds) {
+    if (!g_current) return (uint64_t)-ESRCH;
+
+    vfs_file_t* master = NULL;
+    vfs_file_t* slave = NULL;
+    int err = pty_alloc(&master, &slave);
+    if (err < 0) return (uint64_t)(int64_t)err;
+
+    // Install into fd table
+    int64_t mfd = fd_install(master);
+    if (mfd < 0) {
+        master->close(master);
+        slave->close(slave);
+        return (uint64_t)mfd;
+    }
+
+    int64_t sfd = fd_install(slave);
+    if (sfd < 0) {
+        // Close master fd
+        g_current->files_shared->fd_table[mfd] = NULL;
+        master->close(master);
+        slave->close(slave);
+        return (uint64_t)sfd;
+    }
+
+    // Copy fds to userspace
+    int fds[2] = { (int)mfd, (int)sfd };
+    if (copy_to_user((void*)user_fds, fds, sizeof(fds)) != 0) {
+        g_current->files_shared->fd_table[mfd] = NULL;
+        g_current->files_shared->fd_table[sfd] = NULL;
+        master->close(master);
+        slave->close(slave);
+        return (uint64_t)-EFAULT;
+    }
+
+    return 0;
+}
+
 // ── Socket syscalls ───────────────────────────────────────────────────────
 
 // Helper: allocate the lowest available fd ≥ 3 and assign f to it.
@@ -2002,6 +2072,7 @@ static vfs_file_t* fd_to_file(uint64_t fd) {
 // socket(domain, type, proto) → fd or -errno
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
     (void)proto;
+    serial_puts_dbg("[socket] domain="); serial_hex_dbg(domain);
     vfs_file_t* f;
 
     if (domain == AF_UNIX) {
@@ -2013,8 +2084,9 @@ static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
         return (uint64_t)-EAFNOSUPPORT;
     }
 
-    if (!f) return (uint64_t)-ENOMEM;
+    if (!f) { serial_puts_dbg("[socket] ENOMEM\n"); return (uint64_t)-ENOMEM; }
     int64_t fd = fd_install(f);
+    serial_puts_dbg("[socket] fd="); serial_hex_dbg((uint64_t)fd);
     return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
 }
 
@@ -2033,7 +2105,10 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (is_unix_sock(f)) {
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
         if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
-        return (uint64_t)(int64_t)unix_sock_bind(f, sa->sun_path);
+        serial_puts_dbg("[bind] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_bind(f, sa->sun_path);
+        serial_puts_dbg("[bind] result="); serial_hex_dbg((uint64_t)(int64_t)r);
+        return (uint64_t)(int64_t)r;
     }
 
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
@@ -2048,8 +2123,12 @@ static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
 
-    if (is_unix_sock(f))
-        return (uint64_t)(int64_t)unix_sock_listen(f, (int)backlog);
+    if (is_unix_sock(f)) {
+        serial_puts_dbg("[listen] unix backlog="); serial_hex_dbg(backlog);
+        int r = unix_sock_listen(f, (int)backlog);
+        serial_puts_dbg("[listen] result="); serial_hex_dbg((uint64_t)(int64_t)r);
+        return (uint64_t)(int64_t)r;
+    }
 
     (void)backlog;
     int r = socket_listen(f);
@@ -2063,9 +2142,11 @@ static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr)
     if (!f) return (uint64_t)-EBADF;
 
     if (is_unix_sock(f)) {
+        serial_puts_dbg("[accept] unix waiting...\n");
         vfs_file_t* cf = unix_sock_accept(f);
-        if (!cf) return (uint64_t)-ECONNABORTED;
+        if (!cf) { serial_puts_dbg("[accept] failed\n"); return (uint64_t)-ECONNABORTED; }
         int64_t nfd = fd_install(cf);
+        serial_puts_dbg("[accept] new fd="); serial_hex_dbg((uint64_t)nfd);
         return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
     }
 
@@ -2086,7 +2167,10 @@ static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (is_unix_sock(f)) {
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
         if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
-        return (uint64_t)(int64_t)unix_sock_connect(f, sa->sun_path);
+        serial_puts_dbg("[connect] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_connect(f, sa->sun_path);
+        serial_puts_dbg("[connect] result="); serial_hex_dbg((uint64_t)(int64_t)r);
+        return (uint64_t)(int64_t)r;
     }
 
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
@@ -2531,6 +2615,7 @@ static uint64_t sys_restrict_fd(uint64_t fd, uint64_t rights_mask) {
 // The receiving side calls sys_recvfd to get a new fd stamped with new_rights.
 static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
                             uint64_t new_rights) {
+    serial_puts_dbg("[sendfd] sock="); serial_hex_dbg(sock_fd);
     if (!g_current) return (uint64_t)-EBADF;
     task_files_t* files = g_current->files_shared;
 
@@ -2552,6 +2637,7 @@ static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
         return (uint64_t)-EPERM;
 
     int r = unix_sock_sendfd(sock, target_f, (uint32_t)new_rights);
+    serial_puts_dbg("[sendfd] r="); serial_hex_dbg((uint64_t)(int64_t)r);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
 
@@ -2559,6 +2645,7 @@ static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
 // recvfd(sock_fd) → new fd or -errno
 // Dequeues a file descriptor sent via sendfd() over a Unix socket.
 static uint64_t sys_recvfd(uint64_t sock_fd) {
+    serial_puts_dbg("[recvfd] sock="); serial_hex_dbg(sock_fd);
     if (!g_current) return (uint64_t)-EBADF;
     task_files_t* files = g_current->files_shared;
 
@@ -2568,9 +2655,10 @@ static uint64_t sys_recvfd(uint64_t sock_fd) {
     if (!is_unix_sock(sock)) return (uint64_t)-ENOTSOCK;
 
     vfs_file_t* received = unix_sock_recvfd(sock);
-    if (!received) return (uint64_t)-EAGAIN;
+    if (!received) { serial_puts_dbg("[recvfd] NULL\n"); return (uint64_t)-EAGAIN; }
 
     int64_t fd = fd_install(received);
+    serial_puts_dbg("[recvfd] fd="); serial_hex_dbg((uint64_t)fd);
     return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
 }
 
@@ -2677,12 +2765,19 @@ static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
 static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     if (!g_current) return (uint64_t)-EBADF;
 
-    // Validate fd (allow 0/1/2 which are tty fds).
+    // Validate fd
     if (fd < g_current->files_shared->fd_capacity &&
         !g_current->files_shared->fd_table[fd] && fd > 2)
         return (uint64_t)-EBADF;
 
-    // Resolve which tty this fd refers to. For now tty0 is the only one.
+    // If the file has its own ioctl handler (e.g. PTY slave), use it.
+    vfs_file_t* f = NULL;
+    if (fd < g_current->files_shared->fd_capacity)
+        f = g_current->files_shared->fd_table[fd];
+    if (f && f->ioctl)
+        return (uint64_t)f->ioctl(f, request, arg);
+
+    // Fallback: resolve to controlling tty (tty0 for console processes).
     tty_t* tty = &g_ttys[0];
 
     switch (request) {
@@ -2774,16 +2869,18 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     }
 
     // Determine timeout in nanoseconds (NULL = infinite).
-    uint64_t timeout_ns = UINT64_MAX;
+    int sel_infinite = 1;
+    uint64_t timeout_ns = 0;
     if (tv_ptr) {
         k_timeval_t tv;
         copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv));
         timeout_ns = (uint64_t)tv.tv_sec * 1000000000ULL
                    + (uint64_t)tv.tv_usec * 1000ULL;
+        sel_infinite = 0;
     }
 
     extern uint64_t tsc_read_ns(void);
-    uint64_t deadline = tsc_read_ns() + timeout_ns;
+    uint64_t deadline = sel_infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
     do {
@@ -2802,11 +2899,30 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             }
         }
         if (count > 0) break;
-        if (timeout_ns == 0) break;
-        // Yield and retry until timeout.
-        extern void sched_yield(void);
-        sched_yield();
-    } while (tsc_read_ns() < deadline);
+        if (!sel_infinite && timeout_ns == 0) break;
+        // Register as poll_waiter on all watched fds.
+        for (uint32_t fd = 0; fd < nfds; fd++) {
+            if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) && !FD_ISSET(fd, &eset))
+                continue;
+            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (f) f->poll_waiter = g_current;
+        }
+        {
+            uint64_t now = tsc_read_ns();
+            uint64_t wake = now + 10000000ULL; // 10ms fallback
+            if (!sel_infinite && wake > deadline) wake = deadline;
+            g_current->sleep_until_ns = wake;
+            sched_sleep();
+            g_current->sleep_until_ns = 0;
+        }
+        // Clear poll_waiter on all watched fds.
+        for (uint32_t fd = 0; fd < nfds; fd++) {
+            if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) && !FD_ISSET(fd, &eset))
+                continue;
+            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
+        }
+    } while (sel_infinite || tsc_read_ns() < deadline);
 
     // Write back output sets.
     if (rset_ptr) copy_to_user((void*)rset_ptr, &rout, sizeof(rout));
@@ -2825,10 +2941,10 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
     pollfd_t* ufds = (pollfd_t*)fds_ptr;
     task_files_t* files = g_current->files_shared;
 
-    uint64_t timeout_ns = (timeout_ms == (uint64_t)-1) ? UINT64_MAX
-                        : (timeout_ms * 1000000ULL);
+    int infinite = (timeout_ms == (uint64_t)-1);
+    uint64_t timeout_ns = infinite ? 0 : (timeout_ms * 1000000ULL);
     extern uint64_t tsc_read_ns(void);
-    uint64_t deadline = tsc_read_ns() + timeout_ns;
+    uint64_t deadline = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
     do {
@@ -2847,9 +2963,30 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         }
         if (count > 0) break;
         if (timeout_ms == 0) break;
-        extern void sched_yield(void);
-        sched_yield();
-    } while (tsc_read_ns() < deadline);
+        // Register as poll_waiter on all fds so data producers wake us instantly.
+        for (uint64_t i = 0; i < nfds; i++) {
+            int fd = ufds[i].fd;
+            if (fd < 0) continue;
+            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (f) f->poll_waiter = g_current;
+        }
+        // Sleep with a timeout as fallback (in case no producer wakes us).
+        {
+            uint64_t now = tsc_read_ns();
+            uint64_t wake = now + 10000000ULL; // 10ms fallback
+            if (!infinite && wake > deadline) wake = deadline;
+            g_current->sleep_until_ns = wake;
+            sched_sleep();
+            g_current->sleep_until_ns = 0;
+        }
+        // Clear poll_waiter on all fds after waking.
+        for (uint64_t i = 0; i < nfds; i++) {
+            int fd = ufds[i].fd;
+            if (fd < 0) continue;
+            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
+        }
+    } while (infinite || tsc_read_ns() < deadline);
 
     return (uint64_t)(int64_t)count;
 }
@@ -3108,6 +3245,8 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETTOD:       ret = sys_gettimeofday(arg1, arg2);              break;
         case SYS_FB_BLIT:      ret = sys_fb_blit(arg1, arg2, arg3, arg4);      break;
         case SYS_FB_INFO:      ret = sys_fb_info(arg1);                         break;
+        case SYS_FB_MAP:       ret = sys_fb_map();                              break;
+        case SYS_OPENPTY:      ret = sys_openpty(arg1);                         break;
         case SYS_SOCKET:       ret = sys_socket(arg1, arg2, arg3);              break;
         case SYS_BIND:         ret = sys_bind(arg1, arg2, arg3);                break;
         case SYS_LISTEN:       ret = sys_listen(arg1, arg2);                    break;

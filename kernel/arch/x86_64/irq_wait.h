@@ -9,6 +9,10 @@
 // Sleep until the given IRQ line fires.
 void irq_wait(uint8_t irq);
 
+// Drain any accumulated pending counts for the given IRQ line.
+// Call before issuing a new command to avoid consuming stale IRQs.
+void irq_drain(uint8_t irq);
+
 // Wake the process sleeping on the given IRQ line.
 // Called from IRQ handlers after EOI.
 void irq_notify(uint8_t irq);

@@ -7,8 +7,6 @@ uint32_t g_fb_col = 0;
 uint32_t g_fb_row = 0;
 uint32_t g_fb_fg  = 0x00FFFFFF; /* white */
 uint32_t g_fb_bg  = 0x00000000; /* black */
-int      g_fb_exclusive = 0;
-uint64_t g_fb_owner_pid = 0;
 
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
     g_fb.base_virt = fb_phys + HHDM_OFFSET;
@@ -23,7 +21,6 @@ void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
 }
 
 void fb_clear(void) {
-    if (g_fb_exclusive) return;
     uint32_t rows = g_fb.height;
     uint32_t cols = g_fb.pitch / 4;
     uint32_t* row_ptr = (uint32_t*)g_fb.base_virt;
@@ -70,7 +67,6 @@ void fb_term_scroll(void) {
 }
 
 void fb_term_putc(char c) {
-    if (g_fb_exclusive) return;
     uint32_t cols = fb_cols();
     uint32_t rows = fb_rows();
 

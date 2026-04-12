@@ -4,6 +4,7 @@
 // Future ttys (serial, pty) slot in identically.
 
 #include "tty.h"
+#include "pty.h"
 #include "input_core.h"
 #include "vfs.h"
 #include "kheap.h"
@@ -224,6 +225,7 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
     const uint8_t* src = (const uint8_t*)buf;
+    if (!tty->write_char) return (int64_t)len;  // no output backend (e.g. compositor owns fb)
     for (uint64_t i = 0; i < len; i++) {
         uint8_t c = src[i];
         // OPOST + ONLCR: translate \n → \r\n on output.
@@ -265,10 +267,12 @@ vfs_file_t* tty_open(int idx) {
     f->write    = tty_vfs_write;
     f->close    = tty_vfs_close;
     f->seek     = NULL;   // ttys are not seekable
-    f->poll     = tty_vfs_poll;
-    f->ctx      = ctx;
-    f->flags    = 0;
-    f->refcount = 1;
+    f->poll        = tty_vfs_poll;
+    f->ioctl       = NULL;  // tty0 ioctl handled by sys_ioctl fallback
+    f->ctx         = ctx;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
     f->rights   = 0;   // device fd: no rights enforcement (checked as open by kernel)
     f->path[0]  = '\0';
 
@@ -278,9 +282,16 @@ vfs_file_t* tty_open(int idx) {
 // ── tty_get_ctty / tty_set_ctty ──────────────────────────────────────────
 tty_t* tty_get_ctty(void) {
     if (!g_current) return NULL;
+    // Check physical TTYs
     for (int i = 0; i < TTY_COUNT; i++) {
         if (g_ttys[i].session == g_current->sid)
             return &g_ttys[i];
+    }
+    // Check PTY slaves
+    extern pty_t g_ptys[];
+    for (int i = 0; i < PTY_MAX; i++) {
+        if (g_ptys[i].allocated && g_ptys[i].slave.session == g_current->sid)
+            return &g_ptys[i].slave;
     }
     return NULL;
 }

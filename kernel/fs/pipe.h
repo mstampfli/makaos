@@ -21,6 +21,8 @@ typedef struct {
     uint32_t count;         // bytes currently in buffer
     uint8_t  writer_refs;   // number of open write-end fds
     uint8_t  reader_refs;   // number of open read-end fds
+    struct vfs_file_t* read_file;   // back-pointer for poll wakeups
+    struct vfs_file_t* write_file;  // back-pointer for poll wakeups
 } pipe_buf_t;
 
 // Create a pipe; fills fds[0] (read) and fds[1] (write).

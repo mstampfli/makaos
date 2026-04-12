@@ -108,9 +108,30 @@ phys_addr_t vmm_kernel_pml4_get(void);
 // Successive calls allocate from a growing window starting at 0xFFFF900000000000.
 virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes);
 
+// Map a contiguous range of physical addresses into a process's user
+// address space.  Used for MMIO (e.g. framebuffer mapping via SYS_FB_MAP).
+// Creates a VMA with VMA_MMIO flag.  Pages are mapped immediately (not
+// demand-paged) with write-combining (PWT) cache policy.
+// Returns the virtual address, or 0 on failure.
+struct mm_t;
+virt_addr_t vmm_map_physical_user(struct mm_t* mm, phys_addr_t pml4_phys,
+                                  phys_addr_t phys, uint64_t bytes);
+
 // Page-fault ISR (called from IDT handler for vector 14)
 typedef struct interrupt_frame_t interrupt_frame_t;
 void isr14_page_fault(interrupt_frame_t* f, uint64_t ec);
+
+// ── get_user_pages ───────────────────────────────────────────────────────
+// Resolve `count` pages starting at user virtual address `uaddr` to
+// kernel-accessible (HHDM) pointers.  Handles demand-paging: if a page
+// is not yet mapped, allocates a fresh frame and maps it.
+// `out` must have room for `count` pointers.
+// Returns `count` on success, 0 on failure.
+// The caller must be in the context of the process that owns `uaddr`
+// (i.e. the process's PML4 must be the currently loaded one, or
+// pml4_phys must be explicitly passed).
+uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
+                            uint32_t count, void** out);
 
 // Return the physical address currently in CR3.
 phys_addr_t vmm_current_pml4(void);

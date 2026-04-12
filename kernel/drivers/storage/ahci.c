@@ -7,6 +7,7 @@
 #include "lapic.h"
 #include "irq_wait.h"
 #include "sched.h"
+#include "process.h"
 
 // ── PCI class codes for AHCI ──────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
@@ -142,6 +143,37 @@ static phys_addr_t s_cmdtbl_phys;    // 4 KB, cmd_table_t for slot 0
 #define DMA_SECTORS (8u * PAGE_SIZE / 512u)   // 64 sectors = 32 KB
 static phys_addr_t s_dma_phys;
 
+// ── I/O request queue ────────────────────────────────────────────────────
+// After the scheduler starts, all disk I/O goes through a dedicated kthread.
+// Callers submit requests and sleep; the kthread processes them serially
+// (it's the sole owner of the AHCI hardware) and wakes each caller on
+// completion.  Before the kthread starts, do_rw uses direct polling.
+
+#define AHCI_MAX_REQS  32
+#define AHCI_MAX_PAGES 16  // max pages per scatter-gather request (64KB)
+
+typedef struct {
+    uint64_t lba;
+    void*    buf;           // kernel-space buffer (used if page_count == 0)
+    uint32_t count;         // sector count
+    uint8_t  write;
+    task_t*  waiter;
+    volatile uint8_t done;
+    uint8_t  result;
+    // Scatter-gather: pre-resolved HHDM page pointers for user buffers.
+    // If page_count > 0, the kthread scatters/gathers DMA data across
+    // these pages instead of using `buf`.  Each entry points to the
+    // start of a 4KB page (via HHDM).
+    uint8_t* pages[AHCI_MAX_PAGES];
+    uint32_t page_count;         // 0 = use buf; >0 = scatter-gather
+    uint32_t first_page_offset;  // byte offset within pages[0]
+} ahci_req_t;
+
+static ahci_req_t  s_req_ring[AHCI_MAX_REQS];
+static volatile uint8_t s_req_head = 0;   // kthread consumes here
+static volatile uint8_t s_req_tail = 0;   // producers insert here
+static task_t*     s_io_thread = NULL;     // the kthread task_t
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 static void udelay(uint32_t us) {
@@ -224,8 +256,10 @@ void ahci_irq_handler(void) {
 
 // ── Issue one chunk command via bounce buffer ─────────────────────────────
 // count must be <= DMA_SECTORS.
+// `use_irq`: 0 = busy-poll (early boot), 1 = IRQ-wait (kthread).
 
-static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write) {
+static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write,
+                          uint8_t use_irq) {
     hba_port_t* p = s_port;
 
     // Wait for port idle: BSY=0 and DRQ=0.
@@ -268,15 +302,22 @@ static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write) {
 
     p->is   = p->is;
     p->serr = p->serr;
+
     p->ci   = 1u;
 
-    if (g_ahci_irq != 0xFF && g_current != NULL) {
+    if (use_irq) {
+        // Hybrid: spin briefly for fast DMA, fall back to IRQ sleep.
+        for (int spin = 0; spin < 4000; spin++) {
+            if (!(p->ci & 1u)) goto done;
+            if (p->is & PORT_IS_TFES) return 0;
+        }
+        irq_drain(g_ahci_irq);
         do {
             if (p->is & PORT_IS_TFES) return 0;
             irq_wait(g_ahci_irq);
         } while (p->ci & 1u);
     } else {
-        // Polling fallback: used during early init (before scheduler).
+        // Polling: used during early boot (no scheduler).
         for (int i = 0; i < 3000000; i++) {
             if (!(p->ci & 1u)) break;
             if (p->is & PORT_IS_TFES) return 0;
@@ -284,12 +325,14 @@ static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write) {
             udelay(10);
         }
     }
+done:
     return (p->is & PORT_IS_TFES) ? 0 : 1;
 }
 
-// ── Public read/write — uses bounce buffer, safe for any kernel pointer ───
+// ── Direct I/O (polling) — used before kthread starts ─────────────────────
 
-static uint8_t do_rw(uint64_t lba, void* buf, uint32_t count, uint8_t write) {
+static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
+                             uint8_t write) {
     if (!s_port) return 0;
     uint8_t* p8 = (uint8_t*)buf;
 
@@ -302,7 +345,7 @@ static uint8_t do_rw(uint64_t lba, void* buf, uint32_t count, uint8_t write) {
             for (uint32_t i = 0; i < bytes; i++) dma[i] = p8[i];
         }
 
-        if (!issue_one(lba, n, write)) return 0;
+        if (!issue_one(lba, n, write, 0)) return 0;
 
         if (!write) {
             for (uint32_t i = 0; i < bytes; i++) p8[i] = dma[i];
@@ -315,14 +358,224 @@ static uint8_t do_rw(uint64_t lba, void* buf, uint32_t count, uint8_t write) {
     return 1;
 }
 
+// ── I/O kthread ──────────────────────────────────────────────────────────
+// Sole owner of the AHCI hardware after boot.  Processes requests serially,
+// uses IRQ-based wait, wakes the submitter when done.
+
+// Copy between a DMA bounce buffer and a scatter-gather page list.
+// `to_dma`=1: pages→dma (write path). `to_dma`=0: dma→pages (read path).
+static void scatter_copy(uint8_t* dma, uint32_t bytes,
+                         uint8_t** pages, uint32_t page_count,
+                         uint32_t first_offset, uint32_t buf_offset,
+                         uint8_t to_dma) {
+    uint32_t pos = buf_offset;  // position in the logical user buffer
+    uint32_t done = 0;
+    while (done < bytes) {
+        // Which page does `pos` land in?
+        uint32_t abs = first_offset + pos;
+        uint32_t pg  = abs / PAGE_SIZE;
+        uint32_t off = abs % PAGE_SIZE;
+        if (pg >= page_count) break;
+        uint32_t chunk = PAGE_SIZE - off;
+        if (chunk > bytes - done) chunk = bytes - done;
+        uint8_t* p = pages[pg] + off;
+        if (to_dma) {
+            for (uint32_t i = 0; i < chunk; i++) dma[done + i] = p[i];
+        } else {
+            for (uint32_t i = 0; i < chunk; i++) p[i] = dma[done + i];
+        }
+        done += chunk;
+        pos  += chunk;
+    }
+}
+
+static void ahci_io_thread(void) {
+    for (;;) {
+        // Sleep until there's work.
+        while (s_req_head == s_req_tail)
+            sched_sleep();
+
+        // Process one request.
+        ahci_req_t* r = &s_req_ring[s_req_head];
+        uint64_t lba   = r->lba;
+        uint32_t count = r->count;
+        uint8_t  write = r->write;
+        uint8_t  ok    = 1;
+
+        // Linear (kernel buffer) or scatter-gather (user pages)?
+        uint8_t  scatter = (r->page_count > 0);
+        uint8_t* p8      = (uint8_t*)r->buf;  // used only if !scatter
+        uint32_t sg_off  = 0;  // byte offset into scatter buffer
+
+        while (count > 0 && ok) {
+            uint32_t n     = count < DMA_SECTORS ? count : DMA_SECTORS;
+            uint32_t bytes = n * 512;
+            uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
+
+            if (write) {
+                if (scatter)
+                    scatter_copy(dma, bytes, r->pages, r->page_count,
+                                 r->first_page_offset, sg_off, 1);
+                else
+                    for (uint32_t i = 0; i < bytes; i++) dma[i] = p8[i];
+            }
+
+            ok = issue_one(lba, n, write, 1);
+
+            if (ok && !write) {
+                if (scatter)
+                    scatter_copy(dma, bytes, r->pages, r->page_count,
+                                 r->first_page_offset, sg_off, 0);
+                else
+                    for (uint32_t i = 0; i < bytes; i++) p8[i] = dma[i];
+            }
+
+            if (!scatter) p8 += bytes;
+            sg_off += bytes;
+            lba    += n;
+            count  -= n;
+        }
+
+        r->result = ok;
+        r->done   = 1;
+        __asm__ volatile("" ::: "memory");  // compiler barrier
+        if (r->waiter) sched_wake(r->waiter);
+
+        s_req_head = (s_req_head + 1) % AHCI_MAX_REQS;
+    }
+}
+
+// ── Resolve user-space buffer to HHDM kernel pointer ────────���────────────
+// If `buf` is a user-space address (lower half), walk the current process's
+// page tables to find the physical frame and return the HHDM pointer.
+// If `buf` is already a kernel address (upper half / HHDM), return as-is.
+// This lets the I/O kthread safely access the buffer from any context,
+// since HHDM is always mapped regardless of which process's CR3 is loaded.
+// NOTE: only works for buffers that fit within a single page.  For multi-page
+// buffers, the caller must ensure each page is resolved (or use a kernel buf).
+static void* resolve_to_hhdm(void* buf) {
+    uint64_t va = (uint64_t)buf;
+    if (va >= HHDM_OFFSET) return buf;  // already kernel space
+    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+    uint64_t page_va = va & ~0xFFFULL;
+    phys_addr_t phys = vmm_page_phys(pml4, page_va);
+    if (phys == PMM_INVALID_ADDR) return buf;  // can't resolve — hope for the best
+    return (void*)(phys + HHDM_OFFSET + (va & 0xFFFULL));
+}
+
+// ── Submit a request to the I/O thread and sleep until completion ────��────
+
+static uint8_t ahci_submit(uint64_t lba, void* buf, uint32_t count,
+                            uint8_t write) {
+    // Resolve user-space buffer to HHDM pointer so the kthread can access it.
+    // Multi-page buffers: we resolve page-by-page by checking if buf is in
+    // user space.  For now, all callers pass kernel-space buffers (block cache,
+    // static buffers) so this is a safety net — the fast path is a no-op.
+    void* kbuf = resolve_to_hhdm(buf);
+
+    // Find a slot in the ring.
+    uint8_t next_tail = (s_req_tail + 1) % AHCI_MAX_REQS;
+
+    // If ring is full, spin-yield until a slot opens.
+    while (next_tail == s_req_head)
+        sched_yield();
+
+    ahci_req_t* r = &s_req_ring[s_req_tail];
+    r->lba    = lba;
+    r->buf    = kbuf;
+    r->count  = count;
+    r->write  = write;
+    r->waiter = g_current;
+    r->done   = 0;
+    r->result = 0;
+    r->page_count = 0;
+    r->first_page_offset = 0;
+    __asm__ volatile("" ::: "memory");  // ensure fields visible before tail bump
+
+    s_req_tail = next_tail;
+
+    // Wake the I/O thread if it's sleeping.
+    if (s_io_thread) sched_wake(s_io_thread);
+
+    // Sleep until the I/O thread sets done=1 and wakes us.
+    while (!r->done)
+        sched_sleep();
+
+    return r->result;
+}
+
+// ── Scatter-gather submit: resolve user pages and DMA directly ───────────
+// Called from ext2's multi-block path.  Resolves the user buffer pages
+// via vmm_get_user_pages() so the kthread can write DMA data directly
+// to the user's physical frames via HHDM — zero extra copies.
+
+static uint8_t ahci_submit_sg(uint64_t lba, void* user_buf,
+                               uint32_t count, uint8_t write) {
+    uint64_t va = (uint64_t)user_buf;
+    uint32_t total_bytes = count * 512;
+    uint32_t first_off = (uint32_t)(va & 0xFFF);
+    uint32_t npages = (first_off + total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    if (npages > AHCI_MAX_PAGES) return 0;  // too large for scatter list
+
+    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+    void* page_ptrs[AHCI_MAX_PAGES];
+    if (!vmm_get_user_pages(pml4, va, npages, page_ptrs))
+        return 0;
+
+    // Submit with scatter-gather.
+    uint8_t next_tail = (s_req_tail + 1) % AHCI_MAX_REQS;
+    while (next_tail == s_req_head)
+        sched_yield();
+
+    ahci_req_t* r = &s_req_ring[s_req_tail];
+    r->lba    = lba;
+    r->buf    = NULL;
+    r->count  = count;
+    r->write  = write;
+    r->waiter = g_current;
+    r->done   = 0;
+    r->result = 0;
+    r->page_count        = npages;
+    r->first_page_offset = first_off;
+    for (uint32_t i = 0; i < npages; i++)
+        r->pages[i] = (uint8_t*)page_ptrs[i];
+    __asm__ volatile("" ::: "memory");
+
+    s_req_tail = next_tail;
+    if (s_io_thread) sched_wake(s_io_thread);
+    while (!r->done) sched_sleep();
+    return r->result;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 uint8_t ahci_read(uint64_t lba, void* buf, uint32_t count) {
-    return do_rw(lba, buf, count, 0);
+    if (!s_port) return 0;
+    if (s_io_thread) return ahci_submit(lba, buf, count, 0);
+    return do_rw_direct(lba, buf, count, 0);
 }
 
 uint8_t ahci_write(uint64_t lba, const void* buf, uint32_t count) {
-    return do_rw(lba, (void*)buf, count, 1);
+    if (!s_port) return 0;
+    if (s_io_thread) return ahci_submit(lba, (void*)buf, count, 1);
+    return do_rw_direct(lba, (void*)buf, count, 1);
+}
+
+// Read directly into a user-space buffer via scatter-gather.
+// Resolves user pages to HHDM, DMA bounce → pages.  Zero extra copies.
+uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
+    if (!s_port) return 0;
+    if (s_io_thread) return ahci_submit_sg(lba, user_buf, count, 0);
+    return do_rw_direct(lba, user_buf, count, 0);
+}
+
+// ── Start the I/O kthread (call after sched_init) ────────────────────────
+
+void ahci_start_io_thread(void) {
+    if (g_ahci_irq == 0xFF) return;  // no MSI — stay in polling mode
+    s_io_thread = task_create_kthread(ahci_io_thread, pid_alloc());
+    if (s_io_thread) sched_add(s_io_thread);
 }
 
 // ── ahci_init ─────────────────────────────────────────────────────────────

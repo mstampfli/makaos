@@ -103,6 +103,10 @@
 #define SYS_SHM_OPEN   90  // shm_open(name,namelen,oflags,mode)  → fd or -errno
 #define SYS_SHM_UNLINK 91  // shm_unlink(name,namelen)            → 0 or -errno
 
+// ── Framebuffer syscalls ─────────────────────────────────────────────────
+#define SYS_FB_MAP     92  // fb_map()                             → vaddr or -errno
+#define SYS_OPENPTY    93  // openpty(int fds[2])                  → 0 or -errno
+
 // waitpid options
 #define WNOHANG 1
 

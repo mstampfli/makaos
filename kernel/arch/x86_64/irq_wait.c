@@ -2,16 +2,16 @@
 #include "sched.h"
 #include "process.h"
 
-// One waiter + one pending counter per IRQ line.
-// s_pending[irq] is incremented when irq_notify fires with no sleeping waiter,
-// so the driver thread never misses an IRQ even if it was still processing.
+// Per-IRQ waiter list: up to MAX_IRQ_WAITERS tasks can sleep on a single
+// IRQ line simultaneously.  When the IRQ fires, ALL waiters are woken
+// (broadcast) — each driver re-checks its own completion condition.
 #define IRQ_COUNT 16
-static task_t* s_waiters[IRQ_COUNT];
+#define MAX_IRQ_WAITERS 16
+
+static task_t* s_waiters[IRQ_COUNT][MAX_IRQ_WAITERS];
+static uint8_t s_nwaiters[IRQ_COUNT];
 static uint8_t s_pending[IRQ_COUNT];
 
-// Sleep until irq fires.  Atomically checks the pending counter first so an
-// IRQ that fired before we slept is not lost.  cli/sti guard the check-and-set
-// against the IRQ firing between the check and the sleep (single CPU).
 void irq_wait(uint8_t irq) {
     if (irq >= IRQ_COUNT) return;
     __asm__ volatile("cli");
@@ -20,19 +20,33 @@ void irq_wait(uint8_t irq) {
         __asm__ volatile("sti");
         return;
     }
-    s_waiters[irq] = g_current;
-    sched_sleep();   // re-enables interrupts via do_switch → sti
+    if (s_nwaiters[irq] < MAX_IRQ_WAITERS) {
+        s_waiters[irq][s_nwaiters[irq]++] = g_current;
+    }
+    sched_sleep();
+    // Re-enable interrupts after waking.  We entered with cli; the task was
+    // switched out with IF=0 and the do_switch sti only fires at the very end.
+    // Without this, the caller (issue_one) loops back with IF=0 and the next
+    // AHCI completion IRQ can't be delivered, causing a deadlock.
+    __asm__ volatile("sti");
 }
 
-// Called from ISR context (interrupts disabled).
-// Wakes the sleeping driver thread, or records a pending count if nobody is
-// waiting yet (driver still processing the previous IRQ).
+void irq_drain(uint8_t irq) {
+    if (irq >= IRQ_COUNT) return;
+    __asm__ volatile("cli");
+    s_pending[irq] = 0;
+    __asm__ volatile("sti");
+}
+
 void irq_notify(uint8_t irq) {
     if (irq >= IRQ_COUNT) return;
-    task_t* p = s_waiters[irq];
-    if (p) {
-        s_waiters[irq] = NULL;
-        sched_wake(p);
+    uint8_t n = s_nwaiters[irq];
+    if (n) {
+        s_nwaiters[irq] = 0;
+        for (uint8_t i = 0; i < n; i++) {
+            sched_wake(s_waiters[irq][i]);
+            s_waiters[irq][i] = NULL;
+        }
     } else {
         if (s_pending[irq] < 255) s_pending[irq]++;
     }

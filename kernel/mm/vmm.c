@@ -109,6 +109,35 @@ virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
     return base;
 }
 
+// ── vmm_map_physical_user ─────────────────────────────────────────────────
+// Maps a contiguous physical range into a user address space.
+// Used for MMIO-style mappings (e.g. framebuffer).  Pages are mapped
+// immediately with write-through (PWT) and user-accessible flags.
+// Creates a VMA_MMIO VMA so fork/CoW skip these pages.
+virt_addr_t vmm_map_physical_user(mm_t* mm, phys_addr_t pml4_phys,
+                                  phys_addr_t phys, uint64_t bytes) {
+    if (!mm || !bytes) return 0;
+
+    uint64_t len = (bytes + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    virt_addr_t vaddr = mm_vma_find_free(mm, len);
+    if (!vaddr) return 0;
+
+    // Add a VMA: readable + writable + MMIO (no CoW, no swap, no demand-page).
+    if (!mm_vma_add(mm, vaddr, vaddr + len, VMA_R | VMA_W | VMA_MMIO))
+        return 0;
+
+    // Map all pages immediately — MMIO is not demand-paged.
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_PWT | PAGE_NX;
+    uint64_t npages = len / PAGE_SIZE;
+    for (uint64_t i = 0; i < npages; i++) {
+        vmm_page_map(pml4_phys,
+                     vaddr + i * PAGE_SIZE,
+                     phys  + i * PAGE_SIZE,
+                     flags);
+    }
+    return vaddr;
+}
+
 void vmm_init(phys_addr_t kernel_pml4_phys) {
     g_kernel_pml4 = kernel_pml4_phys;
 
@@ -184,6 +213,45 @@ phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr) {
     return *pte & PAGE_ADDR_MASK;
 }
 
+// ── vmm_get_user_pages ───────────────────────────────────────────────────
+// Resolve `count` consecutive pages starting at page-aligned `uaddr` into
+// HHDM kernel pointers.  If a page is not yet present (demand-page), we
+// allocate a frame and map it writable+user+NX — same as the page-fault
+// handler would do.  No CoW concern: MakaOS fork does full deep-copy.
+//
+// Returns `count` on success, 0 on any failure (OOM, bad address).
+uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
+                            uint32_t count, void** out) {
+    uint64_t inter = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    uint64_t leaf  = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NX;
+
+    for (uint32_t i = 0; i < count; i++) {
+        virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
+
+        // Try to find existing mapping.
+        pte_t* pte = vmm_pte_get(pml4_phys, va, 0, 0);
+
+        if (pte && (*pte & PAGE_PRESENT)) {
+            // Page exists — use its physical frame.
+            phys_addr_t phys = *pte & PAGE_ADDR_MASK;
+            out[i] = (void*)(phys + HHDM_OFFSET);
+        } else {
+            // Not mapped yet — demand-allocate (mirrors page-fault handler).
+            phys_addr_t frame = pmm_buddy_alloc(0);
+            if (frame == PMM_INVALID_ADDR) return 0;
+            // Zero the frame (same as page-fault handler).
+            uint8_t* p = (uint8_t*)(frame + HHDM_OFFSET);
+            for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+            // Create intermediate tables if needed and map.
+            pte = vmm_pte_get(pml4_phys, va, 1, inter);
+            if (!pte) { pmm_buddy_free(frame, 0); return 0; }
+            *pte = frame | leaf;
+            out[i] = (void*)(frame + HHDM_OFFSET);
+        }
+    }
+    return count;
+}
+
 // Allocate a physical frame, map it at vaddr in the CURRENT address space.
 void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags) {
     phys_addr_t frame = pmm_buddy_alloc(0);
@@ -241,13 +309,14 @@ void vmm_free_user_ex(phys_addr_t pml4_phys, mm_t* mm) {
                     virt_addr_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30)
                                    | ((uint64_t)k << 21) | ((uint64_t)l << 12);
 
-                    int is_shared = 0;
+                    int skip_free = 0;
                     if (mm) {
                         vma_t* vma = mm_vma_find(mm, va);
-                        if (vma && vma->shmem) is_shared = 1;
+                        if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
+                            skip_free = 1;
                     }
 
-                    if (!is_shared)
+                    if (!skip_free)
                         pmm_buddy_free(leaf, 0);
                 }
                 pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0);     // free PT frame
@@ -328,7 +397,8 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     int is_shared = 0;
                     if (src_mm) {
                         vma_t* vma = mm_vma_find(src_mm, va);
-                        if (vma && vma->shmem) is_shared = 1;
+                        if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
+                            is_shared = 1;
                     }
 
                     if (is_shared) {

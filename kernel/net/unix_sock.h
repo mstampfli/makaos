@@ -128,6 +128,9 @@ typedef struct unix_sock {
     // ── Blocking support ─────────────────────────────────────────────────
     // Task(s) sleeping on this socket (accept, recv, connect, send-when-full).
     void* waiter;   // task_t* — avoid circular include
+
+    // Back-pointer to the vfs_file_t wrapping this socket (for poll wakeups).
+    struct vfs_file_t* file;
 } unix_sock_t;
 
 // ── Kernel API ───────────────────────────────────────────────────────────

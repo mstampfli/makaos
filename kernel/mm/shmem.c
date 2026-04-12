@@ -257,10 +257,12 @@ vfs_file_t* shmem_fd_create(shmem_t* shm) {
     f->write    = shmem_fd_write;
     f->close    = shmem_fd_close;
     f->seek     = NULL;
-    f->poll     = NULL;
-    f->ctx      = shm;
-    f->flags    = 0;
-    f->refcount = 1;
+    f->poll        = NULL;
+    f->ioctl       = NULL;
+    f->ctx         = shm;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
     f->rights   = 0xFFFFFFFF; // all rights — narrowed by restrict_fd if needed
     f->path[0]  = '\0';
 

@@ -17,7 +17,7 @@ int vsnprintf(char* buf, size_t size, const char* fmt, va_list ap);
 // ── Static FILE storage for stdin/stdout/stderr ───────────────────────────
 
 static FILE s_stdin_file  = { .fd = 0, .flags = _FILE_READ,  .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
-static FILE s_stdout_file = { .fd = 1, .flags = _FILE_WRITE, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
+static FILE s_stdout_file = { .fd = 1, .flags = _FILE_WRITE | _FILE_LNBUF, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
 static FILE s_stderr_file = { .fd = 2, .flags = _FILE_WRITE | _FILE_UNBUF, .rpos=0, .rlen=0, .wpos=0, .file_pos=0 };
 
 FILE* stdin  = &s_stdin_file;
@@ -288,7 +288,17 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* f) {
         f->wpos += (int)put;
         done    += put;
 
-        if (f->wpos >= STDIO_BUFSIZ || (f->flags & _FILE_UNBUF)) {
+        int need_flush = (f->wpos >= STDIO_BUFSIZ) || (f->flags & _FILE_UNBUF);
+
+        // Line-buffered: flush if the chunk we just wrote contains '\n'.
+        if (!need_flush && (f->flags & _FILE_LNBUF)) {
+            const uint8_t* chunk = src + done - put;
+            for (size_t i = 0; i < put; i++) {
+                if (chunk[i] == '\n') { need_flush = 1; break; }
+            }
+        }
+
+        if (need_flush) {
             if (flush_write(f) == EOF) break;
         }
     }
@@ -364,7 +374,13 @@ int vprintf(const char* fmt, va_list ap) {
 }
 
 int setvbuf(FILE* f, char* buf, int mode, size_t size) {
-    (void)f; (void)buf; (void)mode; (void)size;
-    return 0;  /* no buffering control — all writes go through immediately */
+    (void)buf; (void)size;
+    if (!f) return -1;
+    // Clear existing buffering flags, then set the requested mode.
+    f->flags &= ~(_FILE_UNBUF | _FILE_LNBUF);
+    if (mode == _IONBF)      f->flags |= _FILE_UNBUF;
+    else if (mode == _IOLBF) f->flags |= _FILE_LNBUF;
+    // _IOFBF (fully buffered) = default, no flag needed.
+    return 0;
 }
 

@@ -83,6 +83,7 @@ DOOM_CFLAGS=(
     -I"$DOOM_DIR/include"
     -I"$DOOMGENERIC_DIR/doomgeneric"
     -I"$USERLAND_DIR/libc"
+    -I"$USERLAND_DIR/apps"
     -Wno-implicit-function-declaration
     -Wno-implicit-int
     -Wno-int-conversion
@@ -115,6 +116,11 @@ done
 DOOM_OBJS+=("$BUILD_DIR/doom_makaos.o")
 "$CC" "${DOOM_CFLAGS[@]}" -c "$DOOM_DIR/i_sound_makaos.c" -o "$BUILD_DIR/doom_i_sound_makaos.o"
 DOOM_OBJS+=("$BUILD_DIR/doom_i_sound_makaos.o")
+
+# Build libdisplay for Doom (display server client library)
+DISPLAY_DIR="$USERLAND_DIR/apps/display"
+"$CC" "${DOOM_CFLAGS[@]}" -c "$DISPLAY_DIR/libdisplay.c" -o "$BUILD_DIR/doom_libdisplay.o"
+DOOM_OBJS+=("$BUILD_DIR/doom_libdisplay.o")
 
 ld -nostdlib -T "$USER_LINK" \
    "${USER_RT[@]}" \

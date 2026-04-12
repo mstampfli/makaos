@@ -8,6 +8,7 @@
 #define VMA_X      (1U << 2)   // executable
 #define VMA_ANON   (1U << 3)   // anonymous (backed by zero pages)
 #define VMA_SHARED (1U << 4)   // shared mapping (backed by shmem_t)
+#define VMA_MMIO   (1U << 5)   // physical MMIO mapping (not CoW-able, not swappable)
 // W^X enforced: kernel refuses to create a VMA with both VMA_W and VMA_X.
 
 // ── Virtual Memory Area ───────────────────────────────────────────────────

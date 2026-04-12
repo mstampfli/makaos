@@ -32,6 +32,7 @@
 #define PLEDGE_SENDFD     (1u << 16)  // sys_sendfd, sys_recvfd
 #define PLEDGE_KSEC       (1u << 17)  // sys_register_policy_agent (boot-only, uid=0)
 #define PLEDGE_SHM        (1u << 18)  // shm_open, shm_unlink
+#define PLEDGE_FRAMEBUF   (1u << 19)  // SYS_FB_MAP, SYS_FB_BLIT, SYS_FB_INFO
 
 // Default mask: all groups permitted (unpledged process).
 #define PLEDGE_ALL        (~0u)

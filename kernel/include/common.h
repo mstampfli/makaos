@@ -51,6 +51,22 @@ __attribute__((no_caller_saved_registers)) void outb_irq(uint16_t port, uint8_t 
 __attribute__((no_caller_saved_registers)) void insw_irq(uint16_t port, void* addr, uint32_t count);
 __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const void* addr, uint32_t count);
 
+// ── Quick serial debug helpers ───────────────────────────────────────────
+static inline void serial_putc_dbg(char c) {
+    while (!(inb(0x3F8 + 5) & 0x20));
+    outb(0x3F8, (uint8_t)c);
+}
+static inline void serial_puts_dbg(const char* s) {
+    for (; *s; s++) serial_putc_dbg(*s);
+}
+static inline void serial_hex_dbg(uint64_t v) {
+    for (int i = 60; i >= 0; i -= 4) {
+        uint8_t n = (uint8_t)((v >> i) & 0xF);
+        serial_putc_dbg(n < 10 ? '0' + n : 'A' + (n - 10));
+    }
+    serial_putc_dbg('\n');
+}
+
 #define KERNEL_CS    0x08   // kernel code segment selector
 #define KERNEL_SS    0x10   // kernel data/stack segment selector
 #define USER_CS      0x2B   // user code selector  (0x28 | RPL3)

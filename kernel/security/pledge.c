@@ -138,10 +138,11 @@ uint32_t pledge_group_for_syscall(uint64_t nr) {
     case SYS_SHM_UNLINK:
         return PLEDGE_SHM;
 
-    // ── FB / graphics — no pledge group yet (always allowed if fd open) ──
+    // ── PLEDGE_FRAMEBUF ─────────────────────────────────────────────────
     case SYS_FB_BLIT:
     case SYS_FB_INFO:
-        return PLEDGE_STDIO;
+    case SYS_FB_MAP:
+        return PLEDGE_FRAMEBUF;
 
     case SYS_CHDIR:
         return PLEDGE_RPATH;
