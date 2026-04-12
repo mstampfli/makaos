@@ -214,10 +214,10 @@ phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr) {
 }
 
 // ── vmm_get_user_pages ───────────────────────────────────────────────────
-// Resolve `count` consecutive pages starting at page-aligned `uaddr` into
-// HHDM kernel pointers.  If a page is not yet present (demand-page), we
-// allocate a frame and map it writable+user+NX — same as the page-fault
-// handler would do.  No CoW concern: MakaOS fork does full deep-copy.
+// Resolve `count` consecutive pages starting at `uaddr` into HHDM kernel
+// pointers.  Handles demand-paging and CoW break: if a page is shared
+// (refcount > 1, read-only), we allocate a private copy so DMA writes
+// don't corrupt the shared frame.
 //
 // Returns `count` on success, 0 on any failure (OOM, bad address).
 uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
@@ -228,21 +228,36 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
     for (uint32_t i = 0; i < count; i++) {
         virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
 
-        // Try to find existing mapping.
         pte_t* pte = vmm_pte_get(pml4_phys, va, 0, 0);
 
         if (pte && (*pte & PAGE_PRESENT)) {
-            // Page exists — use its physical frame.
             phys_addr_t phys = *pte & PAGE_ADDR_MASK;
-            out[i] = (void*)(phys + HHDM_OFFSET);
+
+            // CoW break: shared page (rc > 1) without write bit → copy.
+            if (!(*pte & PAGE_WRITABLE) && pmm_ref_get(phys) > 1) {
+                phys_addr_t nf = pmm_buddy_alloc(0);
+                if (nf == PMM_INVALID_ADDR) return 0;
+                uint8_t* s = (uint8_t*)(phys + HHDM_OFFSET);
+                uint8_t* d = (uint8_t*)(nf + HHDM_OFFSET);
+                for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+                *pte = nf | leaf;
+                invlpg(va);
+                pmm_ref_dec(phys);
+                out[i] = (void*)(nf + HHDM_OFFSET);
+            } else if (!(*pte & PAGE_WRITABLE) && pmm_ref_get(phys) == 1) {
+                // Sole owner, still marked RO from old CoW — re-enable write.
+                *pte |= PAGE_WRITABLE;
+                invlpg(va);
+                out[i] = (void*)(phys + HHDM_OFFSET);
+            } else {
+                out[i] = (void*)(phys + HHDM_OFFSET);
+            }
         } else {
-            // Not mapped yet — demand-allocate (mirrors page-fault handler).
+            // Not mapped — demand-allocate.
             phys_addr_t frame = pmm_buddy_alloc(0);
             if (frame == PMM_INVALID_ADDR) return 0;
-            // Zero the frame (same as page-fault handler).
             uint8_t* p = (uint8_t*)(frame + HHDM_OFFSET);
             for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
-            // Create intermediate tables if needed and map.
             pte = vmm_pte_get(pml4_phys, va, 1, inter);
             if (!pte) { pmm_buddy_free(frame, 0); return 0; }
             *pte = frame | leaf;
@@ -268,7 +283,7 @@ void* vmm_page_alloc(virt_addr_t vaddr, uint64_t flags) {
 void vmm_page_free(virt_addr_t vaddr) {
     phys_addr_t frame;
     if (vmm_page_unmap(vmm_pml4_get(), vaddr, &frame))
-        pmm_buddy_free(frame, 0);
+        pmm_ref_dec(frame);  // CoW-aware: only frees when rc→0
 }
 
 // Switch to a different address space.
@@ -317,7 +332,7 @@ void vmm_free_user_ex(phys_addr_t pml4_phys, mm_t* mm) {
                     }
 
                     if (!skip_free)
-                        pmm_buddy_free(leaf, 0);
+                        pmm_ref_dec(leaf);  // CoW-aware: only frees when rc→0
                 }
                 pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0);     // free PT frame
             }
@@ -336,10 +351,19 @@ void vmm_free_user(phys_addr_t pml4_phys) {
 
 // ── vmm_clone_user ────────────────────────────────────────────────────────
 // Clone all user (lower half) page table entries from src to dst PML4.
-// For private pages: allocate a new frame and deep-copy 4096 bytes.
-// For shared pages (VMA has shmem backing): map the SAME physical frame
-// (no copy — both parent and child see the same memory).
-// If src_mm is NULL, all pages are treated as private (legacy behavior).
+//
+// Copy-on-Write:
+//   Private pages are NOT deep-copied.  Instead, both parent and child PTEs
+//   point to the SAME physical frame, both marked read-only.  The frame's
+//   refcount is incremented.  The first write by either side triggers a
+//   page fault → CoW break (see isr14_page_fault).
+//
+// Exceptions:
+//   - Shared/MMIO VMAs: map the same frame with original flags (no CoW).
+//   - Pinned frames (DMA in flight): deep-copy immediately — the parent
+//     must keep exclusive ownership so the DMA target isn't corrupted.
+//   - src_mm == NULL: legacy deep-copy everything (error-path safety).
+//
 // Returns 1 on success, 0 on OOM.
 uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                           mm_t* src_mm) {
@@ -391,9 +415,11 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     phys_addr_t src_frame = src_pt[si] & PAGE_ADDR_MASK;
                     uint64_t leaf_flags = src_pt[si] & ~PAGE_ADDR_MASK;
 
-                    // Check if this page is in a shared VMA.
+                    // Reconstruct virtual address for VMA lookup.
                     virt_addr_t va = ((uint64_t)pi << 39) | ((uint64_t)qi << 30)
                                    | ((uint64_t)ri << 21) | ((uint64_t)si << 12);
+
+                    // Shared/MMIO VMAs: share frame with original flags (no CoW).
                     int is_shared = 0;
                     if (src_mm) {
                         vma_t* vma = mm_vma_find(src_mm, va);
@@ -402,10 +428,13 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     }
 
                     if (is_shared) {
-                        // Shared: map the SAME physical frame (no copy).
                         dst_pt[si] = src_frame | leaf_flags;
-                    } else {
-                        // Private: allocate a new frame and deep-copy.
+                        continue;
+                    }
+
+                    // No mm → legacy deep-copy (error-path safety).
+                    // Pinned frame → deep-copy (DMA in flight, parent keeps exclusive).
+                    if (!src_mm || pmm_pin_get(src_frame) > 0) {
                         phys_addr_t dst_frame = pmm_buddy_alloc(0);
                         if (dst_frame == PMM_INVALID_ADDR) return 0;
 
@@ -414,11 +443,29 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                         for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
 
                         dst_pt[si] = dst_frame | leaf_flags;
+                        continue;
                     }
+
+                    // ── CoW: share the frame, mark BOTH read-only ────────
+                    // Clear RW bit in both parent and child leaf PTEs.
+                    // The frame's refcount is bumped to track sharing.
+                    uint64_t cow_flags = leaf_flags & ~PAGE_WRITABLE;
+
+                    src_pt[si] = src_frame | cow_flags;   // parent: now read-only
+                    dst_pt[si] = src_frame | cow_flags;   // child:  same frame, read-only
+
+                    pmm_ref_inc(src_frame);               // shared: rc 1→2
                 }
             }
         }
     }
+
+    // Flush parent's TLB — we changed its PTEs from RW to RO.
+    // If src_pml4 is the currently loaded one, we must flush.
+    if (vmm_pml4_get() == src_pml4) {
+        __asm__ volatile("mov %0, %%cr3" : : "r"(src_pml4) : "memory");
+    }
+
     return 1;
 }
 
@@ -495,8 +542,47 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
         if (!mm) goto kernel_panic;
 
-        // Protection violation (present page, wrong permissions).
-        // For user faults → kill. For kernel faults → panic (shouldn't happen).
+        // ── Copy-on-Write break ──────────────────────────────────────────
+        // Protection violation on write to a present page: check for CoW.
+        // CoW pages are present + read-only, in a writable VMA, with rc > 1.
+        if (is_present && is_write) {
+            vma_t* vma = mm_vma_find(mm, fault_addr);
+            if (vma && (vma->flags & VMA_W) && !vma->shmem && !(vma->flags & VMA_MMIO)) {
+                virt_addr_t page = fault_addr & ~PAGE_MASK;
+                phys_addr_t old_frame = vmm_page_phys(vmm_pml4_get(), page);
+                if (old_frame != PMM_INVALID_ADDR) {
+                    uint32_t rc = pmm_ref_get(old_frame);
+                    if (rc > 1) {
+                        // Shared CoW page — allocate a private copy.
+                        phys_addr_t new_frame = pmm_buddy_alloc(0);
+                        if (new_frame == PMM_INVALID_ADDR) {
+                            if (is_user) goto kill; else goto kernel_panic;
+                        }
+                        uint8_t* s = (uint8_t*)(old_frame + HHDM_OFFSET);
+                        uint8_t* d = (uint8_t*)(new_frame + HHDM_OFFSET);
+                        for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+
+                        // Map the new private frame with full VMA permissions.
+                        vmm_page_map(vmm_pml4_get(), page, new_frame,
+                                     mm_vma_pte_flags(vma->flags));
+                        pmm_ref_dec(old_frame);  // drop our share (may free if rc→0)
+                        return; // fault resolved
+                    }
+                    if (rc == 1) {
+                        // Sole owner — just re-enable write, no copy needed.
+                        pte_t* pte = vmm_pte_get(vmm_pml4_get(), page, 0, 0);
+                        if (pte) {
+                            *pte |= PAGE_WRITABLE;
+                            invlpg(page);
+                        }
+                        return; // fault resolved
+                    }
+                }
+            }
+            // Not a CoW page — genuine protection violation, fall through to kill.
+        }
+
+        // Protection violation (present page, not CoW).
         if (is_present) { if (is_user) goto kill; else goto kernel_panic; }
 
         vma_t* vma = mm_vma_find(mm, fault_addr);

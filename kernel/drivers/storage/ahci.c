@@ -523,6 +523,15 @@ static uint8_t ahci_submit_sg(uint64_t lba, void* user_buf,
     if (!vmm_get_user_pages(pml4, va, npages, page_ptrs))
         return 0;
 
+    // Pin every resolved frame so CoW fork won't share them while DMA
+    // is in flight.  The kthread writes via HHDM — if fork CoW-shared
+    // the frame, the child would see DMA data it shouldn't.
+    phys_addr_t pin_addrs[AHCI_MAX_PAGES];
+    for (uint32_t i = 0; i < npages; i++) {
+        pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
+        pmm_pin(pin_addrs[i]);
+    }
+
     // Submit with scatter-gather.
     uint8_t next_tail = (s_req_tail + 1) % AHCI_MAX_REQS;
     while (next_tail == s_req_head)
@@ -545,6 +554,11 @@ static uint8_t ahci_submit_sg(uint64_t lba, void* user_buf,
     s_req_tail = next_tail;
     if (s_io_thread) sched_wake(s_io_thread);
     while (!r->done) sched_sleep();
+
+    // Unpin after DMA is complete.
+    for (uint32_t i = 0; i < npages; i++)
+        pmm_unpin(pin_addrs[i]);
+
     return r->result;
 }
 

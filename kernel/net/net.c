@@ -9,6 +9,8 @@
 #include "irq_wait.h"
 #include "common.h"
 
+extern void sched_yield(void);
+
 // ── Serial helpers (inline, no serial.h needed) ───────────────────────────
 
 static void ser_putc(char c) {
@@ -49,6 +51,10 @@ static uint32_t s_mask   = IP4_BE(255,255,255, 0);
 static uint32_t s_bcast  = IP4_BE(10, 0, 2, 255);
 static int      s_ready  = 0;
 
+#define NET_MAX_DNS 4
+static uint32_t s_dns[NET_MAX_DNS];
+static uint32_t s_dns_count = 0;
+
 uint32_t net_our_ip(void)       { return s_our_ip; }
 uint32_t net_gateway_ip(void)   { return s_gw_ip;  }
 uint32_t net_subnet_mask(void)  { return s_mask;   }
@@ -61,6 +67,32 @@ void net_set_config(uint32_t our_ip_be, uint32_t gw_be, uint32_t mask_be) {
     s_mask   = mask_be;
     // Broadcast = (ip & mask) | ~mask
     s_bcast  = (our_ip_be & mask_be) | (~mask_be);
+
+    // Log to serial so headless test runs can grep this line.
+    uint8_t* ip = (uint8_t*)&s_our_ip;
+    uint8_t* gw = (uint8_t*)&s_gw_ip;
+    ser_puts("[net] ifconfig IP ");
+    ser_put_dec(ip[0]); ser_putc('.');
+    ser_put_dec(ip[1]); ser_putc('.');
+    ser_put_dec(ip[2]); ser_putc('.');
+    ser_put_dec(ip[3]);
+    ser_puts(" GW ");
+    ser_put_dec(gw[0]); ser_putc('.');
+    ser_put_dec(gw[1]); ser_putc('.');
+    ser_put_dec(gw[2]); ser_putc('.');
+    ser_put_dec(gw[3]); ser_putc('\n');
+}
+
+uint32_t net_get_dns(uint32_t* out, uint32_t max) {
+    uint32_t n = s_dns_count < max ? s_dns_count : max;
+    for (uint32_t i = 0; i < n; i++) out[i] = s_dns[i];
+    return n;
+}
+
+void net_set_dns(const uint32_t* servers, uint32_t count) {
+    if (count > NET_MAX_DNS) count = NET_MAX_DNS;
+    for (uint32_t i = 0; i < count; i++) s_dns[i] = servers[i];
+    s_dns_count = count;
 }
 
 // ── Net receive thread ────────────────────────────────────────────────────
@@ -72,16 +104,17 @@ static void net_rx_thread(void) {
     uint32_t tick = 0;
 
     for (;;) {
-        irq_wait(g_virtio_net_irq);
-
+        // Poll the RX ring — virtio-net IRQ/MSI-X isn't wired up yet, so
+        // we cooperate with the scheduler instead of sleeping on an IRQ.
         skbuff_t* skb;
         while (virtio_net_rx_poll(&skb))
             eth_recv(skb);
 
-        if (++tick >= 10u) {
+        if (++tick >= 100u) {
             tick = 0;
             tcp_timer_tick();
         }
+        sched_yield();
     }
 }
 

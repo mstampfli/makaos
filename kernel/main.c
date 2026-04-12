@@ -139,6 +139,17 @@ void kmain(void) {
     net_init();
     sched_add(init);
 
+    // ── Launch /bin/dhcpcd as a background daemon ───────────────────────────
+    // dhcpcd runs as root (inherits from kernel-spawned process) and acquires
+    // a DHCP lease before login is typically complete.  It logs progress over
+    // serial via write(1, ...) which is connected to /dev/tty0 — note that
+    // during boot the controlling tty isn't up yet, so we rely on its stderr
+    // path.  This is best-effort: failure to spawn is non-fatal.
+    static const char* dhcp_argv[] = { "/bin/dhcpcd", NULL };
+    task_t* dhcpd = elf_exec_from_ext2("/bin/dhcpcd", pid_alloc(),
+                                        dhcp_argv, init_envp, NULL);
+    if (dhcpd) sched_add(dhcpd);
+
     timer_init(1000);
 
     __asm__ volatile("sti");

@@ -106,6 +106,19 @@
 // ── Framebuffer syscalls ─────────────────────────────────────────────────
 #define SYS_FB_MAP     92  // fb_map()                             → vaddr or -errno
 #define SYS_OPENPTY    93  // openpty(int fds[2])                  → 0 or -errno
+#define SYS_GETPEERPID 94  // getpeerpid(fd)                       → pid or -errno
+#define SYS_NET_IFCONFIG 95 // net_ifconfig(ipcfg_t*, len)          → 0 or -errno
+#define SYS_NET_MAC      96 // net_mac(uint8_t out[6])              → 0 or -errno
+
+// ── Network interface configuration (for dhcpcd) ─────────────────────────
+#define IFCFG_MAX_DNS  3
+typedef struct {
+    uint32_t ip_be;           // host IP (network byte order)
+    uint32_t gateway_be;      // default gateway
+    uint32_t netmask_be;      // subnet mask
+    uint32_t dns_be[IFCFG_MAX_DNS]; // DNS servers (0 = unset)
+    uint32_t lease_seconds;   // for logging; 0 = unknown/static
+} ifcfg_t;
 
 // waitpid options
 #define WNOHANG 1

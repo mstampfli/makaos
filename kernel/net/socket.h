@@ -39,6 +39,25 @@ typedef struct __attribute__((packed)) {
 #define SHUT_WR   1
 #define SHUT_RDWR 2
 
+// ── setsockopt / getsockopt levels and options ────────────────────────────
+// Values chosen to match Linux so userland code is portable.
+#define SOL_SOCKET   1
+
+#define SO_DEBUG       1
+#define SO_REUSEADDR   2
+#define SO_TYPE        3
+#define SO_ERROR       4
+#define SO_DONTROUTE   5
+#define SO_BROADCAST   6
+#define SO_SNDBUF      7
+#define SO_RCVBUF      8
+#define SO_KEEPALIVE   9
+#define SO_OOBINLINE   10
+#define SO_LINGER      13
+#define SO_REUSEPORT   15
+#define SO_RCVTIMEO    20
+#define SO_SNDTIMEO    21
+
 // ── Internal socket state ─────────────────────────────────────────────────
 // socket_t is the kernel-side representation; it is reference-counted via
 // vfs_file_t.ctx.
@@ -48,22 +67,31 @@ struct tcp_pcb;  // forward declaration from tcp.h
 typedef struct socket_t {
     uint8_t  type;         // SOCK_STREAM or SOCK_DGRAM
     uint8_t  bound;        // 1 if bind() has been called
+    uint8_t  broadcast;    // 1 if SO_BROADCAST has been enabled
+    uint8_t  _pad;
     uint16_t local_port;   // host byte order
 
     // TCP-specific.
     struct tcp_pcb* pcb;   // NULL for UDP
 
-    // UDP receive queue: a simple singly-linked list of skbuffs.
-    // Protected by the single-threaded kernel (no SMP yet).
+    // UDP receive queue: a simple singly-linked list of skbuffs.  Each skb
+    // carries its own src_ip_be + src_port (stamped at delivery) so multiple
+    // senders can interleave without clobbering each other.
     skbuff_t* udp_rx_head;
     skbuff_t* udp_rx_tail;
     uint16_t  udp_rx_count;
-    uint32_t  udp_peer_ip;   // last sender (network byte order)
-    uint16_t  udp_peer_port; // last sender port (host byte order)
+    // Remembered "connected" peer — set by sendto() or an explicit connect()
+    // on a UDP socket, used by subsequent send()/write() calls.
+    uint32_t  udp_peer_ip;   // network byte order
+    uint16_t  udp_peer_port; // host byte order
 
     // Task sleeping in socket_recv / socket_recvfrom (UDP) or
     // socket_accept / socket_connect (TCP).
     void* waiter;   // task_t* — avoid circular include with process.h
+
+    // Backpointer to the owning vfs_file_t so the UDP delivery path and the
+    // TCP layer can wake any task sleeping in poll()/select() on this fd.
+    struct vfs_file_t* file;
 } socket_t;
 
 // ── Kernel-internal API ───────────────────────────────────────────────────
@@ -116,6 +144,11 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
 
 // Half-close: shutdown(how) — SHUT_WR sends TCP FIN.
 int socket_shutdown(vfs_file_t* f, int how);
+
+// setsockopt — level/optname/val interpretation matches POSIX.
+// Returns 0 on success, -errno on failure.
+int socket_setsockopt(vfs_file_t* f, int level, int optname,
+                       const void* optval, uint32_t optlen);
 
 // ── Called by the UDP layer to deliver an incoming datagram ──────────────
 // `dst_port` is in host byte order (already converted by udp_recv).

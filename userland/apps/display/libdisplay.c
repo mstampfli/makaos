@@ -17,6 +17,17 @@ struct md_client_buffer {
     uint32_t data_size;
     md_display_t* dpy;
     md_buffer_release_handler_t on_release;
+    struct md_dbuf* owner_dbuf;  // non-NULL when the buffer is part of a dbuf pair
+};
+
+struct md_dbuf {
+    md_client_surface_t* surf;
+    md_display_t*        dpy;
+    md_client_buffer_t*  bufs[2];
+    uint8_t              in_use[2];  // 1 = committed, compositor still holds it
+    uint8_t              back;       // index of the buffer returned by acquire()
+    uint32_t             width;
+    uint32_t             height;
 };
 
 struct md_client_surface {
@@ -152,6 +163,15 @@ static md_client_buffer_t* find_buffer(md_display_t* dpy, uint32_t id) {
 md_display_t* md_display_connect(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 0;
+
+    // Close-on-exec: any child the client fork+execs (e.g. the terminal
+    // spawning bash) MUST NOT inherit a live reference to the compositor
+    // socket. If it did, the underlying unix_sock_t would stay alive from
+    // the kernel's perspective after we close(), the compositor would
+    // never see POLLHUP, and this client's windows would linger on screen
+    // until the unrelated child process eventually died. Matches how
+    // Wayland/X11 clients handle CLOEXEC on their display fds.
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     struct sockaddr_un sa;
     sa.sun_family = AF_UNIX;
@@ -295,6 +315,21 @@ static void dispatch_event(md_display_t* dpy, md_msg_header_t* hdr,
         case MD_DISPLAY_ERROR:
             // Could log, for now ignore
             break;
+        case MD_DISPLAY_PING: {
+            // Auto-reply with the same serial. A client that can pump its
+            // event loop is, by definition, responsive — the reply proves
+            // the event pump is alive. Clients that block inside a user
+            // callback will miss this path and correctly appear "not
+            // responding" to the compositor.
+            if (payload_len >= 4) {
+                md_display_ping_t pong;
+                pong.hdr = md_msg(0, MD_DISPLAY_PONG, sizeof(pong));
+                pong.serial = *(uint32_t*)payload;
+                pong._pad   = 0;
+                send_msg(dpy->fd, &pong, sizeof(pong));
+            }
+            break;
+        }
         }
     }
 }
@@ -494,6 +529,8 @@ md_client_buffer_t* md_buffer_create(md_display_t* dpy,
     uint32_t total_size = buf->stride * height;
     int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
     if (shm_fd < 0) return 0;
+    // Don't leak pixel-buffer fds into children at exec time.
+    fcntl(shm_fd, F_SETFD, FD_CLOEXEC);
 
     // Resize shmem to fit the buffer
     if (ftruncate(shm_fd, total_size) < 0) {
@@ -574,6 +611,125 @@ uint32_t md_buffer_height(md_client_buffer_t* buf) {
 uint32_t md_buffer_stride(md_client_buffer_t* buf) {
     return buf ? buf->stride : 0;
 }
+
+// ── Resize helper ────────────────────────────────────────────────────────
+
+int md_surface_resize_commit(md_client_surface_t* surf,
+                             md_client_buffer_t** inout_buf,
+                             uint32_t width, uint32_t height,
+                             md_resize_render_fn render, void* userdata) {
+    if (!surf || !inout_buf) return -1;
+    if (width == 0 || height == 0) return -1;
+
+    md_client_buffer_t* old_buf = *inout_buf;
+    md_client_buffer_t* new_buf = md_buffer_create(surf->dpy, width, height);
+    if (!new_buf) return -1;
+
+    if (render) render(new_buf, userdata);
+
+    md_surface_attach(surf, new_buf);
+    md_surface_damage(surf, 0, 0, width, height);
+    md_surface_commit(surf);
+
+    if (old_buf) md_buffer_destroy(old_buf);
+    *inout_buf = new_buf;
+    return 0;
+}
+
+// ── Double-buffering (md_dbuf) ───────────────────────────────────────────
+//
+// Each md_dbuf owns two md_client_buffers and tracks which are still held
+// by the compositor. The compositor already emits MD_BUFFER_RELEASE when a
+// new commit replaces a previously-attached buffer — we wire each buffer's
+// on_release callback back to its parent dbuf so we can clear the in_use
+// flag.
+
+static void md_dbuf_release_cb(md_client_buffer_t* buf) {
+    md_dbuf_t* db = buf->owner_dbuf;
+    if (!db) return;
+    for (int i = 0; i < 2; i++) {
+        if (db->bufs[i] == buf) { db->in_use[i] = 0; return; }
+    }
+}
+
+md_dbuf_t* md_dbuf_create(md_client_surface_t* surf,
+                          uint32_t width, uint32_t height) {
+    if (!surf || width == 0 || height == 0) return 0;
+    md_dbuf_t* db = (md_dbuf_t*)malloc(sizeof(md_dbuf_t));
+    if (!db) return 0;
+    mem_zero(db, sizeof(*db));
+    db->surf = surf;
+    db->dpy  = surf->dpy;
+    db->width = width;
+    db->height = height;
+    for (int i = 0; i < 2; i++) {
+        db->bufs[i] = md_buffer_create(surf->dpy, width, height);
+        if (!db->bufs[i]) {
+            if (i == 1 && db->bufs[0]) md_buffer_destroy(db->bufs[0]);
+            free(db);
+            return 0;
+        }
+        db->bufs[i]->owner_dbuf = db;
+        md_buffer_on_release(db->bufs[i], md_dbuf_release_cb);
+    }
+    return db;
+}
+
+void md_dbuf_destroy(md_dbuf_t* db) {
+    if (!db) return;
+    for (int i = 0; i < 2; i++) {
+        if (db->bufs[i]) {
+            db->bufs[i]->owner_dbuf = 0;
+            md_buffer_destroy(db->bufs[i]);
+            db->bufs[i] = 0;
+        }
+    }
+    free(db);
+}
+
+int md_dbuf_resize(md_dbuf_t* db, uint32_t width, uint32_t height) {
+    if (!db || width == 0 || height == 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        if (db->bufs[i]) {
+            db->bufs[i]->owner_dbuf = 0;
+            md_buffer_destroy(db->bufs[i]);
+            db->bufs[i] = 0;
+        }
+        db->in_use[i] = 0;
+    }
+    db->back = 0;
+    db->width = width;
+    db->height = height;
+    for (int i = 0; i < 2; i++) {
+        db->bufs[i] = md_buffer_create(db->dpy, width, height);
+        if (!db->bufs[i]) return -1;
+        db->bufs[i]->owner_dbuf = db;
+        md_buffer_on_release(db->bufs[i], md_dbuf_release_cb);
+    }
+    return 0;
+}
+
+md_client_buffer_t* md_dbuf_acquire(md_dbuf_t* db) {
+    if (!db) return 0;
+    while (db->in_use[db->back]) {
+        if (md_display_dispatch_blocking(db->dpy) < 0) return 0;
+    }
+    return db->bufs[db->back];
+}
+
+void md_dbuf_present(md_dbuf_t* db) {
+    if (!db) return;
+    md_client_buffer_t* buf = db->bufs[db->back];
+    if (!buf) return;
+    md_surface_attach(db->surf, buf);
+    md_surface_damage(db->surf, 0, 0, db->width, db->height);
+    md_surface_commit(db->surf);
+    db->in_use[db->back] = 1;
+    db->back ^= 1;
+}
+
+uint32_t md_dbuf_width(md_dbuf_t* db)  { return db ? db->width  : 0; }
+uint32_t md_dbuf_height(md_dbuf_t* db) { return db ? db->height : 0; }
 
 // ── Event handler registration ───────────────────────────────────────────
 

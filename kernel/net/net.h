@@ -21,6 +21,11 @@ uint32_t net_gateway_ip(void);
 uint32_t net_subnet_mask(void);
 uint32_t net_broadcast_ip(void);
 
+// Kernel-cached DNS server list (populated by dhcpcd via SYS_NET_IFCONFIG).
+// Returns the number of DNS servers stored in `out` (up to `max`).
+uint32_t net_get_dns(uint32_t* out, uint32_t max);
+void     net_set_dns(const uint32_t* servers, uint32_t count);
+
 // Configure IP settings (called internally or by future DHCP client).
 void net_set_config(uint32_t our_ip_be, uint32_t gw_be,
                     uint32_t mask_be);

@@ -29,3 +29,10 @@ void udp_deliver(uint16_t dst_port, skbuff_t* skb);
 // Returns 0 on success.
 int udp_send(uint32_t dst_ip_be, uint16_t src_port, uint16_t dst_port,
              const void* data, uint16_t len);
+
+// Same as udp_send but with an explicit source IP (network byte order).
+// Pass 0 for `src_ip_be` to use net_our_ip().  DHCP clients need to pass
+// 0.0.0.0 explicitly before they have a lease.
+int udp_send_ex(uint32_t src_ip_be, uint32_t dst_ip_be,
+                 uint16_t src_port, uint16_t dst_port,
+                 const void* data, uint16_t len);

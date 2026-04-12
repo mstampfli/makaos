@@ -222,6 +222,66 @@ static void pty_slave_close(vfs_file_t* self) {
     kfree(self);
 }
 
+// ── Master ioctl ─────────────────────────────────────────────────────────
+// The PTY master shares the slave's tty_t (winsize, termios, pgid, etc.), so
+// TIOCGWINSZ/TIOCSWINSZ/TCGETS/... from the master operate on that same
+// struct. Without this handler, sys_ioctl would fall through to a generic
+// console-tty fallback that accidentally signals the *console's* fg_pgid —
+// which killed makaterm with SIGWINCH on every resize.
+
+static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
+    tty_t* tty = &ctx->pty->slave;
+
+    switch (request) {
+        case 0x5401: { // TCGETS
+            termios_t* out = (termios_t*)arg;
+            *out = tty->termios;
+            return 0;
+        }
+        case 0x5402: // TCSETS
+        case 0x5403: // TCSETSW
+        case 0x5404: { // TCSETSF
+            const termios_t* in = (const termios_t*)arg;
+            tty->termios = *in;
+            if (request == 0x5404) tty_flush_input(tty);
+            return 0;
+        }
+        case 0x540F: { // TIOCGPGRP
+            uint32_t* out = (uint32_t*)arg;
+            *out = tty->fg_pgid;
+            return 0;
+        }
+        case 0x5410: { // TIOCSPGRP
+            const uint32_t* in = (const uint32_t*)arg;
+            tty->fg_pgid = *in;
+            return 0;
+        }
+        case 0x5413: { // TIOCGWINSZ
+            winsize_t* out = (winsize_t*)arg;
+            *out = tty->winsize;
+            return 0;
+        }
+        case 0x5414: { // TIOCSWINSZ
+            const winsize_t* in = (const winsize_t*)arg;
+            tty->winsize = *in;
+            // Notify the foreground pgroup on the slave side so the child
+            // shell can reflow. Never signal the master's own pgroup.
+            if (tty->fg_pgid)
+                signal_send_pgrp(tty->fg_pgid, SIGWINCH);
+            return 0;
+        }
+        case 0x5425: // TCSBRK
+        case 0x540B: // TCXONC
+        case 0x540C: // TCFLSH
+        case 0x540D: // TIOCEXCL
+        case 0x540A: // TIOCNXCL
+            return 0;
+        default:
+            return -22; // EINVAL
+    }
+}
+
 // ── Slave ioctl ──────────────────────────────────────────────────────────
 
 static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
@@ -358,7 +418,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     master->close       = pty_master_close;
     master->seek        = NULL;
     master->poll        = pty_master_poll;
-    master->ioctl       = NULL;
+    master->ioctl       = pty_master_ioctl;
     master->ctx         = mctx;
     master->poll_waiter = NULL;
     master->flags       = 0;
