@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x0000000000042EFB
+kernel.bin size=0x0000000000045F0B
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x0000000000042EFB
+kernel loaded, bytes=0x0000000000045F0B
 phys_ceiling=0x0000010000000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
@@ -25,107 +25,13 @@ Kore login: Password:
 [spawn] path=/bin/bash
 0000000000400003
 00007FFFFFFFDEB3
-[open] pid=0000000f /dev/tty -> fd=00000003
-[open] pid=0000000f /etc/passwd -> fd=00000003
-[open] pid=0000000f /root/.bashrc -> ERR 00000002
-[open] pid=0000000f /root/.bash_history -> ERR 00000002
-bash-5.2# lost+found
-bin
-etc
-home
-tmp
-dev
-root
-TEST.TXT
-proc
-[exit] pid=00000010 code=00000000
-bash-5.2# makadisplay: starting compositor
-makadisplay: fb 1280x800 pitch=5120
-[fb_map] enter
-[fb_map] vaddr=00007FEFFFC18000
-makadisplay: framebuffer mapped, desktop drawn
-[socket] domain=0000000000000001
+[open] pid=00000010 /dev/tty -> fd=00000003
+[open] pid=00000010 /etc/passwd -> fd=00000003
+[open] pid=00000010 /root/.bashrc -> ERR 00000002
+[open] pid=00000010 /root/.bash_history -> ERR 00000002
+bash-5.2# [dhcpcd] starting
+[dhcpcd] MAC 52:54:00:12:34:56
+[net] ifconfig IP 0.0.0.0 GW 0.0.0.0
+[socket] domain=0000000000000002
 [socket] fd=0000000000000003
-[bind] unix path=/tmp/makadisplay.sock
-[bind] result=0000000000000000
-[listen] unix backlog=0000000000000010
-[listen] result=0000000000000000
-makadisplay: listening on /tmp/makadisplay.sock
-[open] pid=00000011 /dev/input/event0 -> fd=00000004
-makadisplay: keyboard opened (/dev/input/event0)
-[open] pid=00000011 /dev/mouse -> fd=00000005
-makadisplay: mouse opened (/dev/mouse)
-[spawn] path=/bin/makaterm
-makadisplay: launched /bin/makaterm
-0000000000400003
-00007FFFFFFFDEA3
-makaterm: starting terminal emulator
-makaterm: PTY opened
-makaterm: bash forked
-[socket] domain=0000000000000001
-[socket] fd=0000000000000004
-[connect] unix path=/tmp/makadisplay.sock
-[open] pid=00000013 /dev/tty -> fd=00000003
-[open] pid=00000013 /etc/passwd -> fd=00000003
-[open] pid=00000013 //.bash_history -> ERR 00000002
-bash-5.2# [accept] unix waiting...
-[accept] [connect] result=0000000000000000
-new fd=0000000000000006
-makaterm: surface created, on_key set
-[shm_open] namelen=0000000000000007
-[shm_open] fd=0000000000000005
-[sendfd] sock=0000000000000004
-[sendfd] r=0000000000000000
-[recvfd] sock=0000000000000006
-[recvfd] fd=0000000000000007
-makaterm: terminal window created
-[socket] domain=0000000000000001
-[socket] fd=0000000000000003
-[connect] unix path=/tmp/makadisplay.sock
-[accept] unix waiting...
-[accept] ne[connect] result=0000000000000000
-w fd=0000000000000008
-[shm_open] namelen=0000000000000007
-[shm_open] fd=0000000000000004
-[sendfd] sock=0000000000000003
-[sendfd] r=0000000000000000
-[recvfd] sock=0000000000000008
-[recvfd] fd=0000000000000009
-                           Doom Generic 0.1
-Z_Init: Init zone memory allocation daemon. 
-zone memory: 0x5ef060, 1000000 allocated for zone
-Using . for configuration and saves
-V_Init: allocate screens.
-M_LoadDefaults: Load system defaults.
-saving config in .default.cfg
-[open] pid=00000014 /bin/doom1.wad -> fd=00000005
-W_Init: Init WADfiles.
- adding /bin/doom1.wad
-[open] pid=00000014 /bin/doom1.wad -> fd=00000005
-Using ./.savegame/ for savegames
-===========================================================================
-                            DOOM Shareware
-===========================================================================
- Doom Generic is free software, covered by the GNU General Public
- License.  There is NO warranty; not even for MERCHANTABILITY or FITNESS
- FOR A PARTICULAR PURPOSE. You are welcome to change and distribute
- copies under certain conditions. See the source for more information.
-===========================================================================
-I_Init: Setting up machine state.
-[open] pid=00000014 /dev/dsp -> fd=00000006
-M_Init: Init miscellaneous info.
-R_Init: Init DOOM refresh daemon - ...................
-P_Init: Init Playloop state.
-S_Init: Setting up sound.
-D_CheckNetGame: Checking network game status.
-startskill 2  deathmatch: 0  startmap: 1  startepisode: 1
-player 1 of 1 (1 nodes)
-Emulating the behavior of the 'Doom 1.9' executable.
-HU_Init: Setting up heads up display.
-ST_Init: Init status bar.
-I_InitGraphics: framebuffer: x_res: 640, y_res: 400, x_virtual: 640, y_virtual: 400, bpp: 32
-I_InitGraphics: framebuffer: RGBA: 8888, red_off: 16, green_off: 8, blue_off: 0, transp_off: 24
-I_InitGraphics: DOOM screen size: w x h: 320 x 200
-I_InitGraphics: Auto-scaling factor: 2
-[exit] pid=00000014 code=00000000
-bash-5.2# 
+[dhcpcd] sending DISCOVER

@@ -77,21 +77,40 @@ int tcp_listen(tcp_pcb_t* pcb);
 tcp_pcb_t* tcp_accept(tcp_pcb_t* listener);
 
 // Send data on an established connection.
-// Copies `len` bytes from `data` into the send buffer.
-// Blocks if the send window is full.
-int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len);
+// Copies up to `len` bytes from `data` into the send buffer.
+// If `nonblock` is 0, blocks while the send buffer is full.
+// If `nonblock` is non-zero, returns -EAGAIN when no progress can be made.
+// Returns the number of bytes queued on success, or a negative errno on error:
+//   -EPIPE        — connection is CLOSED or peer has closed its receive side
+//   -ENOTCONN     — PCB is not in a state that accepts outbound data
+//   -EAGAIN       — nonblock mode and buffer full
+int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock);
 
 // Receive data from an established connection.
-// Copies up to `len` bytes into `buf`.
-// Blocks if no data is available and the connection is still open.
-// Returns 0 on graceful close, -1 on error.
-int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len);
+// Copies up to `len` bytes into `buf`. Returns the number of bytes read.
+// Returns 0 on graceful EOF (peer FIN + drained rx buffer).
+// Returns a negative errno on error:
+//   -EAGAIN       — nonblock mode, nothing available
+//   -ENOTCONN     — PCB never connected / was reset
+//   -ECONNRESET   — connection was reset while reading
+int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len, int nonblock);
 
 // Initiate graceful close (send FIN).
 void tcp_close(tcp_pcb_t* pcb);
 
 // Query the state of a PCB.
 tcp_state_t tcp_pcb_state(const tcp_pcb_t* pcb);
+
+// Non-blocking readiness / state queries used by the socket poll handler.
+// tcp_pcb_rx_used   — bytes of receive data immediately available.
+// tcp_pcb_tx_space  — free bytes in send buffer.
+// tcp_pcb_eof       — 1 if peer FIN has been seen (recv will return 0).
+// tcp_pcb_has_accept — 1 if a listener has a completed child waiting in its
+//                      accept queue.
+uint32_t tcp_pcb_rx_used  (const tcp_pcb_t* pcb);
+uint32_t tcp_pcb_tx_space (const tcp_pcb_t* pcb);
+int      tcp_pcb_eof      (const tcp_pcb_t* pcb);
+int      tcp_pcb_has_accept(const tcp_pcb_t* pcb);
 
 // Current local port assignment (for connect without explicit bind).
 uint16_t tcp_ephemeral_port(void);
@@ -100,3 +119,8 @@ uint16_t tcp_ephemeral_port(void);
 // `waiter` is a task_t*; declared void* to avoid a circular dependency with
 // process.h.  The TCP layer calls sched_wake(pcb->waiter) at state changes.
 void tcp_pcb_set_waiter(tcp_pcb_t* pcb, void* waiter);
+
+// Bind a vfs_file_t* backpointer to this PCB so that pcb_wake() can also
+// wake any task sleeping in poll()/select() on the socket fd.  Declared as
+// void* to avoid dragging vfs.h into tcp.h.
+void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file);

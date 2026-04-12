@@ -235,6 +235,30 @@ static inline uint64_t syscall4(uint64_t nr, uint64_t a1, uint64_t a2,
     return ret;
 }
 
+// 5- and 6-argument syscalls: r8 / r9 carry args 5 and 6.  Needed by
+// sendto/recvfrom/mmap, which have six parameters in the kernel ABI.
+static inline uint64_t syscall6(uint64_t nr, uint64_t a1, uint64_t a2,
+                                  uint64_t a3, uint64_t a4,
+                                  uint64_t a5, uint64_t a6) {
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8  __asm__("r8")  = a5;
+    register uint64_t r9  __asm__("r9")  = a6;
+    uint64_t ret;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a1), "S"(a2), "d"(a3),
+          "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static inline uint64_t syscall5(uint64_t nr, uint64_t a1, uint64_t a2,
+                                  uint64_t a3, uint64_t a4, uint64_t a5) {
+    return syscall6(nr, a1, a2, a3, a4, a5, 0);
+}
+
 static inline uint64_t syscall3(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3) {
     return syscall4(nr, a1, a2, a3, 0);
 }
@@ -651,6 +675,12 @@ void* fb_map(void);
 // openpty(fds) → 0 or -1.  fds[0]=master, fds[1]=slave.
 int openpty(int fds[2]);
 
+// getpeerpid(fd) → pid of peer on AF_UNIX SOCK_STREAM socket, -1 on error.
+// Kernel-trusted; stamped at accept/connect. Use for privileged IPC peers
+// where you need to act on the peer process (e.g. compositor SIGKILL of an
+// unresponsive client).
+int getpeerpid(int fd);
+
 // ── BSD Sockets ──────────────────────────────────────────────────────────
 
 #define AF_UNIX     1
@@ -687,6 +717,40 @@ typedef uint32_t socklen_t;
 
 static inline uint16_t htons(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
 static inline uint16_t ntohs(uint16_t v) { return htons(v); }
+static inline uint32_t htonl(uint32_t v) {
+    return ((v & 0xFF000000u) >> 24) |
+           ((v & 0x00FF0000u) >>  8) |
+           ((v & 0x0000FF00u) <<  8) |
+           ((v & 0x000000FFu) << 24);
+}
+static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
+
+// INADDR_ANY / INADDR_BROADCAST — both in network byte order.
+#define INADDR_ANY        0x00000000u
+#define INADDR_BROADCAST  0xFFFFFFFFu
+#define INADDR_LOOPBACK   0x0100007Fu   // 127.0.0.1 (network byte order)
+
+// setsockopt levels / options — match the kernel.
+#define SOL_SOCKET     1
+#define SO_DEBUG       1
+#define SO_REUSEADDR   2
+#define SO_TYPE        3
+#define SO_ERROR       4
+#define SO_DONTROUTE   5
+#define SO_BROADCAST   6
+#define SO_SNDBUF      7
+#define SO_RCVBUF      8
+#define SO_KEEPALIVE   9
+#define SO_OOBINLINE  10
+#define SO_LINGER     13
+#define SO_REUSEPORT  15
+#define SO_RCVTIMEO   20
+#define SO_SNDTIMEO   21
+
+// Flags for send/recv (currently ignored by the kernel but accepted so
+// portable code compiles).
+#define MSG_PEEK      0x02
+#define MSG_DONTWAIT  0x40
 
 int socket(int domain, int type, int protocol);
 int bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
@@ -695,9 +759,50 @@ int accept(int fd, struct sockaddr* addr, socklen_t* addrlen);
 int connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
 ssize_t send(int fd, const void* buf, size_t len, int flags);
 ssize_t recv(int fd, void* buf, size_t len, int flags);
+ssize_t sendto(int fd, const void* buf, size_t len, int flags,
+                const struct sockaddr* dst, socklen_t dstlen);
+ssize_t recvfrom(int fd, void* buf, size_t len, int flags,
+                  struct sockaddr* src, socklen_t* srclen);
+int setsockopt(int fd, int level, int optname,
+                const void* optval, socklen_t optlen);
 int shutdown(int fd, int how);
 int sendfd(int sock_fd, int target_fd, unsigned int rights);
 int recvfd(int sock_fd);
+
+// inet_pton / inet_ntop — IPv4 only (AF_INET).
+// inet_pton: parse "a.b.c.d" → *out (network byte order). Returns 1 on
+//   success, 0 if `src` is malformed, -1 on unsupported family.
+// inet_ntop: format 4-byte network-order address into `dst[dst_len]`.
+//   Returns dst on success, NULL on buffer-too-small.
+int         inet_pton(int family, const char* src, void* out);
+const char* inet_ntop(int family, const void* src, char* dst, socklen_t dst_len);
+
+// ── Network interface configuration (root-only, called by dhcpcd) ──────
+#define IFCFG_MAX_DNS 3
+typedef struct {
+    uint32_t ip_be;
+    uint32_t gateway_be;
+    uint32_t netmask_be;
+    uint32_t dns_be[IFCFG_MAX_DNS];
+    uint32_t lease_seconds;
+} ifcfg_t;
+
+int net_ifconfig(const ifcfg_t* cfg);
+int net_mac(uint8_t out[6]);
+
+// ── DNS resolver (RFC 1035) ────────────────────────────────────────────────
+// POSIX-style name resolution. Reads /etc/resolv.conf on first use, falls back
+// to the gateway if no nameservers are configured.  IPv4 only.
+//
+// gethostbyname_ipv4("example.com", out_ip_be) -> 0 on success, -1 on failure
+// (errno = EINVAL / ENOENT / EAGAIN / ETIMEDOUT).
+// Numeric "a.b.c.d" is resolved via inet_pton without a network round-trip.
+int gethostbyname_ipv4(const char* name, uint32_t* out_ip_be);
+
+// Simple blocking getaddrinfo for IPv4. Caller passes a statically-sized
+// sockaddr_in_t and the port in host byte order. Returns 0 on success.
+int getaddrinfo_ipv4(const char* host, uint16_t port,
+                     sockaddr_in_t* out_addr);
 
 // ── New syscall numbers ───────────────────────────────────────────────────
 #define SYS_SOCKET      35
@@ -741,6 +846,8 @@ int recvfd(int sock_fd);
 #define SYS_TCGETPGRP   73
 #define SYS_TCSETPGRP   74
 #define SYS_REBOOT      75
+#define SYS_NET_IFCONFIG 95
+#define SYS_NET_MAC      96
 
 // ── Extra errno values ────────────────────────────────────────────────────
 #define EILSEQ      84

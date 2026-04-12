@@ -66,6 +66,8 @@ void ipv4_recv(skbuff_t* skb) {
         skb_free(skb);
         return;
     }
+    serial_puts_dbg("[ip] rx proto="); serial_hex_dbg((uint64_t)hdr->protocol);
+    serial_puts_dbg("[ip] rx dst="); serial_hex_dbg((uint64_t)hdr->dst);
 
     // Verify checksum.
     uint16_t saved = hdr->checksum;
@@ -75,8 +77,13 @@ void ipv4_recv(skbuff_t* skb) {
     if (calc != saved) { skb_free(skb); return; }
 
     // Drop packets not addressed to us (unicast to our IP or broadcast).
+    // Exception: while unconfigured (our_ip == 0), accept everything so DHCP
+    // bootstrap works — RFC 2131 allows the server to reply either broadcast
+    // or unicast to the yiaddr, and QEMU SLIRP unicasts to yiaddr even when
+    // the client sets the BROADCAST flag.
     uint32_t our_ip = net_our_ip();
-    if (hdr->dst != our_ip && hdr->dst != 0xFFFFFFFFu &&
+    if (our_ip != 0 &&
+        hdr->dst != our_ip && hdr->dst != 0xFFFFFFFFu &&
         hdr->dst != net_broadcast_ip()) {
         skb_free(skb);
         return;
@@ -104,8 +111,10 @@ void ipv4_recv(skbuff_t* skb) {
 
 // ── Transmit ──────────────────────────────────────────────────────────────
 
-int ipv4_send(skbuff_t* skb, uint32_t dst_ip_be, uint8_t protocol) {
+int ipv4_send_ex(skbuff_t* skb, uint32_t src_ip_be, uint32_t dst_ip_be,
+                  uint8_t protocol) {
     uint32_t our_ip = net_our_ip();
+    if (src_ip_be == 0 && our_ip != 0) src_ip_be = our_ip;
     uint16_t payload_len = (uint16_t)skb->len;
 
     // Prepend IP header.
@@ -120,16 +129,26 @@ int ipv4_send(skbuff_t* skb, uint32_t dst_ip_be, uint8_t protocol) {
     hdr->ttl       = 64;
     hdr->protocol  = protocol;
     hdr->checksum  = 0;
-    hdr->src       = our_ip;
+    hdr->src       = src_ip_be;
     hdr->dst       = dst_ip_be;
     hdr->checksum  = inet_checksum(hdr, IPV4_HDR_LEN);
+
+    // Broadcast fast path: limited broadcast (255.255.255.255) and the
+    // configured subnet broadcast go straight out as an L2 broadcast.
+    // This is what DHCP DISCOVER/REQUEST needs before the host has an IP.
+    if (dst_ip_be == 0xFFFFFFFFu ||
+        (net_broadcast_ip() != 0 && dst_ip_be == net_broadcast_ip())) {
+        return eth_send(skb, eth_broadcast, ETHERTYPE_IPV4);
+    }
 
     // Resolve next-hop MAC via ARP.
     // If the destination is on the same subnet, resolve directly.
     // Otherwise use the gateway.
+    uint32_t mask = net_subnet_mask();
     uint32_t next_hop = dst_ip_be;
-    if ((dst_ip_be & net_subnet_mask()) != (our_ip & net_subnet_mask()))
+    if (mask && (dst_ip_be & mask) != (src_ip_be & mask))
         next_hop = net_gateway_ip();
+    if (next_hop == 0) return -1;  // no route
 
     const uint8_t* dst_mac = arp_lookup(next_hop);
     if (!dst_mac) {
@@ -138,4 +157,8 @@ int ipv4_send(skbuff_t* skb, uint32_t dst_ip_be, uint8_t protocol) {
     }
 
     return eth_send(skb, dst_mac, ETHERTYPE_IPV4);
+}
+
+int ipv4_send(skbuff_t* skb, uint32_t dst_ip_be, uint8_t protocol) {
+    return ipv4_send_ex(skb, 0, dst_ip_be, protocol);
 }

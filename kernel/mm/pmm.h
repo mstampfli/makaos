@@ -45,6 +45,20 @@ typedef struct slab_cache_t {
 } slab_cache_t;
 
 phys_addr_t pmm_highest_address_get(void);
+uint64_t    pmm_total_frames_get(void);
+
+// ── Per-frame refcount (Copy-on-Write) ────────────────────────────────────
+// Every frame starts at refcount 1 on alloc.  CoW fork increments it.
+// pmm_ref_dec frees the frame when refcount drops to 0.
+void     pmm_ref_inc(phys_addr_t addr);
+void     pmm_ref_dec(phys_addr_t addr);   // frees frame when rc hits 0
+uint32_t pmm_ref_get(phys_addr_t addr);
+
+// ── Per-frame pin count (DMA safety) ─────────────────────────────────────
+// Pinned frames must not be CoW-shared — fork deep-copies them instead.
+void     pmm_pin(phys_addr_t addr);
+void     pmm_unpin(phys_addr_t addr);
+uint16_t pmm_pin_get(phys_addr_t addr);
 
 mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count);
 

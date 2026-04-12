@@ -20,6 +20,15 @@ static uint64_t* g_buddy_coalesce[MAX_ORDER + 1];
 static uint64_t g_buddy_blocks[MAX_ORDER + 1];          // number of blocks at each order
 static uint64_t g_buddy_words_coalesce[MAX_ORDER + 1];
 
+// ── Per-frame refcount + pin count (CoW / DMA) ──────────────────────────
+// Indexed by frame number (phys >> PAGE_SHIFT).
+// refcount: starts at 1 on alloc, incremented by CoW fork, decremented by
+//           vmm_free_user / CoW break.  Frame freed when rc hits 0.
+// pincount: non-zero while DMA is in flight to this frame.  Fork must
+//           deep-copy pinned frames instead of CoW-sharing them.
+static uint32_t* g_frame_refcount;   // [frame_index] → reference count
+static uint16_t* g_frame_pincount;   // [frame_index] → pin count
+
 // Slab trackers
 static slab_cache_t** g_slab_trackers;   // [frame_index] -> owning cache or NULL
 static void** g_slab_heads;      // [frame_index] -> (void*)head_frame_index
@@ -246,6 +255,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
     meta_size_bytes += bytes_for_bits(coalesce_bits);
   }
 
+  meta_size_bytes += g_total_frames * sizeof(uint32_t);       // g_frame_refcount
+  meta_size_bytes += g_total_frames * sizeof(uint16_t);       // g_frame_pincount
   meta_size_bytes += g_total_frames * sizeof(slab_cache_t*);
   meta_size_bytes += g_total_frames * sizeof(void*);
 
@@ -294,6 +305,12 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
     g_buddy_coalesce[current_order] = (uint64_t*)(meta_virt + off);
     off += coalesce_bytes;
   }
+
+  g_frame_refcount = (uint32_t*)(meta_virt + off);
+  off += g_total_frames * sizeof(uint32_t);
+
+  g_frame_pincount = (uint16_t*)(meta_virt + off);
+  off += g_total_frames * sizeof(uint16_t);
 
   g_slab_trackers = (slab_cache_t**)(meta_virt + off);
   off += g_total_frames * sizeof(slab_cache_t*);
@@ -411,6 +428,15 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
 
     // We keep holding the left child
     block_index = (block_index << 1);
+  }
+
+  // Set refcount = 1 for every frame in the allocated block.
+  {
+      uint64_t fi = allocated_phys >> PAGE_SHIFT;
+      uint64_t n  = order_to_pages(order);
+      for (uint64_t k = 0; k < n; k++)
+          if (fi + k < g_total_frames)
+              g_frame_refcount[fi + k] = 1;
   }
 
   return allocated_phys;
@@ -650,4 +676,47 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size) {
   cache->partial = NULL;
   cache->full = NULL;
   cache->slab_order = calculate_slab_order(slot_size);
+}
+
+uint64_t pmm_total_frames_get(void) { return g_total_frames; }
+
+// ── Per-frame refcount API ───────────────────────────────────────────────
+
+void pmm_ref_inc(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi < g_total_frames) g_frame_refcount[fi]++;
+}
+
+void pmm_ref_dec(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi >= g_total_frames) return;
+    if (g_frame_refcount[fi] == 0) return;  // safety: already freed
+    g_frame_refcount[fi]--;
+    if (g_frame_refcount[fi] == 0)
+        pmm_buddy_free(addr, 0);
+}
+
+uint32_t pmm_ref_get(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi >= g_total_frames) return 0;
+    return g_frame_refcount[fi];
+}
+
+// ── Per-frame pin count API ──────────────────────────────────────────────
+
+void pmm_pin(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi < g_total_frames) g_frame_pincount[fi]++;
+}
+
+void pmm_unpin(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi < g_total_frames && g_frame_pincount[fi] > 0)
+        g_frame_pincount[fi]--;
+}
+
+uint16_t pmm_pin_get(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi >= g_total_frames) return 0;
+    return g_frame_pincount[fi];
 }

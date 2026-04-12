@@ -131,6 +131,12 @@ typedef struct unix_sock {
 
     // Back-pointer to the vfs_file_t wrapping this socket (for poll wakeups).
     struct vfs_file_t* file;
+
+    // PID of the process on the OTHER end of this connection, as seen by the
+    // kernel at accept()/connect() time. Trusted — never client-reported.
+    // Used by the compositor to SIGKILL an unresponsive client after the user
+    // force-closes its window. 0 = no peer (unconnected / listener).
+    uint32_t peer_pid;
 } unix_sock_t;
 
 // ── Kernel API ───────────────────────────────────────────────────────────

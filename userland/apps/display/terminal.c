@@ -10,13 +10,18 @@
 #include "../home/font8x16.h"
 
 // ── Terminal dimensions ─────────────────────────────────────────────────
+// Grid dimensions (cols/rows) and pixel buffer dimensions (win_w/win_h)
+// are dynamic — reallocated on MD_SURFACE_CONFIGURE (window resize).
 
-#define TERM_COLS    80
-#define TERM_ROWS    25
 #define GLYPH_W      8
 #define GLYPH_H      16
-#define WIN_W        (TERM_COLS * GLYPH_W)
-#define WIN_H        (TERM_ROWS * GLYPH_H)
+#define INIT_COLS    80
+#define INIT_ROWS    25
+
+static int      g_cols = INIT_COLS;
+static int      g_rows = INIT_ROWS;
+static uint32_t g_win_w = INIT_COLS * GLYPH_W;
+static uint32_t g_win_h = INIT_ROWS * GLYPH_H;
 
 // ── ANSI color palette (standard 8 + bright 8) ─────────────────────────
 
@@ -51,7 +56,9 @@ typedef struct {
 
 // ── Terminal state ──────────────────────────────────────────────────────
 
-static term_cell_t g_cells[TERM_ROWS][TERM_COLS];
+// Dynamically allocated cell grid: g_cols * g_rows cells, row-major.
+static term_cell_t* g_cells;
+#define CELL(r, c) (g_cells[(r) * g_cols + (c)])
 static int         g_cur_row;
 static int         g_cur_col;
 static uint8_t     g_cur_fg = 7;   // default: white on black
@@ -84,9 +91,9 @@ static int g_dirty = 0;  // any cells changed since last commit?
 // ── Rendering ───────────────────────────────────────────────────────────
 
 static void render_cell(int row, int col) {
-    if (row < 0 || row >= TERM_ROWS || col < 0 || col >= TERM_COLS) return;
+    if (row < 0 || row >= g_rows || col < 0 || col >= g_cols) return;
 
-    term_cell_t* c = &g_cells[row][col];
+    term_cell_t* c = &CELL(row, col);
     uint32_t fg = g_ansi_colors[c->fg & 0xF];
     uint32_t bg = g_ansi_colors[c->bg & 0xF];
 
@@ -100,7 +107,7 @@ static void render_cell(int row, int col) {
         uint8_t bits = glyph[y];
         for (int x = 0; x < GLYPH_W; x++) {
             uint32_t color = (bits & (0x80 >> x)) ? fg : bg;
-            g_pixels[(py + y) * WIN_W + (px + x)] = color;
+            g_pixels[(py + y) * g_win_w + (px + x)] = color;
         }
     }
 }
@@ -108,8 +115,8 @@ static void render_cell(int row, int col) {
 // Draw cursor (inverted cell)
 static void render_cursor(void) {
     if (!g_cur_visible) return;
-    if (g_cur_row < 0 || g_cur_row >= TERM_ROWS) return;
-    if (g_cur_col < 0 || g_cur_col >= TERM_COLS) return;
+    if (g_cur_row < 0 || g_cur_row >= g_rows) return;
+    if (g_cur_col < 0 || g_cur_col >= g_cols) return;
 
     int px = g_cur_col * GLYPH_W;
     int py = g_cur_row * GLYPH_H;
@@ -117,15 +124,15 @@ static void render_cursor(void) {
     // Invert the bottom 2 scanlines for an underline cursor
     for (int y = GLYPH_H - 2; y < GLYPH_H; y++) {
         for (int x = 0; x < GLYPH_W; x++) {
-            int idx = (py + y) * WIN_W + (px + x);
+            int idx = (py + y) * g_win_w + (px + x);
             g_pixels[idx] ^= 0x00FFFFFF;
         }
     }
 }
 
 static void render_all(void) {
-    for (int r = 0; r < TERM_ROWS; r++)
-        for (int c = 0; c < TERM_COLS; c++)
+    for (int r = 0; r < g_rows; r++)
+        for (int c = 0; c < g_cols; c++)
             render_cell(r, c);
     render_cursor();
 }
@@ -134,7 +141,7 @@ static void commit_display(void) {
     if (!g_dirty) return;
     render_all();
     md_surface_attach(g_surf, g_buf);
-    md_surface_damage(g_surf, 0, 0, WIN_W, WIN_H);
+    md_surface_damage(g_surf, 0, 0, g_win_w, g_win_h);
     md_surface_commit(g_surf);
     g_dirty = 0;
 }
@@ -142,17 +149,17 @@ static void commit_display(void) {
 // ── Terminal operations ─────────────────────────────────────────────────
 
 static void term_scroll_up(void) {
-    // Move rows 1..TERM_ROWS-1 up by one
-    for (int r = 0; r < TERM_ROWS - 1; r++)
-        for (int c = 0; c < TERM_COLS; c++)
-            g_cells[r][c] = g_cells[r + 1][c];
+    // Move rows 1..g_rows-1 up by one
+    for (int r = 0; r < g_rows - 1; r++)
+        for (int c = 0; c < g_cols; c++)
+            CELL(r, c) = CELL(r + 1, c);
 
     // Clear last row
-    for (int c = 0; c < TERM_COLS; c++) {
-        g_cells[TERM_ROWS - 1][c].ch = ' ';
-        g_cells[TERM_ROWS - 1][c].fg = g_cur_fg;
-        g_cells[TERM_ROWS - 1][c].bg = g_cur_bg;
-        g_cells[TERM_ROWS - 1][c].attrs = 0;
+    for (int c = 0; c < g_cols; c++) {
+        CELL(g_rows - 1, c).ch = ' ';
+        CELL(g_rows - 1, c).fg = g_cur_fg;
+        CELL(g_rows - 1, c).bg = g_cur_bg;
+        CELL(g_rows - 1, c).attrs = 0;
     }
     g_dirty = 1;
 }
@@ -160,46 +167,46 @@ static void term_scroll_up(void) {
 static void term_newline(void) {
     g_cur_col = 0;
     g_cur_row++;
-    if (g_cur_row >= TERM_ROWS) {
-        g_cur_row = TERM_ROWS - 1;
+    if (g_cur_row >= g_rows) {
+        g_cur_row = g_rows - 1;
         term_scroll_up();
     }
     g_dirty = 1;
 }
 
 static void term_putchar(char ch) {
-    if (g_cur_col >= TERM_COLS) {
+    if (g_cur_col >= g_cols) {
         g_cur_col = 0;
         g_cur_row++;
-        if (g_cur_row >= TERM_ROWS) {
-            g_cur_row = TERM_ROWS - 1;
+        if (g_cur_row >= g_rows) {
+            g_cur_row = g_rows - 1;
             term_scroll_up();
         }
     }
-    g_cells[g_cur_row][g_cur_col].ch = ch;
-    g_cells[g_cur_row][g_cur_col].fg = g_cur_fg;
-    g_cells[g_cur_row][g_cur_col].bg = g_cur_bg;
-    g_cells[g_cur_row][g_cur_col].attrs = 0;
+    CELL(g_cur_row, g_cur_col).ch = ch;
+    CELL(g_cur_row, g_cur_col).fg = g_cur_fg;
+    CELL(g_cur_row, g_cur_col).bg = g_cur_bg;
+    CELL(g_cur_row, g_cur_col).attrs = 0;
     g_cur_col++;
     g_dirty = 1;
 }
 
 static void term_clear_row(int row, int from, int to) {
-    if (row < 0 || row >= TERM_ROWS) return;
+    if (row < 0 || row >= g_rows) return;
     if (from < 0) from = 0;
-    if (to > TERM_COLS) to = TERM_COLS;
+    if (to > g_cols) to = g_cols;
     for (int c = from; c < to; c++) {
-        g_cells[row][c].ch = ' ';
-        g_cells[row][c].fg = g_cur_fg;
-        g_cells[row][c].bg = g_cur_bg;
-        g_cells[row][c].attrs = 0;
+        CELL(row, c).ch = ' ';
+        CELL(row, c).fg = g_cur_fg;
+        CELL(row, c).bg = g_cur_bg;
+        CELL(row, c).attrs = 0;
     }
     g_dirty = 1;
 }
 
 static void term_clear_screen(void) {
-    for (int r = 0; r < TERM_ROWS; r++)
-        term_clear_row(r, 0, TERM_COLS);
+    for (int r = 0; r < g_rows; r++)
+        term_clear_row(r, 0, g_cols);
     g_dirty = 1;
 }
 
@@ -217,12 +224,12 @@ static void csi_dispatch(char final) {
         break;
     case 'B': // Cursor Down
         g_cur_row += (p0 ? p0 : 1);
-        if (g_cur_row >= TERM_ROWS) g_cur_row = TERM_ROWS - 1;
+        if (g_cur_row >= g_rows) g_cur_row = g_rows - 1;
         g_dirty = 1;
         break;
     case 'C': // Cursor Forward (right)
         g_cur_col += (p0 ? p0 : 1);
-        if (g_cur_col >= TERM_COLS) g_cur_col = TERM_COLS - 1;
+        if (g_cur_col >= g_cols) g_cur_col = g_cols - 1;
         g_dirty = 1;
         break;
     case 'D': // Cursor Back (left)
@@ -234,8 +241,8 @@ static void csi_dispatch(char final) {
     case 'f':
         g_cur_row = (p0 ? p0 - 1 : 0);
         g_cur_col = (p1 ? p1 - 1 : 0);
-        if (g_cur_row >= TERM_ROWS) g_cur_row = TERM_ROWS - 1;
-        if (g_cur_col >= TERM_COLS) g_cur_col = TERM_COLS - 1;
+        if (g_cur_row >= g_rows) g_cur_row = g_rows - 1;
+        if (g_cur_col >= g_cols) g_cur_col = g_cols - 1;
         if (g_cur_row < 0) g_cur_row = 0;
         if (g_cur_col < 0) g_cur_col = 0;
         g_dirty = 1;
@@ -243,13 +250,13 @@ static void csi_dispatch(char final) {
     case 'J': // Erase in Display
         if (p0 == 0) {
             // Clear from cursor to end of screen
-            term_clear_row(g_cur_row, g_cur_col, TERM_COLS);
-            for (int r = g_cur_row + 1; r < TERM_ROWS; r++)
-                term_clear_row(r, 0, TERM_COLS);
+            term_clear_row(g_cur_row, g_cur_col, g_cols);
+            for (int r = g_cur_row + 1; r < g_rows; r++)
+                term_clear_row(r, 0, g_cols);
         } else if (p0 == 1) {
             // Clear from start to cursor
             for (int r = 0; r < g_cur_row; r++)
-                term_clear_row(r, 0, TERM_COLS);
+                term_clear_row(r, 0, g_cols);
             term_clear_row(g_cur_row, 0, g_cur_col + 1);
         } else if (p0 == 2) {
             // Clear entire screen
@@ -258,44 +265,44 @@ static void csi_dispatch(char final) {
         break;
     case 'K': // Erase in Line
         if (p0 == 0) {
-            term_clear_row(g_cur_row, g_cur_col, TERM_COLS);
+            term_clear_row(g_cur_row, g_cur_col, g_cols);
         } else if (p0 == 1) {
             term_clear_row(g_cur_row, 0, g_cur_col + 1);
         } else if (p0 == 2) {
-            term_clear_row(g_cur_row, 0, TERM_COLS);
+            term_clear_row(g_cur_row, 0, g_cols);
         }
         break;
     case 'L': { // Insert Lines
         int n = p0 ? p0 : 1;
-        for (int i = 0; i < n && g_cur_row + n < TERM_ROWS; i++) {
-            for (int r = TERM_ROWS - 1; r > g_cur_row; r--)
-                for (int c = 0; c < TERM_COLS; c++)
-                    g_cells[r][c] = g_cells[r - 1][c];
-            term_clear_row(g_cur_row, 0, TERM_COLS);
+        for (int i = 0; i < n && g_cur_row + n < g_rows; i++) {
+            for (int r = g_rows - 1; r > g_cur_row; r--)
+                for (int c = 0; c < g_cols; c++)
+                    CELL(r, c) = CELL(r - 1, c);
+            term_clear_row(g_cur_row, 0, g_cols);
         }
         break;
     }
     case 'M': { // Delete Lines
         int n = p0 ? p0 : 1;
         for (int i = 0; i < n; i++) {
-            for (int r = g_cur_row; r < TERM_ROWS - 1; r++)
-                for (int c = 0; c < TERM_COLS; c++)
-                    g_cells[r][c] = g_cells[r + 1][c];
-            term_clear_row(TERM_ROWS - 1, 0, TERM_COLS);
+            for (int r = g_cur_row; r < g_rows - 1; r++)
+                for (int c = 0; c < g_cols; c++)
+                    CELL(r, c) = CELL(r + 1, c);
+            term_clear_row(g_rows - 1, 0, g_cols);
         }
         break;
     }
     case 'P': { // Delete Characters
         int n = p0 ? p0 : 1;
-        for (int c = g_cur_col; c < TERM_COLS - n; c++)
-            g_cells[g_cur_row][c] = g_cells[g_cur_row][c + n];
-        term_clear_row(g_cur_row, TERM_COLS - n, TERM_COLS);
+        for (int c = g_cur_col; c < g_cols - n; c++)
+            CELL(g_cur_row, c) = CELL(g_cur_row, c + n);
+        term_clear_row(g_cur_row, g_cols - n, g_cols);
         break;
     }
     case '@': { // Insert Characters
         int n = p0 ? p0 : 1;
-        for (int c = TERM_COLS - 1; c >= g_cur_col + n; c--)
-            g_cells[g_cur_row][c] = g_cells[g_cur_row][c - n];
+        for (int c = g_cols - 1; c >= g_cur_col + n; c--)
+            CELL(g_cur_row, c) = CELL(g_cur_row, c - n);
         term_clear_row(g_cur_row, g_cur_col, g_cur_col + n);
         break;
     }
@@ -364,12 +371,12 @@ static void csi_dispatch(char final) {
         break;
     case 'd': // Vertical Line Position Absolute
         g_cur_row = (p0 ? p0 - 1 : 0);
-        if (g_cur_row >= TERM_ROWS) g_cur_row = TERM_ROWS - 1;
+        if (g_cur_row >= g_rows) g_cur_row = g_rows - 1;
         g_dirty = 1;
         break;
     case 'G': // Cursor Horizontal Absolute
         g_cur_col = (p0 ? p0 - 1 : 0);
-        if (g_cur_col >= TERM_COLS) g_cur_col = TERM_COLS - 1;
+        if (g_cur_col >= g_cols) g_cur_col = g_cols - 1;
         g_dirty = 1;
         break;
     case 'S': { // Scroll Up
@@ -380,19 +387,19 @@ static void csi_dispatch(char final) {
     case 'T': { // Scroll Down
         int n = p0 ? p0 : 1;
         for (int i = 0; i < n; i++) {
-            for (int r = TERM_ROWS - 1; r > 0; r--)
-                for (int c = 0; c < TERM_COLS; c++)
-                    g_cells[r][c] = g_cells[r - 1][c];
-            term_clear_row(0, 0, TERM_COLS);
+            for (int r = g_rows - 1; r > 0; r--)
+                for (int c = 0; c < g_cols; c++)
+                    CELL(r, c) = CELL(r - 1, c);
+            term_clear_row(0, 0, g_cols);
         }
         break;
     }
     case 'X': { // Erase Characters
         int n = p0 ? p0 : 1;
-        for (int i = 0; i < n && g_cur_col + i < TERM_COLS; i++) {
-            g_cells[g_cur_row][g_cur_col + i].ch = ' ';
-            g_cells[g_cur_row][g_cur_col + i].fg = g_cur_fg;
-            g_cells[g_cur_row][g_cur_col + i].bg = g_cur_bg;
+        for (int i = 0; i < n && g_cur_col + i < g_cols; i++) {
+            CELL(g_cur_row, g_cur_col + i).ch = ' ';
+            CELL(g_cur_row, g_cur_col + i).fg = g_cur_fg;
+            CELL(g_cur_row, g_cur_col + i).bg = g_cur_bg;
         }
         g_dirty = 1;
         break;
@@ -420,7 +427,7 @@ static void term_process_char(char c) {
             g_dirty = 1;
         } else if (c == '\t') {
             int next = (g_cur_col + 8) & ~7;
-            if (next > TERM_COLS) next = TERM_COLS;
+            if (next > g_cols) next = g_cols;
             while (g_cur_col < next) term_putchar(' ');
         } else if (c == '\a') {
             // Bell — ignore
@@ -454,10 +461,10 @@ static void term_process_char(char c) {
                 g_cur_row--;
             } else {
                 // Scroll down
-                for (int r = TERM_ROWS - 1; r > 0; r--)
-                    for (int cc = 0; cc < TERM_COLS; cc++)
-                        g_cells[r][cc] = g_cells[r - 1][cc];
-                term_clear_row(0, 0, TERM_COLS);
+                for (int r = g_rows - 1; r > 0; r--)
+                    for (int cc = 0; cc < g_cols; cc++)
+                        CELL(r, cc) = CELL(r - 1, cc);
+                term_clear_row(0, 0, g_cols);
             }
             g_dirty = 1;
             g_esc_state = ESC_NONE;
@@ -590,9 +597,93 @@ static void on_key(md_client_surface_t* surf, uint32_t keycode,
     write(g_pty_master_fd, &ch, 1);
 }
 
+// Allocate / reallocate the cell grid for the current g_cols/g_rows.
+// If old grid exists, preserves the overlapping top-left region.
+static void alloc_cells(int old_cols, int old_rows) {
+    term_cell_t* old = g_cells;
+    size_t bytes = (size_t)g_cols * (size_t)g_rows * sizeof(term_cell_t);
+    g_cells = (term_cell_t*)malloc(bytes);
+    if (!g_cells) { g_running = 0; return; }
+    for (int r = 0; r < g_rows; r++) {
+        for (int c = 0; c < g_cols; c++) {
+            term_cell_t* dst = &g_cells[r * g_cols + c];
+            if (old && r < old_rows && c < old_cols) {
+                *dst = old[r * old_cols + c];
+            } else {
+                dst->ch = ' ';
+                dst->fg = g_cur_fg;
+                dst->bg = g_cur_bg;
+                dst->attrs = 0;
+            }
+        }
+    }
+    if (old) free(old);
+}
+
+// Render callback invoked by md_surface_resize_commit with the freshly
+// allocated buffer. This is where the terminal reacts to the new window
+// size: reflow the grid, clamp the cursor, and repaint the whole surface
+// into the new buffer. Because the helper sequences allocate→render→
+// attach→commit→destroy, the old buffer is still attached on the server
+// while we paint the new one, so there is no flicker or race.
+typedef struct {
+    int old_cols;
+    int old_rows;
+} resize_ctx_t;
+
+static void resize_render(md_client_buffer_t* new_buf, void* userdata) {
+    resize_ctx_t* ctx = (resize_ctx_t*)userdata;
+    g_win_w  = md_buffer_width(new_buf);
+    g_win_h  = md_buffer_height(new_buf);
+    g_pixels = md_buffer_data(new_buf);
+
+    g_cols = (int)(g_win_w / GLYPH_W);
+    g_rows = (int)(g_win_h / GLYPH_H);
+    if (g_cols < 1) g_cols = 1;
+    if (g_rows < 1) g_rows = 1;
+
+    alloc_cells(ctx->old_cols, ctx->old_rows);
+
+    if (g_cur_row >= g_rows) g_cur_row = g_rows - 1;
+    if (g_cur_col >= g_cols) g_cur_col = g_cols - 1;
+
+    for (uint32_t i = 0; i < g_win_w * g_win_h; i++) g_pixels[i] = 0;
+    render_all();
+    g_dirty = 0;
+}
+
+static void on_configure(md_client_surface_t* surf, uint32_t width,
+                         uint32_t height, uint32_t states) {
+    (void)surf; (void)states;
+    if (width == 0 || height == 0) return;
+    if (width == g_win_w && height == g_win_h) return;
+
+    resize_ctx_t ctx = { g_cols, g_rows };
+    if (md_surface_resize_commit(g_surf, &g_buf, width, height,
+                                 resize_render, &ctx) < 0) {
+        return;  // allocation failed — keep old buffer
+    }
+
+    // Tell the child about the new grid so it reflows its prompt/layout.
+    if (g_pty_master_fd >= 0) {
+        winsize_t ws;
+        ws.ws_row = g_rows;
+        ws.ws_col = g_cols;
+        ws.ws_xpixel = g_win_w;
+        ws.ws_ypixel = g_win_h;
+        ioctl(g_pty_master_fd, 0x5414, (void*)&ws);  // TIOCSWINSZ
+    }
+}
+
 static void on_close(md_client_surface_t* surf) {
     (void)surf;
-    g_running = 0;
+    // Match doom: die immediately. The kernel tears down every fd we own,
+    // which closes the pty master (SIGHUPs bash) and the display socket
+    // (compositor sees POLLHUP → client_disconnect → surface gone). Running
+    // the graceful path from inside the dispatch callback was leaving the
+    // surface on screen in cases where the post-loop teardown got stuck
+    // behind a blocking pty/shm close.
+    _exit(0);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -639,10 +730,10 @@ int main(int argc, char** argv) {
         ioctl(0, TIOCSCTTY, (void*)0);
 
         winsize_t ws;
-        ws.ws_row = TERM_ROWS;
-        ws.ws_col = TERM_COLS;
-        ws.ws_xpixel = WIN_W;
-        ws.ws_ypixel = WIN_H;
+        ws.ws_row = g_rows;
+        ws.ws_col = g_cols;
+        ws.ws_xpixel = g_win_w;
+        ws.ws_ypixel = g_win_h;
         ioctl(0, 0x5414, (void*)&ws);  // TIOCSWINSZ
 
         const char* bash_argv[] = { "bash", "--norc", "--noprofile", 0 };
@@ -674,17 +765,19 @@ int main(int argc, char** argv) {
     md_surface_set_title(g_surf, "Terminal");
     md_surface_on_key(g_surf, on_key);
     md_surface_on_close(g_surf, on_close);
+    md_surface_on_configure(g_surf, on_configure);
 
     print("makaterm: surface created, on_key set\n");
 
-    g_buf = md_buffer_create(g_dpy, WIN_W, WIN_H);
+    g_buf = md_buffer_create(g_dpy, g_win_w, g_win_h);
     if (!g_buf) {
         print("makaterm: failed to create buffer\n");
         return 1;
     }
     g_pixels = md_buffer_data(g_buf);
 
-    // Initialize terminal cells
+    // Allocate the initial cell grid, then clear it.
+    alloc_cells(0, 0);
     term_clear_screen();
 
     // Initial render

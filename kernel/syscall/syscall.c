@@ -21,6 +21,7 @@
 #include "net/socket.h"
 #include "net/unix_sock.h"
 #include "net/net.h"
+#include "net/virtio_net.h"
 #include "cred.h"
 #include "rights.h"
 #include "pledge.h"
@@ -451,11 +452,12 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 
     // ── Shrink heap ───────────────────────────────────────────────────────
     // Unmap and free physical frames in [new_brk, old_brk).
+    // Use pmm_ref_dec (CoW-aware): frame only freed when refcount→0.
     phys_addr_t pml4 = vmm_current_pml4();
     for (virt_addr_t page = new_brk; page < old_brk; page += PAGE_SIZE) {
         phys_addr_t frame;
         if (vmm_page_unmap(pml4, page, &frame))
-            pmm_buddy_free(frame, 0);
+            pmm_ref_dec(frame);
     }
 
     // Shrink or remove the heap VMA.
@@ -483,7 +485,15 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 }
 
 // ── sys_exit ──────────────────────────────────────────────────────────────
-// Reparent direct children to g_init_task before zombifying.
+// Reparent direct children to g_init_task, drop the fd table, then zombify.
+//
+// Releasing files_shared here (matching Linux exit_files()) is load-bearing:
+// peers on the other end of a unix socket must see POLLHUP the moment the
+// task calls exit(), not whenever the parent eventually calls wait(). Without
+// this, a process that exits while its parent is busy (e.g. makaterm exiting
+// while its parent loops on something else) leaves its sockets half-open and
+// the peer never learns the client is gone. The zombie only needs to retain
+// exit_code / pid for waitpid — fds are not part of that contract.
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
         // Move all children to init's children list and update their ppid.
@@ -500,6 +510,13 @@ static uint64_t sys_exit(uint64_t code) {
             child = next_child;
         }
         g_current->children = NULL;
+
+        // Drop the fd table now so peers (pipes, sockets, ttys) see EOF
+        // immediately rather than at reap time.
+        if (g_current->files_shared) {
+            task_files_release(g_current->files_shared);
+            g_current->files_shared = NULL;
+        }
 
         g_current->exit_code = (int32_t)(int)code;
         g_current->state = TASK_ZOMBIE;
@@ -735,7 +752,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
 
     // ── Swap in new address space ─────────────────────────────────────────
-    vmm_free_user(g_current->mm_shared->pml4_phys);
+    vmm_free_user_ex(g_current->mm_shared->pml4_phys, g_current->mm_shared->mm);
     pmm_buddy_free(g_current->mm_shared->pml4_phys, 0);
     mm_destroy(g_current->mm_shared->mm);
 
@@ -916,7 +933,9 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     } else {
         phys_addr_t new_pml4 = vmm_alloc_pml4();
         if (new_pml4 == PMM_INVALID_ADDR) { pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }
-        if (!vmm_clone_user(new_pml4, g_current->mm_shared->pml4_phys)) {
+        // CoW clone: pass mm so private pages are CoW-shared, not deep-copied.
+        if (!vmm_clone_user_ex(new_pml4, g_current->mm_shared->pml4_phys,
+                               g_current->mm_shared->mm)) {
             vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
@@ -1621,9 +1640,10 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             phys_addr_t frame;
             if (vmm_page_unmap(pml4, p, &frame)) {
                 // Only free the frame if the VMA at this address is private.
+                // CoW-aware: pmm_ref_dec only frees when refcount→0.
                 vma_t* old_vma = mm_vma_find(mm, p);
                 if (!old_vma || !old_vma->shmem)
-                    pmm_buddy_free(frame, 0);
+                    pmm_ref_dec(frame);
             }
         }
         mm_vma_remove(mm, addr, addr + len);
@@ -1725,7 +1745,7 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
         phys_addr_t frame;
         if (vmm_page_unmap(pml4, p, &frame)) {
             if (!vma || !vma->shmem)
-                pmm_buddy_free(frame, 0);
+                pmm_ref_dec(frame);  // CoW-aware: only frees when rc→0
             // Shared frames: just unmap the PTE, don't free the physical page.
         }
     }
@@ -2115,7 +2135,7 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!sa) return (uint64_t)-EINVAL;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     int r = socket_bind(f, port);
-    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+    return (uint64_t)(int64_t)r;
 }
 
 // listen(fd, backlog) → 0 or -errno
@@ -2132,7 +2152,7 @@ static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
 
     (void)backlog;
     int r = socket_listen(f);
-    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+    return (uint64_t)(int64_t)r;
 }
 
 // accept(fd, sockaddr*, addrlen*) → new fd or -errno
@@ -2152,7 +2172,15 @@ static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr)
 
     sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
     vfs_file_t* cf = socket_accept(f, peer);
-    if (!cf) return (uint64_t)-ECONNABORTED;
+    if (!cf) {
+        // Non-blocking accept: no ready child. Otherwise a real failure.
+        if (f->flags & O_NONBLOCK) return (uint64_t)-EAGAIN;
+        return (uint64_t)-ECONNABORTED;
+    }
+    if (peer) {
+        // Convert port back to network byte order for userspace.
+        peer->sin_port = (uint16_t)((peer->sin_port >> 8) | (peer->sin_port << 8));
+    }
     int64_t nfd = fd_install(cf);
     return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
 }
@@ -2176,7 +2204,7 @@ static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     int r = socket_connect(f, sa->sin_addr, port);
-    return (r == 0) ? 0 : (uint64_t)-ECONNREFUSED;
+    return (uint64_t)(int64_t)r;
 }
 
 // sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
@@ -2206,7 +2234,7 @@ static uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     } else {
         r = socket_send(f, (const void*)buf_ptr, (uint32_t)len);
     }
-    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+    return (uint64_t)(int64_t)r;
 }
 
 // recvfrom(fd, buf, len, flags, addr, addrlen*) → bytes or -errno
@@ -2225,18 +2253,77 @@ static uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     int r;
     if (sa) {
         r = socket_recvfrom(f, (void*)buf_ptr, (uint32_t)len, sa);
-        if (r >= 0 && sa)
-            sa->sin_port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
+        // src_port is already in network byte order (stamped from skb).
     } else {
         r = socket_recv(f, (void*)buf_ptr, (uint32_t)len);
     }
-    return (r < 0) ? (uint64_t)-EIO : (uint64_t)r;
+    return (uint64_t)(int64_t)r;
 }
 
-// setsockopt — stub (returns 0 for anything we don't understand)
+// setsockopt(fd, level, optname, optval*, optlen) → 0 or -errno
 static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                                 uint64_t val_ptr, uint64_t vallen) {
-    (void)fd; (void)level; (void)opt; (void)val_ptr; (void)vallen;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (is_unix_sock(f)) {
+        // Unix sockets: accept everything silently (no options honoured yet).
+        return 0;
+    }
+    int r = socket_setsockopt(f, (int)level, (int)opt,
+                               (const void*)val_ptr, (uint32_t)vallen);
+    return (uint64_t)(int64_t)r;
+}
+
+// getpeerpid(fd) → pid of peer on AF_UNIX SOCK_STREAM conn, or -errno.
+// Kernel-trusted — stamped at accept()/connect(). The compositor uses this
+// to SIGKILL an unresponsive client after the user force-closes its window.
+static uint64_t sys_getpeerpid(uint64_t fd) {
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (!is_unix_sock(f)) return (uint64_t)-ENOTSOCK;
+    unix_sock_t* s = (unix_sock_t*)f->ctx;
+    if (!s) return (uint64_t)-EBADF;
+    if (s->state != UNIX_STATE_CONNECTED) return (uint64_t)-ENOTCONN;
+    if (s->peer_pid == 0) return (uint64_t)-ENOTCONN;
+    return (uint64_t)s->peer_pid;
+}
+
+// net_ifconfig(ifcfg_t*, len) → 0 or -errno
+// Root-only syscall used by dhcpcd to configure the primary interface
+// after a successful DHCP lease.  Writes IP/gw/mask and the DNS server
+// list into the kernel's network state so resolvers and routers see the
+// new values immediately.
+static uint64_t sys_net_ifconfig(uint64_t cfg_ptr, uint64_t len) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (g_current->cred.euid != 0) return (uint64_t)-EPERM;
+    if (!cfg_ptr || len < sizeof(ifcfg_t)) return (uint64_t)-EINVAL;
+
+    ifcfg_t cfg;
+    if (copy_from_user(&cfg, (const void*)cfg_ptr, sizeof(cfg)) != 0)
+        return (uint64_t)-EFAULT;
+
+    net_set_config(cfg.ip_be, cfg.gateway_be, cfg.netmask_be);
+
+    uint32_t n = 0;
+    uint32_t dns[IFCFG_MAX_DNS];
+    for (uint32_t i = 0; i < IFCFG_MAX_DNS; i++) {
+        if (cfg.dns_be[i] != 0) dns[n++] = cfg.dns_be[i];
+    }
+    net_set_dns(dns, n);
+    return 0;
+}
+
+// net_mac(uint8_t out[6]) → 0 or -errno
+// Returns the primary NIC's hardware address.  Used by dhcpcd to build
+// DHCP packets (chaddr field) and by any userland tool that needs to
+// display the interface MAC.  Not root-restricted — the MAC is broadcast
+// on every frame we send, so exposing it is not a privacy leak.
+static uint64_t sys_net_mac(uint64_t out_ptr) {
+    if (!out_ptr) return (uint64_t)-EINVAL;
+    const uint8_t* mac = virtio_net_mac();
+    if (!mac) return (uint64_t)-EIO;
+    if (copy_to_user((void*)out_ptr, mac, 6) != 0)
+        return (uint64_t)-EFAULT;
     return 0;
 }
 
@@ -2249,7 +2336,7 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
         return (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
 
     int r = socket_shutdown(f, (int)how);
-    return (r == 0) ? 0 : (uint64_t)-EINVAL;
+    return (uint64_t)(int64_t)r;
 }
 
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
@@ -2854,6 +2941,11 @@ static int fd_is_writable(vfs_file_t* f) {
     return 1;
 }
 
+static int fd_has_hup(vfs_file_t* f) {
+    if (!f || !f->poll) return 0;
+    return f->poll(f, POLLHUP);
+}
+
 static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
                             uint64_t eset_ptr, uint64_t tv_ptr) {
     if (!g_current) return (uint64_t)-EINVAL;
@@ -2959,6 +3051,9 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             uint16_t rev = 0;
             if ((ufds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
             if ((ufds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
+            // POLLHUP and POLLERR are always reported, regardless of the
+            // caller's events mask (POSIX requirement).
+            if (fd_has_hup(f)) rev |= POLLHUP;
             if (rev) { ufds[i].revents = rev; count++; }
         }
         if (count > 0) break;
@@ -3247,6 +3342,7 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_FB_INFO:      ret = sys_fb_info(arg1);                         break;
         case SYS_FB_MAP:       ret = sys_fb_map();                              break;
         case SYS_OPENPTY:      ret = sys_openpty(arg1);                         break;
+        case SYS_GETPEERPID:   ret = sys_getpeerpid(arg1);                      break;
         case SYS_SOCKET:       ret = sys_socket(arg1, arg2, arg3);              break;
         case SYS_BIND:         ret = sys_bind(arg1, arg2, arg3);                break;
         case SYS_LISTEN:       ret = sys_listen(arg1, arg2);                    break;
@@ -3260,6 +3356,8 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_SETSOCKOPT:   ret = sys_setsockopt(arg1, arg2, arg3, arg4,
                                                      g_syscall_arg5);            break;
         case SYS_SHUTDOWN:     ret = sys_shutdown(arg1, arg2);                  break;
+        case SYS_NET_IFCONFIG: ret = sys_net_ifconfig(arg1, arg2);              break;
+        case SYS_NET_MAC:      ret = sys_net_mac(arg1);                         break;
 
         // ── POSIX bash-compat syscalls ────────────────────────────────────
         case SYS_FCNTL:      ret = sys_fcntl(arg1, arg2, arg3);               break;

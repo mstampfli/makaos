@@ -35,6 +35,15 @@ void ipv4_recv(skbuff_t* skb);
 // Returns 0 on success, -1 on failure (no ARP entry, no headroom, etc.).
 int ipv4_send(skbuff_t* skb, uint32_t dst_ip_be, uint8_t protocol);
 
+// Transmit an IPv4 datagram with an explicit source IP.
+// Used by DHCP (which must send from 0.0.0.0 before it owns an address) and
+// any future raw IP senders.  When `src_ip_be == 0` behaves like ipv4_send
+// (uses net_our_ip() as the source).
+// Limited broadcast (255.255.255.255) and the subnet broadcast address
+// bypass ARP and use the Ethernet broadcast MAC directly.
+int ipv4_send_ex(skbuff_t* skb, uint32_t src_ip_be, uint32_t dst_ip_be,
+                  uint8_t protocol);
+
 // Compute the Internet checksum (RFC 1071) over `len` bytes starting at `data`.
 // `len` must be even; callers pad to even if needed.
 uint16_t inet_checksum(const void* data, uint32_t len);
