@@ -82,12 +82,28 @@ static int read_exact(int fd, void* buf, uint32_t n) {
     return 0;
 }
 
-// Wait for a specific event (blocking read until we get it)
+// Wait for a specific event (blocking read until we get it).
+//
+// Care: this function can be called from inside a dispatch_event callback
+// (e.g., terminal's on_configure → md_buffer_create). At that point,
+// dpy->read_buf may still contain *unprocessed* messages that the parent
+// md_display_dispatch loop has yet to reach. We must NOT read fresh bytes
+// from the socket that would appear *before* those in wire order — so we
+// append any fresh messages to the tail of read_buf and only harvest the
+// OBJECT_ID reply without disturbing existing ordering.
 static int wait_for_object_id(md_display_t* dpy, uint32_t* out_id) {
-    // Read messages until we get MD_DISPLAY_OBJECT_ID
     for (;;) {
+        // Make sure we have at least one full message at the tail of
+        // read_buf that has NOT yet been dispatched by the outer loop.
+        // We track the write cursor via dpy->read_len.
+        // First, try to find an OBJECT_ID anywhere in the unprocessed tail.
+        // But we don't know what's "unprocessed" without parser state, so
+        // instead we read fresh bytes until we find an OBJECT_ID reply in
+        // the newly arrived stream, and append everything in between to
+        // read_buf so the outer dispatch loop sees it later.
         md_msg_header_t hdr;
         if (read_exact(dpy->fd, &hdr, MD_HEADER_SIZE) < 0) return -1;
+        if (hdr.size < MD_HEADER_SIZE || hdr.size > MD_MAX_MSG_SIZE) return -1;
 
         uint32_t payload_size = hdr.size - MD_HEADER_SIZE;
         uint8_t payload[MD_MAX_MSG_SIZE];
@@ -96,7 +112,6 @@ static int wait_for_object_id(md_display_t* dpy, uint32_t* out_id) {
         }
 
         if (hdr.object_id == 0 && hdr.opcode == MD_DISPLAY_OBJECT_ID) {
-            // payload has: new_id(4) + obj_type(4) = 8 bytes
             if (payload_size >= 8) {
                 uint32_t* p32 = (uint32_t*)payload;
                 *out_id = p32[0];
@@ -104,7 +119,17 @@ static int wait_for_object_id(md_display_t* dpy, uint32_t* out_id) {
             }
             return -1;
         }
-        // Other event — discard for now (could queue for later dispatch)
+
+        // Not the reply — queue it into read_buf so the outer dispatcher
+        // can process it after we return. Drop the event if there is no
+        // room (unfortunate but better than crashing).
+        uint32_t needed = hdr.size;
+        if (dpy->read_len + needed > sizeof(dpy->read_buf)) continue;
+        uint8_t* dst = dpy->read_buf + dpy->read_len;
+        uint8_t* src = (uint8_t*)&hdr;
+        for (uint32_t i = 0; i < MD_HEADER_SIZE; i++) dst[i] = src[i];
+        for (uint32_t i = 0; i < payload_size; i++) dst[MD_HEADER_SIZE + i] = payload[i];
+        dpy->read_len += needed;
     }
 }
 
@@ -448,9 +473,26 @@ md_client_buffer_t* md_buffer_create(md_display_t* dpy,
     buf->height = height;
     buf->stride = width * 4;  // BGRX8888
 
-    // Create shared memory
+    // Create shared memory — each buffer needs a UNIQUE name, otherwise
+    // a second shm_open of the same name re-opens the existing object and
+    // subsequent ftruncate corrupts every prior mapping.
+    static uint32_t s_shm_seq;
+    char shm_name[32];
+    shm_name[0] = '/'; shm_name[1] = 'm'; shm_name[2] = 'd';
+    shm_name[3] = '_'; shm_name[4] = 'b'; shm_name[5] = 'u'; shm_name[6] = 'f';
+    shm_name[7] = '_';
+    uint32_t seq = ++s_shm_seq;
+    int pos = 8;
+    // Write seq in decimal.
+    char digs[12];
+    int dn = 0;
+    if (seq == 0) digs[dn++] = '0';
+    while (seq) { digs[dn++] = '0' + (seq % 10); seq /= 10; }
+    while (dn > 0) shm_name[pos++] = digs[--dn];
+    shm_name[pos] = '\0';
+
     uint32_t total_size = buf->stride * height;
-    int shm_fd = shm_open("/md_buf", O_CREAT | O_RDWR, 0600);
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
     if (shm_fd < 0) return 0;
 
     // Resize shmem to fit the buffer
