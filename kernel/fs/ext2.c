@@ -15,10 +15,32 @@ static uint32_t s_num_groups      = 0;
 static uint32_t s_first_data_blk  = 0;   // superblock's s_first_data_block
 static uint8_t  s_mounted         = 0;
 
-// Static I/O buffers — 1024 bytes to hold a full 1KB block.
-// Two buffers so helpers can use one without clobbering the caller's.
-static uint8_t s_blk_buf[1024];
-static uint8_t s_blk_buf2[1024];
+// Static I/O buffers for misc operations.
+static uint8_t s_blk_buf[4096];
+static uint8_t s_blk_buf2[4096];
+
+// ── Block cache ───────────────────────────────────────────────────────────
+// Direct-mapped cache: 256 slots × 4KB = 1MB BSS.  Block number % BCACHE_SIZE
+// determines the slot.  Collisions evict.  Eliminates redundant disk reads
+// for indirect blocks (read once per file, hit cache on every subsequent
+// data block lookup) and repeated reads of the same data block.
+
+#define BCACHE_SIZE  256
+#define BCACHE_INVALID 0xFFFFFFFFu
+
+static uint8_t  s_bcache_data[BCACHE_SIZE][4096];
+static uint32_t s_bcache_tag[BCACHE_SIZE];  // block number, INVALID = empty
+
+static void bcache_init(void) {
+    for (int i = 0; i < BCACHE_SIZE; i++)
+        s_bcache_tag[i] = BCACHE_INVALID;
+}
+
+static void bcache_invalidate(uint32_t blk) {
+    uint32_t slot = blk % BCACHE_SIZE;
+    if (s_bcache_tag[slot] == blk)
+        s_bcache_tag[slot] = BCACHE_INVALID;
+}
 
 // ── Inode cache — 2-level radix tree ──────────────────────────────────────
 // Key: uint32_t inode number.  Value: ext2_inode_t (cached from disk).
@@ -79,15 +101,32 @@ static void irtree_put(uint32_t ino, const ext2_inode_t* inode) {
 
 // Read one filesystem block into `buf` (must be at least s_block_size bytes).
 static uint8_t read_block(uint32_t blk, uint8_t* buf) {
-    // LBA = partition_start + block_number * (block_size / 512)
+    uint32_t slot = blk % BCACHE_SIZE;
+    if (s_bcache_tag[slot] == blk) {
+        // Cache hit — copy from cache.
+        const uint8_t* src = s_bcache_data[slot];
+        for (uint32_t i = 0; i < s_block_size; i++) buf[i] = src[i];
+        return 1;
+    }
+    // Cache miss — read from disk and populate cache.
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
-    return ahci_read(lba, buf, s_sectors_per_blk);
+    if (!ahci_read(lba, buf, s_sectors_per_blk)) return 0;
+    s_bcache_tag[slot] = blk;
+    uint8_t* dst = s_bcache_data[slot];
+    for (uint32_t i = 0; i < s_block_size; i++) dst[i] = buf[i];
+    return 1;
 }
 
 // Write one filesystem block from `buf`.
 static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
-    return ahci_write(lba, buf, s_sectors_per_blk);
+    if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
+    // Update cache with the written data.
+    uint32_t slot = blk % BCACHE_SIZE;
+    s_bcache_tag[slot] = blk;
+    uint8_t* dst = s_bcache_data[slot];
+    for (uint32_t i = 0; i < s_block_size; i++) dst[i] = buf[i];
+    return 1;
 }
 
 // ── Bitmap helpers ─────────────────────────────────────────────────────────
@@ -206,6 +245,7 @@ static uint8_t write_inode(uint32_t ino, const ext2_inode_t* in) {
 uint8_t ext2_init(uint32_t part_lba) {
     s_part_lba = part_lba;
     s_mounted  = 0;
+    bcache_init();
 
     // Superblock is at byte offset 1024 from partition start = LBA part_lba + 2
     // (each sector is 512 bytes, so 1024 = 2 sectors).
@@ -263,7 +303,7 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         uint32_t indirect_blk = ino->i_block[12];
         if (!indirect_blk) return 0;
 
-        static uint8_t ind_buf[1024];
+        static uint8_t ind_buf[4096];
         if (!read_block(indirect_blk, ind_buf)) return 0;
         uint32_t* addrs = (uint32_t*)ind_buf;
         return addrs[idx];
@@ -275,14 +315,14 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         uint32_t dblind_blk = ino->i_block[13];
         if (!dblind_blk) return 0;
 
-        static uint8_t dbl_buf[1024];
+        static uint8_t dbl_buf[4096];
         if (!read_block(dblind_blk, dbl_buf)) return 0;
         uint32_t* l1 = (uint32_t*)dbl_buf;
         uint32_t l1_idx = idx / addrs_per_blk;
         uint32_t l2_idx = idx % addrs_per_blk;
         if (!l1[l1_idx]) return 0;
 
-        static uint8_t dbl_buf2[1024];
+        static uint8_t dbl_buf2[4096];
         if (!read_block(l1[l1_idx], dbl_buf2)) return 0;
         uint32_t* l2 = (uint32_t*)dbl_buf2;
         return l2[l2_idx];
@@ -306,7 +346,7 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t dir_buf[1024];
+        static uint8_t dir_buf[4096];
         if (!read_block(blk, dir_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -409,14 +449,69 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
 
         uint32_t blk = inode_get_block(&fd->inode, blk_idx);
         if (!blk) {
-            // Sparse hole: block not allocated, return zeros.
             for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = 0;
-        } else {
-            static uint8_t rd_buf[1024];
-            if (!read_block(blk, rd_buf)) return -1;
-            const uint8_t* src = rd_buf + off_in_blk;
-            for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
+            total       += to_copy;
+            fd->cur_pos += to_copy;
+            continue;
         }
+
+        // Multi-block fast path: if we're block-aligned and reading full
+        // blocks, coalesce consecutive physical blocks into one large DMA.
+        // This turns 125 separate 4KB reads into ~4 large 32KB reads.
+        if (off_in_blk == 0 && to_copy == s_block_size) {
+            uint32_t run = 1;
+            uint32_t max_run = (len - total) / s_block_size;
+            uint32_t file_blks = (fd->file_size - fd->cur_pos) / s_block_size;
+            if (max_run > file_blks) max_run = file_blks;
+            // DMA_SECTORS = 64, each block = 8 sectors → max 8 blocks per DMA
+            uint32_t dma_max = 64 / s_sectors_per_blk;
+            if (max_run > dma_max) max_run = dma_max;
+
+            while (run < max_run) {
+                uint32_t next_blk = inode_get_block(&fd->inode, blk_idx + run);
+                if (next_blk != blk + run) break;
+                run++;
+            }
+
+            if (run > 1) {
+                // Multi-block coalesced DMA.
+                uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+                uint32_t sectors = run * s_sectors_per_blk;
+                uint8_t* dest = dst + total;
+
+                // User-space buffer → scatter-gather zero-copy.
+                // Kernel buffer (ELF loader, etc.) → plain ahci_read
+                // (kthread can access HHDM addresses directly).
+                uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
+                if (is_user) {
+                    if (!ahci_read_user(lba, dest, sectors)) return -1;
+                } else {
+                    if (!ahci_read(lba, dest, sectors)) return -1;
+                }
+
+                // Populate block cache from the buffer (safe — we're
+                // in the caller's context).
+                for (uint32_t r = 0; r < run; r++) {
+                    uint32_t b = blk + r;
+                    uint32_t slot = b % BCACHE_SIZE;
+                    s_bcache_tag[slot] = b;
+                    const uint8_t* src = dest + r * s_block_size;
+                    uint8_t* cache = s_bcache_data[slot];
+                    for (uint32_t j = 0; j < s_block_size; j++)
+                        cache[j] = src[j];
+                }
+                uint32_t bytes = run * s_block_size;
+                total       += bytes;
+                fd->cur_pos += bytes;
+                continue;
+            }
+        }
+
+        // Single block read (partial block or non-consecutive).
+        static uint8_t rd_buf[4096];
+        if (!read_block(blk, rd_buf)) return -1;
+        const uint8_t* src = rd_buf + off_in_blk;
+        for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
 
         total        += to_copy;
         fd->cur_pos  += to_copy;
@@ -448,14 +543,14 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
             blk = alloc_block();
             if (!blk) break;
             // Zero-initialize new block.
-            static uint8_t zb[1024];
+            static uint8_t zb[4096];
             for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
             if (!write_block(blk, zb)) { free_block(blk); break; }
             if (!inode_set_block(&fd->inode, blk_idx, blk)) { free_block(blk); break; }
         }
 
         // Read-modify-write if partial block.
-        static uint8_t wr_buf[1024];
+        static uint8_t wr_buf[4096];
         if (off_in_blk != 0 || to_write != s_block_size) {
             if (!read_block(blk, wr_buf)) break;
         }
@@ -526,10 +621,12 @@ vfs_file_t* ext2_open(const char* path) {
     f->write    = ext2_vfs_write;   // caller enforces O_RDONLY by clearing this
     f->seek     = ext2_vfs_seek;
     f->close    = ext2_vfs_close;
-    f->poll     = NULL;             // ext2 files are always ready
-    f->ctx      = fd;
-    f->flags    = 0;
-    f->refcount = 1;
+    f->poll        = NULL;             // ext2 files are always ready
+    f->ioctl       = NULL;
+    f->ctx         = fd;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
     f->rights   = 0;   // stamped by sys_open after open; zero for internal opens
     // Store absolute path for fstat/ftruncate.
     uint32_t pi = 0;
@@ -561,7 +658,7 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t rdd_buf[1024];
+        static uint8_t rdd_buf[4096];
         if (!read_block(blk, rdd_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -614,7 +711,7 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
 
 // Allocate a free inode from any group. Returns inode number or 0.
 static uint32_t alloc_inode(void) {
-    static uint8_t ibm_buf[1024];
+    static uint8_t ibm_buf[4096];
 
     for (uint32_t g = 0; g < s_num_groups; g++) {
         ext2_bgd_t bgd;
@@ -640,7 +737,7 @@ static uint32_t alloc_inode(void) {
 
 // Allocate a free block from any group. Returns block number or 0.
 static uint32_t alloc_block(void) {
-    static uint8_t bbm_buf[1024];
+    static uint8_t bbm_buf[4096];
 
     for (uint32_t g = 0; g < s_num_groups; g++) {
         ext2_bgd_t bgd;
@@ -667,7 +764,7 @@ static uint32_t alloc_block(void) {
 // Free a block.
 static void free_block(uint32_t blk) {
     if (!blk) return;
-    static uint8_t fbb_buf[1024];
+    static uint8_t fbb_buf[4096];
 
     // Determine which group this block belongs to.
     uint32_t rel = (blk >= s_first_data_blk) ? (blk - s_first_data_blk) : blk;
@@ -689,7 +786,7 @@ static void free_block(uint32_t blk) {
 // Free an inode.
 static void free_inode_num(uint32_t ino) {
     if (!ino) return;
-    static uint8_t fib_buf[1024];
+    static uint8_t fib_buf[4096];
 
     uint32_t g   = (ino - 1) / s_inodes_per_grp;
     uint32_t bit = (ino - 1) % s_inodes_per_grp;
@@ -708,7 +805,7 @@ static void free_inode_num(uint32_t ino) {
 
 // Zero a block on disk.
 static void zero_block(uint32_t blk) {
-    static uint8_t zb_buf[1024];
+    static uint8_t zb_buf[4096];
     for (uint32_t i = 0; i < s_block_size; i++) zb_buf[i] = 0;
     write_block(blk, zb_buf);
 }
@@ -725,7 +822,7 @@ static void free_inode_blocks(ext2_inode_t* inode) {
     }
 
     if (inode->i_block[12]) {
-        static uint8_t ind_free_buf[1024];
+        static uint8_t ind_free_buf[4096];
         if (read_block(inode->i_block[12], ind_free_buf)) {
             uint32_t* addrs = (uint32_t*)ind_free_buf;
             for (uint32_t i = 0; i < addrs_per_blk; i++) {
@@ -738,12 +835,12 @@ static void free_inode_blocks(ext2_inode_t* inode) {
 
     // Double indirect.
     if (inode->i_block[13]) {
-        static uint8_t dind_free_buf[1024];
+        static uint8_t dind_free_buf[4096];
         if (read_block(inode->i_block[13], dind_free_buf)) {
             uint32_t* l1 = (uint32_t*)dind_free_buf;
             for (uint32_t i = 0; i < addrs_per_blk; i++) {
                 if (!l1[i]) continue;
-                static uint8_t dind_free_buf2[1024];
+                static uint8_t dind_free_buf2[4096];
                 if (read_block(l1[i], dind_free_buf2)) {
                     uint32_t* l2 = (uint32_t*)dind_free_buf2;
                     for (uint32_t j = 0; j < addrs_per_blk; j++) {
@@ -774,7 +871,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
 
     if (idx < addrs_per_blk) {
         // Single indirect.
-        static uint8_t si_buf[1024];
+        static uint8_t si_buf[4096];
         if (!inode->i_block[12]) {
             // Allocate indirect block.
             uint32_t ind_blk = alloc_block();
@@ -794,7 +891,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
 
     if (idx < addrs_per_blk * addrs_per_blk) {
         // Double indirect.
-        static uint8_t di_l1_buf[1024];
+        static uint8_t di_l1_buf[4096];
         if (!inode->i_block[13]) {
             uint32_t dind_blk = alloc_block();
             if (!dind_blk) return 0;
@@ -807,7 +904,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
         uint32_t l1_idx = idx / addrs_per_blk;
         uint32_t l2_idx = idx % addrs_per_blk;
 
-        static uint8_t di_l2_buf[1024];
+        static uint8_t di_l2_buf[4096];
         if (!l1[l1_idx]) {
             uint32_t l2_blk = alloc_block();
             if (!l2_blk) return 0;
@@ -864,7 +961,7 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
             if (!blk) break;
         }
 
-        static uint8_t dae_buf[1024];
+        static uint8_t dae_buf[4096];
         if (!read_block(blk, dae_buf)) return 0;
 
         if (new_blk) {
@@ -947,7 +1044,7 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t dre_buf[1024];
+        static uint8_t dre_buf[4096];
         if (!read_block(blk, dre_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1037,7 +1134,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
             uint32_t blk = alloc_block();
             if (!blk) return 0;
 
-            static uint8_t wr_buf[1024];
+            static uint8_t wr_buf[4096];
             uint32_t to_write = size - written;
             if (to_write > s_block_size) to_write = s_block_size;
 
@@ -1078,7 +1175,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         uint32_t blk = alloc_block();
         if (!blk) { free_inode_num(new_ino); return 0; }
 
-        static uint8_t nwr_buf[1024];
+        static uint8_t nwr_buf[4096];
         uint32_t to_write = size - written;
         if (to_write > s_block_size) to_write = s_block_size;
 
@@ -1278,7 +1375,7 @@ int ext2_mkdir(const char* path) {
     if (!data_blk) { free_inode_num(new_ino); return 0; }
 
     // Build the data block with "." and "..".
-    static uint8_t mkdir_buf[1024];
+    static uint8_t mkdir_buf[4096];
     for (uint32_t i = 0; i < s_block_size; i++) mkdir_buf[i] = 0;
 
     // "." entry.

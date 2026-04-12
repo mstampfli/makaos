@@ -121,12 +121,14 @@ vfs_file_t* socket_open(int domain, int type) {
 
     f->read     = sock_read;
     f->write    = sock_write;
-    f->close    = sock_close;
-    f->seek     = sock_seek;
-    f->poll     = NULL;
-    f->ctx      = s;
-    f->flags    = 0;
-    f->refcount = 1;
+    f->close       = sock_close;
+    f->seek        = sock_seek;
+    f->poll        = NULL;
+    f->ioctl       = NULL;
+    f->ctx         = s;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
     f->rights   = 0;
     f->path[0]  = '\0';
 
@@ -205,10 +207,12 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     cf->write    = sock_write;
     cf->close    = sock_close;
     cf->seek     = sock_seek;
-    cf->poll     = NULL;
-    cf->ctx      = cs;
-    cf->flags    = 0;
-    cf->refcount = 1;
+    cf->poll        = NULL;
+    cf->ioctl       = NULL;
+    cf->ctx         = cs;
+    cf->poll_waiter = NULL;
+    cf->flags       = 0;
+    cf->refcount    = 1;
     cf->rights   = 0;
     cf->path[0]  = '\0';
     return cf;

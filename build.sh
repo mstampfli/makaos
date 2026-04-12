@@ -180,6 +180,24 @@ for util in cat echo mkdir rm mv clear reboot; do
        -o "$BUILD_DIR/user_${util}.elf"
 done
 
+# ── Display server (compositor + client library + demo) ────────────────────
+DISPLAY_DIR="$USERLAND_DIR/apps/display"
+DISPLAY_INCLUDES=("${USER_INCLUDES[@]}" -I"$DISPLAY_DIR")
+
+"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/libdisplay.c" -o "$BUILD_DIR/user_libdisplay.o"
+
+"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/compositor.c" -o "$BUILD_DIR/user_compositor.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_compositor.o" \
+   -o "$BUILD_DIR/user_compositor.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/demo_client.c" -o "$BUILD_DIR/user_demo_client.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_demo_client.o" \
+   -o "$BUILD_DIR/user_demo_client.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/terminal.c" -o "$BUILD_DIR/user_terminal.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_terminal.o" \
+   -o "$BUILD_DIR/user_terminal.elf"
+
 echo "[+] Building kernel (clang + ld.lld)"
 
 KERNEL_C_OBJS=()
@@ -414,6 +432,20 @@ for util in cat echo mkdir rm mv clear reboot; do
         echo "[+] $util ELF installed at bin/$util (root:root 0755)"
     fi
 done
+
+# ── Display server ────────────────────────────────────────────────────────
+if [ -f "$BUILD_DIR/user_compositor.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_compositor.elf" bin/makadisplay
+    echo "[+] makadisplay ELF installed at bin/makadisplay (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_demo_client.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_demo_client.elf" bin/demo_client
+    echo "[+] demo_client ELF installed at bin/demo_client (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_terminal.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_terminal.elf" bin/makaterm
+    echo "[+] makaterm ELF installed at bin/makaterm (root:root 0755)"
+fi
 
 WAD_SEARCH=(
     "$DOOM_DIR/doom1.wad"

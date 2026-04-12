@@ -33,7 +33,11 @@ typedef struct vfs_file_t {
     // Returns 1 if ready, 0 if not.  May be NULL (means always ready).
     int     (*poll )(struct vfs_file_t* self, int events);
 
+    // Ioctl: device-specific control.  May be NULL (means not supported).
+    int64_t (*ioctl)(struct vfs_file_t* self, uint64_t request, uint64_t arg);
+
     void*    ctx;      // driver-specific state (may be NULL for stateless drivers)
+    void*    poll_waiter; // task_t* — task sleeping in poll/select on this fd
     uint32_t flags;    // open flags (O_APPEND, O_NONBLOCK etc.)
     uint32_t refcount; // reference count; 0 = static object (never freed)
     uint32_t rights;   // RIGHT_* bitmask; checked before every operation

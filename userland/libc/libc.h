@@ -162,6 +162,7 @@ typedef _Bool              bool;
 // ── Shared memory syscall numbers ────────────────────────────────────────
 #define SYS_SHM_OPEN    90
 #define SYS_SHM_UNLINK  91
+#define SYS_FB_MAP      92
 
 // ── Misc syscall numbers ──────────────────────────────────────────────────
 #define SYS_GETUID      49
@@ -642,6 +643,13 @@ int   munmap(void* addr, size_t len);
 // ── POSIX shared memory ─────────────────────────────────────────────────
 int shm_open(const char* name, int oflag, int mode);
 int shm_unlink(const char* name);
+
+// ── Framebuffer mapping (root only) ─────────────────────────────────────
+void* fb_map(void);
+
+// ── Pseudo-terminal ────────────────────────────────────────────────────
+// openpty(fds) → 0 or -1.  fds[0]=master, fds[1]=slave.
+int openpty(int fds[2]);
 
 // ── BSD Sockets ──────────────────────────────────────────────────────────
 

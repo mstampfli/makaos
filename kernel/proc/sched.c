@@ -13,9 +13,9 @@
 // all tasks back to level 0, preventing starvation of CPU-bound tasks.
 
 #define MLFQ_LEVELS      4
-#define BOOST_INTERVAL   100   // ticks ≈ 1 s at 100 Hz
+#define BOOST_INTERVAL   1000  // ticks ≈ 1 s at 1000 Hz
 
-static const uint8_t s_quanta[MLFQ_LEVELS] = {2, 4, 8, 16};
+static const uint8_t s_quanta[MLFQ_LEVELS] = {8, 16, 32, 64};
 
 // ── Globals ───────────────────────────────────────────────────────────────
 
@@ -261,6 +261,14 @@ void sched_wake(task_t* proc) {
     if (*pp) *pp = proc->next;
     proc->next = NULL;
     enqueue(proc);
+    // If the woken task has strictly higher priority (lower level number)
+    // than the currently running task, request a preemption.  I/O-bound
+    // tasks stay at level 0 (sched_sleep refreshes their quantum), so this
+    // ensures they preempt CPU-bound tasks that have been demoted.
+    if (g_current != &s_idle && g_current->mlfq_level > 0 &&
+        proc->mlfq_level < g_current->mlfq_level) {
+        s_reschedule = 1;
+    }
 }
 
 // Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
