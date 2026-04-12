@@ -62,6 +62,19 @@ struct md_buffer {
     md_client_t* owner;
 };
 
+// ── Per-surface damage accumulator ───────────────────────────────────────
+// Clients send MD_SURFACE_DAMAGE rects between attach and commit.  We merge
+// them into a single bounding box per surface.  On commit, only that box
+// (translated to screen coords) is added to the global dirty region.
+// If no damage was reported, we conservatively dirty the whole surface.
+
+#define SURFACE_DAMAGE_MAX 1  // we only track a merged bounding box
+
+typedef struct {
+    int32_t  x0, y0, x1, y1;  // accumulated bounding box (surface-local coords)
+    int      has_damage;       // 0 = no damage rects received since last commit
+} surface_damage_t;
+
 // ── Server-side surface object ───────────────────────────────────────────
 
 struct md_surface {
@@ -79,6 +92,11 @@ struct md_surface {
     md_client_t* owner;
     md_surface_t* z_prev;       // z-order doubly-linked list
     md_surface_t* z_next;
+    surface_damage_t damage;    // accumulated damage since last commit
+    // Maximize state: saved geometry for restore
+    int         maximized;
+    int32_t     saved_x, saved_y;
+    uint32_t    saved_w, saved_h;
 };
 
 // ── Client connection ────────────────────────────────────────────────────
@@ -114,6 +132,11 @@ static md_surface_t* g_focused;
 // ── Dirty rectangle tracking ─────────────────────────────────────────────
 static int32_t  g_dirty_x0, g_dirty_y0, g_dirty_x1, g_dirty_y1;
 static int      g_dirty_full;
+
+// Damage overlay debug: when enabled, the compositor tints the last dirty
+// rectangle on every frame so you can see exactly what got recomposited.
+// Toggle with F12.
+static int      g_debug_damage;
 static void dirty_reset(void);
 static void dirty_add(int32_t x, int32_t y, uint32_t w, uint32_t h);
 static void dirty_add_surface(md_surface_t* s);
@@ -137,6 +160,8 @@ static int       g_cursor_drawn;   // whether save buffer is valid
 // Dragging state
 static md_surface_t* g_drag_surface;  // surface being dragged (title bar move)
 
+// (Edge resize intentionally disabled for now — will be re-added later.)
+
 // ── Modifier key tracking ────────────────────────────────────────────────
 
 static uint32_t g_mod_state;  // MD_MOD_SHIFT | MD_MOD_CTRL | MD_MOD_ALT etc.
@@ -154,6 +179,7 @@ static uint32_t g_mod_state;  // MD_MOD_SHIFT | MD_MOD_CTRL | MD_MOD_ALT etc.
 #define KEY_F4          62
 #define KEY_F5          63
 #define KEY_F6          64
+#define KEY_F12         88
 
 // ── Configure serial counter ─────────────────────────────────────────────
 
@@ -390,6 +416,42 @@ static void surface_send_configure(md_surface_t* s, uint32_t states) {
     send_msg(s->owner->fd, &cfg, sizeof(cfg));
 }
 
+static void surface_toggle_maximize(md_surface_t* s) {
+    if (!s || !s->id || !s->owner) return;
+
+    dirty_add_surface(s);  // dirty old position
+
+    if (s->maximized) {
+        // Restore to saved geometry.
+        s->x = s->saved_x;
+        s->y = s->saved_y;
+        s->width = s->saved_w;
+        s->height = s->saved_h;
+        s->maximized = 0;
+    } else {
+        // Save current geometry, then maximize.
+        s->saved_x = s->x;
+        s->saved_y = s->y;
+        s->saved_w = s->width;
+        s->saved_h = s->height;
+        // Maximized: fill screen under title bar + borders.
+        s->x = MD_DECO_BORDER_W;
+        s->y = MD_DECO_TITLEBAR_H + MD_DECO_BORDER_W;
+        s->width = g_fb_width - 2 * MD_DECO_BORDER_W;
+        s->height = g_fb_height - MD_DECO_TITLEBAR_H - 2 * MD_DECO_BORDER_W;
+        s->maximized = 1;
+    }
+
+    // Tell the client the new size so it can reallocate its buffer.
+    uint32_t states = s->focused ? MD_SURFACE_STATE_FOCUSED : 0;
+    if (s->maximized) states |= MD_SURFACE_STATE_MAXIMIZED;
+    surface_send_configure(s, states);
+
+    dirty_add_surface(s);  // dirty new position
+    g_dirty_full = 1;      // safe: window size changed
+    g_needs_recomposite = 1;
+}
+
 static void surface_destroy(md_surface_t* s) {
     if (!s || !s->id) return;
     int was_focused = (g_focused == s);
@@ -398,6 +460,7 @@ static void surface_destroy(md_surface_t* s) {
     z_remove(s);
     s->id = 0;
     s->attached = 0;
+    s->prev_buffer = 0;
     s->committed = 0;
     s->visible = 0;
     if (s->owner) s->owner->surface_count--;
@@ -459,8 +522,10 @@ static void handle_display_msg(md_client_t* c, md_msg_header_t* hdr) {
         resp.new_id = s->id;
         resp.obj_type = MD_OBJ_SURFACE;
         send_msg(c->fd, &resp, sizeof(resp));
-        // Send initial configure event
-        surface_send_configure(s, MD_SURFACE_STATE_FOCUSED);
+        // No initial configure — the client picks its first buffer size and
+        // the compositor adopts whatever dims the first commit supplies.
+        // Configure events are only sent when the compositor initiates a
+        // resize (edge drag, maximize, etc.).
         break;
     }
     case MD_DISPLAY_GET_SEAT: {
@@ -535,9 +600,28 @@ static void handle_surface_msg(md_client_t* c, md_msg_header_t* hdr, uint8_t* pa
         s->attached = buf;
         break;
     }
-    case MD_SURFACE_DAMAGE:
-        // We recomposite the whole surface for now; damage tracking is Phase 10
+    case MD_SURFACE_DAMAGE: {
+        if (hdr->size < sizeof(md_surface_damage_t)) break;
+        md_surface_damage_t* dmg = (md_surface_damage_t*)hdr;
+        // Merge into the surface's damage bounding box.
+        int32_t dx0 = dmg->x;
+        int32_t dy0 = dmg->y;
+        int32_t dx1 = dmg->x + (int32_t)dmg->width;
+        int32_t dy1 = dmg->y + (int32_t)dmg->height;
+        if (!s->damage.has_damage) {
+            s->damage.x0 = dx0;
+            s->damage.y0 = dy0;
+            s->damage.x1 = dx1;
+            s->damage.y1 = dy1;
+            s->damage.has_damage = 1;
+        } else {
+            if (dx0 < s->damage.x0) s->damage.x0 = dx0;
+            if (dy0 < s->damage.y0) s->damage.y0 = dy0;
+            if (dx1 > s->damage.x1) s->damage.x1 = dx1;
+            if (dy1 > s->damage.y1) s->damage.y1 = dy1;
+        }
         break;
+    }
     case MD_SURFACE_COMMIT:
         if (s->attached) {
             // Release the previous buffer if it's different from the new one
@@ -551,6 +635,8 @@ static void handle_surface_msg(md_client_t* c, md_msg_header_t* hdr, uint8_t* pa
                 send_msg(prev->owner->fd, &rel, MD_HEADER_SIZE);
             }
             int first_commit = !s->committed;
+            int size_changed = (s->width != s->attached->width ||
+                                s->height != s->attached->height);
             s->committed = 1;
             s->width = s->attached->width;
             s->height = s->attached->height;
@@ -559,7 +645,24 @@ static void handle_surface_msg(md_client_t* c, md_msg_header_t* hdr, uint8_t* pa
                 s->visible = 1;
                 focus_surface(s);
             }
-            dirty_add_surface(s);
+            // Use per-surface damage to dirty only the changed region.
+            // If client sent damage rects, translate to screen coords.
+            // If no damage or size changed, dirty the whole surface.
+            if (s->damage.has_damage && !first_commit && !size_changed) {
+                // Clamp damage to surface bounds.
+                int32_t cx0 = s->damage.x0 < 0 ? 0 : s->damage.x0;
+                int32_t cy0 = s->damage.y0 < 0 ? 0 : s->damage.y0;
+                int32_t cx1 = s->damage.x1 > (int32_t)s->width  ? (int32_t)s->width  : s->damage.x1;
+                int32_t cy1 = s->damage.y1 > (int32_t)s->height ? (int32_t)s->height : s->damage.y1;
+                if (cx1 > cx0 && cy1 > cy0) {
+                    dirty_add(s->x + cx0, s->y + cy0,
+                              (uint32_t)(cx1 - cx0), (uint32_t)(cy1 - cy0));
+                }
+            } else {
+                dirty_add_surface(s);
+            }
+            // Reset surface damage for next frame.
+            s->damage.has_damage = 0;
             g_needs_recomposite = 1;
         }
         break;
@@ -596,6 +699,25 @@ static void handle_buffer_msg(md_client_t* c, md_msg_header_t* hdr) {
     case MD_BUFFER_DESTROY: {
         md_buffer_t* buf = find_buffer(c, hdr->object_id);
         if (!buf) return;
+        // Detach this buffer from any surface currently referencing it,
+        // otherwise the next composite pass dereferences freed memory.
+        // Also clear prev_buffer — the next commit's release-event logic
+        // would otherwise dereference a freed slot that may have been
+        // recycled by a subsequent buffer_create.
+        for (uint32_t i = 0; i < MD_MAX_SURFACES; i++) {
+            md_surface_t* s = &c->surfaces[i];
+            if (!s->id) continue;
+            if (s->attached == buf) {
+                dirty_add_surface(s);
+                s->attached = 0;
+                s->committed = 0;
+                s->visible = 0;
+                g_needs_recomposite = 1;
+            }
+            if (s->prev_buffer == buf) {
+                s->prev_buffer = 0;
+            }
+        }
         if (buf->data) {
             munmap(buf->data, buf->data_size);
             buf->data = 0;
@@ -703,6 +825,35 @@ static void draw_decoration(md_surface_t* s) {
                 g_bb[(uint32_t)py2 * g_fb_stride + (uint32_t)px1] = MD_COLOR_TITLE_TEXT;
         }
     }
+
+    // Maximize button (green square, to the left of close button)
+    int32_t max_x = close_x - MD_DECO_BUTTON_W - 2;
+    int32_t max_y = close_y;
+    fb_fill_rect(max_x, max_y, MD_DECO_BUTTON_W, MD_DECO_BUTTON_H, MD_COLOR_MAXIMIZE_BTN);
+
+    // Draw a rectangle outline (□) in the maximize button
+    for (int i = 4; i < (int)MD_DECO_BUTTON_W - 4; i++) {
+        int32_t px = max_x + i;
+        if (px >= 0 && (uint32_t)px < g_fb_width) {
+            int32_t py_top = max_y + 4;
+            int32_t py_bot = max_y + (int32_t)MD_DECO_BUTTON_H - 5;
+            if (py_top >= 0 && (uint32_t)py_top < g_fb_height)
+                g_bb[(uint32_t)py_top * g_fb_stride + (uint32_t)px] = MD_COLOR_TITLE_TEXT;
+            if (py_bot >= 0 && (uint32_t)py_bot < g_fb_height)
+                g_bb[(uint32_t)py_bot * g_fb_stride + (uint32_t)px] = MD_COLOR_TITLE_TEXT;
+        }
+    }
+    for (int j = 4; j < (int)MD_DECO_BUTTON_H - 4; j++) {
+        int32_t py = max_y + j;
+        if (py >= 0 && (uint32_t)py < g_fb_height) {
+            int32_t px_left = max_x + 4;
+            int32_t px_right = max_x + (int32_t)MD_DECO_BUTTON_W - 5;
+            if (px_left >= 0 && (uint32_t)px_left < g_fb_width)
+                g_bb[(uint32_t)py * g_fb_stride + (uint32_t)px_left] = MD_COLOR_TITLE_TEXT;
+            if (px_right >= 0 && (uint32_t)px_right < g_fb_width)
+                g_bb[(uint32_t)py * g_fb_stride + (uint32_t)px_right] = MD_COLOR_TITLE_TEXT;
+        }
+    }
 }
 
 // ── Cursor rendering ─────────────────────────────────────────────────────
@@ -798,8 +949,59 @@ static void dirty_add_surface(md_surface_t* s) {
     dirty_add(dx, dy, dw, dh);
 }
 
+// ── Damage debug overlay ─────────────────────────────────────────────────
+// When g_debug_damage is on, tint the region the compositor is about to
+// flip so the dirty area is visible. Full-screen redraw paints a bright
+// outline around the whole framebuffer; partial redraw tints the dirty
+// rect itself. Toggled with F12 (scancode 0x58).
+
+static void fb_tint_rect(int32_t x, int32_t y, uint32_t w, uint32_t h,
+                         uint32_t tint) {
+    if (x < 0) { if ((uint32_t)(-x) >= w) return; w += x; x = 0; }
+    if (y < 0) { if ((uint32_t)(-y) >= h) return; h += y; y = 0; }
+    if ((uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height) return;
+    if ((uint32_t)x + w > g_fb_width)  w = g_fb_width  - (uint32_t)x;
+    if ((uint32_t)y + h > g_fb_height) h = g_fb_height - (uint32_t)y;
+    // Simple 50%-blend tint: (px & 0xFEFEFE) >> 1  +  (tint & 0xFEFEFE) >> 1
+    for (uint32_t row = 0; row < h; row++) {
+        uint32_t* p = g_bb + ((uint32_t)y + row) * g_fb_stride + (uint32_t)x;
+        for (uint32_t col = 0; col < w; col++) {
+            uint32_t px = p[col];
+            p[col] = ((px & 0xFEFEFE) >> 1) + ((tint & 0xFEFEFE) >> 1);
+        }
+    }
+}
+
+static void fb_stroke_rect(int32_t x, int32_t y, uint32_t w, uint32_t h,
+                           uint32_t color, uint32_t thick) {
+    if (w == 0 || h == 0) return;
+    fb_fill_rect(x, y, w, thick, color);
+    if (h > thick) fb_fill_rect(x, y + (int32_t)h - (int32_t)thick, w, thick, color);
+    fb_fill_rect(x, y, thick, h, color);
+    if (w > thick) fb_fill_rect(x + (int32_t)w - (int32_t)thick, y, thick, h, color);
+}
+
+static void draw_debug_damage_full(void) {
+    if (!g_debug_damage) return;
+    // Highlight the whole framebuffer with a magenta outline.
+    fb_stroke_rect(0, 0, g_fb_width, g_fb_height, 0x00FF00FF, 3);
+}
+
+static void draw_debug_damage_partial(int32_t x, int32_t y,
+                                      uint32_t w, uint32_t h) {
+    if (!g_debug_damage) return;
+    // Tint the dirty region + outline it in bright green.
+    fb_tint_rect(x, y, w, h, 0x0000FF00);
+    fb_stroke_rect(x, y, w, h, 0x0000FF00, 1);
+}
+
 static void composite(void) {
-    g_cursor_drawn = 0;
+    // Restore backbuffer pixels under the cursor before anything else.
+    // If we skip this (and just clear the flag), a partial recompose that
+    // doesn't touch the cursor region will later cause draw_cursor() to
+    // "save" the existing cursor pixels as the underlying content, which
+    // becomes a permanent ghost cursor on the next mouse move.
+    erase_cursor();
 
     if (g_dirty_full) {
         // Full-screen redraw (focus change, window move/create/destroy)
@@ -813,6 +1015,7 @@ static void composite(void) {
                            s->width, s->height);
         }
 
+        draw_debug_damage_full();
         draw_cursor();
         fb_flip();
     } else {
@@ -830,15 +1033,37 @@ static void composite(void) {
         // Clear the dirty region to background
         fb_fill_rect(g_dirty_x0, g_dirty_y0, dw, dh, MD_COLOR_BACKGROUND);
 
-        // Redraw all surfaces that overlap the dirty region
+        // Redraw only surfaces that overlap the dirty region.
+        // Clip each blit to the dirty bounding box to avoid redundant
+        // backbuffer writes outside the region that will be flipped.
         for (md_surface_t* s = g_z_bottom; s; s = s->z_next) {
             if (!s->id || !s->visible || !s->committed || !s->attached)
                 continue;
+            // Surface bounding box including decorations.
+            int32_t sx0 = s->x - MD_DECO_BORDER_W;
+            int32_t sy0 = s->y - MD_DECO_TITLEBAR_H - MD_DECO_BORDER_W;
+            int32_t sx1 = s->x + (int32_t)s->width + MD_DECO_BORDER_W;
+            int32_t sy1 = s->y + (int32_t)s->height + MD_DECO_BORDER_W;
+            // Skip if no overlap with dirty rect.
+            if (sx1 <= g_dirty_x0 || sx0 >= g_dirty_x1 ||
+                sy1 <= g_dirty_y0 || sy0 >= g_dirty_y1)
+                continue;
             draw_decoration(s);
-            fb_blit_buffer(s->attached, s->x, s->y, 0, 0,
-                           s->width, s->height);
+            // Clip blit to dirty region for fewer backbuffer writes.
+            int32_t bx0 = g_dirty_x0 > s->x ? g_dirty_x0 : s->x;
+            int32_t by0 = g_dirty_y0 > s->y ? g_dirty_y0 : s->y;
+            int32_t bx1 = g_dirty_x1 < s->x + (int32_t)s->width
+                        ? g_dirty_x1 : s->x + (int32_t)s->width;
+            int32_t by1 = g_dirty_y1 < s->y + (int32_t)s->height
+                        ? g_dirty_y1 : s->y + (int32_t)s->height;
+            if (bx1 > bx0 && by1 > by0) {
+                fb_blit_buffer(s->attached, bx0, by0,
+                               (uint32_t)(bx0 - s->x), (uint32_t)(by0 - s->y),
+                               (uint32_t)(bx1 - bx0), (uint32_t)(by1 - by0));
+            }
         }
 
+        draw_debug_damage_partial(g_dirty_x0, g_dirty_y0, dw, dh);
         draw_cursor();
         // Only flip the dirty rectangle to MMIO — the big perf win
         fb_flip_rect(g_dirty_x0, g_dirty_y0, dw, dh);
@@ -851,12 +1076,23 @@ static void composite(void) {
 // ── Hit testing ──────────────────────────────────────────────────────────
 
 static md_surface_t* hit_test(int32_t px, int32_t py,
-                              int* hit_titlebar, int* hit_close) {
+                              int* hit_titlebar, int* hit_close,
+                              int* hit_maximize) {
     *hit_titlebar = 0;
     *hit_close = 0;
+    *hit_maximize = 0;
 
     for (md_surface_t* s = g_z_top; s; s = s->z_prev) {
         if (!s->id || !s->visible || !s->committed) continue;
+
+        // Full decorated bounding box
+        int32_t bx0 = s->x - MD_DECO_BORDER_W;
+        int32_t by0 = s->y - MD_DECO_TITLEBAR_H - MD_DECO_BORDER_W;
+        int32_t bx1 = s->x + (int32_t)s->width + MD_DECO_BORDER_W;
+        int32_t by1 = s->y + (int32_t)s->height + MD_DECO_BORDER_W;
+
+        if (px < bx0 || px >= bx1 || py < by0 || py >= by1)
+            continue;
 
         // Check title bar area
         int32_t tb_x = s->x;
@@ -869,9 +1105,17 @@ static md_surface_t* hit_test(int32_t px, int32_t py,
             if (px >= close_x && px < close_x + (int32_t)MD_DECO_BUTTON_W &&
                 py >= close_y && py < close_y + (int32_t)MD_DECO_BUTTON_H) {
                 *hit_close = 1;
-            } else {
-                *hit_titlebar = 1;
+                return s;
             }
+            // Check maximize button
+            int32_t max_x = close_x - MD_DECO_BUTTON_W - 2;
+            int32_t max_y = close_y;
+            if (px >= max_x && px < max_x + (int32_t)MD_DECO_BUTTON_W &&
+                py >= max_y && py < max_y + (int32_t)MD_DECO_BUTTON_H) {
+                *hit_maximize = 1;
+                return s;
+            }
+            *hit_titlebar = 1;
             return s;
         }
 
@@ -916,6 +1160,14 @@ static void handle_keyboard(int kb_fd) {
             if (pressed) g_mod_state |= MD_MOD_ALT;
             else         g_mod_state &= ~MD_MOD_ALT;
             break;
+        }
+
+        // ── F12: toggle damage debug overlay ──────────────────────────
+        if (pressed && ev->code == KEY_F12) {
+            g_debug_damage = !g_debug_damage;
+            g_dirty_full = 1;
+            g_needs_recomposite = 1;
+            continue;
         }
 
         // ── VT switching: Ctrl+Alt+F1..F6 ──────────────────────────────
@@ -991,11 +1243,9 @@ static void handle_mouse(int mouse_fd) {
         // Handle title bar drag
         if (g_drag_surface) {
             if (left_released) {
-                // End drag
                 g_drag_surface->moving = 0;
                 g_drag_surface = 0;
             } else {
-                // Continue drag — move the surface
                 g_drag_surface->x = g_cursor_x - g_drag_surface->drag_ox;
                 g_drag_surface->y = g_cursor_y - g_drag_surface->drag_oy;
                 g_dirty_full = 1;
@@ -1006,39 +1256,40 @@ static void handle_mouse(int mouse_fd) {
 
         // Left button press: hit test
         if (left_pressed) {
-            int hit_titlebar = 0, hit_close = 0;
+            int hit_titlebar = 0, hit_close = 0, hit_maximize = 0;
             md_surface_t* s = hit_test(g_cursor_x, g_cursor_y,
-                                       &hit_titlebar, &hit_close);
+                                       &hit_titlebar, &hit_close,
+                                       &hit_maximize);
             if (s) {
-                // Focus this surface
                 focus_surface(s);
 
                 if (hit_close) {
-                    // Send close event to client
                     if (s->owner && s->owner->active) {
                         md_msg_header_t close_msg = md_msg(s->id, MD_SURFACE_CLOSE,
                                                            MD_HEADER_SIZE);
                         send_msg(s->owner->fd, &close_msg, MD_HEADER_SIZE);
                     }
+                } else if (hit_maximize) {
+                    surface_toggle_maximize(s);
                 } else if (hit_titlebar) {
-                    // Start dragging
+                    // Double-click on title bar could maximize too,
+                    // but for now just start dragging.
                     g_drag_surface = s;
                     s->moving = 1;
                     s->drag_ox = g_cursor_x - s->x;
                     s->drag_oy = g_cursor_y - s->y;
                 } else {
-                    // Click in client area — send pointer button event
+                    // Click in client area
                     if (s->owner && s->owner->active && s->owner->seat_id) {
                         md_seat_pointer_button_t btn;
                         btn.hdr = md_msg(s->owner->seat_id, MD_SEAT_POINTER_BUTTON,
                                          sizeof(btn));
-                        btn.button = 0;  // left
-                        btn.state = 1;   // pressed
+                        btn.button = 0;
+                        btn.state = 1;
                         send_msg(s->owner->fd, &btn, sizeof(btn));
                     }
                 }
             } else {
-                // Click on desktop — unfocus
                 focus_surface(0);
             }
         }
