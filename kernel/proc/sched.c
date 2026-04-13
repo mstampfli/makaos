@@ -235,6 +235,9 @@ void sched_yield(void) {
 
 void sched_preempt(void) {
     if (!s_reschedule) return;
+    // Honour preemption disable: defer the switch until depth reaches zero.
+    // The preempt_enable() path will call sched_preempt() again then.
+    if (g_current && g_current->preempt_depth > 0) return;
     s_reschedule = 0;
     do_switch(1);
 }

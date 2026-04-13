@@ -262,7 +262,7 @@ done
   -o "$BUILD_DIR/kernel.elf"
 
 "$OBJCOPY" -O binary \
-  -j .text -j .rodata -j .initcall_early -j .initcall_subsys -j .data -j .bss \
+  -j .text -j .rodata -j .initcall_0 -j .initcall_1 -j .data -j .bss \
   "$BUILD_DIR/kernel.elf" "$BUILD_DIR/kernel.bin"
 
 echo "[+] Building UEFI bootloader (clang → PE32+)"

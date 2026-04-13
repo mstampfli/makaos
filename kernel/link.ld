@@ -17,31 +17,28 @@ SECTIONS
     }
     . = ALIGN(4096);
 
-    /* ── Initcall tables ────────────────────────────────────────────────────
-     * Two levels, each with 8 priority slots (0 = first, 7 = last).
-     * Macros in initcall.h place function pointers into these sections;
-     * do_initcalls() walks them in order at boot.
+    /* ── Initcall DAG tables ─────────────────────────────────────────────────
+     * One section per level.  Each entry is a pointer to an initcall_t.
+     * The DAG runner (initcall.c) reads these, builds a dependency graph,
+     * topologically sorts it, and executes in the correct order.
      *
-     * INITCALL_EARLY  — runs in kmain, interrupts off, no scheduler
-     * INITCALL_SUBSYS — runs in init_kthread, scheduler live
+     * Level 0 (INITCALL_LEVEL_EARLY)  — runs in kmain, no scheduler
+     * Level 1 (INITCALL_LEVEL_SUBSYS) — runs in init_kthread, may sleep
+     *
+     * KEEP() prevents linker GC.  Sections must also be listed in the
+     * objcopy -j flags in build.sh so they appear in the raw binary.
      */
-    .initcall_early : ALIGN(8) {
-        __initcall_early_start = .;
-        KEEP(*(.initcall_early0)) KEEP(*(.initcall_early1))
-        KEEP(*(.initcall_early2)) KEEP(*(.initcall_early3))
-        KEEP(*(.initcall_early4)) KEEP(*(.initcall_early5))
-        KEEP(*(.initcall_early6)) KEEP(*(.initcall_early7))
-        __initcall_early_end = .;
+    .initcall_0 : ALIGN(8) {
+        __initcall_0_start = .;
+        KEEP(*(.initcall_0))
+        __initcall_0_end = .;
     }
     . = ALIGN(8);
 
-    .initcall_subsys : ALIGN(8) {
-        __initcall_subsys_start = .;
-        KEEP(*(.initcall_subsys0)) KEEP(*(.initcall_subsys1))
-        KEEP(*(.initcall_subsys2)) KEEP(*(.initcall_subsys3))
-        KEEP(*(.initcall_subsys4)) KEEP(*(.initcall_subsys5))
-        KEEP(*(.initcall_subsys6)) KEEP(*(.initcall_subsys7))
-        __initcall_subsys_end = .;
+    .initcall_1 : ALIGN(8) {
+        __initcall_1_start = .;
+        KEEP(*(.initcall_1))
+        __initcall_1_end = .;
     }
     . = ALIGN(8);
 
