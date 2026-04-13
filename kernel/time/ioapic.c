@@ -151,27 +151,20 @@ void ioapic_init(const acpi_info_t* info) {
         rdt_write(gsi, VEC_LAPIC_TIMER, isa_irq_flags(0), /*masked=*/1);
     }
 
-    // IRQ 1 (PS/2 keyboard): install stub handler + leave UNMASKED.
-    // Stub just sends EOI; keyboard_init() (called from init_kthread) overwrites
-    // the IDT entry with the real handler.  Any spurious pre-init IRQ1 is eaten
-    // safely instead of faulting with no IDT entry.
+    // IRQ 1 (PS/2 keyboard): route to vector 0x21, leave MASKED.
+    // keyboard_init() installs the real handler, drains the KBC, then
+    // calls ioapic_unmask() when the driver is ready to receive events.
     {
-        extern void irq1_stub_entry(void);
-        extern void idt_irq_register(uint8_t vec, uint64_t handler);
-        idt_irq_register(0x21, (uint64_t)irq1_stub_entry);
         uint32_t gsi   = ioapic_isa_to_gsi(1);
         uint16_t flags = isa_irq_flags(1);
-        rdt_write(gsi, 0x21u, flags, /*masked=*/0);
+        rdt_write(gsi, 0x21u, flags, /*masked=*/1);
     }
 
-    // IRQ 12 (PS/2 mouse): same pattern — stub + unmasked.
+    // IRQ 12 (PS/2 mouse): same pattern — routed but masked until mouse_init().
     {
-        extern void irq12_stub_entry(void);
-        extern void idt_irq_register(uint8_t vec, uint64_t handler);
-        idt_irq_register(0x2C, (uint64_t)irq12_stub_entry);
         uint32_t gsi   = ioapic_isa_to_gsi(12);
         uint16_t flags = isa_irq_flags(12);
-        rdt_write(gsi, 0x2Cu, flags, /*masked=*/0);
+        rdt_write(gsi, 0x2Cu, flags, /*masked=*/1);
     }
 
     // IRQ 8 (RTC): leave masked — we don't use it.

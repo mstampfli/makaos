@@ -210,8 +210,10 @@ void mouse_init(void) {
     mouse_write(MOUSE_CMD_ENABLE_REPORT);
     mouse_read_byte();   // ACK
 
-    // 7. Overwrite stub IDT entry with real handler, then spawn thread.
+    // 7. Install real handler, unmask IRQ12, then spawn thread.
+    // Unmasking after all hardware init ensures no phantom packets are delivered.
     idt_irq_register(0x2C, (uint64_t)irq12_entry);
+    ioapic_unmask(ioapic_isa_to_gsi(12));
     task_t* t = task_create_kthread(mouse_thread_fn, pid_alloc());
     if (t) sched_add(t);
 }
