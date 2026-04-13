@@ -80,8 +80,17 @@ irq0_entry:
     iretq
 
 ; ── 0x21: PS/2 keyboard — IOAPIC-routed, LAPIC-delivered ─────────────────
-; IRQ1 is now delivered by the IOAPIC → LAPIC at vector 0x21.
-; EOI to LAPIC only (PIC is disabled).
+; irq1_stub_entry: installed by ioapic_init before keyboard_init() runs.
+; Safely eats any early spurious IRQ1s — just EOI, no handler call.
+; keyboard_init() overwrites this slot with irq1_entry (the real handler).
+global irq1_stub_entry
+irq1_stub_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    POP_GPRS
+    iretq
+
+; Real keyboard handler — installed by keyboard_init().
 global irq1_entry
 irq1_entry:
     PUSH_GPRS
@@ -91,8 +100,15 @@ irq1_entry:
     iretq
 
 ; ── 0x2C: PS/2 mouse — IOAPIC-routed, LAPIC-delivered ───────────────────
-; IRQ12 is now delivered by the IOAPIC → LAPIC at vector 0x2C.
-; EOI to LAPIC only.
+; irq12_stub_entry: installed by ioapic_init before mouse_init() runs.
+global irq12_stub_entry
+irq12_stub_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    POP_GPRS
+    iretq
+
+; Real mouse handler — installed by mouse_init().
 global irq12_entry
 irq12_entry:
     PUSH_GPRS
@@ -138,3 +154,4 @@ virtio_net_irq_entry:
 global lapic_spurious_entry
 lapic_spurious_entry:
     iretq
+

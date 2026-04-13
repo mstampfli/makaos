@@ -104,17 +104,24 @@ static void net_rx_thread(void) {
     uint32_t tick = 0;
 
     for (;;) {
-        // Poll the RX ring — virtio-net IRQ/MSI-X isn't wired up yet, so
-        // we cooperate with the scheduler instead of sleeping on an IRQ.
+        // Drain the entire RX ring before sleeping.
         skbuff_t* skb;
         while (virtio_net_rx_poll(&skb))
             eth_recv(skb);
 
-        if (++tick >= 100u) {
+        if (++tick >= 10u) {
             tick = 0;
             tcp_timer_tick();
         }
-        sched_yield();
+
+        // Sleep until the virtio-net MSI fires.
+        // The IRQ handler calls irq_notify(g_virtio_net_irq) on RX so we
+        // wake immediately.  irq_wait returns instantly if an IRQ is pending.
+        // Fall back to a yield if the IRQ slot isn't assigned yet.
+        if (g_virtio_net_irq != 0xFFu)
+            irq_wait(g_virtio_net_irq);
+        else
+            sched_yield();
     }
 }
 

@@ -27,8 +27,8 @@ typedef struct {
     uint8_t  buttons;  // button bitmask (MOUSE_BTN_*)
 } __attribute__((packed)) mouse_event_t;
 
-// Initialise the PS/2 mouse: enable aux port on the KBC, set stream mode,
-// enable data reporting, register IRQ12, spawn the mouse driver thread.
+// Hardware setup, register real IRQ12 handler (replaces stub), spawn kthread.
+// Call from init_kthread after tasks are running.
 void mouse_init(void);
 
 // Called from IRQ12 ASM stub — do not call directly.

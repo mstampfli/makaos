@@ -393,6 +393,7 @@ int virtio_net_rx_poll(skbuff_t** skb_out) {
 
     __asm__ volatile("lfence" ::: "memory");
     if (s_rxq.used->idx == s_rxq.last_used_idx) return 0;  // nothing received
+    serial_puts_dbg("[virtio] rx packet!\n");
 
     uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
     uint32_t desc_id   = s_rxq.used->ring[used_slot].id;

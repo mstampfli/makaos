@@ -144,22 +144,31 @@ void ioapic_init(const acpi_info_t* info) {
     }
 
     // ── Route ISA IRQs we actually use ───────────────────────────────────
-    // IRQ 0 (PIT): masked — the LAPIC timer takes over scheduling.
-    //   We still programme the entry so it is consistent; leave it masked.
+    // IRQ 0 (PIT): route to VEC_LAPIC_TIMER, leave masked until timer_init()
+    //   calls ioapic_unmask() after programming the PIT divisor.
     {
         uint32_t gsi = ioapic_isa_to_gsi(0);
         rdt_write(gsi, VEC_LAPIC_TIMER, isa_irq_flags(0), /*masked=*/1);
     }
 
-    // IRQ 1 (PS/2 keyboard): vector 0x21, edge, active-high.
+    // IRQ 1 (PS/2 keyboard): install stub handler + leave UNMASKED.
+    // Stub just sends EOI; keyboard_init() (called from init_kthread) overwrites
+    // the IDT entry with the real handler.  Any spurious pre-init IRQ1 is eaten
+    // safely instead of faulting with no IDT entry.
     {
+        extern void irq1_stub_entry(void);
+        extern void idt_irq_register(uint8_t vec, uint64_t handler);
+        idt_irq_register(0x21, (uint64_t)irq1_stub_entry);
         uint32_t gsi   = ioapic_isa_to_gsi(1);
         uint16_t flags = isa_irq_flags(1);
         rdt_write(gsi, 0x21u, flags, /*masked=*/0);
     }
 
-    // IRQ 12 (PS/2 mouse): vector 0x2C, edge, active-high.
+    // IRQ 12 (PS/2 mouse): same pattern — stub + unmasked.
     {
+        extern void irq12_stub_entry(void);
+        extern void idt_irq_register(uint8_t vec, uint64_t handler);
+        idt_irq_register(0x2C, (uint64_t)irq12_stub_entry);
         uint32_t gsi   = ioapic_isa_to_gsi(12);
         uint16_t flags = isa_irq_flags(12);
         rdt_write(gsi, 0x2Cu, flags, /*masked=*/0);

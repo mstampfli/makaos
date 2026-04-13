@@ -110,6 +110,36 @@
 #define SYS_NET_IFCONFIG 95 // net_ifconfig(ipcfg_t*, len)          → 0 or -errno
 #define SYS_NET_MAC      96 // net_mac(uint8_t out[6])              → 0 or -errno
 
+// ── epoll syscalls ────────────────────────────────────────────────────────
+#define SYS_EPOLL_CREATE 97 // epoll_create(flags)                  → fd or -errno
+#define SYS_EPOLL_CTL    98 // epoll_ctl(epfd,op,fd,event*)         → 0 or -errno
+#define SYS_EPOLL_WAIT   99 // epoll_wait(epfd,events,maxev,timeout)→ count or -errno
+
+// ── epoll types ───────────────────────────────────────────────────────────
+#define EPOLLIN      0x00000001u
+#define EPOLLOUT     0x00000004u
+#define EPOLLERR     0x00000008u
+#define EPOLLHUP     0x00000010u
+#define EPOLLRDHUP   0x00002000u
+#define EPOLLET      0x80000000u  // edge-triggered (accepted but treated as LT)
+#define EPOLLONESHOT 0x40000000u
+
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+typedef union epoll_data {
+    void*    ptr;
+    int32_t  fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+typedef struct {
+    uint32_t     events;  // EPOLLIN | EPOLLOUT | ...
+    epoll_data_t data;
+} epoll_event_t;
+
 // ── Network interface configuration (for dhcpcd) ─────────────────────────
 #define IFCFG_MAX_DNS  3
 typedef struct {
