@@ -10,6 +10,7 @@
 #include "hda.h"
 #include "net/net.h"
 #include "fb.h"
+#include "ioapic.h"
 
 // ── INITCALL_LEVEL_EARLY registrations ───────────────────────────────────
 // No sleeping.  Strict dependency order declared explicitly.
@@ -45,8 +46,14 @@ DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
 // preempt_disable/enable — kbd/mouse threads can't be scheduled between
 // their spawn and the flush.
 static int _input_init(void) {
-    keyboard_init();   // install handler, flush KBC+FIFO, unmask IRQ1
-    mouse_init();      // install handler, init hardware, unmask IRQ12
+    // keyboard_init installs IRQ1 handler but keeps IRQ1 masked —
+    // mouse_init polls port 0x60 for ACKs and IRQ1 would steal those bytes.
+    // After mouse_init completes, flush the KBC+FIFO then unmask IRQ1.
+    // mouse_init unmasks IRQ12 itself (no interference with keyboard path).
+    keyboard_init();
+    mouse_init();
+    keyboard_flush();
+    ioapic_unmask(ioapic_isa_to_gsi(1));
     tty_flush_input(&g_ttys[0]);
     fb_clear();
     return 0;
