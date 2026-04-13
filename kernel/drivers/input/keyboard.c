@@ -285,8 +285,11 @@ void keyboard_flush(void) {
 }
 
 void keyboard_init(void) {
-    // Overwrite the stub IDT entry with the real handler, then spawn thread.
+    // Install real handler, drain KBC + FIFO, then unmask IRQ1 at the IOAPIC.
+    // Unmasking last guarantees the handler is fully ready before any IRQ fires.
     idt_irq_register(0x21, (uint64_t)irq1_entry);
+    keyboard_flush();
+    ioapic_unmask(ioapic_isa_to_gsi(1));
     task_t* t = task_create_kthread(keyboard_thread_fn, pid_alloc());
     if (t) sched_add(t);
 }
