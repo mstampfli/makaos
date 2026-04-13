@@ -5,6 +5,10 @@
 #include "sched.h"
 #include "process.h"
 
+// Global wait queue — woken after each decoded mouse packet so poll/epoll
+// on /dev/mouse wakes immediately when events are available.
+wait_queue_t g_mouse_waitq;
+
 // ── PS/2 KBC ports ───────────────────────────────────────────────────────
 #define KBC_DATA    0x60   // read data / write aux data
 #define KBC_STATUS  0x64   // read status register
@@ -146,6 +150,8 @@ void mouse_irq_handler(void) {
     if (s_packet_idx == PACKET_BYTES) {
         packet_decode();
         s_packet_idx = 0;
+        // Wake poll/epoll waiters on /dev/mouse.
+        wait_queue_wake_all(&g_mouse_waitq);
     }
 
     irq_notify(12);
@@ -167,6 +173,10 @@ static void mouse_thread_fn(void) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
+int mouse_has_events(void) {
+    return s_evt_head != s_evt_tail;
+}
+
 int mouse_read(mouse_event_t* buf, int max) {
     int n = 0;
     while (n < max && s_evt_head != s_evt_tail) {
@@ -177,6 +187,8 @@ int mouse_read(mouse_event_t* buf, int max) {
 }
 
 void mouse_init(void) {
+    wait_queue_init(&g_mouse_waitq);
+
     // 1. Flush any stale data in the KBC output buffer.
     kbc_flush();
 

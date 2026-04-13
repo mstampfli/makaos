@@ -104,11 +104,7 @@ static void evdev_on_event(const kbd_event_t* kbd, void* data) {
             sched_wake(c->reader);
             c->reader = NULL;
         }
-        if (c->file && c->file->poll_waiter) {
-            task_t* w = (task_t*)c->file->poll_waiter;
-            c->file->poll_waiter = NULL;
-            sched_wake(w);
-        }
+        if (c->file) wait_queue_wake_all(c->file->waitq);
     }
 }
 
@@ -144,7 +140,7 @@ static int evdev_vfs_poll(vfs_file_t* self, int events) {
     evdev_client_t* c = (evdev_client_t*)self->ctx;
     if (!c) return 0;
     if (events & 1 /*POLLIN*/) return !ring_empty(c);
-    return 1;
+    return 0;
 }
 
 static void evdev_vfs_close(vfs_file_t* self) {
@@ -183,11 +179,12 @@ vfs_file_t* evdev_open(void) {
     f->write    = NULL;
     f->close    = evdev_vfs_close;
     f->seek     = NULL;
-    f->poll        = evdev_vfs_poll;
-    f->ioctl       = NULL;
-    f->ctx         = c;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
+    f->poll           = evdev_vfs_poll;
+    f->ioctl          = NULL;
+    f->ctx            = c;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
     f->refcount    = 1;
     f->rights      = 0;
     f->path[0]     = '\0';

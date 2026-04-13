@@ -249,11 +249,12 @@ vfs_file_t* fat32_open(const char* name83) {
                 f->write    = NULL;
                 f->close    = fat32_close;
                 f->seek     = NULL;
-                f->poll        = NULL;
-                f->ioctl       = NULL;
-                f->ctx         = fd;
-                f->poll_waiter = NULL;
-                f->flags       = 0;
+                f->poll           = NULL;
+                f->ioctl          = NULL;
+                f->ctx            = fd;
+                f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+                f->secondary_waitq = NULL;
+                f->flags          = 0;
                 f->refcount    = 1;
                 f->rights   = 0;
                 f->path[0]  = '\0';

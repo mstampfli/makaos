@@ -64,11 +64,13 @@ static void ldisc_flush_line(tty_t* tty) {
     for (uint32_t i = 0; i < tty->line_len; i++)
         rd_push(tty, tty->line_buf[i]);
     tty->line_len = 0;
-    // Wake blocked reader.
+    // Wake blocked reader (blocking read()).
     if (tty->reader) {
         sched_wake(tty->reader);
         tty->reader = NULL;
     }
+    // Wake all poll/epoll waiters.
+    wait_queue_wake_all(&tty->waitq);
 }
 
 // ── N_TTY: process one input character ────────────────────────────────────
@@ -170,6 +172,7 @@ void tty_input_char(tty_t* tty, char c) {
         sched_wake(tty->reader);
         tty->reader = NULL;
     }
+    wait_queue_wake_all(&tty->waitq);
 }
 
 // ── Flush input buffers ───────────────────────────────────────────────────
@@ -273,11 +276,12 @@ vfs_file_t* tty_open(int idx) {
     f->write    = tty_vfs_write;
     f->close    = tty_vfs_close;
     f->seek     = NULL;   // ttys are not seekable
-    f->poll        = tty_vfs_poll;
-    f->ioctl       = NULL;  // tty0 ioctl handled by sys_ioctl fallback
-    f->ctx         = ctx;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
+    f->poll           = tty_vfs_poll;
+    f->ioctl          = NULL;  // tty0 ioctl handled by sys_ioctl fallback
+    f->ctx            = ctx;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = &tty->waitq;  // woken by ldisc when data arrives
+    f->flags          = 0;
     f->refcount    = 1;
     f->rights   = 0;   // device fd: no rights enforcement (checked as open by kernel)
     f->path[0]  = '\0';
@@ -360,6 +364,7 @@ void tty_init(void) {
     tty->rd_tail   = 0;
     tty->line_len  = 0;
     tty->reader    = NULL;
+    wait_queue_init(&tty->waitq);
     tty->write_char = console_write_char;
 
     for (int i = 0; i < 16; i++) tty->name[i] = 0;

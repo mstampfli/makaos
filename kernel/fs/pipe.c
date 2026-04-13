@@ -41,12 +41,8 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
         p->count++;
     }
 
-    // Wake reader polling on this pipe.
-    if (p->read_file && p->read_file->poll_waiter) {
-        task_t* w = (task_t*)p->read_file->poll_waiter;
-        p->read_file->poll_waiter = NULL;
-        sched_wake(w);
-    }
+    // Wake all readers polling on this pipe.
+    if (p->read_file) wait_queue_wake_all(p->read_file->waitq);
 
     return (int64_t)total;
 }
@@ -104,11 +100,12 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     r->write       = NULL;
     r->seek        = NULL;
     r->close       = pipe_read_close;
-    r->poll        = pipe_read_poll;
-    r->ioctl       = NULL;
-    r->ctx         = p;
-    r->poll_waiter = NULL;
-    r->flags       = 0;
+    r->poll           = pipe_read_poll;
+    r->ioctl          = NULL;
+    r->ctx            = p;
+    r->waitq           = &r->_waitq; wait_queue_init(r->waitq);
+    r->secondary_waitq = NULL;
+    r->flags          = 0;
     r->refcount    = 1;
     r->rights      = 0;
     r->path[0]     = '\0';
@@ -117,11 +114,12 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     w->write       = pipe_write;
     w->seek        = NULL;
     w->close       = pipe_write_close;
-    w->poll        = pipe_write_poll;
-    w->ioctl       = NULL;
-    w->ctx         = p;
-    w->poll_waiter = NULL;
-    w->flags       = 0;
+    w->poll           = pipe_write_poll;
+    w->ioctl          = NULL;
+    w->ctx            = p;
+    w->waitq           = &w->_waitq; wait_queue_init(w->waitq);
+    w->secondary_waitq = NULL;
+    w->flags          = 0;
     w->refcount    = 1;
     w->rights      = 0;
     w->path[0]     = '\0';

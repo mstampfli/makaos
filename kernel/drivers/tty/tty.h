@@ -2,6 +2,7 @@
 #include "common.h"
 #include "syscall.h"    // termios_t, winsize_t, ICANON, ECHO, ISIG, …
 #include "input_core.h" // input_handler_t, kbd_event_t
+#include "wait.h"       // wait_queue_t
 
 // ── TTY subsystem ────────────────────────────────────────────────────────
 //
@@ -50,6 +51,11 @@ typedef struct tty_t {
     // Single-waiter model: one task blocked in read() at a time.
     // Good enough for a single-CPU OS; replace with wait_queue for SMP.
     struct task_t* reader;
+
+    // ── Poll/epoll waiters ────────────────────────────────────────────────
+    // Tasks sleeping in poll()/epoll_wait() on this tty.  All are woken
+    // whenever data is pushed into the read buffer.
+    wait_queue_t   waitq;
 
     // ── Output ops (tty→screen) ───────────────────────────────────────────
     // Called by the line discipline to echo input or for tty write().

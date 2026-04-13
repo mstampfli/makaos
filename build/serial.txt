@@ -4,14 +4,21 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x0000000000042EFB
+kernel.bin size=0x000000000004471B
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x0000000000042EFB
+kernel loaded, bytes=0x000000000004471B
 phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
 ExitBootServices OK
 K
+[initcall] tty
+[initcall] ahci
+[initcall] evdev
+[initcall] ext2
+[initcall] input
+[initcall] hda
+[initcall] net
 [net] IP 10.0.2.15 GW 10.0.2.2
 [net] MAC 52:54:00:12:34:56
 [net] ready
@@ -31,4 +38,52 @@ Kore login: Password:
 [open] pid=00000011 /root/.bashrc -> ERR 00000002
 [open] pid=00000011 /root/.bash_history -> ERR 00000002
 bash-5.2# [dhcpcd] sending DISCOVER
-[dhcpcd] sending DISCOVER
+makadisplay: starting compositor
+makadisplay: fb 1280x800 pitch=5120
+[fb_map] enter
+[fb_map] vaddr=00007FEFFFC18000
+makadisplay: framebuffer mapped, desktop drawn
+[socket] domain=0000000000000001
+[socket] fd=0000000000000003
+[bind] unix path=/tmp/makadisplay.sock
+[bind] result=0000000000000000
+[listen] unix backlog=0000000000000040
+[listen] result=0000000000000000
+makadisplay: listening on /tmp/makadisplay.sock
+[open] pid=00000012 /dev/input/event0 -> fd=00000004
+makadisplay: keyboard opened (/dev/input/event0)
+[open] pid=00000012 /dev/mouse -> fd=00000005
+makadisplay: mouse opened (/dev/mouse)
+[spawn] path=/bin/makaterm
+makadisplay: launched /bin/makaterm
+makaterm: starting terminal emulator
+makaterm: PTY opened
+makaterm: bash forked
+[socket] domain=0000000000000001
+[socket] fd=0000000000000004
+[connect] unix path=/tmp/makadisplay.sock
+[open] pid=00000014 /dev/tty -> fd=00000003
+[open] pid=00000014 /etc/passwd -> fd=00000003
+[open] pid=00000014 //.bash_history -> ERR 00000002
+bash-5.2# [accept] unix waiting...
+[accept] new fd=0000000[connect] result=0000000000000000
+000000007
+makaterm: surface created, on_key set
+[shm_open] namelen=0000000000000009
+[shm_open] fd=0000000000000005
+[sendfd] sock=0000000000000004
+[sendfd] r=0000000000000000
+[recvfd] sock=0000000000000007
+[recvfd] fd=0000000000000008
+makaterm: terminal window created
+lost+found
+bin
+etc
+home
+tmp
+dev
+root
+TEST.TXT
+proc
+[exit] pid=00000015 code=00000000
+bash-5.2# 

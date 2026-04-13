@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "wait.h"
 
 // ── PS/2 Mouse driver ─────────────────────────────────────────────────────
 //
@@ -37,3 +38,10 @@ void mouse_irq_handler(void);
 // Non-blocking: drain up to `max` events into `buf`.
 // Returns the number of events written (0 if buffer is empty).
 int mouse_read(mouse_event_t* buf, int max);
+
+// Global wait queue: woken by mouse_irq_handler whenever a complete packet
+// is decoded.  poll/epoll on /dev/mouse registers on this queue.
+extern wait_queue_t g_mouse_waitq;
+
+// Returns 1 if there is at least one event pending, 0 otherwise.
+int mouse_has_events(void);

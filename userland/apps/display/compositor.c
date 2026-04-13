@@ -160,6 +160,14 @@ static md_client_t  g_clients[MD_MAX_CLIENTS];
 static uint32_t     g_client_count;
 static int          g_listener_fd = -1;
 static int          g_needs_recomposite;
+static int          g_epfd = -1;  // epoll fd for the main event loop
+
+// Tag values stored in epoll_data.u32 to identify event sources.
+// Client fds use (MD_EP_CLIENT_BASE + client index).
+#define MD_EP_LISTENER  0u
+#define MD_EP_KEYBOARD  1u
+#define MD_EP_MOUSE     2u
+#define MD_EP_CLIENT_BASE 16u
 
 // Z-order: bottom -> top linked list
 static md_surface_t* g_z_bottom;
@@ -435,6 +443,16 @@ static int client_tx_reserve(md_client_t* c, uint32_t need) {
     return 0;
 }
 
+// Arm or disarm EPOLLOUT for a client based on whether tx_len > 0.
+static void client_epoll_update(md_client_t* c) {
+    if (g_epfd < 0) return;
+    uint32_t idx = (uint32_t)(c - g_clients);
+    epoll_event_t ev;
+    ev.events   = EPOLLIN | (c->tx_len > 0 ? EPOLLOUT : 0);
+    ev.data.u32 = MD_EP_CLIENT_BASE + idx;
+    epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+}
+
 static void client_tx_append(md_client_t* c, const uint8_t* p, uint32_t n) {
     if (client_tx_reserve(c, c->tx_len + n) < 0) {
         c->dead = 1;
@@ -443,6 +461,7 @@ static void client_tx_append(md_client_t* c, const uint8_t* p, uint32_t n) {
     for (uint32_t i = 0; i < n; i++)
         c->tx_buf[c->tx_len + i] = p[i];
     c->tx_len += n;
+    client_epoll_update(c);  // arm EPOLLOUT now that we have queued data
 }
 
 static void client_tx_flush(md_client_t* c) {
@@ -451,7 +470,7 @@ static void client_tx_flush(md_client_t* c) {
     while (off < c->tx_len) {
         int r = (int)send(c->fd, c->tx_buf + off, c->tx_len - off, 0);
         if (r > 0) { off += (uint32_t)r; continue; }
-        if (r < 0 && errno == EAGAIN) break;   // still full, wait for next POLLOUT
+        if (r < 0 && errno == EAGAIN) break;   // still full, wait for next EPOLLOUT
         c->dead = 1;                            // EPIPE / ECONNRESET / etc.
         return;
     }
@@ -462,6 +481,7 @@ static void client_tx_flush(md_client_t* c) {
             c->tx_buf[i] = c->tx_buf[off + i];
         c->tx_len = rem;
     }
+    client_epoll_update(c);  // disarm EPOLLOUT if queue now empty
 }
 
 static void send_msg(md_client_t* c, const void* msg, uint32_t size) {
@@ -500,6 +520,13 @@ static md_client_t* client_alloc(int fd) {
             c->active = 1;
             c->next_id = 2;  // even IDs start at 2
             g_client_count++;
+            // Register with epoll — EPOLLIN always; EPOLLOUT added on demand.
+            if (g_epfd >= 0) {
+                epoll_event_t ev;
+                ev.events   = EPOLLIN;
+                ev.data.u32 = MD_EP_CLIENT_BASE + i;
+                epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
+            }
             return c;
         }
     }
@@ -530,6 +557,8 @@ static void client_disconnect(md_client_t* c) {
         }
     }
 
+    // Remove from epoll before closing fd.
+    if (g_epfd >= 0) epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     if (c->tx_buf) { free(c->tx_buf); c->tx_buf = 0; }
     c->tx_len = 0;
@@ -1950,65 +1979,46 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ── Main event loop ──────────────────────────────────────────────────
-    dirty_reset();
-    for (;;) {
-        // Build pollfd array: listener + keyboard + mouse + clients
-        pollfd_t fds[MD_MAX_CLIENTS + 4];
-        int nfds = 0;
+    // ── Main event loop (epoll-based) ────────────────────────────────────
+    g_epfd = epoll_create(MD_MAX_CLIENTS + 4);
+    if (g_epfd < 0) { print("makadisplay: epoll_create failed\n"); return 1; }
 
-        fds[nfds].fd = g_listener_fd;
-        fds[nfds].events = POLLIN;
-        fds[nfds].revents = 0;
-        int listener_idx = nfds++;
-
-        int kb_idx = -1;
+    // Register fixed fds.
+    {
+        epoll_event_t ev;
+        ev.events = EPOLLIN; ev.data.u32 = MD_EP_LISTENER;
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_listener_fd, &ev);
         if (kb_fd >= 0) {
-            fds[nfds].fd = kb_fd;
-            fds[nfds].events = POLLIN;
-            fds[nfds].revents = 0;
-            kb_idx = nfds++;
+            ev.events = EPOLLIN; ev.data.u32 = MD_EP_KEYBOARD;
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, kb_fd, &ev);
         }
-
-        int mouse_idx = -1;
         if (mouse_fd >= 0) {
-            fds[nfds].fd = mouse_fd;
-            fds[nfds].events = POLLIN;
-            fds[nfds].revents = 0;
-            mouse_idx = nfds++;
+            ev.events = EPOLLIN; ev.data.u32 = MD_EP_MOUSE;
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, mouse_fd, &ev);
         }
+    }
 
-        int client_poll_idx[MD_MAX_CLIENTS];
-        for (uint32_t i = 0; i < MD_MAX_CLIENTS; i++) {
-            if (g_clients[i].active && !g_clients[i].dead) {
-                client_poll_idx[i] = nfds;
-                fds[nfds].fd = g_clients[i].fd;
-                fds[nfds].events = POLLIN;
-                // Also watch for POLLOUT if we have queued outgoing data.
-                if (g_clients[i].tx_len > 0)
-                    fds[nfds].events |= POLLOUT;
-                fds[nfds].revents = 0;
-                nfds++;
-            } else {
-                client_poll_idx[i] = -1;
-            }
-        }
+    dirty_reset();
+    epoll_event_t ep_evs[MD_MAX_CLIENTS + 4];
 
-        // Poll with a short timeout so we can recomposite even without events
-        int ready = poll(fds, nfds, g_needs_recomposite ? 0 : 100);
+    for (;;) {
+        // Block until events arrive, or return immediately if recomposite pending.
+        // Use MD_PING_INTERVAL_MS as the maximum timeout so the liveness tick
+        // fires even when no client sends anything.
+        int nready = epoll_wait(g_epfd, ep_evs, MD_MAX_CLIENTS + 4,
+                                g_needs_recomposite ? 0 : (int)MD_PING_INTERVAL_MS);
 
-        if (ready > 0) {
-            // Accept new connections
-            if (fds[listener_idx].revents & POLLIN) {
+        for (int ei = 0; ei < nready; ei++) {
+            uint32_t tag = ep_evs[ei].data.u32;
+            uint32_t ev  = ep_evs[ei].events;
+
+            if (tag == MD_EP_LISTENER) {
+                // Accept new connections
                 int client_fd = accept(g_listener_fd, 0, 0);
                 if (client_fd >= 0) {
-                    // Make the client socket nonblocking so fan-out sends
-                    // never stall the compositor on a slow peer.
                     fcntl(client_fd, F_SETFL, O_NONBLOCK);
                     md_client_t* c = client_alloc(client_fd);
                     if (c) {
-                        // Trusted pid from the kernel, for liveness-driven
-                        // SIGKILL on user-initiated force-close.
                         int pp = getpeerpid(client_fd);
                         c->peer_pid = (pp > 0) ? (uint32_t)pp : 0;
                         md_display_global_info_t info_msg;
@@ -2023,24 +2033,20 @@ int main(int argc, char** argv) {
                         close(client_fd);
                     }
                 }
-            }
-
-            // Read keyboard input
-            if (kb_idx >= 0 && (fds[kb_idx].revents & POLLIN))
+            } else if (tag == MD_EP_KEYBOARD) {
                 handle_keyboard(kb_fd);
-
-            // Read mouse input
-            if (mouse_idx >= 0 && (fds[mouse_idx].revents & POLLIN))
+            } else if (tag == MD_EP_MOUSE) {
                 handle_mouse(mouse_fd);
-
-            // Drain per-client outgoing queues on POLLOUT, then read input.
-            for (uint32_t i = 0; i < MD_MAX_CLIENTS; i++) {
-                if (client_poll_idx[i] < 0) continue;
-                uint16_t rev = fds[client_poll_idx[i]].revents;
-                if (rev & POLLOUT)
-                    client_tx_flush(&g_clients[i]);
-                if (rev & (POLLIN | POLLHUP | POLLERR))
-                    client_read(&g_clients[i]);
+            } else {
+                // Client fd event
+                uint32_t idx = tag - MD_EP_CLIENT_BASE;
+                if (idx < MD_MAX_CLIENTS && g_clients[idx].active) {
+                    md_client_t* c = &g_clients[idx];
+                    if (ev & EPOLLOUT)
+                        client_tx_flush(c);
+                    if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR))
+                        client_read(c);
+                }
             }
         }
 

@@ -621,11 +621,12 @@ vfs_file_t* ext2_open(const char* path) {
     f->write    = ext2_vfs_write;   // caller enforces O_RDONLY by clearing this
     f->seek     = ext2_vfs_seek;
     f->close    = ext2_vfs_close;
-    f->poll        = NULL;             // ext2 files are always ready
-    f->ioctl       = NULL;
-    f->ctx         = fd;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
+    f->poll           = NULL;             // ext2 files are always ready
+    f->ioctl          = NULL;
+    f->ctx            = fd;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
     f->refcount    = 1;
     f->rights   = 0;   // stamped by sys_open after open; zero for internal opens
     // Store absolute path for fstat/ftruncate.

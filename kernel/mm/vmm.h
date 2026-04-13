@@ -109,9 +109,9 @@ phys_addr_t vmm_kernel_pml4_get(void);
 virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes);
 
 // Map a contiguous range of physical addresses into a process's user
-// address space.  Used for MMIO (e.g. framebuffer mapping via SYS_FB_MAP).
+// address space.  Used for the framebuffer (SYS_FB_MAP).
 // Creates a VMA with VMA_MMIO flag.  Pages are mapped immediately (not
-// demand-paged) with write-combining (PWT) cache policy.
+// demand-paged) with write-combining cache policy (PAT[1]=WC via PWT=1,PCD=0).
 // Returns the virtual address, or 0 on failure.
 struct mm_t;
 virt_addr_t vmm_map_physical_user(struct mm_t* mm, phys_addr_t pml4_phys,
