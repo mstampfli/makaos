@@ -10,7 +10,6 @@
 #include "hda.h"
 #include "net/net.h"
 #include "fb.h"
-#include "ioapic.h"
 
 // ── INITCALL_LEVEL_EARLY registrations ───────────────────────────────────
 // No sleeping.  Strict dependency order declared explicitly.
@@ -46,30 +45,18 @@ DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
 // preempt_disable/enable — kbd/mouse threads can't be scheduled between
 // their spawn and the flush.
 static int _input_init(void) {
-    // Mask IRQ1 at the IOAPIC for the window between installing the real
-    // keyboard handler and draining the KBC + FIFO.  This prevents mouse
-    // hardware ACKs (0xFA) — which arrive via the shared KBC and fire IRQ1 —
-    // from being pushed into the keyboard FIFO as phantom scancodes.
-    // The real keyboard handler is in place but delivery is blocked at the
-    // hardware level; keyboard_flush() drains whatever is in the KBC/FIFO,
-    // then we unmask so real user keypresses flow normally.
-    uint32_t irq1_gsi = ioapic_isa_to_gsi(1);
-    ioapic_mask(irq1_gsi);
-
-    keyboard_init();    // install real IRQ1 handler, spawn kbd thread
-    mouse_init();       // send mouse hw cmds — ACKs arrive at KBC but IRQ1 masked
-    keyboard_flush();   // drain KBC hw buf + s_sc_fifo + irq_pending
-    tty_flush_input(&g_ttys[0]);  // discard any phantom bytes in tty
-    fb_clear();         // wipe UEFI boot artifacts
-
-    ioapic_unmask(irq1_gsi);  // real keypresses flow from here
+    // Each driver owns its IRQ lifecycle: masked at boot, handler installed,
+    // hardware initialised, then unmasked.  No external coordination needed.
+    keyboard_init();   // installs handler, flushes KBC+FIFO, unmasks IRQ1
+    mouse_init();      // installs handler, inits hardware, unmasks IRQ12
+    tty_flush_input(&g_ttys[0]);
+    fb_clear();
     return 0;
 }
 
 DEFINE_INITCALL(input, INITCALL_LEVEL_SUBSYS,
-    .fn    = _input_init,
-    .flags = INITCALL_FLAG_PREEMPT_OFF,
-    .deps  = INITCALL_DEPS("tty", "evdev"),
+    .fn   = _input_init,
+    .deps = INITCALL_DEPS("tty", "evdev"),
 );
 
 // hda: Intel HDA audio — may sleep waiting for codec response
