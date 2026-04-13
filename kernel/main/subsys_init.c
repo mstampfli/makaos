@@ -10,6 +10,7 @@
 #include "hda.h"
 #include "net/net.h"
 #include "fb.h"
+#include "ioapic.h"
 
 // ── INITCALL_LEVEL_EARLY registrations ───────────────────────────────────
 // No sleeping.  Strict dependency order declared explicitly.
@@ -40,16 +41,28 @@ DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
 // ── INITCALL_LEVEL_SUBSYS registrations ──────────────────────────────────
 // Process context — can sleep.
 
-// input: keyboard + mouse init + full flush, all under preempt_disable so
-// the spawned threads can't be scheduled before the flush completes.
-// Declared with INITCALL_FLAG_PREEMPT_OFF — the DAG runner calls
-// preempt_disable()/preempt_enable() around the fn automatically.
+// input: keyboard + mouse init + full flush under preempt_disable.
+// INITCALL_FLAG_PREEMPT_OFF so the DAG runner wraps fn with
+// preempt_disable/enable — kbd/mouse threads can't be scheduled between
+// their spawn and the flush.
 static int _input_init(void) {
-    keyboard_init();    // install real IDT handler, spawn kbd thread
-    mouse_init();       // install real IDT handler, spawn mouse thread
-    keyboard_flush();   // drain KBC hw buf + s_sc_fifo + modifier state
+    // Mask IRQ1 at the IOAPIC for the window between installing the real
+    // keyboard handler and draining the KBC + FIFO.  This prevents mouse
+    // hardware ACKs (0xFA) — which arrive via the shared KBC and fire IRQ1 —
+    // from being pushed into the keyboard FIFO as phantom scancodes.
+    // The real keyboard handler is in place but delivery is blocked at the
+    // hardware level; keyboard_flush() drains whatever is in the KBC/FIFO,
+    // then we unmask so real user keypresses flow normally.
+    uint32_t irq1_gsi = ioapic_isa_to_gsi(1);
+    ioapic_mask(irq1_gsi);
+
+    keyboard_init();    // install real IRQ1 handler, spawn kbd thread
+    mouse_init();       // send mouse hw cmds — ACKs arrive at KBC but IRQ1 masked
+    keyboard_flush();   // drain KBC hw buf + s_sc_fifo + irq_pending
     tty_flush_input(&g_ttys[0]);  // discard any phantom bytes in tty
     fb_clear();         // wipe UEFI boot artifacts
+
+    ioapic_unmask(irq1_gsi);  // real keypresses flow from here
     return 0;
 }
 
