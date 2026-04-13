@@ -10,6 +10,7 @@
 #include "hda.h"
 #include "net/net.h"
 #include "fb.h"
+#include "ioapic.h"
 
 // ── INITCALL_LEVEL_EARLY registrations ───────────────────────────────────
 // No sleeping.  Strict dependency order declared explicitly.
@@ -45,12 +46,23 @@ DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
 // preempt_disable/enable — kbd/mouse threads can't be scheduled between
 // their spawn and the flush.
 static int _input_init(void) {
-    // Each driver owns its IRQ lifecycle: masked at boot, handler installed,
-    // hardware initialised, then unmasked.  No external coordination needed.
-    keyboard_init();   // installs handler, flushes KBC+FIFO, unmasks IRQ1
-    mouse_init();      // installs handler, inits hardware, unmasks IRQ12
+    // keyboard_init and mouse_init both use the shared KBC port 0x60.
+    // IRQ1 must stay masked until after mouse_init completes: if IRQ1 fires
+    // during mouse hardware init, keyboard_irq_handler reads port 0x60 and
+    // steals the mouse ACK byte, causing mouse_read_byte() to hang.
+    //
+    // Sequence:
+    //   1. keyboard_init — install IRQ1 handler + spawn thread (IRQ1 still masked)
+    //   2. mouse_init    — full hardware init via polling, install IRQ12 handler
+    //   3. keyboard_flush — drain KBC output buf + software FIFO
+    //   4. unmask IRQ1 + IRQ12 — both drivers ready, open for business
+    keyboard_init();
+    mouse_init();
+    keyboard_flush();
     tty_flush_input(&g_ttys[0]);
     fb_clear();
+    ioapic_unmask(ioapic_isa_to_gsi(1));
+    ioapic_unmask(ioapic_isa_to_gsi(12));
     return 0;
 }
 
