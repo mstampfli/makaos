@@ -132,6 +132,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->files_shared     = files;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
+    t->preempt_depth    = 0;
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
@@ -306,6 +307,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->files_shared     = files;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
+    t->preempt_depth    = 0;
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
