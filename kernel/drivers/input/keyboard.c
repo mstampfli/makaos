@@ -281,6 +281,7 @@ void keyboard_flush(void) {
     s_sc_head = s_sc_tail = 0;             // discard any queued scancodes
     s_extended = 0;                        // reset extended prefix state
     s_shift = s_ctrl = s_altgr = 0;       // reset all modifier state
+    irq_drain(1);                          // clear any pending phantom IRQ1 counts
 }
 
 void keyboard_init(void) {
