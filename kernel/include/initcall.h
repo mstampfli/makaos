@@ -1,63 +1,105 @@
 #pragma once
+#include "common.h"
 
-// ── Initcall system ───────────────────────────────────────────────────────
+// ── Initcall DAG system ───────────────────────────────────────────────────
 //
-// Two execution levels, each with 8 priority slots:
+// Drivers register themselves with a name and explicit dependencies.
+// At boot the init runner builds a dependency graph, topologically sorts it,
+// and executes each initcall in the correct order.  Cycles cause a kernel
+// panic with a clear diagnostic at boot, never a silent hang.
 //
-//   INITCALL_EARLY(fn, priority)
-//     Runs in kmain — no scheduler, no heap, interrupts off.
-//     Use for: IDT, PMM, VMM, LAPIC, IOAPIC, TSS, syscall table.
-//     Priority 0 runs first, 7 runs last within the level.
+// Two execution levels:
 //
-//   INITCALL_SUBSYS(fn, priority)
-//     Runs in init_kthread — scheduler live, heap available, can sleep.
-//     Use for: drivers (AHCI, HDA, net), TTY, ext2, keyboard, login spawn.
-//     Priority 0 runs first, 7 runs last within the level.
+//   INITCALL_LEVEL_EARLY  — runs in kmain, no scheduler, no heap, no sleep.
+//                           Use for: IDT, PMM, VMM, LAPIC, IOAPIC, TSS.
+//
+//   INITCALL_LEVEL_SUBSYS — runs in init_kthread, scheduler live, can sleep.
+//                           Use for: storage, TTY, input drivers, network.
 //
 // Usage:
 //   static int my_driver_init(void) { ...; return 0; }
-//   INITCALL_SUBSYS(my_driver_init, 3);
 //
-// Return value: 0 = success, non-zero = failure (logged, boot continues).
+//   DEFINE_INITCALL(my_driver, INITCALL_LEVEL_SUBSYS,
+//       .deps = INITCALL_DEPS("tty", "ahci"),
+//   );
 //
-// Kernel modules use the exact same macros — they register into the same
-// ELF sections and do_initcalls() picks them up automatically.
+//   INITCALL_FN(my_driver) = my_driver_init;
+//
+// Or the short form for drivers with no deps:
+//   DEFINE_INITCALL_NODEPS(my_driver, INITCALL_LEVEL_SUBSYS, my_driver_init);
+//
+// Return value: 0 = success, non-zero = failure (logged, boot continues
+// unless INITCALL_FLAG_REQUIRED is set, in which case the kernel panics).
+//
+// Kernel modules use the exact same macros.  The ELF section mechanism
+// ensures they are picked up automatically with no changes to main.c.
 
+// ── Execution levels ──────────────────────────────────────────────────────
+#define INITCALL_LEVEL_EARLY   0   // pre-scheduler, no sleeping
+#define INITCALL_LEVEL_SUBSYS  1   // post-scheduler, may sleep
+
+// ── Flags ─────────────────────────────────────────────────────────────────
+#define INITCALL_FLAG_NONE      0
+#define INITCALL_FLAG_REQUIRED  (1 << 0)  // panic on failure
+#define INITCALL_FLAG_PREEMPT_OFF (1 << 1) // run with preemption disabled
+
+// ── Maximum dependencies per initcall ────────────────────────────────────
+#define INITCALL_MAX_DEPS  8
+
+// ── initcall_t — one registered initcall ─────────────────────────────────
 typedef int (*initcall_fn_t)(void);
 
-// Place a pointer to `fn` into the correct ELF section.
-// The __used__ attribute prevents the compiler from optimising away the
-// pointer even if fn is static.  The section name encodes level + priority.
-#define _INITCALL(fn, level, prio) \
-    static initcall_fn_t __initcall_##fn##_##level##prio \
-        __attribute__((__used__, __section__(".initcall_" #level #prio))) = (fn)
+typedef struct {
+    const char*    name;                         // unique driver name
+    uint8_t        level;                        // INITCALL_LEVEL_*
+    uint8_t        flags;                        // INITCALL_FLAG_*
+    initcall_fn_t  fn;                           // init function
+    const char*    deps[INITCALL_MAX_DEPS + 1];  // NULL-terminated dep list
+} initcall_t;
 
-// Trailing semicolon is included — use without one: INITCALL_EARLY(fn, 3)
-#define INITCALL_EARLY(fn, prio)  _INITCALL(fn, early,  prio)
-#define INITCALL_SUBSYS(fn, prio) _INITCALL(fn, subsys, prio)
+// ── INITCALL_DEPS — build a NULL-terminated dependency list ──────────────
+// Usage: .deps = INITCALL_DEPS("tty", "ahci")
+// Up to INITCALL_MAX_DEPS entries.  Always NULL-terminated.
+#define INITCALL_DEPS(...)  { __VA_ARGS__, NULL }
 
-// ── Convenience aliases matching Linux naming convention ─────────────────
-// pure hardware / arch init
-#define early_initcall(fn)     INITCALL_EARLY(fn,  0)
-// memory / paging
-#define mm_initcall(fn)        INITCALL_EARLY(fn,  1)
-// interrupt / timer infrastructure
-#define irq_initcall(fn)       INITCALL_EARLY(fn,  2)
-// bus / PCI scan
-#define bus_initcall(fn)       INITCALL_EARLY(fn,  3)
-// storage drivers
-#define fs_initcall(fn)        INITCALL_SUBSYS(fn, 0)
-// tty / input
-#define tty_initcall(fn)       INITCALL_SUBSYS(fn, 1)
-// network
-#define net_initcall(fn)       INITCALL_SUBSYS(fn, 2)
-// sound
-#define sound_initcall(fn)     INITCALL_SUBSYS(fn, 3)
-// everything else
-#define device_initcall(fn)    INITCALL_SUBSYS(fn, 4)
-// late / userspace-facing setup
-#define late_initcall(fn)      INITCALL_SUBSYS(fn, 7)
+// ── DEFINE_INITCALL — register an initcall ───────────────────────────────
+// Places an initcall_t pointer into the correct ELF section.
+// The __used__ + KEEP() pair ensures the linker never discards it.
+//
+// Usage:
+//   DEFINE_INITCALL(my_driver, INITCALL_LEVEL_SUBSYS,
+//       .deps  = INITCALL_DEPS("tty", "pci"),
+//       .flags = INITCALL_FLAG_REQUIRED,
+//       .fn    = my_driver_init,
+//   );
 
-// ── Runner — called once per level by main.c ─────────────────────────────
-void do_initcalls_early(void);   // called from kmain
-void do_initcalls_subsys(void);  // called from init_kthread
+#define _INITCALL_SECTION(level) \
+    ".initcall_" #level
+
+// _INITCALL_STR forces macro expansion before stringification so that
+// INITCALL_LEVEL_EARLY (which is 0) becomes the string "0", not the
+// string "INITCALL_LEVEL_EARLY".
+#define _INITCALL_STR2(x) #x
+#define _INITCALL_STR(x)  _INITCALL_STR2(x)
+
+#define DEFINE_INITCALL(id, _level, ...)                                    \
+    static initcall_t __initcall_desc_##id = {                              \
+        .name  = #id,                                                       \
+        .level = (_level),                                                  \
+        .flags = INITCALL_FLAG_NONE,                                        \
+        .deps  = { NULL },                                                  \
+        __VA_ARGS__                                                         \
+    };                                                                      \
+    static initcall_t* __initcall_ptr_##id                                  \
+        __attribute__((__used__,                                            \
+                       __section__(".initcall_" _INITCALL_STR(_level))))    \
+        = &__initcall_desc_##id
+
+// ── DEFINE_INITCALL_NODEPS — shorthand for dep-free initcalls ────────────
+#define DEFINE_INITCALL_NODEPS(id, _level, _fn)                            \
+    DEFINE_INITCALL(id, _level, .fn = (_fn))
+
+// ── Runner API ────────────────────────────────────────────────────────────
+// Called once per level by main.c / init_kthread.
+void do_initcalls_early(void);   // level EARLY — called from kmain
+void do_initcalls_subsys(void);  // level SUBSYS — called from init_kthread
