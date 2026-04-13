@@ -188,6 +188,11 @@ static uint8_t sc_pop(void) {
 extern void irq1_entry(void);
 
 void keyboard_irq_handler(void) {
+    // Discard bytes that originated from the aux (mouse) port — the KBC
+    // shares port 0x60 between keyboard and mouse; bit 5 of the status
+    // register distinguishes them.  Without this check, mouse ACKs during
+    // mouse_init would be stolen from the polling path, causing a hang.
+    if (inb(0x64) & (1 << 5)) { inb(KB_DATA_PORT); return; }
     uint8_t sc = inb(KB_DATA_PORT);
     sc_push(sc);
     irq_notify(1);
@@ -285,11 +290,9 @@ void keyboard_flush(void) {
 }
 
 void keyboard_init(void) {
-    // Install real handler and spawn thread.  Caller is responsible for
-    // calling keyboard_flush() and ioapic_unmask(ioapic_isa_to_gsi(1))
-    // after all KBC hardware init (keyboard + mouse) is complete, so that
-    // keyboard_irq_handler doesn't steal mouse ACK bytes from the KBC.
     idt_irq_register(0x21, (uint64_t)irq1_entry);
+    keyboard_flush();
+    ioapic_unmask(ioapic_isa_to_gsi(1));
     task_t* t = task_create_kthread(keyboard_thread_fn, pid_alloc());
     if (t) sched_add(t);
 }
