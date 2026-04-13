@@ -290,9 +290,12 @@ void keyboard_flush(void) {
 }
 
 void keyboard_init(void) {
+    // Install handler + spawn thread but do NOT unmask IRQ1 yet.
+    // IRQ1 shares the KBC data register with the mouse — if IRQ1 fires
+    // while mouse_init is polling for ACK bytes, keyboard_irq_handler
+    // consumes those bytes even with the AUX discard, starving mouse_read_byte.
+    // _input_init calls keyboard_flush() + ioapic_unmask(IRQ1) after mouse_init.
     idt_irq_register(0x21, (uint64_t)irq1_entry);
-    keyboard_flush();
-    ioapic_unmask(ioapic_isa_to_gsi(1));
     task_t* t = task_create_kthread(keyboard_thread_fn, pid_alloc());
     if (t) sched_add(t);
 }
