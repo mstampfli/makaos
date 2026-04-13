@@ -215,6 +215,7 @@ KERNEL_C_OBJS=()
 # Collect all .c files from all kernel subdirs (excluding KERNEL_EXCLUDE)
 KERNEL_SUBDIRS=(
     "$KERNEL_DIR"
+    "$KERNEL_DIR/main"
     "$KERNEL_DIR/mm"
     "$KERNEL_DIR/proc"
     "$KERNEL_DIR/fs"
@@ -261,7 +262,7 @@ done
   -o "$BUILD_DIR/kernel.elf"
 
 "$OBJCOPY" -O binary \
-  -j .text -j .rodata -j .data -j .bss \
+  -j .text -j .rodata -j .initcall_early -j .initcall_subsys -j .data -j .bss \
   "$BUILD_DIR/kernel.elf" "$BUILD_DIR/kernel.bin"
 
 echo "[+] Building UEFI bootloader (clang → PE32+)"
@@ -518,7 +519,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display sdl \
-  -audiodev pa,id=snd0,server=unix:/mnt/wslg/PulseServer \
+  -audiodev pa,id=snd0,server=/run/user/1000/pulse/native \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \

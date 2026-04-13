@@ -99,9 +99,10 @@ global proc_trampoline
 proc_trampoline:
     sti         ; re-enable interrupts — PIT can now preempt this process
     call r12    ; call the real entry function (set by process_create)
-    ; If the entry function returns, mark dead and yield.
+    ; If the entry function returns, yield forever so the scheduler
+    ; can run other tasks (do NOT cli — that would block timer IRQs).
 .dead:
-    cli
+    sti
     hlt
     jmp .dead
 
@@ -153,37 +154,6 @@ serial_hex64:
 global user_trampoline
 user_trampoline:
     cli                     ; disable interrupts while building frame
-
-    ; Debug: print "UT:" + r12 (entry RIP) + r13 (user RSP) to COM1
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    ; print "UT:"
-    mov  rdx, 0x3F8+5
-.ut_w1: in al, dx; test al,0x20; jz .ut_w1; mov rdx,0x3F8; mov al,'U'; out dx,al
-    mov  rdx, 0x3F8+5
-.ut_w2: in al, dx; test al,0x20; jz .ut_w2; mov rdx,0x3F8; mov al,'T'; out dx,al
-    mov  rdx, 0x3F8+5
-.ut_w3: in al, dx; test al,0x20; jz .ut_w3; mov rdx,0x3F8; mov al,':'; out dx,al
-    ; print r12 as hex
-    mov  rax, r12
-    call serial_hex64
-    ; print "RSP:"
-    mov  rdx, 0x3F8+5
-.ut_w4: in al, dx; test al,0x20; jz .ut_w4; mov rdx,0x3F8; mov al,'R'; out dx,al
-    mov  rdx, 0x3F8+5
-.ut_w5: in al, dx; test al,0x20; jz .ut_w5; mov rdx,0x3F8; mov al,'S'; out dx,al
-    mov  rdx, 0x3F8+5
-.ut_w6: in al, dx; test al,0x20; jz .ut_w6; mov rdx,0x3F8; mov al,'P'; out dx,al
-    mov  rdx, 0x3F8+5
-.ut_w7: in al, dx; test al,0x20; jz .ut_w7; mov rdx,0x3F8; mov al,':'; out dx,al
-    mov  rax, r13
-    call serial_hex64
-    pop  rdx
-    pop  rcx
-    pop  rbx
-    pop  rax
 
     ; Push iretq frame (push in reverse order: SS first, RIP last).
     mov  rax, 0x23          ; USER_SS  (user data64, DPL=3 → 0x20|3)

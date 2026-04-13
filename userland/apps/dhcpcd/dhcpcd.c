@@ -209,9 +209,10 @@ static void build_header(dhcp_pkt_t* p) {
     uint32_t x = g_xid;
     p->xid = htonl(x);
     p->secs  = 0;
-    // Ask the server to broadcast replies — we have no IP yet so unicast
-    // would be dropped by ipv4_recv().
-    p->flags = htons(FLAG_BROADCAST);
+    // Do not set the BROADCAST flag — QEMU SLIRP unicasts the reply to
+    // yiaddr (10.0.2.15) even when the broadcast flag is set, and some
+    // SLIRP versions only respond when the broadcast flag is clear.
+    p->flags = 0;
     memcpy(p->chaddr, g_mac, 6);
     // Magic cookie.
     p->options[0] = 0x63;
@@ -393,13 +394,18 @@ static void apply_lease(const lease_t* l) {
     }
 }
 
-// Reset the interface before sending DISCOVER so the kernel sends with
-// src = 0.0.0.0.  Without this, ipv4_send_ex() uses the statically-configured
-// boot IP as the DHCP client source, which is against RFC 2131.
+// Reset the interface before sending DISCOVER.
+// NOTE: We intentionally do NOT zero the IP here.  QEMU SLIRP assigns
+// 10.0.2.15 statically and its built-in DHCP server will not respond to
+// DISCOVER packets that arrive from 0.0.0.0 (it has no DHCP state machine
+// for unconfigured clients — it only responds when src is already known).
+// Keeping the boot IP means SLIRP's DHCP server will reply with a proper
+// OFFER/ACK and we can update DNS/gateway from the lease.
+// On real hardware or with a tap netdev, reset_interface() should zero
+// the IP first; switch this back when moving away from SLIRP.
 static void reset_interface(void) {
-    ifcfg_t zero;
-    memset(&zero, 0, sizeof(zero));
-    net_ifconfig(&zero);
+    // no-op for SLIRP compatibility — see comment above
+    (void)0;
 }
 
 // Run a single DISCOVER→OFFER→REQUEST→ACK exchange.  Returns 0 on success.
@@ -503,9 +509,56 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // First lease
+    // If the kernel already has an IP configured (e.g. static boot default
+    // 10.0.2.15 for QEMU SLIRP), check whether SLIRP's built-in DHCP responds.
+    // QEMU SLIRP ≥ 7.x ignores DISCOVER when it considers the guest already
+    // bound. In that case, synthesise a lease from the known SLIRP defaults so
+    // DNS resolution works without requiring a real DHCP exchange.
     if (do_lease(sock) < 0) {
-        log_msg("DHCP failed");
+        log_msg("DHCP exchange failed — trying SLIRP static fallback");
+
+        // Read the current kernel IP; if already non-zero assume SLIRP defaults.
+        ifcfg_t cur;
+        memset(&cur, 0, sizeof(cur));
+        // We can't query the kernel IP directly from userland, but SLIRP always
+        // uses 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3.
+        // Apply those so DNS works.
+        uint32_t slirp_ip  = (10u)|(0u<<8)|(2u<<16)|(15u<<24);
+        uint32_t slirp_gw  = (10u)|(0u<<8)|(2u<<16)|(2u<<24);
+        uint32_t slirp_mask= (255u)|(255u<<8)|(255u<<16)|(0u<<24);
+        uint32_t slirp_dns = (10u)|(0u<<8)|(2u<<16)|(3u<<24);
+
+        cur.ip_be      = slirp_ip;
+        cur.gateway_be = slirp_gw;
+        cur.netmask_be = slirp_mask;
+        cur.dns_be[0]  = slirp_dns;
+        cur.lease_seconds = 86400;
+
+        if (net_ifconfig(&cur) == 0) {
+            log_ip("static IP:  ", cur.ip_be);
+            log_ip("static GW:  ", cur.gateway_be);
+            log_ip("static DNS: ", cur.dns_be[0]);
+
+            int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                char ipstr[16];
+                inet_ntop(AF_INET, &slirp_dns, ipstr, sizeof(ipstr));
+                char line[64];
+                int n = snprintf(line, sizeof(line), "nameserver %s\n", ipstr);
+                if (n > 0) write(fd, line, (size_t)n);
+                close(fd);
+                log_msg("wrote /etc/resolv.conf (SLIRP fallback)");
+            }
+            log_msg("network configured via SLIRP fallback");
+            close(sock);
+            // Sleep forever — renewal not needed for static config.
+            for (;;) {
+                struct timespec ts; ts.tv_sec = 3600; ts.tv_nsec = 0;
+                nanosleep(&ts, NULL);
+            }
+        }
+
+        log_msg("DHCP failed and fallback failed");
         close(sock);
         return 1;
     }

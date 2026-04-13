@@ -33,6 +33,9 @@ uint32_t pledge_group_for_syscall(uint64_t nr) {
     case SYS_FCNTL:
     case SYS_POLL:
     case SYS_SELECT:
+    case SYS_EPOLL_CREATE:
+    case SYS_EPOLL_CTL:
+    case SYS_EPOLL_WAIT:
     case SYS_NANOSLEEP:
     case SYS_UNAME:
     case SYS_UMASK:

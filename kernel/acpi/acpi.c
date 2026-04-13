@@ -1,6 +1,9 @@
 #include "acpi.h"
 #include "common.h"
 
+// Global ACPI info — populated by acpi_parse(), consumed by lapic/ioapic init.
+acpi_info_t g_acpi = { .ok = 0 };
+
 // ── ACPI structure definitions ────────────────────────────────────────────
 // All multi-byte fields are little-endian (x86 native).
 

@@ -198,15 +198,21 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (vmin == 0) vmin = 1; // always read at least 1
 
     // Block until at least vmin bytes are available.
+    // Register as reader BEFORE the empty check to avoid losing a wakeup:
+    //   if input arrives between the check and sched_sleep(), ldisc_flush_line
+    //   will call sched_wake(tty->reader) and find us already registered.
+    tty->reader = g_current;
     while (rb_empty(tty->rd_head, tty->rd_tail)) {
-        // Register as the sleeping reader and yield.
-        tty->reader = g_current;
         sched_sleep();
+        tty->reader = g_current;  // re-arm for the next iteration
         // Woken by tty_input_char or signal delivery.
         // If a signal was delivered, EINTR.
-        if (g_current->sigstate.head != g_current->sigstate.tail)
+        if (g_current->sigstate.head != g_current->sigstate.tail) {
+            tty->reader = NULL;
             return -4; // -EINTR
+        }
     }
+    tty->reader = NULL;
 
     // Drain up to len bytes.
     while (got < len) {

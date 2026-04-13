@@ -37,3 +37,6 @@ typedef struct {
 // If rsdp_phys == 0 the function searches the legacy BIOS area (0xE0000–
 // 0xFFFFF) for the "RSD PTR " signature — useful for SeaBIOS boots.
 acpi_info_t acpi_parse(uint64_t rsdp_phys);
+
+// Global ACPI info — populated by acpi_parse(), consumed by lapic/ioapic init.
+extern acpi_info_t g_acpi;

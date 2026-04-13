@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "input_core.h"
 #include "idt.h"
+#include "ioapic.h"
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
@@ -273,7 +274,17 @@ static void keyboard_thread_fn(void) {
 char keyboard_getchar(void) { return 0; }
 char keyboard_wait(void)    { for (;;) sched_sleep(); }
 
+void keyboard_flush(void) {
+    // Drain KBC hardware buffer and reset all software state.
+    // Call after keyboard_init() but before any user input is expected.
+    while (inb(0x64) & 0x01) inb(0x60);   // drain KBC hardware FIFO
+    s_sc_head = s_sc_tail = 0;             // discard any queued scancodes
+    s_extended = 0;                        // reset extended prefix state
+    s_shift = s_ctrl = s_altgr = 0;       // reset all modifier state
+}
+
 void keyboard_init(void) {
+    // Overwrite the stub IDT entry with the real handler, then spawn thread.
     idt_irq_register(0x21, (uint64_t)irq1_entry);
     task_t* t = task_create_kthread(keyboard_thread_fn, pid_alloc());
     if (t) sched_add(t);
