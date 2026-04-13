@@ -88,6 +88,20 @@ void kmain(void) {
         efer_lo |= (1U << 11);
         __asm__ volatile("wrmsr" : : "a"(efer_lo), "d"(efer_hi), "c"(0xC0000080U));
     }
+    // PAT (Page Attribute Table): program MSR 0x277 so that PAT entry 1
+    // (selected by PWT=1, PCD=0, PAT=0 in the PTE) is write-combining (WC).
+    // Default layout: [0]=WB [1]=WT [2]=UC- [3]=UC [4]=WB [5]=WT [6]=UC- [7]=UC
+    // We change entry 1 from WT (0x04) to WC (0x01) — only affects pages
+    // mapped with PWT=1,PCD=0 which is exclusively the user framebuffer mapping.
+    // MMIO mappings use PWT=1,PCD=1 → entry 3 (UC) — unchanged.
+    {
+        // PAT encoding: each entry is 3 bits in an 8-byte MSR.
+        // Byte 0 = entry 0, byte 1 = entry 1, ..., byte 7 = entry 7.
+        // Types: WB=0x06, WT=0x04, UC-=0x07, UC=0x00, WC=0x01
+        uint32_t pat_lo = 0x00010406; // [3]=UC [2]=UC- [1]=WC [0]=WB  (changed [1] WT→WC)
+        uint32_t pat_hi = 0x00070406; // [7]=UC [6]=UC- [5]=WT [4]=WB  (upper half unchanged)
+        __asm__ volatile("wrmsr" : : "a"(pat_lo), "d"(pat_hi), "c"(0x277U));
+    }
     // SSE/SSE2: CR4.OSFXSR + CR4.OSXMMEXCPT, clear CR0.EM + CR0.TS
     {
         uint64_t cr0, cr4;

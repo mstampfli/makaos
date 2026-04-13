@@ -119,11 +119,7 @@ static void pcb_wake(tcp_pcb_t* pcb) {
     }
     if (pcb->sock_file) {
         vfs_file_t* f = (vfs_file_t*)pcb->sock_file;
-        if (f->poll_waiter) {
-            task_t* pw = (task_t*)f->poll_waiter;
-            f->poll_waiter = NULL;
-            sched_wake(pw);
-        }
+        wait_queue_wake_all(f->waitq);
     }
 }
 

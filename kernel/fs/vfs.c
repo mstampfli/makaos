@@ -5,6 +5,7 @@
 #include "hda.h"
 #include "common.h"
 #include "fb.h"
+#include "kheap.h"
 
 // ── [LEGACY] Framebuffer console device (/dev/vga) ───────────────────────
 // LEGACY: Direct write to framebuffer terminal, bypasses TTY entirely.
@@ -23,6 +24,31 @@ uint32_t g_vga_col = 0;
 // ── Current working directory ─────────────────────────────────────────────
 char g_cwd[256] = "/";
 
+// ── Helper: allocate and initialise a minimal vfs_file_t ─────────────────
+// Sets waitq → &_waitq, secondary_waitq = NULL, refcount = 1, rights = 0.
+// Caller fills in the function pointers and ctx.
+static vfs_file_t* vfs_alloc_file(void) {
+    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    if (!f) return NULL;
+    f->read            = NULL;
+    f->write           = NULL;
+    f->close           = NULL;
+    f->seek            = NULL;
+    f->poll            = NULL;
+    f->ioctl           = NULL;
+    f->ctx             = NULL;
+    f->waitq           = &f->_waitq;
+    wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags           = 0;
+    f->refcount        = 1;
+    f->rights          = 0;
+    f->path[0]         = '\0';
+    return f;
+}
+
+// ── /dev/vga ─────────────────────────────────────────────────────────────
+
 static int64_t vga_write(vfs_file_t* self, const void* buf, uint64_t len) {
     (void)self;
     const char* s = (const char*)buf;
@@ -33,65 +59,44 @@ static int64_t vga_write(vfs_file_t* self, const void* buf, uint64_t len) {
     return (int64_t)len;
 }
 
-static void vga_noop_close(vfs_file_t* self) { (void)self; }
-
-static vfs_file_t s_vga_file = {
-    .read  = NULL,         // write-only device
-    .write = vga_write,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
+static void vga_close(vfs_file_t* self) { kfree(self); }
 
 vfs_file_t* vfs_vga_open(void) {
-    return &s_vga_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->write = vga_write;
+    f->close = vga_close;
+    return f;
 }
 
 // ── [LEGACY] /dev/kbd raw keyboard device ────────────────────────────────
-// LEGACY: Direct keyboard polling via keyboard_wait()/keyboard_getchar().
-//   keyboard_wait() is now a stub that sleeps forever (returns nothing).
-//   keyboard_getchar() is now a stub that always returns 0.
-//
-// NEW PATH: Open /dev/tty or /dev/tty0 instead.
-//   Input flows: PS/2 IRQ → keyboard thread → input_emit() → tty_on_kbd_event()
-//   → N_TTY line discipline → tty_vfs_read() → userland read(fd, ...).
-//   For raw evdev events use /dev/input/event0 (input_event_t structs).
-//   For raw PS/2 scancodes use /dev/kbdraw (evdev_getraw()).
-//
-// This device and vfs_kbd_open() are kept only so that process.c's
-// fallback fd_table init compiles.  Nothing should open /dev/kbd in
-// new code.  Remove once process.c is updated to always use tty_open(0).
+// LEGACY API path — use tty_open(0) or evdev_open() for new code.
 
 static int64_t kbd_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
     if (len == 0) return 0;
     char* dst = (char*)buf;
     uint64_t i = 0;
-    // LEGACY: keyboard_wait() is now a dead stub — blocks forever.
     dst[i++] = keyboard_wait();
     while (i < len) {
-        char c = keyboard_getchar(); // LEGACY: always returns 0
+        char c = keyboard_getchar();
         if (!c) break;
         dst[i++] = c;
     }
     return (int64_t)i;
 }
 
-static vfs_file_t s_kbd_file = {
-    .read  = kbd_read,
-    .write = NULL,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
+static void generic_close(vfs_file_t* self) { kfree(self); }
 
-// LEGACY — see block comment above.  Use tty_open(0) for new code.
 vfs_file_t* vfs_kbd_open(void) {
-    return &s_kbd_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read  = kbd_read;
+    f->close = generic_close;
+    return f;
 }
 
 // ── Raw scancode device (/dev/kbdraw) ────────────────────────────────────
-// Backed by evdev's raw scancode buffer.  Non-blocking: returns 0 if empty.
 
 static int64_t kbdraw_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
@@ -100,21 +105,18 @@ static int64_t kbdraw_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)n;
 }
 
-static vfs_file_t s_kbdraw_file = {
-    .read  = kbdraw_read,
-    .write = NULL,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
-
 vfs_file_t* vfs_kbdraw_open(void) {
-    return &s_kbdraw_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read  = kbdraw_read;
+    f->close = generic_close;
+    return f;
 }
 
 // ── Mouse device (/dev/mouse) ─────────────────────────────────────────────
-// Returns packed mouse_event_t structs.  Non-blocking: returns 0 bytes if
-// no events are pending.  Callers should read in multiples of sizeof(mouse_event_t).
+// Returns packed mouse_event_t structs.
+// poll() returns 1 when events are pending; epoll wakes via g_mouse_waitq
+// which mouse_irq_handler fires after each decoded packet.
 
 static int64_t mouse_dev_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
@@ -125,66 +127,59 @@ static int64_t mouse_dev_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)(n * (int)sizeof(mouse_event_t));
 }
 
-static vfs_file_t s_mouse_file = {
-    .read  = mouse_dev_read,
-    .write = NULL,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
+static int mouse_dev_poll(vfs_file_t* self, int events) {
+    (void)self; (void)events;
+    return mouse_has_events() ? 1 : 0;
+}
 
 vfs_file_t* vfs_mouse_open(void) {
-    return &s_mouse_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read            = mouse_dev_read;
+    f->poll            = mouse_dev_poll;
+    f->close           = generic_close;
+    // Register on g_mouse_waitq so epoll/poll wakeups reach this fd.
+    f->secondary_waitq = &g_mouse_waitq;
+    return f;
 }
 
 // ── DSP device (/dev/dsp) ─────────────────────────────────────────────────
-// Write-only.  Accepts signed 16-bit stereo PCM at HDA_SAMPLE_RATE Hz.
-// Blocks (IRQ-driven) when the HDA DMA ring is full.
 
 static int64_t dsp_write(vfs_file_t* self, const void* buf, uint64_t len) {
     (void)self;
     return (int64_t)hda_write(buf, (uint32_t)len);
 }
 
-static vfs_file_t s_dsp_file = {
-    .read  = NULL,
-    .write = dsp_write,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
-
 vfs_file_t* vfs_dsp_open(void) {
-    return &s_dsp_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->write = dsp_write;
+    f->close = generic_close;
+    return f;
 }
 
-// ── /dev/null device ──────────────────────────────────────────────────────
-// Reads return 0 (EOF), writes consume silently.
+// ── /dev/null ─────────────────────────────────────────────────────────────
 
 static int64_t null_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len;
-    return 0; // EOF
+    return 0;
 }
 
 static int64_t null_write(vfs_file_t* self, const void* buf, uint64_t len) {
     (void)self; (void)buf;
-    return (int64_t)len; // swallow all
+    return (int64_t)len;
 }
-
-static vfs_file_t s_null_file = {
-    .read  = null_read,
-    .write = null_write,
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
 
 vfs_file_t* vfs_null_open(void) {
-    return &s_null_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read  = null_read;
+    f->write = null_write;
+    f->close = generic_close;
+    return f;
 }
 
-// ── /dev/zero device ─────────────────────────────────────────────────────
-// Reads return zeroed bytes; writes are consumed silently.
+// ── /dev/zero ─────────────────────────────────────────────────────────────
 
 static int64_t zero_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
@@ -193,20 +188,16 @@ static int64_t zero_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)len;
 }
 
-static vfs_file_t s_zero_file = {
-    .read  = zero_read,
-    .write = null_write, // reuse: consume silently
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
-
 vfs_file_t* vfs_zero_open(void) {
-    return &s_zero_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read  = zero_read;
+    f->write = null_write;
+    f->close = generic_close;
+    return f;
 }
 
-// ── /dev/urandom device ───────────────────────────────────────────────────
-// Returns TSC-seeded pseudo-random bytes.
+// ── /dev/urandom ──────────────────────────────────────────────────────────
 
 static uint64_t s_urandom_state = 0x123456789abcdef0ULL;
 
@@ -214,7 +205,6 @@ static int64_t urandom_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
     uint8_t* p = (uint8_t*)buf;
     for (uint64_t i = 0; i < len; i++) {
-        // xorshift64
         s_urandom_state ^= s_urandom_state << 13;
         s_urandom_state ^= s_urandom_state >> 7;
         s_urandom_state ^= s_urandom_state << 17;
@@ -223,20 +213,16 @@ static int64_t urandom_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)len;
 }
 
-static vfs_file_t s_urandom_file = {
-    .read  = urandom_read,
-    .write = null_write, // consume silently
-    .close = vga_noop_close,
-    .ctx   = NULL,
-    .flags = 0,
-};
-
 vfs_file_t* vfs_urandom_open(void) {
-    // Seed with TSC on first call.
     if (s_urandom_state == 0x123456789abcdef0ULL) {
         uint32_t lo, hi;
         __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
         s_urandom_state ^= ((uint64_t)hi << 32) | lo;
     }
-    return &s_urandom_file;
+    vfs_file_t* f = vfs_alloc_file();
+    if (!f) return NULL;
+    f->read  = urandom_read;
+    f->write = null_write;
+    f->close = generic_close;
+    return f;
 }

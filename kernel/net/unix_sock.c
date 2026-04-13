@@ -84,13 +84,9 @@ static void unix_wake(unix_sock_t* s) {
     }
 }
 
-// Wake a task sleeping in poll/select on this socket's vfs_file.
+// Wake all tasks sleeping in poll/epoll on this socket's vfs_file.
 static void unix_poll_wake(unix_sock_t* s) {
-    if (s->file && s->file->poll_waiter) {
-        task_t* w = (task_t*)s->file->poll_waiter;
-        s->file->poll_waiter = NULL;
-        sched_wake(w);
-    }
+    if (s->file) wait_queue_wake_all(s->file->waitq);
 }
 
 // ── Circular buffer operations (SOCK_STREAM) ────────────────────────────
@@ -221,11 +217,12 @@ vfs_file_t* unix_sock_open(int type) {
     f->write       = unix_vfs_write;
     f->close       = unix_sock_close;
     f->seek        = NULL;
-    f->poll        = unix_vfs_poll;
-    f->ioctl       = NULL;
-    f->ctx         = s;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
+    f->poll           = unix_vfs_poll;
+    f->ioctl          = NULL;
+    f->ctx            = s;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
     f->refcount    = 1;
     f->rights      = 0xFFFFFFFF;
     f->path[0]     = '\0';

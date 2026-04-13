@@ -111,8 +111,9 @@ virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
 
 // ── vmm_map_physical_user ─────────────────────────────────────────────────
 // Maps a contiguous physical range into a user address space.
-// Used for MMIO-style mappings (e.g. framebuffer).  Pages are mapped
-// immediately with write-through (PWT) and user-accessible flags.
+// Used for the framebuffer.  Pages are mapped write-combining (WC) so the
+// CPU batches stores and flushes in bursts — critical for framebuffer perf.
+// WC is selected via PWT=1, PCD=0 → PAT entry 1, which kmain programs to WC.
 // Creates a VMA_MMIO VMA so fork/CoW skip these pages.
 virt_addr_t vmm_map_physical_user(mm_t* mm, phys_addr_t pml4_phys,
                                   phys_addr_t phys, uint64_t bytes) {
@@ -126,7 +127,8 @@ virt_addr_t vmm_map_physical_user(mm_t* mm, phys_addr_t pml4_phys,
     if (!mm_vma_add(mm, vaddr, vaddr + len, VMA_R | VMA_W | VMA_MMIO))
         return 0;
 
-    // Map all pages immediately — MMIO is not demand-paged.
+    // Map all pages write-combining: PWT=1, PCD=0 → PAT[1]=WC (set in kmain).
+    // NX: framebuffer pages are data-only, never executed.
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_PWT | PAGE_NX;
     uint64_t npages = len / PAGE_SIZE;
     for (uint64_t i = 0; i < npages; i++) {
