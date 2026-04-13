@@ -18,6 +18,7 @@ void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
     g_fb_row = 0;
     g_fb_fg  = FB_WHITE;
     g_fb_bg  = FB_BLACK;
+    fb_clear();
 }
 
 void fb_clear(void) {

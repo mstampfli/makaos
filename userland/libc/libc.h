@@ -848,6 +848,9 @@ int getaddrinfo_ipv4(const char* host, uint16_t port,
 #define SYS_REBOOT      75
 #define SYS_NET_IFCONFIG 95
 #define SYS_NET_MAC      96
+#define SYS_EPOLL_CREATE 97
+#define SYS_EPOLL_CTL    98
+#define SYS_EPOLL_WAIT   99
 
 // ── Extra errno values ────────────────────────────────────────────────────
 #define EILSEQ      84
@@ -1188,6 +1191,57 @@ typedef struct {
 static inline int poll(pollfd_t* fds, uint32_t nfds, int timeout_ms) {
     return (int)__syscall_ret(syscall3(SYS_POLL, (uint64_t)fds,
                                        (uint64_t)nfds, (uint64_t)timeout_ms));
+}
+
+// ── epoll ─────────────────────────────────────────────────────────────────
+#define EPOLLIN      0x00000001u
+#define EPOLLOUT     0x00000004u
+#define EPOLLERR     0x00000008u
+#define EPOLLHUP     0x00000010u
+#define EPOLLRDHUP   0x00002000u
+#define EPOLLET      0x80000000u
+#define EPOLLONESHOT 0x40000000u
+
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+
+#define EPOLL_CLOEXEC 0x80000
+
+typedef union epoll_data {
+    void*    ptr;
+    int32_t  fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+typedef struct {
+    uint32_t     events;
+    epoll_data_t data;
+} epoll_event_t;
+
+static inline int epoll_create1(int flags) {
+    return (int)__syscall_ret(syscall1(SYS_EPOLL_CREATE, (uint64_t)flags));
+}
+static inline int epoll_create(int size) {
+    (void)size;
+    return epoll_create1(0);
+}
+static inline int epoll_ctl(int epfd, int op, int fd, epoll_event_t* event) {
+    return (int)__syscall_ret(syscall4(SYS_EPOLL_CTL, (uint64_t)epfd,
+                                       (uint64_t)op, (uint64_t)fd,
+                                       (uint64_t)event));
+}
+static inline int epoll_wait(int epfd, epoll_event_t* events,
+                              int maxevents, int timeout_ms) {
+    return (int)__syscall_ret(syscall4(SYS_EPOLL_WAIT, (uint64_t)epfd,
+                                       (uint64_t)events, (uint64_t)maxevents,
+                                       (uint64_t)timeout_ms));
+}
+static inline int epoll_pwait(int epfd, epoll_event_t* events,
+                               int maxevents, int timeout_ms, const void* sigmask) {
+    (void)sigmask;  // signal masking not implemented; behaves as epoll_wait
+    return epoll_wait(epfd, events, maxevents, timeout_ms);
 }
 
 // ── readlink / symlink / link ─────────────────────────────────────────────

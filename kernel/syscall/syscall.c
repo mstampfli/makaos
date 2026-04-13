@@ -2905,6 +2905,8 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TCSBRK:
     case TCXONC:
     case TCFLSH:
+        tty_flush_input(tty);
+        return 0;
     case TIOCEXCL:
     case TIOCNXCL:
         return 0;  // Acknowledged, no-op.
@@ -3079,6 +3081,238 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             int fd = ufds[i].fd;
             if (fd < 0) continue;
             vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
+        }
+    } while (infinite || tsc_read_ns() < deadline);
+
+    return (uint64_t)(int64_t)count;
+}
+
+// ── epoll ─────────────────────────────────────────────────────────────────
+//
+// Lightweight epoll implementation backed by the same vfs_file_t->poll()
+// mechanism used by select/poll.  We intentionally do level-triggered only
+// (ET flag is accepted but ignored) to keep the implementation simple and
+// correct.  The epoll fd itself appears in the fd table as a normal vfs_file_t
+// whose ctx points to an epoll_state_t.
+//
+// epoll_state_t contains:
+//   • a fixed watch table (up to EPOLL_MAX_WATCHES entries)
+//   • each entry: { fd, events mask, epoll_data_t user cookie }
+//
+// epoll_wait():
+//   Scans all watched fds via vfs_file_t->poll() exactly like sys_poll.
+//   Writes ready epoll_event_t entries into userspace and returns the count.
+//   Sleeps (with poll_waiter registration) until at least one fd is ready
+//   or timeout expires.
+
+#define EPOLL_MAX_WATCHES 512
+
+typedef struct {
+    int32_t      fd;       // -1 = empty slot
+    uint32_t     events;   // EPOLLIN | EPOLLOUT | ...
+    epoll_data_t data;
+} epoll_watch_t;
+
+typedef struct {
+    epoll_watch_t watches[EPOLL_MAX_WATCHES];
+} epoll_state_t;
+
+// VFS ops for the epoll fd itself (not readable/writable by the user).
+static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
+    (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
+}
+static int64_t epoll_write(vfs_file_t* self, const void* buf, uint64_t len) {
+    (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
+}
+static int64_t epoll_seek(vfs_file_t* self, int64_t off, int w) {
+    (void)self; (void)off; (void)w; return (int64_t)-ESPIPE;
+}
+static void epoll_close(vfs_file_t* self) {
+    if (self->ctx) kfree(self->ctx);
+    kfree(self);
+}
+
+// epoll_create1(flags) → fd or -errno
+// We accept EPOLL_CLOEXEC (flag=0x80000 on Linux) silently.
+static uint64_t sys_epoll_create(uint64_t flags) {
+    (void)flags;
+    if (!g_current) return (uint64_t)-EINVAL;
+
+    epoll_state_t* state = (epoll_state_t*)kmalloc(sizeof(epoll_state_t));
+    if (!state) return (uint64_t)-ENOMEM;
+
+    // Mark all watch slots empty.
+    for (int i = 0; i < EPOLL_MAX_WATCHES; i++)
+        state->watches[i].fd = -1;
+
+    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    if (!f) { kfree(state); return (uint64_t)-ENOMEM; }
+
+    f->read        = epoll_read;
+    f->write       = epoll_write;
+    f->close       = epoll_close;
+    f->seek        = epoll_seek;
+    f->poll        = NULL;
+    f->ioctl       = NULL;
+    f->ctx         = state;
+    f->poll_waiter = NULL;
+    f->flags       = 0;
+    f->refcount    = 1;
+    f->rights      = 0;
+    f->path[0]     = '\0';
+
+    int64_t efd = fd_install(f);
+    if (efd < 0) return (uint64_t)(int64_t)efd;
+    return (uint64_t)efd;
+}
+
+// epoll_ctl(epfd, op, fd, event*) → 0 or -errno
+static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
+                               uint64_t event_ptr) {
+    if (!g_current) return (uint64_t)-EINVAL;
+
+    vfs_file_t* ef = fd_to_file(epfd);
+    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    epoll_state_t* state = (epoll_state_t*)ef->ctx;
+
+    epoll_event_t ev;
+    if (op != EPOLL_CTL_DEL) {
+        if (!event_ptr) return (uint64_t)-EINVAL;
+        if (copy_from_user(&ev, (const void*)event_ptr, sizeof(ev)) != 0)
+            return (uint64_t)-EFAULT;
+    }
+
+    int32_t tfd = (int32_t)fd;
+
+    switch (op) {
+    case EPOLL_CTL_ADD: {
+        // Reject if fd is already watched.
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            if (state->watches[i].fd == tfd) return (uint64_t)-EEXIST;
+        }
+        // Find an empty slot.
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            if (state->watches[i].fd == -1) {
+                state->watches[i].fd     = tfd;
+                state->watches[i].events = ev.events;
+                state->watches[i].data   = ev.data;
+                return 0;
+            }
+        }
+        return (uint64_t)-ENOSPC;
+    }
+    case EPOLL_CTL_DEL: {
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            if (state->watches[i].fd == tfd) {
+                state->watches[i].fd = -1;
+                return 0;
+            }
+        }
+        return (uint64_t)-ENOENT;
+    }
+    case EPOLL_CTL_MOD: {
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            if (state->watches[i].fd == tfd) {
+                state->watches[i].events = ev.events;
+                state->watches[i].data   = ev.data;
+                return 0;
+            }
+        }
+        return (uint64_t)-ENOENT;
+    }
+    default:
+        return (uint64_t)-EINVAL;
+    }
+}
+
+// epoll_wait(epfd, events_ptr, maxevents, timeout_ms) → count or -errno
+static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
+                                uint64_t maxevents, uint64_t timeout_ms) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    if (!events_ptr || maxevents == 0 || maxevents > 1024) return (uint64_t)-EINVAL;
+
+    vfs_file_t* ef = fd_to_file(epfd);
+    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    epoll_state_t* state = (epoll_state_t*)ef->ctx;
+
+    task_files_t* files = g_current->files_shared;
+    epoll_event_t* uevents = (epoll_event_t*)events_ptr;
+
+    int infinite = (timeout_ms == (uint64_t)-1);
+    extern uint64_t tsc_read_ns(void);
+    uint64_t timeout_ns = infinite ? 0 : (timeout_ms * 1000000ULL);
+    uint64_t deadline   = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
+    int count = 0;
+
+    do {
+        count = 0;
+        for (int i = 0; i < EPOLL_MAX_WATCHES && (uint64_t)count < maxevents; i++) {
+            int32_t wfd = state->watches[i].fd;
+            if (wfd < 0) continue;
+
+            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
+                            ? files->fd_table[wfd] : NULL;
+            if (!f) {
+                // fd was closed after EPOLL_CTL_ADD — report EPOLLERR
+                epoll_event_t out;
+                out.events = EPOLLERR | EPOLLHUP;
+                out.data   = state->watches[i].data;
+                if (copy_to_user(uevents + count, &out, sizeof(out)) != 0)
+                    return (uint64_t)-EFAULT;
+                count++;
+                continue;
+            }
+
+            uint32_t mask = state->watches[i].events;
+            uint32_t rev  = 0;
+            if (f->poll) {
+                if ((mask & EPOLLIN)  && f->poll(f, POLLIN))  rev |= EPOLLIN;
+                if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) rev |= EPOLLOUT;
+                if (f->poll(f, POLLHUP)) rev |= EPOLLHUP;
+            } else {
+                // No poll op → always ready.
+                if (mask & EPOLLIN)  rev |= EPOLLIN;
+                if (mask & EPOLLOUT) rev |= EPOLLOUT;
+            }
+
+            if (rev) {
+                epoll_event_t out;
+                out.events = rev;
+                out.data   = state->watches[i].data;
+                if (copy_to_user(uevents + count, &out, sizeof(out)) != 0)
+                    return (uint64_t)-EFAULT;
+                count++;
+            }
+        }
+
+        if (count > 0) break;
+        if (timeout_ms == 0) break;
+
+        // Register as poll_waiter on all watched fds so producers wake us.
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            int32_t wfd = state->watches[i].fd;
+            if (wfd < 0) continue;
+            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
+                            ? files->fd_table[wfd] : NULL;
+            if (f && !f->poll_waiter) f->poll_waiter = g_current;
+        }
+
+        {
+            uint64_t now  = tsc_read_ns();
+            uint64_t wake = now + 10000000ULL;  // 10 ms fallback
+            if (!infinite && wake > deadline) wake = deadline;
+            g_current->sleep_until_ns = wake;
+            sched_sleep();
+            g_current->sleep_until_ns = 0;
+        }
+
+        // Clear poll_waiter on all watched fds after waking.
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            int32_t wfd = state->watches[i].fd;
+            if (wfd < 0) continue;
+            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
+                            ? files->fd_table[wfd] : NULL;
             if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
         }
     } while (infinite || tsc_read_ns() < deadline);
@@ -3417,6 +3651,11 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         // ── Shared memory ─────────────────────────────────────────────────
         case SYS_SHM_OPEN:   ret = sys_shm_open(arg1, arg2, arg3, arg4);    break;
         case SYS_SHM_UNLINK: ret = sys_shm_unlink(arg1, arg2);              break;
+
+        // ── epoll ─────────────────────────────────────────────────────────
+        case SYS_EPOLL_CREATE: ret = sys_epoll_create(arg1);                break;
+        case SYS_EPOLL_CTL:    ret = sys_epoll_ctl(arg1, arg2, arg3, arg4); break;
+        case SYS_EPOLL_WAIT:   ret = sys_epoll_wait(arg1, arg2, arg3, arg4);break;
 
         default:               ret = (uint64_t)-ENOSYS;                         break;
     }

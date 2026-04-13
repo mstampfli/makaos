@@ -4,10 +4,10 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x0000000000045F0B
+kernel.bin size=0x0000000000042EFB
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x0000000000045F0B
-phys_ceiling=0x0000010000000000
+kernel loaded, bytes=0x0000000000042EFB
+phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
 ExitBootServices OK
@@ -15,23 +15,20 @@ K
 [net] IP 10.0.2.15 GW 10.0.2.2
 [net] MAC 52:54:00:12:34:56
 [net] ready
-0000000000400003
-00007FFFFFFFDEB3
-[open] pid=0000000a /etc/passwd -> fd=00000003
-[open] pid=0000000a /etc/shadow -> fd=00000003
+[dhcpcd] starting
+[dhcpcd] MAC 52:54:00:12:34:56
+[socket] domain=0000000000000002
+[socket] fd=0000000000000003
+[dhcpcd] sending DISCOVER
+[open] pid=0000000f /etc/passwd -> fd=00000003
+[open] pid=0000000f /etc/shadow -> fd=00000003
 
 Kore login: Password: 
 Welcome, root!
 [spawn] path=/bin/bash
-0000000000400003
-00007FFFFFFFDEB3
-[open] pid=00000010 /dev/tty -> fd=00000003
-[open] pid=00000010 /etc/passwd -> fd=00000003
-[open] pid=00000010 /root/.bashrc -> ERR 00000002
-[open] pid=00000010 /root/.bash_history -> ERR 00000002
-bash-5.2# [dhcpcd] starting
-[dhcpcd] MAC 52:54:00:12:34:56
-[net] ifconfig IP 0.0.0.0 GW 0.0.0.0
-[socket] domain=0000000000000002
-[socket] fd=0000000000000003
+[open] pid=00000011 /dev/tty -> fd=00000003
+[open] pid=00000011 /etc/passwd -> fd=00000003
+[open] pid=00000011 /root/.bashrc -> ERR 00000002
+[open] pid=00000011 /root/.bash_history -> ERR 00000002
+bash-5.2# [dhcpcd] sending DISCOVER
 [dhcpcd] sending DISCOVER

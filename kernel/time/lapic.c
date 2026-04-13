@@ -102,25 +102,14 @@ static void calibrate_timer(void) {
 void lapic_init(uint64_t lapic_phys) {
     s_phys  = lapic_phys ? lapic_phys : 0xFEE00000ULL;
     s_lapic = (volatile uint32_t*)vmm_map_mmio((phys_addr_t)s_phys, 0x1000u);
-
-    // Set Task Priority Register to 0 so the CPU accepts all interrupt vectors.
     lapic_w(LAPIC_TPR, 0);
-
-    // Program the Spurious Interrupt Vector Register:
-    //   bits [7:0] = spurious vector, bit 8 = software enable.
     lapic_w(LAPIC_SPURIOUS, VEC_LAPIC_SPURIOUS | SVR_ENABLE);
-
-    // Calibrate the built-in timer against the TSC.
     calibrate_timer();
 }
 
 void lapic_timer_start(uint32_t hz) {
-    // ticks_per_hz = (ticks_per_ms) * (1000 / hz)
-    // = s_timer_ticks_per_hz * 1000 / hz
     uint32_t init = s_timer_ticks_per_hz * 1000u / hz;
-
     lapic_w(LAPIC_TIMER_DCR, DCR_DIVIDE_BY_1);
-    // LVT: periodic mode, unmasked, vector = VEC_LAPIC_TIMER.
     lapic_w(LAPIC_TIMER_LVT, LVT_PERIODIC | VEC_LAPIC_TIMER);
     lapic_w(LAPIC_TIMER_INIT, init);
 }

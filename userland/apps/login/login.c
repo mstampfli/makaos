@@ -181,6 +181,7 @@ static int read_password(char* buf, int max) {
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main(void) {
+    ioctl(0, TCFLSH, (void*)0);  // flush stale input (phantom keystrokes from BIOS/UEFI)
     write(1, "\f", 1);  // clear screen on entry
 
     static char passwd_buf[4096];

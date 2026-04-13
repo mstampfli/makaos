@@ -3,8 +3,12 @@
 
 // ── PS/2 Keyboard driver ──────────────────────────────────────────────────
 
-// Register IRQ1 in the IDT and unmask it on the PIC.
+// Register real IRQ1 handler (replaces stub) and spawn driver kthread.
+// Call from init_kthread after tasks are running.
 void keyboard_init(void);
+// Flush KBC hardware buffer and reset all software scancode/modifier state.
+// Call after keyboard_init() before expecting clean input.
+void keyboard_flush(void);
 
 // Called from IRQ1 ASM stub — do not call directly.
 void keyboard_irq_handler(void);
