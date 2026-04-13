@@ -44,16 +44,13 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
     }
-    // Wake master reader if sleeping (blocking read or poll)
+    // Wake master reader if sleeping in blocking read().
     if (pty->m_reader) {
         sched_wake(pty->m_reader);
         pty->m_reader = NULL;
     }
-    if (pty->master_file && pty->master_file->poll_waiter) {
-        task_t* w = (task_t*)pty->master_file->poll_waiter;
-        pty->master_file->poll_waiter = NULL;
-        sched_wake(w);
-    }
+    // Wake all poll/epoll waiters on the master fd.
+    wait_queue_wake_all(&pty->master_waitq);
 }
 
 // ── Master fd VFS operations ─────────────────────────────────────────────
@@ -68,6 +65,11 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     pty_t* pty = ctx->pty;
     if (!len) return 0;
 
+    // Non-blocking: if no data in buffer, return EAGAIN (or EOF if slave gone).
+    if (mb_empty(pty) && (self->flags & 0x800 /*O_NONBLOCK*/)) {
+        if (!pty->slave_open_count) return 0; // EOF: slave closed
+        return -11; // EAGAIN
+    }
     // Block until data available
     while (mb_empty(pty)) {
         if (!pty->slave_open_count) return 0;  // EOF: slave closed
@@ -420,13 +422,15 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     master->poll        = pty_master_poll;
     master->ioctl       = pty_master_ioctl;
     master->ctx         = mctx;
-    master->poll_waiter = NULL;
+    master->waitq           = &master->_waitq; wait_queue_init(master->waitq);
+    wait_queue_init(&pty->master_waitq);
+    master->secondary_waitq = &pty->master_waitq;  // woken by pty_master_push
     master->flags       = 0;
     master->refcount    = 1;
     master->rights      = 0;
     master->path[0]     = '\0';
 
-    pty->master_file = master;  // back-pointer for poll wakeups
+    pty->master_file = master;  // kept for master close detection (slave EIO path)
 
     // Create slave vfs_file_t
     pty_slave_ctx_t* sctx = kmalloc(sizeof(pty_slave_ctx_t));
@@ -443,7 +447,9 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     slave->poll     = pty_slave_poll;
     slave->ioctl       = pty_slave_ioctl;
     slave->ctx         = sctx;
-    slave->poll_waiter = NULL;
+    slave->waitq           = &slave->_waitq; wait_queue_init(slave->waitq);
+    wait_queue_init(&pty->slave.waitq);
+    slave->secondary_waitq = &pty->slave.waitq;  // woken by ldisc when data arrives
     slave->flags       = 0;
     slave->refcount    = 1;
     slave->rights      = 0;

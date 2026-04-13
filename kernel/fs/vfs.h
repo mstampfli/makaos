@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "rights.h"
+#include "wait.h"
 
 // ── VFS — Virtual File System interface ──────────────────────────────────
 //
@@ -36,9 +37,14 @@ typedef struct vfs_file_t {
     // Ioctl: device-specific control.  May be NULL (means not supported).
     int64_t (*ioctl)(struct vfs_file_t* self, uint64_t request, uint64_t arg);
 
-    void*    ctx;      // driver-specific state (may be NULL for stateless drivers)
-    void*    poll_waiter; // task_t* — task sleeping in poll/select on this fd
-    uint32_t flags;    // open flags (O_APPEND, O_NONBLOCK etc.)
+    void*         ctx;           // driver-specific state (may be NULL for stateless drivers)
+    wait_queue_t* waitq;         // primary poll/epoll queue; always &self->_waitq for normal fds.
+    wait_queue_t  _waitq;        // embedded storage for waitq — do not use directly.
+    wait_queue_t* secondary_waitq; // optional second queue to also register on.
+                                 // Used by TTY slave (→ tty_t.waitq) and PTY master/slave
+                                 // (→ pty_t.master_waitq / tty_t.waitq) so ldisc/output
+                                 // wakeups reach poll/epoll waiters.  NULL for most fds.
+    uint32_t      flags;         // open flags (O_APPEND, O_NONBLOCK etc.)
     uint32_t refcount; // reference count; 0 = static object (never freed)
     uint32_t rights;   // RIGHT_* bitmask; checked before every operation
     char     path[256]; // absolute path for ext2 files (empty for devices/pipes)

@@ -57,13 +57,9 @@ static socket_t* udp_table_find(uint16_t port) {
     return 0;
 }
 
-// Wake the task sitting in poll()/select() on a socket fd.
+// Wake all tasks sitting in poll()/epoll_wait() on a socket fd.
 static void sock_poll_wake(socket_t* s) {
-    if (s && s->file && s->file->poll_waiter) {
-        task_t* w = (task_t*)s->file->poll_waiter;
-        s->file->poll_waiter = NULL;
-        sched_wake(w);
-    }
+    if (s && s->file) wait_queue_wake_all(s->file->waitq);
 }
 
 // ── VFS operations ────────────────────────────────────────────────────────
@@ -202,14 +198,15 @@ vfs_file_t* socket_open(int domain, int type) {
     f->write       = sock_write;
     f->close       = sock_close;
     f->seek        = sock_seek;
-    f->poll        = sock_poll;
-    f->ioctl       = NULL;
-    f->ctx         = s;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
-    f->refcount    = 1;
-    f->rights      = 0;
-    f->path[0]     = '\0';
+    f->poll           = sock_poll;
+    f->ioctl          = NULL;
+    f->ctx            = s;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
+    f->refcount       = 1;
+    f->rights         = 0;
+    f->path[0]        = '\0';
 
     s->file = f;
     if (s->pcb) tcp_pcb_set_file(s->pcb, f);
@@ -298,14 +295,15 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     cf->write       = sock_write;
     cf->close       = sock_close;
     cf->seek        = sock_seek;
-    cf->poll        = sock_poll;
-    cf->ioctl       = NULL;
-    cf->ctx         = cs;
-    cf->poll_waiter = NULL;
-    cf->flags       = 0;
-    cf->refcount    = 1;
-    cf->rights      = 0;
-    cf->path[0]     = '\0';
+    cf->poll           = sock_poll;
+    cf->ioctl          = NULL;
+    cf->ctx            = cs;
+    cf->waitq           = &cf->_waitq; wait_queue_init(cf->waitq);
+    cf->secondary_waitq = NULL;
+    cf->flags          = 0;
+    cf->refcount       = 1;
+    cf->rights         = 0;
+    cf->path[0]        = '\0';
 
     cs->file = cf;
     tcp_pcb_set_file(child_pcb, cf);

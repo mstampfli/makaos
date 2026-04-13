@@ -88,6 +88,23 @@ static uint32_t*            g_pixels;
 
 static int g_dirty = 0;  // any cells changed since last commit?
 
+// Per-cell dirty bitmap: 1 bit per cell, allocated alongside g_cells.
+// Avoids re-rendering all 2000 cells when only a few changed.
+static uint8_t* g_cell_dirty = NULL;  // g_cols * g_rows bytes (1 = dirty)
+
+static void cell_mark_dirty(int r, int c) {
+    if (r >= 0 && r < g_rows && c >= 0 && c < g_cols)
+        g_cell_dirty[r * g_cols + c] = 1;
+}
+static void cell_mark_all_dirty(void) {
+    int n = g_cols * g_rows;
+    for (int i = 0; i < n; i++) g_cell_dirty[i] = 1;
+}
+
+// Previous cursor position — needed to erase old cursor on move.
+static int g_prev_cur_row = 0;
+static int g_prev_cur_col = 0;
+
 // ── Rendering ───────────────────────────────────────────────────────────
 
 static void render_cell(int row, int col) {
@@ -130,16 +147,27 @@ static void render_cursor(void) {
     }
 }
 
-static void render_all(void) {
-    for (int r = 0; r < g_rows; r++)
-        for (int c = 0; c < g_cols; c++)
+static void render_dirty(void) {
+    // Erase old cursor position (re-render that cell from grid).
+    cell_mark_dirty(g_prev_cur_row, g_prev_cur_col);
+    // Mark current cursor cell dirty so it gets drawn below.
+    cell_mark_dirty(g_cur_row, g_cur_col);
+
+    for (int r = 0; r < g_rows; r++) {
+        for (int c = 0; c < g_cols; c++) {
+            if (!g_cell_dirty[r * g_cols + c]) continue;
             render_cell(r, c);
+            g_cell_dirty[r * g_cols + c] = 0;
+        }
+    }
     render_cursor();
+    g_prev_cur_row = g_cur_row;
+    g_prev_cur_col = g_cur_col;
 }
 
 static void commit_display(void) {
     if (!g_dirty) return;
-    render_all();
+    render_dirty();
     md_surface_attach(g_surf, g_buf);
     md_surface_damage(g_surf, 0, 0, g_win_w, g_win_h);
     md_surface_commit(g_surf);
@@ -161,6 +189,8 @@ static void term_scroll_up(void) {
         CELL(g_rows - 1, c).bg = g_cur_bg;
         CELL(g_rows - 1, c).attrs = 0;
     }
+    // Scroll shifts every row — all cells dirty
+    cell_mark_all_dirty();
     g_dirty = 1;
 }
 
@@ -187,6 +217,7 @@ static void term_putchar(char ch) {
     CELL(g_cur_row, g_cur_col).fg = g_cur_fg;
     CELL(g_cur_row, g_cur_col).bg = g_cur_bg;
     CELL(g_cur_row, g_cur_col).attrs = 0;
+    cell_mark_dirty(g_cur_row, g_cur_col);
     g_cur_col++;
     g_dirty = 1;
 }
@@ -200,6 +231,7 @@ static void term_clear_row(int row, int from, int to) {
         CELL(row, c).fg = g_cur_fg;
         CELL(row, c).bg = g_cur_bg;
         CELL(row, c).attrs = 0;
+        cell_mark_dirty(row, c);
     }
     g_dirty = 1;
 }
@@ -600,10 +632,14 @@ static void on_key(md_client_surface_t* surf, uint32_t keycode,
 // Allocate / reallocate the cell grid for the current g_cols/g_rows.
 // If old grid exists, preserves the overlapping top-left region.
 static void alloc_cells(int old_cols, int old_rows) {
-    term_cell_t* old = g_cells;
-    size_t bytes = (size_t)g_cols * (size_t)g_rows * sizeof(term_cell_t);
-    g_cells = (term_cell_t*)malloc(bytes);
-    if (!g_cells) { g_running = 0; return; }
+    term_cell_t* old      = g_cells;
+    uint8_t*     old_dirt = g_cell_dirty;
+
+    size_t n     = (size_t)g_cols * (size_t)g_rows;
+    g_cells      = (term_cell_t*)malloc(n * sizeof(term_cell_t));
+    g_cell_dirty = (uint8_t*)malloc(n);
+    if (!g_cells || !g_cell_dirty) { g_running = 0; return; }
+
     for (int r = 0; r < g_rows; r++) {
         for (int c = 0; c < g_cols; c++) {
             term_cell_t* dst = &g_cells[r * g_cols + c];
@@ -615,9 +651,11 @@ static void alloc_cells(int old_cols, int old_rows) {
                 dst->bg = g_cur_bg;
                 dst->attrs = 0;
             }
+            g_cell_dirty[r * g_cols + c] = 1;  // all dirty after alloc/resize
         }
     }
-    if (old) free(old);
+    if (old)      free(old);
+    if (old_dirt) free(old_dirt);
 }
 
 // Render callback invoked by md_surface_resize_commit with the freshly
@@ -648,7 +686,8 @@ static void resize_render(md_client_buffer_t* new_buf, void* userdata) {
     if (g_cur_col >= g_cols) g_cur_col = g_cols - 1;
 
     for (uint32_t i = 0; i < g_win_w * g_win_h; i++) g_pixels[i] = 0;
-    render_all();
+    cell_mark_all_dirty();
+    render_dirty();
     g_dirty = 0;
 }
 
@@ -709,6 +748,11 @@ int main(int argc, char** argv) {
     }
     g_pty_master_fd = pty_fds[0];
     int slave_fd = pty_fds[1];
+    // Set PTY master non-blocking so we can drain it without epoll telling us.
+    // This fixes the one-behind render lag: after writing a key to master, the
+    // slave echo arrives asynchronously; non-blocking drain after every epoll
+    // iteration catches it without waiting for the next wakeup cycle.
+    fcntl(g_pty_master_fd, F_SETFL, O_NONBLOCK);
 
     print("makaterm: PTY opened\n");
 
@@ -787,42 +831,61 @@ int main(int argc, char** argv) {
     print("makaterm: terminal window created\n");
 
     // ── Main event loop ─────────────────────────────────────────────────
-    // Poll on both: display server socket + PTY master fd
+    // epoll on both: display server socket + PTY master fd.
+    // epoll is used instead of poll to avoid re-registering poll_waiter
+    // on every iteration — the kernel's epoll_wait only registers once per
+    // sleep, reducing the race window where a wakeup can be missed.
 
     int dpy_fd = md_display_fd(g_dpy);
 
+#define EV_DPY 0
+#define EV_PTY 1
+    int ep = epoll_create(2);
+    if (ep < 0) { print("makaterm: epoll_create failed\n"); return 1; }
+
+    epoll_event_t ev;
+    ev.events   = EPOLLIN;
+    ev.data.u32 = EV_DPY;
+    epoll_ctl(ep, EPOLL_CTL_ADD, dpy_fd, &ev);
+    ev.events   = EPOLLIN;
+    ev.data.u32 = EV_PTY;
+    epoll_ctl(ep, EPOLL_CTL_ADD, g_pty_master_fd, &ev);
+
+    epoll_event_t ready_evs[4];
+
     while (g_running) {
-        pollfd_t fds[2];
-        fds[0].fd = dpy_fd;
-        fds[0].events = POLLIN;
-        fds[1].fd = g_pty_master_fd;
-        fds[1].events = POLLIN;
+        int n = epoll_wait(ep, ready_evs, 4, -1);
 
-        poll(fds, 2, g_dirty ? 16 : 100);
-
-        // Handle display server events (keyboard input from compositor)
-        if (fds[0].revents & POLLIN) {
-            int r = md_display_dispatch(g_dpy);
-            if (r < 0) break;
+        // Process display server events (key/mouse/configure).
+        for (int i = 0; i < n; i++) {
+            if (ready_evs[i].data.u32 == EV_DPY) {
+                int r = md_display_dispatch(g_dpy);
+                if (r < 0) { g_running = 0; break; }
+            }
+            // EV_PTY handled by the drain loop below.
         }
+        if (!g_running) break;
 
-        // Handle PTY master output (bash wrote something)
-        if (fds[1].revents & POLLIN) {
-            char pty_buf[1024];
-            int n = (int)read(g_pty_master_fd, pty_buf, sizeof(pty_buf));
-            if (n <= 0) {
-                // Bash exited
-                g_running = 0;
-                break;
+        // Drain PTY master non-blocking after every iteration.
+        // Catches echoes that arrive between EV_DPY dispatch and here,
+        // and processes all pending output on EV_PTY wakeups.
+        {
+            char pty_buf[4096];
+            int r;
+            while ((r = (int)read(g_pty_master_fd, pty_buf, sizeof(pty_buf))) > 0) {
+                for (int j = 0; j < r; j++)
+                    term_process_char(pty_buf[j]);
             }
-            for (int i = 0; i < n; i++) {
-                term_process_char(pty_buf[i]);
-            }
+            // r == 0: EOF (slave closed) — kill terminal
+            if (r == 0) { g_running = 0; break; }
+            // r < 0: EAGAIN — no more data, continue
         }
 
         // Commit any dirty state to display
         commit_display();
     }
+
+    close(ep);
 
     // Clean up
     close(g_pty_master_fd);

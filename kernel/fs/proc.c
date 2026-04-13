@@ -109,11 +109,12 @@ static vfs_file_t* membuf_open(uint8_t* buf, uint64_t size) {
     f->write    = NULL;  // read-only
     f->close    = membuf_close;
     f->seek     = membuf_seek;
-    f->poll        = NULL;
-    f->ioctl       = NULL;
-    f->ctx         = ctx;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
+    f->poll           = NULL;
+    f->ioctl          = NULL;
+    f->ctx            = ctx;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
     f->refcount    = 1;
     f->rights   = 0;
     f->path[0]  = '\0';

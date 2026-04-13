@@ -2995,27 +2995,58 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
         }
         if (count > 0) break;
         if (!sel_infinite && timeout_ns == 0) break;
-        // Register as poll_waiter on all watched fds.
-        for (uint32_t fd = 0; fd < nfds; fd++) {
-            if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) && !FD_ISSET(fd, &eset))
-                continue;
-            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
-            if (f) f->poll_waiter = g_current;
+        // Register one task_we_t per watched fd (on both queues if secondary exists).
+        // 2*nfds slots worst-case; unused slots stay zeroed.
+        uint32_t sel_nslots = nfds * 2;
+        task_we_t* sel_wes = (task_we_t*)kmalloc(sel_nslots * sizeof(task_we_t));
+        uint32_t sel_used = 0;
+        if (sel_wes) {
+            uint8_t* sp = (uint8_t*)sel_wes;
+            for (uint32_t si = 0; si < sel_nslots * sizeof(task_we_t); si++) sp[si] = 0;
+            for (uint32_t fd = 0; fd < nfds; fd++) {
+                if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
+                    !FD_ISSET(fd, &eset)) continue;
+                vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+                if (!f) continue;
+                if (sel_used < sel_nslots) {
+                    task_we_init(&sel_wes[sel_used], g_current);
+                    task_we_add(f->waitq, &sel_wes[sel_used]);
+                    sel_used++;
+                }
+                if (f->secondary_waitq && sel_used < sel_nslots) {
+                    task_we_init(&sel_wes[sel_used], g_current);
+                    task_we_add(f->secondary_waitq, &sel_wes[sel_used]);
+                    sel_used++;
+                }
+            }
         }
-        {
-            uint64_t now = tsc_read_ns();
-            uint64_t wake = now + 10000000ULL; // 10ms fallback
-            if (!sel_infinite && wake > deadline) wake = deadline;
-            g_current->sleep_until_ns = wake;
+        // Re-check after registering — close race between first check and add.
+        int sel_recheck = 0;
+        for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
+            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            if (!f) continue;
+            if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
+                (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
+        }
+        if (!sel_recheck) {
+            g_current->sleep_until_ns = sel_infinite ? 0 : deadline;
             sched_sleep();
             g_current->sleep_until_ns = 0;
         }
-        // Clear poll_waiter on all watched fds.
-        for (uint32_t fd = 0; fd < nfds; fd++) {
-            if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) && !FD_ISSET(fd, &eset))
-                continue;
-            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
-            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
+        // Remove all entries still on a queue (wq_remove is a no-op if already gone).
+        if (sel_wes) {
+            uint32_t si = 0;
+            for (uint32_t fd = 0; fd < nfds && si < sel_used; fd++) {
+                if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
+                    !FD_ISSET(fd, &eset)) continue;
+                vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+                if (!f) continue;
+                if (si < sel_used) { task_we_remove(f->waitq, &sel_wes[si]); si++; }
+                if (f->secondary_waitq && si < sel_used) {
+                    task_we_remove(f->secondary_waitq, &sel_wes[si]); si++;
+                }
+            }
+            kfree(sel_wes);
         }
     } while (sel_infinite || tsc_read_ns() < deadline);
 
@@ -3061,28 +3092,62 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         }
         if (count > 0) break;
         if (timeout_ms == 0) break;
-        // Register as poll_waiter on all fds so data producers wake us instantly.
+        // Register one task_we_t per watched fd (on both queues if secondary exists).
+        uint32_t p_nslots = (uint32_t)nfds * 2;
+        task_we_t* p_wes = (task_we_t*)kmalloc(p_nslots * sizeof(task_we_t));
+        uint32_t p_used = 0;
+        if (p_wes) {
+            uint8_t* pp = (uint8_t*)p_wes;
+            for (uint32_t pi = 0; pi < p_nslots * sizeof(task_we_t); pi++) pp[pi] = 0;
+            for (uint64_t i = 0; i < nfds; i++) {
+                int fd = ufds[i].fd;
+                if (fd < 0) continue;
+                vfs_file_t* f = ((uint32_t)fd < files->fd_capacity)
+                                ? files->fd_table[fd] : NULL;
+                if (!f) continue;
+                if (p_used < p_nslots) {
+                    task_we_init(&p_wes[p_used], g_current);
+                    task_we_add(f->waitq, &p_wes[p_used]);
+                    p_used++;
+                }
+                if (f->secondary_waitq && p_used < p_nslots) {
+                    task_we_init(&p_wes[p_used], g_current);
+                    task_we_add(f->secondary_waitq, &p_wes[p_used]);
+                    p_used++;
+                }
+            }
+        }
+        // Re-check after registering — close race between first check and add.
+        int recheck = 0;
         for (uint64_t i = 0; i < nfds; i++) {
             int fd = ufds[i].fd;
             if (fd < 0) continue;
             vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
-            if (f) f->poll_waiter = g_current;
+            if (!f) continue;
+            if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
+                ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
+                fd_has_hup(f)) { recheck = 1; break; }
         }
-        // Sleep with a timeout as fallback (in case no producer wakes us).
-        {
-            uint64_t now = tsc_read_ns();
-            uint64_t wake = now + 10000000ULL; // 10ms fallback
-            if (!infinite && wake > deadline) wake = deadline;
-            g_current->sleep_until_ns = wake;
+        if (!recheck) {
+            g_current->sleep_until_ns = infinite ? 0 : deadline;
             sched_sleep();
             g_current->sleep_until_ns = 0;
         }
-        // Clear poll_waiter on all fds after waking.
-        for (uint64_t i = 0; i < nfds; i++) {
-            int fd = ufds[i].fd;
-            if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
-            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
+        // Remove all entries still on a queue.
+        if (p_wes) {
+            uint32_t pi = 0;
+            for (uint64_t i = 0; i < nfds && pi < p_used; i++) {
+                int fd = ufds[i].fd;
+                if (fd < 0) continue;
+                vfs_file_t* f = ((uint32_t)fd < files->fd_capacity)
+                                ? files->fd_table[fd] : NULL;
+                if (!f) continue;
+                if (pi < p_used) { task_we_remove(f->waitq, &p_wes[pi]); pi++; }
+                if (f->secondary_waitq && pi < p_used) {
+                    task_we_remove(f->secondary_waitq, &p_wes[pi]); pi++;
+                }
+            }
+            kfree(p_wes);
         }
     } while (infinite || tsc_read_ns() < deadline);
 
@@ -3091,35 +3156,70 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
 
 // ── epoll ─────────────────────────────────────────────────────────────────
 //
-// Lightweight epoll implementation backed by the same vfs_file_t->poll()
-// mechanism used by select/poll.  We intentionally do level-triggered only
-// (ET flag is accepted but ignored) to keep the implementation simple and
-// correct.  The epoll fd itself appears in the fd table as a normal vfs_file_t
-// whose ctx points to an epoll_state_t.
+// Linux-accurate epoll using wait.h callback design (see kernel/include/wait.h):
 //
-// epoll_state_t contains:
-//   • a fixed watch table (up to EPOLL_MAX_WATCHES entries)
-//   • each entry: { fd, events mask, epoll_data_t user cookie }
+//   epoll_ctl(ADD): initialises a persistent epoll_we_t per watched fd and
+//     registers it on the fd's waitq (and secondary_waitq if present).
+//     epoll_we_t.func = epoll_wake_func: sets state->has_ready=1 and wakes
+//     state->wq.  Returns WQ_KEEP — stays in the file's waitq until DEL/close.
 //
-// epoll_wait():
-//   Scans all watched fds via vfs_file_t->poll() exactly like sys_poll.
-//   Writes ready epoll_event_t entries into userspace and returns the count.
-//   Sleeps (with poll_waiter registration) until at least one fd is ready
-//   or timeout expires.
+//   epoll_wait(): registers ONE stack-allocated task_we_t on state->wq and
+//     sleeps.  When any watched fd fires: fd.waitq → epoll_wake_func →
+//     state->wq → task_we_t wakes the task (WQ_REMOVE).
+//     Zero per-wakeup allocations after ADD.
+//
+//   epoll_ctl(DEL/MOD): calls epoll_we_remove to unlink persistent entries,
+//     then re-registers for MOD.
+//
+//   epoll_close(): removes all persistent entries and frees state.
 
 #define EPOLL_MAX_WATCHES 512
 
 typedef struct {
-    int32_t      fd;       // -1 = empty slot
-    uint32_t     events;   // EPOLLIN | EPOLLOUT | ...
+    int32_t      fd;        // -1 = empty slot
+    uint32_t     events;    // EPOLLIN | EPOLLOUT | ...
     epoll_data_t data;
+    // Persistent epoll_we_t entries registered on the watched fd's queues.
+    // Allocated by epoll_ctl(ADD), freed at DEL/close. Return WQ_KEEP — never
+    // removed on wakeup; stay forever until epoll_ctl(DEL) or epoll fd close.
+    epoll_we_t   entry;     // on f->waitq
+    epoll_we_t   entry2;    // on f->secondary_waitq (if any)
+    int          has_entry2;
 } epoll_watch_t;
 
 typedef struct {
     epoll_watch_t watches[EPOLL_MAX_WATCHES];
+    wait_queue_t  wq;        // epoll instance's own queue; sleeping tasks go here
+    int           has_ready; // set to 1 by epoll_wake_func when any watched fd fires
 } epoll_state_t;
 
-// VFS ops for the epoll fd itself (not readable/writable by the user).
+// Register/unregister persistent epoll_we_t entries for watch slot i.
+// epoll_we_t.func = epoll_wake_func, which sets state->has_ready and wakes
+// state->wq.  Returns WQ_KEEP — entries stay in the file's waitq until DEL.
+static void epoll_watch_register(epoll_state_t* state, int i, vfs_file_t* f) {
+    epoll_watch_t* w = &state->watches[i];
+    epoll_we_init(&w->entry, &state->wq, &state->has_ready);
+    epoll_we_add(f->waitq, &w->entry);
+    if (f->secondary_waitq) {
+        epoll_we_init(&w->entry2, &state->wq, &state->has_ready);
+        epoll_we_add(f->secondary_waitq, &w->entry2);
+        w->has_entry2 = 1;
+    } else {
+        w->has_entry2 = 0;
+    }
+}
+
+static void epoll_watch_unregister(epoll_state_t* state, int i, vfs_file_t* f) {
+    epoll_watch_t* w = &state->watches[i];
+    if (f) {
+        epoll_we_remove(f->waitq, &w->entry);
+        if (w->has_entry2 && f->secondary_waitq)
+            epoll_we_remove(f->secondary_waitq, &w->entry2);
+    }
+    w->has_entry2 = 0;
+}
+
+// VFS ops for the epoll fd itself.
 static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
 }
@@ -3130,12 +3230,22 @@ static int64_t epoll_seek(vfs_file_t* self, int64_t off, int w) {
     (void)self; (void)off; (void)w; return (int64_t)-ESPIPE;
 }
 static void epoll_close(vfs_file_t* self) {
-    if (self->ctx) kfree(self->ctx);
+    if (self->ctx) {
+        epoll_state_t* state = (epoll_state_t*)self->ctx;
+        task_files_t* files = g_current ? g_current->files_shared : NULL;
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+            int32_t wfd = state->watches[i].fd;
+            if (wfd < 0) continue;
+            vfs_file_t* f = (files && (uint32_t)wfd < files->fd_capacity)
+                            ? files->fd_table[wfd] : NULL;
+            epoll_watch_unregister(state, i, f);
+        }
+        kfree(state);
+    }
     kfree(self);
 }
 
 // epoll_create1(flags) → fd or -errno
-// We accept EPOLL_CLOEXEC (flag=0x80000 on Linux) silently.
 static uint64_t sys_epoll_create(uint64_t flags) {
     (void)flags;
     if (!g_current) return (uint64_t)-EINVAL;
@@ -3143,25 +3253,32 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     epoll_state_t* state = (epoll_state_t*)kmalloc(sizeof(epoll_state_t));
     if (!state) return (uint64_t)-ENOMEM;
 
-    // Mark all watch slots empty.
-    for (int i = 0; i < EPOLL_MAX_WATCHES; i++)
-        state->watches[i].fd = -1;
+    wait_queue_init(&state->wq);
+    state->has_ready = 0;
+    for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+        state->watches[i].fd         = -1;
+        state->watches[i].has_entry2 = 0;
+        // entry/entry2 are zeroed by the loop initializer; func=NULL means not live.
+        state->watches[i].entry.we.func  = 0;
+        state->watches[i].entry2.we.func = 0;
+    }
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(state); return (uint64_t)-ENOMEM; }
 
-    f->read        = epoll_read;
-    f->write       = epoll_write;
-    f->close       = epoll_close;
-    f->seek        = epoll_seek;
-    f->poll        = NULL;
-    f->ioctl       = NULL;
-    f->ctx         = state;
-    f->poll_waiter = NULL;
-    f->flags       = 0;
-    f->refcount    = 1;
-    f->rights      = 0;
-    f->path[0]     = '\0';
+    f->read           = epoll_read;
+    f->write          = epoll_write;
+    f->close          = epoll_close;
+    f->seek           = epoll_seek;
+    f->poll           = NULL;
+    f->ioctl          = NULL;
+    f->ctx            = state;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags          = 0;
+    f->refcount       = 1;
+    f->rights         = 0;
+    f->path[0]        = '\0';
 
     int64_t efd = fd_install(f);
     if (efd < 0) return (uint64_t)(int64_t)efd;
@@ -3185,19 +3302,21 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     }
 
     int32_t tfd = (int32_t)fd;
+    task_files_t* files = g_current->files_shared;
 
     switch (op) {
     case EPOLL_CTL_ADD: {
-        // Reject if fd is already watched.
-        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
+        for (int i = 0; i < EPOLL_MAX_WATCHES; i++)
             if (state->watches[i].fd == tfd) return (uint64_t)-EEXIST;
-        }
-        // Find an empty slot.
         for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
             if (state->watches[i].fd == -1) {
+                vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
+                                 ? files->fd_table[tfd] : NULL;
+                if (!wf) return (uint64_t)-EBADF;
                 state->watches[i].fd     = tfd;
                 state->watches[i].events = ev.events;
                 state->watches[i].data   = ev.data;
+                epoll_watch_register(state, i, wf);
                 return 0;
             }
         }
@@ -3206,6 +3325,9 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     case EPOLL_CTL_DEL: {
         for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
             if (state->watches[i].fd == tfd) {
+                vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
+                                 ? files->fd_table[tfd] : NULL;
+                epoll_watch_unregister(state, i, wf);
                 state->watches[i].fd = -1;
                 return 0;
             }
@@ -3215,8 +3337,13 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     case EPOLL_CTL_MOD: {
         for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
             if (state->watches[i].fd == tfd) {
+                vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
+                                 ? files->fd_table[tfd] : NULL;
+                // Unregister old, re-register with same fd (events may change).
+                epoll_watch_unregister(state, i, wf);
                 state->watches[i].events = ev.events;
                 state->watches[i].data   = ev.data;
+                if (wf) epoll_watch_register(state, i, wf);
                 return 0;
             }
         }
@@ -3246,6 +3373,9 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     uint64_t deadline   = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // One task_we_t on the epoll's own wq — stack allocated, zero per-wakeup alloc.
+    task_we_t task_we;
+
     do {
         count = 0;
         for (int i = 0; i < EPOLL_MAX_WATCHES && (uint64_t)count < maxevents; i++) {
@@ -3255,7 +3385,6 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
                             ? files->fd_table[wfd] : NULL;
             if (!f) {
-                // fd was closed after EPOLL_CTL_ADD — report EPOLLERR
                 epoll_event_t out;
                 out.events = EPOLLERR | EPOLLHUP;
                 out.data   = state->watches[i].data;
@@ -3272,7 +3401,6 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
                 if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) rev |= EPOLLOUT;
                 if (f->poll(f, POLLHUP)) rev |= EPOLLHUP;
             } else {
-                // No poll op → always ready.
                 if (mask & EPOLLIN)  rev |= EPOLLIN;
                 if (mask & EPOLLOUT) rev |= EPOLLOUT;
             }
@@ -3290,32 +3418,36 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
         if (count > 0) break;
         if (timeout_ms == 0) break;
 
-        // Register as poll_waiter on all watched fds so producers wake us.
-        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
-            int32_t wfd = state->watches[i].fd;
-            if (wfd < 0) continue;
-            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
-                            ? files->fd_table[wfd] : NULL;
-            if (f && !f->poll_waiter) f->poll_waiter = g_current;
-        }
+        // Sleep on epoll's own wq. Persistent epoll_we_t entries on each watched
+        // fd's waitq call epoll_wake_func → set state->has_ready=1 and wake state->wq.
+        // Zero per-wakeup allocation after epoll_ctl(ADD).
+        state->has_ready = 0;
+        task_we_init(&task_we, g_current);
+        task_we_add(&state->wq, &task_we);
 
-        {
-            uint64_t now  = tsc_read_ns();
-            uint64_t wake = now + 10000000ULL;  // 10 ms fallback
-            if (!infinite && wake > deadline) wake = deadline;
-            g_current->sleep_until_ns = wake;
+        // Re-check after registering to close the race window.
+        int ep_recheck = state->has_ready;
+        if (!ep_recheck) {
+            for (int i = 0; i < EPOLL_MAX_WATCHES && !ep_recheck; i++) {
+                int32_t wfd = state->watches[i].fd;
+                if (wfd < 0) continue;
+                vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
+                                ? files->fd_table[wfd] : NULL;
+                if (!f || !f->poll) continue;
+                uint32_t mask = state->watches[i].events;
+                if ((mask & EPOLLIN)  && f->poll(f, POLLIN))  ep_recheck = 1;
+                if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) ep_recheck = 1;
+                if (f->poll(f, POLLHUP))                      ep_recheck = 1;
+            }
+        }
+        if (!ep_recheck) {
+            g_current->sleep_until_ns = infinite ? 0 : deadline;
             sched_sleep();
             g_current->sleep_until_ns = 0;
         }
+        // Remove the task entry (wq_remove is a no-op if already removed by wake).
+        task_we_remove(&state->wq, &task_we);
 
-        // Clear poll_waiter on all watched fds after waking.
-        for (int i = 0; i < EPOLL_MAX_WATCHES; i++) {
-            int32_t wfd = state->watches[i].fd;
-            if (wfd < 0) continue;
-            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
-                            ? files->fd_table[wfd] : NULL;
-            if (f && f->poll_waiter == g_current) f->poll_waiter = NULL;
-        }
     } while (infinite || tsc_read_ns() < deadline);
 
     return (uint64_t)(int64_t)count;
