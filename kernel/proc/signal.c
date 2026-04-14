@@ -46,20 +46,24 @@ void signal_send(task_t* t, int sig) {
 
 // ── signal_send_group ─────────────────────────────────────────────────────
 // Walk the tgid hash bucket — O(threads in process), not O(total tasks).
+// The walker holds the tgid table lock for the duration so concurrent
+// task_idx_insert/remove cannot tear the list we're iterating.
+
+static void sig_group_visit(task_t* t, void* data) {
+    int sig = *(int*)data;
+    if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE) return;
+    signal_send(t, sig);
+}
+
 void signal_send_group(uint32_t tgid, int sig) {
-    for (task_t* t = task_idx_tgid_head(tgid); t; t = t->tg_next) {
-        if (t->state == TASK_DEAD) continue;
-        signal_send(t, sig);
-    }
+    task_idx_tgid_walk(tgid, sig_group_visit, &sig);
 }
 
 // ── signal_send_pgrp ─────────────────────────────────────────────────────
 // Walk the pgid hash bucket — O(procs in pgrp), not O(total tasks).
+// Same locking invariant as signal_send_group.
 void signal_send_pgrp(uint32_t pgid, int sig) {
-    for (task_t* t = task_idx_pgid_head(pgid); t; t = t->pg_next) {
-        if (t->state == TASK_DEAD) continue;
-        signal_send(t, sig);
-    }
+    task_idx_pgid_walk(pgid, sig_group_visit, &sig);
 }
 
 // ── signal_setup_frame ────────────────────────────────────────────────────

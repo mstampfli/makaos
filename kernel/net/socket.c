@@ -9,10 +9,17 @@
 #include "process.h"
 #include "errno.h"
 #include "syscall.h"   // POLLIN / POLLOUT / POLLHUP / POLLERR, O_NONBLOCK
+#include "smp.h"
+#include "rcu.h"
 
-// ── UDP socket registry ───────────────────────────────────────────────────
-// Open-addressing hash table: maps local port (host order) → socket_t*.
-// Key=0 means empty.  Table grows at 75% load.  No fixed cap.
+// ── UDP socket registry (RCU-protected) ──────────────────────────────────
+// The whole table is a single object (udp_table_t) published via
+// rcu_assign_pointer.  Readers (udp_table_find, called from the NIC
+// softirq path per packet) walk lock-free inside rcu_read_lock() — zero
+// atomics, zero cache-line bouncing.  Writers (register/remove) serialise
+// on s_udp_wlock, build a fresh table via copy-on-write, and call_rcu the
+// old one for deferred free.  Mutation is O(cap) but register/remove are
+// once-per-socket events, while find is per-packet.
 
 #define UDP_RX_QUEUE_MAX     64u   // per-socket cap on pending datagrams
 #define UDP_HT_INIT_CAP      32u   // initial power-of-2 slot count
@@ -22,94 +29,109 @@ typedef struct {
     socket_t* sock;
 } udp_sock_entry_t;
 
-static udp_sock_entry_t* s_udp_slots = NULL;
-static uint32_t          s_udp_cap   = 0;
-static uint32_t          s_udp_count = 0;
+typedef struct udp_table {
+    uint32_t         cap;
+    uint32_t         cnt;
+    udp_sock_entry_t slots[];
+} udp_table_t;
 
-// Lazy-init the table on first use.
-static void udp_ht_ensure_init(void) {
-    if (s_udp_slots) return;
-    s_udp_slots = (udp_sock_entry_t*)kmalloc(
-        (uint64_t)UDP_HT_INIT_CAP * sizeof(udp_sock_entry_t));
-    if (!s_udp_slots) return; // OOM at boot — will fail later gracefully
-    __builtin_memset(s_udp_slots, 0,
-                      (uint64_t)UDP_HT_INIT_CAP * sizeof(udp_sock_entry_t));
-    s_udp_cap = UDP_HT_INIT_CAP;
-}
+static udp_table_t* s_udp       = NULL;   // RCU-protected
+static spinlock_t   s_udp_wlock = SPINLOCK_INIT;
 
 static uint32_t udp_hash(uint16_t port, uint32_t cap) {
     return ((uint32_t)port * 2654435761u) & (cap - 1u);
 }
 
-// Find slot index for port. Returns cap if not found.
-static uint32_t udp_ht_find(uint16_t port) {
-    if (!s_udp_slots) return s_udp_cap;
-    uint32_t i = udp_hash(port, s_udp_cap);
-    for (uint32_t n = 0; n < s_udp_cap; n++) {
-        if (s_udp_slots[i].port == 0) return s_udp_cap; // empty = not found
-        if (s_udp_slots[i].port == port) return i;
-        i = (i + 1u) & (s_udp_cap - 1u);
-    }
-    return s_udp_cap;
+static udp_table_t* udp_table_alloc(uint32_t cap) {
+    udp_table_t* t = (udp_table_t*)kmalloc(sizeof(udp_table_t) +
+                                            (uint64_t)cap * sizeof(udp_sock_entry_t));
+    if (!t) return NULL;
+    t->cap = cap;
+    t->cnt = 0;
+    __builtin_memset(t->slots, 0, (uint64_t)cap * sizeof(udp_sock_entry_t));
+    return t;
 }
 
-static void udp_ht_raw_insert(udp_sock_entry_t* slots, uint32_t cap,
-                               uint16_t port, socket_t* s) {
-    uint32_t i = udp_hash(port, cap);
-    for (;;) {
-        if (!slots[i].port) { slots[i].port = port; slots[i].sock = s; return; }
-        i = (i + 1u) & (cap - 1u);
-    }
+static void udp_table_raw_insert(udp_table_t* t, uint16_t port, socket_t* s) {
+    uint32_t i = udp_hash(port, t->cap);
+    while (t->slots[i].port) i = (i + 1u) & (t->cap - 1u);
+    t->slots[i].port = port;
+    t->slots[i].sock = s;
+    t->cnt++;
 }
 
-static int udp_ht_grow(void) {
-    uint32_t new_cap = s_udp_cap * 2u;
-    udp_sock_entry_t* ns = (udp_sock_entry_t*)kmalloc(
-        (uint64_t)new_cap * sizeof(udp_sock_entry_t));
-    if (!ns) return -ENOMEM;
-    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(udp_sock_entry_t));
-    for (uint32_t i = 0; i < s_udp_cap; i++)
-        if (s_udp_slots[i].port)
-            udp_ht_raw_insert(ns, new_cap, s_udp_slots[i].port, s_udp_slots[i].sock);
-    kfree(s_udp_slots);
-    s_udp_slots = ns;
-    s_udp_cap   = new_cap;
-    return 0;
-}
+static void udp_table_free_rcu(void* p) { kfree(p); }
 
 static int udp_table_register(uint16_t port, socket_t* s) {
-    udp_ht_ensure_init();
-    if (!s_udp_slots) return -ENOMEM;
-    if (udp_ht_find(port) < s_udp_cap) return -EADDRINUSE;
-    // Grow at 75% load.
-    if (s_udp_count * 4u >= s_udp_cap * 3u)
-        if (udp_ht_grow() < 0) return -ENOMEM;
-    udp_ht_raw_insert(s_udp_slots, s_udp_cap, port, s);
-    s_udp_count++;
+    uint64_t flags = spin_lock_irqsave(&s_udp_wlock);
+    udp_table_t* old = s_udp;
+    uint32_t old_cap = old ? old->cap : 0;
+    uint32_t old_cnt = old ? old->cnt : 0;
+
+    // Duplicate check.
+    if (old) {
+        uint32_t i = udp_hash(port, old_cap);
+        for (uint32_t n = 0; n < old_cap; n++) {
+            if (!old->slots[i].port) break;
+            if (old->slots[i].port == port) {
+                spin_unlock_irqrestore(&s_udp_wlock, flags);
+                return -EADDRINUSE;
+            }
+            i = (i + 1u) & (old_cap - 1u);
+        }
+    }
+
+    uint32_t new_cap = old_cap ? old_cap : UDP_HT_INIT_CAP;
+    if ((old_cnt + 1u) * 4u >= new_cap * 3u)
+        new_cap = old_cap ? old_cap * 2u : UDP_HT_INIT_CAP;
+
+    udp_table_t* neu = udp_table_alloc(new_cap);
+    if (!neu) { spin_unlock_irqrestore(&s_udp_wlock, flags); return -ENOMEM; }
+
+    if (old) {
+        for (uint32_t i = 0; i < old->cap; i++)
+            if (old->slots[i].port)
+                udp_table_raw_insert(neu, old->slots[i].port, old->slots[i].sock);
+    }
+    udp_table_raw_insert(neu, port, s);
+
+    rcu_assign_pointer(s_udp, neu);
+    spin_unlock_irqrestore(&s_udp_wlock, flags);
+    if (old) call_rcu(udp_table_free_rcu, old);
     return 0;
 }
 
 static void udp_table_remove(uint16_t port) {
-    uint32_t idx = udp_ht_find(port);
-    if (idx >= s_udp_cap) return;
-    // Robin Hood deletion: shift subsequent entries back.
-    s_udp_slots[idx].port = 0;
-    s_udp_slots[idx].sock = NULL;
-    uint32_t i = (idx + 1u) & (s_udp_cap - 1u);
-    while (s_udp_slots[i].port) {
-        uint16_t ep = s_udp_slots[i].port;
-        socket_t* es = s_udp_slots[i].sock;
-        s_udp_slots[i].port = 0;
-        s_udp_slots[i].sock = NULL;
-        udp_ht_raw_insert(s_udp_slots, s_udp_cap, ep, es);
-        i = (i + 1u) & (s_udp_cap - 1u);
+    uint64_t flags = spin_lock_irqsave(&s_udp_wlock);
+    udp_table_t* old = s_udp;
+    if (!old) { spin_unlock_irqrestore(&s_udp_wlock, flags); return; }
+
+    udp_table_t* neu = udp_table_alloc(old->cap);
+    if (!neu) { spin_unlock_irqrestore(&s_udp_wlock, flags); return; }
+    int removed = 0;
+    for (uint32_t i = 0; i < old->cap; i++) {
+        if (!old->slots[i].port) continue;
+        if (!removed && old->slots[i].port == port) { removed = 1; continue; }
+        udp_table_raw_insert(neu, old->slots[i].port, old->slots[i].sock);
     }
-    s_udp_count--;
+
+    rcu_assign_pointer(s_udp, neu);
+    spin_unlock_irqrestore(&s_udp_wlock, flags);
+    call_rcu(udp_table_free_rcu, old);
 }
 
+// Reader — must be inside rcu_read_lock().
 static socket_t* udp_table_find(uint16_t port) {
-    uint32_t idx = udp_ht_find(port);
-    return (idx < s_udp_cap) ? s_udp_slots[idx].sock : NULL;
+    udp_table_t* t = rcu_dereference(s_udp);
+    if (!t) return NULL;
+    uint32_t cap = t->cap;
+    uint32_t i = udp_hash(port, cap);
+    for (uint32_t n = 0; n < cap; n++) {
+        if (!t->slots[i].port) return NULL;
+        if (t->slots[i].port == port) return t->slots[i].sock;
+        i = (i + 1u) & (cap - 1u);
+    }
+    return NULL;
 }
 
 // Wake all tasks sitting in poll()/epoll_wait() on a socket fd.
@@ -185,6 +207,22 @@ static int sock_poll(vfs_file_t* self, int events) {
     return 0;
 }
 
+// Deferred socket free — runs after an RCU grace period so any in-flight
+// udp_table_find / socket_deliver_udp reader that observed this socket
+// has dropped out of its reader section.
+static void sock_free_rcu(void* data) {
+    socket_t* s = (socket_t*)data;
+    if (s->type == SOCK_DGRAM) {
+        skbuff_t* skb = s->udp_rx_head;
+        while (skb) {
+            skbuff_t* next = skb->next;
+            skb_free(skb);
+            skb = next;
+        }
+    }
+    kfree(s);
+}
+
 static void sock_close(vfs_file_t* self) {
     socket_t* s = (socket_t*)self->ctx;
     if (!s) { kfree(self); return; }
@@ -194,22 +232,16 @@ static void sock_close(vfs_file_t* self) {
         // a freed vfs_file_t after we let go of it here.
         tcp_pcb_set_file(s->pcb, NULL);
         tcp_close(s->pcb);
-        tcp_pcb_free(s->pcb);
+        tcp_pcb_free(s->pcb);  // call_rcu-deferred inside tcp_pcb_free
         s->pcb = 0;
     }
 
-    if (s->type == SOCK_DGRAM && s->bound) {
+    // Unpublish from the UDP registry first; readers that already observed
+    // the socket are still safe because the final free is deferred below.
+    if (s->type == SOCK_DGRAM && s->bound)
         udp_table_remove(s->local_port);
-        // Free any pending datagrams.
-        skbuff_t* skb = s->udp_rx_head;
-        while (skb) {
-            skbuff_t* next = skb->next;
-            skb_free(skb);
-            skb = next;
-        }
-    }
 
-    kfree(s);
+    call_rcu(sock_free_rcu, s);
     kfree(self);
 }
 
@@ -604,11 +636,20 @@ int socket_setsockopt(vfs_file_t* f, int level, int optname,
 // Enqueues the skb into the matching UDP socket's receive queue.
 
 void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
+    // Reader section covers both the table lookup and the enqueue onto
+    // the socket's RX ring.  If a concurrent sock_close() on `s` fires,
+    // the final teardown is deferred via call_rcu so `s` stays valid
+    // until we rcu_read_unlock.  Nothing in this section sleeps.
+    rcu_read_lock();
     socket_t* s = udp_table_find(dst_port);
-    if (!s) { skb_free(skb); return; }
+    if (!s) { rcu_read_unlock(); skb_free(skb); return; }
 
     // Drop if queue is full — upper bound avoids unbounded memory growth.
-    if (s->udp_rx_count >= UDP_RX_QUEUE_MAX) { skb_free(skb); return; }
+    if (s->udp_rx_count >= UDP_RX_QUEUE_MAX) {
+        rcu_read_unlock();
+        skb_free(skb);
+        return;
+    }
 
     // Enqueue. The skb already has src_ip_be and src_port_be stamped.
     skb->next = 0;
@@ -624,4 +665,5 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     wait_queue_wake_all(&s->waitq);
     // And any task sleeping in poll()/select() on this fd.
     sock_poll_wake(s);
+    rcu_read_unlock();
 }

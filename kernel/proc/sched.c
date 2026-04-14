@@ -232,14 +232,23 @@ _Static_assert(MLFQ_LEVELS == SCHED_MLFQ_LEVELS,
 #define TIDX_TOMB     ((task_t*)1uL)
 
 typedef struct {
-    task_t**  slots;
-    uint32_t  cap;
-    uint32_t  count;      // number of non-empty buckets (not tasks)
+    task_t**   slots;
+    uint32_t   cap;
+    uint32_t   count;     // number of non-empty buckets (not tasks)
+    spinlock_t lock;      // IRQ-safe; guards slots, cap, count, and the
+                          // pg/tg/sid linked-list pointers inside every
+                          // task stored in this table.  Taken by find,
+                          // insert, remove, and by the head walkers in
+                          // signal_send_pgrp / signal_send_group /
+                          // tty_get_ctty (via head accessors).
 } task_idx_t;
 
-static task_idx_t s_pgid_ht;
-static task_idx_t s_tgid_ht;
-static task_idx_t s_sid_ht;
+static task_idx_t s_pgid_ht = { .slots = NULL, .cap = 0, .count = 0,
+                                .lock = SPINLOCK_INIT };
+static task_idx_t s_tgid_ht = { .slots = NULL, .cap = 0, .count = 0,
+                                .lock = SPINLOCK_INIT };
+static task_idx_t s_sid_ht  = { .slots = NULL, .cap = 0, .count = 0,
+                                .lock = SPINLOCK_INIT };
 
 static uint32_t tidx_hash(uint32_t key, uint32_t cap) {
     return (key * 2654435761u) & (cap - 1u);
@@ -315,14 +324,32 @@ static uint32_t keyof_pgid(const task_t* t) { return t->pgid; }
 static uint32_t keyof_tgid(const task_t* t) { return t->tgid; }
 static uint32_t keyof_sid (const task_t* t) { return t->sid;  }
 
-// Generic doubly-linked-list insert at head of the bucket.
-// The offsets of {prev,next} pointers are passed via accessor lambdas.
+// Each generated _insert / _remove takes the table's per-table
+// spinlock via spin_lock_irqsave.  The lock covers the entire
+// operation (probe, resize if needed, doubly-linked-list unlink /
+// relink).  Critical section is bounded by the probe depth + the
+// linked-list unlink — trivially small for realistic process groups.
+//
+// The generated _walk(key, cb, data) holds the lock for the whole
+// walk so concurrent remove/insert can't tear the list.  The callback
+// MUST NOT take any lock that the writers might be waiting on, and
+// MUST be short.  It may call signal_send (which takes rq_lock of
+// the target task's home CPU — a strictly-lower lock in the ordering
+// pgid_ht.lock > rq_lock, so no cycle).
 #define TIDX_DEFINE(name, prev_field, next_field, keyof)                      \
 static void name##_insert(task_t* t) {                                        \
+    uint64_t flags = spin_lock_irqsave(&s_##name.lock);                       \
     tidx_ensure_init(&s_##name);                                              \
-    if (!s_##name.slots) return;                                              \
-    if (s_##name.count * 4u >= s_##name.cap * 3u)                             \
-        if (tidx_grow(&s_##name, keyof) < 0) return;                          \
+    if (!s_##name.slots) {                                                    \
+        spin_unlock_irqrestore(&s_##name.lock, flags);                        \
+        return;                                                               \
+    }                                                                         \
+    if (s_##name.count * 4u >= s_##name.cap * 3u) {                           \
+        if (tidx_grow(&s_##name, keyof) < 0) {                                \
+            spin_unlock_irqrestore(&s_##name.lock, flags);                    \
+            return;                                                           \
+        }                                                                     \
+    }                                                                         \
     uint32_t key = keyof(t);                                                  \
     uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
     if (idx < s_##name.cap) {                                                 \
@@ -335,19 +362,30 @@ static void name##_insert(task_t* t) {                                        \
     } else {                                                                  \
         /* new bucket */                                                      \
         uint32_t slot = tidx_alloc_slot(&s_##name, key);                      \
-        if (slot >= s_##name.cap) return;                                     \
+        if (slot >= s_##name.cap) {                                           \
+            spin_unlock_irqrestore(&s_##name.lock, flags);                    \
+            return;                                                           \
+        }                                                                     \
         t->prev_field = NULL;                                                 \
         t->next_field = NULL;                                                 \
         s_##name.slots[slot] = t;                                             \
         s_##name.count++;                                                     \
     }                                                                         \
+    spin_unlock_irqrestore(&s_##name.lock, flags);                            \
 }                                                                             \
                                                                               \
 static void name##_remove(task_t* t) {                                        \
-    if (!s_##name.slots) return;                                              \
+    uint64_t flags = spin_lock_irqsave(&s_##name.lock);                       \
+    if (!s_##name.slots) {                                                    \
+        spin_unlock_irqrestore(&s_##name.lock, flags);                        \
+        return;                                                               \
+    }                                                                         \
     uint32_t key = keyof(t);                                                  \
     uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
-    if (idx >= s_##name.cap) return;                                          \
+    if (idx >= s_##name.cap) {                                                \
+        spin_unlock_irqrestore(&s_##name.lock, flags);                        \
+        return;                                                               \
+    }                                                                         \
     /* Unlink from doubly-linked list */                                      \
     task_t* prev = t->prev_field;                                             \
     task_t* next = t->next_field;                                             \
@@ -360,12 +398,27 @@ static void name##_remove(task_t* t) {                                        \
     }                                                                         \
     t->prev_field = NULL;                                                     \
     t->next_field = NULL;                                                     \
+    spin_unlock_irqrestore(&s_##name.lock, flags);                            \
 }                                                                             \
                                                                               \
-task_t* name##_head(uint32_t key) {                                           \
-    if (!s_##name.slots) return NULL;                                         \
+void name##_walk(uint32_t key, void (*cb)(task_t*, void*), void* data) {      \
+    uint64_t flags = spin_lock_irqsave(&s_##name.lock);                       \
+    if (!s_##name.slots) {                                                    \
+        spin_unlock_irqrestore(&s_##name.lock, flags);                        \
+        return;                                                               \
+    }                                                                         \
     uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
-    return (idx < s_##name.cap) ? s_##name.slots[idx] : NULL;                 \
+    if (idx >= s_##name.cap) {                                                \
+        spin_unlock_irqrestore(&s_##name.lock, flags);                        \
+        return;                                                               \
+    }                                                                         \
+    task_t* t = s_##name.slots[idx];                                          \
+    while (t) {                                                               \
+        task_t* nx = t->next_field;                                           \
+        cb(t, data);                                                          \
+        t = nx;                                                               \
+    }                                                                         \
+    spin_unlock_irqrestore(&s_##name.lock, flags);                            \
 }
 
 TIDX_DEFINE(pgid_ht, pg_prev,  pg_next,  keyof_pgid)
@@ -396,9 +449,12 @@ void task_idx_pgid_changed (task_t* t) { pgid_ht_insert(t); }
 void task_idx_sid_changing (task_t* t) { sid_ht_remove(t);  }
 void task_idx_sid_changed  (task_t* t) { sid_ht_insert(t);  }
 
-task_t* task_idx_pgid_head(uint32_t pgid) { return pgid_ht_head(pgid); }
-task_t* task_idx_tgid_head(uint32_t tgid) { return tgid_ht_head(tgid); }
-task_t* task_idx_sid_head (uint32_t sid)  { return sid_ht_head(sid);   }
+void task_idx_pgid_walk(uint32_t pgid, void (*cb)(task_t*, void*), void* data) {
+    pgid_ht_walk(pgid, cb, data);
+}
+void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data) {
+    tgid_ht_walk(tgid, cb, data);
+}
 
 // Idle process — never put on a queue, runs when all queues are empty.
 static uint8_t      s_idle_stack[PAGE_SIZE];

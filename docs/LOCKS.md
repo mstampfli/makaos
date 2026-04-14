@@ -219,6 +219,83 @@ template. This list is for tracking the *plan*, not the code.
 
 ---
 
+## Phase 6 — RCU-ized global tables (landed)
+
+All of the following are **writer-only** spinlocks.  The read path is
+lock-free (`rcu_read_lock` = preempt_disable + plain pointer load +
+hash walk).  Writers acquire the lock to serialise against other
+writers, build a fresh table via copy-on-write, publish the new
+pointer via `rcu_assign_pointer`, and hand the old table to `call_rcu`
+for deferred free.  Mutations are rare (O(sockets)) so the O(cap) COW
+cost is amortised; the reader hot path is the only thing that matters.
+
+### `s_arp_wlock` — `kernel/net/arp.c`
+Guards the `s_arp` RCU-published table pointer.  Writer path runs
+only inside `arp_recv` (NIC softirq).  `arp_lookup`, called on every
+outgoing packet, does **zero atomics** — just `rcu_read_lock`, hash
+walk, `memcpy(mac, 6)`, `rcu_read_unlock`.
+
+### `s_udp_wlock` — `kernel/net/socket.c`
+Guards the `s_udp` port table pointer.  Writers are
+`udp_table_register` / `udp_table_remove`.  `udp_table_find` runs
+inside `rcu_read_lock()` from `socket_deliver_udp` on every UDP
+packet.  `socket_t` teardown is `call_rcu`-deferred via
+`sock_free_rcu` so the reader's RX enqueue cannot race a close.
+
+### `s_unix_ns_wlock` — `kernel/net/unix_sock.c`
+Guards the `s_unix_ns` namespace table pointer.  `unix_sock_close`
+defers the full teardown (peer unlink, backlog drain, dgram drain,
+ancillary fd close, struct free) via `call_rcu(unix_sock_free_rcu)`,
+so a concurrent `connect`/`sendto` inside `rcu_read_lock()` sees a
+consistent peer until it exits the reader section.
+
+### `s_namespace_lock` — `kernel/mm/shmem.c`
+Guards the `s_namespace` table pointer.  `shmem_ns_find` walks
+lock-free inside `rcu_read_lock()` and bumps the found object's
+refcount via `shmem_tryget` — a CAS loop that increments only if the
+count is currently > 0, so it cannot resurrect a freed object.
+`shmem_t.refcount` is now atomic.  Final free runs from
+`shmem_free_rcu` after a grace period.
+
+### `s_pcb_wlock` — `kernel/net/tcp.c`
+Guards the `s_pcb_head` linked-list head and every `->next` link.
+`tcp_recv` and `tcp_timer_tick` walk the list inside `rcu_read_lock()`
+with `rcu_dereference` on each `->next`, which keeps the pcbs alive
+via the `call_rcu`-deferred `tcp_pcb_free_rcu` path.  `tcp_pcb_alloc`
+publishes at the head via `rcu_assign_pointer`.
+
+### `task_idx_t.lock` (×3) — `kernel/proc/sched.c`
+One IRQ-safe spinlock per `task_idx_t` (pgid, tgid, sid).  Held on
+every `task_idx_*_insert` / `task_idx_*_remove` / `task_idx_*_walk`.
+Signal delivery (`signal_send_group` / `signal_send_pgrp`) walks the
+bucket list inside the table lock so the callback sees a consistent
+list.  Not RCU because signals are cold-path and the bucket walk +
+per-task callback is already microsecond scale.  The per-bucket
+doubly-linked list pointers in `task_t` (`pg_prev/pg_next`,
+`tg_prev/tg_next`, `sid_prev/sid_next`) are also covered by these
+locks.
+
+### `epoll_state_t.lock` (per-fd) — `kernel/syscall/syscall.c`
+Guards the `slots[]` / `cap` / `count` fields of an individual epoll
+fd.  **Not IRQ-off**: the wake callback `epoll_wake_func` only touches
+`has_ready` + `wq` and never takes this lock, so the watched fd's
+waitq can fire from IRQ context without serialising on epoll.
+`epoll_wait` collects matching events into a temporary kernel buffer
+under the lock, then releases the lock before `copy_to_user` so a
+user-page fault never happens with a spinlock held.
+
+### RCU-deferred free paths (not locks, but part of Phase 6)
+
+- `task_destroy` → `call_rcu(task_free_rcu)` frees kstack, mm,
+  files, cwd, unveil, and the `task_t` itself after a grace period.
+- `tcp_pcb_free` → `call_rcu(tcp_pcb_free_rcu)` (txbuf, rxbuf, pcb).
+- `sock_close` → `call_rcu(sock_free_rcu)` (UDP RX queue + socket).
+- `unix_sock_close` → `call_rcu(unix_sock_free_rcu)` (full teardown).
+- `shmem_unref` on last ref → `call_rcu(shmem_free_rcu)` (pages +
+  struct).
+
+---
+
 ## Running count
 
 | Phase | Spinlocks added | Total |
@@ -228,10 +305,10 @@ template. This list is for tracking the *plan*, not the code.
 | 3 | 0 (all lock-free) | 1 |
 | 4 | 1 global g_pmm_lock (temporary until redesign lands — see PHASE4_REDESIGN.md) | 2 |
 | 5 | 1 per-CPU rq_lock (MAX_CPUS=64 instances but 1 design entry) | 3 |
-| 6 | 3 (pgid/tgid/sid writers) + handful (signal/mount/route) | ~7 |
-| 7 | 0 (seqlocks) | ~7 |
-| 8 | per-object mutexes (not global) | ~7 + per-object |
-| 9 | 0 | ~7 |
+| 6 | 8 writer-only (arp / udp / unix-ns / shmem-ns / tcp-pcb / 3×task_idx) + 1 epoll-per-fd | ~11 |
+| 7 | 0 (seqlocks) | ~11 |
+| 8 | per-object mutexes (not global) | ~11 + per-object |
+| 9 | 0 | ~11 |
 
 After Phase 4 proper lands (post-SMP, per-CPU magazines), g_pmm_lock
 collapses to a rarely-taken depot lock and doesn't change the total

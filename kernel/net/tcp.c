@@ -10,6 +10,8 @@
 #include "errno.h"
 #include "vfs.h"
 #include "syscall.h"  // POLLIN / POLLOUT / POLLHUP / POLLERR
+#include "smp.h"
+#include "rcu.h"
 
 // ── TCP constants ─────────────────────────────────────────────────────────
 #define TCP_RTO_NS        1000000000ULL   // retransmit timeout: 1 second
@@ -90,7 +92,14 @@ struct tcp_pcb {
 // Singly-linked list of all live PCBs.  Insertion is O(1); lookup is O(n)
 // in the number of open connections — same complexity as before but with no
 // fixed cap.  Each PCB is individually kmalloc'd.
-static tcp_pcb_t* s_pcb_head = NULL;
+// RCU-protected singly-linked list of live PCBs.  Readers (pcb_find,
+// tcp_timer_tick) walk under rcu_read_lock() with zero synchronization.
+// Writers serialise on s_pcb_wlock for insert/remove of the ->next link,
+// and tcp_pcb_free defers the actual teardown to call_rcu so a concurrent
+// reader that still holds a pointer to the pcb sees a valid object until
+// its rcu_read_unlock.
+static tcp_pcb_t* s_pcb_head   = NULL;
+static spinlock_t s_pcb_wlock  = SPINLOCK_INIT;
 
 // Ephemeral port counter.
 static uint16_t s_eph_port = 49152u;
@@ -216,11 +225,16 @@ static void tcp_send_rst(uint32_t src_ip, uint16_t src_port,
 
 // ── PCB lookup ────────────────────────────────────────────────────────────
 
+// Caller must be inside rcu_read_lock() and stay there for as long as it
+// uses the returned pcb.  That keeps the pcb alive even if another CPU
+// calls tcp_pcb_free — the actual free is deferred via call_rcu until
+// every pre-existing reader has dropped out.
 static tcp_pcb_t* pcb_find(uint32_t local_ip, uint16_t local_port,
                              uint32_t remote_ip, uint16_t remote_port) {
     (void)local_ip;
     tcp_pcb_t* listener = NULL;
-    for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+    for (tcp_pcb_t* p = rcu_dereference(s_pcb_head); p;
+                    p = rcu_dereference(p->next)) {
         // Exact match (ESTABLISHED / SYN_RCVD / etc).
         if (p->local_port  == local_port  &&
             p->remote_port == remote_port &&
@@ -267,9 +281,14 @@ void tcp_recv(skbuff_t* skb) {
     uint8_t* data     = (uint8_t*)skb->data + hlen;
     uint32_t our_ip   = net_our_ip();
 
+    // RCU reader section covers pcb_find and every dereference below.
+    // call_rcu in tcp_pcb_free keeps the pcb alive until we rcu_read_unlock,
+    // which happens at the single exit at the bottom of this function.
+    rcu_read_lock();
     tcp_pcb_t* pcb = pcb_find(our_ip, dst_port, skb->src_ip_be, src_port);
 
     if (!pcb) {
+        rcu_read_unlock();
         // No PCB — send RST unless the incoming segment is already a RST.
         if (!(flags & TCP_RST))
             tcp_send_rst(our_ip, dst_port, skb->src_ip_be, src_port,
@@ -286,6 +305,7 @@ void tcp_recv(skbuff_t* skb) {
             pcb->state = TCP_CLOSED;
             pcb_wake(pcb);
         }
+        rcu_read_unlock();
         skb_free(skb);
         return;
     }
@@ -424,6 +444,7 @@ void tcp_recv(skbuff_t* skb) {
         break;
     }
 
+    rcu_read_unlock();
     skb_free(skb);
 }
 
@@ -431,7 +452,12 @@ void tcp_recv(skbuff_t* skb) {
 
 void tcp_timer_tick(void) {
     uint64_t now = tsc_read_ns();
-    for (tcp_pcb_t* pcb = s_pcb_head; pcb; pcb = pcb->next) {
+    // RCU reader section: a concurrent tcp_pcb_free can unlink a pcb we're
+    // walking, but call_rcu defers the actual free until after we drop the
+    // reader section, so every pcb we touch stays valid.
+    rcu_read_lock();
+    for (tcp_pcb_t* pcb = rcu_dereference(s_pcb_head); pcb;
+                    pcb = rcu_dereference(pcb->next)) {
 
         // Retransmit timeout.
         if (pcb->rto_deadline && now >= pcb->rto_deadline &&
@@ -457,6 +483,7 @@ void tcp_timer_tick(void) {
             pcb_wake(pcb);
         }
     }
+    rcu_read_unlock();
 }
 
 // ── Public PCB management ─────────────────────────────────────────────────
@@ -481,29 +508,51 @@ tcp_pcb_t* tcp_pcb_alloc(uint16_t lport) {
         return NULL;
     }
 
-    // Insert at head of live PCB list.
-    p->next    = s_pcb_head;
-    s_pcb_head = p;
+    // Publish the new pcb at the head of the RCU-protected list.  Readers
+    // that have already loaded s_pcb_head see their old snapshot; readers
+    // that load after rcu_assign_pointer see the new head.  Either is
+    // correct — a new pcb has no traffic yet.
+    uint64_t flags = spin_lock_irqsave(&s_pcb_wlock);
+    p->next = s_pcb_head;
+    rcu_assign_pointer(s_pcb_head, p);
+    spin_unlock_irqrestore(&s_pcb_wlock, flags);
     serial_puts_dbg("[tcp] pcb_alloc port=");
     serial_hex_dbg((uint64_t)lport);
     return p;
 }
 
-void tcp_pcb_free(tcp_pcb_t* pcb) {
-    if (!pcb) return;
-    // Remove from linked list.
-    if (s_pcb_head == pcb) {
-        s_pcb_head = pcb->next;
-    } else {
-        for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
-            if (p->next == pcb) { p->next = pcb->next; break; }
-        }
-    }
+// Deferred teardown: runs after a full RCU grace period, at which point
+// no pcb_find / tcp_recv / tcp_timer_tick reader still holds a pointer
+// to this pcb.  Safe to free the buffers and the pcb itself.
+static void tcp_pcb_free_rcu(void* data) {
+    tcp_pcb_t* pcb = (tcp_pcb_t*)data;
     if (pcb->txbuf) { kfree(pcb->txbuf); pcb->txbuf = NULL; }
     if (pcb->rxbuf) { kfree(pcb->rxbuf); pcb->rxbuf = NULL; }
     serial_puts_dbg("[tcp] pcb_free port=");
     serial_hex_dbg((uint64_t)pcb->local_port);
     kfree(pcb);
+}
+
+void tcp_pcb_free(tcp_pcb_t* pcb) {
+    if (!pcb) return;
+    // Unlink from the RCU-protected list.  Writer-side exclusion via
+    // s_pcb_wlock; the ->next pointer updates are plain stores because
+    // readers walk via rcu_dereference which on x86 is a plain load.
+    uint64_t flags = spin_lock_irqsave(&s_pcb_wlock);
+    if (s_pcb_head == pcb) {
+        rcu_assign_pointer(s_pcb_head, pcb->next);
+    } else {
+        for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+            if (p->next == pcb) {
+                rcu_assign_pointer(p->next, pcb->next);
+                break;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&s_pcb_wlock, flags);
+    // Defer the actual free until every in-flight reader has dropped
+    // its reference.
+    call_rcu(tcp_pcb_free_rcu, pcb);
 }
 
 int tcp_connect(tcp_pcb_t* pcb, uint32_t dst_ip_be, uint16_t dst_port) {

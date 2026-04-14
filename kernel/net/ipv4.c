@@ -150,8 +150,8 @@ int ipv4_send_ex(skbuff_t* skb, uint32_t src_ip_be, uint32_t dst_ip_be,
         next_hop = net_gateway_ip();
     if (next_hop == 0) return -1;  // no route
 
-    const uint8_t* dst_mac = arp_lookup(next_hop);
-    if (!dst_mac) {
+    uint8_t dst_mac[ETH_ALEN];
+    if (!arp_lookup(next_hop, dst_mac)) {
         // ARP request sent; caller should retry.
         return -1;
     }

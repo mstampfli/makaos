@@ -5,6 +5,8 @@
 #include "skbuff.h"
 #include "common.h"
 #include "kheap.h"
+#include "smp.h"
+#include "rcu.h"
 
 // ── ARP packet layout (RFC 826, §3) ──────────────────────────────────────
 typedef struct __attribute__((packed)) {
@@ -24,9 +26,18 @@ typedef struct __attribute__((packed)) {
 #define ARP_OP_REQUEST 1u
 #define ARP_OP_REPLY   2u
 
-// ── ARP cache ─────────────────────────────────────────────────────────────
-// Open-addressing hash table keyed by ip_be.  Grows at 75% load; no fixed
-// cap.  ip_be == 0 means empty slot (0.0.0.0 is never a real host address).
+// ── ARP cache (RCU-protected) ────────────────────────────────────────────
+// Open-addressing hash table keyed by ip_be.  The whole table is a single
+// object (arp_table_t) published via rcu_assign_pointer.  Readers take
+// zero locks: rcu_read_lock() + walk + memcpy(6) of the MAC into a caller
+// buffer + rcu_read_unlock().  Zero atomics, zero cache-line bouncing on
+// the outgoing-packet hot path.
+//
+// Writers (arp_recv only) serialise against each other under s_arp_wlock,
+// build a new table via copy-on-write, rcu_assign_pointer the new one in,
+// and call_rcu the old one for deferred free.  This makes inserts
+// O(cap) but insert is a control-plane event (once per new host) so the
+// cost is amortised away.
 
 #define ARP_HT_INIT_CAP 32u
 
@@ -35,76 +46,81 @@ typedef struct {
     uint8_t  mac[ETH_ALEN];
 } arp_entry_t;
 
-static arp_entry_t* s_cache     = NULL;
-static uint32_t     s_cache_cap = 0;
-static uint32_t     s_cache_cnt = 0;
+typedef struct {
+    uint32_t    cap;      // power of two
+    uint32_t    cnt;
+    arp_entry_t slots[];  // flexible
+} arp_table_t;
+
+static arp_table_t* s_arp        = NULL;   // RCU-protected
+static spinlock_t   s_arp_wlock  = SPINLOCK_INIT;
 
 static uint32_t arp_hash(uint32_t ip_be, uint32_t cap) {
     return (ip_be * 2654435761u) & (cap - 1u);
 }
 
-static void arp_cache_ensure_init(void) {
-    if (s_cache) return;
-    s_cache = (arp_entry_t*)kmalloc((uint64_t)ARP_HT_INIT_CAP * sizeof(arp_entry_t));
-    if (!s_cache) return;
-    __builtin_memset(s_cache, 0,
-                      (uint64_t)ARP_HT_INIT_CAP * sizeof(arp_entry_t));
-    s_cache_cap = ARP_HT_INIT_CAP;
+static arp_table_t* arp_table_alloc(uint32_t cap) {
+    arp_table_t* t = (arp_table_t*)kmalloc(sizeof(arp_table_t) +
+                                           (uint64_t)cap * sizeof(arp_entry_t));
+    if (!t) return NULL;
+    t->cap = cap;
+    t->cnt = 0;
+    __builtin_memset(t->slots, 0, (uint64_t)cap * sizeof(arp_entry_t));
+    return t;
 }
 
-// Find slot for ip_be, or cap if not present.
-static uint32_t arp_cache_find(uint32_t ip_be) {
-    if (!s_cache) return s_cache_cap;
-    uint32_t i = arp_hash(ip_be, s_cache_cap);
-    for (uint32_t n = 0; n < s_cache_cap; n++) {
-        if (!s_cache[i].ip_be) return s_cache_cap;
-        if (s_cache[i].ip_be == ip_be) return i;
-        i = (i + 1u) & (s_cache_cap - 1u);
-    }
-    return s_cache_cap;
-}
-
-static void arp_cache_raw_insert(arp_entry_t* slots, uint32_t cap,
-                                  uint32_t ip_be, const uint8_t* mac) {
-    uint32_t i = arp_hash(ip_be, cap);
+static void arp_table_raw_insert(arp_table_t* t, uint32_t ip_be, const uint8_t* mac) {
+    uint32_t i = arp_hash(ip_be, t->cap);
     for (;;) {
-        if (!slots[i].ip_be) {
-            slots[i].ip_be = ip_be;
-            __builtin_memcpy(slots[i].mac, mac, ETH_ALEN);
+        if (!t->slots[i].ip_be) {
+            t->slots[i].ip_be = ip_be;
+            __builtin_memcpy(t->slots[i].mac, mac, ETH_ALEN);
+            t->cnt++;
             return;
         }
-        i = (i + 1u) & (cap - 1u);
+        if (t->slots[i].ip_be == ip_be) {
+            __builtin_memcpy(t->slots[i].mac, mac, ETH_ALEN);
+            return;
+        }
+        i = (i + 1u) & (t->cap - 1u);
     }
 }
 
-static int arp_cache_grow(void) {
-    uint32_t new_cap = s_cache_cap * 2u;
-    arp_entry_t* ns = (arp_entry_t*)kmalloc((uint64_t)new_cap * sizeof(arp_entry_t));
-    if (!ns) return -1;
-    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(arp_entry_t));
-    for (uint32_t i = 0; i < s_cache_cap; i++)
-        if (s_cache[i].ip_be)
-            arp_cache_raw_insert(ns, new_cap, s_cache[i].ip_be, s_cache[i].mac);
-    kfree(s_cache);
-    s_cache     = ns;
-    s_cache_cap = new_cap;
-    return 0;
+static void arp_table_free_rcu(void* p) { kfree(p); }
+
+// Writer: called from arp_recv only.  Must hold s_arp_wlock.
+// Builds a fresh table, copies existing entries (or grows), inserts the
+// new mapping, publishes via rcu_assign_pointer, defers the old free.
+static void cache_insert_locked(uint32_t ip_be, const uint8_t* mac) {
+    arp_table_t* old = s_arp;
+    uint32_t old_cap = old ? old->cap : 0;
+    uint32_t old_cnt = old ? old->cnt : 0;
+
+    // Decide target capacity: init or 75%-load grow.
+    uint32_t new_cap = old_cap ? old_cap : ARP_HT_INIT_CAP;
+    if ((old_cnt + 1u) * 4u >= new_cap * 3u) new_cap = old_cap ? old_cap * 2u : ARP_HT_INIT_CAP;
+
+    arp_table_t* neu = arp_table_alloc(new_cap);
+    if (!neu) return;
+
+    // Copy existing entries.
+    if (old) {
+        for (uint32_t i = 0; i < old->cap; i++)
+            if (old->slots[i].ip_be)
+                arp_table_raw_insert(neu, old->slots[i].ip_be, old->slots[i].mac);
+    }
+    // Insert (or overwrite) the new mapping.
+    arp_table_raw_insert(neu, ip_be, mac);
+
+    rcu_assign_pointer(s_arp, neu);
+    if (old) call_rcu(arp_table_free_rcu, old);
 }
 
 static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
     if (!ip_be) return;
-    arp_cache_ensure_init();
-    if (!s_cache) return;
-    uint32_t idx = arp_cache_find(ip_be);
-    if (idx < s_cache_cap) {
-        // Update existing entry.
-        __builtin_memcpy(s_cache[idx].mac, mac, ETH_ALEN);
-        return;
-    }
-    if (s_cache_cnt * 4u >= s_cache_cap * 3u)
-        if (arp_cache_grow() < 0) return;
-    arp_cache_raw_insert(s_cache, s_cache_cap, ip_be, mac);
-    s_cache_cnt++;
+    uint64_t flags = spin_lock_irqsave(&s_arp_wlock);
+    cache_insert_locked(ip_be, mac);
+    spin_unlock_irqrestore(&s_arp_wlock, flags);
 }
 
 // ── ARP send helpers ──────────────────────────────────────────────────────
@@ -161,13 +177,35 @@ void arp_recv(skbuff_t* skb) {
     skb_free(skb);
 }
 
-const uint8_t* arp_lookup(uint32_t ip_be) {
-    uint32_t idx = arp_cache_find(ip_be);
-    if (idx < s_cache_cap) return s_cache[idx].mac;
-    // Miss: send a broadcast request.  Caller must retry.
+int arp_lookup(uint32_t ip_be, uint8_t out_mac[ETH_ALEN]) {
+    // RCU reader fast path — zero atomics, just preempt_disable and a
+    // pointer load.  The reader takes a local copy of the 6-byte MAC,
+    // so the table object can be reclaimed as soon as the grace period
+    // elapses.
+    int hit = 0;
+    rcu_read_lock();
+    arp_table_t* t = rcu_dereference(s_arp);
+    if (t) {
+        uint32_t cap = t->cap;
+        uint32_t i = arp_hash(ip_be, cap);
+        for (uint32_t n = 0; n < cap; n++) {
+            uint32_t k = t->slots[i].ip_be;
+            if (!k) break;
+            if (k == ip_be) {
+                __builtin_memcpy(out_mac, t->slots[i].mac, ETH_ALEN);
+                hit = 1;
+                break;
+            }
+            i = (i + 1u) & (cap - 1u);
+        }
+    }
+    rcu_read_unlock();
+    if (hit) return 1;
+
+    // Miss: broadcast request, caller retries on the next send.
     uint8_t zero[ETH_ALEN] = {0};
     arp_send(ARP_OP_REQUEST, zero, ip_be, eth_broadcast);
-    return NULL;
+    return 0;
 }
 
 void arp_announce(void) {

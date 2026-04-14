@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include "errno.h"
+#include "smp.h"
 #include "pipe.h"
 #include "common.h"
 #include "sched.h"
@@ -1834,15 +1835,20 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
     int exclusive   = !!(oflags & O_EXCL);
     int truncating  = !!(oflags & O_TRUNC);
 
+    // shmem_ns_find returns with an extra refcount so the object cannot
+    // be freed under us while we examine it.  On success paths we drop
+    // that extra reference right before returning; on the newly-created
+    // branch there is no extra reference to drop.
     shmem_t* shm = shmem_ns_find(iname);
+    int found_extra_ref = (shm != NULL);
 
     if (shm) {
         // Object already exists.
-        if (creating && exclusive) return (uint64_t)-EEXIST;
+        if (creating && exclusive) { shmem_unref(shm); return (uint64_t)-EEXIST; }
 
         // Permission check.
         int rc = shmem_check_access(shm, &g_current->cred, access_mode);
-        if (rc) return (uint64_t)rc;
+        if (rc) { shmem_unref(shm); return (uint64_t)rc; }
 
         // O_TRUNC: resize to 0 (only if writable).
         if (truncating && (access_mode == 1 || access_mode == 2))
@@ -1875,9 +1881,13 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
         }
     }
 
-    // Create the fd wrapping this shmem object.
+    // Create the fd wrapping this shmem object.  fd_create bumps the
+    // refcount to claim its own reference.
     vfs_file_t* f = shmem_fd_create(shm);
-    if (!f) return (uint64_t)-ENOMEM;
+    if (!f) {
+        if (found_extra_ref) shmem_unref(shm);
+        return (uint64_t)-ENOMEM;
+    }
 
     // Allocate an fd slot.
     task_files_t* files = g_current->files_shared;
@@ -1886,6 +1896,7 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
             files->fd_table[i] = f;
             files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
             serial_puts_dbg("[shm_open] fd="); serial_hex_dbg((uint64_t)i);
+            if (found_extra_ref) shmem_unref(shm);
             return i;
         }
     }
@@ -1895,11 +1906,13 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
             if (!files->fd_table[i]) {
                 files->fd_table[i] = f;
                 files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+                if (found_extra_ref) shmem_unref(shm);
                 return i;
             }
         }
     }
     vfs_close(f);
+    if (found_extra_ref) shmem_unref(shm);
     return (uint64_t)-EMFILE;
 }
 
@@ -1921,18 +1934,24 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
     const char* iname = name + 1;
     if (!iname[0]) return (uint64_t)-EINVAL;
 
+    // shmem_ns_find returns with refcount +1.  We drop that extra
+    // reference at the end along with the namespace's implicit ref.
     shmem_t* shm = shmem_ns_find(iname);
     if (!shm) return (uint64_t)-ENOENT;
 
     // Permission check: only owner or root can unlink.
-    if (g_current->cred.euid != 0 && g_current->cred.euid != shm->uid)
+    if (g_current->cred.euid != 0 && g_current->cred.euid != shm->uid) {
+        shmem_unref(shm);
         return (uint64_t)-EACCES;
+    }
 
     // Remove from namespace (makes it invisible for future shm_open calls).
     // The shmem_t itself survives if there are still fd/VMA references.
     shmem_ns_remove(shm);
     shm->name[0] = '\0'; // prevent double-remove in shmem_unref
 
+    // Drop our shmem_ns_find refcount (the "tryget" +1).
+    shmem_unref(shm);
     // Drop the namespace's implicit reference.  If there are no fd/VMA
     // references, this will free the object immediately.
     shmem_unref(shm);
@@ -3252,6 +3271,15 @@ typedef struct {
     uint32_t        count;  // live watches
     wait_queue_t    wq;     // sleeping tasks
     int             has_ready;
+    // Writer lock: serialises epoll_ctl against epoll_wait scans and
+    // against other concurrent epoll_ctl calls on the same epfd.  NOT
+    // IRQ-off: the wake callback (epoll_wake_func, which can fire from
+    // an IRQ handler via a watched fd's waitq) only touches has_ready +
+    // wq and never takes this lock, so there is no IRQ↔lock ordering
+    // problem.  Keeping IRQs enabled means we can safely copy_to_user,
+    // call f->poll, or kmalloc while holding it (though we still avoid
+    // copy_to_user under the lock to minimise hold time).
+    spinlock_t      lock;
 } epoll_state_t;
 
 // Hash table helpers.  Key = fd (int32_t, always ≥ 0).
@@ -3366,6 +3394,7 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     state->cap       = EPOLL_HT_INIT_CAP;
     state->count     = 0;
     state->has_ready = 0;
+    spin_lock_init(&state->lock);
     wait_queue_init(&state->wq);
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
@@ -3409,18 +3438,20 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     int32_t tfd = (int32_t)fd;
     task_files_t* files = g_current->files_shared;
 
+    spin_lock(&state->lock);
+    uint64_t ret;
     switch (op) {
     case EPOLL_CTL_ADD: {
-        if (ep_find(state, tfd) < state->cap) return (uint64_t)-EEXIST;
+        if (ep_find(state, tfd) < state->cap) { ret = (uint64_t)-EEXIST; break; }
         vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
                          ? files->fd_table[tfd] : NULL;
-        if (!wf) return (uint64_t)-EBADF;
+        if (!wf) { ret = (uint64_t)-EBADF; break; }
         // Grow if at 75% load.
         if (state->count * 4u >= state->cap * 3u) {
-            if (ep_grow(state, state->cap * 2u) < 0) return (uint64_t)-ENOMEM;
+            if (ep_grow(state, state->cap * 2u) < 0) { ret = (uint64_t)-ENOMEM; break; }
         }
         epoll_watch_t* w = (epoll_watch_t*)kmalloc(sizeof(epoll_watch_t));
-        if (!w) return (uint64_t)-ENOMEM;
+        if (!w) { ret = (uint64_t)-ENOMEM; break; }
         w->fd         = tfd;
         w->events     = ev.events;
         w->data       = ev.data;
@@ -3430,11 +3461,12 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         state->count++;
         serial_puts_dbg("[epoll] ADD fd=");
         serial_hex_dbg((uint64_t)(uint32_t)tfd);
-        return 0;
+        ret = 0;
+        break;
     }
     case EPOLL_CTL_DEL: {
         uint32_t idx = ep_find(state, tfd);
-        if (idx >= state->cap) return (uint64_t)-ENOENT;
+        if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
         vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
                          ? files->fd_table[tfd] : NULL;
@@ -3444,11 +3476,12 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         kfree(w);
         serial_puts_dbg("[epoll] DEL fd=");
         serial_hex_dbg((uint64_t)(uint32_t)tfd);
-        return 0;
+        ret = 0;
+        break;
     }
     case EPOLL_CTL_MOD: {
         uint32_t idx = ep_find(state, tfd);
-        if (idx >= state->cap) return (uint64_t)-ENOENT;
+        if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
         vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
                          ? files->fd_table[tfd] : NULL;
@@ -3456,11 +3489,15 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         w->events = ev.events;
         w->data   = ev.data;
         if (wf) epoll_watch_register(state, w, wf);
-        return 0;
+        ret = 0;
+        break;
     }
     default:
-        return (uint64_t)-EINVAL;
+        ret = (uint64_t)-EINVAL;
+        break;
     }
+    spin_unlock(&state->lock);
+    return ret;
 }
 
 // epoll_wait(epfd, events_ptr, maxevents, timeout_ms) → count or -errno
@@ -3482,11 +3519,21 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     uint64_t deadline   = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // Collect ready events into a temporary kernel buffer under state->lock,
+    // then release the lock before copy_to_user.  This keeps the lock hold
+    // time bounded to a pure in-memory scan and avoids running copy_to_user
+    // (which may fault) with a spinlock held.  maxevents is capped to 1024
+    // above, so the allocation is at most 16 KiB.
+    epoll_event_t* kevents = (epoll_event_t*)kmalloc(
+        (uint64_t)maxevents * sizeof(epoll_event_t));
+    if (!kevents) return (uint64_t)-ENOMEM;
+
     // One task_we_t on the epoll's own wq — stack allocated, zero per-wakeup alloc.
     task_we_t task_we;
 
     do {
         count = 0;
+        spin_lock(&state->lock);
         for (uint32_t i = 0; i < state->cap && (uint64_t)count < maxevents; i++) {
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
@@ -3495,11 +3542,8 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
                             ? files->fd_table[wfd] : NULL;
             if (!f) {
-                epoll_event_t out;
-                out.events = EPOLLERR | EPOLLHUP;
-                out.data   = w->data;
-                if (copy_to_user(uevents + count, &out, sizeof(out)) != 0)
-                    return (uint64_t)-EFAULT;
+                kevents[count].events = EPOLLERR | EPOLLHUP;
+                kevents[count].data   = w->data;
                 count++;
                 continue;
             }
@@ -3516,14 +3560,12 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             }
 
             if (rev) {
-                epoll_event_t out;
-                out.events = rev;
-                out.data   = w->data;
-                if (copy_to_user(uevents + count, &out, sizeof(out)) != 0)
-                    return (uint64_t)-EFAULT;
+                kevents[count].events = rev;
+                kevents[count].data   = w->data;
                 count++;
             }
         }
+        spin_unlock(&state->lock);
 
         if (count > 0) break;
         if (timeout_ms == 0) break;
@@ -3538,6 +3580,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
         // Re-check after registering to close the race window.
         int ep_recheck = state->has_ready;
         if (!ep_recheck) {
+            spin_lock(&state->lock);
             for (uint32_t i = 0; i < state->cap && !ep_recheck; i++) {
                 epoll_watch_t* w = state->slots[i];
                 if (!w || w == EPOLL_DELETED) continue;
@@ -3550,6 +3593,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
                 if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) ep_recheck = 1;
                 if (f->poll(f, POLLHUP))                      ep_recheck = 1;
             }
+            spin_unlock(&state->lock);
         }
         if (!ep_recheck) {
             g_current->sleep_until_ns = infinite ? 0 : deadline;
@@ -3561,6 +3605,15 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
 
     } while (infinite || tsc_read_ns() < deadline);
 
+    // Copy the collected events out to user space, outside of any lock.
+    if (count > 0) {
+        if (copy_to_user(uevents, kevents,
+                          (uint64_t)count * sizeof(epoll_event_t)) != 0) {
+            kfree(kevents);
+            return (uint64_t)-EFAULT;
+        }
+    }
+    kfree(kevents);
     return (uint64_t)(int64_t)count;
 }
 

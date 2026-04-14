@@ -5,6 +5,7 @@
 #include "kheap.h"
 #include "vfs.h"
 #include "sched.h"
+#include "rcu.h"
 
 // ── task_mm_t helpers ─────────────────────────────────────────────────────
 
@@ -257,21 +258,51 @@ mm_t* task_get_mm(void* task) {
 }
 
 // ── task_destroy ──────────────────────────────────────────────────────────
-void task_destroy(task_t* t) {
-    if (!t) return;
-    // Remove from the pid hash table here — zombies STAY in pid_ht
-    // until they're reaped and freed, so every specific-pid lookup
-    // (kill, waitpid, setpgid, /proc/[pid]) is O(1) regardless of
-    // whether the task is alive or a zombie.  Only the final destroy
-    // removes the entry.
-    pid_ht_remove(t);
-    pid_free(t->pid);
+//
+// Two-phase destroy to make task_t lifecycle SMP-safe:
+//
+// 1. Synchronous phase:
+//      - Remove from pid_ht (readers that hold an already-loaded
+//        pointer keep it valid; new lookups return NULL).
+//      - Free the pid number so it can be reused.
+//    These two steps must happen BEFORE we defer anything — they
+//    release resources other subsystems might be waiting for.
+//
+// 2. Deferred phase (via call_rcu):
+//      - Release kstack, mm, files, cwd, unveil, then kfree(t).
+//    All of these touch memory that concurrent RCU readers might
+//    still be dereferencing (e.g. signal_send_pgrp walking a task
+//    list, reading t->sigstate).  Deferring until the next RCU
+//    grace period guarantees every reader that started before
+//    pid_ht_remove has finished.
+//
+// On UP, synchronize_rcu is a no-op so call_rcu is effectively
+// synchronous with a function-call overhead.  Under SMP the task
+// survives until every CPU has passed through a quiescent state.
+
+static void task_free_rcu(void* data) {
+    task_t* t = (task_t*)data;
     kstack_free(t->kstack_top);
     task_mm_release(t->mm_shared);
     task_files_release(t->files_shared);
     kfree(t->cwd);
     unveil_free(&t->unveil);
     kfree(t);
+}
+
+void task_destroy(task_t* t) {
+    if (!t) return;
+    // Remove from pid_ht first.  Zombies STAY in pid_ht until this
+    // final destroy, so every specific-pid lookup is O(1) for
+    // zombies AND living tasks.
+    pid_ht_remove(t);
+    pid_free(t->pid);
+
+    // Defer the rest of the free via RCU.  Concurrent readers in
+    // pid_ht_find / signal_send_pgrp / sched_for_each etc. may hold
+    // a task_t pointer from a recent lookup — they must be allowed
+    // to finish before the storage disappears.
+    call_rcu(task_free_rcu, t);
 }
 
 // ── task_fork ─────────────────────────────────────────────────────────────
