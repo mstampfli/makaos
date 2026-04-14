@@ -1,6 +1,7 @@
 #include "initcall.h"
 #include "preempt.h"
 #include "common.h"
+#include "kheap.h"
 
 // ── Linker-provided section bounds ────────────────────────────────────────
 extern initcall_t* __initcall_0_start[];  // INITCALL_LEVEL_EARLY
@@ -29,53 +30,56 @@ static void ic_put_str_nl(const char* prefix, const char* name) {
 }
 
 // ── DAG state ─────────────────────────────────────────────────────────────
-// Maximum initcalls per level.  Increase if needed.
-#define INITCALL_MAX_NODES  64
+// No fixed cap — node arrays are kmalloc'd based on the actual size of the
+// linker-provided initcall section.  kheap is already initialised before
+// do_initcalls_early runs (see main.c: kheap_init → do_initcalls_early).
 
 typedef struct {
     initcall_t* ic;
-    uint8_t     in_degree;   // number of unresolved dependencies
+    uint32_t    in_degree;   // number of unresolved dependencies
     uint8_t     done;        // 1 once executed
 } ic_node_t;
-
-static ic_node_t s_nodes[INITCALL_MAX_NODES];
-static uint8_t   s_n;
 
 // Kahn's algorithm: topological sort + cycle detection.
 // Executes each node in dependency order.
 static void run_dag(initcall_t** start, initcall_t** end) {
-    s_n = 0;
+    uint32_t slot_count = (uint32_t)(end - start);
+    if (slot_count == 0) return;
+
+    ic_node_t* nodes = (ic_node_t*)kmalloc((uint64_t)slot_count * sizeof(ic_node_t));
+    uint32_t*  queue = (uint32_t*)kmalloc((uint64_t)slot_count * sizeof(uint32_t));
+    if (!nodes || !queue) {
+        ic_puts("[initcall] PANIC: OOM allocating initcall DAG\n");
+        for (;;) __asm__ volatile("hlt");
+    }
 
     // ── Load nodes ────────────────────────────────────────────────────────
+    uint32_t n = 0;
     for (initcall_t** p = start; p < end; p++) {
         if (!*p || !(*p)->fn) continue;
-        if (s_n >= INITCALL_MAX_NODES) {
-            ic_puts("[initcall] PANIC: too many initcalls (increase INITCALL_MAX_NODES)\n");
-            for (;;) __asm__ volatile("hlt");
-        }
-        s_nodes[s_n].ic        = *p;
-        s_nodes[s_n].in_degree = 0;
-        s_nodes[s_n].done      = 0;
-        s_n++;
+        nodes[n].ic        = *p;
+        nodes[n].in_degree = 0;
+        nodes[n].done      = 0;
+        n++;
     }
 
     // ── Compute in-degrees ────────────────────────────────────────────────
     // For each node, count how many of its declared deps exist in this level.
-    for (uint8_t i = 0; i < s_n; i++) {
-        const char** dep = s_nodes[i].ic->deps;
+    for (uint32_t i = 0; i < n; i++) {
+        const char** dep = nodes[i].ic->deps;
         while (*dep) {
             // Find the dep in the node list.
             int found = 0;
-            for (uint8_t j = 0; j < s_n; j++) {
+            for (uint32_t j = 0; j < n; j++) {
                 if (j == i) continue;
-                if (s_nodes[j].ic->name &&
-                    ic_strcmp(s_nodes[j].ic->name, *dep) == 0) {
+                if (nodes[j].ic->name &&
+                    ic_strcmp(nodes[j].ic->name, *dep) == 0) {
                     found = 1;
                     break;
                 }
             }
             if (found)
-                s_nodes[i].in_degree++;
+                nodes[i].in_degree++;
             // Deps that don't exist in this level are silently satisfied
             // (they live in a different level that already ran).
             dep++;
@@ -83,19 +87,17 @@ static void run_dag(initcall_t** start, initcall_t** end) {
     }
 
     // ── Kahn's algorithm ──────────────────────────────────────────────────
-    // Simple queue using a static array — no heap needed.
-    uint8_t queue[INITCALL_MAX_NODES];
-    uint8_t qhead = 0, qtail = 0;
-    uint8_t executed = 0;
+    uint32_t qhead = 0, qtail = 0;
+    uint32_t executed = 0;
 
     // Seed: all nodes with no dependencies.
-    for (uint8_t i = 0; i < s_n; i++)
-        if (s_nodes[i].in_degree == 0)
-            queue[qtail++ % INITCALL_MAX_NODES] = i;
+    for (uint32_t i = 0; i < n; i++)
+        if (nodes[i].in_degree == 0)
+            queue[qtail++] = i;
 
     while (qhead != qtail) {
-        uint8_t idx = queue[qhead++ % INITCALL_MAX_NODES];
-        ic_node_t* node = &s_nodes[idx];
+        uint32_t idx = queue[qhead++];
+        ic_node_t* node = &nodes[idx];
 
         // ── Execute ───────────────────────────────────────────────────────
         ic_put_str_nl("[initcall] ", node->ic->name);
@@ -119,15 +121,15 @@ static void run_dag(initcall_t** start, initcall_t** end) {
         executed++;
 
         // Decrement in-degree of nodes that depend on this one.
-        for (uint8_t i = 0; i < s_n; i++) {
-            if (s_nodes[i].done) continue;
-            const char** dep = s_nodes[i].ic->deps;
+        for (uint32_t i = 0; i < n; i++) {
+            if (nodes[i].done) continue;
+            const char** dep = nodes[i].ic->deps;
             while (*dep) {
                 if (ic_strcmp(*dep, node->ic->name) == 0) {
-                    if (s_nodes[i].in_degree > 0)
-                        s_nodes[i].in_degree--;
-                    if (s_nodes[i].in_degree == 0)
-                        queue[qtail++ % INITCALL_MAX_NODES] = i;
+                    if (nodes[i].in_degree > 0)
+                        nodes[i].in_degree--;
+                    if (nodes[i].in_degree == 0)
+                        queue[qtail++] = i;
                     break;
                 }
                 dep++;
@@ -136,15 +138,18 @@ static void run_dag(initcall_t** start, initcall_t** end) {
     }
 
     // ── Cycle detection ───────────────────────────────────────────────────
-    if (executed < s_n) {
+    if (executed < n) {
         ic_puts("[initcall] PANIC: dependency cycle detected!\n");
         ic_puts("[initcall] Unresolved nodes:\n");
-        for (uint8_t i = 0; i < s_n; i++) {
-            if (!s_nodes[i].done)
-                ic_put_str_nl("  - ", s_nodes[i].ic->name);
+        for (uint32_t i = 0; i < n; i++) {
+            if (!nodes[i].done)
+                ic_put_str_nl("  - ", nodes[i].ic->name);
         }
         for (;;) __asm__ volatile("hlt");
     }
+
+    kfree(queue);
+    kfree(nodes);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────

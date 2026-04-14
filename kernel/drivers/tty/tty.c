@@ -13,8 +13,8 @@
 #include "signal.h"
 #include "fb.h"
 
-// ── Global tty table ─────────────────────────────────────────────────────
-tty_t g_ttys[TTY_COUNT];
+// ── Physical console TTY ─────────────────────────────────────────────────
+tty_t g_tty0;
 
 // ── Ring-buffer helpers ───────────────────────────────────────────────────
 
@@ -285,8 +285,8 @@ static int tty_vfs_poll(vfs_file_t* self, int events) {
 
 // ── tty_open ─────────────────────────────────────────────────────────────
 vfs_file_t* tty_open(int idx) {
-    if (idx < 0 || idx >= TTY_COUNT) return NULL;
-    tty_t* tty = &g_ttys[idx];
+    if (idx != 0) return NULL;
+    tty_t* tty = &g_tty0;
 
     tty_ctx_t* ctx = kmalloc(sizeof(tty_ctx_t));
     if (!ctx) return NULL;
@@ -315,16 +315,11 @@ vfs_file_t* tty_open(int idx) {
 // ── tty_get_ctty / tty_set_ctty ──────────────────────────────────────────
 tty_t* tty_get_ctty(void) {
     if (!g_current) return NULL;
-    // Check physical TTYs
-    for (int i = 0; i < TTY_COUNT; i++) {
-        if (g_ttys[i].session == g_current->sid)
-            return &g_ttys[i];
-    }
-    // Check PTY slaves
-    extern pty_t g_ptys[];
-    for (int i = 0; i < PTY_MAX; i++) {
-        if (g_ptys[i].allocated && g_ptys[i].slave.session == g_current->sid)
-            return &g_ptys[i].slave;
+    // Physical console TTY.
+    if (g_tty0.session == g_current->sid) return &g_tty0;
+    // PTY slaves — walk the live PTY list (maintained in pty.c).
+    for (pty_t* p = pty_list_head(); p; p = p->next) {
+        if (p->slave.session == g_current->sid) return &p->slave;
     }
     return NULL;
 }
@@ -347,7 +342,7 @@ static void tty_on_kbd_event(const kbd_event_t* ev, void* data);
 
 // ── tty_init ─────────────────────────────────────────────────────────────
 void tty_init(void) {
-    tty_t* tty = &g_ttys[0];
+    tty_t* tty = &g_tty0;
 
     // Default termios: canonical, echo, signals enabled.
     tty->termios.c_iflag = ICRNL | IXON;

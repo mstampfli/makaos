@@ -29,7 +29,8 @@
 
 #define ACL_WILDCARD    0xFFFFFFFFu   // matches any uid/gid
 
-#define ACL_MAX_ENTRIES 32   // per inode; covers all realistic use cases
+// Per-inode ACL entry count is stored in the xattr itself — no fixed cap.
+// acl_check() takes an explicit count parameter and walks linearly.
 
 typedef struct __attribute__((packed)) {
     uint8_t  tag;        // ACL_TAG_USER / ACL_TAG_GROUP / ACL_TAG_OTHER
