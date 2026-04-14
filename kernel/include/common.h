@@ -119,3 +119,18 @@ extern phys_addr_t KERNEL_BASE_PHYS;
 extern uint64_t    KERNEL_SIZE;           // actual kernel binary size (from linker symbols)
 extern uint64_t    LOADER_RESERVED_SIZE;  // physical region to exclude from PMM:
                                           // covers kernel + loader page tables at top of window
+
+// ── Compiler attributes ─────────────────────────────────────────────────
+// ALWAYS_INLINE forces inlining regardless of optimization level.  Use for
+// hot-path helpers (preempt_disable, rcu_read_lock, atomic_*, spinlocks)
+// so -O0 debug builds keep them correct and -O2 builds keep them fast
+// without depending on the inliner's heuristics.
+#define ALWAYS_INLINE static inline __attribute__((always_inline))
+
+// NOINLINE prevents inlining even under -O2.  Use for cold slow paths
+// (error handlers, panic) so the hot caller doesn't grow bloated.
+#define NOINLINE __attribute__((noinline))
+
+// Branch prediction hints.
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
