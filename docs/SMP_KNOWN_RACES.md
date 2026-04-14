@@ -158,20 +158,18 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## 9. ext2 bcache slot contents
+## 9. ext2 bcache slot contents — RESOLVED (Phase 7)
 
-- **Location:** `kernel/fs/ext2.c` — `s_bcache_data[slot]` and
-  `s_bcache_tag[slot]`
-- **Race:** cache readers memcpy from a slot while an I/O completion
-  might be writing the same slot. Writers blindly overwrite the tag
-  then the data.
-- **Why safe on UP:** block I/O is serialized through the AHCI
-  io_thread, and reads happen in caller context — they can't overlap
-  with a write to the same slot without first yielding.
-- **Fix phase:** Phase 7 — seqlock hot caches.
-- **Fix strategy:** one seqlock per cache slot. Readers retry on a
-  version mismatch. Writers (cache-miss fill) take the write side of
-  the seqlock around the tag + memcpy.
+- **Fix:** `kernel/fs/ext2.c` now stores per-slot meta in
+  `s_bcache_meta[BCACHE_SIZE]` where each entry is
+  `{ seqlock_t seq; uint32_t tag; }`, 16 bytes (4 slots per cache line).
+  `read_block` is a seqlock reader: `seq_begin` → tag check → 4 KiB
+  memcpy → `seq_retry`.  On a clean hit that's three loads plus one
+  streaming memcpy — zero atomics on the slot lock line.  Writers
+  (`bcache_store`, called from `read_block` miss fill, `write_block`,
+  and the readahead prefill loop) use `seq_write_begin` /
+  `seq_write_end` which serialise multi-writer races on a per-slot
+  spinlock.  Readers never block.
 
 ---
 
