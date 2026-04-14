@@ -2,6 +2,8 @@
 #include "common.h"
 #include "vfs.h"
 
+struct task_t; // forward declaration
+
 // ── Kernel pipe ───────────────────────────────────────────────────────────
 // A pipe is a one-directional byte stream backed by a circular kernel buffer.
 // pipe(fds[2]) returns fds[0]=read end, fds[1]=write end.
@@ -23,6 +25,7 @@ typedef struct {
     uint8_t  reader_refs;   // number of open read-end fds
     struct vfs_file_t* read_file;   // back-pointer for poll wakeups
     struct vfs_file_t* write_file;  // back-pointer for poll wakeups
+    struct task_t*     reader;      // task sleeping in pipe_read (or NULL)
 } pipe_buf_t;
 
 // Create a pipe; fills fds[0] (read) and fds[1] (write).

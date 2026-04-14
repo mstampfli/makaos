@@ -1,7 +1,10 @@
 #include "pipe.h"
 #include "kheap.h"
 #include "sched.h"
+#include "signal.h"
+#include "process.h"
 #include "errno.h"
+#include "common.h"
 
 // ── Pipe VFS callbacks ────────────────────────────────────────────────────
 
@@ -14,7 +17,9 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
         // Wait for data.
         while (p->count == 0) {
             if (p->writer_refs == 0) return (int64_t)total; // EOF
+            p->reader = g_current;
             sched_sleep();
+            p->reader = NULL;
         }
         dst[total++] = p->buf[p->head];
         p->head = (p->head + 1) & (PIPE_BUF_SIZE - 1);
@@ -23,17 +28,41 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)total;
 }
 
+// deliver_sigpipe — send SIGPIPE to g_current unless it's blocked or ignored.
+// Returns 1 if signal was sent (caller should return -EPIPE),
+//         0 if suppressed (SIG_IGN or blocked — caller still returns -EPIPE).
+static int deliver_sigpipe(void) {
+    if (!g_current) return 0;
+    sigstate_t* ss = &g_current->sigstate;
+    uint32_t bit = 1u << (SIGPIPE - 1);
+    // Suppressed: blocked mask or SIG_IGN handler.
+    if (ss->blocked & bit) return 0;
+    if (ss->handlers[SIGPIPE].sa_handler == (uint64_t)SIG_IGN) return 0;
+    serial_puts_dbg("[pipe] SIGPIPE → pid=");
+    serial_hex_dbg((uint64_t)g_current->pid);
+    signal_send(g_current, SIGPIPE);
+    return 1;
+}
+
 static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     const uint8_t* src = (const uint8_t*)buf;
     uint64_t total = 0;
 
-    if (p->reader_refs == 0) return (int64_t)-EPIPE;
+    // Read end already closed before we started — SIGPIPE + EPIPE immediately.
+    if (p->reader_refs == 0) {
+        deliver_sigpipe();
+        return (int64_t)-EPIPE;
+    }
 
     while (total < len) {
         // Wait for space.
         while (p->count == PIPE_BUF_SIZE) {
-            if (p->reader_refs == 0) return total ? (int64_t)total : (int64_t)-EPIPE;
+            if (p->reader_refs == 0) {
+                // Reader closed while we were blocked mid-write.
+                deliver_sigpipe();
+                return total ? (int64_t)total : (int64_t)-EPIPE;
+            }
             sched_sleep();
         }
         p->buf[p->tail] = src[total++];
@@ -41,8 +70,11 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
         p->count++;
     }
 
-    // Wake all readers polling on this pipe.
-    if (p->read_file) wait_queue_wake_all(p->read_file->waitq);
+    // Wake all readers and poll waiters.
+    if (p->read_file) {
+        if (p->reader) sched_wake(p->reader);
+        wait_queue_wake_all(p->read_file->waitq);
+    }
 
     return (int64_t)total;
 }
@@ -57,6 +89,11 @@ static void pipe_read_close(vfs_file_t* self) {
 static void pipe_write_close(vfs_file_t* self) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     if (p->writer_refs > 0) p->writer_refs--;
+    // Wake any reader sleeping in pipe_read so it sees EOF immediately.
+    if (p->writer_refs == 0) {
+        if (p->reader) sched_wake(p->reader);
+        if (p->read_file) wait_queue_wake_all(p->read_file->waitq);
+    }
     if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
     kfree(self);
 }
@@ -86,6 +123,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     p->head = p->tail = p->count = 0;
     p->writer_refs = 1;
     p->reader_refs = 1;
+    p->reader      = NULL;
 
     vfs_file_t* r = kmalloc(sizeof(vfs_file_t));
     vfs_file_t* w = kmalloc(sizeof(vfs_file_t));
