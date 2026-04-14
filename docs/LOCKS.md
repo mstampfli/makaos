@@ -56,6 +56,57 @@ of CPUs fork simultaneously, which is not a real workload.
 
 ---
 
+## `g_pmm_lock` — `kernel/mm/pmm.c`
+
+**Guards:** all buddy free lists, slab cache heads (partial/full),
+per-frame refcount array, per-frame pincount array, slab tracker
+array. Essentially the entire PMM state.
+
+**Readers (lock-free):**
+- `pmm_ref_get`, `pmm_pin_get`, `pmm_is_slab_ptr` — single aligned
+  loads. May race with a concurrent mutation but each individual read
+  is intact (uint32_t/pointer loads are atomic on x86). Callers
+  needing a stable read must hold a higher-level lock.
+
+**Writers:** `pmm_buddy_alloc/free`, `pmm_slab_alloc/free`,
+`pmm_ref_inc/dec`, `pmm_pin/unpin`. Called from every `kmalloc`,
+`kfree`, `pmm_buddy_alloc(0)` path, fork (CoW ref bump), page fault
+(CoW break), DMA setup (pin).
+
+**Why a single global lock here, temporarily:**
+- Phase 4 (per-CPU allocators) was attempted, tried, and reverted
+  after a design flaw made the common path SLOWER than the single-
+  lock version.  See `docs/PHASE4_REDESIGN.md` for the post-mortem
+  and the redesigned plan.
+- Until Phase 4 lands properly, correctness trumps speed: one global
+  lock makes every allocation SMP-safe.
+- Uncontended cost: one `lock cmpxchg` + `pushfq`/`popfq` pair,
+  ~30 cycles of overhead per alloc.  Measurable only at
+  microbenchmark scale.
+- On a single CPU (today), the lock is always uncontended.  When APs
+  boot in Phase 9, all CPUs serialize here — unacceptable long-term
+  but safe short-term.
+
+**IRQ-safety:** MUST use `spin_lock_irqsave` / `spin_unlock_irqrestore`.
+`pmm_ref_dec` is reachable from the page fault handler which may run
+with some IRQs masked, and `kfree` is called from IRQ-context code
+paths in the future (deferred work callbacks, Phase 6).
+
+**Critical section contents:** buddy free-list operations (O(MAX_ORDER)
+splits/merges), slab list manipulation, memset-of-slab-header, tracker
+array updates. No sleeps, no cross-call retention. The one costly op
+is buddy split/merge which touches multiple free lists — still
+bounded O(MAX_ORDER=32) and does no I/O.
+
+**SMP-readiness:** correct as-is but a serialization bottleneck. Phase 4
+proper replaces this with per-CPU magazines + per-CPU pagesets, at
+which point `g_pmm_lock` becomes only the depot lock hit on magazine
+refill (~1 in 16 allocs after warmup).
+
+**Future work:** see `docs/PHASE4_REDESIGN.md` for the full plan.
+
+---
+
 ## Planned locks (not yet added — for Phase 3–8)
 
 Each entry will be added as the phase lands, with the same justification
@@ -126,12 +177,16 @@ template. This list is for tracking the *plan*, not the code.
 | 1 | 0 | 0 |
 | 2 | 1 (pid_ht writer) | 1 |
 | 3 | 0 (all lock-free) | 1 |
-| 4 | 1 slab depot + 1 buddy (cold) | 3 |
-| 5 | 0 (all per-CPU) | 3 |
-| 6 | 3 (pgid/tgid/sid writers) + handful (signal/mount/route) | ~8 |
-| 7 | 0 (seqlocks) | ~8 |
-| 8 | per-object mutexes (not global) | ~8 + per-object |
-| 9 | 0 | ~8 |
+| 4 | 1 global g_pmm_lock (temporary until redesign lands — see PHASE4_REDESIGN.md) | 2 |
+| 5 | 0 (all per-CPU) | 2 |
+| 6 | 3 (pgid/tgid/sid writers) + handful (signal/mount/route) | ~7 |
+| 7 | 0 (seqlocks) | ~7 |
+| 8 | per-object mutexes (not global) | ~7 + per-object |
+| 9 | 0 | ~7 |
+
+After Phase 4 proper lands (post-SMP, per-CPU magazines), g_pmm_lock
+collapses to a rarely-taken depot lock and doesn't change the total
+count — just moves off the hot path.
 
 The per-object mutexes in Phase 8 aren't in the "global spinlock" count
 — they're finer-grained and there's one per fd table / per inode / per

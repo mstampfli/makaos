@@ -14,6 +14,21 @@ Format:
 
 ---
 
+## 0. PMM / kheap all internal state — RESOLVED (Phase 4 bridge)
+
+- **Location:** `kernel/mm/pmm.c`, `kernel/mm/kheap.c`
+- **What was unsafe:** every buddy free list, slab cache head, per-frame
+  refcount, per-frame pincount, slab tracker array. Zero synchronization
+  before Phase 4.
+- **Fix:** global `g_pmm_lock` spinlock (IRQ-safe) wraps every public
+  PMM mutating entry point. Read-only queries stay lock-free on
+  aligned loads. See `docs/PHASE4_REDESIGN.md` for the per-CPU
+  magazine plan that eventually replaces this bottleneck.
+- **Status:** SMP-correct, but single-lock contention under multi-CPU
+  load. Acceptable bridge until Phase 4 proper lands.
+
+---
+
 ## 1. `irq_wait` waiter list head — RESOLVED (Phase 3)
 
 - **Location:** `kernel/arch/x86_64/irq_wait.c`
