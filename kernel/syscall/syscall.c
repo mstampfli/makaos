@@ -220,74 +220,71 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     vfs_file_t* f = NULL;
 
-    // ── Permission check via unified fs_lookup ────────────────────────────
+    // ── Permission check + existence test via unified fs_lookup ──────────
     // Covers both virtfs (/proc, /dev) and ext2 in one call.
-    // For O_CREAT on a new file we only need to check the parent dir later,
-    // so a ENOENT here is only fatal if O_CREAT is not set.
+    // fsn.inode_nr is the already-resolved ext2 inode — no second lookup needed.
+    uint8_t open_need = ACL_PERM_READ;
     {
-        uint8_t open_need = ACL_PERM_READ;
         int oflags_acc = (int)(flags & 3);
         if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) open_need |= ACL_PERM_WRITE;
-        fs_node_t fsn;
-        int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
-        if (fsr == 0 && (flags & O_CREAT) && (flags & O_EXCL))
-            return (uint64_t)-EEXIST;
-        if (fsr != 0 && fsr != -ENOENT) return (uint64_t)(int64_t)fsr;
-        if (fsr == -ENOENT && !(flags & O_CREAT)) return (uint64_t)-ENOENT;
+    }
+    fs_node_t fsn;
+    int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
+    if (fsr == 0 && (flags & O_CREAT) && (flags & O_EXCL))
+        return (uint64_t)-EEXIST;
+    if (fsr != 0 && fsr != -ENOENT) return (uint64_t)(int64_t)fsr;
+    if (fsr == -ENOENT && !(flags & O_CREAT)) return (uint64_t)-ENOENT;
 
-        // Virtual path — dispatch to backend; permission already checked.
-        if (fsr == 0 && fsn.is_virtual) {
-            if (path[0]=='/' && path[1]=='p') {
-                // /proc
-                f = proc_open(path);
-                if (!f) return (uint64_t)-ENOENT;
-                goto got_file;
-            }
-            // /dev — dispatch by device name
-            const char* dev = path + 5; // skip "/dev/"
-            uint8_t match_kbd    = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
-            uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
-                                 && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
-            uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
-            uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
-                                 && dev[4]=='e' && dev[5]=='\0');
-            uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
-            uint8_t match_tty    = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='\0');
-            uint8_t match_tty0   = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='0' && dev[4]=='\0');
-            uint8_t match_null   = (dev[0]=='n' && dev[1]=='u' && dev[2]=='l' && dev[3]=='l' && dev[4]=='\0');
-            uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
-            uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
-                                 && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
-            uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
-                                 && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
-                                 && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
-                                 && dev[12]=='\0');
-            if      (match_tty)    f = tty_open(0);
-            else if (match_tty0)   f = tty_open(0);
-            else if (match_kbdraw) f = vfs_kbdraw_open();
-            else if (match_event0) f = evdev_open();
-            else if (match_kbd)    f = vfs_kbd_open();
-            else if (match_vga)    f = vfs_vga_open();
-            else if (match_mouse)  f = vfs_mouse_open();
-            else if (match_dsp)    f = vfs_dsp_open();
-            else if (match_null)   f = vfs_null_open();
-            else if (match_zero)   f = vfs_zero_open();
-            else if (match_urnd)   f = vfs_urandom_open();
-            else return (uint64_t)-ENOENT;
-            // fall through to got_file
+    // Virtual path — dispatch to backend; permission already checked by fs_lookup.
+    if (fsr == 0 && fsn.is_virtual) {
+        if (path[0]=='/' && path[1]=='p') {
+            // /proc
+            f = proc_open(path);
+            if (!f) return (uint64_t)-ENOENT;
+            goto got_file;
         }
+        // /dev — dispatch by device name
+        const char* dev = path + 5; // skip "/dev/"
+        uint8_t match_kbd    = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='\0');
+        uint8_t match_kbdraw = (dev[0]=='k' && dev[1]=='b' && dev[2]=='d' && dev[3]=='r'
+                             && dev[4]=='a' && dev[5]=='w' && dev[6]=='\0');
+        uint8_t match_vga    = (dev[0]=='v' && dev[1]=='g' && dev[2]=='a' && dev[3]=='\0');
+        uint8_t match_mouse  = (dev[0]=='m' && dev[1]=='o' && dev[2]=='u' && dev[3]=='s'
+                             && dev[4]=='e' && dev[5]=='\0');
+        uint8_t match_dsp    = (dev[0]=='d' && dev[1]=='s' && dev[2]=='p' && dev[3]=='\0');
+        uint8_t match_tty    = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='\0');
+        uint8_t match_tty0   = (dev[0]=='t' && dev[1]=='t' && dev[2]=='y' && dev[3]=='0' && dev[4]=='\0');
+        uint8_t match_null   = (dev[0]=='n' && dev[1]=='u' && dev[2]=='l' && dev[3]=='l' && dev[4]=='\0');
+        uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
+        uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
+                             && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+        uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
+                             && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
+                             && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
+                             && dev[12]=='\0');
+        if      (match_tty)    f = tty_open(0);
+        else if (match_tty0)   f = tty_open(0);
+        else if (match_kbdraw) f = vfs_kbdraw_open();
+        else if (match_event0) f = evdev_open();
+        else if (match_kbd)    f = vfs_kbd_open();
+        else if (match_vga)    f = vfs_vga_open();
+        else if (match_mouse)  f = vfs_mouse_open();
+        else if (match_dsp)    f = vfs_dsp_open();
+        else if (match_null)   f = vfs_null_open();
+        else if (match_zero)   f = vfs_zero_open();
+        else if (match_urnd)   f = vfs_urandom_open();
+        else return (uint64_t)-ENOENT;
+        // fall through to got_file
     }
 
     if (!f) {
-        // ext2 path: file exists (or O_CREAT on new file).
-        int path_err = 0;
-        uint32_t check_ino = ext2_lookup_path(path, &g_current->cred, &path_err);
-        if (check_ino) {
-            if ((flags & O_CREAT) && (flags & O_EXCL)) {
-                return (uint64_t)-EEXIST;
-            }
-        } else if (flags & O_CREAT) {
-            // File doesn't exist — check write+exec on parent directory.
+        // ext2 path.  fsn.inode_nr is already resolved by fs_lookup above —
+        // no second ext2_lookup_path call needed.
+        if (fsr == 0) {
+            // File exists.  O_EXCL already handled above.
+            (void)fsn.inode_nr; // inode known; ext2_open re-opens by path (stateless)
+        } else {
+            // fsr == -ENOENT && O_CREAT: check write+exec on parent directory.
             char parent[512];
             uint64_t plen = 0;
             while (path[plen]) plen++;
@@ -295,33 +292,15 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             while (slash > 0 && path[slash] != '/') slash--;
             if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
             else { for (uint64_t k = 0; k < slash; k++) parent[k] = path[k]; parent[slash] = '\0'; }
-            int dir_err = 0;
-            uint32_t dir_ino = ext2_lookup_path(parent, &g_current->cred, &dir_err);
-            if (!dir_ino) return dir_err ? (uint64_t)(int64_t)dir_err : (uint64_t)-ENOENT;
-            ext2_inode_t dir_inode;
-            if (ext2_read_inode(dir_ino, &dir_inode)) {
-                inode_perm_t ip = {
-                    .uid = dir_inode.i_uid, .gid = dir_inode.i_gid,
-                    .mode = dir_inode.i_mode & 0x1FF,
-                    .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
-                };
-                int pr = vfs_check_perm(&ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
-                if (pr != 0) return (uint64_t)(int64_t)pr;
-            }
-        } else {
-            // File doesn't exist, no O_CREAT — propagate the error from the walk.
-            return path_err ? (uint64_t)(int64_t)path_err : (uint64_t)-ENOENT;
+            // Use fs_lookup for the parent too — avoids a raw ext2_lookup_path.
+            fs_node_t par_fsn;
+            int par_r = fs_lookup(parent, &g_current->cred,
+                                   ACL_PERM_WRITE | ACL_PERM_EXEC, &par_fsn);
+            if (par_r != 0) return (uint64_t)(int64_t)par_r;
         }
 
         f = ext2_open(path);
-        if (f && (flags & O_CREAT) && (flags & O_EXCL)) {
-            // O_CREAT|O_EXCL: file must not already exist.
-            vfs_close(f);
-            return (uint64_t)-EEXIST;
-        }
         if (!f && (flags & O_CREAT)) {
-            // Apply umask to mode before creating.
-            // TODO: pass mode to ext2_create when it supports permissions
             mode &= ~(uint64_t)g_current->umask;
             (void)mode;
             if (!ext2_create(path)) return (uint64_t)-EIO;
@@ -2421,18 +2400,14 @@ static inline int _access_ok(uint64_t addr, uint64_t len) {
 static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)src_u, len);
-    const uint8_t* s = (const uint8_t*)src_u;
-    uint8_t* d = (uint8_t*)dst;
-    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    __builtin_memcpy(dst, src_u, len);
     return 0;
 }
 
 static int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)dst_u, len);
-    const uint8_t* s = (const uint8_t*)src;
-    uint8_t* d = (uint8_t*)dst_u;
-    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    __builtin_memcpy(dst_u, src, len);
     return 0;
 }
 
