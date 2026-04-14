@@ -41,10 +41,10 @@ DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
 // ── INITCALL_LEVEL_SUBSYS registrations ──────────────────────────────────
 // Process context — can sleep.
 
-// input: keyboard + mouse init + full flush under preempt_disable.
-// INITCALL_FLAG_PREEMPT_OFF so the DAG runner wraps fn with
-// preempt_disable/enable — kbd/mouse threads can't be scheduled between
-// their spawn and the flush.
+// input: keyboard + mouse init + full flush.  Runs in process context
+// with preemption enabled — each device driver handles its own short
+// preempt_disable sections internally where hardware access needs to
+// be atomic.
 static int _input_init(void) {
     // keyboard_init installs IRQ1 handler but keeps IRQ1 masked —
     // mouse_init polls port 0x60 for ACKs and IRQ1 would steal those bytes.

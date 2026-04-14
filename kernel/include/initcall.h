@@ -41,7 +41,22 @@
 // ── Flags ─────────────────────────────────────────────────────────────────
 #define INITCALL_FLAG_NONE      0
 #define INITCALL_FLAG_REQUIRED  (1 << 0)  // panic on failure
-#define INITCALL_FLAG_PREEMPT_OFF (1 << 1) // run with preemption disabled
+
+// INITCALL_FLAG_PREEMPT_OFF: run the whole init function with preemption
+// disabled.  Useful for short hardware bring-up sequences that must not
+// be interleaved with scheduler activity — e.g. programming IOAPIC
+// redirection entries, LAPIC config, MSR writes during CPU setup.
+//
+// RULES — a preempt-off initcall MUST NOT:
+//   - call sched_sleep / sched_yield / irq_wait
+//   - wait for an IRQ-driven completion
+//   - allocate large objects (anything kmalloc might defer on)
+//   - take any spinlock that can be held for more than a few cycles
+//
+// Violation is not silent: sched_sleep() panics loudly if called with
+// preempt_depth > 0, so any accidental sleep under this flag is caught
+// immediately on first execution.  See kernel/proc/sched.c.
+#define INITCALL_FLAG_PREEMPT_OFF (1 << 1)
 
 // ── Maximum dependencies per initcall ────────────────────────────────────
 #define INITCALL_MAX_DEPS  8
