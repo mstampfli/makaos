@@ -1,5 +1,34 @@
 #include "pmm.h"
 #include "common.h"
+#include "smp.h"
+
+// ── SMP correctness — global PMM lock ───────────────────────────────────
+//
+// This is Phase 4's placeholder for SMP safety while the per-CPU
+// magazine/pageset redesign is deferred (see docs/PHASE4_REDESIGN.md).
+// Every public entry point below acquires g_pmm_lock (IRQ-safe variant
+// because pmm_ref_dec can be reached from CoW page-fault paths that may
+// run with some IRQs masked) for the duration of its critical section.
+//
+// Consequences:
+//   - Correct under SMP: two CPUs cannot race on the buddy free lists,
+//     the slab cache heads, the per-frame refcount, or the slab tracker
+//     array.
+//   - Slow under contention: every alloc/free serializes on one global
+//     lock.  On a single CPU (today) the lock is always uncontended so
+//     the cost is ~20 cycles per call (one lock cmpxchg + pushfq/popfq).
+//   - To be replaced in Phase 4 proper with per-CPU magazines and a
+//     per-class depot lock.
+//
+// The _locked suffix on internal helpers indicates "caller holds
+// g_pmm_lock".  Never call a non-_locked public entry from inside a
+// critical section — it would self-deadlock.
+static spinlock_t g_pmm_lock = SPINLOCK_INIT;
+
+// Forward declarations for _locked internals so init code can call them
+// without going through the public lock-taking wrappers.
+static phys_addr_t pmm_buddy_alloc_locked(uint8_t order);
+static void        pmm_buddy_free_locked(phys_addr_t addr, uint8_t order);
 
 static phys_addr_t g_phys_ceiling = 0;
 static uint64_t    g_total_frames = 0;
@@ -381,15 +410,18 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
         continue;
       }
 
-      // Found a valid free block. Insert it.
-      pmm_buddy_free(current, current_order);
+      // Found a valid free block.  This runs during boot init on one
+      // CPU before any other code can touch the allocator, so we call
+      // the _locked variant directly (no lock needed).
+      pmm_buddy_free_locked(current, current_order);
 
       current += order_to_bytes(current_order);
     }
   }
 }
 
-phys_addr_t pmm_buddy_alloc(uint8_t order) {
+// Internal implementation — caller holds g_pmm_lock.
+static phys_addr_t pmm_buddy_alloc_locked(uint8_t order) {
   if (order > MAX_ORDER) return PMM_INVALID_ADDR;
 
   // 1. Find the smallest available block >= order
@@ -442,7 +474,8 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   return allocated_phys;
 }
 
-void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
+// Internal implementation — caller holds g_pmm_lock.
+static void pmm_buddy_free_locked(phys_addr_t addr, uint8_t order) {
   if (order > MAX_ORDER) return;
 
   uint64_t frame_index = (addr >> PAGE_SHIFT);
@@ -482,6 +515,20 @@ void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
 
   // Add the final (merged) block to the free list
   free_list_push(order, addr);
+}
+
+// ── Public buddy API — takes g_pmm_lock ───────────────────────────────
+phys_addr_t pmm_buddy_alloc(uint8_t order) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  phys_addr_t r = pmm_buddy_alloc_locked(order);
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return r;
+}
+
+void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  pmm_buddy_free_locked(addr, order);
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 static inline uint64_t align_up_to(uint64_t value, uint64_t align) {
@@ -527,8 +574,9 @@ static inline void slab_list_push(slab_header_t** head, slab_header_t* h) {
   *head = h;
 }
 
-static slab_header_t* pmm_slab_grow(slab_cache_t* cache) {
-  phys_addr_t slab_phys = pmm_buddy_alloc(cache->slab_order);
+// Internal — caller holds g_pmm_lock.
+static slab_header_t* pmm_slab_grow_locked(slab_cache_t* cache) {
+  phys_addr_t slab_phys = pmm_buddy_alloc_locked(cache->slab_order);
   if (slab_phys == PMM_INVALID_ADDR) return NULL;
 
   uint64_t head_frame_index = (slab_phys >> PAGE_SHIFT);
@@ -567,7 +615,7 @@ static slab_header_t* pmm_slab_grow(slab_cache_t* cache) {
       g_slab_trackers[frame_index] = NULL;
       g_slab_heads[frame_index] = NULL;
     }
-    pmm_buddy_free(slab_phys, cache->slab_order);
+    pmm_buddy_free_locked(slab_phys, cache->slab_order);
     return NULL;
   }
 
@@ -587,11 +635,12 @@ static slab_header_t* pmm_slab_grow(slab_cache_t* cache) {
   return h;
 }
 
-void* pmm_slab_alloc(slab_cache_t* cache) {
+// Internal — caller holds g_pmm_lock.
+static void* pmm_slab_alloc_locked(slab_cache_t* cache) {
   slab_header_t* h = (slab_header_t*)cache->partial;
 
   if (!h) {
-    h = pmm_slab_grow(cache);
+    h = pmm_slab_grow_locked(cache);
     if (!h) return NULL;
   }
 
@@ -610,7 +659,16 @@ void* pmm_slab_alloc(slab_cache_t* cache) {
   return slot;
 }
 
-static void pmm_slab_destroy(slab_cache_t* cache, slab_header_t* h) {
+// Public wrapper — takes g_pmm_lock.
+void* pmm_slab_alloc(slab_cache_t* cache) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  void* r = pmm_slab_alloc_locked(cache);
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return r;
+}
+
+// Internal — caller holds g_pmm_lock.
+static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
   if (h->in_full_list) slab_list_remove((slab_header_t**)&cache->full, h);
   else slab_list_remove((slab_header_t**)&cache->partial, h);
 
@@ -625,10 +683,11 @@ static void pmm_slab_destroy(slab_cache_t* cache, slab_header_t* h) {
     g_slab_heads[frame_index] = NULL;
   }
 
-  pmm_buddy_free(h->slab_phys, cache->slab_order);
+  pmm_buddy_free_locked(h->slab_phys, cache->slab_order);
 }
 
-void pmm_slab_free(void* ptr) {
+// Internal — caller holds g_pmm_lock.
+static void pmm_slab_free_locked(void* ptr) {
   if (!ptr) return;
 
   phys_addr_t phys = virt_to_phys((virt_addr_t)ptr);
@@ -655,8 +714,16 @@ void pmm_slab_free(void* ptr) {
   }
 
   if (h->inuse == 0) {
-    pmm_slab_destroy(cache, h);
+    pmm_slab_destroy_locked(cache, h);
   }
+}
+
+// Public wrapper — takes g_pmm_lock.
+void pmm_slab_free(void* ptr) {
+  if (!ptr) return;
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  pmm_slab_free_locked(ptr);
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 uint8_t pmm_is_slab_ptr(void* ptr) {
@@ -684,19 +751,32 @@ uint64_t pmm_total_frames_get(void) { return g_total_frames; }
 
 void pmm_ref_inc(phys_addr_t addr) {
     uint64_t fi = addr >> PAGE_SHIFT;
-    if (fi < g_total_frames) g_frame_refcount[fi]++;
+    if (fi >= g_total_frames) return;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    g_frame_refcount[fi]++;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 void pmm_ref_dec(phys_addr_t addr) {
     uint64_t fi = addr >> PAGE_SHIFT;
     if (fi >= g_total_frames) return;
-    if (g_frame_refcount[fi] == 0) return;  // safety: already freed
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    if (g_frame_refcount[fi] == 0) {
+        spin_unlock_irqrestore(&g_pmm_lock, flags);
+        return;  // safety: already freed
+    }
     g_frame_refcount[fi]--;
-    if (g_frame_refcount[fi] == 0)
-        pmm_buddy_free(addr, 0);
+    int last_ref = (g_frame_refcount[fi] == 0);
+    if (last_ref)
+        pmm_buddy_free_locked(addr, 0);
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 uint32_t pmm_ref_get(phys_addr_t addr) {
+    // Read-only access.  The value may race with a concurrent
+    // inc/dec but each individual read is intact (uint32_t aligned
+    // reads are atomic on x86).  Callers that need a stable count
+    // should hold the appropriate higher-level lock.
     uint64_t fi = addr >> PAGE_SHIFT;
     if (fi >= g_total_frames) return 0;
     return g_frame_refcount[fi];
@@ -706,13 +786,18 @@ uint32_t pmm_ref_get(phys_addr_t addr) {
 
 void pmm_pin(phys_addr_t addr) {
     uint64_t fi = addr >> PAGE_SHIFT;
-    if (fi < g_total_frames) g_frame_pincount[fi]++;
+    if (fi >= g_total_frames) return;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    g_frame_pincount[fi]++;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 void pmm_unpin(phys_addr_t addr) {
     uint64_t fi = addr >> PAGE_SHIFT;
-    if (fi < g_total_frames && g_frame_pincount[fi] > 0)
-        g_frame_pincount[fi]--;
+    if (fi >= g_total_frames) return;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    if (g_frame_pincount[fi] > 0) g_frame_pincount[fi]--;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 uint16_t pmm_pin_get(phys_addr_t addr) {
