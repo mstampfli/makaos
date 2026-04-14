@@ -162,8 +162,8 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) break;  // OOM — abort prefault
 
-        uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
-        for (int i = 0; i < 512; i++) p[i] = 0;
+        // Zero the full page (512 × 8 bytes = 4096).
+        __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
         if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
             pmm_buddy_free(frame, 0);
@@ -291,7 +291,7 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             uint64_t slash = plen;
             while (slash > 0 && path[slash] != '/') slash--;
             if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
-            else { for (uint64_t k = 0; k < slash; k++) parent[k] = path[k]; parent[slash] = '\0'; }
+            else { __builtin_memcpy(parent, path, slash); parent[slash] = '\0'; }
             // Use fs_lookup for the parent too — avoids a raw ext2_lookup_path.
             fs_node_t par_fsn;
             int par_r = fs_lookup(parent, &g_current->cred,
@@ -641,7 +641,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
             uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
             char* ks = kmalloc(l + 1);
             if (!ks) goto oom;
-            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            __builtin_memcpy(ks, s, l);
             ks[l] = '\0';
             k_argv[argc++] = ks;
         }
@@ -661,7 +661,7 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
             uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
             char* ks = kmalloc(l + 1);
             if (!ks) goto oom;
-            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            __builtin_memcpy(ks, s, l);
             ks[l] = '\0';
             k_envp[envc++] = ks;
         }
@@ -819,7 +819,7 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
             uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
             char* ks = kmalloc(l + 1);
             if (!ks) goto oom_argv;
-            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            __builtin_memcpy(ks, s, l);
             ks[l] = '\0';
             k_argv[argc++] = ks;
         }
@@ -841,7 +841,7 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
             uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
             char* ks = kmalloc(l + 1);
             if (!ks) goto oom_envp;
-            for (uint64_t i = 0; i < l; i++) ks[i] = s[i];
+            __builtin_memcpy(ks, s, l);
             ks[l] = '\0';
             k_envp[envc++] = ks;
         }
@@ -1145,7 +1145,7 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (!raw || !path) { kfree(raw); kfree(path); return (uint64_t)-ENOMEM; }
 
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    __builtin_memcpy(raw, upath, pathlen);
     raw[pathlen] = '\0';
 
     if (raw[0] != '/') {
@@ -1208,7 +1208,7 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (count < 0) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
 
     ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
-    for (int i = 0; i < count; i++) ubuf[i] = kbuf[i];
+    __builtin_memcpy(ubuf, kbuf, (uint64_t)count * sizeof(ext2_entry_t));
 
     kfree(kbuf);
     kfree(path);
@@ -1227,7 +1227,7 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    __builtin_memcpy(raw, upath, pathlen);
     raw[pathlen] = '\0';
 
     char path[512];
@@ -1281,7 +1281,7 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    __builtin_memcpy(path, upath, pathlen);
     path[pathlen] = '\0';
 
     // Check write permission on the file's parent directory.
@@ -1290,7 +1290,7 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
     char parent[256];
     if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
-    else { for (uint64_t i = 0; i < last; i++) parent[i] = path[i]; parent[last] = '\0'; }
+    else { __builtin_memcpy(parent, path, last); parent[last] = '\0'; }
 
     int ul_err = 0;
     uint32_t par_ino = ext2_lookup_path(parent, &g_current->cred, &ul_err);
@@ -1318,9 +1318,9 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     char src[256], dst[256];
     const char* usrc = (const char*)src_ptr;
     const char* udst = (const char*)dst_ptr;
-    for (uint64_t i = 0; i < srclen; i++) src[i] = usrc[i];
+    __builtin_memcpy(src, usrc, srclen);
     src[srclen] = '\0';
-    for (uint64_t i = 0; i < dstlen; i++) dst[i] = udst[i];
+    __builtin_memcpy(dst, udst, dstlen);
     dst[dstlen] = '\0';
 
     // Require write+exec on src parent directory.
@@ -1328,7 +1328,7 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     for (uint64_t i = 0; i < srclen; i++) if (src[i] == '/') src_last = i;
     char src_parent[256];
     if (src_last == 0) { src_parent[0] = '/'; src_parent[1] = '\0'; }
-    else { for (uint64_t i = 0; i < src_last; i++) src_parent[i] = src[i]; src_parent[src_last] = '\0'; }
+    else { __builtin_memcpy(src_parent, src, src_last); src_parent[src_last] = '\0'; }
 
     int rn_err = 0;
     uint32_t sp_ino = ext2_lookup_path(src_parent, &g_current->cred, &rn_err);
@@ -1402,8 +1402,8 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
 
         // Zero the frame and write the cwd string.
         uint8_t* kbuf = (uint8_t*)(frame + HHDM_OFFSET);
-        for (int i = 0; i < (int)PAGE_SIZE; i++) kbuf[i] = 0;
-        for (uint64_t i = 0; i < cwdlen; i++) kbuf[i] = (uint8_t)cwd[i];
+        __builtin_memset(kbuf, 0, PAGE_SIZE);
+        __builtin_memcpy(kbuf, cwd, cwdlen);
 
         return uva;
     }
@@ -1412,7 +1412,7 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
     if (cwdlen > buflen) return (uint64_t)-ERANGE;
 
     char* ubuf = (char*)buf_ptr;
-    for (uint64_t i = 0; i < cwdlen; i++) ubuf[i] = cwd[i];
+    __builtin_memcpy(ubuf, cwd, cwdlen);
     return buf_ptr;
 }
 
@@ -1423,7 +1423,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) raw[i] = upath[i];
+    __builtin_memcpy(raw, upath, pathlen);
     raw[pathlen] = '\0';
 
     // Resolve relative paths against cwd.
@@ -1468,7 +1468,7 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    for (uint64_t i = 0; i < pathlen; i++) path[i] = upath[i];
+    __builtin_memcpy(path, upath, pathlen);
     path[pathlen] = '\0';
 
     // Require write+exec on parent directory.
@@ -1476,7 +1476,7 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') mk_last = i;
     char mk_parent[256];
     if (mk_last == 0) { mk_parent[0] = '/'; mk_parent[1] = '\0'; }
-    else { for (uint64_t i = 0; i < mk_last; i++) mk_parent[i] = path[i]; mk_parent[mk_last] = '\0'; }
+    else { __builtin_memcpy(mk_parent, path, mk_last); mk_parent[mk_last] = '\0'; }
 
     int mk_err = 0;
     uint32_t mkp_ino = ext2_lookup_path(mk_parent, &g_current->cred, &mk_err);
@@ -1823,7 +1823,7 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
     // Copy name from userspace.
     char name[SHMEM_NAME_MAX + 1];
     const char* uname = (const char*)name_ptr;
-    for (uint64_t i = 0; i < namelen; i++) name[i] = uname[i];
+    __builtin_memcpy(name, uname, namelen);
     name[namelen] = '\0';
 
     // POSIX: name must start with '/' and contain no embedded slashes.
@@ -1920,7 +1920,7 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
 
     char name[SHMEM_NAME_MAX + 1];
     const char* uname = (const char*)name_ptr;
-    for (uint64_t i = 0; i < namelen; i++) name[i] = uname[i];
+    __builtin_memcpy(name, uname, namelen);
     name[namelen] = '\0';
 
     if (name[0] != '/') return (uint64_t)-EINVAL;
@@ -2979,7 +2979,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TIOCGSERIAL:
         if (arg) {
             uint8_t* p = (uint8_t*)arg;
-            for (int i = 0; i < 60; i++) p[i] = 0;
+            __builtin_memset(p, 0, 60);
         }
         return 0;
     default:
