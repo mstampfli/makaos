@@ -37,7 +37,8 @@ static void shm_ns_ensure_init(void) {
     s_namespace = (ns_entry_t*)kmalloc(
         (uint64_t)SHMEM_NS_INIT_CAP * sizeof(ns_entry_t));
     if (!s_namespace) return;
-    for (uint32_t i = 0; i < SHMEM_NS_INIT_CAP; i++) s_namespace[i].shm = NULL;
+    __builtin_memset(s_namespace, 0,
+                      (uint64_t)SHMEM_NS_INIT_CAP * sizeof(ns_entry_t));
     s_namespace_cap = SHMEM_NS_INIT_CAP;
 }
 
@@ -65,7 +66,7 @@ static int shm_ns_grow(void) {
     uint32_t new_cap = s_namespace_cap * 2u;
     ns_entry_t* ns2 = (ns_entry_t*)kmalloc((uint64_t)new_cap * sizeof(ns_entry_t));
     if (!ns2) return -ENOMEM;
-    for (uint32_t i = 0; i < new_cap; i++) ns2[i].shm = NULL;
+    __builtin_memset(ns2, 0, (uint64_t)new_cap * sizeof(ns_entry_t));
     for (uint32_t i = 0; i < s_namespace_cap; i++)
         if (s_namespace[i].shm) shm_ns_raw_insert(ns2, new_cap, s_namespace[i].shm);
     kfree(s_namespace);
@@ -144,9 +145,8 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
     if (frame == PMM_INVALID_ADDR)
         return PMM_INVALID_ADDR;
 
-    // Zero the frame (security: never expose stale data).
-    uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
-    for (int i = 0; i < 512; i++) p[i] = 0;
+    // Zero the frame (security: never expose stale data) — full page.
+    __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
     shm->pages[pg_idx] = frame;
     return frame;
