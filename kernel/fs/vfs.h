@@ -67,19 +67,45 @@ static inline int64_t vfs_write(vfs_file_t* f, const void* buf, uint64_t len) {
 }
 
 // dup: increment refcount so two fds share one file description.
-// Returns f (same pointer), or NULL if f is NULL.
+// Returns f (same pointer), or NULL if f is NULL.  Safe under SMP: the
+// increment is an atomic fetch_add, not a plain store.  Callers that
+// already know the refcount is > 0 (e.g. the owner of an fd slot) use
+// this; callers that only observe the pointer via an RCU lookup must
+// use vfs_tryget instead, which fails if the object is mid-teardown.
 static inline vfs_file_t* vfs_dup(vfs_file_t* f) {
-    if (f && f->refcount > 0) f->refcount++;
+    if (f && __atomic_load_n(&f->refcount, __ATOMIC_RELAXED) > 0)
+        __atomic_fetch_add(&f->refcount, 1u, __ATOMIC_ACQ_REL);
     return f;
+}
+
+// Atomic tryget — bumps refcount only if it is currently > 0.  Returns
+// `f` on success, NULL if the object is being destroyed (count == 0) or
+// is a static object (also count == 0).  Used by fdget after an RCU
+// lookup so a concurrent last-close cannot free the file under the
+// caller.
+static inline vfs_file_t* vfs_tryget(vfs_file_t* f) {
+    if (!f) return NULL;
+    uint32_t old = __atomic_load_n(&f->refcount, __ATOMIC_RELAXED);
+    for (;;) {
+        if (old == 0) return NULL;
+        if (__atomic_compare_exchange_n(&f->refcount, &old, old + 1u,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return f;
+    }
 }
 
 // close: decrement refcount; only call driver close when it reaches 0.
 // Static objects (refcount==0) are never freed.
 static inline void vfs_close(vfs_file_t* f) {
     if (!f) return;
-    if (f->refcount == 0) return;           // static object
-    if (--f->refcount > 0) return;          // still referenced
-    if (f->close) f->close(f);             // last reference: free it
+    // Fast-out for static objects.  A static object's refcount is a
+    // plain read that never changes.
+    if (__atomic_load_n(&f->refcount, __ATOMIC_RELAXED) == 0) return;
+    // Atomic fetch_sub returns the PRE-decrement value.  Only the CPU
+    // that observes the 1→0 transition owns the teardown.
+    uint32_t prev = __atomic_fetch_sub(&f->refcount, 1u, __ATOMIC_ACQ_REL);
+    if (prev != 1u) return;
+    if (f->close) f->close(f);
 }
 
 // ── Shared VGA cursor state (defined in vfs.c) ────────────────────────────

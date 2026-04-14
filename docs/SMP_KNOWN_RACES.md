@@ -132,17 +132,31 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## 7. fd table reads vs. mutation
+## 7. fd table reads vs. mutation — RESOLVED (Phase 8A)
 
-- **Location:** `kernel/proc/process.c` — `task_files_t.fd_table`
-- **Race:** `fd_to_file` is called on every syscall that takes an fd.
-  `sys_dup`, `sys_close`, `sys_open`, `sys_pipe`, `sys_socket`,
-  `fd_table_grow` all mutate the array. No synchronization.
-- **Why safe on UP:** single thread inside any given syscall at a time.
-- **Fix phase:** Phase 8 — fd table + VFS + ext2 metadata.
-- **Fix strategy:** per-`task_files_t` mutex for mutation, RCU-published
-  pointer for the `fd_table` array. Read path stays a plain indexed
-  load. Grow reallocates and publishes via `rcu_assign_pointer`.
+- **Fix:** `task_files_t` now holds a pointer to a separately-allocated
+  `fdtable_t { vfs_file_t** fd_table; uint32_t* fd_flags; uint32_t cap }`
+  published via `rcu_assign_pointer` and loaded on the read side with
+  `__atomic_load_n(..., ACQUIRE)`.  `fd_table_grow` allocates a fresh
+  `fdtable_t`, copies the live slots, installs the new pointer, and
+  hands the old `fdtable_t` to `call_rcu(fdtable_free_rcu, old)` so
+  any in-flight reader that already loaded the old pointer stays
+  valid until the grace period ends.
+
+  `vfs_file_t.refcount` is now atomic (`__atomic_fetch_add/sub`),
+  with a new `vfs_tryget` (CAS-if-nonzero) so a reader that observes
+  a slot can bump the refcount safely even against a concurrent last-
+  close.  The hot lookup is a new helper `fdget(fd)` which does
+  `rcu_read_lock` → acquire-load `ft` → bounds check → load slot →
+  `vfs_tryget` → `rcu_read_unlock`.  Callers drop the reference with
+  `fdput(f)` (aliased to `vfs_close`).  Writer paths (`sys_dup`,
+  `sys_dup2`, `sys_close`, `sys_pipe`, `fd_install`, `sys_fcntl`
+  F_DUPFD / F_GETFD / F_SETFD, `sys_open`, `sys_shm_open`, CLOEXEC
+  sweep in exec) serialise on a per-`task_files_t` writer spinlock.
+
+  Hot path cost on x86: `lock xadd` (pin), single fence, tag load,
+  `lock cmpxchg` for tryget, `lock xadd` on release.  No spinlock on
+  the read path.
 
 ---
 
