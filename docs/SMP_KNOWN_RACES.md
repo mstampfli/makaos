@@ -158,18 +158,24 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## 9. ext2 bcache slot contents — RESOLVED (Phase 7)
+## 9. ext2 bcache slot contents — RESOLVED (Phase 7 + 7.2)
 
-- **Fix:** `kernel/fs/ext2.c` now stores per-slot meta in
-  `s_bcache_meta[BCACHE_SIZE]` where each entry is
-  `{ seqlock_t seq; uint32_t tag; }`, 16 bytes (4 slots per cache line).
-  `read_block` is a seqlock reader: `seq_begin` → tag check → 4 KiB
-  memcpy → `seq_retry`.  On a clean hit that's three loads plus one
-  streaming memcpy — zero atomics on the slot lock line.  Writers
-  (`bcache_store`, called from `read_block` miss fill, `write_block`,
-  and the readahead prefill loop) use `seq_write_begin` /
-  `seq_write_end` which serialise multi-writer races on a per-slot
-  spinlock.  Readers never block.
+- **Phase 7.2 fix (zero-copy):** per-slot meta is now
+  `{ spinlock_t wlock; uint32_t tag; uint32_t pin; }`.  Hot readers call
+  `bcache_get(blk, scratch)` which does an optimistic
+  atomic-fetch-add on `pin`, a full fence, and a tag load — on a hit
+  that returns a `const uint8_t*` straight into the cache slot **with
+  no memcpy** and the caller pins the slot until `bcache_put`.
+  Writers (`bcache_fill`, called on miss-fill and write-through) use
+  `trylock` + pin-then-tag-invalidate + pin-recheck, bailing silently
+  on slot conflict.  On mismatch the reader falls back to `ahci_read`
+  into the caller's scratch, then opportunistically publishes into
+  the cache.  ext2 hot paths (`inode_get_block`, `dir_lookup`,
+  `read_bgd`, `read_inode`, `ext2_vfs_read` partial/multi-block,
+  `ext2_readdir`) now read the 4–128 bytes they actually need out of
+  a pinned slot instead of paying a 4 KiB memcpy per block lookup.
+  Bitmap walks and RMW paths still go through the `read_block`
+  compat shim because they need a mutable working copy.
 
 ---
 

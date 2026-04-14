@@ -2,7 +2,7 @@
 #include "ahci.h"
 #include "kheap.h"
 #include "common.h"
-#include "seqlock.h"
+#include "smp.h"
 
 // ── Multi-task-safe scratch buffers ──────────────────────────────────────
 // Function-local 4 KiB scratch buffers must NOT live on the kstack (8 KiB
@@ -70,39 +70,136 @@ static uint8_t s_blk_buf2[4096];
 // for indirect blocks (read once per file, hit cache on every subsequent
 // data block lookup) and repeated reads of the same data block.
 
-#define BCACHE_SIZE  256
+// ── Zero-copy block cache ────────────────────────────────────────────────
+// Direct-mapped, 256 slots × 4 KiB = 1 MiB BSS.  Block number % BCACHE_SIZE
+// picks the slot.  The hot read path (`bcache_get`) returns a pointer
+// straight into the cache — **no memcpy on a hit**.  The caller must
+// `bcache_put` the returned ref when done, which drops the per-slot pin
+// count so a concurrent writer can eventually refill that slot.
+//
+// Correctness protocol (pin + double-check):
+//
+//   Reader:                         Writer (bcache_fill):
+//     pin++                           trylock(wlock)
+//     smp_mb                          if (pin != 0)        unlock & skip
+//     if (tag == blk) return          save old_tag
+//     pin--                           tag = INVALID        // poison
+//                                     smp_mb
+//                                     if (pin != 0) {      // lost the race
+//                                         tag = old_tag
+//                                         unlock & skip
+//                                     }
+//                                     memcpy(data, src)
+//                                     smp_wmb
+//                                     tag = blk
+//                                     unlock
+//
+// Race proof sketch: if reader's (pin++; mb; tag_load) ordering places
+// pin++ before writer's (tag_store_INVALID; mb; pin_load), then writer's
+// second pin_load sees the reader's pin and bails (tag restored; reader
+// sees old tag, either matches or not, no torn data).  If pin++ is after
+// writer's mb, then reader's tag_load is after writer's tag_store_INVALID
+// by program order through the mb — reader sees INVALID and bails.
+// Either way, reader never returns a pointer into a slot that is being
+// rewritten.
+//
+// On slot conflict (writer finds pinned slot holding a different block),
+// the writer silently drops the cache update — next reader will miss and
+// re-fetch from disk.  Writers (miss-fill, write-back, readahead) are
+// rare compared to reads, so the dropped update is harmless.
+
+#define BCACHE_SIZE    256u
 #define BCACHE_INVALID 0xFFFFFFFFu
 
-// Meta is kept in its own small array so that the reader's hot-path probe
-// (tag compare + sequence load) touches one cache line per 4 slots instead
-// of dragging in the 4 KiB data block on every miss.  The data array stays
-// out-of-line: one page per slot, so the memcpy on a hit streams straight
-// out of the cache without polluting unrelated slots.
 typedef struct {
-    seqlock_t seq;
-    uint32_t  tag;   // block number, BCACHE_INVALID = empty
+    spinlock_t wlock;      // writer mutual exclusion (trylock only)
+    uint32_t   tag;        // block number, BCACHE_INVALID = empty
+    uint32_t   pin;        // atomic: number of active readers holding data[]
 } bcache_meta_t;
 
-static uint8_t        s_bcache_data[BCACHE_SIZE][4096];
-static bcache_meta_t  s_bcache_meta[BCACHE_SIZE];
+static uint8_t       s_bcache_data[BCACHE_SIZE][4096];
+static bcache_meta_t s_bcache_meta[BCACHE_SIZE];
+
+// Handle returned by bcache_get.  Caller keeps it on the stack and passes
+// a pointer to bcache_put when done.  `data` is NULL on I/O error.
+typedef struct {
+    const uint8_t* data;    // either the pinned cache slot or `scratch`
+    uint32_t       blk;
+    uint8_t        pinned;  // 1 = release holds a slot pin; 0 = scratch fallback
+} bcache_ref_t;
 
 static void bcache_init(void) {
-    for (int i = 0; i < BCACHE_SIZE; i++) {
-        seqlock_init(&s_bcache_meta[i].seq);
+    for (uint32_t i = 0; i < BCACHE_SIZE; i++) {
+        spin_lock_init(&s_bcache_meta[i].wlock);
         s_bcache_meta[i].tag = BCACHE_INVALID;
+        s_bcache_meta[i].pin = 0;
     }
 }
 
-// Publish fresh data into a cache slot.  Uses the seqlock's multi-writer
-// API so two CPUs that race to refill the same slot serialise on the
-// per-slot write_lock (not a global one).  Readers never block on this.
-static void bcache_store(uint32_t blk, const uint8_t* data, uint32_t len) {
+// Publish fresh data into a cache slot.  Silently skips on conflict: if
+// the slot is currently pinned by any reader, the update is dropped and
+// the caller's data lives only in their buffer.
+static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
     uint32_t slot = blk % BCACHE_SIZE;
     bcache_meta_t* m = &s_bcache_meta[slot];
-    seq_write_begin(&m->seq);
-    m->tag = blk;
+    if (!spin_trylock(&m->wlock)) return;
+    if (__atomic_load_n(&m->pin, __ATOMIC_ACQUIRE) != 0) {
+        spin_unlock(&m->wlock);
+        return;
+    }
+    uint32_t old_tag = m->tag;
+    m->tag = BCACHE_INVALID;                      // poison first
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);      // poison visible before pin recheck
+    if (__atomic_load_n(&m->pin, __ATOMIC_ACQUIRE) != 0) {
+        // Raced with a new reader pinning the old tag.  Restore and bail.
+        m->tag = old_tag;
+        spin_unlock(&m->wlock);
+        return;
+    }
     __builtin_memcpy(s_bcache_data[slot], data, len);
-    seq_write_end(&m->seq);
+    smp_wmb();                                    // data stores retire before tag publish
+    m->tag = blk;
+    spin_unlock(&m->wlock);
+}
+
+// Acquire a block.  On a cache hit, `ref.data` points directly into the
+// cache (pinned, no copy).  On a miss, the block is read from disk into
+// `scratch` and speculatively published into the cache (which may drop
+// the update on slot conflict — harmless).
+//
+// Returns `ref.data == NULL` on I/O error.  Caller must `bcache_put(&ref)`
+// on success to drop any held pin.
+static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
+    bcache_ref_t r = { NULL, blk, 0 };
+    uint32_t slot = blk % BCACHE_SIZE;
+    bcache_meta_t* m = &s_bcache_meta[slot];
+
+    // Fast path — optimistic pin, then verify the tag.  On x86 the
+    // atomic_fetch_add is a single `lock xadd` and implies a full barrier.
+    __atomic_fetch_add(&m->pin, 1u, __ATOMIC_ACQ_REL);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&m->tag, __ATOMIC_ACQUIRE) == blk) {
+        r.data   = s_bcache_data[slot];
+        r.pinned = 1;
+        return r;
+    }
+    __atomic_fetch_sub(&m->pin, 1u, __ATOMIC_RELEASE);
+
+    // Slow path — go to disk.
+    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+    if (!ahci_read(lba, scratch, s_sectors_per_blk)) return r;
+    bcache_fill(blk, scratch, s_block_size);
+    r.data = scratch;
+    return r;
+}
+
+static void bcache_put(bcache_ref_t* r) {
+    if (r->pinned) {
+        uint32_t slot = r->blk % BCACHE_SIZE;
+        __atomic_fetch_sub(&s_bcache_meta[slot].pin, 1u, __ATOMIC_RELEASE);
+        r->pinned = 0;
+    }
+    r->data = NULL;
 }
 
 
@@ -163,38 +260,28 @@ static void irtree_put(uint32_t ino, const ext2_inode_t* inode) {
 
 // ── Low-level block I/O ────────────────────────────────────────────────────
 
-// Read one filesystem block into `buf` (must be at least s_block_size bytes).
-//
-// Fast path is a seqlock reader: sample the sequence, check the tag, copy
-// the data, re-check the sequence.  On a clean hit this is three memory
-// ops plus one 4 KiB memcpy — no atomics, no cache-line ping on the slot
-// lock.  If the sequence changed mid-copy (a concurrent bcache_store or
-// bcache_invalidate hit this slot), we retry.  If the tag never matches,
-// we fall through to the disk read.
+// Copy-based read shim for callers that need a mutable scratch buffer
+// (bitmap walks, in-place inode edits, etc.).  Goes through bcache_get so
+// a hit still touches the cache once — but the caller is going to modify
+// `buf`, so we pay the 4 KiB memcpy to avoid corrupting the shared slot.
 static uint8_t read_block(uint32_t blk, uint8_t* buf) {
-    uint32_t slot = blk % BCACHE_SIZE;
-    bcache_meta_t* m = &s_bcache_meta[slot];
-    for (;;) {
-        uint32_t s = seq_begin(&m->seq);
-        if (m->tag != blk) break;  // miss (or currently being refilled to a different blk)
-        __builtin_memcpy(buf, s_bcache_data[slot], s_block_size);
-        if (!seq_retry(&m->seq, s)) return 1;
-        // Writer raced us — loop and re-sample.  On a cache miss the
-        // tag check above will fall out of the loop.
+    bcache_ref_t r = bcache_get(blk, buf);
+    if (!r.data) return 0;
+    if (r.pinned) {
+        __builtin_memcpy(buf, r.data, s_block_size);
+        bcache_put(&r);
     }
-    // Cache miss — read from disk and populate the cache.
-    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
-    if (!ahci_read(lba, buf, s_sectors_per_blk)) return 0;
-    bcache_store(blk, buf, s_block_size);
+    // If not pinned, r.data == buf (disk was read straight into it).
     return 1;
 }
 
-// Write one filesystem block from `buf`.
+// Write one filesystem block from `buf`.  Writes through to disk and
+// publishes the new contents into the block cache (skipped on slot
+// conflict — harmless, the next read will re-fetch).
 static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
     if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
-    // Update cache with the written data.
-    bcache_store(blk, buf, s_block_size);
+    bcache_fill(blk, buf, s_block_size);
     return 1;
 }
 
@@ -231,18 +318,17 @@ static uint32_t bgd_table_block(void) {
     return s_first_data_blk + 1;
 }
 
-// Read BGD for group `g` into `out`.
+// Read BGD for group `g` into `out`.  Zero-copy: we pin the slot just
+// long enough to copy 32 bytes out.
 static uint8_t read_bgd(uint32_t g, ext2_bgd_t* out) {
-    // Each BGD is 32 bytes.
     uint32_t offset_in_table = g * sizeof(ext2_bgd_t);
     uint32_t blk_idx = bgd_table_block() + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    if (!read_block(blk_idx, s_blk_buf2)) return 0;
-
-    const uint8_t* src = s_blk_buf2 + off;
-    uint8_t* dst = (uint8_t*)out;
-    for (uint32_t i = 0; i < sizeof(ext2_bgd_t); i++) dst[i] = src[i];
+    bcache_ref_t r = bcache_get(blk_idx, s_blk_buf2);
+    if (!r.data) return 0;
+    __builtin_memcpy(out, r.data + off, sizeof(ext2_bgd_t));
+    bcache_put(&r);
     return 1;
 }
 
@@ -276,11 +362,14 @@ static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
     uint32_t blk_idx = bgd.bg_inode_table + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    if (!read_block(blk_idx, s_blk_buf)) return 0;
-
-    const uint8_t* src = s_blk_buf + off;
-    uint8_t* dst = (uint8_t*)out;
-    for (uint32_t i = 0; i < sizeof(ext2_inode_t); i++) dst[i] = src[i];
+    // Zero-copy read: pin the cache slot while we copy 128 bytes of
+    // inode out.  A 4 KiB block read used to memcpy twice; now the
+    // disk-to-bcache copy happens once (on miss) and the bcache-to-out
+    // is a single tight struct copy.
+    bcache_ref_t r = bcache_get(blk_idx, s_blk_buf);
+    if (!r.data) return 0;
+    __builtin_memcpy(out, r.data + off, sizeof(ext2_inode_t));
+    bcache_put(&r);
 
     irtree_put(ino, out);  // populate cache
     return 1;
@@ -360,10 +449,13 @@ static int str_cmp_n(const char* a, const char* b, uint32_t n) {
 // Return the block number for the Nth logical block of an inode.
 // Handles direct blocks (0-11) and single-indirect block (12-267) only.
 // Returns 0 on error or if block is sparse/unallocated.
+//
+// Zero-copy: we only need 4 bytes out of each indirect block, so
+// `bcache_get` pins the slot, we load the index, `bcache_put`.  On a
+// cache hit the whole operation is 2 atomic ops and a 4-byte load —
+// no 4 KiB memcpy at all.
 static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
-    if (idx < 12) {
-        return ino->i_block[idx];
-    }
+    if (idx < 12) return ino->i_block[idx];
 
     // Single indirect.
     idx -= 12;
@@ -373,9 +465,11 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         if (!indirect_blk) return 0;
 
         EXT2_SCRATCH(ind_buf);
-        if (!read_block(indirect_blk, ind_buf)) return 0;
-        uint32_t* addrs = (uint32_t*)ind_buf;
-        return addrs[idx];
+        bcache_ref_t r = bcache_get(indirect_blk, ind_buf);
+        if (!r.data) return 0;
+        uint32_t out = ((const uint32_t*)r.data)[idx];
+        bcache_put(&r);
+        return out;
     }
 
     // Double indirect.
@@ -384,17 +478,22 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         uint32_t dblind_blk = ino->i_block[13];
         if (!dblind_blk) return 0;
 
-        EXT2_SCRATCH(dbl_buf);
-        if (!read_block(dblind_blk, dbl_buf)) return 0;
-        uint32_t* l1 = (uint32_t*)dbl_buf;
         uint32_t l1_idx = idx / addrs_per_blk;
         uint32_t l2_idx = idx % addrs_per_blk;
-        if (!l1[l1_idx]) return 0;
+
+        EXT2_SCRATCH(dbl_buf);
+        bcache_ref_t r1 = bcache_get(dblind_blk, dbl_buf);
+        if (!r1.data) return 0;
+        uint32_t l2_blk = ((const uint32_t*)r1.data)[l1_idx];
+        bcache_put(&r1);
+        if (!l2_blk) return 0;
 
         EXT2_SCRATCH(dbl_buf2);
-        if (!read_block(l1[l1_idx], dbl_buf2)) return 0;
-        uint32_t* l2 = (uint32_t*)dbl_buf2;
-        return l2[l2_idx];
+        bcache_ref_t r2 = bcache_get(l2_blk, dbl_buf2);
+        if (!r2.data) return 0;
+        uint32_t out = ((const uint32_t*)r2.data)[l2_idx];
+        bcache_put(&r2);
+        return out;
     }
 
     // Triple indirect not implemented — too large for our use case.
@@ -411,29 +510,33 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
     uint32_t blk_idx = 0;
 
     EXT2_SCRATCH_DECL(dir_buf);  // alloc lazily once we know there's data
+    uint32_t found = 0;
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(dir_ino, blk_idx);
         blk_idx++;
         if (!blk) break;
 
         if (!dir_buf) EXT2_SCRATCH_ALLOC(dir_buf);
-        if (!read_block(blk, dir_buf)) break;
+
+        // Zero-copy walk: pin the cache slot, walk the dirents in place.
+        bcache_ref_t r = bcache_get(blk, dir_buf);
+        if (!r.data) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
         uint32_t off = 0;
-
         while (off + 8 <= blk_bytes) {
-            ext2_dirent_t* de = (ext2_dirent_t*)(dir_buf + off);
+            const ext2_dirent_t* de = (const ext2_dirent_t*)(r.data + off);
             if (de->rec_len == 0) break;
-
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
                 str_cmp_n(de->name, name, name_len) == 0) {
-                return de->inode;
+                found = de->inode;
+                break;
             }
-
             off += de->rec_len;
         }
+        bcache_put(&r);
+        if (found) return found;
 
         if (blk_bytes >= s_block_size)
             bytes_left -= s_block_size;
@@ -564,11 +667,11 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
 
-                // Populate block cache from the buffer via the seqlock
-                // writer API so concurrent readers on other CPUs see a
-                // consistent slot.
+                // Populate the block cache from the DMA buffer.  bcache_fill
+                // silently skips any slot that is currently pinned by a
+                // concurrent reader — harmless, next lookup will re-read.
                 for (uint32_t r = 0; r < run; r++)
-                    bcache_store(blk + r, dest + r * s_block_size, s_block_size);
+                    bcache_fill(blk + r, dest + r * s_block_size, s_block_size);
                 uint32_t bytes = run * s_block_size;
                 total       += bytes;
                 fd->cur_pos += bytes;
@@ -576,11 +679,14 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
             }
         }
 
-        // Single block read (partial block or non-consecutive).
+        // Single block read (partial block or non-consecutive).  Pin
+        // the cache slot, copy just `to_copy` bytes from `off_in_blk`
+        // straight into the user dst — no intermediate scratch memcpy.
         if (!rd_buf) EXT2_SCRATCH_ALLOC_NEG1(rd_buf);
-        if (!read_block(blk, rd_buf)) return -1;
-        const uint8_t* src = rd_buf + off_in_blk;
-        for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
+        bcache_ref_t r = bcache_get(blk, rd_buf);
+        if (!r.data) return -1;
+        __builtin_memcpy(dst + total, r.data + off_in_blk, to_copy);
+        bcache_put(&r);
 
         total        += to_copy;
         fd->cur_pos  += to_copy;
@@ -735,13 +841,17 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
         if (!blk) break;
 
         if (!rdd_buf) EXT2_SCRATCH_ALLOC_NEG1(rdd_buf);
-        if (!read_block(blk, rdd_buf)) break;
+        // Zero-copy dirent walk: pin the cache slot and walk dirents in
+        // place.  The per-entry read_inode call pins a different slot
+        // (or hits the irtree cache entirely) so there's no self-conflict.
+        bcache_ref_t rr = bcache_get(blk, rdd_buf);
+        if (!rr.data) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
         uint32_t off = 0;
 
         while (off + 8 <= blk_bytes && count < max) {
-            ext2_dirent_t* de = (ext2_dirent_t*)(rdd_buf + off);
+            const ext2_dirent_t* de = (const ext2_dirent_t*)(rr.data + off);
             if (de->rec_len == 0) break;
 
             if (de->inode != 0) {
@@ -773,6 +883,7 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
 
             off += de->rec_len;
         }
+        bcache_put(&rr);
 
         if (blk_bytes >= s_block_size)
             bytes_left -= s_block_size;
