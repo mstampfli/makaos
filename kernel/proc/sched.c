@@ -7,6 +7,7 @@
 #include "common.h"
 #include "kheap.h"
 #include "cpu.h"
+#include "rcu.h"
 
 
 // ── MLFQ parameters ───────────────────────────────────────────────────────
@@ -24,35 +25,57 @@ static const uint8_t s_quanta[MLFQ_LEVELS] = {8, 16, 32, 64};
 task_t* g_current   = NULL;
 task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
-// ── PID -> task hash table ────────────────────────────────────────────────
-// Open-addressing hash table keyed by pid.  O(1) avg lookup/insert/delete
-// for kill/wait/ptrace.  Grows at 75% load; no fixed PID cap.
+// ── PID -> task hash table (RCU-protected) ──────────────────────────────
 //
-// Small initial capacity (64) keeps BSS near zero; doubles as tasks are
-// created.  A tombstone sentinel (PID_HT_TOMB) preserves probe chains
-// across deletes.
+// Readers (pid_ht_find) take zero locks: rcu_read_lock + rcu_dereference
+// of the state pointer, then a plain walk of the slot array.  Writers
+// (insert/remove/grow) serialize on s_pid_ht_lock.  Grow publishes the
+// new state via rcu_assign_pointer and frees the old state after
+// synchronize_rcu so any in-flight reader finishes first.
+//
+// The state struct bundles {slots, cap, count} so a reader that snapped
+// a pointer is guaranteed a consistent (array, capacity) pair — the
+// writer never mutates an already-published state, only builds a fresh
+// one during grow.
+//
+// Count updates are done by the writer on the *current* state, protected
+// by the spinlock.  Readers don't care about count.
+//
+// Tombstones (PID_HT_TOMB) mark deleted slots so probe chains survive.
+// In-flight readers that see a tombstone just skip it; they never touch
+// freed memory because the task_t is only freed after a separate
+// synchronize_rcu on exit (handled by sched_add_zombie reclaim, which
+// will be RCU-izzed in Phase 6).
 
 #define PID_HT_INIT_CAP   64u
 #define PID_HT_TOMB       ((task_t*)1uL)
 
-static task_t** s_pid_slots = NULL;
-static uint32_t s_pid_cap   = 0;
-static uint32_t s_pid_count = 0;
+typedef struct pid_ht_state {
+    task_t** slots;
+    uint32_t cap;
+    uint32_t count;
+} pid_ht_state_t;
+
+static pid_ht_state_t* s_pid_ht = NULL;        // published via rcu_assign_pointer
+static spinlock_t      s_pid_ht_lock = SPINLOCK_INIT;
 
 static uint32_t pid_hash(uint32_t pid, uint32_t cap) {
     return (pid * 2654435761u) & (cap - 1u);
 }
 
-static void pid_ht_ensure_init(void) {
-    if (s_pid_slots) return;
-    s_pid_slots = (task_t**)kmalloc((uint64_t)PID_HT_INIT_CAP * sizeof(task_t*));
-    if (!s_pid_slots) return;
-    __builtin_memset(s_pid_slots, 0, (uint64_t)PID_HT_INIT_CAP * sizeof(task_t*));
-    s_pid_cap = PID_HT_INIT_CAP;
+// Allocate a fresh state with the given capacity.  Returns NULL on OOM.
+static pid_ht_state_t* pid_ht_alloc_state(uint32_t cap) {
+    pid_ht_state_t* st = (pid_ht_state_t*)kmalloc(sizeof(pid_ht_state_t));
+    if (!st) return NULL;
+    st->slots = (task_t**)kmalloc((uint64_t)cap * sizeof(task_t*));
+    if (!st->slots) { kfree(st); return NULL; }
+    __builtin_memset(st->slots, 0, (uint64_t)cap * sizeof(task_t*));
+    st->cap   = cap;
+    st->count = 0;
+    return st;
 }
 
-// Insert t into the given slot array (caller ensures cap > count and
-// t->pid is not already present).
+// Insert t into slots[] using linear probing.  Caller ensures capacity.
 static void pid_ht_raw_insert(task_t** slots, uint32_t cap, task_t* t) {
     uint32_t i = pid_hash(t->pid, cap);
     for (;;) {
@@ -62,56 +85,94 @@ static void pid_ht_raw_insert(task_t** slots, uint32_t cap, task_t* t) {
     }
 }
 
-static int pid_ht_grow(void) {
-    uint32_t new_cap = s_pid_cap * 2u;
-    task_t** ns = (task_t**)kmalloc((uint64_t)new_cap * sizeof(task_t*));
+// Lazy initialization — called under the writer lock.
+static pid_ht_state_t* pid_ht_ensure_init_locked(void) {
+    pid_ht_state_t* st = s_pid_ht;
+    if (st) return st;
+    st = pid_ht_alloc_state(PID_HT_INIT_CAP);
+    if (!st) return NULL;
+    rcu_assign_pointer(s_pid_ht, st);
+    return st;
+}
+
+// Grow the hash table.  Publishes the new state, then synchronize_rcu
+// before freeing the old one.
+static int pid_ht_grow_locked(pid_ht_state_t* old) {
+    uint32_t new_cap = old->cap * 2u;
+    pid_ht_state_t* ns = pid_ht_alloc_state(new_cap);
     if (!ns) return -1;
-    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(task_t*));
-    for (uint32_t i = 0; i < s_pid_cap; i++) {
-        task_t* s = s_pid_slots[i];
-        if (s && s != PID_HT_TOMB) pid_ht_raw_insert(ns, new_cap, s);
+    // Copy all live entries (skip tombstones).
+    for (uint32_t i = 0; i < old->cap; i++) {
+        task_t* s = old->slots[i];
+        if (s && s != PID_HT_TOMB) pid_ht_raw_insert(ns->slots, new_cap, s);
     }
-    kfree(s_pid_slots);
-    s_pid_slots = ns;
-    s_pid_cap   = new_cap;
+    ns->count = old->count;
+    // Publish the new state.  Readers who dereference s_pid_ht after
+    // this point see the new array; readers who dereferenced before see
+    // the old one.
+    rcu_assign_pointer(s_pid_ht, ns);
+    // Wait for any in-flight readers on the old state to finish, then
+    // reclaim it.  synchronize_rcu is a no-op on UP.
+    synchronize_rcu();
+    kfree(old->slots);
+    kfree(old);
     return 0;
 }
 
 void pid_ht_insert(task_t* t) {
     if (!t) return;
-    pid_ht_ensure_init();
-    if (!s_pid_slots) return;
-    if (s_pid_count * 4u >= s_pid_cap * 3u)
-        if (pid_ht_grow() < 0) return;
-    pid_ht_raw_insert(s_pid_slots, s_pid_cap, t);
-    s_pid_count++;
+    spin_lock(&s_pid_ht_lock);
+    pid_ht_state_t* st = pid_ht_ensure_init_locked();
+    if (!st) { spin_unlock(&s_pid_ht_lock); return; }
+    // Grow at 75% load before inserting.
+    if (st->count * 4u >= st->cap * 3u) {
+        if (pid_ht_grow_locked(st) < 0) { spin_unlock(&s_pid_ht_lock); return; }
+        st = s_pid_ht;
+    }
+    pid_ht_raw_insert(st->slots, st->cap, t);
+    st->count++;
+    spin_unlock(&s_pid_ht_lock);
 }
 
 void pid_ht_remove(task_t* t) {
-    if (!t || !s_pid_slots) return;
-    uint32_t i = pid_hash(t->pid, s_pid_cap);
-    for (uint32_t n = 0; n < s_pid_cap; n++) {
-        task_t* s = s_pid_slots[i];
-        if (!s) return;                       // empty — not found
+    if (!t) return;
+    spin_lock(&s_pid_ht_lock);
+    pid_ht_state_t* st = s_pid_ht;
+    if (!st) { spin_unlock(&s_pid_ht_lock); return; }
+    uint32_t i = pid_hash(t->pid, st->cap);
+    for (uint32_t n = 0; n < st->cap; n++) {
+        task_t* s = st->slots[i];
+        if (!s) break;                          // empty — not found
         if (s == t) {
-            s_pid_slots[i] = PID_HT_TOMB;
-            s_pid_count--;
-            return;
+            // Leave a tombstone so concurrent readers stepping through
+            // this probe chain see a "skipped" slot, not an empty one
+            // (which would falsely signal "not found" for subsequent
+            // entries in the chain).  The tombstone pointer is never
+            // dereferenced.
+            atomic_store_rel((task_t* volatile*)&st->slots[i], PID_HT_TOMB);
+            st->count--;
+            break;
         }
-        i = (i + 1u) & (s_pid_cap - 1u);
+        i = (i + 1u) & (st->cap - 1u);
     }
+    spin_unlock(&s_pid_ht_lock);
 }
 
 task_t* pid_ht_find(uint32_t pid) {
-    if (!s_pid_slots) return NULL;
-    uint32_t i = pid_hash(pid, s_pid_cap);
-    for (uint32_t n = 0; n < s_pid_cap; n++) {
-        task_t* s = s_pid_slots[i];
-        if (!s) return NULL;                  // empty — not found
-        if (s != PID_HT_TOMB && s->pid == pid) return s;
-        i = (i + 1u) & (s_pid_cap - 1u);
+    rcu_read_lock();
+    pid_ht_state_t* st = rcu_dereference(s_pid_ht);
+    if (!st) { rcu_read_unlock(); return NULL; }
+    uint32_t cap = st->cap;
+    uint32_t i   = pid_hash(pid, cap);
+    task_t* result = NULL;
+    for (uint32_t n = 0; n < cap; n++) {
+        task_t* s = atomic_load_acq(&st->slots[i]);
+        if (!s) break;                          // empty — not found
+        if (s != PID_HT_TOMB && s->pid == pid) { result = s; break; }
+        i = (i + 1u) & (cap - 1u);
     }
-    return NULL;
+    rcu_read_unlock();
+    return result;
 }
 
 // Per-level FIFO queues.
@@ -477,7 +538,10 @@ static void do_switch(uint8_t preempted) {
     if (!next) {
         if (preempted) return;   // nothing to switch to — let current task keep running
         // Voluntary yield/sleep: HLT until an interrupt wakes something.
+        // Every hlt wakeup is an RCU quiescent state: we can't possibly
+        // be inside a reader section while halted.
         while (!next) {
+            rcu_note_qs();
             __asm__ volatile("sti\nhlt\ncli");
             next = dequeue();
         }
@@ -509,6 +573,11 @@ static void do_switch(uint8_t preempted) {
     g_current   = next;
     this_cpu()->current = next;
     this_cpu()->context_switches++;
+    // Every context switch is an RCU quiescent state for this CPU: the
+    // outgoing task can no longer be in a reader section, and the
+    // incoming task starts fresh.  Bumping the counter here lets
+    // synchronize_rcu() observe that this CPU has made progress.
+    rcu_note_qs();
 
     tss_set_rsp0(next->kstack_top);
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
