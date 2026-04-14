@@ -1002,6 +1002,9 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->next             = NULL;
     t->children         = NULL;
     t->child_next       = NULL;
+    t->pg_prev = t->pg_next = NULL;
+    t->tg_prev = t->tg_next = NULL;
+    t->sid_prev = t->sid_next = NULL;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
@@ -2849,7 +2852,10 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     // Can't change pgid of a session leader.
     if (t->pid == t->sid) return (uint64_t)-EPERM;
 
+    // Move between pgid hash buckets atomically w.r.t. signal delivery.
+    task_idx_pgid_changing(t);
     t->pgid = pgid;
+    task_idx_pgid_changed(t);
     return 0;
 }
 
@@ -2868,8 +2874,14 @@ static uint64_t sys_setsid(void) {
     if (!g_current) return (uint64_t)-EINVAL;
     // If we're already a process group leader we can't create a new session.
     if (g_current->pid == g_current->pgid) return (uint64_t)-EPERM;
+
+    task_idx_sid_changing(g_current);
+    task_idx_pgid_changing(g_current);
     g_current->sid  = g_current->pid;
     g_current->pgid = g_current->pid;
+    task_idx_pgid_changed(g_current);
+    task_idx_sid_changed(g_current);
+
     // New session leader starts without a controlling terminal.
     // The tty fg_pgid is updated when the shell calls TIOCSCTTY/TIOCSPGRP.
     return (uint64_t)g_current->sid;

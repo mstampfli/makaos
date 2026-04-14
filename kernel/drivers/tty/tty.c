@@ -313,6 +313,13 @@ vfs_file_t* tty_open(int idx) {
 }
 
 // ── tty_get_ctty / tty_set_ctty ──────────────────────────────────────────
+//
+// Returns the controlling tty of the current task.  Each tty stores its
+// session id (tty->session), set by TIOCSCTTY.  We find the tty whose
+// session matches g_current->sid.  Two candidates exist: the physical
+// console (g_tty0) and any open PTY slaves.  No iteration over tasks is
+// needed — the tty-side lookup is O(1) for g_tty0 and O(live PTYs) for
+// the PTY list, which is tiny.
 tty_t* tty_get_ctty(void) {
     if (!g_current) return NULL;
     // Physical console TTY.

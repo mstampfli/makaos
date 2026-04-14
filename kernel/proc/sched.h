@@ -78,6 +78,27 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data);
 // Returns NULL if not found.
 task_t* sched_find_pid(uint32_t pid);
 
+// ── Task index tables (pgid / tgid / sid → task list head) ──────────────
+// O(1) avg lookup.  Used by signal_send_{group,pgrp} and tty_get_ctty.
+// Callers walk the returned head via t->pg_next / tg_next / sid_next.
+//
+// Insert/remove are called from sched_add and sched_add_zombie / reap
+// respectively.  Mid-life ID changes use the _changing/_changed pair.
+
+void task_idx_insert(task_t* t);
+void task_idx_remove(task_t* t);
+
+// Call before mutating t->pgid or t->sid, then again after the mutation.
+void task_idx_pgid_changing(task_t* t);
+void task_idx_pgid_changed (task_t* t);
+void task_idx_sid_changing (task_t* t);
+void task_idx_sid_changed  (task_t* t);
+
+// Head-of-bucket accessors.  Returned task chains through pg_next / etc.
+task_t* task_idx_pgid_head(uint32_t pgid);
+task_t* task_idx_tgid_head(uint32_t tgid);
+task_t* task_idx_sid_head (uint32_t sid);
+
 // Called from the timer IRQ handler after sched_tick() if s_reschedule is set.
 // Performs a preemptive context switch — safe to call from IRQ context because
 // context_switch saves the IRQ stub's rsp; iretq in the stub restores it later.

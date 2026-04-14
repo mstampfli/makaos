@@ -125,6 +125,198 @@ static task_t* s_sleep_head = NULL;
 // Tasks stay here until the parent calls wait() to reap them.
 static task_t* s_zombie_head = NULL;
 
+// ── Task index hash tables (pgid / tgid / sid → task list) ──────────────
+// Three open-addressing hash tables keyed on group IDs.  Each slot holds
+// a doubly-linked list of tasks sharing that ID, chained through the
+// pg_prev/pg_next (or tg_*, sid_*) pointers in task_t.
+//
+// Used to make signal_send_pgrp / signal_send_group / tty_get_ctty O(list
+// length in the group) instead of O(total tasks in system).
+//
+// Locking (SMP): today these run under the implicit UP lock; when SMP
+// arrives each table gains a spinlock_t lock field protecting insert/
+// remove/iterate.
+//
+// Each table stores a head pointer per bucket.  NULL = empty bucket.
+// Deletes use tombstones only for *slots whose head is NULL*; since we
+// delete by unlinking from the per-bucket list, we can keep the slot
+// marker "alive" if other tasks still hash to the same bucket — but
+// that's handled naturally by leaving the bucket head pointing at the
+// remaining chain.  When the last task leaves a bucket, we set it to
+// a tombstone to preserve probe chains for other IDs that collided here.
+
+#define TIDX_INIT_CAP 32u
+#define TIDX_TOMB     ((task_t*)1uL)
+
+typedef struct {
+    task_t**  slots;
+    uint32_t  cap;
+    uint32_t  count;      // number of non-empty buckets (not tasks)
+} task_idx_t;
+
+static task_idx_t s_pgid_ht;
+static task_idx_t s_tgid_ht;
+static task_idx_t s_sid_ht;
+
+static uint32_t tidx_hash(uint32_t key, uint32_t cap) {
+    return (key * 2654435761u) & (cap - 1u);
+}
+
+// Offset into task_t of {pg,tg,sid}_prev pointers.  We use a pair of
+// functions per-table rather than offsets to keep the code legible.
+
+// Ensure table has a slots array.
+static void tidx_ensure_init(task_idx_t* ht) {
+    if (ht->slots) return;
+    ht->slots = (task_t**)kmalloc((uint64_t)TIDX_INIT_CAP * sizeof(task_t*));
+    if (!ht->slots) return;
+    for (uint32_t i = 0; i < TIDX_INIT_CAP; i++) ht->slots[i] = NULL;
+    ht->cap = TIDX_INIT_CAP;
+}
+
+// Find bucket index for `key`.  Returns ht->cap if not present.
+// A bucket is "present" iff its head slot is neither NULL nor TIDX_TOMB
+// AND the head task's relevant ID equals `key`.
+//
+// We need table-specific access to read the head task's ID, so the caller
+// passes a getter.
+typedef uint32_t (*tidx_keyof_t)(const task_t*);
+
+static uint32_t tidx_find(const task_idx_t* ht, uint32_t key, tidx_keyof_t keyof) {
+    if (!ht->slots) return ht->cap;
+    uint32_t i = tidx_hash(key, ht->cap);
+    for (uint32_t n = 0; n < ht->cap; n++) {
+        task_t* head = ht->slots[i];
+        if (!head) return ht->cap;               // empty — not found
+        if (head != TIDX_TOMB && keyof(head) == key) return i;
+        i = (i + 1u) & (ht->cap - 1u);
+    }
+    return ht->cap;
+}
+
+// Find an insertion slot for `key` — first empty/tomb along the probe chain.
+// Caller has already verified that `key` is not already present.
+static uint32_t tidx_alloc_slot(task_idx_t* ht, uint32_t key) {
+    uint32_t i = tidx_hash(key, ht->cap);
+    for (uint32_t n = 0; n < ht->cap; n++) {
+        task_t* s = ht->slots[i];
+        if (!s || s == TIDX_TOMB) return i;
+        i = (i + 1u) & (ht->cap - 1u);
+    }
+    return ht->cap; // full — caller must grow
+}
+
+static int tidx_grow(task_idx_t* ht, tidx_keyof_t keyof) {
+    uint32_t new_cap = ht->cap * 2u;
+    task_t** ns = (task_t**)kmalloc((uint64_t)new_cap * sizeof(task_t*));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < new_cap; i++) ns[i] = NULL;
+    for (uint32_t i = 0; i < ht->cap; i++) {
+        task_t* head = ht->slots[i];
+        if (!head || head == TIDX_TOMB) continue;
+        uint32_t key = keyof(head);
+        uint32_t j = tidx_hash(key, new_cap);
+        for (;;) {
+            if (!ns[j]) { ns[j] = head; break; }
+            j = (j + 1u) & (new_cap - 1u);
+        }
+    }
+    kfree(ht->slots);
+    ht->slots = ns;
+    ht->cap   = new_cap;
+    return 0;
+}
+
+// ── Per-table getters and link macros ───────────────────────────────────
+static uint32_t keyof_pgid(const task_t* t) { return t->pgid; }
+static uint32_t keyof_tgid(const task_t* t) { return t->tgid; }
+static uint32_t keyof_sid (const task_t* t) { return t->sid;  }
+
+// Generic doubly-linked-list insert at head of the bucket.
+// The offsets of {prev,next} pointers are passed via accessor lambdas.
+#define TIDX_DEFINE(name, prev_field, next_field, keyof)                      \
+static void name##_insert(task_t* t) {                                        \
+    tidx_ensure_init(&s_##name);                                              \
+    if (!s_##name.slots) return;                                              \
+    if (s_##name.count * 4u >= s_##name.cap * 3u)                             \
+        if (tidx_grow(&s_##name, keyof) < 0) return;                          \
+    uint32_t key = keyof(t);                                                  \
+    uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
+    if (idx < s_##name.cap) {                                                 \
+        /* existing bucket — link at head */                                  \
+        task_t* old = s_##name.slots[idx];                                    \
+        t->prev_field = NULL;                                                 \
+        t->next_field = old;                                                  \
+        if (old) old->prev_field = t;                                         \
+        s_##name.slots[idx] = t;                                              \
+    } else {                                                                  \
+        /* new bucket */                                                      \
+        uint32_t slot = tidx_alloc_slot(&s_##name, key);                      \
+        if (slot >= s_##name.cap) return;                                     \
+        t->prev_field = NULL;                                                 \
+        t->next_field = NULL;                                                 \
+        s_##name.slots[slot] = t;                                             \
+        s_##name.count++;                                                     \
+    }                                                                         \
+}                                                                             \
+                                                                              \
+static void name##_remove(task_t* t) {                                        \
+    if (!s_##name.slots) return;                                              \
+    uint32_t key = keyof(t);                                                  \
+    uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
+    if (idx >= s_##name.cap) return;                                          \
+    /* Unlink from doubly-linked list */                                      \
+    task_t* prev = t->prev_field;                                             \
+    task_t* next = t->next_field;                                             \
+    if (prev) prev->next_field = next;                                        \
+    if (next) next->prev_field = prev;                                        \
+    if (s_##name.slots[idx] == t) {                                           \
+        /* was head — replace with next, or tombstone if list now empty */    \
+        s_##name.slots[idx] = next ? next : TIDX_TOMB;                        \
+        if (!next) s_##name.count--;                                          \
+    }                                                                         \
+    t->prev_field = NULL;                                                     \
+    t->next_field = NULL;                                                     \
+}                                                                             \
+                                                                              \
+task_t* name##_head(uint32_t key) {                                           \
+    if (!s_##name.slots) return NULL;                                         \
+    uint32_t idx = tidx_find(&s_##name, key, keyof);                          \
+    return (idx < s_##name.cap) ? s_##name.slots[idx] : NULL;                 \
+}
+
+TIDX_DEFINE(pgid_ht, pg_prev,  pg_next,  keyof_pgid)
+TIDX_DEFINE(tgid_ht, tg_prev,  tg_next,  keyof_tgid)
+TIDX_DEFINE(sid_ht,  sid_prev, sid_next, keyof_sid)
+
+// Public entry points (declared in sched.h).
+void task_idx_insert(task_t* t) {
+    if (!t) return;
+    pgid_ht_insert(t);
+    tgid_ht_insert(t);
+    sid_ht_insert(t);
+}
+
+void task_idx_remove(task_t* t) {
+    if (!t) return;
+    pgid_ht_remove(t);
+    tgid_ht_remove(t);
+    sid_ht_remove(t);
+}
+
+// Used by sys_setpgid to update membership when a task's pgid changes.
+// The caller must have already updated t->pgid to the new value AFTER the
+// remove — otherwise we can't find the old bucket.  So the correct
+// sequence is: task_idx_pgid_changing(t); t->pgid = new; task_idx_pgid_changed(t);
+void task_idx_pgid_changing(task_t* t) { pgid_ht_remove(t); }
+void task_idx_pgid_changed (task_t* t) { pgid_ht_insert(t); }
+void task_idx_sid_changing (task_t* t) { sid_ht_remove(t);  }
+void task_idx_sid_changed  (task_t* t) { sid_ht_insert(t);  }
+
+task_t* task_idx_pgid_head(uint32_t pgid) { return pgid_ht_head(pgid); }
+task_t* task_idx_tgid_head(uint32_t tgid) { return tgid_ht_head(tgid); }
+task_t* task_idx_sid_head (uint32_t sid)  { return sid_ht_head(sid);   }
+
 // Idle process — never put on a queue, runs when all queues are empty.
 static uint8_t      s_idle_stack[PAGE_SIZE];
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
@@ -192,6 +384,7 @@ void sched_add(task_t* proc) {
     if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
         g_init_task = proc;
     pid_ht_insert(proc);
+    task_idx_insert(proc);
     enqueue(proc);
 }
 
@@ -369,6 +562,7 @@ void sched_wake(task_t* proc) {
 // Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
 void sched_add_zombie(task_t* t) {
     pid_ht_remove(t);
+    task_idx_remove(t);
     t->next = s_zombie_head;
     s_zombie_head = t;
 }
