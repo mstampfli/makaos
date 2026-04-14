@@ -24,21 +24,20 @@ extern uint64_t g_signal_rdi;
 extern uint8_t  g_signal_in_syscall;
 
 // ── signal_send ───────────────────────────────────────────────────────────
+// Atomically set the pending bit.  Cross-CPU senders never race with the
+// receiver's deliver path because bit set/clear are LOCK-prefixed under SMP.
 void signal_send(task_t* t, int sig) {
     if (!t) return;
     if (sig < 1 || sig >= NSIG) return;
 
+    uint32_t bit = 1u << (uint32_t)(sig - 1);
+
     // SIGKILL is unblockable — forcibly clear the blocked bit.
     if (sig == SIGKILL)
-        t->sigstate.blocked &= ~(1u << (uint32_t)(sig - 1));
+        t->sigstate.blocked &= ~bit;
 
-    // Enqueue into ring buffer.  If full, drop.
-    sigstate_t* ss = &t->sigstate;
-    uint8_t next_tail = (ss->tail + 1) & (SIG_QUEUE_SIZE - 1);
-    if (next_tail != ss->head) {
-        ss->queue[ss->tail] = (uint8_t)sig;
-        ss->tail = next_tail;
-    }
+    // Set the pending bit atomically.  Coalesces repeat sends (classic POSIX).
+    atomic_or(&t->sigstate.pending, bit);
 
     // Wake the task if sleeping.
     if (t->state == TASK_SLEEPING)
@@ -128,30 +127,15 @@ void signal_deliver_pending(void) {
 
     sigstate_t* ss = &g_current->sigstate;
 
-    // Dequeue the first unblocked signal.
-    int sig = 0;
-    uint8_t scan = ss->head;
-    while (scan != ss->tail) {
-        uint8_t candidate = ss->queue[scan];
-        uint32_t bit = 1u << (uint32_t)(candidate - 1);
-        if (!(ss->blocked & bit)) {
-            sig = (int)candidate;
-            if (scan == ss->head) {
-                ss->head = (ss->head + 1) & (SIG_QUEUE_SIZE - 1);
-            } else {
-                uint8_t i = scan;
-                while (i != ss->tail) {
-                    uint8_t next = (i + 1) & (SIG_QUEUE_SIZE - 1);
-                    ss->queue[i] = ss->queue[next];
-                    i = next;
-                }
-                ss->tail = (ss->tail - 1) & (SIG_QUEUE_SIZE - 1);
-            }
-            break;
-        }
-        scan = (scan + 1) & (SIG_QUEUE_SIZE - 1);
-    }
-    if (!sig) return;
+    // Pick the lowest-numbered pending-and-not-blocked signal.  Classic
+    // POSIX priority: lower signal numbers deliver first (so a pending
+    // SIGKILL wins over SIGCHLD).
+    uint32_t eff = ss->pending & ~ss->blocked;
+    if (!eff) return;
+    int bit = __builtin_ctz(eff);
+    int sig = bit + 1;
+    // Clear the pending bit atomically before dispatching.
+    atomic_clear_bit(&ss->pending, (unsigned)bit);
 
     k_sigaction_t* ka = &ss->handlers[sig < NSIG ? sig : 0];
     uint64_t handler = (sig < NSIG) ? ka->sa_handler : (uint64_t)SIG_DFL;
