@@ -19,10 +19,11 @@
 //   - Suitable for short critical sections that touch shared state and must
 //     not be interrupted by the scheduler (e.g. driver init sequences).
 //
-// Per-task depth counter lives in task_t::preempt_depth.
-// Before tasks exist (early boot), g_current == &s_idle which has depth 0;
-// preempt_disable on the boot stack works correctly since sched_preempt()
-// checks the depth before switching.
+// Per-CPU depth counter lives in cpu_t::preempt_depth (see cpu.h).
+// Early boot is safe: g_cpus[] is BSS-zeroed, so the depth reads as 0
+// before cpu_init_bsp() runs.  sched_preempt() checks the depth before
+// switching so preempt_disable on the boot stack is correct from the
+// very first instruction.
 
 void preempt_disable(void);
 void preempt_enable(void);

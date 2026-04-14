@@ -6,6 +6,7 @@
 #include "tss.h"
 #include "common.h"
 #include "kheap.h"
+#include "cpu.h"
 
 
 // ── MLFQ parameters ───────────────────────────────────────────────────────
@@ -376,6 +377,11 @@ void sched_init(void) {
         s_heads[i] = s_tails[i] = NULL;
 
     g_current = &s_idle;
+    // Mirror into the per-CPU slot so this_cpu()->current is always in
+    // sync.  Phase 5 will make this the primary storage and demote
+    // g_current to a compatibility macro.
+    this_cpu()->current = &s_idle;
+    this_cpu()->idle    = &s_idle;
     timer_register_tick(sched_tick);
 }
 
@@ -501,6 +507,8 @@ static void do_switch(uint8_t preempted) {
 
     next->state = TASK_RUNNING;
     g_current   = next;
+    this_cpu()->current = next;
+    this_cpu()->context_switches++;
 
     tss_set_rsp0(next->kstack_top);
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
@@ -522,7 +530,7 @@ void sched_preempt(void) {
     if (!s_reschedule) return;
     // Honour preemption disable: defer the switch until depth reaches zero.
     // The preempt_enable() path will call sched_preempt() again then.
-    if (g_current && g_current->preempt_depth > 0) return;
+    if (this_cpu()->preempt_depth > 0) return;
     s_reschedule = 0;
     do_switch(1);
 }

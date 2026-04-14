@@ -9,6 +9,7 @@
 #include "pic.h"
 #include "timer.h"
 #include "sched.h"
+#include "cpu.h"
 #include "ahci.h"
 #include "ext2.h"
 #include "elf.h"
@@ -152,6 +153,7 @@ void kmain(void) {
     // ── CPU structures ────────────────────────────────────────────────────
     tss_init();
     syscall_init();
+    cpu_init_bsp();           // per-CPU state for the BSP (Phase 1 SMP)
 
     // ── Scheduler + timer — sched_init must precede timer_init ───────────
     sched_init();
