@@ -14,22 +14,15 @@ Format:
 
 ---
 
-## 1. `irq_wait` waiter list head
+## 1. `irq_wait` waiter list head — RESOLVED (Phase 3)
 
-- **Location:** `kernel/arch/x86_64/irq_wait.c` — `s_head[irq]` linked list
-- **Race:** `irq_wait` pushes a stack-allocated node onto `s_head[irq]`;
-  `irq_notify` pops the whole list and wakes each waiter. Both paths
-  currently use `cli` for same-CPU atomicity. Under SMP, CPU A can be
-  in `irq_wait` mid-push while CPU B's IRQ handler on the same line
-  (or a different line steered to CPU B) calls `irq_notify` and
-  mutates the head — torn list.
-- **Why safe on UP:** `cli` masks interrupts on the one CPU that exists,
-  so no concurrent access to `s_head[irq]` is possible.
-- **Fix phase:** Phase 3 — lock-free data structures.
-- **Fix strategy:** replace the `s_head[irq]` linked list with an MPSC
-  wait queue (multi-producer waiters, single-consumer IRQ handler).
-  Push is a single atomic `xchg` on the tail pointer. Pop is lock-free
-  by the owner.
+- **Location:** `kernel/arch/x86_64/irq_wait.c`
+- **Fix:** `s_head[irq]` linked list replaced with
+  `s_wq[irq]` of `wait_queue_t`. Waiters stack-allocate a
+  `task_we_t` and push onto the queue via the lock-free MPSC CAS.
+  `irq_notify` calls `wait_queue_wake_all` which detaches the whole
+  chain with one xchg.  Same-CPU races covered by `cli`; cross-CPU
+  races covered by the atomic primitives in the wait queue itself.
 
 ---
 
@@ -170,22 +163,26 @@ Format:
 
 ---
 
-## 11. Pipe / PTY / TTY single-waiter fields
+## 11. Pipe / PTY / TTY / unix / socket single-waiter fields — RESOLVED (Phase 3)
 
-- **Location:**
-  - `kernel/fs/pipe.c` — `pipe_buf_t.reader`
-  - `kernel/drivers/tty/tty.c` — `tty_t.reader`
-  - `kernel/drivers/tty/pty.c` — `pty_t.m_reader`, `pty_t.slave.reader`
-  - `kernel/net/unix_sock.c` — `unix_sock_t.waiter`
-- **Race:** each of these is a `task_t*` field set by the reader and
-  cleared by the writer on wake. Under SMP, two CPUs can race: one
-  writing `t = g_current`, another reading and calling `sched_wake(t)`.
-  Torn writes or use-after-store-free.
-- **Why safe on UP:** reader always sleeps before writer can access.
-- **Fix phase:** Phase 3 — replace single-waiter with MPSC wait queue.
-- **Fix strategy:** each of these becomes a full MPSC wait queue with
-  atomic push/pop. Multiple readers can queue; writer wakes them all
-  or one, as appropriate.
+- **Locations (all now using lock-free MPSC wait queues):**
+  - `kernel/fs/pipe.c` — `pipe_buf_t.reader` removed; uses
+    read_file->waitq / write_file->waitq
+  - `kernel/drivers/tty/tty.c` — `tty_t.reader` removed; uses tty->waitq
+  - `kernel/drivers/tty/pty.c` — `pty_t.m_reader` removed; uses
+    master_waitq and slave.waitq
+  - `kernel/net/unix_sock.c` — `unix_sock_t.waiter` removed; new
+    `wait_queue_t waitq` field
+  - `kernel/net/socket.c` — `socket_t.waiter` removed; new
+    `wait_queue_t waitq` field
+- **Fix:** every blocking caller now stack-allocates a `task_we_t`,
+  registers it on the relevant wait_queue_t, re-checks the condition
+  under the registration (closes lost-wakeup window), then sleeps.
+  Writers call `wait_queue_wake_all` which atomically drains the
+  chain and fires each entry's callback.
+- **SMP safety:** push is lock-free CAS, drain is lock-free xchg;
+  cancellation (`wq_remove`) takes a tiny per-queue spinlock that is
+  never held on the hot wake path.
 
 ---
 

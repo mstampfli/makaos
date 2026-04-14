@@ -65,12 +65,8 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
     }
-    // Wake master reader if sleeping in blocking read().
-    if (pty->m_reader) {
-        sched_wake(pty->m_reader);
-        pty->m_reader = NULL;
-    }
-    // Wake all poll/epoll waiters on the master fd.
+    // Wake every waiter on the master queue — blocking readers
+    // (task_we_t) and poll/epoll (epoll_we_t) share the same queue.
     wait_queue_wake_all(&pty->master_waitq);
 }
 
@@ -91,11 +87,20 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (!pty->slave_open_count) return 0; // EOF: slave closed
         return -11; // EAGAIN
     }
-    // Block until data available
-    while (mb_empty(pty)) {
+    // Block until data available.  Register a task_we_t on the
+    // master's wait queue, then re-check — closes the lost-wakeup race.
+    for (;;) {
+        if (!mb_empty(pty)) break;
         if (!pty->slave_open_count) return 0;  // EOF: slave closed
-        pty->m_reader = g_current;
-        sched_sleep();
+
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&pty->master_waitq, &node);
+        if (mb_empty(pty) && pty->slave_open_count) {
+            sched_sleep();
+        }
+        task_we_remove(&pty->master_waitq, &node);
+
         if (signal_has_actionable(&g_current->sigstate))
             return -4; // EINTR
     }
@@ -138,11 +143,9 @@ static void pty_master_close(vfs_file_t* self) {
 
     pty->master_open = 0;
 
-    // Wake any slave reader (they'll get EOF / EIO)
-    if (pty->slave.reader) {
-        sched_wake(pty->slave.reader);
-        pty->slave.reader = NULL;
-    }
+    // Wake any slave reader (they'll get EOF / EIO).  Blocking readers
+    // sleep on slave.waitq, poll/epoll waiters too — one wake_all
+    // fires both.
     wait_queue_wake_all(&pty->slave.waitq);
 
     kfree(ctx);
@@ -183,10 +186,18 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
                   : tty->termios.c_cc[VMIN];
     if (vmin == 0) vmin = 1;
 
-    while (tty->rd_head == tty->rd_tail) {
+    for (;;) {
+        if (tty->rd_head != tty->rd_tail) break;
         if (!ctx->pty->master_open) return 0; // EOF
-        tty->reader = g_current;
-        sched_sleep();
+
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&tty->waitq, &node);
+        if (tty->rd_head == tty->rd_tail && ctx->pty->master_open) {
+            sched_sleep();
+        }
+        task_we_remove(&tty->waitq, &node);
+
         if (signal_has_actionable(&g_current->sigstate))
             return -4; // EINTR
     }
@@ -249,11 +260,7 @@ static void pty_slave_close(vfs_file_t* self) {
 
     pty->slave_open_count--;
 
-    // Wake master reader (EOF)
-    if (pty->m_reader) {
-        sched_wake(pty->m_reader);
-        pty->m_reader = NULL;
-    }
+    // Wake every master-side waiter so they observe EOF.
     wait_queue_wake_all(&pty->master_waitq);
 
     kfree(ctx);

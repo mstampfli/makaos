@@ -59,17 +59,14 @@ static void ldisc_erase_char(tty_t* tty) {
     }
 }
 
-// ── Flush canonical line buffer to read_buf, then wake reader ────────────
+// ── Flush canonical line buffer to read_buf, then wake readers ──────────
 static void ldisc_flush_line(tty_t* tty) {
     for (uint32_t i = 0; i < tty->line_len; i++)
         rd_push(tty, tty->line_buf[i]);
     tty->line_len = 0;
-    // Wake blocked reader (blocking read()).
-    if (tty->reader) {
-        sched_wake(tty->reader);
-        tty->reader = NULL;
-    }
-    // Wake all poll/epoll waiters.
+    // Wake every waiter on the tty's queue — blocking readers register
+    // task_we_t nodes, poll/epoll registers epoll_we_t nodes.  A single
+    // wake_all drains them all.
     wait_queue_wake_all(&tty->waitq);
 }
 
@@ -168,10 +165,6 @@ void tty_input_char(tty_t* tty, char c) {
 
     if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
     rd_push(tty, (uint8_t)c);
-    if (tty->reader) {
-        sched_wake(tty->reader);
-        tty->reader = NULL;
-    }
     wait_queue_wake_all(&tty->waitq);
 }
 
@@ -209,26 +202,32 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                   : tty->termios.c_cc[VMIN];
     if (vmin == 0) vmin = 1; // always read at least 1
 
-    // Block until at least vmin bytes are available.
-    // Register as reader BEFORE the empty check to avoid losing a wakeup:
-    //   if input arrives between the check and sched_sleep(), ldisc_flush_line
-    //   will call sched_wake(tty->reader) and find us already registered.
-    tty->reader = g_current;
-    while (rb_empty(tty->rd_head, tty->rd_tail)) {
-        sched_sleep();
-        tty->reader = g_current;  // re-arm for the next iteration
-        // Woken by tty_input_char or signal delivery.
-        // Only return EINTR if a signal will actually be delivered to userspace.
-        // Signals with SIG_DFL-ignore disposition (SIGCHLD, SIGWINCH) must not
-        // interrupt a blocking read — they will be silently discarded on the next
-        // syscall return path, and returning EINTR here causes an infinite loop
-        // since the signal stays queued until signal_deliver_pending() runs.
-        if (signal_has_actionable(&g_current->sigstate)) {
-            tty->reader = NULL;
-            return -4; // -EINTR
+    // Block until at least vmin bytes are available.  Each iteration
+    // registers a fresh task_we_t on the tty's wait queue, then
+    // re-checks the buffer.  Registration BEFORE the check closes the
+    // lost-wakeup race: if input arrives between our check and the
+    // sched_sleep, wait_queue_wake_all will find our entry and wake us.
+    //
+    // Signals with SIG_DFL-ignore disposition (SIGCHLD, SIGWINCH) must
+    // NOT interrupt the read — they're silently discarded on the syscall
+    // return path, and returning EINTR here causes an infinite loop
+    // since the signal stays queued until signal_deliver_pending runs.
+    for (;;) {
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&tty->waitq, &node);
+
+        if (!rb_empty(tty->rd_head, tty->rd_tail)) {
+            task_we_remove(&tty->waitq, &node);
+            break;
         }
+
+        sched_sleep();
+        task_we_remove(&tty->waitq, &node);
+
+        if (signal_has_actionable(&g_current->sigstate))
+            return -4; // -EINTR
     }
-    tty->reader = NULL;
 
     // Drain up to len bytes.
     while (got < len) {
@@ -388,7 +387,6 @@ void tty_init(void) {
     tty->rd_head   = 0;
     tty->rd_tail   = 0;
     tty->line_len  = 0;
-    tty->reader    = NULL;
     wait_queue_init(&tty->waitq);
     tty->write_char = console_write_char;
 

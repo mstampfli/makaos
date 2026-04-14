@@ -127,8 +127,9 @@ typedef struct unix_sock {
     unix_ancillary_t ancillary;
 
     // ── Blocking support ─────────────────────────────────────────────────
-    // Task(s) sleeping on this socket (accept, recv, connect, send-when-full).
-    void* waiter;   // task_t* — avoid circular include
+    // Wait queue for tasks sleeping on this socket (accept, recv,
+    // connect, send-when-full).  SMP-safe lock-free MPSC queue.
+    wait_queue_t waitq;
 
     // Back-pointer to the vfs_file_t wrapping this socket (for poll wakeups).
     struct vfs_file_t* file;

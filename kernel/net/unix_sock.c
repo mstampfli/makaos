@@ -134,13 +134,9 @@ static void zero_mem(void* p, uint32_t n) {
     __builtin_memset(p, 0, n);
 }
 
-// Wake a task sleeping on a socket (blocking recv/accept/connect).
+// Wake every task sleeping on a socket (blocking recv/accept/connect/send).
 static void unix_wake(unix_sock_t* s) {
-    if (s->waiter) {
-        task_t* w = (task_t*)s->waiter;
-        s->waiter = NULL;
-        sched_wake(w);
-    }
+    wait_queue_wake_all(&s->waitq);
 }
 
 // Wake all tasks sleeping in poll/epoll on this socket's vfs_file.
@@ -265,6 +261,7 @@ vfs_file_t* unix_sock_open(int type) {
     unix_sock_t* s = kmalloc(sizeof(unix_sock_t));
     if (!s) return NULL;
     zero_mem(s, sizeof(unix_sock_t));
+    wait_queue_init(&s->waitq);
 
     s->type  = (uint8_t)type;
     s->state = UNIX_STATE_UNCONNECTED;
@@ -332,10 +329,16 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
     if (!listener || listener->type != SOCK_STREAM) return NULL;
     if (listener->state != UNIX_STATE_LISTENING) return NULL;
 
-    // Block until a pending connection is available.
-    while (!listener->backlog_head) {
-        listener->waiter = g_current;
-        sched_sleep();
+    // Block until a pending connection is available.  Register on the
+    // listener's wait queue before re-checking — closes the lost-wakeup
+    // window with a concurrent connect() on another CPU.
+    for (;;) {
+        if (listener->backlog_head) break;
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&listener->waitq, &node);
+        if (!listener->backlog_head) sched_sleep();
+        task_we_remove(&listener->waitq, &node);
         // If listener was closed while we slept, bail out.
         if (listener->state != UNIX_STATE_LISTENING) return NULL;
     }
@@ -431,8 +434,11 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
 
     // Block until accept() completes the pairing (or listener closes).
     while (s->state == UNIX_STATE_CONNECTING) {
-        s->waiter = g_current;
-        sched_sleep();
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&s->waitq, &node);
+        if (s->state == UNIX_STATE_CONNECTING) sched_sleep();
+        task_we_remove(&s->waitq, &node);
     }
 
     if (s->state != UNIX_STATE_CONNECTED) {
@@ -481,8 +487,11 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
                 if (peer->buf_count >= UNIX_BUF_SIZE) {
                     if (f->flags & O_NONBLOCK)
                         return total > 0 ? (int)total : -EAGAIN;
-                    s->waiter = g_current;
-                    sched_sleep();
+                    task_we_t node;
+                    task_we_init(&node, g_current);
+                    task_we_add(&s->waitq, &node);
+                    if (peer->buf_count >= UNIX_BUF_SIZE) sched_sleep();
+                    task_we_remove(&s->waitq, &node);
                 }
             }
         }
@@ -504,11 +513,17 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
 
     if (s->type == SOCK_STREAM) {
         // Block until data available or peer disconnects.
-        while (s->buf_count == 0) {
+        for (;;) {
+            if (s->buf_count != 0) break;
             if (s->state == UNIX_STATE_DISCONNECTED) return 0; // EOF
             if (f->flags & O_NONBLOCK) return -EAGAIN;
-            s->waiter = g_current;
-            sched_sleep();
+
+            task_we_t node;
+            task_we_init(&node, g_current);
+            task_we_add(&s->waitq, &node);
+            if (s->buf_count == 0 && s->state != UNIX_STATE_DISCONNECTED)
+                sched_sleep();
+            task_we_remove(&s->waitq, &node);
         }
 
         uint32_t got = cbuf_read(s, buf, len);
@@ -520,11 +535,17 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
     }
 
     // SOCK_DGRAM: dequeue one message.
-    while (!s->dgram_head) {
+    for (;;) {
+        if (s->dgram_head) break;
         if (s->state == UNIX_STATE_DISCONNECTED) return 0;
         if (f->flags & O_NONBLOCK) return -EAGAIN;
-        s->waiter = g_current;
-        sched_sleep();
+
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&s->waitq, &node);
+        if (!s->dgram_head && s->state != UNIX_STATE_DISCONNECTED)
+            sched_sleep();
+        task_we_remove(&s->waitq, &node);
     }
 
     unix_dgram_t* msg = s->dgram_head;
@@ -644,10 +665,17 @@ vfs_file_t* unix_sock_recvfd(vfs_file_t* sock) {
     unix_ancillary_t* anc = &s->ancillary;
 
     // Block until an fd is available or peer disconnects.
-    while (anc->count == 0) {
+    for (;;) {
+        if (anc->count != 0) break;
         if (s->state == UNIX_STATE_DISCONNECTED && !s->peer) return NULL;
-        s->waiter = g_current;
-        sched_sleep();
+
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&s->waitq, &node);
+        if (anc->count == 0 &&
+            !(s->state == UNIX_STATE_DISCONNECTED && !s->peer))
+            sched_sleep();
+        task_we_remove(&s->waitq, &node);
     }
 
     uint8_t idx = anc->head;

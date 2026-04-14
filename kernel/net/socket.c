@@ -228,6 +228,7 @@ vfs_file_t* socket_open(int domain, int type) {
     if (!s) return 0;
 
     __builtin_memset(s, 0, sizeof(socket_t));
+    wait_queue_init(&s->waitq);
 
     s->type = (uint8_t)type;
 
@@ -337,6 +338,7 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     socket_t* cs = (socket_t*)kmalloc(sizeof(socket_t));
     if (!cs) { tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
     __builtin_memset(cs, 0, sizeof(socket_t));
+    wait_queue_init(&cs->waitq);
     cs->type  = SOCK_STREAM;
     cs->pcb   = child_pcb;
     cs->bound = 1;
@@ -444,11 +446,14 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
     }
 
     // UDP: wait for a datagram (or EAGAIN in nonblock).
-    while (!s->udp_rx_head) {
+    for (;;) {
+        if (s->udp_rx_head) break;
         if (nonblock) return -EAGAIN;
-        s->waiter = g_current;
-        sched_sleep();
-        s->waiter = 0;
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&s->waitq, &node);
+        if (!s->udp_rx_head) sched_sleep();
+        task_we_remove(&s->waitq, &node);
     }
 
     skbuff_t* skb = s->udp_rx_head;
@@ -507,11 +512,14 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
 
     int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
 
-    while (!s->udp_rx_head) {
+    for (;;) {
+        if (s->udp_rx_head) break;
         if (nonblock) return -EAGAIN;
-        s->waiter = g_current;
-        sched_sleep();
-        s->waiter = 0;
+        task_we_t node;
+        task_we_init(&node, g_current);
+        task_we_add(&s->waitq, &node);
+        if (!s->udp_rx_head) sched_sleep();
+        task_we_remove(&s->waitq, &node);
     }
 
     skbuff_t* skb = s->udp_rx_head;
@@ -613,11 +621,7 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     s->udp_rx_count++;
 
     // Wake any task blocked in socket_recv / socket_recvfrom.
-    if (s->waiter) {
-        task_t* w = (task_t*)s->waiter;
-        s->waiter = 0;
-        sched_wake(w);
-    }
+    wait_queue_wake_all(&s->waitq);
     // And any task sleeping in poll()/select() on this fd.
     sock_poll_wake(s);
 }
