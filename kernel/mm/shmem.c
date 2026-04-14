@@ -6,20 +6,71 @@
 #include "vfs.h"
 
 // ── Named namespace ──────────────────────────────────────────────────────
-// Flat table of named shmem objects.  Protected by the single-threaded
-// kernel (no SMP yet — when SMP arrives, this needs a spinlock).
+// Open-addressing hash table: shm->name → shmem_t*.
+// Keyed by name string; shm==NULL means empty slot.  Grows at 75% load.
+
+#define SHMEM_NS_INIT_CAP 32u
 
 typedef struct {
     shmem_t* shm;   // NULL = empty slot
 } ns_entry_t;
 
-static ns_entry_t s_namespace[SHMEM_NS_MAX];
+static ns_entry_t* s_namespace     = NULL;
+static uint32_t    s_namespace_cap = 0;
+static uint32_t    s_namespace_cnt = 0;
 
 // ── Internal helpers ─────────────────────────────────────────────────────
 
 static int s_streq(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a == '\0' && *b == '\0';
+}
+
+static uint32_t shm_hash_str(const char* s, uint32_t cap) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h & (cap - 1u);
+}
+
+static void shm_ns_ensure_init(void) {
+    if (s_namespace) return;
+    s_namespace = (ns_entry_t*)kmalloc(
+        (uint64_t)SHMEM_NS_INIT_CAP * sizeof(ns_entry_t));
+    if (!s_namespace) return;
+    for (uint32_t i = 0; i < SHMEM_NS_INIT_CAP; i++) s_namespace[i].shm = NULL;
+    s_namespace_cap = SHMEM_NS_INIT_CAP;
+}
+
+// Find slot index for name. Returns s_namespace_cap if not found.
+static uint32_t shm_ns_find_idx(const char* name) {
+    if (!s_namespace) return s_namespace_cap;
+    uint32_t i = shm_hash_str(name, s_namespace_cap);
+    for (uint32_t n = 0; n < s_namespace_cap; n++) {
+        if (!s_namespace[i].shm) return s_namespace_cap;
+        if (s_streq(s_namespace[i].shm->name, name)) return i;
+        i = (i + 1u) & (s_namespace_cap - 1u);
+    }
+    return s_namespace_cap;
+}
+
+static void shm_ns_raw_insert(ns_entry_t* slots, uint32_t cap, shmem_t* shm) {
+    uint32_t i = shm_hash_str(shm->name, cap);
+    for (;;) {
+        if (!slots[i].shm) { slots[i].shm = shm; return; }
+        i = (i + 1u) & (cap - 1u);
+    }
+}
+
+static int shm_ns_grow(void) {
+    uint32_t new_cap = s_namespace_cap * 2u;
+    ns_entry_t* ns2 = (ns_entry_t*)kmalloc((uint64_t)new_cap * sizeof(ns_entry_t));
+    if (!ns2) return -ENOMEM;
+    for (uint32_t i = 0; i < new_cap; i++) ns2[i].shm = NULL;
+    for (uint32_t i = 0; i < s_namespace_cap; i++)
+        if (s_namespace[i].shm) shm_ns_raw_insert(ns2, new_cap, s_namespace[i].shm);
+    kfree(s_namespace);
+    s_namespace = ns2; s_namespace_cap = new_cap;
+    return 0;
 }
 
 // ── shmem_create ─────────────────────────────────────────────────────────
@@ -158,41 +209,40 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
 
 shmem_t* shmem_ns_find(const char* name) {
     if (!name || !name[0]) return NULL;
-    for (int i = 0; i < SHMEM_NS_MAX; i++) {
-        if (s_namespace[i].shm && s_streq(s_namespace[i].shm->name, name))
-            return s_namespace[i].shm;
-    }
-    return NULL;
+    uint32_t idx = shm_ns_find_idx(name);
+    return (idx < s_namespace_cap) ? s_namespace[idx].shm : NULL;
 }
 
 // ── shmem_ns_insert ──────────────────────────────────────────────────────
 
 int shmem_ns_insert(shmem_t* shm) {
     if (!shm || !shm->name[0]) return -EINVAL;
-
-    // Check for duplicate name.
-    if (shmem_ns_find(shm->name)) return -EEXIST;
-
-    // Find an empty slot.
-    for (int i = 0; i < SHMEM_NS_MAX; i++) {
-        if (!s_namespace[i].shm) {
-            s_namespace[i].shm = shm;
-            return 0;
-        }
-    }
-    return -ENOSPC;
+    shm_ns_ensure_init();
+    if (!s_namespace) return -ENOMEM;
+    if (shm_ns_find_idx(shm->name) < s_namespace_cap) return -EEXIST;
+    if (s_namespace_cnt * 4u >= s_namespace_cap * 3u)
+        if (shm_ns_grow() < 0) return -ENOMEM;
+    shm_ns_raw_insert(s_namespace, s_namespace_cap, shm);
+    s_namespace_cnt++;
+    return 0;
 }
 
 // ── shmem_ns_remove ──────────────────────────────────────────────────────
 
 void shmem_ns_remove(shmem_t* shm) {
-    if (!shm) return;
-    for (int i = 0; i < SHMEM_NS_MAX; i++) {
-        if (s_namespace[i].shm == shm) {
-            s_namespace[i].shm = NULL;
-            return;
-        }
+    if (!shm || !shm->name[0]) return;
+    uint32_t idx = shm_ns_find_idx(shm->name);
+    if (idx >= s_namespace_cap) return;
+    // Robin Hood deletion.
+    s_namespace[idx].shm = NULL;
+    uint32_t i = (idx + 1u) & (s_namespace_cap - 1u);
+    while (s_namespace[i].shm) {
+        shmem_t* tmp = s_namespace[i].shm;
+        s_namespace[i].shm = NULL;
+        shm_ns_raw_insert(s_namespace, s_namespace_cap, tmp);
+        i = (i + 1u) & (s_namespace_cap - 1u);
     }
+    s_namespace_cnt--;
 }
 
 // ── shmem_check_access ──────────────────────────────────────────────────

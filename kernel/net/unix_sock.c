@@ -12,54 +12,115 @@
 #endif
 
 // ── Bind namespace ───────────────────────────────────────────────────────
-// Flat table mapping path → unix_sock_t*.  Protected by the single-threaded
-// kernel (add spinlock when SMP arrives).
+// Open-addressing hash table: path → unix_sock_t*.
+// sock==NULL means empty.  Grows at 75% load.  No fixed cap.
+
+#define UNIX_NS_INIT_CAP 32u
 
 typedef struct {
     char         path[UNIX_PATH_MAX];
-    unix_sock_t* sock;
+    unix_sock_t* sock;  // NULL = empty slot
 } unix_ns_entry_t;
 
-static unix_ns_entry_t s_unix_ns[UNIX_NS_MAX];
+static unix_ns_entry_t* s_unix_ns     = NULL;
+static uint32_t         s_unix_ns_cap = 0;
+static uint32_t         s_unix_ns_cnt = 0;
 
 static int ns_streq(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a == '\0' && *b == '\0';
 }
 
-static unix_sock_t* ns_find(const char* path) {
-    for (int i = 0; i < UNIX_NS_MAX; i++) {
-        if (s_unix_ns[i].sock && ns_streq(s_unix_ns[i].path, path))
-            return s_unix_ns[i].sock;
+static void ns_path_copy(char* dst, const char* src) {
+    int i = 0;
+    while (src[i] && i < UNIX_PATH_MAX - 1) { dst[i] = src[i]; i++; }
+    dst[i] = '\0';
+}
+
+static uint32_t ns_hash_str(const char* s, uint32_t cap) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h & (cap - 1u);
+}
+
+static void ns_ensure_init(void) {
+    if (s_unix_ns) return;
+    s_unix_ns = (unix_ns_entry_t*)kmalloc(
+        (uint64_t)UNIX_NS_INIT_CAP * sizeof(unix_ns_entry_t));
+    if (!s_unix_ns) return;
+    for (uint32_t i = 0; i < UNIX_NS_INIT_CAP; i++) {
+        s_unix_ns[i].sock = NULL; s_unix_ns[i].path[0] = '\0';
     }
-    return NULL;
+    s_unix_ns_cap = UNIX_NS_INIT_CAP;
+}
+
+static uint32_t ns_ht_find_idx(const char* path) {
+    if (!s_unix_ns) return s_unix_ns_cap;
+    uint32_t i = ns_hash_str(path, s_unix_ns_cap);
+    for (uint32_t n = 0; n < s_unix_ns_cap; n++) {
+        if (!s_unix_ns[i].sock) return s_unix_ns_cap;
+        if (ns_streq(s_unix_ns[i].path, path)) return i;
+        i = (i + 1u) & (s_unix_ns_cap - 1u);
+    }
+    return s_unix_ns_cap;
+}
+
+static void ns_raw_insert(unix_ns_entry_t* slots, uint32_t cap,
+                           const char* path, unix_sock_t* sock) {
+    uint32_t i = ns_hash_str(path, cap);
+    for (;;) {
+        if (!slots[i].sock) {
+            ns_path_copy(slots[i].path, path);
+            slots[i].sock = sock;
+            return;
+        }
+        i = (i + 1u) & (cap - 1u);
+    }
+}
+
+static int ns_grow(void) {
+    uint32_t new_cap = s_unix_ns_cap * 2u;
+    unix_ns_entry_t* ns2 = (unix_ns_entry_t*)kmalloc(
+        (uint64_t)new_cap * sizeof(unix_ns_entry_t));
+    if (!ns2) return -ENOMEM;
+    for (uint32_t i = 0; i < new_cap; i++) { ns2[i].sock = NULL; ns2[i].path[0] = '\0'; }
+    for (uint32_t i = 0; i < s_unix_ns_cap; i++)
+        if (s_unix_ns[i].sock)
+            ns_raw_insert(ns2, new_cap, s_unix_ns[i].path, s_unix_ns[i].sock);
+    kfree(s_unix_ns);
+    s_unix_ns = ns2; s_unix_ns_cap = new_cap;
+    return 0;
+}
+
+static unix_sock_t* ns_find(const char* path) {
+    uint32_t idx = ns_ht_find_idx(path);
+    return (idx < s_unix_ns_cap) ? s_unix_ns[idx].sock : NULL;
 }
 
 static int ns_insert(const char* path, unix_sock_t* sock) {
-    if (ns_find(path)) return -EADDRINUSE;
-    for (int i = 0; i < UNIX_NS_MAX; i++) {
-        if (!s_unix_ns[i].sock) {
-            int j = 0;
-            while (path[j] && j < UNIX_PATH_MAX - 1) {
-                s_unix_ns[i].path[j] = path[j];
-                j++;
-            }
-            s_unix_ns[i].path[j] = '\0';
-            s_unix_ns[i].sock = sock;
-            return 0;
-        }
-    }
-    return -ENOSPC;
+    ns_ensure_init();
+    if (!s_unix_ns) return -ENOMEM;
+    if (ns_ht_find_idx(path) < s_unix_ns_cap) return -EADDRINUSE;
+    if (s_unix_ns_cnt * 4u >= s_unix_ns_cap * 3u)
+        if (ns_grow() < 0) return -ENOMEM;
+    ns_raw_insert(s_unix_ns, s_unix_ns_cap, path, sock);
+    s_unix_ns_cnt++;
+    return 0;
 }
 
 static void ns_remove(const char* path) {
-    for (int i = 0; i < UNIX_NS_MAX; i++) {
-        if (s_unix_ns[i].sock && ns_streq(s_unix_ns[i].path, path)) {
-            s_unix_ns[i].sock = NULL;
-            s_unix_ns[i].path[0] = '\0';
-            return;
-        }
+    uint32_t idx = ns_ht_find_idx(path);
+    if (idx >= s_unix_ns_cap) return;
+    // Robin Hood deletion.
+    s_unix_ns[idx].sock = NULL; s_unix_ns[idx].path[0] = '\0';
+    uint32_t i = (idx + 1u) & (s_unix_ns_cap - 1u);
+    while (s_unix_ns[i].sock) {
+        unix_ns_entry_t tmp = s_unix_ns[i];
+        s_unix_ns[i].sock = NULL; s_unix_ns[i].path[0] = '\0';
+        ns_raw_insert(s_unix_ns, s_unix_ns_cap, tmp.path, tmp.sock);
+        i = (i + 1u) & (s_unix_ns_cap - 1u);
     }
+    s_unix_ns_cnt--;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────
