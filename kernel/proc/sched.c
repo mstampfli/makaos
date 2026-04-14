@@ -95,12 +95,20 @@ static pid_ht_state_t* pid_ht_ensure_init_locked(void) {
     return st;
 }
 
-// Grow the hash table.  Publishes the new state, then synchronize_rcu
-// before freeing the old one.
-static int pid_ht_grow_locked(pid_ht_state_t* old) {
+// Grow the hash table.  Publishes the new state via rcu_assign_pointer,
+// then — AFTER releasing the writer lock — calls synchronize_rcu and
+// frees the old state.  We must not hold a spinlock across
+// synchronize_rcu because that would yield with the lock held.
+//
+// Returns the new state on success, or NULL on OOM.  Caller holds
+// s_pid_ht_lock on entry, still holds it on return.  The old state is
+// stashed into *out_old_for_reclaim so the caller can reclaim it after
+// releasing the lock.
+static pid_ht_state_t* pid_ht_grow_locked(pid_ht_state_t* old,
+                                           pid_ht_state_t** out_old_for_reclaim) {
     uint32_t new_cap = old->cap * 2u;
     pid_ht_state_t* ns = pid_ht_alloc_state(new_cap);
-    if (!ns) return -1;
+    if (!ns) { *out_old_for_reclaim = NULL; return NULL; }
     // Copy all live entries (skip tombstones).
     for (uint32_t i = 0; i < old->cap; i++) {
         task_t* s = old->slots[i];
@@ -108,30 +116,42 @@ static int pid_ht_grow_locked(pid_ht_state_t* old) {
     }
     ns->count = old->count;
     // Publish the new state.  Readers who dereference s_pid_ht after
-    // this point see the new array; readers who dereferenced before see
-    // the old one.
+    // this point see the new array; readers who dereferenced before
+    // see the old one.
     rcu_assign_pointer(s_pid_ht, ns);
-    // Wait for any in-flight readers on the old state to finish, then
-    // reclaim it.  synchronize_rcu is a no-op on UP.
+    // Defer reclamation of the old state to the caller (after lock drop).
+    *out_old_for_reclaim = old;
+    return ns;
+}
+
+// Reclaim an old pid_ht_state_t after a grow.  Must be called with the
+// writer lock NOT held, because synchronize_rcu may yield.
+static void pid_ht_reclaim_state(pid_ht_state_t* old) {
+    if (!old) return;
     synchronize_rcu();
     kfree(old->slots);
     kfree(old);
-    return 0;
 }
 
 void pid_ht_insert(task_t* t) {
     if (!t) return;
+    pid_ht_state_t* old_for_reclaim = NULL;
+
     spin_lock(&s_pid_ht_lock);
     pid_ht_state_t* st = pid_ht_ensure_init_locked();
     if (!st) { spin_unlock(&s_pid_ht_lock); return; }
     // Grow at 75% load before inserting.
     if (st->count * 4u >= st->cap * 3u) {
-        if (pid_ht_grow_locked(st) < 0) { spin_unlock(&s_pid_ht_lock); return; }
-        st = s_pid_ht;
+        st = pid_ht_grow_locked(st, &old_for_reclaim);
+        if (!st) { spin_unlock(&s_pid_ht_lock); return; }
     }
     pid_ht_raw_insert(st->slots, st->cap, t);
     st->count++;
     spin_unlock(&s_pid_ht_lock);
+
+    // Reclaim the old state outside the lock so synchronize_rcu can
+    // yield safely.
+    pid_ht_reclaim_state(old_for_reclaim);
 }
 
 void pid_ht_remove(task_t* t) {
