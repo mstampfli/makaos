@@ -91,7 +91,7 @@ extern unsigned g_num_cpus;
 
 // Accessor for the current CPU.  Phase 1: always returns &g_cpus[0].
 // Phase 9: reads GS base via an MSR or rdgsbase.
-static inline cpu_t* this_cpu(void) {
+ALWAYS_INLINE cpu_t* this_cpu(void) {
     // TODO SMP: `return (cpu_t*)__rdgsbase();` once APs bring up GS base.
     return &g_cpus[0];
 }
@@ -103,10 +103,10 @@ void cpu_init_bsp(void);
 // ── Convenience accessors used everywhere ───────────────────────────────
 // These exist so call sites don't need to know the cpu_t layout.
 
-static inline struct task_t* current_task(void) {
+ALWAYS_INLINE struct task_t* current_task(void) {
     return this_cpu()->current;
 }
 
-static inline void set_current_task(struct task_t* t) {
+ALWAYS_INLINE void set_current_task(struct task_t* t) {
     this_cpu()->current = t;
 }

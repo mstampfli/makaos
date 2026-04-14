@@ -54,8 +54,14 @@ KERNEL_CFLAGS=(
   -fno-unwind-tables
   -fno-omit-frame-pointer
   -mcmodel=kernel
-  -O0
+  # -O2 for speed.  -g keeps DWARF debug info so GDB still works; the
+  # kernel's hot paths (rcu_read_lock, kmalloc, fb_term_scroll, syscall
+  # dispatch, memcpy-based copies) depend on the compiler actually
+  # inlining and register-allocating.  Hot inlined helpers additionally
+  # carry __attribute__((always_inline)) so they inline even at -O0.
+  -O2
   -g
+  -fno-strict-aliasing          # kernel casts through pointers all the time
   -Wall -Wextra
   -Wno-unused-parameter
   -Wno-missing-field-initializers
