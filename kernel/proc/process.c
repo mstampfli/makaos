@@ -141,6 +141,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->pg_prev = t->pg_next = NULL;
     t->tg_prev = t->tg_next = NULL;
     t->sid_prev = t->sid_next = NULL;
+    t->home_cpu = 0;
     t->mm_shared        = mm;
     t->files_shared     = files;
     t->mlfq_level       = 0;
@@ -319,6 +320,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->pg_prev = t->pg_next = NULL;
     t->tg_prev = t->tg_next = NULL;
     t->sid_prev = t->sid_next = NULL;
+    t->home_cpu = 0;
     t->mm_shared        = tmm;
     t->files_shared     = files;
     t->mlfq_level       = 0;

@@ -107,6 +107,55 @@ refill (~1 in 16 allocs after warmup).
 
 ---
 
+## `cpu_t.rq_lock` — `kernel/proc/sched.c` (per-CPU, MAX_CPUS instances)
+
+**Guards:** one CPU's run queue (MLFQ `heads[]`/`tails[]`), sleep
+list, zombie list, and `reschedule_pending` flag. Each CPU has its
+own instance; no global scheduler lock exists.
+
+**Readers (lock-free):**
+- `pid_ht_find` — not a reader of rq state, uses RCU on a separate
+  table.
+- `sched_for_each` — actually a reader but takes each CPU's rq_lock
+  in turn because it needs to walk the lists safely. Cold path
+  (only /proc enumeration and broadcast kill(-1)).
+
+**Writers:** `sched_add`, `sched_add_zombie`, `sched_reap_*`,
+`sched_wake`, `sched_sleep`, `sched_yield`, `sched_tick`, `do_switch`,
+`sched_wait_pid`, `sched_poll_pid`, `sched_has_child_zombie`.
+
+**Why a lock per CPU, not a global:**
+- The alternative (one global sched lock) would serialize every
+  context switch across all CPUs — unacceptable for SMP scalability.
+- Per-CPU locks allow CPUs to run their own schedulers in parallel
+  with zero contention on the common path (sched_tick, sched_yield,
+  sched_sleep, local wakes all touch only the running CPU's lock).
+- Cross-CPU wakes (`sched_wake(t)` where `t->home_cpu != current_cpu`)
+  do take the target's lock, but that's a rare path compared to
+  local scheduling.
+
+**IRQ-safety:** MUST use `spin_lock_irqsave` / `spin_unlock_irqrestore`.
+`sched_tick` runs in the timer ISR (already IRQ-disabled but saving
+flags is uniform), and `sched_wake` can be called from hardware IRQ
+completion paths (AHCI, keyboard, network). A non-irqsave variant
+would deadlock the moment a timer IRQ fired while a sched_wake was
+mid-op.
+
+**Critical section contents:** MLFQ list walk / push / pop, sleep
+list insert / remove, zombie list insert / remove, reschedule flag
+set. No allocations inside the lock. No sleeps (enforced by the
+`sched_sleep_while_preempt_disabled_panic` in sched_sleep).
+
+**Release-before-switch invariant:** `do_switch` releases the rq_lock
+BEFORE calling `context_switch`. Holding the lock across the context
+switch would deadlock — the new task might try to take the same lock
+before the old task's unlock ever runs.
+
+**SMP-readiness:** correct. Every scheduler operation is properly
+locked. The cross-CPU wake path is a simple lock-on-target pattern.
+
+---
+
 ## Planned locks (not yet added — for Phase 3–8)
 
 Each entry will be added as the phase lands, with the same justification
@@ -178,7 +227,7 @@ template. This list is for tracking the *plan*, not the code.
 | 2 | 1 (pid_ht writer) | 1 |
 | 3 | 0 (all lock-free) | 1 |
 | 4 | 1 global g_pmm_lock (temporary until redesign lands — see PHASE4_REDESIGN.md) | 2 |
-| 5 | 0 (all per-CPU) | 2 |
+| 5 | 1 per-CPU rq_lock (MAX_CPUS=64 instances but 1 design entry) | 3 |
 | 6 | 3 (pgid/tgid/sid writers) + handful (signal/mount/route) | ~7 |
 | 7 | 0 (seqlocks) | ~7 |
 | 8 | per-object mutexes (not global) | ~7 + per-object |
