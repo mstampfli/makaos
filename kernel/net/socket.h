@@ -85,9 +85,9 @@ typedef struct socket_t {
     uint32_t  udp_peer_ip;   // network byte order
     uint16_t  udp_peer_port; // host byte order
 
-    // Task sleeping in socket_recv / socket_recvfrom (UDP) or
-    // socket_accept / socket_connect (TCP).
-    void* waiter;   // task_t* — avoid circular include with process.h
+    // Wait queue for tasks blocked on this socket (UDP recv, TCP
+    // accept/connect).  SMP-safe MPSC — wake_all drains with one xchg.
+    wait_queue_t waitq;
 
     // Backpointer to the owning vfs_file_t so the UDP delivery path and the
     // TCP layer can wake any task sleeping in poll()/select() on this fd.
