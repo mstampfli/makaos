@@ -111,10 +111,17 @@ void task_idx_pgid_changed (task_t* t);
 void task_idx_sid_changing (task_t* t);
 void task_idx_sid_changed  (task_t* t);
 
-// Head-of-bucket accessors.  Returned task chains through pg_next / etc.
-task_t* task_idx_pgid_head(uint32_t pgid);
-task_t* task_idx_tgid_head(uint32_t tgid);
-task_t* task_idx_sid_head (uint32_t sid);
+// Locked walker: invoke cb(t, data) for every task in the given
+// bucket.  The table lock is held across the whole walk so
+// concurrent insert / remove cannot tear the list, and the callback
+// sees a consistent snapshot.
+//
+// The callback MUST be short and MUST NOT take any lock that a
+// task_idx writer could be waiting on.  signal_send is safe
+// (signal_send → atomic bit + sched_wake → rq_lock; rq_lock is
+// lower in the ordering than task_idx locks, no cycle).
+void task_idx_pgid_walk(uint32_t pgid, void (*cb)(task_t*, void*), void* data);
+void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data);
 
 // Called from the timer IRQ handler after sched_tick() if s_reschedule is set.
 // Performs a preemptive context switch — safe to call from IRQ context because

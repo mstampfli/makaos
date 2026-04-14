@@ -60,20 +60,20 @@ Format:
 
 ---
 
-## 3. `task_idx` (pgid/tgid/sid) hash tables
+## 3. `task_idx` (pgid/tgid/sid) hash tables — RESOLVED (Phase 6)
 
-- **Location:** `kernel/proc/sched.c` — `s_pgid_ht`, `s_tgid_ht`,
-  `s_sid_ht` and their slot arrays
-- **Race:** `task_idx_insert` / `task_idx_remove` / `task_idx_pgid_changing`
-  / `task_idx_sid_changing` modify the hash tables with no lock.
-  Readers (`signal_send_group`, `signal_send_pgrp`, `tty_get_ctty`)
-  walk them without RCU protection.
-- **Why safe on UP:** single thread of execution.
-- **Fix phase:** Phase 6 — RCU-ize global tables.
-- **Fix strategy:** same pattern as `s_pid_ht`. State bundled in a
-  pointer published via `rcu_assign_pointer`. Readers get a zero-lock
-  walk. Writers serialize on a per-table spinlock; grow drops the lock
-  before `synchronize_rcu` to reclaim the old state.
+- **Location:** `kernel/proc/sched.c` — `s_pgid_ht`, `s_tgid_ht`, `s_sid_ht`
+- **Fix:** each `task_idx_t` now carries its own IRQ-safe spinlock.
+  All insert/remove and `task_idx_*_walk` operations acquire that lock
+  for the duration; writers hold it across slot mutation, walkers hold
+  it across the full callback invocation so concurrent insert/remove
+  cannot tear the doubly-linked bucket list.  `signal_send_group` and
+  `signal_send_pgrp` now use the new `task_idx_tgid_walk` /
+  `task_idx_pgid_walk` APIs, which are O(threads-in-bucket).
+- **Why spinlock and not full RCU:** signal delivery is not on the
+  per-packet hot path; the bucket walks are microsecond-scale and the
+  lock is uncontended in practice.  The RCU-COW machinery used by the
+  network tables would add complexity with no measurable win here.
 
 ---
 
@@ -99,22 +99,36 @@ Format:
 
 ---
 
-## 6. Hash-table writers that haven't been RCU-ized yet
+## 6. Hash-table writers — RESOLVED (Phase 6)
 
-- **Location:**
-  - `kernel/net/arp.c` — `s_cache`
-  - `kernel/net/socket.c` — `s_udp_slots`
-  - `kernel/net/unix_sock.c` — `s_unix_ns`
-  - `kernel/mm/shmem.c` — `s_namespace`
-  - `kernel/net/tcp.c` — `s_pcb_head` list
-  - `kernel/syscall/syscall.c` — epoll `s_pid_slots`-style grow paths
-- **Race:** each of these has an insert/remove/grow path with no
-  locking. Readers walk without RCU protection.
-- **Why safe on UP:** single thread of execution.
-- **Fix phase:** Phase 6 — RCU-ize global tables.
-- **Fix strategy:** bulk-convert all read-mostly hash tables to the
-  same RCU-published-state pattern. Shared helper macro so each table
-  doesn't duplicate 100 lines of resize plumbing.
+All of these are now lock-free on the read path via QSBR RCU.  The
+whole table (not individual slots) is wrapped in a heap-allocated
+object whose pointer is published via `rcu_assign_pointer`.  Writers
+serialise on a small writer spinlock, build a fresh table via
+copy-on-write, publish, and `call_rcu` the old table.  Readers do a
+preempt-disable + plain pointer load + hash walk — zero atomics, zero
+cache-line bouncing, per-packet cost is a single memory load.
+
+- `kernel/net/arp.c` — `s_arp` (was `s_cache`).  `arp_lookup` (called
+  on every outgoing packet) is lock-free.
+- `kernel/net/socket.c` — `s_udp` (was `s_udp_slots`).  `udp_table_find`
+  (called per UDP packet in `socket_deliver_udp`) is lock-free and
+  wrapped in `rcu_read_lock()` that also covers the RX enqueue, so
+  the socket cannot be freed under the delivery path.  `socket_t`
+  teardown is `call_rcu`-deferred via `sock_free_rcu`.
+- `kernel/net/unix_sock.c` — `s_unix_ns` (was an open-addressing array).
+  `unix_sock_close` defers the full teardown via `call_rcu`, so
+  concurrent `connect`/`sendto` readers inside `rcu_read_lock()` see a
+  consistent sock until they exit the reader section.
+- `kernel/mm/shmem.c` — `s_namespace`.  `shmem_t.refcount` is now
+  atomic; `shmem_ns_find` bumps the refcount via `shmem_tryget` inside
+  `rcu_read_lock()` so the object cannot be freed under the caller.
+  Final teardown runs from `shmem_free_rcu` after a grace period.
+- `kernel/net/tcp.c` — `s_pcb_head` linked list.  `tcp_recv` and
+  `tcp_timer_tick` walk under `rcu_read_lock()`; `tcp_pcb_free` unlinks
+  then `call_rcu`s the pcb destruction.
+
+See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
@@ -161,15 +175,16 @@ Format:
 
 ---
 
-## 10. TCP PCB list walk vs. alloc/free
+## 10. TCP PCB list walk vs. alloc/free — RESOLVED (Phase 6)
 
-- **Location:** `kernel/net/tcp.c` — `s_pcb_head`
-- **Race:** `tcp_recv` walks `s_pcb_head` for every incoming segment
-  while `tcp_pcb_alloc` / `tcp_pcb_free` mutate the list.
-- **Why safe on UP:** same.
-- **Fix phase:** Phase 6.
-- **Fix strategy:** RCU-ize the list. Walkers do an RCU read section;
-  allocators push under a writer lock + `call_rcu` to defer free.
+- **Fix:** `s_pcb_head` is now an RCU-protected singly-linked list.
+  `tcp_recv` and `tcp_timer_tick` walk the list inside `rcu_read_lock()`
+  using `rcu_dereference` on each `->next`.  `tcp_pcb_alloc` publishes
+  at the head via `rcu_assign_pointer` under `s_pcb_wlock`.  `tcp_pcb_free`
+  unlinks under the writer lock and defers the full teardown (txbuf,
+  rxbuf, struct) to `tcp_pcb_free_rcu` via `call_rcu`, so any in-flight
+  reader still dereferencing the pcb sees a live object until its
+  reader section ends.
 
 ---
 
@@ -196,20 +211,17 @@ Format:
 
 ---
 
-## 12. Signal delivery free-after-exit
+## 12. Signal delivery free-after-exit — RESOLVED (Phase 6)
 
-- **Location:** `kernel/proc/signal.c:signal_send` and task_t access
-- **Race:** `signal_send(t)` is called by `signal_send_pgrp` which
-  walks the pgid list. If `t` exits between the list walk and the
-  signal_send call, we'd touch a freed task_t.
-- **Why safe on UP:** the pgid list walk is atomic wrt scheduling, so
-  `t` can't exit mid-walk.
-- **Fix phase:** Phase 6 (RCU-ize pgid/tgid/sid tables) +
-  Phase 8 (task_t lifecycle management).
-- **Fix strategy:** task_t free is deferred via `call_rcu` after
-  removal from the pid_ht. All task lookups happen inside rcu_read_lock.
-  A task obtained from a lookup is guaranteed valid until
-  rcu_read_unlock.
+- **Fix:** `task_destroy` no longer frees the task synchronously.
+  It removes from `pid_ht`, frees the pid slot, and then hands the
+  task_t to `call_rcu(task_free_rcu, t)` which runs kstack/mm/files/
+  kfree after a grace period.  `signal_send_group` / `signal_send_pgrp`
+  walk the pgid/tgid hash buckets under the per-table spinlock, which
+  prevents a concurrent `task_idx_*_remove` from splicing the bucket
+  list mid-walk; any task the walker reached has already observed
+  state != TASK_DEAD so its `rcu_read_lock`-equivalent bucket-lock
+  window covers the signal_send call.
 
 ---
 
