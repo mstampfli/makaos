@@ -2,6 +2,7 @@
 #include "ahci.h"
 #include "kheap.h"
 #include "common.h"
+#include "seqlock.h"
 
 // ── Multi-task-safe scratch buffers ──────────────────────────────────────
 // Function-local 4 KiB scratch buffers must NOT live on the kstack (8 KiB
@@ -72,19 +73,38 @@ static uint8_t s_blk_buf2[4096];
 #define BCACHE_SIZE  256
 #define BCACHE_INVALID 0xFFFFFFFFu
 
-static uint8_t  s_bcache_data[BCACHE_SIZE][4096];
-static uint32_t s_bcache_tag[BCACHE_SIZE];  // block number, INVALID = empty
+// Meta is kept in its own small array so that the reader's hot-path probe
+// (tag compare + sequence load) touches one cache line per 4 slots instead
+// of dragging in the 4 KiB data block on every miss.  The data array stays
+// out-of-line: one page per slot, so the memcpy on a hit streams straight
+// out of the cache without polluting unrelated slots.
+typedef struct {
+    seqlock_t seq;
+    uint32_t  tag;   // block number, BCACHE_INVALID = empty
+} bcache_meta_t;
+
+static uint8_t        s_bcache_data[BCACHE_SIZE][4096];
+static bcache_meta_t  s_bcache_meta[BCACHE_SIZE];
 
 static void bcache_init(void) {
-    for (int i = 0; i < BCACHE_SIZE; i++)
-        s_bcache_tag[i] = BCACHE_INVALID;
+    for (int i = 0; i < BCACHE_SIZE; i++) {
+        seqlock_init(&s_bcache_meta[i].seq);
+        s_bcache_meta[i].tag = BCACHE_INVALID;
+    }
 }
 
-static void bcache_invalidate(uint32_t blk) {
+// Publish fresh data into a cache slot.  Uses the seqlock's multi-writer
+// API so two CPUs that race to refill the same slot serialise on the
+// per-slot write_lock (not a global one).  Readers never block on this.
+static void bcache_store(uint32_t blk, const uint8_t* data, uint32_t len) {
     uint32_t slot = blk % BCACHE_SIZE;
-    if (s_bcache_tag[slot] == blk)
-        s_bcache_tag[slot] = BCACHE_INVALID;
+    bcache_meta_t* m = &s_bcache_meta[slot];
+    seq_write_begin(&m->seq);
+    m->tag = blk;
+    __builtin_memcpy(s_bcache_data[slot], data, len);
+    seq_write_end(&m->seq);
 }
+
 
 // ── Inode cache — 2-level radix tree ──────────────────────────────────────
 // Key: uint32_t inode number.  Value: ext2_inode_t (cached from disk).
@@ -144,18 +164,28 @@ static void irtree_put(uint32_t ino, const ext2_inode_t* inode) {
 // ── Low-level block I/O ────────────────────────────────────────────────────
 
 // Read one filesystem block into `buf` (must be at least s_block_size bytes).
+//
+// Fast path is a seqlock reader: sample the sequence, check the tag, copy
+// the data, re-check the sequence.  On a clean hit this is three memory
+// ops plus one 4 KiB memcpy — no atomics, no cache-line ping on the slot
+// lock.  If the sequence changed mid-copy (a concurrent bcache_store or
+// bcache_invalidate hit this slot), we retry.  If the tag never matches,
+// we fall through to the disk read.
 static uint8_t read_block(uint32_t blk, uint8_t* buf) {
     uint32_t slot = blk % BCACHE_SIZE;
-    if (s_bcache_tag[slot] == blk) {
-        // Cache hit — copy from cache.
+    bcache_meta_t* m = &s_bcache_meta[slot];
+    for (;;) {
+        uint32_t s = seq_begin(&m->seq);
+        if (m->tag != blk) break;  // miss (or currently being refilled to a different blk)
         __builtin_memcpy(buf, s_bcache_data[slot], s_block_size);
-        return 1;
+        if (!seq_retry(&m->seq, s)) return 1;
+        // Writer raced us — loop and re-sample.  On a cache miss the
+        // tag check above will fall out of the loop.
     }
-    // Cache miss — read from disk and populate cache.
+    // Cache miss — read from disk and populate the cache.
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
     if (!ahci_read(lba, buf, s_sectors_per_blk)) return 0;
-    s_bcache_tag[slot] = blk;
-    __builtin_memcpy(s_bcache_data[slot], buf, s_block_size);
+    bcache_store(blk, buf, s_block_size);
     return 1;
 }
 
@@ -164,9 +194,7 @@ static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
     if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
     // Update cache with the written data.
-    uint32_t slot = blk % BCACHE_SIZE;
-    s_bcache_tag[slot] = blk;
-    __builtin_memcpy(s_bcache_data[slot], buf, s_block_size);
+    bcache_store(blk, buf, s_block_size);
     return 1;
 }
 
@@ -536,16 +564,11 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
 
-                // Populate block cache from the buffer (safe — we're
-                // in the caller's context).
-                for (uint32_t r = 0; r < run; r++) {
-                    uint32_t b = blk + r;
-                    uint32_t slot = b % BCACHE_SIZE;
-                    s_bcache_tag[slot] = b;
-                    __builtin_memcpy(s_bcache_data[slot],
-                                      dest + r * s_block_size,
-                                      s_block_size);
-                }
+                // Populate block cache from the buffer via the seqlock
+                // writer API so concurrent readers on other CPUs see a
+                // consistent slot.
+                for (uint32_t r = 0; r < run; r++)
+                    bcache_store(blk + r, dest + r * s_block_size, s_block_size);
                 uint32_t bytes = run * s_block_size;
                 total       += bytes;
                 fd->cur_pos += bytes;
