@@ -12,9 +12,30 @@
 #include "process.h"
 #include "signal.h"
 
-// ── Global PTY table ────────────────────────────────────────────────────
+// ── Live PTY list ───────────────────────────────────────────────────────
+// Singly-linked list of all PTYs that still have at least one fd open.
+// Each node is kmalloc'd in pty_alloc and freed when both master and all
+// slaves have closed.  No fixed cap.
 
-pty_t g_ptys[PTY_MAX];
+static pty_t* s_pty_head = NULL;
+static uint32_t s_next_pty_index = 0;  // monotonically increasing /dev/pts/N
+
+pty_t* pty_list_head(void) { return s_pty_head; }
+
+// Remove pty from s_pty_head and free it.  Called when both master_open==0
+// and slave_open_count==0.
+static void pty_free_locked(pty_t* pty) {
+    if (s_pty_head == pty) {
+        s_pty_head = pty->next;
+    } else {
+        for (pty_t* p = s_pty_head; p; p = p->next) {
+            if (p->next == pty) { p->next = pty->next; break; }
+        }
+    }
+    serial_puts_dbg("[pty] free idx=");
+    serial_hex_dbg((uint64_t)(uint32_t)pty->index);
+    kfree(pty);
+}
 
 // ── Ring buffer helpers (master read buffer) ─────────────────────────────
 
@@ -122,13 +143,14 @@ static void pty_master_close(vfs_file_t* self) {
         sched_wake(pty->slave.reader);
         pty->slave.reader = NULL;
     }
-
-    // If slave is also closed, free the PTY slot
-    if (pty->slave_open_count == 0)
-        pty->allocated = 0;
+    wait_queue_wake_all(&pty->slave.waitq);
 
     kfree(ctx);
     kfree(self);
+
+    // If both sides are now closed, free the pty struct.
+    if (pty->slave_open_count == 0)
+        pty_free_locked(pty);
 }
 
 // ── Slave fd VFS operations ─────────────────────────────────────────────
@@ -227,18 +249,19 @@ static void pty_slave_close(vfs_file_t* self) {
 
     pty->slave_open_count--;
 
-    // If both sides closed, free the slot
-    if (pty->slave_open_count == 0 && !pty->master_open)
-        pty->allocated = 0;
-
     // Wake master reader (EOF)
     if (pty->m_reader) {
         sched_wake(pty->m_reader);
         pty->m_reader = NULL;
     }
+    wait_queue_wake_all(&pty->master_waitq);
 
     kfree(ctx);
     kfree(self);
+
+    // If both sides are now closed, free the pty struct.
+    if (pty->slave_open_count == 0 && !pty->master_open)
+        pty_free_locked(pty);
 }
 
 // ── Master ioctl ─────────────────────────────────────────────────────────
@@ -359,27 +382,25 @@ static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg)
 // ── pty_alloc — create a new PTY pair ────────────────────────────────────
 
 int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
-    // Find a free slot
-    pty_t* pty = NULL;
-    for (int i = 0; i < PTY_MAX; i++) {
-        if (!g_ptys[i].allocated) {
-            pty = &g_ptys[i];
-            pty->index = i;
-            break;
-        }
-    }
-    if (!pty) return -23; // ENFILE
+    // Allocate a fresh pty struct.  No fixed cap — just OOM on failure.
+    pty_t* pty = (pty_t*)kmalloc(sizeof(pty_t));
+    if (!pty) return -12; // ENOMEM
 
-    int idx = pty->index;
-
-    // Zero the struct
+    // Zero the struct.
     for (uint64_t i = 0; i < sizeof(pty_t); i++)
         ((uint8_t*)pty)[i] = 0;
 
-    pty->allocated = 1;
     pty->master_open = 1;
     pty->slave_open_count = 1;
-    pty->index = idx;
+    pty->index = (int)(s_next_pty_index++);
+    int idx = pty->index;
+
+    // Link into the live PTY list (head insert).
+    pty->next = s_pty_head;
+    s_pty_head = pty;
+
+    serial_puts_dbg("[pty] alloc idx=");
+    serial_hex_dbg((uint64_t)(uint32_t)idx);
 
     // Initialize slave tty with sane defaults
     tty_t* tty = &pty->slave;
@@ -426,11 +447,11 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     // Create master vfs_file_t
     pty_master_ctx_t* mctx = kmalloc(sizeof(pty_master_ctx_t));
-    if (!mctx) { pty->allocated = 0; return -12; } // ENOMEM
+    if (!mctx) { pty_free_locked(pty); return -12; } // ENOMEM
     mctx->pty = pty;
 
     vfs_file_t* master = kmalloc(sizeof(vfs_file_t));
-    if (!master) { kfree(mctx); pty->allocated = 0; return -12; }
+    if (!master) { kfree(mctx); pty_free_locked(pty); return -12; }
 
     master->read        = pty_master_read;
     master->write       = pty_master_write;
@@ -451,11 +472,11 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     // Create slave vfs_file_t
     pty_slave_ctx_t* sctx = kmalloc(sizeof(pty_slave_ctx_t));
-    if (!sctx) { kfree(mctx); kfree(master); pty->allocated = 0; return -12; }
+    if (!sctx) { kfree(mctx); kfree(master); pty_free_locked(pty); return -12; }
     sctx->pty = pty;
 
     vfs_file_t* slave = kmalloc(sizeof(vfs_file_t));
-    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty->allocated = 0; return -12; }
+    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_locked(pty); return -12; }
 
     slave->read     = pty_slave_read;
     slave->write    = pty_slave_write;

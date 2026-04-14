@@ -54,7 +54,7 @@ static int _input_init(void) {
     mouse_init();
     keyboard_flush();
     ioapic_unmask(ioapic_isa_to_gsi(1));
-    tty_flush_input(&g_ttys[0]);
+    tty_flush_input(&g_tty0);
     fb_clear();
     return 0;
 }

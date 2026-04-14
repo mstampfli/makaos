@@ -925,7 +925,7 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // Without this, bash detects it's not in the foreground and spins on SIGTTOU.
     if (!stdio_ptr || (((const int*)stdio_ptr)[0] == -1)) {
         tty_t* tty = tty_get_ctty();
-        if (!tty) tty = &g_ttys[0];
+        if (!tty) tty = &g_tty0;
         tty->fg_pgid = child->pgid;
     }
 
@@ -1098,7 +1098,7 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
 
             // Job control: return terminal to parent's process group.
             tty_t* tty = tty_get_ctty();
-            if (!tty) tty = &g_ttys[0];
+            if (!tty) tty = &g_tty0;
             if (tty && tty->fg_pgid == child_pgid)
                 tty->fg_pgid = g_current->pgid;
 
@@ -2062,8 +2062,8 @@ static uint64_t sys_fb_map(void) {
     if (!vaddr) return (uint64_t)-ENOMEM;
 
     // Compositor takes ownership — detach TTY0 console output
-    extern tty_t g_ttys[];
-    g_ttys[0].write_char = NULL;
+    extern tty_t g_tty0;
+    g_tty0.write_char = NULL;
 
     return vaddr;
 }
@@ -2887,14 +2887,14 @@ static uint64_t sys_getsid(uint64_t pid_arg) {
 static uint64_t sys_tcgetpgrp(uint64_t fd) {
     (void)fd;
     tty_t* tty = tty_get_ctty();
-    if (!tty) tty = &g_ttys[0];
+    if (!tty) tty = &g_tty0;
     return (uint64_t)tty->fg_pgid;
 }
 
 static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
     (void)fd;
     tty_t* tty = tty_get_ctty();
-    if (!tty) tty = &g_ttys[0];
+    if (!tty) tty = &g_tty0;
     tty->fg_pgid = (uint32_t)pgid;
     return 0;
 }
@@ -2917,7 +2917,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
         return (uint64_t)f->ioctl(f, request, arg);
 
     // Fallback: resolve to controlling tty (tty0 for console processes).
-    tty_t* tty = &g_ttys[0];
+    tty_t* tty = &g_tty0;
 
     switch (request) {
     case TIOCGWINSZ:
@@ -3750,8 +3750,441 @@ static void serial_hex_u32(uint32_t v) {
     for (int i = 28; i >= 0; i -= 4) serial_putc(h[(v >> i) & 0xF]);
 }
 
+// ── Syscall jump table ────────────────────────────────────────────────────
+// Every handler has the uniform signature (arg1, arg2, arg3, arg4).  Handlers
+// that need arg5/arg6 read them from g_syscall_arg5/6 directly (set by the
+// asm entry stub before calling us).  Handlers that take fewer args simply
+// ignore the extras.  NULL means "not implemented" → ENOSYS.
+
+typedef uint64_t (*sys_handler_t)(uint64_t, uint64_t, uint64_t, uint64_t);
+
+// ── Thin wrappers for handlers with non-uniform signatures ───────────────
+
+static uint64_t w_sys_write(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_write(a, b, c);
+}
+static uint64_t w_sys_exit(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d;
+    if (g_current && g_current->pid > 2) {
+        serial_puts("[exit] pid="); serial_hex_u32((uint32_t)g_current->pid);
+        serial_puts(" code="); serial_hex_u32((uint32_t)a);
+        serial_putc('\n');
+    }
+    return sys_exit(a);
+}
+static uint64_t w_sys_open(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d;
+    uint64_t ret = sys_open(a, b, c);
+    if (g_current && g_current->pid > 2) {
+        serial_puts("[open] pid="); serial_hex_u32((uint32_t)g_current->pid);
+        serial_putc(' ');
+        serial_puts((const char*)a);
+        serial_puts(" -> ");
+        if ((int64_t)ret < 0) { serial_puts("ERR "); serial_hex_u32((uint32_t)(-(int64_t)ret)); }
+        else { serial_puts("fd="); serial_hex_u32((uint32_t)ret); }
+        serial_putc('\n');
+    }
+    return ret;
+}
+static uint64_t w_sys_close(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_close(a);
+}
+static uint64_t w_sys_brk(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_brk(a);
+}
+static uint64_t w_sys_kill(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_kill(a, b);
+}
+static uint64_t w_sys_fork(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_fork();
+}
+static uint64_t w_sys_exec(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_exec(a, b, c);
+}
+static uint64_t w_sys_wait(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_wait(a, b, c);
+}
+static uint64_t w_sys_getpid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getpid();
+}
+static uint64_t w_sys_getppid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getppid();
+}
+static uint64_t w_sys_spawn(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_spawn(a, b, c, d, g_syscall_arg5);
+}
+static uint64_t w_sys_thread(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_thread(a, b, c);
+}
+static uint64_t w_sys_clock_ns(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return tsc_read_ns();
+}
+static uint64_t w_sys_stat(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_stat(a, b, c);
+}
+static uint64_t w_sys_unlink(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_unlink(a, b);
+}
+static uint64_t w_sys_getcwd(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_getcwd(a, b);
+}
+static uint64_t w_sys_chdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_chdir(a, b);
+}
+static uint64_t w_sys_mkdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_mkdir(a, b);
+}
+static uint64_t w_sys_lseek(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_lseek(a, b, c);
+}
+static uint64_t w_sys_dup(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_dup(a);
+}
+static uint64_t w_sys_dup2(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_dup2(a, b);
+}
+static uint64_t w_sys_pipe(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_pipe(a);
+}
+static uint64_t w_sys_sigaction(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_sigaction(a, b, c);
+}
+static uint64_t w_sys_sigprocmask(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_sigprocmask(a, b, c);
+}
+static uint64_t w_sys_sigreturn(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_sigreturn();
+}
+static uint64_t w_sys_mmap(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_mmap(a, b, c, d, g_syscall_arg5, g_syscall_arg6);
+}
+static uint64_t w_sys_munmap(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_munmap(a, b);
+}
+static uint64_t w_sys_nanosleep(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_nanosleep(a, b);
+}
+static uint64_t w_sys_gettod(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_gettimeofday(a, b);
+}
+static uint64_t w_sys_fb_blit(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_fb_blit(a, b, c, d);
+}
+static uint64_t w_sys_fb_info(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_fb_info(a);
+}
+static uint64_t w_sys_fb_map(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_fb_map();
+}
+static uint64_t w_sys_openpty(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_openpty(a);
+}
+static uint64_t w_sys_getpeerpid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_getpeerpid(a);
+}
+static uint64_t w_sys_socket(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_socket(a, b, c);
+}
+static uint64_t w_sys_bind(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_bind(a, b, c);
+}
+static uint64_t w_sys_listen(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_listen(a, b);
+}
+static uint64_t w_sys_accept(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_accept(a, b, c);
+}
+static uint64_t w_sys_connect(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_connect(a, b, c);
+}
+static uint64_t w_sys_sendto(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_sendto(a, b, c, d, g_syscall_arg5, g_syscall_arg6);
+}
+static uint64_t w_sys_recvfrom(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_recvfrom(a, b, c, d, g_syscall_arg5, g_syscall_arg6);
+}
+static uint64_t w_sys_setsockopt(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_setsockopt(a, b, c, d, g_syscall_arg5);
+}
+static uint64_t w_sys_shutdown(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_shutdown(a, b);
+}
+static uint64_t w_sys_net_ifconfig(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_net_ifconfig(a, b);
+}
+static uint64_t w_sys_net_mac(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_net_mac(a);
+}
+static uint64_t w_sys_fcntl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_fcntl(a, b, c);
+}
+static uint64_t w_sys_fstat(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_fstat(a, b);
+}
+static uint64_t w_sys_access(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_access(a, b);
+}
+static uint64_t w_sys_uname(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_uname(a);
+}
+static uint64_t w_sys_umask(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_umask(a);
+}
+static uint64_t w_sys_getuid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getuid();
+}
+static uint64_t w_sys_geteuid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_geteuid();
+}
+static uint64_t w_sys_getgid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getgid();
+}
+static uint64_t w_sys_getegid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getegid();
+}
+static uint64_t w_sys_getgroups(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_getgroups(a, b);
+}
+static uint64_t w_sys_setpgid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_setpgid(a, b);
+}
+static uint64_t w_sys_getpgid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_getpgid(a);
+}
+static uint64_t w_sys_getpgrp(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_getpgrp();
+}
+static uint64_t w_sys_setsid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_setsid();
+}
+static uint64_t w_sys_getsid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_getsid(a);
+}
+static uint64_t w_sys_ioctl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_ioctl(a, b, c);
+}
+static uint64_t w_sys_select(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_select(a, b, c, d, g_syscall_arg5);
+}
+static uint64_t w_sys_poll(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_poll(a, b, c);
+}
+static uint64_t w_sys_readlink(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_readlink(a, b, c);
+}
+static uint64_t w_sys_symlink(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_symlink(a, b);
+}
+static uint64_t w_sys_link(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_link(a, b);
+}
+static uint64_t w_sys_chmod(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_chmod(a, b);
+}
+static uint64_t w_sys_fchmod(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_fchmod(a, b);
+}
+static uint64_t w_sys_chown(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_chown(a, b, c);
+}
+static uint64_t w_sys_fchown(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_fchown(a, b, c);
+}
+static uint64_t w_sys_truncate(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_truncate(a, b);
+}
+static uint64_t w_sys_ftruncate(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_ftruncate(a, b);
+}
+static uint64_t w_sys_times(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_times(a);
+}
+static uint64_t w_sys_getrusage(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_getrusage(a, b);
+}
+static uint64_t w_sys_tcgetpgrp(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_tcgetpgrp(a);
+}
+static uint64_t w_sys_tcsetpgrp(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_tcsetpgrp(a, b);
+}
+static uint64_t w_sys_reboot(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    outb(0x64, 0xFE);
+    for (;;) __asm__ volatile("cli; hlt");
+    return 0;
+}
+static uint64_t w_sys_setuid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_setuid(a);
+}
+static uint64_t w_sys_setgid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_setgid(a);
+}
+static uint64_t w_sys_seteuid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_seteuid(a);
+}
+static uint64_t w_sys_setegid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_setegid(a);
+}
+static uint64_t w_sys_setreuid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_setreuid(a, b);
+}
+static uint64_t w_sys_setregid(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_setregid(a, b);
+}
+static uint64_t w_sys_setgroups(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_setgroups(a, b);
+}
+static uint64_t w_sys_pledge(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_pledge(a);
+}
+static uint64_t w_sys_unveil(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_unveil(a, b, c);
+}
+static uint64_t w_sys_unveil_lock(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d; return sys_unveil_lock();
+}
+static uint64_t w_sys_restrict_fd(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_restrict_fd(a, b);
+}
+static uint64_t w_sys_sendfd(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)d; return sys_sendfd(a, b, c);
+}
+static uint64_t w_sys_recvfd(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_recvfd(a);
+}
+static uint64_t w_sys_register_policy_agent(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_register_policy_agent(a, b);
+}
+static uint64_t w_sys_shm_open(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_shm_open(a, b, c, d);
+}
+static uint64_t w_sys_shm_unlink(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_shm_unlink(a, b);
+}
+static uint64_t w_sys_epoll_create(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d; return sys_epoll_create(a);
+}
+static uint64_t w_sys_epoll_ctl(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_epoll_ctl(a, b, c, d);
+}
+static uint64_t w_sys_epoll_wait(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_epoll_wait(a, b, c, d);
+}
+
+// 4-arg handlers that already match the uniform signature — used directly.
+// sys_read(a,b,c,d), sys_readdir(a,b,c,d), sys_rename(a,b,c,d)
+
+// ── The jump table ────────────────────────────────────────────────────────
+// Indexed by syscall number.  NULL entries → ENOSYS.  Designated
+// initializers mean any unused slot is implicitly NULL and reordering the
+// array is safe.
+
+static const sys_handler_t s_syscall_table[100] = {
+    [SYS_WRITE]               = w_sys_write,
+    [SYS_EXIT]                = w_sys_exit,
+    [SYS_READ]                = sys_read,
+    [SYS_OPEN]                = w_sys_open,
+    [SYS_CLOSE]               = w_sys_close,
+    [SYS_BRK]                 = w_sys_brk,
+    [SYS_KILL]                = w_sys_kill,
+    [SYS_FORK]                = w_sys_fork,
+    [SYS_EXEC]                = w_sys_exec,
+    [SYS_WAIT]                = w_sys_wait,
+    [SYS_GETPID]              = w_sys_getpid,
+    [SYS_READDIR]             = sys_readdir,
+    [SYS_SPAWN]               = w_sys_spawn,
+    [SYS_THREAD]              = w_sys_thread,
+    [SYS_CLOCK_NS]            = w_sys_clock_ns,
+    [SYS_STAT]                = w_sys_stat,
+    [SYS_UNLINK]              = w_sys_unlink,
+    [SYS_RENAME]              = sys_rename,
+    [SYS_GETCWD]              = w_sys_getcwd,
+    [SYS_CHDIR]               = w_sys_chdir,
+    [SYS_MKDIR]               = w_sys_mkdir,
+    [SYS_LSEEK]               = w_sys_lseek,
+    [SYS_GETPPID]             = w_sys_getppid,
+    [SYS_DUP]                 = w_sys_dup,
+    [SYS_DUP2]                = w_sys_dup2,
+    [SYS_PIPE]                = w_sys_pipe,
+    [SYS_SIGACTION]           = w_sys_sigaction,
+    [SYS_SIGPROCMASK]         = w_sys_sigprocmask,
+    [SYS_SIGRETURN]           = w_sys_sigreturn,
+    [SYS_MMAP]                = w_sys_mmap,
+    [SYS_MUNMAP]              = w_sys_munmap,
+    [SYS_NANOSLEEP]           = w_sys_nanosleep,
+    [SYS_GETTOD]              = w_sys_gettod,
+    [SYS_FB_BLIT]             = w_sys_fb_blit,
+    [SYS_FB_INFO]             = w_sys_fb_info,
+    [SYS_SOCKET]              = w_sys_socket,
+    [SYS_BIND]                = w_sys_bind,
+    [SYS_LISTEN]              = w_sys_listen,
+    [SYS_ACCEPT]              = w_sys_accept,
+    [SYS_CONNECT]             = w_sys_connect,
+    [SYS_SENDTO]              = w_sys_sendto,
+    [SYS_RECVFROM]            = w_sys_recvfrom,
+    [SYS_SETSOCKOPT]          = w_sys_setsockopt,
+    [SYS_SHUTDOWN]            = w_sys_shutdown,
+    [SYS_FCNTL]               = w_sys_fcntl,
+    [SYS_FSTAT]               = w_sys_fstat,
+    [SYS_ACCESS]              = w_sys_access,
+    [SYS_UNAME]               = w_sys_uname,
+    [SYS_UMASK]               = w_sys_umask,
+    [SYS_GETUID]              = w_sys_getuid,
+    [SYS_GETEUID]             = w_sys_geteuid,
+    [SYS_GETGID]              = w_sys_getgid,
+    [SYS_GETEGID]             = w_sys_getegid,
+    [SYS_GETGROUPS]           = w_sys_getgroups,
+    [SYS_SETPGID]             = w_sys_setpgid,
+    [SYS_GETPGID]             = w_sys_getpgid,
+    [SYS_GETPGRP]             = w_sys_getpgrp,
+    [SYS_SETSID]              = w_sys_setsid,
+    [SYS_GETSID]              = w_sys_getsid,
+    [SYS_IOCTL]               = w_sys_ioctl,
+    [SYS_SELECT]              = w_sys_select,
+    [SYS_POLL]                = w_sys_poll,
+    [SYS_READLINK]            = w_sys_readlink,
+    [SYS_SYMLINK]             = w_sys_symlink,
+    [SYS_LINK]                = w_sys_link,
+    [SYS_CHMOD]               = w_sys_chmod,
+    [SYS_FCHMOD]              = w_sys_fchmod,
+    [SYS_CHOWN]               = w_sys_chown,
+    [SYS_FCHOWN]              = w_sys_fchown,
+    [SYS_TRUNCATE]            = w_sys_truncate,
+    [SYS_FTRUNCATE]           = w_sys_ftruncate,
+    [SYS_TIMES]               = w_sys_times,
+    [SYS_GETRUSAGE]           = w_sys_getrusage,
+    [SYS_TCGETPGRP]           = w_sys_tcgetpgrp,
+    [SYS_TCSETPGRP]           = w_sys_tcsetpgrp,
+    [SYS_REBOOT]              = w_sys_reboot,
+    [SYS_SETUID]              = w_sys_setuid,
+    [SYS_SETGID]              = w_sys_setgid,
+    [SYS_SETEUID]             = w_sys_seteuid,
+    [SYS_SETEGID]             = w_sys_setegid,
+    [SYS_SETREUID]            = w_sys_setreuid,
+    [SYS_SETREGID]            = w_sys_setregid,
+    [SYS_SETGROUPS]           = w_sys_setgroups,
+    [SYS_PLEDGE]              = w_sys_pledge,
+    [SYS_UNVEIL]              = w_sys_unveil,
+    [SYS_UNVEIL_LOCK]         = w_sys_unveil_lock,
+    [SYS_RESTRICT_FD]         = w_sys_restrict_fd,
+    [SYS_SENDFD]              = w_sys_sendfd,
+    [SYS_RECVFD]              = w_sys_recvfd,
+    [SYS_REGISTER_POLICY_AGENT]= w_sys_register_policy_agent,
+    [SYS_SHM_OPEN]            = w_sys_shm_open,
+    [SYS_SHM_UNLINK]          = w_sys_shm_unlink,
+    [SYS_FB_MAP]              = w_sys_fb_map,
+    [SYS_OPENPTY]             = w_sys_openpty,
+    [SYS_GETPEERPID]          = w_sys_getpeerpid,
+    [SYS_NET_IFCONFIG]        = w_sys_net_ifconfig,
+    [SYS_NET_MAC]             = w_sys_net_mac,
+    [SYS_EPOLL_CREATE]        = w_sys_epoll_create,
+    [SYS_EPOLL_CTL]           = w_sys_epoll_ctl,
+    [SYS_EPOLL_WAIT]          = w_sys_epoll_wait,
+};
+
 // ── native_syscall_dispatch ───────────────────────────────────────────────
-// Dispatches using our internal syscall numbers.
+// Dispatches using our internal syscall numbers via a jump table.
 uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                                   uint64_t arg3, uint64_t arg4) {
     uint64_t ret;
@@ -3760,145 +4193,11 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         const char* s = (const char*)arg2;
         for (uint64_t i = 0; i < arg3; i++) serial_putc(s[i]);
     }
-    switch (nr) {
-        case SYS_WRITE:   ret = sys_write(arg1, arg2, arg3);      break;
-        case SYS_EXIT:
-            if (g_current && g_current->pid > 2) {
-                serial_puts("[exit] pid="); serial_hex_u32((uint32_t)g_current->pid);
-                serial_puts(" code="); serial_hex_u32((uint32_t)arg1);
-                serial_putc('\n');
-            }
-            ret = sys_exit(arg1);
-            break;
-        case SYS_READ:    ret = sys_read(arg1, arg2, arg3, arg4);  break;
-        case SYS_OPEN:    ret = sys_open(arg1, arg2, arg3);
-            if (g_current && g_current->pid > 2) {
-                serial_puts("[open] pid="); serial_hex_u32((uint32_t)g_current->pid);
-                serial_putc(' ');
-                serial_puts((const char*)arg1);
-                serial_puts(" -> ");
-                if ((int64_t)ret < 0) { serial_puts("ERR "); serial_hex_u32((uint32_t)(-(int64_t)ret)); }
-                else { serial_puts("fd="); serial_hex_u32((uint32_t)ret); }
-                serial_putc('\n');
-            }
-            break;
-        case SYS_CLOSE:   ret = sys_close(arg1);                   break;
-        case SYS_BRK:     ret = sys_brk(arg1);                     break;
-        case SYS_KILL:    ret = sys_kill(arg1, arg2);              break;
-        case SYS_FORK:    ret = sys_fork();                         break;
-        case SYS_EXEC:    ret = sys_exec(arg1, arg2, arg3);         break;
-        case SYS_WAIT:    ret = sys_wait(arg1, arg2, arg3);         break;
-        case SYS_GETPID:  ret = sys_getpid();                      break;
-        case SYS_GETPPID: ret = sys_getppid();                     break;
-        case SYS_READDIR: ret = sys_readdir(arg1, arg2, arg3, arg4); break;
-        case SYS_SPAWN:   ret = sys_spawn(arg1, arg2, arg3, arg4, g_syscall_arg5); break;
-        case SYS_THREAD:   ret = sys_thread(arg1, arg2, arg3);     break;
-        case SYS_CLOCK_NS: ret = tsc_read_ns();                    break;
-        case SYS_STAT:    ret = sys_stat(arg1, arg2, arg3);        break;
-        case SYS_UNLINK:  ret = sys_unlink(arg1, arg2);            break;
-        case SYS_RENAME:  ret = sys_rename(arg1, arg2, arg3, arg4); break;
-        case SYS_GETCWD:  ret = sys_getcwd(arg1, arg2);            break;
-        case SYS_CHDIR:   ret = sys_chdir(arg1, arg2);             break;
-        case SYS_MKDIR:   ret = sys_mkdir(arg1, arg2);             break;
-        case SYS_LSEEK:   ret = sys_lseek(arg1, arg2, arg3);      break;
-        case SYS_DUP:          ret = sys_dup(arg1);                       break;
-        case SYS_DUP2:         ret = sys_dup2(arg1, arg2);                break;
-        case SYS_PIPE:         ret = sys_pipe(arg1);                      break;
-        case SYS_SIGACTION:    ret = sys_sigaction(arg1, arg2, arg3);          break;
-        case SYS_SIGPROCMASK:  ret = sys_sigprocmask(arg1, arg2, arg3);        break;
-        case SYS_SIGRETURN:    ret = sys_sigreturn();                           break;
-        case SYS_MMAP:         ret = sys_mmap(arg1, arg2, arg3, arg4,
-                                              g_syscall_arg5, g_syscall_arg6);  break;
-        case SYS_MUNMAP:       ret = sys_munmap(arg1, arg2);                    break;
-        case SYS_NANOSLEEP:    ret = sys_nanosleep(arg1, arg2);                 break;
-        case SYS_GETTOD:       ret = sys_gettimeofday(arg1, arg2);              break;
-        case SYS_FB_BLIT:      ret = sys_fb_blit(arg1, arg2, arg3, arg4);      break;
-        case SYS_FB_INFO:      ret = sys_fb_info(arg1);                         break;
-        case SYS_FB_MAP:       ret = sys_fb_map();                              break;
-        case SYS_OPENPTY:      ret = sys_openpty(arg1);                         break;
-        case SYS_GETPEERPID:   ret = sys_getpeerpid(arg1);                      break;
-        case SYS_SOCKET:       ret = sys_socket(arg1, arg2, arg3);              break;
-        case SYS_BIND:         ret = sys_bind(arg1, arg2, arg3);                break;
-        case SYS_LISTEN:       ret = sys_listen(arg1, arg2);                    break;
-        case SYS_ACCEPT:       ret = sys_accept(arg1, arg2, arg3);              break;
-        case SYS_CONNECT:      ret = sys_connect(arg1, arg2, arg3);             break;
-        case SYS_SENDTO:       ret = sys_sendto(arg1, arg2, arg3, arg4,
-                                                g_syscall_arg5, g_syscall_arg6); break;
-        case SYS_RECVFROM:     ret = sys_recvfrom(arg1, arg2, arg3, arg4,
-                                                   g_syscall_arg5,
-                                                   g_syscall_arg6);              break;
-        case SYS_SETSOCKOPT:   ret = sys_setsockopt(arg1, arg2, arg3, arg4,
-                                                     g_syscall_arg5);            break;
-        case SYS_SHUTDOWN:     ret = sys_shutdown(arg1, arg2);                  break;
-        case SYS_NET_IFCONFIG: ret = sys_net_ifconfig(arg1, arg2);              break;
-        case SYS_NET_MAC:      ret = sys_net_mac(arg1);                         break;
 
-        // ── POSIX bash-compat syscalls ────────────────────────────────────
-        case SYS_FCNTL:      ret = sys_fcntl(arg1, arg2, arg3);               break;
-        case SYS_FSTAT:      ret = sys_fstat(arg1, arg2);                     break;
-        case SYS_ACCESS:     ret = sys_access(arg1, arg2);                    break;
-        case SYS_UNAME:      ret = sys_uname(arg1);                           break;
-        case SYS_UMASK:      ret = sys_umask(arg1);                           break;
-        case SYS_GETUID:     ret = sys_getuid();                              break;
-        case SYS_GETEUID:    ret = sys_geteuid();                             break;
-        case SYS_GETGID:     ret = sys_getgid();                              break;
-        case SYS_GETEGID:    ret = sys_getegid();                             break;
-        case SYS_GETGROUPS:  ret = sys_getgroups(arg1, arg2);                break;
-        case SYS_SETPGID:    ret = sys_setpgid(arg1, arg2);                  break;
-        case SYS_GETPGID:    ret = sys_getpgid(arg1);                        break;
-        case SYS_GETPGRP:    ret = sys_getpgrp();                             break;
-        case SYS_SETSID:     ret = sys_setsid();                              break;
-        case SYS_GETSID:     ret = sys_getsid(arg1);                         break;
-        case SYS_IOCTL:      ret = sys_ioctl(arg1, arg2, arg3);              break;
-        case SYS_SELECT:     ret = sys_select(arg1, arg2, arg3, arg4,
-                                              g_syscall_arg5);                break;
-        case SYS_POLL:       ret = sys_poll(arg1, arg2, arg3);               break;
-        case SYS_READLINK:   ret = sys_readlink(arg1, arg2, arg3);           break;
-        case SYS_SYMLINK:    ret = sys_symlink(arg1, arg2);                  break;
-        case SYS_LINK:       ret = sys_link(arg1, arg2);                     break;
-        case SYS_CHMOD:      ret = sys_chmod(arg1, arg2);                    break;
-        case SYS_FCHMOD:     ret = sys_fchmod(arg1, arg2);                   break;
-        case SYS_CHOWN:      ret = sys_chown(arg1, arg2, arg3);              break;
-        case SYS_FCHOWN:     ret = sys_fchown(arg1, arg2, arg3);             break;
-        case SYS_TRUNCATE:   ret = sys_truncate(arg1, arg2);                 break;
-        case SYS_FTRUNCATE:  ret = sys_ftruncate(arg1, arg2);                break;
-        case SYS_TIMES:      ret = sys_times(arg1);                          break;
-        case SYS_GETRUSAGE:  ret = sys_getrusage(arg1, arg2);                break;
-        case SYS_TCGETPGRP:  ret = sys_tcgetpgrp(arg1);                      break;
-        case SYS_TCSETPGRP:  ret = sys_tcsetpgrp(arg1, arg2);                break;
-        case SYS_REBOOT:
-            outb(0x64, 0xFE);
-            for (;;) __asm__ volatile("cli; hlt");
-            break;
+    sys_handler_t h = (nr < (uint64_t)(sizeof(s_syscall_table) / sizeof(s_syscall_table[0])))
+                      ? s_syscall_table[nr] : NULL;
+    ret = h ? h(arg1, arg2, arg3, arg4) : (uint64_t)-ENOSYS;
 
-        // ── Security syscalls ─────────────────────────────────────────────
-        case SYS_SETUID:     ret = sys_setuid(arg1);                         break;
-        case SYS_SETGID:     ret = sys_setgid(arg1);                         break;
-        case SYS_SETEUID:    ret = sys_seteuid(arg1);                        break;
-        case SYS_SETEGID:    ret = sys_setegid(arg1);                        break;
-        case SYS_SETREUID:   ret = sys_setreuid(arg1, arg2);                 break;
-        case SYS_SETREGID:   ret = sys_setregid(arg1, arg2);                 break;
-        case SYS_SETGROUPS:  ret = sys_setgroups(arg1, arg2);                break;
-        case SYS_PLEDGE:     ret = sys_pledge(arg1);                         break;
-        case SYS_UNVEIL:     ret = sys_unveil(arg1, arg2, arg3);             break;
-        case SYS_UNVEIL_LOCK: ret = sys_unveil_lock();                       break;
-        case SYS_RESTRICT_FD: ret = sys_restrict_fd(arg1, arg2);             break;
-        case SYS_SENDFD:     ret = sys_sendfd(arg1, arg2, arg3);             break;
-        case SYS_RECVFD:     ret = sys_recvfd(arg1);                         break;
-        case SYS_REGISTER_POLICY_AGENT:
-                             ret = sys_register_policy_agent(arg1, arg2);    break;
-
-        // ── Shared memory ─────────────────────────────────────────────────
-        case SYS_SHM_OPEN:   ret = sys_shm_open(arg1, arg2, arg3, arg4);    break;
-        case SYS_SHM_UNLINK: ret = sys_shm_unlink(arg1, arg2);              break;
-
-        // ── epoll ─────────────────────────────────────────────────────────
-        case SYS_EPOLL_CREATE: ret = sys_epoll_create(arg1);                break;
-        case SYS_EPOLL_CTL:    ret = sys_epoll_ctl(arg1, arg2, arg3, arg4); break;
-        case SYS_EPOLL_WAIT:   ret = sys_epoll_wait(arg1, arg2, arg3, arg4);break;
-
-        default:               ret = (uint64_t)-ENOSYS;                         break;
-    }
     // Deliver any pending signals on the syscall return path.
     // g_signal_in_syscall=1 tells signal_deliver_pending it may set up user frames.
     g_signal_in_syscall = 1;

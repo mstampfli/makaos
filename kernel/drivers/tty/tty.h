@@ -73,10 +73,9 @@ typedef struct tty_t {
     char name[16];
 } tty_t;
 
-// ── Global tty table ─────────────────────────────────────────────────────
-// tty0 = console (framebuffer + PS/2 keyboard). Index 0.
-#define TTY_COUNT 1
-extern tty_t g_ttys[TTY_COUNT];
+// ── Physical console TTY ──────────────────────────────────────────────────
+// tty0 = console (framebuffer + PS/2 keyboard).
+extern tty_t g_tty0;
 
 // ── API ───────────────────────────────────────────────────────────────────
 

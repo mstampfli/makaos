@@ -18,7 +18,6 @@
 // The master side is a plain fd: write injects input into the slave,
 // read receives the slave's output.
 
-#define PTY_MAX        16   // maximum simultaneous PTY pairs
 #define PTY_MASTER_BUF 4096 // master-side read ring buffer size (power of 2)
 
 typedef struct pty {
@@ -29,10 +28,10 @@ typedef struct pty {
     struct task_t* m_reader;                    // task sleeping in master read()
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
     wait_queue_t   master_waitq;                // poll/epoll waiters on the master fd
-    int          allocated;                     // 1 = in use
     int          master_open;                   // master fd still open?
     int          slave_open_count;              // refcount of open slave fds
     int          index;                         // pty number (for /dev/pts/N)
+    struct pty*  next;                          // next node in live PTY list
 } pty_t;
 
 // Allocate a new PTY pair. Returns master and slave vfs_file_t pointers.
@@ -43,5 +42,6 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out);
 // Called by slave's write_char to push output to master's read buffer.
 void pty_master_push(pty_t* pty, uint8_t c);
 
-// Global PTY table (for tty_get_ctty lookup)
-extern pty_t g_ptys[PTY_MAX];
+// Head of the singly-linked list of live (not-yet-fully-closed) PTYs.
+// Used by tty_get_ctty to find PTY slaves by session.
+pty_t* pty_list_head(void);
