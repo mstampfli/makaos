@@ -115,6 +115,22 @@ typedef struct __attribute__((aligned(16))) task_t {
     // child_next: this task's link in its parent's children list.
     struct task_t* children;    // head of direct-children list
     struct task_t* child_next;  // next sibling in parent's children list
+
+    // ── Task index lists (pgid/tgid/sid hash tables) ─────────────────────
+    // Each task is in three intrusive doubly-linked lists maintained by
+    // sched.c: one per {pgid, tgid, sid} hash-bucket membership.  Used so
+    // signal_send_pgrp/group and tty_get_ctty are O(list length) instead
+    // of O(total tasks in system).
+    //
+    // Locking: today these are protected by the global scheduler lock
+    // (single CPU).  Under SMP, pgid/tgid/sid hash tables grow their own
+    // spinlock_t locks (see smp.h).
+    struct task_t* pg_prev;
+    struct task_t* pg_next;
+    struct task_t* tg_prev;
+    struct task_t* tg_next;
+    struct task_t* sid_prev;
+    struct task_t* sid_next;
 } task_t;
 
 typedef task_t process_t;
