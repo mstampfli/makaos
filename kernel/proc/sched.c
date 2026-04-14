@@ -610,7 +610,14 @@ static void do_switch(uint8_t preempted) {
     __asm__ volatile("sti");
 }
 
+// Forward declaration — body below sched_sleep.
+static NOINLINE void sched_sleep_while_preempt_disabled_panic(void);
+
 void sched_yield(void) {
+    // Same invariant as sched_sleep: yielding with preempt disabled is
+    // a bug that would leak the preempt state across the context switch.
+    if (UNLIKELY(this_cpu()->preempt_depth > 0))
+        sched_sleep_while_preempt_disabled_panic();
     s_reschedule = 0;
     do_switch(0);
 }
@@ -624,7 +631,27 @@ void sched_preempt(void) {
     do_switch(1);
 }
 
+// Sleeping with preemption disabled is a bug that always leads to
+// deadlock (the CPU can't context-switch away, so the sleep never
+// returns).  Catch it loudly instead of silently hanging.
+static NOINLINE void sched_sleep_while_preempt_disabled_panic(void) {
+    serial_puts_dbg("[sched] PANIC: sched_sleep with preempt_depth > 0\n");
+    serial_puts_dbg("[sched]   pid=");
+    serial_hex_dbg(g_current ? (uint64_t)g_current->pid : 0);
+    serial_puts_dbg("[sched]   depth=");
+    serial_hex_dbg((uint64_t)this_cpu()->preempt_depth);
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
 void sched_sleep(void) {
+    // Enforce: no task may sleep while preempt is disabled.  This is the
+    // single runtime check that makes preempt_disable safe everywhere —
+    // RCU readers, INITCALL_FLAG_PREEMPT_OFF, fb_term_putc, slab fast
+    // paths (Phase 4), anywhere.  Violation = immediate panic with enough
+    // context for a post-mortem.
+    if (UNLIKELY(this_cpu()->preempt_depth > 0))
+        sched_sleep_while_preempt_disabled_panic();
+
     if (g_current && g_current != &s_idle) {
         g_current->state = TASK_SLEEPING;
         // Refresh quantum so the task gets a full slice when woken.

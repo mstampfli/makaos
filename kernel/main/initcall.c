@@ -102,6 +102,12 @@ static void run_dag(initcall_t** start, initcall_t** end) {
         // ── Execute ───────────────────────────────────────────────────────
         ic_put_str_nl("[initcall] ", node->ic->name);
 
+        // INITCALL_FLAG_PREEMPT_OFF wraps the whole init function in
+        // preempt_disable/enable.  Restricted to short hardware bring-up
+        // sequences that must not be interleaved with scheduler activity.
+        // sched_sleep() panics if called from under this flag, so any
+        // accidental sleep is caught loudly instead of silently
+        // deadlocking.
         int preempt_off = node->ic->flags & INITCALL_FLAG_PREEMPT_OFF;
         if (preempt_off) preempt_disable();
 
