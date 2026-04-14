@@ -350,13 +350,8 @@ int virtio_net_tx(const void* data, uint16_t len) {
     if (!s_ok || len > ETH_MAX_FRAME) return -1;
 
     // Build virtio-net header + frame in the TX buffer.
-    virtio_net_hdr_t* hdr = (virtio_net_hdr_t*)s_tx_buf_virt;
-    for (uint32_t i = 0; i < VIRTIO_NET_HDR_LEN; i++)
-        ((uint8_t*)hdr)[i] = 0;  // all zeros: no GSO, no checksum offload
-
-    uint8_t* frame = s_tx_buf_virt + VIRTIO_NET_HDR_LEN;
-    const uint8_t* src = (const uint8_t*)data;
-    for (uint16_t i = 0; i < len; i++) frame[i] = src[i];
+    __builtin_memset(s_tx_buf_virt, 0, VIRTIO_NET_HDR_LEN);
+    __builtin_memcpy(s_tx_buf_virt + VIRTIO_NET_HDR_LEN, data, len);
 
     __asm__ volatile("mfence" ::: "memory");
 
@@ -408,8 +403,7 @@ int virtio_net_rx_poll(skbuff_t** skb_out) {
     skbuff_t* skb = skb_alloc(eth_len);
     if (skb && eth_len > 0) {
         uint8_t* dst = (uint8_t*)skb_put(skb, eth_len);
-        uint8_t* src = raw + VIRTIO_NET_HDR_LEN;
-        for (uint32_t i = 0; i < eth_len; i++) dst[i] = src[i];
+        __builtin_memcpy(dst, raw + VIRTIO_NET_HDR_LEN, eth_len);
     }
 
     // Return the descriptor to the avail ring so the device can reuse it.

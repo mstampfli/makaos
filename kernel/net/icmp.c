@@ -34,7 +34,7 @@ void icmp_recv(skbuff_t* skb) {
         if (!out) { skb_free(reply); skb_free(skb); return; }
 
         // Copy entire ICMP message.
-        for (uint32_t i = 0; i < skb->len; i++) out[i] = ((uint8_t*)skb->data)[i];
+        __builtin_memcpy(out, skb->data, skb->len);
 
         // Change type to reply.
         icmp_hdr_t* rhdr = (icmp_hdr_t*)out;

@@ -35,11 +35,8 @@ int eth_send(skbuff_t* skb, const uint8_t* dst, uint16_t ethertype) {
     eth_hdr_t* hdr = (eth_hdr_t*)skb_push(skb, ETH_HDR_LEN);
     if (!hdr) return -1;
 
-    const uint8_t* mac = virtio_net_mac();
-    for (uint32_t i = 0; i < ETH_ALEN; i++) {
-        hdr->dst[i] = dst[i];
-        hdr->src[i] = mac[i];
-    }
+    __builtin_memcpy(hdr->dst, dst, ETH_ALEN);
+    __builtin_memcpy(hdr->src, virtio_net_mac(), ETH_ALEN);
     hdr->ethertype = hton16(ethertype);
 
     return virtio_net_tx(skb->data, (uint16_t)skb->len);

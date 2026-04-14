@@ -152,8 +152,7 @@ static int tcp_send_segment(tcp_pcb_t* pcb, uint8_t flags,
 
     if (dlen) {
         uint8_t* p = (uint8_t*)skb_put(skb, dlen);
-        const uint8_t* src = (const uint8_t*)data;
-        for (uint16_t i = 0; i < dlen; i++) p[i] = src[i];
+        __builtin_memcpy(p, data, dlen);
     }
 
     // Compute TCP checksum.

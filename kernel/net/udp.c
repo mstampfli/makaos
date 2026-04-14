@@ -58,8 +58,7 @@ int udp_send_ex(uint32_t src_ip_be, uint32_t dst_ip_be,
     hdr->checksum = 0;
 
     uint8_t* payload = (uint8_t*)skb_put(skb, len);
-    const uint8_t* src = (const uint8_t*)data;
-    for (uint16_t i = 0; i < len; i++) payload[i] = src[i];
+    __builtin_memcpy(payload, data, len);
 
     // Compute UDP checksum over the real source IP (what will go on the wire).
     uint32_t eff_src = src_ip_be ? src_ip_be : net_our_ip();

@@ -568,9 +568,7 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     msg->next = NULL;
     msg->len  = len;
 
-    const uint8_t* src = (const uint8_t*)buf;
-    uint8_t* dst = UNIX_DGRAM_DATA(msg);
-    for (uint32_t i = 0; i < len; i++) dst[i] = src[i];
+    __builtin_memcpy(UNIX_DGRAM_DATA(msg), buf, len);
 
     // Enqueue into target's receive queue.
     if (target->dgram_tail) {

@@ -69,7 +69,7 @@ static void arp_cache_raw_insert(arp_entry_t* slots, uint32_t cap,
     for (;;) {
         if (!slots[i].ip_be) {
             slots[i].ip_be = ip_be;
-            for (uint32_t j = 0; j < ETH_ALEN; j++) slots[i].mac[j] = mac[j];
+            __builtin_memcpy(slots[i].mac, mac, ETH_ALEN);
             return;
         }
         i = (i + 1u) & (cap - 1u);
@@ -97,7 +97,7 @@ static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
     uint32_t idx = arp_cache_find(ip_be);
     if (idx < s_cache_cap) {
         // Update existing entry.
-        for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[idx].mac[j] = mac[j];
+        __builtin_memcpy(s_cache[idx].mac, mac, ETH_ALEN);
         return;
     }
     if (s_cache_cnt * 4u >= s_cache_cap * 3u)
@@ -125,9 +125,9 @@ static void arp_send(uint16_t oper, const uint8_t* tha,
     pkt->hlen  = ETH_ALEN;
     pkt->plen  = 4;
     pkt->oper  = hton16(oper);
-    for (uint32_t i = 0; i < ETH_ALEN; i++) pkt->sha[i] = our_mac[i];
+    __builtin_memcpy(pkt->sha, our_mac, ETH_ALEN);
     pkt->spa = our_ip;
-    for (uint32_t i = 0; i < ETH_ALEN; i++) pkt->tha[i] = tha[i];
+    __builtin_memcpy(pkt->tha, tha, ETH_ALEN);
     pkt->tpa = tpa_be;
 
     eth_send(skb, dst_mac, ETHERTYPE_ARP);

@@ -183,8 +183,7 @@ vfs_file_t* vfs_null_open(void) {
 
 static int64_t zero_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
-    uint8_t* p = (uint8_t*)buf;
-    for (uint64_t i = 0; i < len; i++) p[i] = 0;
+    __builtin_memset(buf, 0, len);
     return (int64_t)len;
 }
 

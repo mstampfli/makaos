@@ -211,9 +211,11 @@ static void port_init(hba_port_t* p) {
     uint8_t* cl = (uint8_t*)(s_cmdlist_phys + HHDM_OFFSET);
     uint8_t* fb = (uint8_t*)(s_fis_phys     + HHDM_OFFSET);
     uint8_t* ct = (uint8_t*)(s_cmdtbl_phys  + HHDM_OFFSET);
-    for (int i = 0; i < 4096; i++) cl[i] = fb[i] = ct[i] = 0;
+    __builtin_memset(cl, 0, 4096);
+    __builtin_memset(fb, 0, 4096);
+    __builtin_memset(ct, 0, 4096);
     uint8_t* dma = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
-    for (uint32_t i = 0; i < (1u << DMA_ORDER) * PAGE_SIZE; i++) dma[i] = 0;
+    __builtin_memset(dma, 0, (1u << DMA_ORDER) * PAGE_SIZE);
 
     // Point command header 0 at the command table.
     cmd_header_t* hdr = (cmd_header_t*)cl;
@@ -286,7 +288,7 @@ static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write,
 
     // H2D FIS.
     uint8_t* fis = ct->cfis;
-    for (int i = 0; i < 64; i++) fis[i] = 0;
+    __builtin_memset(fis, 0, 64);
     fis[0]  = FIS_TYPE_H2D;
     fis[1]  = 0x80;
     fis[2]  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
@@ -341,15 +343,11 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
         uint32_t bytes = n * 512;
         uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
 
-        if (write) {
-            for (uint32_t i = 0; i < bytes; i++) dma[i] = p8[i];
-        }
+        if (write) __builtin_memcpy(dma, p8, bytes);
 
         if (!issue_one(lba, n, write, 0)) return 0;
 
-        if (!write) {
-            for (uint32_t i = 0; i < bytes; i++) p8[i] = dma[i];
-        }
+        if (!write) __builtin_memcpy(p8, dma, bytes);
 
         p8    += bytes;
         lba   += n;
@@ -379,11 +377,8 @@ static void scatter_copy(uint8_t* dma, uint32_t bytes,
         uint32_t chunk = PAGE_SIZE - off;
         if (chunk > bytes - done) chunk = bytes - done;
         uint8_t* p = pages[pg] + off;
-        if (to_dma) {
-            for (uint32_t i = 0; i < chunk; i++) dma[done + i] = p[i];
-        } else {
-            for (uint32_t i = 0; i < chunk; i++) p[i] = dma[done + i];
-        }
+        if (to_dma) __builtin_memcpy(dma + done, p, chunk);
+        else        __builtin_memcpy(p, dma + done, chunk);
         done += chunk;
         pos  += chunk;
     }
@@ -417,7 +412,7 @@ static void ahci_io_thread(void) {
                     scatter_copy(dma, bytes, r->pages, r->page_count,
                                  r->first_page_offset, sg_off, 1);
                 else
-                    for (uint32_t i = 0; i < bytes; i++) dma[i] = p8[i];
+                    __builtin_memcpy(dma, p8, bytes);
             }
 
             ok = issue_one(lba, n, write, 1);
@@ -427,7 +422,7 @@ static void ahci_io_thread(void) {
                     scatter_copy(dma, bytes, r->pages, r->page_count,
                                  r->first_page_offset, sg_off, 0);
                 else
-                    for (uint32_t i = 0; i < bytes; i++) p8[i] = dma[i];
+                    __builtin_memcpy(p8, dma, bytes);
             }
 
             if (!scatter) p8 += bytes;

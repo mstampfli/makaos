@@ -459,9 +459,7 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
     s->udp_rx_count--;
 
     uint32_t copy = skb->len < len ? skb->len : len;
-    uint8_t* src  = (uint8_t*)skb->data;
-    uint8_t* dst  = (uint8_t*)buf;
-    for (uint32_t i = 0; i < copy; i++) dst[i] = src[i];
+    __builtin_memcpy(buf, skb->data, copy);
     skb_free(skb);
     return (int)copy;
 }
@@ -530,9 +528,7 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
     }
 
     uint32_t copy = skb->len < len ? skb->len : len;
-    uint8_t* src  = (uint8_t*)skb->data;
-    uint8_t* dst  = (uint8_t*)buf;
-    for (uint32_t i = 0; i < copy; i++) dst[i] = src[i];
+    __builtin_memcpy(buf, skb->data, copy);
     skb_free(skb);
     return (int)copy;
 }

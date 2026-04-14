@@ -67,9 +67,7 @@ static int64_t membuf_read(vfs_file_t* self, void* dst, uint64_t len) {
     if (ctx->pos >= ctx->size) return 0; // EOF
     uint64_t avail = ctx->size - ctx->pos;
     if (len > avail) len = avail;
-    uint8_t* s = ctx->buf + ctx->pos;
-    uint8_t* d = (uint8_t*)dst;
-    for (uint64_t i = 0; i < len; i++) d[i] = s[i];
+    __builtin_memcpy(dst, ctx->buf + ctx->pos, len);
     ctx->pos += len;
     return (int64_t)len;
 }
@@ -148,7 +146,7 @@ static int strbuf_grow(strbuf_t* b, uint64_t need) {
     while (newcap < b->len + need + 1) newcap *= 2;
     char* newdata = kmalloc(newcap);
     if (!newdata) return 0;
-    for (uint64_t i = 0; i < b->len; i++) newdata[i] = b->data[i];
+    __builtin_memcpy(newdata, b->data, b->len);
     newdata[b->len] = '\0';
     kfree(b->data);
     b->data = newdata;
@@ -225,7 +223,7 @@ static uint8_t* gen_cmdline(task_t* t, uint64_t* out_size) {
     uint64_t len = str_len(name) + 1; // include NUL
     uint8_t* buf = kmalloc(len ? len : 1);
     if (!buf) return NULL;
-    for (uint64_t i = 0; i < len; i++) buf[i] = (uint8_t)name[i];
+    __builtin_memcpy(buf, name, len);
     *out_size = len;
     return buf;
 }

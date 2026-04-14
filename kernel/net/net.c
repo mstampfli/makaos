@@ -85,13 +85,13 @@ void net_set_config(uint32_t our_ip_be, uint32_t gw_be, uint32_t mask_be) {
 
 uint32_t net_get_dns(uint32_t* out, uint32_t max) {
     uint32_t n = s_dns_count < max ? s_dns_count : max;
-    for (uint32_t i = 0; i < n; i++) out[i] = s_dns[i];
+    __builtin_memcpy(out, s_dns, n * sizeof(uint32_t));
     return n;
 }
 
 void net_set_dns(const uint32_t* servers, uint32_t count) {
     if (count > NET_MAX_DNS) count = NET_MAX_DNS;
-    for (uint32_t i = 0; i < count; i++) s_dns[i] = servers[i];
+    __builtin_memcpy(s_dns, servers, count * sizeof(uint32_t));
     s_dns_count = count;
 }
 

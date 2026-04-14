@@ -4,27 +4,57 @@
 #include "vmm.h"
 #include "common.h"
 
-/* ── C library stubs required by the compiler ───────────────────────────── */
+/* ── C library stubs required by the compiler ────────────────────────────
+ *
+ * GCC with -fno-builtin still emits calls to memcpy/memmove/memset for
+ * large __builtin_memcpy/memset calls it can't inline.  The kernel has no
+ * libc, so we must provide these — and they absolutely cannot be byte
+ * loops (fb_term_scroll copies ~8 MB every time the console scrolls).
+ *
+ * Use `rep movsb`/`rep stosb` — on Intel Ivy Bridge and later these are
+ * as fast as SSE/AVX copies thanks to ERMS (Enhanced REP MOVSB), and
+ * crucially they don't touch SSE state (the kernel is compiled with
+ * -mno-sse and doesn't save/restore XMM registers on context switch).
+ */
 void* memcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    __asm__ volatile ("rep movsb"
+                      : "+D"(dst), "+S"(src), "+c"(n)
+                      :
+                      : "memory");
     return dst;
 }
+
 void* memmove(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
+    if (d == s || n == 0) return dst;
     if (d < s) {
-        for (size_t i = 0; i < n; i++) d[i] = s[i];
+        // Forward copy: safe since dst doesn't overlap with remaining src.
+        __asm__ volatile ("rep movsb"
+                          : "+D"(d), "+S"(s), "+c"(n)
+                          :
+                          : "memory");
     } else {
-        for (size_t i = n; i > 0; i--) d[i-1] = s[i-1];
+        // Backward copy: set DF=1, start from the end, rep movsb, clear DF.
+        d += n - 1;
+        s += n - 1;
+        __asm__ volatile ("std\n\t"
+                          "rep movsb\n\t"
+                          "cld"
+                          : "+D"(d), "+S"(s), "+c"(n)
+                          :
+                          : "memory");
     }
     return dst;
 }
+
 void* memset(void* dst, int c, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    for (size_t i = 0; i < n; i++) d[i] = (uint8_t)c;
-    return dst;
+    void* ret = dst;
+    __asm__ volatile ("rep stosb"
+                      : "+D"(dst), "+c"(n)
+                      : "a"((uint8_t)c)
+                      : "memory");
+    return ret;
 }
 
 // ── mm_create ─────────────────────────────────────────────────────────────
