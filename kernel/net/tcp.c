@@ -16,7 +16,7 @@
 #define TCP_MSS           1460u           // max segment size (1500 - 20 IP - 20 TCP)
 #define TCP_WINDOW        65535u          // advertised receive window
 #define TCP_TIME_WAIT_NS  4000000000ULL   // TIME_WAIT: 2×MSL = 4 seconds
-#define TCP_MAX_PCBS      64u             // maximum simultaneous connections
+// TCP_MAX_PCBS removed — PCBs are now kmalloc'd and linked; no fixed cap.
 #define TCP_BACKLOG       8u              // listen backlog per server socket
 #define TCP_RXBUF_SIZE    65536u          // per-connection receive ring (power of 2)
 #define TCP_TXBUF_SIZE    65536u          // per-connection transmit ring (power of 2)
@@ -81,11 +81,16 @@ struct tcp_pcb {
     uint8_t  fin_rcvd;   // 1 if remote FIN received
     uint8_t  reset;      // 1 if the connection was aborted by RST
     uint64_t timewait_start; // when TIME_WAIT was entered
+
+    // Intrusive singly-linked list node for s_pcb_head.
+    struct tcp_pcb* next;
 };
 
-// ── PCB table ─────────────────────────────────────────────────────────────
-static tcp_pcb_t s_pcbs[TCP_MAX_PCBS];
-static uint8_t   s_pcb_used[TCP_MAX_PCBS];
+// ── PCB list ──────────────────────────────────────────────────────────────
+// Singly-linked list of all live PCBs.  Insertion is O(1); lookup is O(n)
+// in the number of open connections — same complexity as before but with no
+// fixed cap.  Each PCB is individually kmalloc'd.
+static tcp_pcb_t* s_pcb_head = NULL;
 
 // Ephemeral port counter.
 static uint16_t s_eph_port = 49152u;
@@ -214,17 +219,16 @@ static void tcp_send_rst(uint32_t src_ip, uint16_t src_port,
 
 static tcp_pcb_t* pcb_find(uint32_t local_ip, uint16_t local_port,
                              uint32_t remote_ip, uint16_t remote_port) {
+    (void)local_ip;
     tcp_pcb_t* listener = NULL;
-    for (uint32_t i = 0; i < TCP_MAX_PCBS; i++) {
-        if (!s_pcb_used[i]) continue;
-        tcp_pcb_t* p = &s_pcbs[i];
-        // Exact match (ESTABLISHED / SYN_RCVD).
+    for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+        // Exact match (ESTABLISHED / SYN_RCVD / etc).
         if (p->local_port  == local_port  &&
             p->remote_port == remote_port &&
             p->remote_ip   == remote_ip   &&
             p->state       != TCP_LISTEN)
             return p;
-        // Listener match.
+        // Listener match (local port, wildcard remote).
         if (p->local_port == local_port && p->state == TCP_LISTEN)
             listener = p;
     }
@@ -428,9 +432,7 @@ void tcp_recv(skbuff_t* skb) {
 
 void tcp_timer_tick(void) {
     uint64_t now = tsc_read_ns();
-    for (uint32_t i = 0; i < TCP_MAX_PCBS; i++) {
-        if (!s_pcb_used[i]) continue;
-        tcp_pcb_t* pcb = &s_pcbs[i];
+    for (tcp_pcb_t* pcb = s_pcb_head; pcb; pcb = pcb->next) {
 
         // Retransmit timeout.
         if (pcb->rto_deadline && now >= pcb->rto_deadline &&
@@ -461,38 +463,49 @@ void tcp_timer_tick(void) {
 // ── Public PCB management ─────────────────────────────────────────────────
 
 tcp_pcb_t* tcp_pcb_alloc(uint16_t lport) {
-    for (uint32_t i = 0; i < TCP_MAX_PCBS; i++) {
-        if (!s_pcb_used[i]) {
-            s_pcb_used[i] = 1;
-            tcp_pcb_t* p = &s_pcbs[i];
-            // Zero the PCB.
-            uint8_t* b = (uint8_t*)p;
-            for (uint32_t j = 0; j < sizeof(tcp_pcb_t); j++) b[j] = 0;
-            p->local_ip   = net_our_ip();
-            p->local_port = lport;
-            p->rcv_wnd    = TCP_WINDOW;
-            p->state      = TCP_CLOSED;
+    tcp_pcb_t* p = (tcp_pcb_t*)kmalloc(sizeof(tcp_pcb_t));
+    if (!p) return NULL;
 
-            p->txbuf = (uint8_t*)kmalloc(TCP_TXBUF_SIZE);
-            p->rxbuf = (uint8_t*)kmalloc(TCP_RXBUF_SIZE);
-            if (!p->txbuf || !p->rxbuf) {
-                if (p->txbuf) kfree(p->txbuf);
-                if (p->rxbuf) kfree(p->rxbuf);
-                s_pcb_used[i] = 0;
-                return NULL;
-            }
-            return p;
-        }
+    // Zero the PCB.
+    uint8_t* b = (uint8_t*)p;
+    for (uint32_t j = 0; j < sizeof(tcp_pcb_t); j++) b[j] = 0;
+    p->local_ip   = net_our_ip();
+    p->local_port = lport;
+    p->rcv_wnd    = TCP_WINDOW;
+    p->state      = TCP_CLOSED;
+
+    p->txbuf = (uint8_t*)kmalloc(TCP_TXBUF_SIZE);
+    p->rxbuf = (uint8_t*)kmalloc(TCP_RXBUF_SIZE);
+    if (!p->txbuf || !p->rxbuf) {
+        if (p->txbuf) kfree(p->txbuf);
+        if (p->rxbuf) kfree(p->rxbuf);
+        kfree(p);
+        return NULL;
     }
-    return NULL;
+
+    // Insert at head of live PCB list.
+    p->next    = s_pcb_head;
+    s_pcb_head = p;
+    serial_puts_dbg("[tcp] pcb_alloc port=");
+    serial_hex_dbg((uint64_t)lport);
+    return p;
 }
 
 void tcp_pcb_free(tcp_pcb_t* pcb) {
     if (!pcb) return;
+    // Remove from linked list.
+    if (s_pcb_head == pcb) {
+        s_pcb_head = pcb->next;
+    } else {
+        for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+            if (p->next == pcb) { p->next = pcb->next; break; }
+        }
+    }
     if (pcb->txbuf) { kfree(pcb->txbuf); pcb->txbuf = NULL; }
     if (pcb->rxbuf) { kfree(pcb->rxbuf); pcb->rxbuf = NULL; }
-    uint32_t idx = (uint32_t)(pcb - s_pcbs);
-    if (idx < TCP_MAX_PCBS) s_pcb_used[idx] = 0;
+    serial_puts_dbg("[tcp] pcb_free port=");
+    serial_hex_dbg((uint64_t)pcb->local_port);
+    kfree(pcb);
 }
 
 int tcp_connect(tcp_pcb_t* pcb, uint32_t dst_ip_be, uint16_t dst_port) {

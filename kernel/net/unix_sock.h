@@ -36,8 +36,9 @@
 // Maximum pending connections on a listening socket.
 #define UNIX_BACKLOG_MAX 16
 
-// Maximum bound unix sockets in the namespace.
-#define UNIX_NS_MAX      64
+// Maximum bound unix sockets in the namespace (dynamic — no fixed cap).
+// UNIX_NS_MAX kept for ABI compatibility; dynamic hash table used internally.
+#define UNIX_NS_MAX      64  // unused — table grows dynamically
 
 // Maximum in-flight fds in the SCM_RIGHTS ancillary queue.
 #define UNIX_ANCILLARY_MAX 8
