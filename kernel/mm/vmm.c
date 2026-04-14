@@ -3,6 +3,8 @@
 #include "idt.h"
 #include "mm.h"
 #include "shmem.h"
+#include "process.h"
+#include "sched.h"
 
 // Physical address of the kernel's own PML4.
 // Set by vmm_init(); used by vmm_alloc_pml4() to clone kernel entries.
@@ -498,9 +500,10 @@ uint8_t vmm_clone_user(phys_addr_t dst_pml4, phys_addr_t src_pml4) {
 //   Not-present in kernel space → demand-map (kheap expansion).
 //   Protection violation in kernel space → panic (unrecoverable).
 
-// Forward declaration — g_current lives in sched.c.
-struct task_t;
-extern struct task_t* g_current;
+// g_current is a per-CPU accessor macro from sched.h (expands to
+// this_cpu()->current).  The page-fault handler runs in process
+// context with preempt disabled at ISR entry, so the per-CPU read is
+// stable.
 
 static void ser_hex64(uint64_t v) {
     const char* h = "0123456789ABCDEF";
