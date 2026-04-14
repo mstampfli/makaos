@@ -144,8 +144,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
-    t->sigstate.head    = 0;
-    t->sigstate.tail    = 0;
+    t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->umask            = 0022u; // default umask: rwxr-xr-x
     t->exit_code        = 0;
@@ -321,8 +320,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
-    t->sigstate.head    = 0;
-    t->sigstate.tail    = 0;
+    t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) __builtin_memcpy(t->cwd, parent->cwd, KPATH_MAX);
