@@ -22,6 +22,28 @@ static const uint8_t s_quanta[MLFQ_LEVELS] = {8, 16, 32, 64};
 task_t* g_current   = NULL;
 task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
+// ── PID -> task hash table ────────────────────────────────────────────────
+// Direct-indexed by pid. PID_MAX+1 = 65536 slots × 8 bytes = 512 KiB BSS.
+// Insert on task creation, remove on zombie reap / task free.
+// Provides O(1) lookup for kill/wait/ptrace instead of sched_for_each O(n).
+#define PID_HT_SIZE  65536u
+static task_t* s_pid_ht[PID_HT_SIZE];
+
+void pid_ht_insert(task_t* t) {
+    if (!t || t->pid >= PID_HT_SIZE) return;
+    s_pid_ht[t->pid] = t;
+}
+
+void pid_ht_remove(task_t* t) {
+    if (!t || t->pid >= PID_HT_SIZE) return;
+    if (s_pid_ht[t->pid] == t) s_pid_ht[t->pid] = NULL;
+}
+
+task_t* pid_ht_find(uint32_t pid) {
+    if (pid >= PID_HT_SIZE) return NULL;
+    return s_pid_ht[pid];
+}
+
 // Per-level FIFO queues.
 static task_t* s_heads[MLFQ_LEVELS];
 static task_t* s_tails[MLFQ_LEVELS];
@@ -100,6 +122,7 @@ void sched_add(task_t* proc) {
     // Register the first user process as the init/orphan-reaper task.
     if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
         g_init_task = proc;
+    pid_ht_insert(proc);
     enqueue(proc);
 }
 
@@ -276,6 +299,7 @@ void sched_wake(task_t* proc) {
 
 // Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
 void sched_add_zombie(task_t* t) {
+    pid_ht_remove(t);
     t->next = s_zombie_head;
     s_zombie_head = t;
 }
@@ -290,6 +314,7 @@ task_t* sched_reap_zombie(uint32_t pid) {
             task_t* z = *pp;
             *pp = z->next;
             z->next = NULL;
+            pid_ht_remove(z);
             return z;
         }
         pp = &(*pp)->next;
@@ -310,6 +335,7 @@ task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
         if (pid_match && is_child) {
             *pp = z->next;
             z->next = NULL;
+            pid_ht_remove(z);
             return z;
         }
         pp = &(*pp)->next;
@@ -395,18 +421,9 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
 }
 
 // ── sched_find_pid ────────────────────────────────────────────────────────
-// Find a task by pid, searching all queues.
-
-typedef struct { uint32_t pid; task_t* result; } find_pid_ctx_t;
-static void find_pid_visit(task_t* t, void* data) {
-    find_pid_ctx_t* ctx = (find_pid_ctx_t*)data;
-    if (!ctx->result && t->pid == ctx->pid) ctx->result = t;
-}
-
+// O(1) lookup via pid hash table.
 task_t* sched_find_pid(uint32_t pid) {
-    find_pid_ctx_t ctx = { pid, NULL };
-    sched_for_each(find_pid_visit, &ctx);
-    return ctx.result;
+    return pid_ht_find(pid);
 }
 
 // ── sched_queue_head — removed: use sched_for_each instead ───────────────

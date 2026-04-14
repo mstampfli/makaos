@@ -6,8 +6,8 @@
 // A process may call sys_pledge(mask) to restrict itself to a subset of
 // syscall groups.  The new mask is AND-ed into the existing mask — rights
 // can only be removed, never added.  Once pledged, the restriction survives
-// fork (child inherits), but is reset on exec (the new image starts
-// unpledged, so it can set its own pledge early in startup).
+// both fork (child inherits) and exec (new image starts with the same mask).
+// This lets a parent set restrictions before exec that the child cannot escape.
 //
 // Enforcement: syscall_dispatch() checks pledge_mask BEFORE calling any
 // handler.  Violation → SIGKILL delivered synchronously, handler never runs.

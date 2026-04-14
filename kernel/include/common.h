@@ -78,6 +78,10 @@ static inline void serial_hex_dbg(uint64_t v) {
 #define UINT64_MAX ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 #define UINT32_MAX 0xFFFFFFFFU
 
+// Maximum kernel path length — matches POSIX PATH_MAX (4096).
+// Use this everywhere instead of ad-hoc 256/512 stack buffers.
+#define KPATH_MAX   4096u
+
 #define HHDM_OFFSET 0xFFFF800000000000ULL
 #define GIB_SIZE    (1ULL << 30)
 #define PS_BIT      (1ULL << 7) // Page Size bit

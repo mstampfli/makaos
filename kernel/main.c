@@ -42,8 +42,8 @@ static void serial_init_and_say(void) {
 
 // ── init_kthread ──────────────────────────────────────────────────────────
 // Runs in process context after the scheduler and timer are live.
-// Calls do_initcalls_subsys() which runs every INITCALL_SUBSYS registration
-// in priority order, then spawns login + dhcpcd.
+// Calls do_initcalls_subsys() then spawns login and svcmgr.
+// svcmgr owns all userspace services (reads /etc/services/*.svc).
 
 static void init_kthread(void) {
     ahci_start_io_thread();
@@ -53,14 +53,17 @@ static void init_kthread(void) {
     // Load userspace processes sequentially — ext2 is not thread-safe.
     static const char* envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", NULL };
 
-    static const char* login_argv[] = { "/bin/login", NULL };
-    task_t* login = elf_exec_from_ext2("/bin/login", pid_alloc(), login_argv, envp, NULL);
+    static const char* login_argv[]  = { "/bin/login",  NULL };
+    static const char* svcmgr_argv[] = { "/bin/svcmgr", NULL };
 
-    static const char* dhcp_argv[] = { "/bin/dhcpcd", NULL };
-    task_t* dhcpd = elf_exec_from_ext2("/bin/dhcpcd", pid_alloc(), dhcp_argv, envp, NULL);
+    static const int login_stdio[3]  = { -1, -1, -1 }; // inherit tty0
+    static const int svcmgr_stdio[3] = { -2, -2, -2 }; // /dev/null
 
-    if (login) sched_add(login);
-    if (dhcpd) sched_add(dhcpd);
+    task_t* login  = elf_exec_from_ext2("/bin/login",  pid_alloc(), login_argv,  envp, login_stdio);
+    task_t* svcmgr = elf_exec_from_ext2("/bin/svcmgr", pid_alloc(), svcmgr_argv, envp, svcmgr_stdio);
+
+    if (login)  sched_add(login);
+    if (svcmgr) sched_add(svcmgr);
 }
 
 // ── kmain ─────────────────────────────────────────────────────────────────
