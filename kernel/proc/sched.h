@@ -13,9 +13,26 @@
 //
 // Idle task: if all queues are empty the idle task runs (hlt loop).
 
-// Pointer to the currently executing process.
-// NULL means the idle process (kmain's hlt loop) is running.
-extern task_t* g_current;
+// Pointer to the currently executing task ON THIS CPU.
+//
+// Under SMP this MUST be a per-CPU accessor, not a global.  Reading a
+// single global from CPU A would give you whatever task CPU B most
+// recently switched to — nonsense.
+//
+// Every read/write of g_current is rewritten by this macro to go
+// through the per-CPU slot in cpu_t.  Because the result is an
+// lvalue (struct field access through a pointer), existing code like
+// `g_current = next;` still compiles and does the right thing.
+//
+// IMPORTANT: this_cpu() dereferences a per-CPU pointer, so any access
+// to g_current that expects a stable value across a possible context
+// switch must bracket the read with preempt_disable / preempt_enable.
+// In practice that's already what every call site does (the
+// scheduler itself is the only place g_current changes, and signal
+// delivery etc. reads it within a syscall context where we're not
+// yet preemptible).
+#include "cpu.h"
+#define g_current (this_cpu()->current)
 
 // The first user process (login/init).  Orphaned children are reparented here.
 extern task_t* g_init_task;

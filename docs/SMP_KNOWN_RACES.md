@@ -41,21 +41,22 @@ Format:
 
 ---
 
-## 2. Scheduler wait/run-queue lists
+## 2. Scheduler wait/run-queue lists — RESOLVED (Phase 5)
 
-- **Location:** `kernel/proc/sched.c` — `s_sleep_head`, `s_heads[]`,
-  `s_tails[]`, `s_zombie_head`, `s_reschedule`
-- **Race:** `sched_wake`, `sched_sleep`, `sched_tick`, `enqueue`,
-  `dequeue`, `sched_add_zombie`, `sched_reap_*` all manipulate these
-  global lists with no synchronization.
-- **Why safe on UP:** only one CPU → only one thread of execution can
-  be in any of these functions at a time. `cli` on IRQ paths keeps IRQ
-  handlers (like timer ticks) from interleaving.
-- **Fix phase:** Phase 5 — per-CPU scheduler.
-- **Fix strategy:** the entire scheduler becomes per-CPU. Run queues
-  live in `cpu_t.rq`. Sleep list is per-CPU. Wake path sends the task
-  to its home CPU via MPSC mailbox + IPI. `sched_tick` only touches
-  the current CPU's state. Global lists cease to exist.
+- **Fix:** all of `s_heads[]`, `s_tails[]`, `s_sleep_head`,
+  `s_zombie_head`, and `s_reschedule` are gone.  Their contents moved
+  into `cpu_t.rq` (a `cpu_rq_t` struct with per-CPU run queues, sleep
+  list, and zombie list) and `cpu_t.reschedule_pending`.  Every access
+  goes through the owning CPU's `rq_lock` (IRQ-safe spinlock).
+- **Cross-CPU wake:** `sched_wake(t)` takes `g_cpus[t->home_cpu].rq_lock`
+  directly and enqueues on the target CPU's run queue.  Sets
+  `reschedule_pending` on the target.  TODO Phase 9: if target CPU is
+  idle/halted, send IPI — currently relies on the next timer tick.
+- **Single lock, SMP-safe.**  On one CPU the lock is always
+  uncontended (`lock cmpxchg` = ~20 cycles).  Under SMP the lock
+  serializes only the few ops that touch the target CPU's rq, which
+  is by construction a small fraction of scheduler work (most is
+  enqueue_on / dequeue_local on the running CPU).
 
 ---
 
@@ -76,31 +77,25 @@ Format:
 
 ---
 
-## 4. Zombie list
+## 4. Zombie list — RESOLVED (Phase 5)
 
-- **Location:** `kernel/proc/sched.c` — `s_zombie_head`
-- **Race:** `sched_add_zombie`, `sched_reap_zombie`, `sched_reap_child_zombie`
-  manipulate the zombie linked list with no synchronization.
-- **Why safe on UP:** same.
-- **Fix phase:** Phase 5 (merged with scheduler rewrite).
-- **Fix strategy:** zombies can live on the exiting task's home CPU
-  until a waiter claims them. Parent's `wait()` searches the per-CPU
-  zombie lists of its children's home CPUs (or uses a per-parent
-  zombie list — TBD during Phase 5).
+- **Fix:** each CPU has its own `cpu_t.rq.zombie_head`.  When a task
+  exits, `sched_add_zombie` puts it on ITS home CPU's zombie list
+  under that CPU's `rq_lock`.  `sched_reap_*` walks every CPU's
+  zombie list (also under the per-CPU lock) to find a match.  Under
+  SMP this means the reaper does `num_cpus` lock acquisitions in
+  the worst case — acceptable because wait()/waitpid() are cold path.
 
 ---
 
-## 5. `sched_wake` cross-CPU preemption flag
+## 5. `sched_wake` cross-CPU preemption flag — RESOLVED (Phase 5)
 
-- **Location:** `kernel/proc/sched.c:sched_wake` — `s_reschedule = 1`
-- **Race:** setting a global reschedule flag from one CPU to force
-  another CPU to context-switch doesn't make sense under SMP — the
-  flag is per-CPU semantically.
-- **Why safe on UP:** there's only one CPU, one flag is fine.
-- **Fix phase:** Phase 5.
-- **Fix strategy:** the flag moves into `cpu_t.reschedule_pending`
-  (already declared in Phase 1). `sched_wake` sets the target CPU's
-  flag and, if the target is idle, sends an IPI to wake it.
+- **Fix:** the flag lives in `cpu_t.reschedule_pending`.  `sched_wake`
+  sets it on the TARGET CPU's cpu_t, under that CPU's rq_lock,
+  after enqueuing the woken task on that CPU's run queue.
+- **TODO Phase 9:** if target is halted in idle, send an IPI so the
+  target CPU context-switches immediately instead of waiting for its
+  next tick.
 
 ---
 
@@ -218,18 +213,16 @@ Format:
 
 ---
 
-## 13. `g_current` global
+## 13. `g_current` global — RESOLVED (Phase 5)
 
-- **Location:** `kernel/proc/sched.c:g_current` — 438 call sites
-- **Race:** `g_current` is a single global pointer set by `do_switch`.
-  Under SMP every CPU has its own "current task" — a single global is
-  meaningless.
-- **Why safe on UP:** exactly one CPU, one current task.
-- **Fix phase:** Phase 5.
-- **Fix strategy:** `g_current` becomes a compatibility macro for
-  `(this_cpu()->current)`. Since Phase 1 already mirrors the value
-  into `this_cpu()->current` on every context switch, flipping the
-  macro is mechanical and all 438 sites work unchanged.
+- **Fix:** `g_current` is now a macro `(this_cpu()->current)` in
+  `kernel/proc/sched.h`.  Storage lives in `cpu_t.current`; the global
+  is deleted entirely.  Assignment and read sites continue to work
+  unchanged (field access through a pointer is an lvalue), but every
+  access now routes through `this_cpu()`, so cross-CPU reads naturally
+  see their own current task.
+- **vmm.c** was the only file with a stale `extern task_t* g_current;`
+  forward declaration — replaced with `#include "sched.h"`.
 
 ---
 

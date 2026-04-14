@@ -19,7 +19,8 @@ void cpu_init_bsp(void) {
     c->apic_id            = 0;   // TODO SMP: read LAPIC ID
     c->current            = NULL;
     c->idle               = NULL;
-    c->rq                 = NULL;
+    // rq and sleep/zombie heads: BSS-zeroed; already NULL.
+    spin_lock_init(&c->rq_lock);
     c->preempt_depth      = 0;
     c->reschedule_pending = 0;
     c->sched_ticks        = 0;

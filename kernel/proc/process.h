@@ -102,6 +102,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     // is a property of the executing context, not of the task itself —
     // a non-running task can't be preempted.
 
+    // Home CPU: which CPU's run queue / sleep list / zombie list this
+    // task belongs to.  Assigned at sched_add time, immutable until
+    // explicit migration (Phase 9 work stealing).  On single CPU this
+    // is always 0.  Readers never synchronize — the value is only
+    // written once during task creation before sched_add.
+    uint32_t      home_cpu;
+
     char*         cwd;          // current working directory (absolute path, heap-allocated KPATH_MAX)
     char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
 

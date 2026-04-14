@@ -2,6 +2,10 @@
 #include "common.h"
 #include "smp.h"
 
+// MLFQ levels — must match sched.c.  Kept as a compile-time constant
+// here so cpu_t can size its per-CPU runqueue arrays inline.
+#define SCHED_MLFQ_LEVELS 4
+
 // ── Per-CPU state ────────────────────────────────────────────────────────
 //
 // Every CPU in the system owns a `cpu_t` holding all of its private state:
@@ -22,10 +26,15 @@
 
 struct task_t;
 
-// Forward-declare run_queue_t so it can appear as a field without pulling
-// in the scheduler header.  The full definition lives in sched.c and is
-// only accessed there.
-typedef struct run_queue_t run_queue_t;
+// Per-CPU run queue: MLFQ with SCHED_MLFQ_LEVELS priority levels.
+// Each level is a doubly-linked list of tasks chained via task_t.next.
+// Protected by cpu_t.rq_lock.
+typedef struct cpu_rq_t {
+    struct task_t* heads[SCHED_MLFQ_LEVELS];
+    struct task_t* tails[SCHED_MLFQ_LEVELS];
+    struct task_t* sleep_head;   // tasks in TASK_SLEEPING owned by this CPU
+    struct task_t* zombie_head;  // zombies owned by this CPU
+} cpu_rq_t;
 
 // Per-CPU slab magazine — a freelist of recently-freed objects for each
 // kmalloc size class.  Placeholder for Phase 4; declared now so cpu_t has
@@ -52,7 +61,8 @@ typedef struct cpu_t {
     // Scheduling.
     struct task_t*  current;            // task currently executing
     struct task_t*  idle;               // this CPU's idle task
-    run_queue_t*    rq;                 // per-CPU run queue slot (owned)
+    cpu_rq_t        rq;                 // run queue / sleep list / zombie list
+    spinlock_t      rq_lock;            // protects rq state; IRQ-safe
 
     // Preemption: depth counter + pending-reschedule flag.  depth > 0 means
     // voluntary context switches are suppressed; IRQs still fire normally.

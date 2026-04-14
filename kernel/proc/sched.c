@@ -22,7 +22,8 @@ static const uint8_t s_quanta[MLFQ_LEVELS] = {8, 16, 32, 64};
 
 // ── Globals ───────────────────────────────────────────────────────────────
 
-task_t* g_current   = NULL;
+// g_current is now a per-CPU accessor macro — see sched.h.  Storage
+// lives in cpu_t.current and is written by do_switch.  No global.
 task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
 // ── PID -> task hash table (RCU-protected) ──────────────────────────────
@@ -196,16 +197,16 @@ task_t* pid_ht_find(uint32_t pid) {
 }
 
 // Per-level FIFO queues.
-static task_t* s_heads[MLFQ_LEVELS];
-static task_t* s_tails[MLFQ_LEVELS];
-
-// Singly-linked list of sleeping tasks (state == TASK_SLEEPING).
-// Uses task_t::next as the link field.
-static task_t* s_sleep_head = NULL;
-
-// Singly-linked list of zombie tasks (state == TASK_ZOMBIE).
-// Tasks stay here until the parent calls wait() to reap them.
-static task_t* s_zombie_head = NULL;
+// Per-CPU run queue / sleep list / zombie list all live in cpu_t.rq,
+// protected by cpu_t.rq_lock.  See kernel/include/cpu.h.
+//
+// Under single CPU: all tasks have home_cpu==0 and live in g_cpus[0].
+// Under SMP: each task lives on its home CPU's lists.
+//
+// _Static_assert keeps the MLFQ_LEVELS macro in sched.c in sync with
+// the SCHED_MLFQ_LEVELS macro that sizes cpu_t.rq.heads[].
+_Static_assert(MLFQ_LEVELS == SCHED_MLFQ_LEVELS,
+               "MLFQ_LEVELS must match SCHED_MLFQ_LEVELS");
 
 // ── Task index hash tables (pgid / tgid / sid → task list) ──────────────
 // Three open-addressing hash tables keyed on group IDs.  Each slot holds
@@ -417,50 +418,60 @@ static task_t s_idle = {
 };
 
 static volatile uint32_t s_tick_count  = 0;
-static volatile uint8_t  s_reschedule  = 0;
 
 // ── Internal helpers ──────────────────────────────────────────────────────
+//
+// Every helper below takes a cpu_rq_t* (pointing at the owning CPU's rq)
+// so the same code works for any CPU.  Callers must hold that CPU's
+// rq_lock.
 
-// Enqueue at the task's current mlfq_level.
-// Initialises ticks_left if this is the task's first run (ticks_left == 0).
-static void enqueue(task_t* p) {
+// Enqueue at the task's current mlfq_level.  Caller holds target's rq_lock.
+static void enqueue_on(cpu_rq_t* rq, task_t* p) {
     p->state = TASK_READY;
     p->next  = NULL;
     if (p->mlfq_ticks_left == 0)
         p->mlfq_ticks_left = s_quanta[p->mlfq_level];
 
     uint8_t lvl = p->mlfq_level;
-    if (!s_tails[lvl]) {
-        s_heads[lvl] = s_tails[lvl] = p;
+    if (!rq->tails[lvl]) {
+        rq->heads[lvl] = rq->tails[lvl] = p;
     } else {
-        s_tails[lvl]->next = p;
-        s_tails[lvl] = p;
+        rq->tails[lvl]->next = p;
+        rq->tails[lvl] = p;
     }
 }
 
-// Dequeue from the highest non-empty level.
-static task_t* dequeue(void) {
+// Dequeue from the highest non-empty level.  Caller holds this CPU's rq_lock.
+static task_t* dequeue_local(cpu_rq_t* rq) {
     for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
-        if (!s_heads[i]) continue;
-        task_t* p = s_heads[i];
-        s_heads[i] = p->next;
-        if (!s_heads[i]) s_tails[i] = NULL;
+        if (!rq->heads[i]) continue;
+        task_t* p = rq->heads[i];
+        rq->heads[i] = p->next;
+        if (!rq->heads[i]) rq->tails[i] = NULL;
         p->next = NULL;
         return p;
     }
     return NULL;
 }
 
+// Pick the target CPU for a new task.  Under single CPU, always 0.
+// Phase 9 will add a real placement policy (least-loaded, cache affinity).
+static inline uint32_t pick_home_cpu(void) {
+    return 0;
+}
+
+// Shortcut to the owning CPU's rq.
+static inline cpu_t* cpu_of_task(task_t* t) {
+    return &g_cpus[t->home_cpu];
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 void sched_init(void) {
-    for (uint8_t i = 0; i < MLFQ_LEVELS; i++)
-        s_heads[i] = s_tails[i] = NULL;
-
-    g_current = &s_idle;
-    // Mirror into the per-CPU slot so this_cpu()->current is always in
-    // sync.  Phase 5 will make this the primary storage and demote
-    // g_current to a compatibility macro.
+    // Per-CPU run queues are BSS-zeroed; rq_lock was initialised by
+    // cpu_init_bsp.  Nothing to do here for the queues themselves.
+    // g_current expands to (this_cpu()->current) via sched.h macro, so
+    // assigning to it stores into the per-CPU slot directly.
     this_cpu()->current = &s_idle;
     this_cpu()->idle    = &s_idle;
     timer_register_tick(sched_tick);
@@ -470,9 +481,18 @@ void sched_add(task_t* proc) {
     // Register the first user process as the init/orphan-reaper task.
     if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
         g_init_task = proc;
+
+    // Assign a home CPU once; the task stays there until Phase 9 adds
+    // work stealing.  On single CPU this is always 0.
+    proc->home_cpu = pick_home_cpu();
+
     pid_ht_insert(proc);
     task_idx_insert(proc);
-    enqueue(proc);
+
+    cpu_t* c = &g_cpus[proc->home_cpu];
+    uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+    enqueue_on(&c->rq, proc);
+    spin_unlock_irqrestore(&c->rq_lock, flags);
 }
 
 // ── Per-task child list ───────────────────────────────────────────────────
@@ -500,16 +520,23 @@ void task_child_remove(task_t* parent, task_t* child) {
 void sched_tick(void) {
     s_tick_count++;
 
+    // sched_tick runs on THIS CPU — it's the local timer ISR.  Only
+    // touch this CPU's rq.
+    cpu_t*    c  = this_cpu();
+    cpu_rq_t* rq = &c->rq;
+
+    uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+
     // Wake any sleeping tasks whose deadline has passed.
     uint64_t now = tsc_read_ns();
-    task_t** pp = &s_sleep_head;
+    task_t** pp = &rq->sleep_head;
     while (*pp) {
         task_t* t = *pp;
         if (t->sleep_until_ns && now >= t->sleep_until_ns) {
             *pp = t->next;
             t->next = NULL;
             t->sleep_until_ns = 0;
-            enqueue(t);
+            enqueue_on(rq, t);
         } else {
             pp = &t->next;
         }
@@ -518,34 +545,36 @@ void sched_tick(void) {
     // Priority boost: move every task in levels 1-3 back to level 0.
     if (s_tick_count % BOOST_INTERVAL == 0) {
         for (uint8_t i = 1; i < MLFQ_LEVELS; i++) {
-            task_t* t = s_heads[i];
+            task_t* t = rq->heads[i];
             while (t) {
                 task_t* nxt = t->next;
                 t->mlfq_level     = 0;
                 t->mlfq_ticks_left = s_quanta[0];
                 t->next = NULL;
-                if (!s_tails[0]) { s_heads[0] = s_tails[0] = t; }
-                else             { s_tails[0]->next = t; s_tails[0] = t; }
+                if (!rq->tails[0]) { rq->heads[0] = rq->tails[0] = t; }
+                else               { rq->tails[0]->next = t; rq->tails[0] = t; }
                 t = nxt;
             }
-            s_heads[i] = s_tails[i] = NULL;
+            rq->heads[i] = rq->tails[i] = NULL;
         }
         // Boost the currently running task too.
-        if (g_current && g_current != &s_idle) {
-            g_current->mlfq_level      = 0;
-            g_current->mlfq_ticks_left = s_quanta[0];
+        if (c->current && c->current != c->idle) {
+            c->current->mlfq_level      = 0;
+            c->current->mlfq_ticks_left = s_quanta[0];
         }
     }
 
     // Tick down the running task's quantum.
-    if (g_current && g_current != &s_idle) {
-        if (g_current->mlfq_ticks_left > 0)
-            g_current->mlfq_ticks_left--;
-        if (g_current->mlfq_ticks_left == 0)
-            s_reschedule = 1;
+    if (c->current && c->current != c->idle) {
+        if (c->current->mlfq_ticks_left > 0)
+            c->current->mlfq_ticks_left--;
+        if (c->current->mlfq_ticks_left == 0)
+            c->reschedule_pending = 1;
     } else {
-        s_reschedule = 1;   // idle → always try to find real work
+        c->reschedule_pending = 1;   // idle → always try to find real work
     }
+
+    spin_unlock_irqrestore(&c->rq_lock, flags);
 }
 
 // ── do_switch ─────────────────────────────────────────────────────────────
@@ -553,22 +582,36 @@ void sched_tick(void) {
 // (timer path); false for voluntary yield/sleep.
 
 static void do_switch(uint8_t preempted) {
-    task_t* next = dequeue();
+    cpu_t*    c  = this_cpu();
+    cpu_rq_t* rq = &c->rq;
+    task_t*   next;
 
+    // Pick the next runnable task under the local rq_lock.  If nothing
+    // is ready and this is a voluntary yield/sleep, halt until an IRQ
+    // wakes something — releasing the lock across the hlt so wakers
+    // on other CPUs (or our own IRQ path) can actually enqueue work.
+    uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+    next = dequeue_local(rq);
     if (!next) {
-        if (preempted) return;   // nothing to switch to — let current task keep running
-        // Voluntary yield/sleep: HLT until an interrupt wakes something.
-        // Every hlt wakeup is an RCU quiescent state: we can't possibly
-        // be inside a reader section while halted.
-        while (!next) {
+        if (preempted) {
+            // Nothing to switch to — let the current task keep running.
+            spin_unlock_irqrestore(&c->rq_lock, flags);
+            return;
+        }
+        // Voluntary yield/sleep with an empty runqueue: drop the lock,
+        // halt until an interrupt, re-take and re-dequeue.
+        for (;;) {
+            spin_unlock_irqrestore(&c->rq_lock, flags);
             rcu_note_qs();
             __asm__ volatile("sti\nhlt\ncli");
-            next = dequeue();
+            flags = spin_lock_irqsave(&c->rq_lock);
+            next = dequeue_local(rq);
+            if (next) break;
         }
     }
 
-    task_t* prev = g_current;
-    if (prev != &s_idle && prev->state == TASK_RUNNING) {
+    task_t* prev = c->current;
+    if (prev != c->idle && prev->state == TASK_RUNNING) {
         if (preempted) {
             // Timer preemption — quantum expired, demote.
             if (prev->mlfq_level < MLFQ_LEVELS - 1)
@@ -586,13 +629,18 @@ static void do_switch(uint8_t preempted) {
                 prev->mlfq_ticks_left = s_quanta[prev->mlfq_level];
             }
         }
-        enqueue(prev);
+        enqueue_on(rq, prev);
     }
 
     next->state = TASK_RUNNING;
-    g_current   = next;
-    this_cpu()->current = next;
-    this_cpu()->context_switches++;
+    c->current  = next;     // g_current expands to this via the sched.h macro
+    c->context_switches++;
+
+    // Release the rq_lock BEFORE context_switch.  Holding it across
+    // the switch would deadlock: the new task might try to take the
+    // same lock before the old task's unlock ever runs.
+    spin_unlock_irqrestore(&c->rq_lock, flags);
+
     // Every context switch is an RCU quiescent state for this CPU: the
     // outgoing task can no longer be in a reader section, and the
     // incoming task starts fresh.  Bumping the counter here lets
@@ -604,7 +652,7 @@ static void do_switch(uint8_t preempted) {
 
     signal_deliver_pending();
 
-    if (prev != &s_idle && prev->state == TASK_DEAD)
+    if (prev != c->idle && prev->state == TASK_DEAD)
         process_destroy(prev);
 
     __asm__ volatile("sti");
@@ -618,16 +666,17 @@ void sched_yield(void) {
     // a bug that would leak the preempt state across the context switch.
     if (UNLIKELY(this_cpu()->preempt_depth > 0))
         sched_sleep_while_preempt_disabled_panic();
-    s_reschedule = 0;
+    this_cpu()->reschedule_pending = 0;
     do_switch(0);
 }
 
 void sched_preempt(void) {
-    if (!s_reschedule) return;
+    cpu_t* c = this_cpu();
+    if (!c->reschedule_pending) return;
     // Honour preemption disable: defer the switch until depth reaches zero.
     // The preempt_enable() path will call sched_preempt() again then.
-    if (this_cpu()->preempt_depth > 0) return;
-    s_reschedule = 0;
+    if (c->preempt_depth > 0) return;
+    c->reschedule_pending = 0;
     do_switch(1);
 }
 
@@ -649,96 +698,149 @@ void sched_sleep(void) {
     // RCU readers, INITCALL_FLAG_PREEMPT_OFF, fb_term_putc, slab fast
     // paths (Phase 4), anywhere.  Violation = immediate panic with enough
     // context for a post-mortem.
-    if (UNLIKELY(this_cpu()->preempt_depth > 0))
+    cpu_t* c = this_cpu();
+    if (UNLIKELY(c->preempt_depth > 0))
         sched_sleep_while_preempt_disabled_panic();
 
-    if (g_current && g_current != &s_idle) {
-        g_current->state = TASK_SLEEPING;
+    if (g_current && g_current != c->idle) {
+        // Put ourselves on our home CPU's sleep list under its rq_lock.
+        // On UP that's always this CPU, so we just need the local lock.
+        task_t* self = g_current;
+        cpu_t* home  = cpu_of_task(self);
+        uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+        self->state = TASK_SLEEPING;
         // Refresh quantum so the task gets a full slice when woken.
-        g_current->mlfq_ticks_left = s_quanta[g_current->mlfq_level];
-        // Add to sleeping list so sched_for_each can still find it.
-        g_current->next = s_sleep_head;
-        s_sleep_head = g_current;
+        self->mlfq_ticks_left = s_quanta[self->mlfq_level];
+        self->next = home->rq.sleep_head;
+        home->rq.sleep_head = self;
+        spin_unlock_irqrestore(&home->rq_lock, flags);
     }
-    s_reschedule = 0;
+    c->reschedule_pending = 0;
     do_switch(0);
 }
 
 void sched_wake(task_t* proc) {
     if (!proc) return;
-    if (proc->state != TASK_SLEEPING) return;
-    // Remove from sleeping list.
-    task_t** pp = &s_sleep_head;
+    // Touch target CPU's rq under its lock.  Cross-CPU safe: we grab
+    // the owning CPU's rq_lock before looking at anything.
+    cpu_t* home = cpu_of_task(proc);
+    uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+    if (proc->state != TASK_SLEEPING) {
+        spin_unlock_irqrestore(&home->rq_lock, flags);
+        return;
+    }
+    // Remove from the target CPU's sleep list.
+    task_t** pp = &home->rq.sleep_head;
     while (*pp && *pp != proc) pp = &(*pp)->next;
     if (*pp) *pp = proc->next;
     proc->next = NULL;
-    enqueue(proc);
-    // If the woken task has strictly higher priority (lower level number)
-    // than the currently running task, request a preemption.  I/O-bound
-    // tasks stay at level 0 (sched_sleep refreshes their quantum), so this
-    // ensures they preempt CPU-bound tasks that have been demoted.
-    if (g_current != &s_idle && g_current->mlfq_level > 0 &&
-        proc->mlfq_level < g_current->mlfq_level) {
-        s_reschedule = 1;
+    enqueue_on(&home->rq, proc);
+
+    // If the woken task has strictly higher priority than the currently
+    // running task on its home CPU, ask that CPU to reschedule.
+    task_t* cur = home->current;
+    if (cur && cur != home->idle && cur->mlfq_level > 0 &&
+        proc->mlfq_level < cur->mlfq_level) {
+        home->reschedule_pending = 1;
+        // TODO Phase 9: if home != this_cpu, send an IPI so the target
+        // CPU actually context-switches soon instead of waiting for its
+        // next tick.
     }
+    spin_unlock_irqrestore(&home->rq_lock, flags);
 }
 
-// Add a TASK_ZOMBIE task to the zombie list (called from sys_exit).
+// Add a TASK_ZOMBIE task to its home CPU's zombie list.
 void sched_add_zombie(task_t* t) {
     pid_ht_remove(t);
     task_idx_remove(t);
-    t->next = s_zombie_head;
-    s_zombie_head = t;
+    cpu_t* home = cpu_of_task(t);
+    uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+    t->next = home->rq.zombie_head;
+    home->rq.zombie_head = t;
+    spin_unlock_irqrestore(&home->rq_lock, flags);
+}
+
+// Walk every CPU's zombie list under that CPU's rq_lock and invoke
+// `visit` on each zombie.  `visit` returns 1 to STOP walking (entry
+// removed); 0 to keep walking.  If `visit` unlinks the entry, it is
+// responsible for fixing the link pointer it passes — see callers.
+//
+// Helper exists because zombie reaping needs to search across all CPUs
+// but the walker body is identical; factoring keeps the locking
+// correct and consistent.
+typedef int (*zombie_visit_fn)(task_t** link, task_t* z, void* data);
+
+static task_t* zombie_walk_reap(zombie_visit_fn visit, void* data) {
+    unsigned n = num_cpus();
+    for (unsigned ci = 0; ci < n; ci++) {
+        cpu_t* c = &g_cpus[ci];
+        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+        task_t** pp = &c->rq.zombie_head;
+        while (*pp) {
+            task_t* z = *pp;
+            if (visit(pp, z, data)) {
+                // visit() unlinked z.  Caller will call process_destroy.
+                spin_unlock_irqrestore(&c->rq_lock, flags);
+                return z;
+            }
+            // visit() returned 0 without unlinking — advance.
+            pp = &z->next;
+        }
+        spin_unlock_irqrestore(&c->rq_lock, flags);
+    }
+    return NULL;
+}
+
+typedef struct { uint32_t pid; } reap_any_arg_t;
+static int reap_any_visit(task_t** link, task_t* z, void* data) {
+    reap_any_arg_t* a = (reap_any_arg_t*)data;
+    if (a->pid != 0 && z->pid != a->pid) return 0;
+    *link = z->next;
+    z->next = NULL;
+    pid_ht_remove(z);
+    return 1;
 }
 
 // Remove and return the zombie with the given pid (0 = any).
-// Does NOT check parent — use sched_reap_child_zombie for waitpid.
-// Returns NULL if not found.  Caller must call process_destroy on result.
 task_t* sched_reap_zombie(uint32_t pid) {
-    task_t** pp = &s_zombie_head;
-    while (*pp) {
-        if (pid == 0 || (*pp)->pid == pid) {
-            task_t* z = *pp;
-            *pp = z->next;
-            z->next = NULL;
-            pid_ht_remove(z);
-            return z;
-        }
-        pp = &(*pp)->next;
-    }
-    return NULL;
+    reap_any_arg_t a = { pid };
+    return zombie_walk_reap(reap_any_visit, &a);
 }
 
-// Remove and return a zombie that is a child of `parent_pid`.
-// If target_pid == 0: reaps any child of parent_pid.
-// If target_pid != 0: reaps that specific pid only if its ppid == parent_pid.
-// Returns NULL if no matching child zombie found.
+typedef struct { uint32_t parent_pid, target_pid; } reap_child_arg_t;
+static int reap_child_visit(task_t** link, task_t* z, void* data) {
+    reap_child_arg_t* a = (reap_child_arg_t*)data;
+    int pid_match = (a->target_pid == 0) || (z->pid == a->target_pid);
+    int is_child  = (z->ppid == a->parent_pid);
+    if (!(pid_match && is_child)) return 0;
+    *link = z->next;
+    z->next = NULL;
+    pid_ht_remove(z);
+    return 1;
+}
+
 task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    task_t** pp = &s_zombie_head;
-    while (*pp) {
-        task_t* z = *pp;
-        int pid_match  = (target_pid == 0) || (z->pid == target_pid);
-        int is_child   = (z->ppid == parent_pid);
-        if (pid_match && is_child) {
-            *pp = z->next;
-            z->next = NULL;
-            pid_ht_remove(z);
-            return z;
-        }
-        pp = &(*pp)->next;
-    }
-    return NULL;
+    reap_child_arg_t a = { parent_pid, target_pid };
+    return zombie_walk_reap(reap_child_visit, &a);
 }
 
 // Check if any zombie child of parent_pid exists (non-blocking poll).
-// If target_pid != 0, checks specifically for that pid.
 uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    task_t* z = s_zombie_head;
-    while (z) {
-        int pid_match = (target_pid == 0) || (z->pid == target_pid);
-        int is_child  = (z->ppid == parent_pid);
-        if (pid_match && is_child) return 1;
-        z = z->next;
+    unsigned n = num_cpus();
+    for (unsigned ci = 0; ci < n; ci++) {
+        cpu_t* c = &g_cpus[ci];
+        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+        task_t* z = c->rq.zombie_head;
+        while (z) {
+            int pid_match = (target_pid == 0) || (z->pid == target_pid);
+            int is_child  = (z->ppid == parent_pid);
+            if (pid_match && is_child) {
+                spin_unlock_irqrestore(&c->rq_lock, flags);
+                return 1;
+            }
+            z = z->next;
+        }
+        spin_unlock_irqrestore(&c->rq_lock, flags);
     }
     return 0;
 }
@@ -756,19 +858,12 @@ static void find_pid_cb(task_t* t, void* data) {
 // pid == 0 means "any child".
 uint8_t sched_wait_pid(uint32_t pid) {
     for (;;) {
-        // Check zombie list.
-        task_t* z = s_zombie_head;
-        while (z) {
-            if (pid == 0 || z->pid == pid) return 1;
-            z = z->next;
-        }
+        // Walk every CPU's zombie list.
+        if (sched_poll_pid(pid)) return 1;
         if (pid == 0) { sched_yield(); continue; } // any: keep waiting
-        // Specific pid: check if still alive anywhere (run queue, sleep, zombie)
-        // or is the currently running task.
+        // Specific pid: check if still alive anywhere.
         wait_pid_arg_t a = {pid, 0};
-        __asm__ volatile("cli");
         sched_for_each(find_pid_cb, &a);
-        __asm__ volatile("sti");
         if (!a.found) return 1;
         sched_yield();
     }
@@ -776,35 +871,60 @@ uint8_t sched_wait_pid(uint32_t pid) {
 
 // Non-blocking variant: returns 1 if zombie ready, 0 if not.
 uint8_t sched_poll_pid(uint32_t pid) {
-    task_t* z = s_zombie_head;
-    while (z) {
-        if (pid == 0 || z->pid == pid) return 1;
-        z = z->next;
+    unsigned n = num_cpus();
+    for (unsigned ci = 0; ci < n; ci++) {
+        cpu_t* c = &g_cpus[ci];
+        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+        task_t* z = c->rq.zombie_head;
+        while (z) {
+            if (pid == 0 || z->pid == pid) {
+                spin_unlock_irqrestore(&c->rq_lock, flags);
+                return 1;
+            }
+            z = z->next;
+        }
+        spin_unlock_irqrestore(&c->rq_lock, flags);
     }
     return 0;
 }
 
 // ── sched_for_each ────────────────────────────────────────────────────────
-// Walks every task in every MLFQ level.
+// Walks every task on every CPU's runqueue/sleep/zombie lists.  Cold
+// path — used by /proc/[pid] enumeration and broadcast kill(-1).  Takes
+// each CPU's rq_lock in turn.
+//
+// WARNING: the callback must NOT take any lock that could be held by
+// the scheduler (or take g_pmm_lock, etc.).  Nested lock acquisition
+// through this path is a deadlock surface.  All existing callers pass
+// trivial visitor functions that just read task fields.
 
 void sched_for_each(void (*cb)(task_t*, void*), void* data) {
-    // Include g_current: it is dequeued while executing, so it won't appear
-    // in any of the lists below.  Callers (e.g. sched_wait_pid) need to see it.
-    if (g_current && g_current != &s_idle)
+    // The currently running task on THIS CPU isn't in any list — it
+    // was dequeued before it started running — so include it
+    // explicitly.  Other CPUs' current tasks are handled below by
+    // iterating their cpu_t.current.
+    if (g_current && g_current != this_cpu()->idle)
         cb(g_current, data);
 
-    for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
-        task_t* t = s_heads[i];
-        while (t) {
-            cb(t, data);
-            t = t->next;
+    unsigned n = num_cpus();
+    for (unsigned ci = 0; ci < n; ci++) {
+        cpu_t* c = &g_cpus[ci];
+
+        // Visit that CPU's currently running task too (if it's not us).
+        if (c != this_cpu() && c->current && c->current != c->idle)
+            cb(c->current, data);
+
+        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+        for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
+            task_t* t = c->rq.heads[i];
+            while (t) { cb(t, data); t = t->next; }
         }
+        task_t* t = c->rq.sleep_head;
+        while (t) { cb(t, data); t = t->next; }
+        t = c->rq.zombie_head;
+        while (t) { cb(t, data); t = t->next; }
+        spin_unlock_irqrestore(&c->rq_lock, flags);
     }
-    // Also walk sleeping and zombie tasks so sched_wait_pid doesn't miss them.
-    task_t* t = s_sleep_head;
-    while (t) { cb(t, data); t = t->next; }
-    t = s_zombie_head;
-    while (t) { cb(t, data); t = t->next; }
 }
 
 // ── sched_find_pid ────────────────────────────────────────────────────────
