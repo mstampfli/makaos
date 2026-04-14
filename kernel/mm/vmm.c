@@ -5,6 +5,7 @@
 #include "shmem.h"
 #include "process.h"
 #include "sched.h"
+#include "rcu.h"
 
 // Physical address of the kernel's own PML4.
 // Set by vmm_init(); used by vmm_alloc_pml4() to clone kernel entries.
@@ -331,9 +332,11 @@ void vmm_free_user_ex(phys_addr_t pml4_phys, mm_t* mm) {
 
                     int skip_free = 0;
                     if (mm) {
+                        rcu_read_lock();
                         vma_t* vma = mm_vma_find(mm, va);
                         if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
                             skip_free = 1;
+                        rcu_read_unlock();
                     }
 
                     if (!skip_free)
@@ -427,9 +430,11 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     // Shared/MMIO VMAs: share frame with original flags (no CoW).
                     int is_shared = 0;
                     if (src_mm) {
+                        rcu_read_lock();
                         vma_t* vma = mm_vma_find(src_mm, va);
                         if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
                             is_shared = 1;
+                        rcu_read_unlock();
                     }
 
                     if (is_shared) {
@@ -552,8 +557,19 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         // Protection violation on write to a present page: check for CoW.
         // CoW pages are present + read-only, in a writable VMA, with rc > 1.
         if (is_present && is_write) {
-            vma_t* vma = mm_vma_find(mm, fault_addr);
-            if (vma && (vma->flags & VMA_W) && !vma->shmem && !(vma->flags & VMA_MMIO)) {
+            uint32_t vma_flags = 0;
+            int have_vma = 0;
+            rcu_read_lock();
+            {
+                vma_t* vma = mm_vma_find(mm, fault_addr);
+                if (vma && (vma->flags & VMA_W) && !vma->shmem && !(vma->flags & VMA_MMIO)) {
+                    vma_flags = vma->flags;
+                    have_vma = 1;
+                }
+            }
+            rcu_read_unlock();
+
+            if (have_vma) {
                 virt_addr_t page = fault_addr & ~PAGE_MASK;
                 phys_addr_t old_frame = vmm_page_phys(vmm_pml4_get(), page);
                 if (old_frame != PMM_INVALID_ADDR) {
@@ -568,14 +584,12 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         uint8_t* d = (uint8_t*)(new_frame + HHDM_OFFSET);
                         for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
 
-                        // Map the new private frame with full VMA permissions.
                         vmm_page_map(vmm_pml4_get(), page, new_frame,
-                                     mm_vma_pte_flags(vma->flags));
-                        pmm_ref_dec(old_frame);  // drop our share (may free if rc→0)
+                                     mm_vma_pte_flags(vma_flags));
+                        pmm_ref_dec(old_frame);
                         return; // fault resolved
                     }
                     if (rc == 1) {
-                        // Sole owner — just re-enable write, no copy needed.
                         pte_t* pte = vmm_pte_get(vmm_pml4_get(), page, 0, 0);
                         if (pte) {
                             *pte |= PAGE_WRITABLE;
@@ -591,45 +605,59 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         // Protection violation (present page, not CoW).
         if (is_present) { if (is_user) goto kill; else goto kernel_panic; }
 
-        vma_t* vma = mm_vma_find(mm, fault_addr);
-        if (!vma) { if (is_user) goto kill; else goto kernel_panic; }
+        // Snapshot the VMA fields we need under RCU so we can drop the
+        // reader section before doing any physical work.  shmem_tryget
+        // handles the case where shmem_unref races our use.
+        uint32_t       vma_flags = 0;
+        virt_addr_t    vma_start = 0;
+        uint32_t       vma_shmem_pgoff = 0;
+        struct shmem*  vma_shmem = NULL;
+        int            have_vma = 0;
+        rcu_read_lock();
+        {
+            vma_t* vma = mm_vma_find(mm, fault_addr);
+            if (vma) {
+                vma_flags       = vma->flags;
+                vma_start       = vma->start;
+                vma_shmem_pgoff = vma->shmem_pgoff;
+                if (vma->shmem && shmem_tryget(vma->shmem))
+                    vma_shmem = vma->shmem;
+                have_vma = 1;
+            }
+        }
+        rcu_read_unlock();
 
-        // Write to read-only mapping.
-        if (is_write && !(vma->flags & VMA_W)) { if (is_user) goto kill; else goto kernel_panic; }
-
-        // Instruction fetch on non-executable mapping.
-        if (is_ifetch && !(vma->flags & VMA_X)) { if (is_user) goto kill; else goto kernel_panic; }
+        if (!have_vma) { if (is_user) goto kill; else goto kernel_panic; }
+        if (is_write  && !(vma_flags & VMA_W)) { if (vma_shmem) shmem_unref(vma_shmem); if (is_user) goto kill; else goto kernel_panic; }
+        if (is_ifetch && !(vma_flags & VMA_X)) { if (vma_shmem) shmem_unref(vma_shmem); if (is_user) goto kill; else goto kernel_panic; }
 
         // Demand-page: resolve the physical frame.
         virt_addr_t page = fault_addr & ~PAGE_MASK;
         phys_addr_t frame;
 
-        if (vma->shmem) {
-            // Shared mapping: get/allocate the page from the shmem object.
-            // The shmem object owns the physical frame — do NOT free it
-            // when unmapping this VMA.
-            uint32_t pg_idx = (uint32_t)((page - vma->start) / PAGE_SIZE)
-                              + vma->shmem_pgoff;
-            frame = shmem_get_page(vma->shmem, pg_idx);
+        if (vma_shmem) {
+            uint32_t pg_idx = (uint32_t)((page - vma_start) / PAGE_SIZE)
+                              + vma_shmem_pgoff;
+            frame = shmem_get_page(vma_shmem, pg_idx);
             if (frame == PMM_INVALID_ADDR) {
+                shmem_unref(vma_shmem);
                 if (is_user) goto kill; else goto kernel_panic;
             }
         } else {
-            // Private anonymous: allocate a fresh zeroed frame.
             frame = pmm_buddy_alloc(0);
             if (frame == PMM_INVALID_ADDR) {
                 if (is_user) goto kill; else goto kernel_panic;
             }
-            // Zero the frame (security: never expose old data to user).
             __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
         }
 
         if (!vmm_page_map(vmm_pml4_get(), page, frame,
-                          mm_vma_pte_flags(vma->flags))) {
-            // Only free the frame if it's private (shmem owns shared frames).
-            if (!vma->shmem) pmm_buddy_free(frame, 0);
+                          mm_vma_pte_flags(vma_flags))) {
+            if (!vma_shmem) pmm_buddy_free(frame, 0);
+            if (vma_shmem) shmem_unref(vma_shmem);
             if (is_user) goto kill; else goto kernel_panic;
         }
+        if (vma_shmem) shmem_unref(vma_shmem);
         return; // fault resolved
 
     kill:
@@ -645,11 +673,14 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             mm_t* dbg_mm = task_get_mm(g_current);
             if (dbg_mm) {
                 ser_str("  VMAs:\n");
-                for (vma_t* v = dbg_mm->vmas; v; v = v->next) {
+                rcu_read_lock();
+                for (vma_t* v = rcu_dereference(dbg_mm->vmas); v;
+                             v = rcu_dereference(v->next)) {
                     ser_str("    ["); ser_hex64(v->start);
                     ser_str(" - ");  ser_hex64(v->end);
                     ser_str("] f="); ser_hex64(v->flags);
                 }
+                rcu_read_unlock();
             }
         }
         // Print top of user stack safely via page table walk

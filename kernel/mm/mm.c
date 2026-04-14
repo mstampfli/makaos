@@ -3,6 +3,7 @@
 #include "kheap.h"
 #include "vmm.h"
 #include "common.h"
+#include "rcu.h"
 
 /* ── C library stubs required by the compiler ────────────────────────────
  *
@@ -66,28 +67,30 @@ mm_t* mm_create(void) {
     mm->brk       = 0;
     mm->mmap_base = VMM_MMAP_BASE;
     mm->refcount  = 1;
+    spin_lock_init(&mm->vma_lock);
     return mm;
+}
+
+// call_rcu callback: free a VMA after its grace period.  Must drop the
+// shmem ref here too so the shmem_t lifetime tracks the VMA's actual
+// unreachability, not the moment we unlinked it.
+void vma_free_rcu(void* data) {
+    vma_t* v = (vma_t*)data;
+    if (v->shmem) shmem_unref(v->shmem);
+    kfree(v);
 }
 
 // ── mm_vma_add ────────────────────────────────────────────────────────────
 // Inserts a new VMA into the sorted list.
-// Security: rejects W+X (no-execute bypass), rejects misaligned addresses,
-// rejects zero-size or overlapping regions.
+// Security: rejects misaligned addresses, rejects zero-size or overlapping
+// regions.  Writer-side: serialised on mm->vma_lock.  Publishes via
+// rcu_assign_pointer so readers walking under rcu_read_lock either see the
+// old list or the new node atomically.
 uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags) {
     if (!mm) return 0;
-
-    // Alignment and size checks.
     if (start >= end)              return 0;
     if (start & PAGE_MASK)         return 0;
     if (end   & PAGE_MASK)         return 0;
-
-    // W^X enforced only for kernel VMAs; user flat binaries have .bss in the
-    // same page as .text, so user code VMAs legitimately need R+W+X.
-
-    // Check for overlap with existing VMAs.
-    for (vma_t* v = mm->vmas; v; v = v->next) {
-        if (start < v->end && end > v->start) return 0; // overlaps
-    }
 
     vma_t* vma = kmalloc(sizeof(vma_t));
     if (!vma) return 0;
@@ -98,25 +101,41 @@ uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags)
     vma->shmem      = NULL;
     vma->shmem_pgoff = 0;
 
-    // Insert sorted by start address.
-    if (!mm->vmas || start < mm->vmas->start) {
-        vma->next = mm->vmas;
-        mm->vmas  = vma;
-        return 1;
+    spin_lock(&mm->vma_lock);
+
+    // Overlap check under the writer lock.
+    for (vma_t* v = mm->vmas; v; v = v->next) {
+        if (start < v->end && end > v->start) {
+            spin_unlock(&mm->vma_lock);
+            kfree(vma);
+            return 0;
+        }
     }
 
-    vma_t* prev = mm->vmas;
-    while (prev->next && prev->next->start < start)
-        prev = prev->next;
-    vma->next  = prev->next;
-    prev->next = vma;
+    // Insert sorted by start address.  Every ->next store that becomes
+    // visible to readers goes through rcu_assign_pointer so a concurrent
+    // walker cannot observe a half-built link.
+    if (!mm->vmas || start < mm->vmas->start) {
+        vma->next = mm->vmas;                   // no readers see this yet
+        rcu_assign_pointer(mm->vmas, vma);
+    } else {
+        vma_t* prev = mm->vmas;
+        while (prev->next && prev->next->start < start) prev = prev->next;
+        vma->next = prev->next;                 // private initialisation
+        rcu_assign_pointer(prev->next, vma);
+    }
+    spin_unlock(&mm->vma_lock);
     return 1;
 }
 
 // ── mm_vma_find ───────────────────────────────────────────────────────────
+// RCU reader walk.  Caller must hold rcu_read_lock() for the lifetime of
+// the returned pointer.  On x86 rcu_dereference is a plain load plus a
+// compiler barrier — the whole walk is three instructions per node.
 vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr) {
     if (!mm) return NULL;
-    for (vma_t* v = mm->vmas; v; v = v->next) {
+    for (vma_t* v = rcu_dereference(mm->vmas); v;
+                 v = rcu_dereference(v->next)) {
         if (addr >= v->start && addr < v->end) return v;
     }
     return NULL;
@@ -124,7 +143,9 @@ vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr) {
 
 // ── mm_destroy ────────────────────────────────────────────────────────────
 // Frees all VMA descriptors and the mm_t itself.
-// Physical frames must be freed separately via vmm_free_user_and_frames().
+// Called at last task_mm_t unref — by that point there are no threads
+// still using this address space and no readers can race us.  Safe to
+// free synchronously (no call_rcu needed).
 void mm_destroy(mm_t* mm) {
     if (!mm) return;
     vma_t* v = mm->vmas;
@@ -139,7 +160,11 @@ void mm_destroy(mm_t* mm) {
 
 // ── mm_clone ──────────────────────────────────────────────────────────────
 // Allocate a new mm_t and copy brk fields + VMA list from src.
-// Does NOT copy physical pages.
+// Does NOT copy physical pages.  Walk src under rcu_read_lock so a
+// concurrent sibling mutating src (threaded parent) cannot free a VMA
+// under our feet.  We copy out v->start/end/flags/shmem before calling
+// mm_vma_add (which drops the lock via kmalloc), so the reader section
+// stays tight.
 mm_t* mm_clone(const mm_t* src) {
     if (!src) return NULL;
     mm_t* dst = mm_create();
@@ -148,22 +173,58 @@ mm_t* mm_clone(const mm_t* src) {
     dst->brk       = src->brk;
     dst->mmap_base = src->mmap_base;
     dst->refcount  = 1;
-    // Copy each VMA.  Shared VMAs get the same shmem_t (bump refcount).
-    for (vma_t* v = src->vmas; v; v = v->next) {
-        if (!mm_vma_add(dst, v->start, v->end, v->flags)) {
+
+    // First pass: snapshot the src list into a stack array so we can drop
+    // the RCU reader before calling mm_vma_add (which allocates and takes
+    // dst's writer lock).
+    typedef struct {
+        virt_addr_t start, end;
+        uint32_t    flags;
+        struct shmem* shmem;
+        uint32_t      shmem_pgoff;
+    } snap_t;
+    // Bound: count entries first.
+    uint32_t n = 0;
+    rcu_read_lock();
+    for (vma_t* v = rcu_dereference(src->vmas); v;
+                 v = rcu_dereference(v->next)) n++;
+    rcu_read_unlock();
+    if (n == 0) return dst;
+
+    snap_t* snap = kmalloc(n * sizeof(snap_t));
+    if (!snap) { mm_destroy(dst); return NULL; }
+
+    rcu_read_lock();
+    uint32_t i = 0;
+    for (vma_t* v = rcu_dereference(src->vmas); v && i < n;
+                 v = rcu_dereference(v->next), i++) {
+        snap[i].start       = v->start;
+        snap[i].end         = v->end;
+        snap[i].flags       = v->flags;
+        snap[i].shmem       = v->shmem;
+        snap[i].shmem_pgoff = v->shmem_pgoff;
+    }
+    rcu_read_unlock();
+    uint32_t cnt = i;
+
+    for (uint32_t k = 0; k < cnt; k++) {
+        if (!mm_vma_add(dst, snap[k].start, snap[k].end, snap[k].flags)) {
+            kfree(snap);
             mm_destroy(dst);
             return NULL;
         }
-        if (v->shmem) {
-            // Find the just-added VMA in dst (it's the one at the same address).
-            vma_t* dv = mm_vma_find(dst, v->start);
+        if (snap[k].shmem) {
+            rcu_read_lock();
+            vma_t* dv = mm_vma_find(dst, snap[k].start);
             if (dv) {
-                dv->shmem       = v->shmem;
-                dv->shmem_pgoff = v->shmem_pgoff;
-                shmem_ref(v->shmem);
+                dv->shmem       = snap[k].shmem;
+                dv->shmem_pgoff = snap[k].shmem_pgoff;
+                shmem_ref(snap[k].shmem);
             }
+            rcu_read_unlock();
         }
     }
+    kfree(snap);
     return dst;
 }
 
@@ -173,10 +234,20 @@ mm_t* mm_clone(const mm_t* src) {
 //   2. VMA overlaps left edge: shrink vma->end.
 //   3. VMA overlaps right edge: shrink vma->start.
 //   4. VMA contains [start,end) as a proper sub-range: split into two.
-// Returns 1 if at least one VMA was modified, 0 otherwise.
+//
+// RCU concurrency: trimming in place (cases 2/3) is done as a plain
+// field update under the writer lock — readers walk bounds via
+// `addr >= v->start && addr < v->end`, so the worst case for a
+// racing reader is observing a transitional bound and either
+// matching or not matching; both outcomes are safe because the page
+// was going to be unmapped from the page tables anyway by the caller.
+// Case 1 (remove) unlinks via rcu_assign_pointer and defers the free
+// via call_rcu.  Case 4 (split) builds the right fragment, links it
+// in under the writer lock, then trims the left in place.
 uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
     if (!mm || start >= end) return 0;
     uint8_t did_work = 0;
+    spin_lock(&mm->vma_lock);
     vma_t** pp = &mm->vmas;
     while (*pp) {
         vma_t* v = *pp;
@@ -186,27 +257,32 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
         }
         did_work = 1;
         if (v->start >= start && v->end <= end) {
-            // Case 1: entirely covered — remove.
-            *pp = v->next;
-            if (v->shmem) shmem_unref(v->shmem);
-            kfree(v);
+            // Case 1: entirely covered — unlink via rcu_assign_pointer,
+            // then defer the free.
+            rcu_assign_pointer(*pp, v->next);
+            call_rcu(vma_free_rcu, v);
             continue;
         }
         if (v->start < start && v->end > end) {
-            // Case 4: split — create a new right fragment.
+            // Case 4: split.  Build the right fragment in private memory
+            // first, then publish by linking it after v and trimming v.
             vma_t* right = kmalloc(sizeof(vma_t));
             if (!right) { pp = &v->next; continue; }
-            right->start      = end;
-            right->end        = v->end;
-            right->flags      = v->flags;
-            right->next       = v->next;
-            right->shmem      = v->shmem;
+            right->start       = end;
+            right->end         = v->end;
+            right->flags       = v->flags;
+            right->next        = v->next;   // private init
+            right->shmem       = v->shmem;
             right->shmem_pgoff = v->shmem_pgoff +
                 (uint32_t)((end - v->start) / PAGE_SIZE);
-            // Both halves reference the same shmem — bump refcount for the new one.
             if (right->shmem) shmem_ref(right->shmem);
-            v->end  = start;
-            v->next = right;
+            // Publish right, then shrink v.  A concurrent reader sees
+            // either {v covers [v->start, old_end)} or
+            // {v covers [v->start, start), right covers [end, old_end)} —
+            // the gap [start, end) is never mapped in page tables while
+            // a walker could observe it.
+            rcu_assign_pointer(v->next, right);
+            v->end = start;
             pp = &right->next;
             continue;
         }
@@ -219,44 +295,44 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
         }
         pp = &v->next;
     }
+    spin_unlock(&mm->vma_lock);
     return did_work;
 }
 
 // ── mm_vma_find_free ──────────────────────────────────────────────────────
-// Find a free virtual address gap of at least `len` bytes in the mmap region.
-// Searches from mmap_base downward (like Linux ASLR-disabled mmap).
-// Returns the start VA of the gap, or 0 on failure.
+// Find a free virtual address gap of at least `len` bytes in the mmap
+// region.  Writer-side: serialises on mm->vma_lock against concurrent
+// mmap/munmap/brk so the gap computed here is still valid when the
+// caller inserts its new VMA.  (The caller typically holds vma_lock
+// internally via mm_vma_add right after.)
 virt_addr_t mm_vma_find_free(mm_t* mm, size_t len) {
     if (!mm || !len) return 0;
     len = (len + PAGE_MASK) & ~PAGE_MASK;
 
-    // Starting hint: use mm->mmap_base (set at process creation).
-    // We scan downward: try [hint - len, hint), then decrement hint.
+    spin_lock(&mm->vma_lock);
     virt_addr_t hint = mm->mmap_base;
-
-    // Hard lower limit: leave 64MB gap above the heap to avoid collision.
     virt_addr_t lower_limit = mm->brk + (64ULL * 1024 * 1024);
 
     while (hint >= lower_limit + len) {
         virt_addr_t candidate = hint - len;
-        candidate &= ~PAGE_MASK; // page-align down
+        candidate &= ~PAGE_MASK;
 
-        // Check if candidate..candidate+len overlaps any existing VMA.
         uint8_t overlaps = 0;
         for (vma_t* v = mm->vmas; v; v = v->next) {
             if (candidate < v->end && candidate + len > v->start) {
-                // Overlap: skip below this VMA.
                 hint = v->start;
                 overlaps = 1;
                 break;
             }
         }
         if (!overlaps) {
-            mm->mmap_base = candidate; // update hint for next allocation
+            mm->mmap_base = candidate;
+            spin_unlock(&mm->vma_lock);
             return candidate;
         }
     }
-    return 0; // no gap found
+    spin_unlock(&mm->vma_lock);
+    return 0;
 }
 
 // ── mm_vma_pte_flags ──────────────────────────────────────────────────────

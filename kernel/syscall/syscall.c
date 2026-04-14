@@ -135,9 +135,16 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
     phys_addr_t pml4 = vmm_current_pml4();  // current CR3 = this process's PML4
 
     for (; page < end; page += 0x1000) {
-        // Walk VMA list — if no VMA covers this page it's not a valid mapping.
-        vma_t* vma = mm_vma_find(mm, page);
-        if (!vma) continue;
+        // Walk VMA list under RCU — snapshot the flags we need, then
+        // drop the reader before touching page tables.
+        uint32_t vma_flags;
+        rcu_read_lock();
+        {
+            vma_t* vma = mm_vma_find(mm, page);
+            if (!vma) { rcu_read_unlock(); continue; }
+            vma_flags = vma->flags;
+        }
+        rcu_read_unlock();
 
         // Check if this page is already present.  vmm_page_unmap returns 0 and
         // does nothing if the PTE is absent, so we use it safely as a probe only
@@ -169,7 +176,7 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
         // Zero the full page (512 × 8 bytes = 4096).
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
-        if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
+        if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
             pmm_buddy_free(frame, 0);
         }
     }
@@ -413,28 +420,24 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 
     if (new_brk > old_brk) {
         // ── Grow heap ─────────────────────────────────────────────────────
-        // Extend or add a heap VMA.  Physical pages are NOT allocated here;
-        // they come in on-demand via the #PF handler.
+        // Rather than remove+add (which races readers and loses flags),
+        // ask mm_vma_remove to drop the old heap VMA (deferred free via
+        // call_rcu) and then mm_vma_add to install the enlarged one.
         virt_addr_t heap_vma_start = mm->brk_start;
-
-        // Remove the old heap VMA if present, then re-add the enlarged one.
-        // (Simpler than a resize operation on the sorted list.)
-        vma_t* prev = NULL;
-        vma_t* v = mm->vmas;
-        while (v) {
-            if (v->start == heap_vma_start) {
-                // Remove from list.
-                if (prev) prev->next = v->next;
-                else       mm->vmas  = v->next;
-                kfree(v);
-                break;
-            }
-            prev = v;
-            v = v->next;
-        }
-        // Add enlarged VMA — end must be page-aligned for mm_vma_add, but
-        // mm->brk stores the exact (possibly unaligned) value.
         virt_addr_t vma_end = (new_brk + PAGE_MASK) & ~PAGE_MASK;
+
+        // mm_vma_remove takes mm->vma_lock internally.
+        extern uint8_t mm_vma_remove(mm_t*, virt_addr_t, virt_addr_t);
+        // We need to know the old end to pass it in.  Read it under RCU.
+        virt_addr_t old_end = 0;
+        rcu_read_lock();
+        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
+            if (v->start == heap_vma_start) { old_end = v->end; break; }
+        }
+        rcu_read_unlock();
+        if (old_end)
+            mm_vma_remove(mm, heap_vma_start, old_end);
+
         if (!mm_vma_add(mm, heap_vma_start, vma_end, VMA_R | VMA_W | VMA_ANON))
             return (uint64_t)-ENOMEM;
 
@@ -452,25 +455,25 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
             pmm_ref_dec(frame);
     }
 
-    // Shrink or remove the heap VMA.
+    // Shrink or remove the heap VMA.  Under mm->vma_lock so mutation
+    // is serialised with concurrent mmap/munmap on the same address space.
     virt_addr_t heap_vma_start = mm->brk_start;
-    vma_t* prev = NULL;
-    vma_t* v = mm->vmas;
-    while (v) {
+    spin_lock(&mm->vma_lock);
+    vma_t** pp = &mm->vmas;
+    while (*pp) {
+        vma_t* v = *pp;
         if (v->start == heap_vma_start) {
             if (new_brk <= heap_vma_start) {
-                // Remove entirely.
-                if (prev) prev->next = v->next;
-                else       mm->vmas  = v->next;
-                kfree(v);
+                rcu_assign_pointer(*pp, v->next);
+                call_rcu(vma_free_rcu, v);
             } else {
-                v->end = new_brk;
+                v->end = new_brk;  // in-place shrink — safe under RCU
             }
             break;
         }
-        prev = v;
-        v = v->next;
+        pp = &v->next;
     }
+    spin_unlock(&mm->vma_lock);
 
     mm->brk = new_brk;
     return new_brk;
@@ -1388,18 +1391,20 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
         virt_addr_t uva = (mm->brk + PAGE_MASK) & ~PAGE_MASK; // page-align up
         virt_addr_t uva_end = uva + PAGE_SIZE;
 
-        // Extend heap VMA to cover the new page.
+        // Extend heap VMA to cover the new page.  Under mm->vma_lock.
         virt_addr_t heap_start = mm->brk_start;
-        vma_t* prev = NULL;
-        vma_t* v = mm->vmas;
-        while (v) {
+        spin_lock(&mm->vma_lock);
+        vma_t** pp2 = &mm->vmas;
+        while (*pp2) {
+            vma_t* v = *pp2;
             if (v->start == heap_start) {
-                if (prev) prev->next = v->next; else mm->vmas = v->next;
-                kfree(v);
+                rcu_assign_pointer(*pp2, v->next);
+                call_rcu(vma_free_rcu, v);
                 break;
             }
-            prev = v; v = v->next;
+            pp2 = &v->next;
         }
+        spin_unlock(&mm->vma_lock);
         if (!mm_vma_add(mm, heap_start, uva_end, VMA_R | VMA_W | VMA_ANON)) {
             pmm_buddy_free(frame, 0);
             return (uint64_t)-ENOMEM;
@@ -1695,16 +1700,18 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     virt_addr_t vaddr;
     if (flags & MAP_FIXED) {
         if (!addr || (addr & PAGE_MASK)) return (uint64_t)-EINVAL;
-        // Unmap anything in the range first (POSIX requirement).
         phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
         for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
             phys_addr_t frame;
             if (vmm_page_unmap(pml4, p, &frame)) {
-                // Only free the frame if the VMA at this address is private.
-                // CoW-aware: pmm_ref_dec only frees when refcount→0.
-                vma_t* old_vma = mm_vma_find(mm, p);
-                if (!old_vma || !old_vma->shmem)
-                    pmm_ref_dec(frame);
+                int is_shared = 0;
+                rcu_read_lock();
+                {
+                    vma_t* old_vma = mm_vma_find(mm, p);
+                    if (old_vma && old_vma->shmem) is_shared = 1;
+                }
+                rcu_read_unlock();
+                if (!is_shared) pmm_ref_dec(frame);
             }
         }
         mm_vma_remove(mm, addr, addr + len);
@@ -1712,9 +1719,11 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     } else if (addr) {
         addr &= ~PAGE_MASK;
         uint8_t free_hint = 1;
-        for (vma_t* v = mm->vmas; v; v = v->next) {
+        rcu_read_lock();
+        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
             if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
         }
+        rcu_read_unlock();
         vaddr = free_hint ? addr : mm_vma_find_free(mm, len);
     } else {
         vaddr = mm_vma_find_free(mm, len);
@@ -1753,11 +1762,18 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             shmem_ref(shm);
             fdput(f);
 
-            vma_t* vma = mm_vma_find(mm, vaddr);
-            if (vma) {
-                vma->shmem       = shm;
-                vma->shmem_pgoff = pg_off;
+            // Attach shmem backing under the writer lock so concurrent
+            // page-fault readers on other CPUs see the shmem fields
+            // atomically rather than in two torn halves.
+            spin_lock(&mm->vma_lock);
+            for (vma_t* v = mm->vmas; v; v = v->next) {
+                if (v->start == vaddr) {
+                    v->shmem       = shm;
+                    v->shmem_pgoff = pg_off;
+                    break;
+                }
             }
+            spin_unlock(&mm->vma_lock);
         } else {
             // MAP_SHARED | MAP_ANONYMOUS: create a new anonymous shmem.
             shm = shmem_create(npages,
@@ -1766,12 +1782,15 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                                0600);
             if (!shm) goto fail_unmap;
 
-            vma_t* vma = mm_vma_find(mm, vaddr);
-            if (vma) {
-                vma->shmem       = shm;
-                vma->shmem_pgoff = 0;
+            spin_lock(&mm->vma_lock);
+            for (vma_t* v = mm->vmas; v; v = v->next) {
+                if (v->start == vaddr) {
+                    v->shmem       = shm;
+                    v->shmem_pgoff = 0;
+                    break;
+                }
             }
-            // shm starts with refcount=1 (owned by this VMA)
+            spin_unlock(&mm->vma_lock);
         }
     }
 
@@ -1797,12 +1816,16 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     // shared frames are owned by the shmem_t and freed when its
     // refcount drops to zero.
     for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
-        vma_t* vma = mm_vma_find(mm, p);
+        int is_shared = 0;
+        rcu_read_lock();
+        {
+            vma_t* vma = mm_vma_find(mm, p);
+            if (vma && vma->shmem) is_shared = 1;
+        }
+        rcu_read_unlock();
         phys_addr_t frame;
         if (vmm_page_unmap(pml4, p, &frame)) {
-            if (!vma || !vma->shmem)
-                pmm_ref_dec(frame);  // CoW-aware: only frees when rc→0
-            // Shared frames: just unmap the PTE, don't free the physical page.
+            if (!is_shared) pmm_ref_dec(frame);
         }
     }
 

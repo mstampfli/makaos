@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vmm.h"
+#include "smp.h"
 
 // ── VMA flags (protection bits) ───────────────────────────────────────────
 #define VMA_R      (1U << 0)   // readable
@@ -37,12 +38,25 @@ typedef struct vma_t {
 // Kernel threads have mm == NULL.
 //
 // Linux equivalent: struct mm_struct
+//
+// Concurrency model:
+//   - `vmas` is an RCU-protected singly-linked list.  Readers walk it
+//     inside rcu_read_lock() using rcu_dereference on each ->next.  VMA
+//     descriptors are freed via call_rcu so a concurrent mm_vma_remove
+//     cannot yank a VMA out from under a page-fault walker.
+//   - Writers (mm_vma_add, mm_vma_remove, mm_vma_find_free, mm_clone's
+//     src walk, brk shrink/grow) serialise on `vma_lock`.  The lock is
+//     NOT IRQ-off: page fault handlers never take it, they only read
+//     under RCU.
+//   - brk / brk_start / mmap_base are updated under vma_lock so they
+//     stay coherent with the VMA list.
 typedef struct mm_t {
-    vma_t*      vmas;           // sorted linked list of VMAs
+    vma_t*      vmas;           // RCU-published sorted linked list of VMAs
     virt_addr_t brk_start;      // base of the heap region (fixed at create time)
     virt_addr_t brk;            // current heap top (grows up via sys_brk)
     virt_addr_t mmap_base;      // hint for next anonymous mmap (grows downward)
     uint32_t    refcount;       // threads sharing this mm (unused until threading)
+    spinlock_t  vma_lock;       // writer-side mutex for the VMA list
 } mm_t;
 
 // ── API ───────────────────────────────────────────────────────────────────
@@ -55,6 +69,13 @@ mm_t* mm_create(void);
 uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags);
 
 // Look up the VMA containing `addr`.  Returns NULL if none.
+//
+// CALLER MUST BE INSIDE rcu_read_lock() and must stay there until it is
+// done dereferencing the returned pointer.  The returned VMA is valid
+// for the duration of the reader section because mm_vma_remove defers
+// the kfree via call_rcu.  The caller may sample v->flags, v->shmem,
+// v->shmem_pgoff inside the section — once rcu_read_unlock has fired,
+// the pointer must not be touched again.
 vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr);
 
 // Remove and free all VMAs and the mm_t itself.
@@ -68,6 +89,11 @@ uint64_t mm_vma_pte_flags(uint32_t vma_flags);
 // Clone a mm_t: allocate a new mm_t, copy brk_start/brk, copy VMA list.
 // Does NOT copy physical pages (use vmm_clone_user for that).
 mm_t* mm_clone(const mm_t* src);
+
+// call_rcu callback for freeing a VMA.  Exposed so callers outside mm.c
+// that unlink a VMA directly (under mm->vma_lock) can hand it off for
+// deferred reclamation via call_rcu(vma_free_rcu, v).
+void vma_free_rcu(void* data);
 
 // Remove the VMA that covers exactly [start, end).  Returns 1 if found and
 // removed, 0 if no matching VMA exists.  Handles partial unmaps by splitting
