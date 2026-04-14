@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include "errno.h"
 #include "smp.h"
+#include "rcu.h"
 #include "pipe.h"
 #include "common.h"
 #include "sched.h"
@@ -90,6 +91,11 @@ static inline uint64_t rdmsr(uint32_t msr) {
     return ((uint64_t)hi << 32) | lo;
 }
 
+// Forward declarations for the fd-lookup fast path (defined further down).
+static vfs_file_t* fdget(uint64_t fd);
+static void        fdput(vfs_file_t* f);
+static vfs_file_t* fd_to_file(uint64_t fd);
+
 // ── syscall_init ──────────────────────────────────────────────────────────
 void syscall_init(void) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);
@@ -100,18 +106,15 @@ void syscall_init(void) {
 
 // ── sys_write ─────────────────────────────────────────────────────────────
 static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
-    if (!g_current || fd >= g_current->files_shared->fd_capacity)
-        return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[fd];
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
-    if (!f->write) return (uint64_t)-EBADF;
-    // Rights check: only enforce if rights field is non-zero (stamped at open).
-    // Zero means the fd was opened before rights stamping existed (legacy path)
-    // or is a device opened via tty_open/evdev_open — treat as fully permitted.
-    if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE))
-        return (uint64_t)-EACCES;
+    if (!f->write) { fdput(f); return (uint64_t)-EBADF; }
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE)) {
+        fdput(f); return (uint64_t)-EACCES;
+    }
     int64_t r = vfs_write(f, (const void*)buf, len);
-    if (r < 0) return (uint64_t)r; // propagate errno from driver (e.g. -EPIPE)
+    fdput(f);
+    if (r < 0) return (uint64_t)r;
     return (uint64_t)r;
 }
 
@@ -175,17 +178,15 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
 // ── sys_read ──────────────────────────────────────────────────────────────
 static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags) {
     (void)flags;
-    if (!g_current || fd >= g_current->files_shared->fd_capacity)
-        return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[fd];
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
-    // Rights check: zero means legacy/device fd — treat as permitted.
-    if (f->rights != 0 && !rights_check(f->rights, RIGHT_READ))
-        return (uint64_t)-EACCES;
-    // Pre-fault the user buffer so kernel writes into it don't kernel-panic.
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_READ)) {
+        fdput(f); return (uint64_t)-EACCES;
+    }
     user_buf_prefault((virt_addr_t)buf, (size_t)len);
     int64_t r = vfs_read(f, (void*)buf, len);
-    return (uint64_t)r;  // pass errno through (r<0 is -errno already)
+    fdput(f);
+    return (uint64_t)r;
 }
 
 // ── sys_open ──────────────────────────────────────────────────────────────
@@ -342,18 +343,22 @@ got_file:
     if ((flags & O_TRUNC) && (flags & (O_WRONLY | O_RDWR)))
         ext2_truncate(path);
 
-    // Find the lowest free fd.
+    // Find the lowest free fd.  The writer lock serialises grow and
+    // slot allocation against concurrent installs / closes / dups.
+    task_files_t* tf = g_current->files_shared;
+    spin_lock(&tf->lock);
     for (uint32_t fd = 0; ; fd++) {
-        if (fd >= g_current->files_shared->fd_capacity) {
-            if (!fd_table_grow(g_current->files_shared)) {
+        if (fd >= tf->ft->cap) {
+            if (!fd_table_grow(tf)) {
+                spin_unlock(&tf->lock);
                 vfs_close(f);
                 return (uint64_t)-ENFILE;
             }
         }
-        if (!g_current->files_shared->fd_table[fd]) {
-            g_current->files_shared->fd_table[fd] = f;
-            // O_CLOEXEC: set FD_CLOEXEC atomically.
-            g_current->files_shared->fd_flags[fd] = (flags & O_CLOEXEC) ? FD_CLOEXEC : 0;
+        if (!tf->ft->fd_table[fd]) {
+            tf->ft->fd_table[fd] = f;
+            tf->ft->fd_flags[fd] = (flags & O_CLOEXEC) ? FD_CLOEXEC : 0;
+            spin_unlock(&tf->lock);
             return (uint64_t)fd;
         }
     }
@@ -362,13 +367,17 @@ got_file:
 // ── sys_close ─────────────────────────────────────────────────────────────
 // close(fd) → 0 or -1
 static uint64_t sys_close(uint64_t fd) {
-    if (!g_current) return (uint64_t)-EBADF;
-    if (fd >= g_current->files_shared->fd_capacity) return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[fd];
-    if (!f) return (uint64_t)-EBADF;
+    if (!g_current || !g_current->files_shared) return (uint64_t)-EBADF;
+    task_files_t* tf = g_current->files_shared;
+    spin_lock(&tf->lock);
+    if (fd >= tf->ft->cap) { spin_unlock(&tf->lock); return (uint64_t)-EBADF; }
+    vfs_file_t* f = tf->ft->fd_table[fd];
+    if (!f) { spin_unlock(&tf->lock); return (uint64_t)-EBADF; }
+    tf->ft->fd_table[fd] = NULL;
+    tf->ft->fd_flags[fd] = 0;
+    spin_unlock(&tf->lock);
+    // Drop ref outside the lock: vfs_close may sleep or take driver locks.
     vfs_close(f);
-    g_current->files_shared->fd_table[fd] = NULL;
-    g_current->files_shared->fd_flags[fd] = 0;
     return 0;
 }
 
@@ -722,13 +731,20 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // ── Close FD_CLOEXEC fds ──────────────────────────────────────────────
     {
         task_files_t* files = g_current->files_shared;
-        for (uint32_t i = 0; i < files->fd_capacity; i++) {
-            if (files->fd_table[i] && (files->fd_flags[i] & FD_CLOEXEC)) {
-                vfs_close(files->fd_table[i]);
-                files->fd_table[i] = NULL;
-                files->fd_flags[i] = 0;
+        spin_lock(&files->lock);
+        fdtable_t* ft = files->ft;
+        for (uint32_t i = 0; i < ft->cap; i++) {
+            if (ft->fd_table[i] && (ft->fd_flags[i] & FD_CLOEXEC)) {
+                vfs_file_t* vf = ft->fd_table[i];
+                ft->fd_table[i] = NULL;
+                ft->fd_flags[i] = 0;
+                spin_unlock(&files->lock);
+                vfs_close(vf);
+                spin_lock(&files->lock);
+                ft = files->ft;  // re-load in case grow raced — unlikely but cheap
             }
         }
+        spin_unlock(&files->lock);
     }
 
     // ── Swap in new address space ─────────────────────────────────────────
@@ -982,9 +998,11 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     } else {
         task_files_t* files = task_files_alloc();
         if (!files) { task_mm_release(t->mm_shared); pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }
-        fd_table_init(files, g_current->files_shared->fd_capacity);
-        for (uint32_t i = 0; i < g_current->files_shared->fd_capacity; i++)
-            files->fd_table[i] = g_current->files_shared->fd_table[i];
+        fdtable_t* src = g_current->files_shared->ft;
+        fd_table_init(files, src->cap);
+        fdtable_t* dst = files->ft;
+        for (uint32_t i = 0; i < src->cap; i++)
+            dst->fd_table[i] = vfs_dup(src->fd_table[i]);
         t->files_shared = files;
     }
 
@@ -1492,48 +1510,46 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
 // ── sys_dup ───────────────────────────────────────────────────────────────
 // dup(oldfd) → new fd sharing the same file description, or -errno.
 static uint64_t sys_dup(uint64_t oldfd) {
-    if (!g_current || oldfd >= g_current->files_shared->fd_capacity)
-        return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[oldfd];
-    if (!f) return (uint64_t)-EBADF;
-
-    // Find lowest free fd.
+    if (!g_current) return (uint64_t)-EBADF;
+    task_files_t* tf = g_current->files_shared;
+    spin_lock(&tf->lock);
+    if (oldfd >= tf->ft->cap || !tf->ft->fd_table[oldfd]) {
+        spin_unlock(&tf->lock); return (uint64_t)-EBADF;
+    }
+    vfs_file_t* f = tf->ft->fd_table[oldfd];
     for (uint32_t fd = 0; ; fd++) {
-        if (fd >= g_current->files_shared->fd_capacity) {
-            if (!fd_table_grow(g_current->files_shared)) return (uint64_t)-ENFILE;
+        if (fd >= tf->ft->cap) {
+            if (!fd_table_grow(tf)) { spin_unlock(&tf->lock); return (uint64_t)-ENFILE; }
         }
-        if (!g_current->files_shared->fd_table[fd]) {
-            g_current->files_shared->fd_table[fd] = vfs_dup(f);
+        if (!tf->ft->fd_table[fd]) {
+            tf->ft->fd_table[fd] = vfs_dup(f);
+            spin_unlock(&tf->lock);
             return (uint64_t)fd;
         }
     }
 }
 
 // ── sys_dup2 ──────────────────────────────────────────────────────────────
-// dup2(oldfd, newfd) → newfd sharing oldfd's file description, or -errno.
-// If newfd == oldfd, returns newfd unchanged. Closes newfd if already open.
 static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     if (!g_current) return (uint64_t)-EBADF;
-    if (oldfd >= g_current->files_shared->fd_capacity) return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[oldfd];
-    if (!f) return (uint64_t)-EBADF;
-    if (oldfd == newfd) return (uint64_t)newfd;
-
-    // Grow fd table if needed.
-    while (newfd >= g_current->files_shared->fd_capacity)
-        if (!fd_table_grow(g_current->files_shared)) return (uint64_t)-ENFILE;
-
-    // Close whatever is currently at newfd.
-    vfs_file_t* old = g_current->files_shared->fd_table[newfd];
+    task_files_t* tf = g_current->files_shared;
+    spin_lock(&tf->lock);
+    if (oldfd >= tf->ft->cap || !tf->ft->fd_table[oldfd]) {
+        spin_unlock(&tf->lock); return (uint64_t)-EBADF;
+    }
+    vfs_file_t* f = tf->ft->fd_table[oldfd];
+    if (oldfd == newfd) { spin_unlock(&tf->lock); return (uint64_t)newfd; }
+    while (newfd >= tf->ft->cap)
+        if (!fd_table_grow(tf)) { spin_unlock(&tf->lock); return (uint64_t)-ENFILE; }
+    vfs_file_t* old = tf->ft->fd_table[newfd];
+    tf->ft->fd_table[newfd] = vfs_dup(f);
+    tf->ft->fd_flags[newfd] = 0;  // POSIX: dup2 clears FD_CLOEXEC
+    spin_unlock(&tf->lock);
     if (old) vfs_close(old);
-
-    g_current->files_shared->fd_table[newfd] = vfs_dup(f);
-    g_current->files_shared->fd_flags[newfd] = 0;  // POSIX: dup2 clears FD_CLOEXEC
     return (uint64_t)newfd;
 }
 
 // ── sys_pipe ──────────────────────────────────────────────────────────────
-// pipe(fds_ptr): fills fds[0]=read, fds[1]=write. Returns 0 or -errno.
 static uint64_t sys_pipe(uint64_t fds_ptr) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
     int* fds = (int*)(uintptr_t)fds_ptr;
@@ -1543,16 +1559,18 @@ static uint64_t sys_pipe(uint64_t fds_ptr) {
     int err = pipe_create(&r, &w);
     if (err) return (uint64_t)(int64_t)err;
 
-    // Allocate two fds.
+    task_files_t* tf = g_current->files_shared;
     int rfd = -1, wfd = -1;
+    spin_lock(&tf->lock);
     for (uint32_t fd = 0; ; fd++) {
-        if (fd >= g_current->files_shared->fd_capacity)
-            if (!fd_table_grow(g_current->files_shared)) goto fail;
-        if (!g_current->files_shared->fd_table[fd]) {
-            if (rfd < 0) { rfd = (int)fd; g_current->files_shared->fd_table[fd] = r; }
-            else         { wfd = (int)fd; g_current->files_shared->fd_table[fd] = w; break; }
+        if (fd >= tf->ft->cap)
+            if (!fd_table_grow(tf)) { spin_unlock(&tf->lock); goto fail; }
+        if (!tf->ft->fd_table[fd]) {
+            if (rfd < 0) { rfd = (int)fd; tf->ft->fd_table[fd] = r; }
+            else         { wfd = (int)fd; tf->ft->fd_table[fd] = w; break; }
         }
     }
+    spin_unlock(&tf->lock);
     fds[0] = rfd;
     fds[1] = wfd;
     return 0;
@@ -1563,14 +1581,12 @@ fail:
 }
 
 // ── sys_lseek ─────────────────────────────────────────────────────────────
-// lseek(fd, offset, whence) → new file offset, or -errno
 static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
-    if (!g_current || fd >= g_current->files_shared->fd_capacity)
-        return (uint64_t)-EBADF;
-    vfs_file_t* f = g_current->files_shared->fd_table[fd];
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
-    if (!f->seek) return (uint64_t)-EINVAL;  // non-seekable (device, pipe)
+    if (!f->seek) { fdput(f); return (uint64_t)-EINVAL; }
     int64_t r = f->seek(f, (int64_t)offset, (int)(int64_t)whence);
+    fdput(f);
     if (r < 0) return (uint64_t)-EINVAL;
     return (uint64_t)r;
 }
@@ -1721,26 +1737,21 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         shmem_t* shm = NULL;
 
         if (has_fd) {
-            // MAP_SHARED with fd: the fd must be a shmem fd.
-            if (fd >= g_current->files_shared->fd_capacity)
-                goto fail_unmap;
-            vfs_file_t* f = g_current->files_shared->fd_table[fd];
+            // MAP_SHARED with fd: the fd must be a shmem fd.  fdget takes
+            // a reference so we can inspect f->ctx without racing close.
+            vfs_file_t* f = fdget(fd);
             if (!f) goto fail_unmap;
-            // Identify shmem fds by checking for the shmem_close callback.
-            // (set when shm_open creates the fd — see shmem fd implementation)
             extern void shmem_fd_close(vfs_file_t*);
-            if (f->close != shmem_fd_close) {
-                // Not a shmem fd.
-                goto fail_unmap;
-            }
+            if (f->close != shmem_fd_close) { fdput(f); goto fail_unmap; }
             shm = (shmem_t*)f->ctx;
-            if (!shm) goto fail_unmap;
+            if (!shm) { fdput(f); goto fail_unmap; }
 
             // Validate offset and size.
             uint32_t pg_off = (uint32_t)(off / PAGE_SIZE);
-            if (pg_off + npages > shm->npages) goto fail_unmap;
+            if (pg_off + npages > shm->npages) { fdput(f); goto fail_unmap; }
 
             shmem_ref(shm);
+            fdput(f);
 
             vma_t* vma = mm_vma_find(mm, vaddr);
             if (vma) {
@@ -1891,26 +1902,29 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
 
     // Allocate an fd slot.
     task_files_t* files = g_current->files_shared;
-    for (uint32_t i = 0; i < files->fd_capacity; i++) {
-        if (!files->fd_table[i]) {
-            files->fd_table[i] = f;
-            files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+    spin_lock(&files->lock);
+    for (uint32_t i = 0; i < files->ft->cap; i++) {
+        if (!files->ft->fd_table[i]) {
+            files->ft->fd_table[i] = f;
+            files->ft->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+            spin_unlock(&files->lock);
             serial_puts_dbg("[shm_open] fd="); serial_hex_dbg((uint64_t)i);
             if (found_extra_ref) shmem_unref(shm);
             return i;
         }
     }
-    // Table full — try to grow.
     if (fd_table_grow(files)) {
-        for (uint32_t i = 0; i < files->fd_capacity; i++) {
-            if (!files->fd_table[i]) {
-                files->fd_table[i] = f;
-                files->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+        for (uint32_t i = 0; i < files->ft->cap; i++) {
+            if (!files->ft->fd_table[i]) {
+                files->ft->fd_table[i] = f;
+                files->ft->fd_flags[i] = (oflags & O_CLOEXEC) ? 1 : 0;
+                spin_unlock(&files->lock);
                 if (found_extra_ref) shmem_unref(shm);
                 return i;
             }
         }
     }
+    spin_unlock(&files->lock);
     vfs_close(f);
     if (found_extra_ref) shmem_unref(shm);
     return (uint64_t)-EMFILE;
@@ -2108,7 +2122,8 @@ static uint64_t sys_openpty(uint64_t user_fds) {
     int64_t sfd = fd_install(slave);
     if (sfd < 0) {
         // Close master fd
-        g_current->files_shared->fd_table[mfd] = NULL;
+        task_files_t* tf0 = g_current->files_shared;
+        spin_lock(&tf0->lock); tf0->ft->fd_table[mfd] = NULL; spin_unlock(&tf0->lock);
         master->close(master);
         slave->close(slave);
         return (uint64_t)sfd;
@@ -2117,8 +2132,11 @@ static uint64_t sys_openpty(uint64_t user_fds) {
     // Copy fds to userspace
     int fds[2] = { (int)mfd, (int)sfd };
     if (copy_to_user((void*)user_fds, fds, sizeof(fds)) != 0) {
-        g_current->files_shared->fd_table[mfd] = NULL;
-        g_current->files_shared->fd_table[sfd] = NULL;
+        task_files_t* tf0 = g_current->files_shared;
+        spin_lock(&tf0->lock);
+        tf0->ft->fd_table[mfd] = NULL;
+        tf0->ft->fd_table[sfd] = NULL;
+        spin_unlock(&tf0->lock);
         master->close(master);
         slave->close(slave);
         return (uint64_t)-EFAULT;
@@ -2132,24 +2150,67 @@ static uint64_t sys_openpty(uint64_t user_fds) {
 // Helper: allocate the lowest available fd ≥ 3 and assign f to it.
 static int64_t fd_install(vfs_file_t* f) {
     if (!g_current) return -EBADF;
+    task_files_t* tf = g_current->files_shared;
+    spin_lock(&tf->lock);
     for (uint32_t fd = 3; ; fd++) {
-        if (fd >= g_current->files_shared->fd_capacity) {
-            if (!fd_table_grow(g_current->files_shared)) {
+        if (fd >= tf->ft->cap) {
+            if (!fd_table_grow(tf)) {
+                spin_unlock(&tf->lock);
                 vfs_close(f);
                 return -ENFILE;
             }
         }
-        if (!g_current->files_shared->fd_table[fd]) {
-            g_current->files_shared->fd_table[fd] = f;
+        if (!tf->ft->fd_table[fd]) {
+            tf->ft->fd_table[fd] = f;
+            spin_unlock(&tf->lock);
             return (int64_t)fd;
         }
     }
 }
 
+// fdget: look up an open file description by fd.  On success the returned
+// vfs_file_t has been ref-bumped via vfs_tryget — the caller MUST pair the
+// call with vfs_close(f) (aliased as fdput below) to drop the reference.
+//
+// Hot path on x86: preempt_disable + plain pointer load (the RCU-published
+// fdtable_t*) + bounds check + plain pointer load (the slot) + atomic
+// tryget (one `lock cmpxchg`) + preempt_enable.  Zero locks, one atomic
+// in the common case.
+//
+// RCU matters for the `fdtable_t` itself: a concurrent fd_table_grow on
+// another CPU can replace `files->ft` with a new, larger table; the old
+// arrays are handed to call_rcu for deferred free.  Inside our reader
+// section the old arrays stay valid even if we sampled the pointer
+// *before* the grow.  vfs_tryget handles the race with a concurrent
+// close() that reaches refcount=0.
+static vfs_file_t* fdget(uint64_t fd) {
+    if (!g_current || !g_current->files_shared) return NULL;
+    vfs_file_t* f;
+    rcu_read_lock();
+    fdtable_t* ft = __atomic_load_n(&g_current->files_shared->ft, __ATOMIC_ACQUIRE);
+    if (!ft || fd >= ft->cap) {
+        rcu_read_unlock();
+        return NULL;
+    }
+    f = __atomic_load_n(&ft->fd_table[fd], __ATOMIC_ACQUIRE);
+    f = vfs_tryget(f);
+    rcu_read_unlock();
+    return f;
+}
+
+// fdput: drop the reference taken by fdget.  Aliased to vfs_close so
+// close-on-last-ref runs the driver teardown; safe to pass NULL.
+static void fdput(vfs_file_t* f) { vfs_close(f); }
+
+// Compat wrapper for a handful of callers that still want the old,
+// un-ref-bumped semantics — used only inside writer-lock critical
+// sections where the task_files_t.lock already prevents a concurrent
+// teardown.  New code should use fdget/fdput.
 static vfs_file_t* fd_to_file(uint64_t fd) {
-    if (!g_current) return NULL;
-    if (fd >= g_current->files_shared->fd_capacity) return NULL;
-    return g_current->files_shared->fd_table[fd];
+    if (!g_current || !g_current->files_shared) return NULL;
+    fdtable_t* ft = __atomic_load_n(&g_current->files_shared->ft, __ATOMIC_ACQUIRE);
+    if (!ft || fd >= ft->cap) return NULL;
+    return ft->fd_table[fd];
 }
 
 // socket(domain, type, proto) → fd or -errno
@@ -2431,49 +2492,67 @@ static int copy_to_user(void* dst_u, const void* src, uint64_t len) {
 static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     if (!g_current) return (uint64_t)-EBADF;
     task_files_t* files = g_current->files_shared;
-    if (fd >= files->fd_capacity || !files->fd_table[fd])
-        return (uint64_t)-EBADF;
 
     switch ((int)cmd) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC: {
-        // Dup to lowest fd >= arg.
+        spin_lock(&files->lock);
+        if (fd >= files->ft->cap || !files->ft->fd_table[fd]) {
+            spin_unlock(&files->lock); return (uint64_t)-EBADF;
+        }
         uint32_t start = (uint32_t)arg;
         for (uint32_t nfd = start; ; nfd++) {
-            if (nfd >= files->fd_capacity) {
-                if (!fd_table_grow(files)) return (uint64_t)-EMFILE;
+            if (nfd >= files->ft->cap) {
+                if (!fd_table_grow(files)) { spin_unlock(&files->lock); return (uint64_t)-EMFILE; }
             }
-            if (!files->fd_table[nfd]) {
-                vfs_file_t* orig = files->fd_table[fd];
+            if (!files->ft->fd_table[nfd]) {
+                vfs_file_t* orig = files->ft->fd_table[fd];
                 vfs_dup(orig);
-                files->fd_table[nfd] = orig;
-                files->fd_flags[nfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+                files->ft->fd_table[nfd] = orig;
+                files->ft->fd_flags[nfd] = (cmd == F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+                spin_unlock(&files->lock);
                 return (uint64_t)nfd;
             }
         }
     }
-    case F_GETFD:
-        return (uint64_t)files->fd_flags[fd];
-    case F_SETFD:
-        files->fd_flags[fd] = (uint32_t)(arg & FD_CLOEXEC);
+    case F_GETFD: {
+        spin_lock(&files->lock);
+        if (fd >= files->ft->cap || !files->ft->fd_table[fd]) {
+            spin_unlock(&files->lock); return (uint64_t)-EBADF;
+        }
+        uint64_t r = files->ft->fd_flags[fd];
+        spin_unlock(&files->lock);
+        return r;
+    }
+    case F_SETFD: {
+        spin_lock(&files->lock);
+        if (fd >= files->ft->cap || !files->ft->fd_table[fd]) {
+            spin_unlock(&files->lock); return (uint64_t)-EBADF;
+        }
+        files->ft->fd_flags[fd] = (uint32_t)(arg & FD_CLOEXEC);
+        spin_unlock(&files->lock);
         return 0;
+    }
     case F_GETFL: {
-        vfs_file_t* f = files->fd_table[fd];
+        vfs_file_t* f = fdget(fd);
+        if (!f) return (uint64_t)-EBADF;
         uint64_t fl = 0;
         if (f->write && f->read) fl = O_RDWR;
         else if (f->write)       fl = O_WRONLY;
         else                     fl = O_RDONLY;
         if (f->flags & O_APPEND)   fl |= O_APPEND;
         if (f->flags & O_NONBLOCK) fl |= O_NONBLOCK;
+        fdput(f);
         return fl;
     }
     case F_SETFL: {
-        vfs_file_t* f = files->fd_table[fd];
-        // Only O_APPEND and O_NONBLOCK are changeable after open.
+        vfs_file_t* f = fdget(fd);
+        if (!f) return (uint64_t)-EBADF;
         if (arg & O_APPEND)   f->flags |= O_APPEND;
         else                  f->flags &= ~(uint32_t)O_APPEND;
         if (arg & O_NONBLOCK) f->flags |= O_NONBLOCK;
         else                  f->flags &= ~(uint32_t)O_NONBLOCK;
+        fdput(f);
         return 0;
     }
     default:
@@ -2485,11 +2564,8 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 // fstat(fd, struct stat*) → 0 or -errno
 static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
     if (!g_current || !stat_ptr) return (uint64_t)-EINVAL;
-    task_files_t* files = g_current->files_shared;
-    if (fd >= files->fd_capacity || !files->fd_table[fd])
-        return (uint64_t)-EBADF;
-
-    vfs_file_t* f = files->fd_table[fd];
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
     struct stat kst;
     __builtin_memset(&kst, 0, sizeof(kst));
 
@@ -2515,6 +2591,7 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
         kst.st_blksize = 4096;
     }
 
+    fdput(f);
     return (copy_to_user((void*)stat_ptr, &kst, sizeof(kst)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 
@@ -2753,12 +2830,10 @@ static uint64_t sys_unveil_lock(void) {
 // restrict_fd(fd, rights_mask) → 0 or -errno
 // ANDs the fd's rights bitmask with `rights_mask`.  Irrevocable downgrade.
 static uint64_t sys_restrict_fd(uint64_t fd, uint64_t rights_mask) {
-    if (!g_current) return (uint64_t)-EBADF;
-    task_files_t* files = g_current->files_shared;
-    if (fd >= files->fd_capacity || !files->fd_table[fd])
-        return (uint64_t)-EBADF;
-    files->fd_table[fd]->rights = rights_restrict(files->fd_table[fd]->rights,
-                                                    (uint32_t)rights_mask);
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    f->rights = rights_restrict(f->rights, (uint32_t)rights_mask);
+    fdput(f);
     return 0;
 }
 
@@ -2770,27 +2845,22 @@ static uint64_t sys_restrict_fd(uint64_t fd, uint64_t rights_mask) {
 static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
                             uint64_t new_rights) {
     serial_puts_dbg("[sendfd] sock="); serial_hex_dbg(sock_fd);
-    if (!g_current) return (uint64_t)-EBADF;
-    task_files_t* files = g_current->files_shared;
+    vfs_file_t* sock = fdget(sock_fd);
+    if (!sock) return (uint64_t)-EBADF;
+    if (!is_unix_sock(sock)) { fdput(sock); return (uint64_t)-ENOTSOCK; }
+    if (!rights_check(sock->rights, RIGHT_SEND_FD)) {
+        fdput(sock); return (uint64_t)-EPERM;
+    }
 
-    // Validate sock_fd — must be a connected unix socket.
-    if (sock_fd >= files->fd_capacity || !files->fd_table[sock_fd])
-        return (uint64_t)-EBADF;
-    vfs_file_t* sock = files->fd_table[sock_fd];
-    if (!is_unix_sock(sock)) return (uint64_t)-ENOTSOCK;
-    if (!rights_check(sock->rights, RIGHT_SEND_FD))
-        return (uint64_t)-EPERM;
-
-    // Validate target_fd.
-    if (target_fd_num >= files->fd_capacity || !files->fd_table[target_fd_num])
-        return (uint64_t)-EBADF;
-    vfs_file_t* target_f = files->fd_table[target_fd_num];
-
-    // new_rights must be a subset of target_fd's current rights.
-    if (((uint32_t)new_rights & ~target_f->rights) != 0)
-        return (uint64_t)-EPERM;
+    vfs_file_t* target_f = fdget(target_fd_num);
+    if (!target_f) { fdput(sock); return (uint64_t)-EBADF; }
+    if (((uint32_t)new_rights & ~target_f->rights) != 0) {
+        fdput(target_f); fdput(sock); return (uint64_t)-EPERM;
+    }
 
     int r = unix_sock_sendfd(sock, target_f, (uint32_t)new_rights);
+    fdput(target_f);
+    fdput(sock);
     serial_puts_dbg("[sendfd] r="); serial_hex_dbg((uint64_t)(int64_t)r);
     return (r < 0) ? (uint64_t)(int64_t)r : 0;
 }
@@ -2800,15 +2870,12 @@ static uint64_t sys_sendfd(uint64_t sock_fd, uint64_t target_fd_num,
 // Dequeues a file descriptor sent via sendfd() over a Unix socket.
 static uint64_t sys_recvfd(uint64_t sock_fd) {
     serial_puts_dbg("[recvfd] sock="); serial_hex_dbg(sock_fd);
-    if (!g_current) return (uint64_t)-EBADF;
-    task_files_t* files = g_current->files_shared;
-
-    if (sock_fd >= files->fd_capacity || !files->fd_table[sock_fd])
-        return (uint64_t)-EBADF;
-    vfs_file_t* sock = files->fd_table[sock_fd];
-    if (!is_unix_sock(sock)) return (uint64_t)-ENOTSOCK;
+    vfs_file_t* sock = fdget(sock_fd);
+    if (!sock) return (uint64_t)-EBADF;
+    if (!is_unix_sock(sock)) { fdput(sock); return (uint64_t)-ENOTSOCK; }
 
     vfs_file_t* received = unix_sock_recvfd(sock);
+    fdput(sock);
     if (!received) { serial_puts_dbg("[recvfd] NULL\n"); return (uint64_t)-EAGAIN; }
 
     int64_t fd = fd_install(received);
@@ -2826,15 +2893,14 @@ static uint64_t sys_register_policy_agent(uint64_t read_fd, uint64_t write_fd) {
     if (g_current->cred.euid != 0) return (uint64_t)-EPERM;
 
     // Only allowed if no agent is registered yet (enforced inside ksec_register_agent).
-    task_files_t* files = g_current->files_shared;
-    if (read_fd  >= files->fd_capacity || !files->fd_table[read_fd])
-        return (uint64_t)-EBADF;
-    if (write_fd >= files->fd_capacity || !files->fd_table[write_fd])
-        return (uint64_t)-EBADF;
+    vfs_file_t* rp = fdget(read_fd);
+    if (!rp) return (uint64_t)-EBADF;
+    vfs_file_t* wp = fdget(write_fd);
+    if (!wp) { fdput(rp); return (uint64_t)-EBADF; }
 
-    vfs_file_t* rp = vfs_dup(files->fd_table[read_fd]);
-    vfs_file_t* wp = vfs_dup(files->fd_table[write_fd]);
-
+    // ksec_register_agent takes ownership — it keeps rp/wp alive by
+    // storing them; it will vfs_close them on unregister.  Our fdget
+    // references are donated to ksec.
     int r = ksec_register_agent(rp, wp);
     if (r != 0) {
         vfs_close(rp);
@@ -2928,17 +2994,21 @@ static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
 static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     if (!g_current) return (uint64_t)-EBADF;
 
-    // Validate fd
-    if (fd < g_current->files_shared->fd_capacity &&
-        !g_current->files_shared->fd_table[fd] && fd > 2)
+    // Try the fd's own ioctl first.  fdget returns NULL for empty slots,
+    // which is benign for the tty-fallback path below — except the old
+    // code explicitly rejected closed fds > 2 here, so we mirror that
+    // behaviour when the slot is empty.
+    vfs_file_t* f = fdget(fd);
+    if (f) {
+        if (f->ioctl) {
+            uint64_t r = (uint64_t)f->ioctl(f, request, arg);
+            fdput(f);
+            return r;
+        }
+        fdput(f);
+    } else if (fd > 2) {
         return (uint64_t)-EBADF;
-
-    // If the file has its own ioctl handler (e.g. PTY slave), use it.
-    vfs_file_t* f = NULL;
-    if (fd < g_current->files_shared->fd_capacity)
-        f = g_current->files_shared->fd_table[fd];
-    if (f && f->ioctl)
-        return (uint64_t)f->ioctl(f, request, arg);
+    }
 
     // Fallback: resolve to controlling tty (tty0 for console processes).
     tty_t* tty = &g_tty0;
@@ -3057,7 +3127,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
         count = 0;
         task_files_t* files = g_current->files_shared;
         for (uint32_t fd = 0; fd < nfds; fd++) {
-            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
             if (FD_ISSET(fd, &rset) && fd_is_readable(f)) {
                 rout.bits[fd/64] |= (1ULL << (fd%64)); count++;
             }
@@ -3080,7 +3150,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             for (uint32_t fd = 0; fd < nfds; fd++) {
                 if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
                     !FD_ISSET(fd, &eset)) continue;
-                vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
                 if (sel_used < sel_nslots) {
                     task_we_init(&sel_wes[sel_used], g_current);
@@ -3097,7 +3167,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
         // Re-check after registering — close race between first check and add.
         int sel_recheck = 0;
         for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
-            vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
             if (!f) continue;
             if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
                 (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
@@ -3113,7 +3183,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             for (uint32_t fd = 0; fd < nfds && si < sel_used; fd++) {
                 if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
                     !FD_ISSET(fd, &eset)) continue;
-                vfs_file_t* f = (fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
                 if (si < sel_used) { task_we_remove(f->waitq, &sel_wes[si]); si++; }
                 if (f->secondary_waitq && si < sel_used) {
@@ -3153,7 +3223,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             ufds[i].revents = 0;
             int fd = ufds[i].fd;
             if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
             if (!f) { ufds[i].revents = POLLNVAL; count++; continue; }
 
             uint16_t rev = 0;
@@ -3175,8 +3245,8 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             for (uint64_t i = 0; i < nfds; i++) {
                 int fd = ufds[i].fd;
                 if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->fd_capacity)
-                                ? files->fd_table[fd] : NULL;
+                vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
+                                ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
                 if (p_used < p_nslots) {
                     task_we_init(&p_wes[p_used], g_current);
@@ -3195,7 +3265,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         for (uint64_t i = 0; i < nfds; i++) {
             int fd = ufds[i].fd;
             if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->fd_capacity) ? files->fd_table[fd] : NULL;
+            vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
             if (!f) continue;
             if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
                 ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
@@ -3212,8 +3282,8 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             for (uint64_t i = 0; i < nfds && pi < p_used; i++) {
                 int fd = ufds[i].fd;
                 if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->fd_capacity)
-                                ? files->fd_table[fd] : NULL;
+                vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
+                                ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
                 if (pi < p_used) { task_we_remove(f->waitq, &p_wes[pi]); pi++; }
                 if (f->secondary_waitq && pi < p_used) {
@@ -3367,8 +3437,8 @@ static void epoll_close(vfs_file_t* self) {
         for (uint32_t i = 0; i < state->cap; i++) {
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
-            vfs_file_t* f = (files && (uint32_t)w->fd < files->fd_capacity)
-                            ? files->fd_table[w->fd] : NULL;
+            vfs_file_t* f = (files && (uint32_t)w->fd < files->ft->cap)
+                            ? files->ft->fd_table[w->fd] : NULL;
             epoll_watch_unregister(w, f);
             kfree(w);
         }
@@ -3443,8 +3513,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     switch (op) {
     case EPOLL_CTL_ADD: {
         if (ep_find(state, tfd) < state->cap) { ret = (uint64_t)-EEXIST; break; }
-        vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
-                         ? files->fd_table[tfd] : NULL;
+        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
+                         ? files->ft->fd_table[tfd] : NULL;
         if (!wf) { ret = (uint64_t)-EBADF; break; }
         // Grow if at 75% load.
         if (state->count * 4u >= state->cap * 3u) {
@@ -3468,8 +3538,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
-                         ? files->fd_table[tfd] : NULL;
+        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
+                         ? files->ft->fd_table[tfd] : NULL;
         epoll_watch_unregister(w, wf);
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
@@ -3483,8 +3553,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->fd_capacity)
-                         ? files->fd_table[tfd] : NULL;
+        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
+                         ? files->ft->fd_table[tfd] : NULL;
         epoll_watch_unregister(w, wf);
         w->events = ev.events;
         w->data   = ev.data;
@@ -3539,8 +3609,8 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             if (!w || w == EPOLL_DELETED) continue;
             int32_t wfd = w->fd;
 
-            vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
-                            ? files->fd_table[wfd] : NULL;
+            vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
+                            ? files->ft->fd_table[wfd] : NULL;
             if (!f) {
                 kevents[count].events = EPOLLERR | EPOLLHUP;
                 kevents[count].data   = w->data;
@@ -3585,8 +3655,8 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
                 epoll_watch_t* w = state->slots[i];
                 if (!w || w == EPOLL_DELETED) continue;
                 int32_t wfd = w->fd;
-                vfs_file_t* f = ((uint32_t)wfd < files->fd_capacity)
-                                ? files->fd_table[wfd] : NULL;
+                vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
+                                ? files->ft->fd_table[wfd] : NULL;
                 if (!f || !f->poll) continue;
                 uint32_t mask = w->events;
                 if ((mask & EPOLLIN)  && f->poll(f, POLLIN))  ep_recheck = 1;
@@ -3746,26 +3816,25 @@ static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
 
 // ftruncate(fd, length) → 0 or -errno
 static uint64_t sys_ftruncate(uint64_t fd, uint64_t length) {
-    if (!g_current) return (uint64_t)-EBADF;
-    task_files_t* files = g_current->files_shared;
-    if (fd >= files->fd_capacity || !files->fd_table[fd])
-        return (uint64_t)-EBADF;
-    vfs_file_t* f = files->fd_table[fd];
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
 
     // shmem fd: resize the shmem object.
     extern void shmem_fd_close(vfs_file_t*);
     if (f->close == shmem_fd_close) {
         shmem_t* shm = (shmem_t*)f->ctx;
-        if (!shm) return (uint64_t)-EINVAL;
+        if (!shm) { fdput(f); return (uint64_t)-EINVAL; }
         uint32_t npages = (uint32_t)((length + PAGE_SIZE - 1) / PAGE_SIZE);
         int rc = shmem_resize(shm, npages);
+        fdput(f);
         return (rc < 0) ? (uint64_t)rc : 0;
     }
 
     // Regular file.
-    if (!f->path[0]) return (uint64_t)-EINVAL; // pipes/devices can't be truncated
-    if (!ext2_truncate_to(f->path, length)) return (uint64_t)-EIO;
-    return 0;
+    if (!f->path[0]) { fdput(f); return (uint64_t)-EINVAL; }
+    int ok = ext2_truncate_to(f->path, length);
+    fdput(f);
+    return ok ? 0 : (uint64_t)-EIO;
 }
 
 // ── sys_times ─────────────────────────────────────────────────────────────

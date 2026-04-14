@@ -8,6 +8,7 @@
 #include "cred.h"
 #include "pledge.h"
 #include "unveil.h"
+#include "smp.h"
 
 // ── Task flags ────────────────────────────────────────────────────────────
 #define TASK_FLAG_KTHREAD   (1U << 0)  // kernel thread: runs at CPL=0
@@ -59,14 +60,21 @@ typedef struct {
 // FD_CLOEXEC: close this fd on execve.
 #define FD_CLOEXEC  1u
 
-// ── Shared file descriptor table (ref-counted) ────────────────────────────
-// fd_table[i]  — open file description (NULL = closed)
-// fd_flags[i]  — per-descriptor flags (FD_CLOEXEC etc.)
-// Both arrays are fd_capacity entries long and always grown together.
+// ── Shared file descriptor table (ref-counted, RCU-read) ─────────────────
+// The fd_table / fd_flags / cap triple lives in a separately-allocated
+// fdtable_t so it can be published atomically via rcu_assign_pointer.
+// Readers (fdget) dereference the pointer inside rcu_read_lock; writers
+// (fd_install/close/dup/grow) serialise on task_files_t.lock and defer
+// the old fdtable_t free via call_rcu.
+typedef struct fdtable {
+    vfs_file_t** fd_table;   // fd_table[i] = NULL → closed
+    uint32_t*    fd_flags;   // parallel: FD_CLOEXEC etc.
+    uint32_t     cap;
+} fdtable_t;
+
 typedef struct {
-    vfs_file_t** fd_table;
-    uint32_t*    fd_flags;    // parallel array: FD_CLOEXEC per descriptor
-    uint32_t     fd_capacity;
+    fdtable_t*   ft;           // RCU-published; load via __atomic_load_n
+    spinlock_t   lock;         // writer mutex for fd_install / close / dup / grow
     uint32_t     refs;
 } task_files_t;
 
