@@ -25,27 +25,85 @@ typedef struct __attribute__((packed)) {
 #define ARP_OP_REPLY   2u
 
 // ── ARP cache ─────────────────────────────────────────────────────────────
+// Open-addressing hash table keyed by ip_be.  Grows at 75% load; no fixed
+// cap.  ip_be == 0 means empty slot (0.0.0.0 is never a real host address).
+
+#define ARP_HT_INIT_CAP 32u
 
 typedef struct {
     uint32_t ip_be;       // 0 = empty slot
     uint8_t  mac[ETH_ALEN];
 } arp_entry_t;
 
-static arp_entry_t s_cache[ARP_CACHE_SIZE];
-static uint8_t     s_cache_next = 0;   // round-robin eviction
+static arp_entry_t* s_cache     = NULL;
+static uint32_t     s_cache_cap = 0;
+static uint32_t     s_cache_cnt = 0;
 
-static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
-    // Update existing entry if present.
-    for (uint8_t i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (s_cache[i].ip_be == ip_be) {
-            for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[i].mac[j] = mac[j];
+static uint32_t arp_hash(uint32_t ip_be, uint32_t cap) {
+    return (ip_be * 2654435761u) & (cap - 1u);
+}
+
+static void arp_cache_ensure_init(void) {
+    if (s_cache) return;
+    s_cache = (arp_entry_t*)kmalloc((uint64_t)ARP_HT_INIT_CAP * sizeof(arp_entry_t));
+    if (!s_cache) return;
+    for (uint32_t i = 0; i < ARP_HT_INIT_CAP; i++) s_cache[i].ip_be = 0;
+    s_cache_cap = ARP_HT_INIT_CAP;
+}
+
+// Find slot for ip_be, or cap if not present.
+static uint32_t arp_cache_find(uint32_t ip_be) {
+    if (!s_cache) return s_cache_cap;
+    uint32_t i = arp_hash(ip_be, s_cache_cap);
+    for (uint32_t n = 0; n < s_cache_cap; n++) {
+        if (!s_cache[i].ip_be) return s_cache_cap;
+        if (s_cache[i].ip_be == ip_be) return i;
+        i = (i + 1u) & (s_cache_cap - 1u);
+    }
+    return s_cache_cap;
+}
+
+static void arp_cache_raw_insert(arp_entry_t* slots, uint32_t cap,
+                                  uint32_t ip_be, const uint8_t* mac) {
+    uint32_t i = arp_hash(ip_be, cap);
+    for (;;) {
+        if (!slots[i].ip_be) {
+            slots[i].ip_be = ip_be;
+            for (uint32_t j = 0; j < ETH_ALEN; j++) slots[i].mac[j] = mac[j];
             return;
         }
+        i = (i + 1u) & (cap - 1u);
     }
-    // Insert into next eviction slot.
-    s_cache[s_cache_next].ip_be = ip_be;
-    for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[s_cache_next].mac[j] = mac[j];
-    s_cache_next = (uint8_t)((s_cache_next + 1u) % ARP_CACHE_SIZE);
+}
+
+static int arp_cache_grow(void) {
+    uint32_t new_cap = s_cache_cap * 2u;
+    arp_entry_t* ns = (arp_entry_t*)kmalloc((uint64_t)new_cap * sizeof(arp_entry_t));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < new_cap; i++) ns[i].ip_be = 0;
+    for (uint32_t i = 0; i < s_cache_cap; i++)
+        if (s_cache[i].ip_be)
+            arp_cache_raw_insert(ns, new_cap, s_cache[i].ip_be, s_cache[i].mac);
+    kfree(s_cache);
+    s_cache     = ns;
+    s_cache_cap = new_cap;
+    return 0;
+}
+
+static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
+    if (!ip_be) return;
+    arp_cache_ensure_init();
+    if (!s_cache) return;
+    uint32_t idx = arp_cache_find(ip_be);
+    if (idx < s_cache_cap) {
+        // Update existing entry.
+        for (uint32_t j = 0; j < ETH_ALEN; j++) s_cache[idx].mac[j] = mac[j];
+        return;
+    }
+    if (s_cache_cnt * 4u >= s_cache_cap * 3u)
+        if (arp_cache_grow() < 0) return;
+    arp_cache_raw_insert(s_cache, s_cache_cap, ip_be, mac);
+    s_cache_cnt++;
 }
 
 // ── ARP send helpers ──────────────────────────────────────────────────────
@@ -103,10 +161,8 @@ void arp_recv(skbuff_t* skb) {
 }
 
 const uint8_t* arp_lookup(uint32_t ip_be) {
-    for (uint8_t i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (s_cache[i].ip_be == ip_be)
-            return s_cache[i].mac;
-    }
+    uint32_t idx = arp_cache_find(ip_be);
+    if (idx < s_cache_cap) return s_cache[idx].mac;
     // Miss: send a broadcast request.  Caller must retry.
     uint8_t zero[ETH_ALEN] = {0};
     arp_send(ARP_OP_REQUEST, zero, ip_be, eth_broadcast);

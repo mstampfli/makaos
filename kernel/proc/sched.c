@@ -5,6 +5,7 @@
 #include "tsc.h"
 #include "tss.h"
 #include "common.h"
+#include "kheap.h"
 
 
 // ── MLFQ parameters ───────────────────────────────────────────────────────
@@ -23,25 +24,93 @@ task_t* g_current   = NULL;
 task_t* g_init_task = NULL;  // first user process; orphans reparent here
 
 // ── PID -> task hash table ────────────────────────────────────────────────
-// Direct-indexed by pid. PID_MAX+1 = 65536 slots × 8 bytes = 512 KiB BSS.
-// Insert on task creation, remove on zombie reap / task free.
-// Provides O(1) lookup for kill/wait/ptrace instead of sched_for_each O(n).
-#define PID_HT_SIZE  65536u
-static task_t* s_pid_ht[PID_HT_SIZE];
+// Open-addressing hash table keyed by pid.  O(1) avg lookup/insert/delete
+// for kill/wait/ptrace.  Grows at 75% load; no fixed PID cap.
+//
+// Small initial capacity (64) keeps BSS near zero; doubles as tasks are
+// created.  A tombstone sentinel (PID_HT_TOMB) preserves probe chains
+// across deletes.
+
+#define PID_HT_INIT_CAP   64u
+#define PID_HT_TOMB       ((task_t*)1uL)
+
+static task_t** s_pid_slots = NULL;
+static uint32_t s_pid_cap   = 0;
+static uint32_t s_pid_count = 0;
+
+static uint32_t pid_hash(uint32_t pid, uint32_t cap) {
+    return (pid * 2654435761u) & (cap - 1u);
+}
+
+static void pid_ht_ensure_init(void) {
+    if (s_pid_slots) return;
+    s_pid_slots = (task_t**)kmalloc((uint64_t)PID_HT_INIT_CAP * sizeof(task_t*));
+    if (!s_pid_slots) return;
+    for (uint32_t i = 0; i < PID_HT_INIT_CAP; i++) s_pid_slots[i] = NULL;
+    s_pid_cap = PID_HT_INIT_CAP;
+}
+
+// Insert t into the given slot array (caller ensures cap > count and
+// t->pid is not already present).
+static void pid_ht_raw_insert(task_t** slots, uint32_t cap, task_t* t) {
+    uint32_t i = pid_hash(t->pid, cap);
+    for (;;) {
+        task_t* s = slots[i];
+        if (!s || s == PID_HT_TOMB) { slots[i] = t; return; }
+        i = (i + 1u) & (cap - 1u);
+    }
+}
+
+static int pid_ht_grow(void) {
+    uint32_t new_cap = s_pid_cap * 2u;
+    task_t** ns = (task_t**)kmalloc((uint64_t)new_cap * sizeof(task_t*));
+    if (!ns) return -1;
+    for (uint32_t i = 0; i < new_cap; i++) ns[i] = NULL;
+    for (uint32_t i = 0; i < s_pid_cap; i++) {
+        task_t* s = s_pid_slots[i];
+        if (s && s != PID_HT_TOMB) pid_ht_raw_insert(ns, new_cap, s);
+    }
+    kfree(s_pid_slots);
+    s_pid_slots = ns;
+    s_pid_cap   = new_cap;
+    return 0;
+}
 
 void pid_ht_insert(task_t* t) {
-    if (!t || t->pid >= PID_HT_SIZE) return;
-    s_pid_ht[t->pid] = t;
+    if (!t) return;
+    pid_ht_ensure_init();
+    if (!s_pid_slots) return;
+    if (s_pid_count * 4u >= s_pid_cap * 3u)
+        if (pid_ht_grow() < 0) return;
+    pid_ht_raw_insert(s_pid_slots, s_pid_cap, t);
+    s_pid_count++;
 }
 
 void pid_ht_remove(task_t* t) {
-    if (!t || t->pid >= PID_HT_SIZE) return;
-    if (s_pid_ht[t->pid] == t) s_pid_ht[t->pid] = NULL;
+    if (!t || !s_pid_slots) return;
+    uint32_t i = pid_hash(t->pid, s_pid_cap);
+    for (uint32_t n = 0; n < s_pid_cap; n++) {
+        task_t* s = s_pid_slots[i];
+        if (!s) return;                       // empty — not found
+        if (s == t) {
+            s_pid_slots[i] = PID_HT_TOMB;
+            s_pid_count--;
+            return;
+        }
+        i = (i + 1u) & (s_pid_cap - 1u);
+    }
 }
 
 task_t* pid_ht_find(uint32_t pid) {
-    if (pid >= PID_HT_SIZE) return NULL;
-    return s_pid_ht[pid];
+    if (!s_pid_slots) return NULL;
+    uint32_t i = pid_hash(pid, s_pid_cap);
+    for (uint32_t n = 0; n < s_pid_cap; n++) {
+        task_t* s = s_pid_slots[i];
+        if (!s) return NULL;                  // empty — not found
+        if (s != PID_HT_TOMB && s->pid == pid) return s;
+        i = (i + 1u) & (s_pid_cap - 1u);
+    }
+    return NULL;
 }
 
 // Per-level FIFO queues.
