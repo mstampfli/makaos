@@ -47,14 +47,11 @@ typedef struct tty_t {
     uint8_t  line_buf[TTY_LINE_BUF_SIZE];
     uint32_t line_len;
 
-    // ── Sleeping reader ───────────────────────────────────────────────────
-    // Single-waiter model: one task blocked in read() at a time.
-    // Good enough for a single-CPU OS; replace with wait_queue for SMP.
-    struct task_t* reader;
-
-    // ── Poll/epoll waiters ────────────────────────────────────────────────
-    // Tasks sleeping in poll()/epoll_wait() on this tty.  All are woken
-    // whenever data is pushed into the read buffer.
+    // ── Wait queue ───────────────────────────────────────────────────────
+    // Blocking readers register task_we_t nodes here.  poll/epoll
+    // waiters register epoll_we_t nodes here.  Every data-arrival
+    // event calls wait_queue_wake_all which fires both kinds.
+    // SMP-safe: wake_all is lock-free via atomic xchg.
     wait_queue_t   waitq;
 
     // ── Output ops (tty→screen) ───────────────────────────────────────────

@@ -25,9 +25,9 @@ typedef struct pty {
     uint8_t      master_buf[PTY_MASTER_BUF];   // ring: slave output → master read
     uint32_t     m_head;                        // master ring head (write position)
     uint32_t     m_tail;                        // master ring tail (read position)
-    struct task_t* m_reader;                    // task sleeping in master read()
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
-    wait_queue_t   master_waitq;                // poll/epoll waiters on the master fd
+    wait_queue_t   master_waitq;                // wait queue for master-side
+                                                // blocking reads + poll/epoll
     int          master_open;                   // master fd still open?
     int          slave_open_count;              // refcount of open slave fds
     int          index;                         // pty number (for /dev/pts/N)
