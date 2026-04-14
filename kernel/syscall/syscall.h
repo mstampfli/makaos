@@ -140,7 +140,39 @@ typedef struct {
     epoll_data_t data;
 } epoll_event_t;
 
-// ── Network interface configuration (for dhcpcd) ─────────────────────────
+// ── spawn_attr_t — optional attributes for sys_spawn ─────────────────────
+//
+// Passed as the 5th argument to spawn(). NULL means "no extra attributes"
+// (backwards-compatible with old callers). Each field is gated by a flag bit
+// in `flags` so callers only need to fill what they use.
+//
+// Pledge and unveil set here become the child's initial restrictions before
+// its first instruction runs. The child may tighten further but never expand.
+// These also survive any subsequent exec() calls the child makes.
+
+#define SPAWN_ATTR_CRED    (1u << 0)  // apply uid / gid
+#define SPAWN_ATTR_UMASK   (1u << 1)  // apply umask
+#define SPAWN_ATTR_PLEDGE  (1u << 2)  // apply pledge_mask
+#define SPAWN_ATTR_UNVEIL  (1u << 3)  // apply unveil table (locked after apply)
+
+typedef struct {
+    char    path[256];
+    uint8_t perms;    // UNVEIL_READ | UNVEIL_WRITE | UNVEIL_EXEC | UNVEIL_CREATE
+} spawn_unveil_entry_t;
+
+// spawn_attr_t — ~32 bytes; unveil entries are a separate user pointer so the
+// struct is always kstack-safe regardless of how many unveil entries are passed.
+typedef struct {
+    uint32_t                    flags;        // SPAWN_ATTR_* bitmask
+    uint32_t                    uid;          // SPAWN_ATTR_CRED
+    uint32_t                    gid;          // SPAWN_ATTR_CRED
+    uint32_t                    umask;        // SPAWN_ATTR_UMASK
+    uint32_t                    pledge_mask;  // SPAWN_ATTR_PLEDGE
+    uint32_t                    nunveil;      // SPAWN_ATTR_UNVEIL: entry count
+    const spawn_unveil_entry_t* unveil;       // SPAWN_ATTR_UNVEIL: user pointer
+} spawn_attr_t;
+
+// ── Network interface configuration ──────────────────────────────────────
 #define IFCFG_MAX_DNS  3
 typedef struct {
     uint32_t ip_be;           // host IP (network byte order)

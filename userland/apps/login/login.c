@@ -264,7 +264,7 @@ int main(void) {
         // elf_exec_from_ext2.  The child shell runs as uid=pw->uid.
         const char* sh_argv[] = { pw->shell, (char*)0 };
         int inherit_stdio[3] = { -1, -1, -1 };
-        int pid = spawn(pw->shell, sh_argv, (void*)0, inherit_stdio);
+        int pid = spawn(pw->shell, sh_argv, (void*)0, inherit_stdio, NULL);
         if (pid < 0) {
             write(1, "login: failed to exec shell\n", 28);
             return 1;

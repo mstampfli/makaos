@@ -192,6 +192,15 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     tty_t* tty = ctx->tty;
     if (!len) return 0;
 
+    // POSIX: background process reading from its controlling tty → SIGTTIN.
+    // Only applies when this tty is the process's controlling terminal.
+    if (g_current && tty->fg_pgid &&
+        g_current->sid == tty->session &&
+        g_current->pgid != tty->fg_pgid) {
+        signal_send(g_current, SIGTTIN);
+        return -4; // -EINTR
+    }
+
     uint8_t* out = (uint8_t*)buf;
     uint64_t got = 0;
 
@@ -209,8 +218,12 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         sched_sleep();
         tty->reader = g_current;  // re-arm for the next iteration
         // Woken by tty_input_char or signal delivery.
-        // If a signal was delivered, EINTR.
-        if (g_current->sigstate.head != g_current->sigstate.tail) {
+        // Only return EINTR if a signal will actually be delivered to userspace.
+        // Signals with SIG_DFL-ignore disposition (SIGCHLD, SIGWINCH) must not
+        // interrupt a blocking read — they will be silently discarded on the next
+        // syscall return path, and returning EINTR here causes an infinite loop
+        // since the signal stays queued until signal_deliver_pending() runs.
+        if (signal_has_actionable(&g_current->sigstate)) {
             tty->reader = NULL;
             return -4; // -EINTR
         }
@@ -234,6 +247,16 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
     const uint8_t* src = (const uint8_t*)buf;
+
+    // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
+    if (g_current && tty->fg_pgid &&
+        g_current->sid == tty->session &&
+        g_current->pgid != tty->fg_pgid &&
+        (tty->termios.c_lflag & TOSTOP)) {
+        signal_send(g_current, SIGTTOU);
+        return -4; // -EINTR
+    }
+
     if (!tty->write_char) return (int64_t)len;  // no output backend (e.g. compositor owns fb)
     for (uint64_t i = 0; i < len; i++) {
         uint8_t c = src[i];

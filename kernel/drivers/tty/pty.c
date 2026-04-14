@@ -75,7 +75,7 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (!pty->slave_open_count) return 0;  // EOF: slave closed
         pty->m_reader = g_current;
         sched_sleep();
-        if (g_current->sigstate.head != g_current->sigstate.tail)
+        if (signal_has_actionable(&g_current->sigstate))
             return -4; // EINTR
     }
 
@@ -146,6 +146,14 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     // If master is closed, return EIO (like Linux)
     if (!ctx->pty->master_open) return -5; // -EIO
 
+    // POSIX: background process reading from its controlling tty → SIGTTIN.
+    if (g_current && tty->fg_pgid &&
+        g_current->sid == tty->session &&
+        g_current->pgid != tty->fg_pgid) {
+        signal_send(g_current, SIGTTIN);
+        return -4; // -EINTR
+    }
+
     uint8_t* out = (uint8_t*)buf;
     uint64_t got = 0;
 
@@ -157,7 +165,7 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (!ctx->pty->master_open) return 0; // EOF
         tty->reader = g_current;
         sched_sleep();
-        if (g_current->sigstate.head != g_current->sigstate.tail)
+        if (signal_has_actionable(&g_current->sigstate))
             return -4; // EINTR
     }
 
@@ -178,6 +186,15 @@ static int64_t pty_slave_write(vfs_file_t* self, const void* buf, uint64_t len) 
     tty_t* tty = &ctx->pty->slave;
 
     if (!ctx->pty->master_open) return -5; // EIO
+
+    // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
+    if (g_current && tty->fg_pgid &&
+        g_current->sid == tty->session &&
+        g_current->pgid != tty->fg_pgid &&
+        (tty->termios.c_lflag & TOSTOP)) {
+        signal_send(g_current, SIGTTOU);
+        return -4; // -EINTR
+    }
 
     if (!tty->write_char) return (int64_t)len; // discard
 

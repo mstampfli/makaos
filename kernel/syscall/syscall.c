@@ -54,6 +54,9 @@ uint64_t g_syscall_user_r15    = 0;
 uint64_t g_syscall_arg5 = 0;   // r8  (mmap fd)
 uint64_t g_syscall_arg6 = 0;   // r9  (mmap offset)
 
+// Forward declaration — defined near copy_from/to_user below.
+static inline int _access_ok(uint64_t addr, uint64_t len);
+
 // Exec redirect globals (read by syscall_entry.asm after exec syscall).
 uint8_t     g_exec_requested = 0;
 uint64_t    g_exec_entry     = 0;
@@ -522,10 +525,13 @@ static uint64_t sys_exit(uint64_t code) {
         g_current->state = TASK_ZOMBIE;
         sched_add_zombie(g_current);
 
-        // Wake parent if it's sleeping in sys_wait.
+        // Wake parent and deliver SIGCHLD so it can reap background jobs.
         task_t* parent = sched_find_pid(g_current->ppid);
-        if (parent && parent->state == TASK_SLEEPING)
-            sched_wake(parent);
+        if (parent) {
+            signal_send(parent, SIGCHLD);
+            if (parent->state == TASK_SLEEPING)
+                sched_wake(parent);
+        }
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
@@ -791,7 +797,7 @@ enoexec:
 }
 
 // ── sys_spawn ─────────────────────────────────────────────────────────────
-// spawn(path_ptr, argv_ptr, envp_ptr, stdio_ptr) → child pid, or -errno.
+// spawn(path_ptr, argv_ptr, envp_ptr, stdio_ptr, attr_ptr) → child pid, -errno.
 //
 // Loads an ELF from the given absolute ext2 path into a brand-new address
 // space and schedules it.  Parent returns immediately with the child's pid.
@@ -800,11 +806,14 @@ enoexec:
 // argv_ptr  — user pointer to NULL-terminated array of user char* (or 0 → {path, NULL})
 // envp_ptr  — user pointer to NULL-terminated array of user char* (or 0 → default env)
 // stdio_ptr — user pointer to int[3]: stdio fd specs for child's 0/1/2
-//               -1 = inherit that fd from parent
+//               -1  = inherit that fd from parent
+//               -2  = /dev/null
 //               >=0 = dup that specific parent fd
 //               0 (null ptr) = open /dev/tty0 for all three
+// attr_ptr  — user pointer to spawn_attr_t, or 0 for no extra attributes
 static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
-                           uint64_t envp_ptr, uint64_t stdio_ptr) {
+                           uint64_t envp_ptr, uint64_t stdio_ptr,
+                           uint64_t attr_ptr) {
     serial_puts_dbg("[spawn] path="); serial_puts_dbg((const char*)path_ptr); serial_putc_dbg('\n');
     if (!g_current) return (uint64_t)-EINVAL;
     if (!path_ptr)  return (uint64_t)-EINVAL;
@@ -888,6 +897,49 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // Wire parent-child relationship so waitpid works correctly.
     child->ppid = g_current->pid;
 
+    // ── Apply spawn_attr if provided ──────────────────────────────────────
+    // spawn_attr_t is now ~32 bytes (unveil is a separate pointer), so it's
+    // safe to copy directly onto the kernel stack.
+    if (attr_ptr) {
+        if (!_access_ok(attr_ptr, sizeof(spawn_attr_t))) goto bad_attr;
+        spawn_attr_t a;
+        __builtin_memcpy(&a, (const void*)attr_ptr, sizeof(spawn_attr_t));
+
+        if (a.flags & SPAWN_ATTR_CRED) {
+            child->cred.ruid = a.uid;
+            child->cred.euid = a.uid;
+            child->cred.suid = a.uid;
+            child->cred.rgid = a.gid;
+            child->cred.egid = a.gid;
+            child->cred.sgid = a.gid;
+        }
+        if (a.flags & SPAWN_ATTR_UMASK) {
+            child->umask = a.umask & 0777u;
+        }
+        if (a.flags & SPAWN_ATTR_PLEDGE) {
+            child->pledge_mask = pledge_restrict(g_current->pledge_mask,
+                                                 a.pledge_mask);
+        }
+        if ((a.flags & SPAWN_ATTR_UNVEIL) && a.nunveil && a.unveil) {
+            uint32_t n = a.nunveil;
+            uint64_t uptr = (uint64_t)(uintptr_t)a.unveil;
+            if (!_access_ok(uptr, (uint64_t)n * sizeof(spawn_unveil_entry_t)))
+                goto bad_attr;
+            // Copy unveil entries one page-safe chunk at a time — each entry
+            // is 257 bytes; kmalloc the whole array then walk it.
+            spawn_unveil_entry_t* ue = kmalloc((uint64_t)n * sizeof(spawn_unveil_entry_t));
+            if (!ue) goto bad_attr;
+            __builtin_memcpy(ue, a.unveil, (uint64_t)n * sizeof(spawn_unveil_entry_t));
+            unveil_free(&child->unveil);
+            unveil_init(&child->unveil);
+            for (uint32_t i = 0; i < n; i++)
+                unveil_add(&child->unveil, ue[i].path, ue[i].perms);
+            unveil_lock(&child->unveil);
+            kfree(ue);
+        }
+    }
+    bad_attr:;
+
     // Job control: if the child inherits the parent's tty (stdio[0]==-1),
     // give the terminal to the child's process group immediately.
     // This is what a proper shell does after fork+exec: tcsetpgrp(tty, child_pgid).
@@ -962,17 +1014,33 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         t->files_shared = files;
     }
 
-    t->tgid            = g_current->tgid;
-    t->ppid            = g_current->ppid;
-    t->flags           = TASK_FLAG_THREAD;
-    t->state           = TASK_READY;
-    t->next            = NULL;
-    t->mlfq_level      = 0;
-    t->mlfq_ticks_left = 0;
-    t->preempt_depth   = 0;
-    t->sigstate.head   = 0;
-    t->sigstate.tail   = 0;
+    t->tgid             = g_current->tgid;
+    t->ppid             = g_current->ppid;
+    t->pgid             = g_current->pgid;
+    t->sid              = g_current->sid;
+    t->flags            = TASK_FLAG_THREAD;
+    t->state            = TASK_READY;
+    t->next             = NULL;
+    t->children         = NULL;
+    t->child_next       = NULL;
+    t->mlfq_level       = 0;
+    t->mlfq_ticks_left  = 0;
+    t->preempt_depth    = 0;
+    t->sigstate.head    = 0;
+    t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
+    t->exit_code        = 0;
+    t->sleep_until_ns   = 0;
+    t->umask            = g_current->umask;
+
+    // Inherit comm, credentials, pledge, unveil, and FPU state from parent.
+    t->cwd = kmalloc(KPATH_MAX);
+    if (t->cwd) __builtin_memcpy(t->cwd, g_current->cwd, KPATH_MAX);
+    __builtin_memcpy(t->comm, g_current->comm, sizeof(t->comm));
+    t->cred         = g_current->cred;
+    t->pledge_mask  = g_current->pledge_mask;
+    unveil_copy(&t->unveil, &g_current->unveil);
+    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 
     // Build initial kernel stack frame.
     // context_switch → user_trampoline → iretq to ring 3.
@@ -1399,7 +1467,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
         if (fsn.type != FS_TYPE_DIR) return (uint64_t)-ENOTDIR;
         if (fsn.is_virtual) {
             uint32_t len = 0;
-            while (len < 255 && path[len]) { g_current->cwd[len] = path[len]; len++; }
+            while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
             g_current->cwd[len] = '\0';
             return 0;
         }
@@ -1407,7 +1475,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
 
     // ext2: fs_lookup already verified existence, type, and permissions.
     uint32_t len = 0;
-    while (len < 255 && path[len]) { g_current->cwd[len] = path[len]; len++; }
+    while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
     g_current->cwd[len] = '\0';
     return 0;
 }
@@ -2340,10 +2408,18 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
     return (uint64_t)(int64_t)r;
 }
 
+static inline int _access_ok(uint64_t addr, uint64_t len) {
+    if (!addr) return 0;
+    if (addr >= HHDM_OFFSET) return 0;
+    if (len && (addr + len) < addr) return 0;       // overflow
+    if (len && (addr + len) > HHDM_OFFSET) return 0;
+    return 1;
+}
+
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
-// Returns 0 on success, -EFAULT if the pointer is obviously bad.
+// Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
 static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
-    if (!src_u) return -EFAULT;
+    if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)src_u, len);
     const uint8_t* s = (const uint8_t*)src_u;
     uint8_t* d = (uint8_t*)dst;
@@ -2352,7 +2428,7 @@ static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
 }
 
 static int copy_to_user(void* dst_u, const void* src, uint64_t len) {
-    if (!dst_u) return -EFAULT;
+    if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)dst_u, len);
     const uint8_t* s = (const uint8_t*)src;
     uint8_t* d = (uint8_t*)dst_u;
@@ -3684,7 +3760,7 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
         case SYS_GETPID:  ret = sys_getpid();                      break;
         case SYS_GETPPID: ret = sys_getppid();                     break;
         case SYS_READDIR: ret = sys_readdir(arg1, arg2, arg3, arg4); break;
-        case SYS_SPAWN:   ret = sys_spawn(arg1, arg2, arg3, arg4); break;
+        case SYS_SPAWN:   ret = sys_spawn(arg1, arg2, arg3, arg4, g_syscall_arg5); break;
         case SYS_THREAD:   ret = sys_thread(arg1, arg2, arg3);     break;
         case SYS_CLOCK_NS: ret = tsc_read_ns();                    break;
         case SYS_STAT:    ret = sys_stat(arg1, arg2, arg3);        break;

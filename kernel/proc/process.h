@@ -100,7 +100,7 @@ typedef struct __attribute__((aligned(16))) task_t {
     uint8_t       mlfq_ticks_left;
     uint32_t      preempt_depth;   // preemption disable nesting counter
 
-    char          cwd[256];     // current working directory (absolute path)
+    char*         cwd;          // current working directory (absolute path, heap-allocated KPATH_MAX)
     char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
 
     // ── Security ──────────────────────────────────────────────────────────

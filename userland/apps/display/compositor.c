@@ -1967,7 +1967,7 @@ int main(int argc, char** argv) {
         const char* child = "/bin/makaterm";
         if (argc > 1) child = argv[1];
         int stdio[3] = { -1, -1, -1 };
-        int pid = spawn(child, 0, 0, stdio);
+        int pid = spawn(child, 0, 0, stdio, NULL);
         if (pid > 0) {
             print("makadisplay: launched ");
             print(child);

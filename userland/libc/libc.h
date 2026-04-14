@@ -332,18 +332,44 @@ static inline int exec(const char* path, size_t pathlen) {
     return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, pathlen));
 }
 
-// spawn(path, argv, envp, stdio) → child pid or -errno.
-//   argv: NULL-terminated array of char* (NULL → synthesise {path, NULL})
-//   envp: NULL-terminated array of char* (NULL → kernel default env)
-//   stdio: int[3] fd specs for child's stdin/stdout/stderr
-//     -1 = inherit that fd from this process
-//     >=0 = dup that specific fd into the child
-//     NULL → open /dev/tty0 for all three
+// ── spawn_attr_t — optional child attributes for spawn() ──────────────────
+// Pass NULL for attr to get the old behaviour (no restrictions applied).
+// Each field is gated by a SPAWN_ATTR_* flag bit so callers only set what
+// they need. Pledge and unveil applied here survive exec in the child.
+
+#define SPAWN_ATTR_CRED    (1u << 0)
+#define SPAWN_ATTR_UMASK   (1u << 1)
+#define SPAWN_ATTR_PLEDGE  (1u << 2)
+#define SPAWN_ATTR_UNVEIL  (1u << 3)
+
+typedef struct {
+    char    path[256];
+    uint8_t perms;
+} spawn_unveil_entry_t;
+
+// spawn_attr_t is ~32 bytes. Unveil entries are a separate array passed by
+// pointer so callers can have any number of entries with no struct size bloat.
+typedef struct {
+    uint32_t                    flags;
+    uint32_t                    uid;
+    uint32_t                    gid;
+    uint32_t                    umask;
+    uint32_t                    pledge_mask;
+    uint32_t                    nunveil;
+    const spawn_unveil_entry_t* unveil;  // pointer to caller-owned array
+} spawn_attr_t;
+
+// spawn(path, argv, envp, stdio, attr) → child pid or -errno.
+//   argv:  NULL-terminated array of char* (NULL → synthesise {path, NULL})
+//   envp:  NULL-terminated array of char* (NULL → kernel default env)
+//   stdio: int[3] fd specs: -2=null, -1=inherit, >=0=dup fd. NULL→tty0.
+//   attr:  optional spawn_attr_t* — uid/gid/pledge/unveil for child. NULL=none.
 static inline int spawn(const char* path, const char* const* argv,
-                        const char* const* envp, const int stdio[3]) {
-    return (int)__syscall_ret(syscall4(SYS_SPAWN, (uint64_t)path,
+                        const char* const* envp, const int stdio[3],
+                        const spawn_attr_t* attr) {
+    return (int)__syscall_ret(syscall5(SYS_SPAWN, (uint64_t)path,
                                        (uint64_t)argv, (uint64_t)envp,
-                                       (uint64_t)stdio));
+                                       (uint64_t)stdio, (uint64_t)attr));
 }
 
 // Macros for decoding the status filled by wait/waitpid.

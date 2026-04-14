@@ -88,3 +88,23 @@ void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
 void signal_send_pgrp(uint32_t pgid, int sig);
 void signal_deliver_pending(void);
+
+// Returns 1 if there is a pending signal that would actually interrupt a
+// blocking syscall (i.e. has a user handler, or SIG_DFL with non-ignore
+// default action). SIGCHLD and SIGWINCH with SIG_DFL are NOT actionable —
+// they are silently discarded by signal_deliver_pending() and must not
+// cause EINTR loops.
+static inline int signal_has_actionable(const sigstate_t* ss) {
+    uint8_t scan = ss->head;
+    while (scan != ss->tail) {
+        int s = (int)ss->queue[scan];
+        uint64_t h = (s > 0 && s < NSIG) ? ss->handlers[s].sa_handler
+                                           : (uint64_t)SIG_DFL;
+        if (h != (uint64_t)SIG_IGN) {
+            if (h != (uint64_t)SIG_DFL || (s != SIGCHLD && s != SIGWINCH))
+                return 1;
+        }
+        scan = (scan + 1) & (SIG_QUEUE_SIZE - 1);
+    }
+    return 0;
+}

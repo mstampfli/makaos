@@ -87,30 +87,41 @@ void task_files_release(task_files_t* f) {
 }
 
 // ── PID pool ──────────────────────────────────────────────────────────────
-#define PID_MAX   4095u
-#define PID_WORDS ((PID_MAX + 1 + 63u) / 64u)
+// Bitmap allocation: O(1) amortised via next-fit cursor + ctzll on free words.
+// 65535 PIDs = 1024 x 64-bit words = 8 KiB BSS.
+// PIDs 0-9 reserved (kernel); userland starts at 10.
+#define PID_MAX   65535u
+#define PID_WORDS ((PID_MAX + 1 + 63u) / 64u)   // 1024 words
 
-static uint64_t s_pid_bitmap[PID_WORDS] = { [0] = 0x3FFu };
+static uint64_t s_pid_bitmap[PID_WORDS] = { [0] = 0x3FFu }; // reserve 0-9
 static uint32_t s_pid_next = 10;
 
 uint32_t pid_alloc(void) {
     for (uint32_t pass = 0; pass < 2; pass++) {
         uint32_t start = (pass == 0) ? s_pid_next : 10u;
         uint32_t end   = (pass == 0) ? PID_MAX    : s_pid_next;
-        for (uint32_t pid = start; pid <= end; pid++) {
-            uint32_t w = pid / 64u, b = pid % 64u;
-            if (!(s_pid_bitmap[w] & (1ull << b))) {
-                s_pid_bitmap[w] |= (1ull << b);
-                s_pid_next = (pid + 1 <= PID_MAX) ? pid + 1 : 10u;
-                return pid;
-            }
+        uint32_t sw = start / 64u;
+        uint32_t ew = end   / 64u;
+        for (uint32_t w = sw; w <= ew; w++) {
+            uint64_t free_bits = ~s_pid_bitmap[w];
+            if (!free_bits) continue;
+            if (w == sw) free_bits &= ~((1ull << (start % 64u)) - 1u);
+            if (w == ew && (end % 64u) != 63u)
+                free_bits &= (1ull << ((end % 64u) + 1u)) - 1u;
+            if (!free_bits) continue;
+            uint32_t b   = (uint32_t)__builtin_ctzll(free_bits);
+            uint32_t pid = w * 64u + b;
+            if (pid > PID_MAX) break;
+            s_pid_bitmap[w] |= (1ull << b);
+            s_pid_next = (pid + 1u <= PID_MAX) ? pid + 1u : 10u;
+            return pid;
         }
     }
-    return 0;
+    return 0; // out of PIDs
 }
 
 void pid_free(uint32_t pid) {
-    if (pid < 10 || pid > PID_MAX) return;
+    if (pid < 10u || pid > PID_MAX) return;
     s_pid_bitmap[pid / 64u] &= ~(1ull << (pid % 64u));
 }
 
@@ -139,8 +150,8 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->umask            = 0022u; // default umask: rwxr-xr-x
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
-    t->cwd[0] = '/';
-    t->cwd[1] = '\0';
+    t->cwd = kmalloc(KPATH_MAX);
+    if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
     t->comm[0] = '\0'; // set by elf_load_with_argv or task_fork
 
     // Security: always start with root credentials and full permissions.
@@ -251,6 +262,8 @@ void task_destroy(task_t* t) {
     kstack_free(t->kstack_top);
     task_mm_release(t->mm_shared);
     task_files_release(t->files_shared);
+    kfree(t->cwd);
+    unveil_free(&t->unveil);
     kfree(t);
 }
 
@@ -311,7 +324,8 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->sigstate.head    = 0;
     t->sigstate.tail    = 0;
     t->sigstate.blocked = 0;
-    for (int _i = 0; _i < 256; _i++) t->cwd[_i]  = parent->cwd[_i];
+    t->cwd = kmalloc(KPATH_MAX);
+    if (t->cwd) __builtin_memcpy(t->cwd, parent->cwd, KPATH_MAX);
     for (int _i = 0; _i < 16;  _i++) t->comm[_i] = parent->comm[_i];
     cred_copy(&t->cred, &parent->cred);
     t->pledge_mask = parent->pledge_mask;
