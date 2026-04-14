@@ -236,8 +236,12 @@ static uint8_t* gen_maps(task_t* t, uint64_t* out_size) {
 
     mm_t* mm = t->mm_shared ? t->mm_shared->mm : NULL;
     if (mm) {
-        // Walk the VMA linked list directly — mm->vmas is public.
-        for (vma_t* v = mm->vmas; v; v = v->next) {
+        // RCU walk: readers take zero locks.  strbuf_append may kmalloc
+        // on growth — that's non-sleeping in this kernel so it's safe
+        // to keep inside the reader section.
+        rcu_read_lock();
+        for (vma_t* v = rcu_dereference(mm->vmas); v;
+                     v = rcu_dereference(v->next)) {
             strbuf_append_hex(&b, v->start);
             strbuf_append(&b, "-");
             strbuf_append_hex(&b, v->end);
@@ -247,6 +251,7 @@ static uint8_t* gen_maps(task_t* t, uint64_t* out_size) {
             strbuf_append(&b, (v->flags & VMA_X) ? "x" : "-");
             strbuf_append(&b, "p\n");
         }
+        rcu_read_unlock();
     } else {
         strbuf_append(&b, "(no address space)\n");
     }
