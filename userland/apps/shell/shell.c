@@ -389,7 +389,7 @@ static void cmd_run(const char* cwd, int argc, char* argv[]) {
     int is_bash = 0;
     { const char* p = path; while (*p) p++; while (p > path && *p != '/') p--; if (*p == '/') p++;
       is_bash = (p[0]=='b' && p[1]=='a' && p[2]=='s' && p[3]=='h' && !p[4]); }
-    int pid = spawn(path, is_bash ? bash_argv : NULL, NULL, inherit_stdio);
+    int pid = spawn(path, is_bash ? bash_argv : NULL, NULL, inherit_stdio, NULL);
     if (pid < 0) { puts_fd("shell: spawn failed: "); puts_fd(path); putc_fd('\n'); return; }
 
     int status = 0;

@@ -165,9 +165,17 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
    -o "$BUILD_DIR/user_ps.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/dhcpcd/dhcpcd.c" -o "$BUILD_DIR/user_dhcpcd.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_dhcpcd.o" \
-   -o "$BUILD_DIR/user_dhcpcd.elf"
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/net/net.c" -o "$BUILD_DIR/user_net.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_net.o" \
+   -o "$BUILD_DIR/user_net.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/svcmgr/svcmgr.c" -o "$BUILD_DIR/user_svcmgr.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_svcmgr.o" \
+   -o "$BUILD_DIR/user_svcmgr.elf"
+
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/restrict/restrict.c" -o "$BUILD_DIR/user_restrict.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_restrict.o" \
+   -o "$BUILD_DIR/user_restrict.elf"
 
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_http_get.o" \
@@ -345,6 +353,7 @@ SHADOW_EOF
 debugfs -w "$BUILD_DIR/ext2.img" <<'DEBUGFS_EOF' > /dev/null 2>&1
 mkdir bin
 mkdir etc
+mkdir etc/services
 mkdir home
 mkdir tmp
 mkdir dev
@@ -378,6 +387,25 @@ debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/root_secret.txt 
 ext2_setperm "$BUILD_DIR/ext2.img" /root/secret.txt 0100600 0 0
 
 echo "[+] /etc/passwd and /etc/shadow installed"
+
+# ── Service definitions ───────────────────────────────────────────────────
+mkdir -p "$BUILD_DIR/etc_stage/services"
+
+cat > "$BUILD_DIR/etc_stage/services/net.svc" <<'SVC_EOF'
+path=/bin/net
+uid=0
+gid=0
+stdio=null
+pledge=net stdio cpath wpath
+unveil=/etc rw
+restart=on-failure
+SVC_EOF
+
+debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/services/net.svc etc/services/net.svc" > /dev/null 2>&1 || true
+ext2_setperm "$BUILD_DIR/ext2.img" /etc/services/net.svc 0100644 0 0
+ext2_setperm "$BUILD_DIR/ext2.img" /etc/services         0040755 0 0
+ext2_setperm "$BUILD_DIR/ext2.img" /etc                  0040755 0 0
+echo "[+] /etc/services/net.svc installed"
 
 # Install binaries with execute permissions (0755 = rwxr-xr-x, type 0100000 = regular file).
 # All binaries: root:root 0755 — any user can execute, only root can write.
@@ -413,9 +441,17 @@ if [ -f "$BUILD_DIR/user_ps.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_ps.elf" bin/ps
     echo "[+] ps ELF installed at bin/ps (root:root 0755)"
 fi
-if [ -f "$BUILD_DIR/user_dhcpcd.elf" ]; then
-    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dhcpcd.elf" bin/dhcpcd
-    echo "[+] dhcpcd ELF installed at bin/dhcpcd (root:root 0755)"
+if [ -f "$BUILD_DIR/user_net.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_net.elf" bin/net
+    echo "[+] net ELF installed at bin/net (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_svcmgr.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_svcmgr.elf" bin/svcmgr
+    echo "[+] svcmgr ELF installed at bin/svcmgr (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_restrict.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_restrict.elf" bin/restrict
+    echo "[+] restrict ELF installed at bin/restrict (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_http_get.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_http_get.elf" bin/http_get

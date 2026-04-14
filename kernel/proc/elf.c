@@ -375,6 +375,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
 static vfs_file_t* resolve_stdio(const int* spec, int i) {
     if (!spec) return tty_open(0);
     int fd = spec[i];
+    if (fd == -2) return vfs_null_open(); // explicit /dev/null
     if (fd == -1) {
         // Inherit from current process.
         if (g_current && g_current->files_shared &&
@@ -438,8 +439,8 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->umask            = 0022u;
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
-    t->cwd[0] = '/';
-    t->cwd[1] = '\0';
+    t->cwd = kmalloc(KPATH_MAX);
+    if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
     // Credentials: inherit from parent if present, otherwise root.
     if (g_current && g_current->files_shared)
         cred_copy(&t->cred, &g_current->cred);
@@ -535,8 +536,8 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->umask            = 0022u;
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
-    t->cwd[0] = '/';
-    t->cwd[1] = '\0';
+    t->cwd = kmalloc(KPATH_MAX);
+    if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
     // Credentials: inherit from spawning process if present, otherwise root.
     if (g_current && g_current->files_shared)
         cred_copy(&t->cred, &g_current->cred);
