@@ -9,7 +9,7 @@
 // On miss: broadcasts an ARP request and blocks until a reply arrives
 //          (or times out after ~1 second).
 
-#define ARP_CACHE_SIZE  32u   // max concurrent ARP entries
+// ARP cache is a dynamic hash table (see arp.c) — no fixed cap.
 
 // Receive and process an ARP packet (called by eth_recv).
 void arp_recv(skbuff_t* skb);

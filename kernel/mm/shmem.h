@@ -24,8 +24,7 @@
 // Maximum pages per shmem object (256 MB at 4K pages — raised if needed).
 #define SHMEM_MAX_PAGES  (256UL * 1024 * 1024 / PAGE_SIZE)
 
-// Maximum named shmem objects in the kernel namespace.
-#define SHMEM_NS_MAX     64
+// Named shmem namespace is a dynamic hash table (see shmem.c) — no fixed cap.
 
 // Maximum name length (excluding NUL terminator).
 #define SHMEM_NAME_MAX   63
