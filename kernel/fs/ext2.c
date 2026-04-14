@@ -148,16 +148,14 @@ static uint8_t read_block(uint32_t blk, uint8_t* buf) {
     uint32_t slot = blk % BCACHE_SIZE;
     if (s_bcache_tag[slot] == blk) {
         // Cache hit — copy from cache.
-        const uint8_t* src = s_bcache_data[slot];
-        for (uint32_t i = 0; i < s_block_size; i++) buf[i] = src[i];
+        __builtin_memcpy(buf, s_bcache_data[slot], s_block_size);
         return 1;
     }
     // Cache miss — read from disk and populate cache.
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
     if (!ahci_read(lba, buf, s_sectors_per_blk)) return 0;
     s_bcache_tag[slot] = blk;
-    uint8_t* dst = s_bcache_data[slot];
-    for (uint32_t i = 0; i < s_block_size; i++) dst[i] = buf[i];
+    __builtin_memcpy(s_bcache_data[slot], buf, s_block_size);
     return 1;
 }
 
@@ -168,8 +166,7 @@ static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
     // Update cache with the written data.
     uint32_t slot = blk % BCACHE_SIZE;
     s_bcache_tag[slot] = blk;
-    uint8_t* dst = s_bcache_data[slot];
-    for (uint32_t i = 0; i < s_block_size; i++) dst[i] = buf[i];
+    __builtin_memcpy(s_bcache_data[slot], buf, s_block_size);
     return 1;
 }
 
@@ -545,10 +542,9 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                     uint32_t b = blk + r;
                     uint32_t slot = b % BCACHE_SIZE;
                     s_bcache_tag[slot] = b;
-                    const uint8_t* src = dest + r * s_block_size;
-                    uint8_t* cache = s_bcache_data[slot];
-                    for (uint32_t j = 0; j < s_block_size; j++)
-                        cache[j] = src[j];
+                    __builtin_memcpy(s_bcache_data[slot],
+                                      dest + r * s_block_size,
+                                      s_block_size);
                 }
                 uint32_t bytes = run * s_block_size;
                 total       += bytes;
@@ -599,7 +595,7 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
             if (!blk) break;
             if (!zb) {
                 EXT2_SCRATCH_ALLOC(zb);
-                for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
+                __builtin_memset(zb, 0, s_block_size);
             }
             if (!write_block(blk, zb)) { free_block(blk); break; }
             if (!inode_set_block(&fd->inode, blk_idx, blk)) { free_block(blk); break; }
@@ -863,7 +859,7 @@ static void free_inode_num(uint32_t ino) {
 // Zero a block on disk.
 static void zero_block(uint32_t blk) {
     EXT2_SCRATCH_VOID(zb_buf);
-    for (uint32_t i = 0; i < s_block_size; i++) zb_buf[i] = 0;
+    __builtin_memset(zb_buf, 0, s_block_size);
     write_block(blk, zb_buf);
 }
 
@@ -936,7 +932,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
             if (!ind_blk) return 0;
             inode->i_block[12] = ind_blk;
             // Zero it.
-            for (uint32_t i = 0; i < s_block_size; i++) si_buf[i] = 0;
+            __builtin_memset(si_buf, 0, s_block_size);
             if (!write_block(ind_blk, si_buf)) return 0;
         }
         if (!read_block(inode->i_block[12], si_buf)) return 0;
@@ -955,7 +951,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
             uint32_t dind_blk = alloc_block();
             if (!dind_blk) return 0;
             inode->i_block[13] = dind_blk;
-            for (uint32_t i = 0; i < s_block_size; i++) di_l1_buf[i] = 0;
+            __builtin_memset(di_l1_buf, 0, s_block_size);
             if (!write_block(dind_blk, di_l1_buf)) return 0;
         }
         if (!read_block(inode->i_block[13], di_l1_buf)) return 0;
@@ -968,7 +964,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
             if (!l2_blk) return 0;
             l1[l1_idx] = l2_blk;
             if (!write_block(inode->i_block[13], di_l1_buf)) return 0;
-            for (uint32_t i = 0; i < s_block_size; i++) di_l2_buf[i] = 0;
+            __builtin_memset(di_l2_buf, 0, s_block_size);
             if (!write_block(l2_blk, di_l2_buf)) return 0;
         }
         if (!read_block(l1[l1_idx], di_l2_buf)) return 0;
@@ -1201,8 +1197,8 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
             uint32_t to_write = size - written;
             if (to_write > s_block_size) to_write = s_block_size;
 
-            for (uint32_t i = 0; i < to_write; i++) wr_buf[i] = data[written + i];
-            for (uint32_t i = to_write; i < s_block_size; i++) wr_buf[i] = 0;
+            __builtin_memcpy(wr_buf, data + written, to_write);
+            __builtin_memset(wr_buf + to_write, 0, s_block_size - to_write);
 
             if (!write_block(blk, wr_buf)) { free_block(blk); return 0; }
             if (!inode_set_block(&old_inode, bi, blk)) { free_block(blk); return 0; }
@@ -1246,8 +1242,8 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         uint32_t to_write = size - written;
         if (to_write > s_block_size) to_write = s_block_size;
 
-        for (uint32_t i = 0; i < to_write; i++) wr_buf[i] = data[written + i];
-        for (uint32_t i = to_write; i < s_block_size; i++) wr_buf[i] = 0;
+        __builtin_memcpy(wr_buf, data + written, to_write);
+        __builtin_memset(wr_buf + to_write, 0, s_block_size - to_write);
 
         if (!write_block(blk, wr_buf)) { free_block(blk); free_inode_num(new_ino); return 0; }
         if (!inode_set_block(&new_inode, bi, blk)) {
@@ -1450,7 +1446,7 @@ int ext2_mkdir(const char* path) {
         free_inode_num(new_ino);
         return 0;
     }
-    for (uint32_t i = 0; i < s_block_size; i++) mkdir_buf[i] = 0;
+    __builtin_memset(mkdir_buf, 0, s_block_size);
 
     // "." entry.
     ext2_dirent_t* dot = (ext2_dirent_t*)mkdir_buf;

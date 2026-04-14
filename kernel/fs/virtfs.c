@@ -308,7 +308,8 @@ void normalize_path(char* path) {
             src += len; continue;
         }
         if (depth < 128) offs[depth++] = (int)(dst - path);
-        for (int i = 0; i < len; i++) *dst++ = src[i];
+        __builtin_memcpy(dst, src, len);
+        dst += len;
         src += len;
         if (*src) *dst++ = '/';                        // separator (not trailing)
     }
