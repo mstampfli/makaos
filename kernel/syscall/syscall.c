@@ -505,8 +505,9 @@ static uint64_t sys_exit(uint64_t code) {
         sched_add_zombie(g_current);
 
         // Wake parent and deliver SIGCHLD so it can reap background jobs.
+        // Skip zombie parents (they can't handle anything any more).
         task_t* parent = sched_find_pid(g_current->ppid);
-        if (parent) {
+        if (parent && parent->state != TASK_ZOMBIE) {
             signal_send(parent, SIGCHLD);
             if (parent->state == TASK_SLEEPING)
                 sched_wake(parent);
@@ -518,17 +519,11 @@ static uint64_t sys_exit(uint64_t code) {
 }
 
 // ── sys_kill helpers (file-scope so clang accepts them) ───────────────────
-typedef struct { int64_t pid; task_t* result; } find_arg_t;
-
-static void kill_find_cb(task_t* t, void* data) {
-    find_arg_t* a = (find_arg_t*)data;
-    if (!a->result && (int64_t)t->pid == a->pid) a->result = t;
-}
-
 static int s_bcast_sig = 0;
 static void kill_bcast_cb(task_t* t, void* data) {
     (void)data;
-    if (!(t->flags & TASK_FLAG_KTHREAD)) signal_send(t, s_bcast_sig);
+    if (!(t->flags & TASK_FLAG_KTHREAD) && t->state != TASK_ZOMBIE)
+        signal_send(t, s_bcast_sig);
 }
 
 // ── sys_kill ──────────────────────────────────────────────────────────────
@@ -543,15 +538,14 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     int64_t pid = (int64_t)pid_raw;
 
     if (pid > 0) {
-        task_t* target = NULL;
-        if (g_current && (int64_t)g_current->pid == pid)
-            target = g_current;
-        if (!target) {
-            find_arg_t a = {pid, NULL};
-            sched_for_each(kill_find_cb, &a);
-            target = a.result;
-        }
-        if (!target) return (uint64_t)-ESRCH;
+        // O(1) lookup via the pid hash table.  Zombies are kept in
+        // pid_ht until fully reaped, but kill() on a zombie is an
+        // error (ESRCH) — the task is semantically dead.
+        task_t* target = ((int64_t)g_current->pid == pid)
+                         ? g_current
+                         : sched_find_pid((uint32_t)pid);
+        if (!target || target->state == TASK_ZOMBIE)
+            return (uint64_t)-ESRCH;
         signal_send(target, sig);
         return 0;
     }
@@ -2847,7 +2841,7 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     uint32_t pgid = pgid_arg ? (uint32_t)pgid_arg : pid;
 
     task_t* t = (pid == g_current->pid) ? g_current : sched_find_pid(pid);
-    if (!t) return (uint64_t)-ESRCH;
+    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
 
     // Can't change pgid of a session leader.
     if (t->pid == t->sid) return (uint64_t)-EPERM;
@@ -2862,7 +2856,7 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
 static uint64_t sys_getpgid(uint64_t pid_arg) {
     if (pid_arg == 0) return (uint64_t)g_current->pgid;
     task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t) return (uint64_t)-ESRCH;
+    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
     return (uint64_t)t->pgid;
 }
 
@@ -2890,7 +2884,7 @@ static uint64_t sys_setsid(void) {
 static uint64_t sys_getsid(uint64_t pid_arg) {
     if (pid_arg == 0) return (uint64_t)g_current->sid;
     task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t) return (uint64_t)-ESRCH;
+    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
     return (uint64_t)t->sid;
 }
 
