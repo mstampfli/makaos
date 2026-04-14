@@ -1,174 +1,185 @@
 #pragma once
-// ── Wait queues — Linux-style callback design ─────────────────────────────
-//
-// Architecture (mirrors Linux exactly, simplified for single-CPU):
-//
-//   wait_queue_t        — list head, embedded in any waitable object
-//                         (vfs_file_t.waitq, tty_t.waitq, epoll_state_t.wq …)
-//
-//   wake_entry_t        — a node in a wait_queue_t.  Contains a func callback
-//                         that is invoked by wait_queue_wake_all/one().
-//                         func() returns:
-//                           WQ_REMOVE — remove this entry from the queue
-//                           WQ_KEEP   — leave this entry in the queue
-//                         This one distinction covers every use case:
-//                           • direct task sleep (poll/select/read): REMOVE
-//                           • epoll watch (persistent): KEEP — entry stays in
-//                             the file's waitq forever, until epoll_ctl(DEL)
-//
-//   task_we_t           — concrete wake_entry for a sleeping task.
-//                         Wakes the task, removes itself (WQ_REMOVE).
-//                         Heap-alloc exactly one per watched fd in poll/select.
-//                         No per-wakeup allocation for epoll.
-//
-//   epoll_we_t          — concrete wake_entry for an epoll watch (persistent).
-//                         On fire: sets has_ready=1, wakes epoll's own wq.
-//                         Returns WQ_KEEP — stays in file's queue forever.
-//                         Allocated once at epoll_ctl(ADD), freed at DEL/close.
-//
-// epoll_wait() flow (zero per-wakeup allocation):
-//   1. Scan watched fds for ready events — return if any.
-//   2. Add ONE task_we_t to epoll_state->wq (task sleeps on epoll's queue).
-//   3. Re-check for ready events (close the race window).
-//   4. sched_sleep().
-//   5. Remove task_we_t from epoll_state->wq.
-//   6. Go to 1.
-//   When any watched fd fires: epoll_we_t.func sets has_ready, wakes wq.
-//   The sleeping task wakes from epoll_state->wq and loops to scan.
-//
-// poll()/select() flow (one small heap alloc per watched fd, freed on return):
-//   Allocate one task_we_t per fd, add to each fd's waitq, sleep, free all.
-//   Typical nfds=2-4, so 2-4 allocs total — negligible.
+#include "common.h"
+#include "smp.h"
 
-#define WQ_REMOVE 1   // remove entry from queue after wake
+// ── Wait queues — lock-free MPSC design ─────────────────────────────────
+//
+// A wait_queue_t is a lock-free stack of wake_entry_t nodes.  Multiple
+// producers (any CPU) can push concurrently via compare-and-swap on the
+// head.  A single consumer (the waker) drains the whole chain with one
+// atomic xchg.  Push and drain take zero spinlocks.
+//
+// Wake semantics are "wake all": the drainer takes the entire list, then
+// walks the linked chain calling func() on each entry.  Entries marked
+// `dead` (cancelled) are skipped without calling func.
+//
+// FIFO vs LIFO: push-to-head means drained order is LIFO.  This is fine
+// for wake-all semantics (all waiters get woken, ordering doesn't matter)
+// and it's the fastest lock-free design.  Wake-one still picks the head.
+//
+// Cancellation: see the "Removal" section below.  In short, removal is
+// serialized via a tiny per-queue spinlock that's only taken on the cold
+// cancel path; the hot wake_all path is lock-free.
+//
+// ── Entry lifetime rules ────────────────────────────────────────────────
+//
+// A wake_entry_t must remain valid for as long as it may be referenced
+// by a drainer.  Two patterns:
+//
+//   1. Stack-allocated (task_we_t for blocking sleepers):
+//      - Caller puts the entry on the stack of the function that calls
+//        sched_sleep.
+//      - The drainer wakes the task via sched_wake().  The task resumes
+//        and eventually returns from sched_sleep, at which point the
+//        stack frame (and the entry) can be dropped.
+//      - Because sched_wake is called while the drainer is still
+//        walking the entry chain, the stack frame is still live.  Safe.
+//
+//   2. Heap-allocated (epoll_we_t for persistent watches):
+//      - Caller kmallocs the entry on epoll_ctl(ADD).
+//      - The entry stays in the queue until epoll_ctl(DEL) or fd close,
+//        at which point the caller unlinks it via wq_remove() and
+//        frees the storage.
+//      - wq_remove takes the per-queue spinlock, so there's no race
+//        with a concurrent drainer.
+//
+// ── The spinlock ─────────────────────────────────────────────────────────
+//
+// Each wait_queue_t has one `spinlock_t remove_lock`.  It's held only in
+// wq_remove() to safely unlink a single entry from the middle of the
+// list.  It's never held on the push or drain path.  Under normal
+// operation (push, wake_all, wake_one) the queue is entirely lock-free.
+//
+// Justification for this lock (per docs/LOCKS.md rules):
+//   1. Hot path is the drain (wake_all), which is lock-free.  Push is
+//      also lock-free.  The lock only covers the cold cancel path.
+//   2. Lock-free cancel would require either:
+//      - a full RCU quiescence wait (too expensive for every wq_remove)
+//      - hazard pointers (complex, bounded memory)
+//      - heap-allocating every wake_entry and using call_rcu to free
+//        (slow, defeats the stack-allocation optimisation)
+//      The spinlock on the cold path is the cleanest choice.
+//   3. Critical section is a linked-list walk + one pointer swap.
+//      Bounded, short, no sleeps.
+//   4. wq_remove is never called from IRQ context.  All removers are
+//      epoll_ctl(DEL) or polling-loop cleanups in process context.
+//      Plain spin_lock is correct (no irqsave needed).
+
+#define WQ_REMOVE 1   // remove entry from queue after wake (one-shot)
 #define WQ_KEEP   0   // leave entry in queue (persistent watches)
 
-struct task_t;  // forward decl
+struct task_t;
 
-// ── Core queue types ──────────────────────────────────────────────────────
+// ── Core types ───────────────────────────────────────────────────────────
 
 typedef struct wake_entry {
-    int (*func)(struct wake_entry* we);  // wake callback; returns WQ_REMOVE/WQ_KEEP
-    struct wake_entry* next;
-    struct wake_entry* prev;
+    int (*func)(struct wake_entry* we);  // wake callback
+    struct wake_entry*  next;             // linked-list next in MPSC chain
+    volatile uint32_t   dead;             // non-zero = skip on drain
 } wake_entry_t;
 
-typedef struct {
-    wake_entry_t* head;
+typedef struct wait_queue_t {
+    // Head of the MPSC chain.  Readers (waker) atomically xchg this to
+    // drain the entire list.  Writers (sleepers) CAS-push new entries.
+    wake_entry_t* volatile head;
+    // Guards wq_remove — see comment above.  Never held on push or drain.
+    spinlock_t remove_lock;
 } wait_queue_t;
 
-// ── Concrete entry types ──────────────────────────────────────────────────
+// ── Concrete entry types ─────────────────────────────────────────────────
 
-// task_we_t: for a task sleeping on a queue (poll, select, blocking ops).
-// One-shot: func wakes the task and returns WQ_REMOVE.
+// One-shot task waiter.  Stack-allocated by the caller.
 typedef struct {
     wake_entry_t    we;
     struct task_t*  task;
 } task_we_t;
 
-// epoll_we_t: persistent watch entry, lives in a file's waitq.
-// func wakes the epoll's own wq and returns WQ_KEEP.
+// Persistent epoll watch.  Heap-allocated in epoll_ctl(ADD).
 typedef struct {
     wake_entry_t    we;
-    wait_queue_t*   epoll_wq;    // &epoll_state->wq
-    int*            p_has_ready; // set to 1 so epoll_wait knows to re-scan
+    struct wait_queue_t* epoll_wq;   // &epoll_state->wq
+    int*            p_has_ready;     // set to 1 so epoll_wait re-scans
 } epoll_we_t;
 
-// ── wake callbacks ────────────────────────────────────────────────────────
-
-// Defined out-of-line in wait.c to avoid circular includes (needs sched_wake).
-// Declared here so wait.h is self-contained for users.
+// ── Wake callbacks (defined in wait.c — need sched_wake) ────────────────
 int task_wake_func(wake_entry_t* we);
 int epoll_wake_func(wake_entry_t* we);
 
-// ── Queue primitives ──────────────────────────────────────────────────────
+// ── Queue primitives ─────────────────────────────────────────────────────
 
-static inline void wait_queue_init(wait_queue_t* wq) { wq->head = 0; }
-
-static inline void wq_add(wait_queue_t* wq, wake_entry_t* we) {
-    we->next = we->prev = 0;
-    if (!wq->head) { wq->head = we; return; }
-    wake_entry_t* tail = wq->head;
-    while (tail->next) tail = tail->next;
-    tail->next = we;
-    we->prev   = tail;
+ALWAYS_INLINE void wait_queue_init(wait_queue_t* wq) {
+    wq->head = NULL;
+    spin_lock_init(&wq->remove_lock);
 }
 
-// Remove an entry from a queue.  Safe to call if already removed (no-op).
-static inline void wq_remove(wait_queue_t* wq, wake_entry_t* we) {
-    // Find the entry (short queues — O(n) is fine).
-    wake_entry_t* cur = wq->head;
-    while (cur && cur != we) cur = cur->next;
-    if (!cur) return;
-
-    if (we->prev) we->prev->next = we->next;
-    else          wq->head       = we->next;
-    if (we->next) we->next->prev = we->prev;
-    we->next = we->prev = 0;
+// Push an entry onto the queue.  Lock-free MPSC push via CAS.
+//
+// Invariant: the entry must not already be in a queue.  Callers who
+// re-register after a wake must re-init (reset we->dead and we->next).
+ALWAYS_INLINE void wq_add(wait_queue_t* wq, wake_entry_t* we) {
+    we->dead = 0;
+    wake_entry_t* old_head;
+    do {
+        old_head = atomic_load_relaxed(&wq->head);
+        we->next = old_head;
+    } while (!__atomic_compare_exchange_n(&wq->head, &old_head, we, 1,
+                                             __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 }
 
-// Wake all entries on the queue.
-// Entries returning WQ_REMOVE are unlinked; WQ_KEEP entries stay.
-static inline void wait_queue_wake_all(wait_queue_t* wq) {
-    wake_entry_t* we = wq->head;
-    while (we) {
-        wake_entry_t* next = we->next;
-        int remove = we->func(we);
-        if (remove) {
-            // Unlink this entry.
-            if (we->prev) we->prev->next = next;
-            else          wq->head       = next;
-            if (next) next->prev = we->prev;
-            we->next = we->prev = 0;
-        }
-        we = next;
-    }
-}
+// Remove an entry from the queue.  Serialized via remove_lock so the
+// unlink can't race with another remover.  Concurrent drainers are
+// handled separately: wq_remove marks the entry dead before walking,
+// and if a drainer has already grabbed the chain the entry's `dead`
+// flag makes the drainer skip the callback.
+//
+// Safe to call if the entry has already been drained (no-op in that
+// case: walk finds nothing to unlink).
+void wq_remove(wait_queue_t* wq, wake_entry_t* we);
 
-// Wake the first entry only.
-static inline void wait_queue_wake_one(wait_queue_t* wq) {
-    wake_entry_t* we = wq->head;
-    if (!we) return;
-    int remove = we->func(we);
-    if (remove) {
-        wq->head = we->next;
-        if (wq->head) wq->head->prev = 0;
-        we->next = we->prev = 0;
-    }
-}
+// Wake every entry currently in the queue.  Lock-free drain: one xchg
+// grabs the whole chain, then we walk it privately.
+//
+// WQ_KEEP entries (persistent watches) are re-pushed onto the queue
+// after wake.  WQ_REMOVE entries are dropped.
+void wait_queue_wake_all(wait_queue_t* wq);
 
-// ── task_we_t helpers ─────────────────────────────────────────────────────
+// Wake exactly one entry (the head of the chain).  Used where
+// "wake the next writer" semantics are needed — typically unused in
+// MakaOS but kept for API compatibility.
+void wait_queue_wake_one(wait_queue_t* wq);
 
-static inline void task_we_init(task_we_t* twe, struct task_t* task) {
+// ── task_we_t helpers ────────────────────────────────────────────────────
+
+ALWAYS_INLINE void task_we_init(task_we_t* twe, struct task_t* task) {
     twe->we.func = task_wake_func;
-    twe->we.next = twe->we.prev = 0;
+    twe->we.next = NULL;
+    twe->we.dead = 0;
     twe->task    = task;
 }
 
-// Add a task_we_t to a queue; also records which queue for removal.
-// (task_we_t doesn't store the queue — caller must pass wq to wq_remove.)
-static inline void task_we_add(wait_queue_t* wq, task_we_t* twe) {
+ALWAYS_INLINE void task_we_add(wait_queue_t* wq, task_we_t* twe) {
     wq_add(wq, &twe->we);
 }
 
-static inline void task_we_remove(wait_queue_t* wq, task_we_t* twe) {
+ALWAYS_INLINE void task_we_remove(wait_queue_t* wq, task_we_t* twe) {
     wq_remove(wq, &twe->we);
 }
 
-// ── epoll_we_t helpers ────────────────────────────────────────────────────
+// ── epoll_we_t helpers ───────────────────────────────────────────────────
 
-static inline void epoll_we_init(epoll_we_t* ewe, wait_queue_t* epoll_wq,
+ALWAYS_INLINE void epoll_we_init(epoll_we_t* ewe, wait_queue_t* epoll_wq,
                                   int* p_has_ready) {
     ewe->we.func     = epoll_wake_func;
-    ewe->we.next     = ewe->we.prev = 0;
+    ewe->we.next     = NULL;
+    ewe->we.dead     = 0;
     ewe->epoll_wq    = epoll_wq;
     ewe->p_has_ready = p_has_ready;
 }
 
-static inline void epoll_we_add(wait_queue_t* wq, epoll_we_t* ewe) {
+ALWAYS_INLINE void epoll_we_add(wait_queue_t* wq, epoll_we_t* ewe) {
     wq_add(wq, &ewe->we);
 }
 
-static inline void epoll_we_remove(wait_queue_t* wq, epoll_we_t* ewe) {
+ALWAYS_INLINE void epoll_we_remove(wait_queue_t* wq, epoll_we_t* ewe) {
     wq_remove(wq, &ewe->we);
 }

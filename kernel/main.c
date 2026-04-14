@@ -10,6 +10,7 @@
 #include "timer.h"
 #include "sched.h"
 #include "cpu.h"
+#include "irq_wait.h"
 #include "ahci.h"
 #include "ext2.h"
 #include "elf.h"
@@ -154,6 +155,7 @@ void kmain(void) {
     tss_init();
     syscall_init();
     cpu_init_bsp();           // per-CPU state for the BSP (Phase 1 SMP)
+    irq_wait_init();          // per-IRQ wait queues (Phase 3 SMP)
 
     // ── Scheduler + timer — sched_init must precede timer_init ───────────
     sched_init();
