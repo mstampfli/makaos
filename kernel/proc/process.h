@@ -98,7 +98,9 @@ typedef struct __attribute__((aligned(16))) task_t {
 
     uint8_t       mlfq_level;
     uint8_t       mlfq_ticks_left;
-    uint32_t      preempt_depth;   // preemption disable nesting counter
+    // preempt_depth moved to cpu_t (per-CPU, not per-task).  Preemption
+    // is a property of the executing context, not of the task itself —
+    // a non-running task can't be preempted.
 
     char*         cwd;          // current working directory (absolute path, heap-allocated KPATH_MAX)
     char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
