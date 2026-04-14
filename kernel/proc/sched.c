@@ -517,14 +517,63 @@ void task_child_remove(task_t* parent, task_t* child) {
 // ── sched_tick ────────────────────────────────────────────────────────────
 // Called from timer IRQ — only sets flags/counters, never touches the stack.
 
+// sched_tick — runs 1000 times per second per CPU, in timer ISR context.
+//
+// ~99% of ticks do ZERO shared-state work: no sleeper expires, no boost,
+// just tick down the running task's local quantum.  Taking rq_lock on
+// every tick is wasteful — it adds ~35 cycles × 1000/sec = 35k cycles/sec
+// of pure overhead for nothing.
+//
+// Optimization: do the cheap no-lock path first (quantum tick + peek at
+// sleep_head / boost counter), and only take the lock if we actually
+// need to mutate shared state.
+//
+// What's safe without the lock:
+//   - c->current and c->current->mlfq_* fields are strictly per-CPU.
+//     Only this CPU's sched code ever touches them.  No lock needed.
+//   - c->reschedule_pending is a flag this CPU sets and this CPU reads
+//     on the next preempt check.  No cross-CPU write.
+//   - Reading rq->sleep_head as a pointer is racy under SMP (another
+//     CPU might be adding to it via sched_wake), but a stale-but-
+//     non-NULL read just means we take the lock and re-check; a
+//     stale-NULL read just means we miss a wakeup by one tick, which
+//     is fine because the next tick catches it.
+//
+// What needs the lock:
+//   - Walking and mutating sleep_head.
+//   - Mutating runqueue heads/tails during priority boost.
 void sched_tick(void) {
     s_tick_count++;
 
-    // sched_tick runs on THIS CPU — it's the local timer ISR.  Only
-    // touch this CPU's rq.
     cpu_t*    c  = this_cpu();
     cpu_rq_t* rq = &c->rq;
 
+    // ── Local-only work (no lock) ───────────────────────────────────────
+    // Tick down the running task's quantum.
+    if (c->current && c->current != c->idle) {
+        if (c->current->mlfq_ticks_left > 0)
+            c->current->mlfq_ticks_left--;
+        if (c->current->mlfq_ticks_left == 0)
+            c->reschedule_pending = 1;
+    } else {
+        c->reschedule_pending = 1;   // idle → always try to find real work
+    }
+
+    // Check whether we need to touch shared state at all.  Reading
+    // sleep_head without the lock is a data race under SMP in the
+    // strict sense, but any racy read is safe here:
+    //   - Non-NULL: we'll take the lock and re-check inside; worst
+    //     case one extra lock acquisition.
+    //   - NULL: a concurrent sched_wake might be adding a sleeper
+    //     right now, but missing its expiry by one tick is harmless
+    //     — the next tick catches it.
+    int need_lock = 0;
+    if (rq->sleep_head) need_lock = 1;
+    if (s_tick_count % BOOST_INTERVAL == 0) need_lock = 1;
+
+    if (!need_lock) return;
+
+    // ── Shared-state work (under lock) ──────────────────────────────────
     uint64_t flags = spin_lock_irqsave(&c->rq_lock);
 
     // Wake any sleeping tasks whose deadline has passed.
@@ -557,21 +606,12 @@ void sched_tick(void) {
             }
             rq->heads[i] = rq->tails[i] = NULL;
         }
-        // Boost the currently running task too.
+        // Boost the currently running task too (local state, but done
+        // here so the boost semantics are visible in one place).
         if (c->current && c->current != c->idle) {
             c->current->mlfq_level      = 0;
             c->current->mlfq_ticks_left = s_quanta[0];
         }
-    }
-
-    // Tick down the running task's quantum.
-    if (c->current && c->current != c->idle) {
-        if (c->current->mlfq_ticks_left > 0)
-            c->current->mlfq_ticks_left--;
-        if (c->current->mlfq_ticks_left == 0)
-            c->reschedule_pending = 1;
-    } else {
-        c->reschedule_pending = 1;   // idle → always try to find real work
     }
 
     spin_unlock_irqrestore(&c->rq_lock, flags);
@@ -721,8 +761,17 @@ void sched_sleep(void) {
 
 void sched_wake(task_t* proc) {
     if (!proc) return;
-    // Touch target CPU's rq under its lock.  Cross-CPU safe: we grab
-    // the owning CPU's rq_lock before looking at anything.
+    // No unlocked early-out on proc->state: there's a window where
+    //   1) the sleeper has published itself on a wait queue
+    //   2) has NOT YET set its state to TASK_SLEEPING
+    //   3) another CPU's waker drains the queue and calls sched_wake
+    // An early "if (state != TASK_SLEEPING) return" here would drop
+    // that wakeup on the floor.  The sleeper would then transition to
+    // TASK_SLEEPING and never get woken.  Classic lost-wakeup bug.
+    //
+    // Fix: always take the lock and check state under it.  The lock
+    // cost (~35 cycles) is still tiny and wake_all on a queue with
+    // many stale entries is rare in practice.
     cpu_t* home = cpu_of_task(proc);
     uint64_t flags = spin_lock_irqsave(&home->rq_lock);
     if (proc->state != TASK_SLEEPING) {
