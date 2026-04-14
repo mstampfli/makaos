@@ -433,8 +433,7 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
-    t->sigstate.head    = 0;
-    t->sigstate.tail    = 0;
+    t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->umask            = 0022u;
     t->exit_code        = 0;
@@ -530,8 +529,7 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
-    t->sigstate.head    = 0;
-    t->sigstate.tail    = 0;
+    t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->umask            = 0022u;
     t->exit_code        = 0;

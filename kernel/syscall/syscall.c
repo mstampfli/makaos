@@ -1005,8 +1005,7 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->preempt_depth    = 0;
-    t->sigstate.head    = 0;
-    t->sigstate.tail    = 0;
+    t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
@@ -2837,7 +2836,7 @@ static uint64_t sys_register_policy_agent(uint64_t read_fd, uint64_t write_fd) {
 // ── Process group / session syscalls ─────────────────────────────────────
 
 // Find a task by pid. Returns NULL if not found.
-// We scan the scheduler's run queue. This is O(n) but correct.
+// O(1) via sched's pid hash table.
 extern task_t* sched_find_pid(uint32_t pid);
 
 static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {

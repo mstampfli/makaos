@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "smp.h"
 
 // ── Signal numbers ────────────────────────────────────────────────────────
 // Mirrors POSIX signal numbers where it matters for future compatibility.
@@ -69,15 +70,24 @@ typedef struct {
 } sigframe_t;
 
 // ── Per-task signal state (embedded in task_t) ────────────────────────────
-#define SIG_QUEUE_SIZE 32   // power of 2; max pending signals queued at once
-
+//
+// Pending signals are represented as a bitmap: bit (sig-1) in `pending` is
+// set iff signal `sig` is queued for delivery.  This is the classic POSIX
+// semantics for non-RT signals: sending the same signal twice while it's
+// blocked coalesces into a single delivery (SIGCHLD, SIGINT, etc.).
+//
+// With NSIG=32 the bitmap fits in a single uint32_t, so set/clear/scan are
+// O(1).  atomic_set_bit/atomic_clear_bit are used so senders on other CPUs
+// (future SMP) don't race with the receiver's dequeue path.
+//
+// Real-time signals (SIGRTMIN..SIGRTMAX) require a *queue* with payloads;
+// MakaOS does not support them and is unlikely to.  If added later, hang a
+// separate sigqueue_t list off sigstate_t for sig >= 32 only.
 typedef struct {
-    uint8_t       queue[SIG_QUEUE_SIZE]; // ring buffer of pending signal numbers
-    uint8_t       head;
-    uint8_t       tail;
-    uint32_t      blocked;               // bitmask: bit (sig-1) set → blocked
-    k_sigaction_t handlers[NSIG];        // per-signal user action (0 = SIG_DFL)
-    uint64_t      sigframe_rsp;          // address of sigframe_t on user stack
+    volatile uint32_t pending;           // bitmap of pending signals (1<<(sig-1))
+    uint32_t          blocked;           // bitmap of blocked signals
+    k_sigaction_t     handlers[NSIG];    // per-signal user action (0 = SIG_DFL)
+    uint64_t          sigframe_rsp;      // address of sigframe_t on user stack
 } sigstate_t;
 
 // ── API ───────────────────────────────────────────────────────────────────
@@ -89,22 +99,28 @@ void signal_send_group(uint32_t tgid, int sig);
 void signal_send_pgrp(uint32_t pgid, int sig);
 void signal_deliver_pending(void);
 
+// Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these
+// is pending with SIG_DFL, signal_deliver_pending silently drops it and
+// blocking syscalls must NOT return EINTR for it (that was the SIGCHLD
+// infinite EINTR loop bug in login — see feedback_sigchld_eintr.md).
+#define SIG_DFL_IGNORE_MASK  ((1u << (SIGCHLD - 1)) | (1u << (SIGWINCH - 1)))
+
 // Returns 1 if there is a pending signal that would actually interrupt a
-// blocking syscall (i.e. has a user handler, or SIG_DFL with non-ignore
-// default action). SIGCHLD and SIGWINCH with SIG_DFL are NOT actionable —
-// they are silently discarded by signal_deliver_pending() and must not
-// cause EINTR loops.
+// blocking syscall (has a user handler, or SIG_DFL with non-ignore default).
 static inline int signal_has_actionable(const sigstate_t* ss) {
-    uint8_t scan = ss->head;
-    while (scan != ss->tail) {
-        int s = (int)ss->queue[scan];
-        uint64_t h = (s > 0 && s < NSIG) ? ss->handlers[s].sa_handler
-                                           : (uint64_t)SIG_DFL;
-        if (h != (uint64_t)SIG_IGN) {
-            if (h != (uint64_t)SIG_DFL || (s != SIGCHLD && s != SIGWINCH))
-                return 1;
-        }
-        scan = (scan + 1) & (SIG_QUEUE_SIZE - 1);
+    uint32_t eff = ss->pending & ~ss->blocked;
+    if (!eff) return 0;
+    // A bit is actionable iff its handler is not SIG_IGN and it's not a
+    // SIG_DFL-ignored signal (SIGCHLD/SIGWINCH with SIG_DFL).
+    uint32_t mask = eff;
+    while (mask) {
+        int bit = __builtin_ctz(mask);
+        mask &= mask - 1;
+        int sig = bit + 1;
+        uint64_t h = ss->handlers[sig].sa_handler;
+        if (h == (uint64_t)SIG_IGN) continue;
+        if (h == (uint64_t)SIG_DFL && (SIG_DFL_IGNORE_MASK & (1u << bit))) continue;
+        return 1;
     }
     return 0;
 }

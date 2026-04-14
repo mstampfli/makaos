@@ -3,6 +3,7 @@
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
+#include "signal.h"
 #include "tsc.h"
 #include "common.h"
 
@@ -121,7 +122,7 @@ static int64_t evdev_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     while (ring_empty(c)) {
         c->reader = g_current;
         sched_sleep();
-        if (g_current->sigstate.head != g_current->sigstate.tail)
+        if (signal_has_actionable(&g_current->sigstate))
             return -4; // -EINTR
     }
 
