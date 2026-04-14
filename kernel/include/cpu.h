@@ -71,6 +71,14 @@ typedef struct cpu_t {
     // by the IOAPIC, so access is naturally single-CPU in the common path.
     uint8_t         irq_pending[256];
 
+    // RCU quiescent-state counter.  Bumped on every context switch and
+    // every idle-loop iteration.  synchronize_rcu() waits until every
+    // CPU's counter has advanced since the grace period began.
+    // Written non-atomically by the owning CPU; read by any CPU via
+    // atomic_load_relaxed (torn reads are fine — they just delay grace
+    // period detection by one cycle).
+    volatile uint64_t rcu_qs_count;
+
     // Statistics — non-atomic, owner-only.
     uint64_t        sched_ticks;
     uint64_t        context_switches;
