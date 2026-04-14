@@ -3063,8 +3063,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
         task_we_t* sel_wes = (task_we_t*)kmalloc(sel_nslots * sizeof(task_we_t));
         uint32_t sel_used = 0;
         if (sel_wes) {
-            uint8_t* sp = (uint8_t*)sel_wes;
-            for (uint32_t si = 0; si < sel_nslots * sizeof(task_we_t); si++) sp[si] = 0;
+            __builtin_memset(sel_wes, 0, sel_nslots * sizeof(task_we_t));
             for (uint32_t fd = 0; fd < nfds; fd++) {
                 if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
                     !FD_ISSET(fd, &eset)) continue;
@@ -3159,8 +3158,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         task_we_t* p_wes = (task_we_t*)kmalloc(p_nslots * sizeof(task_we_t));
         uint32_t p_used = 0;
         if (p_wes) {
-            uint8_t* pp = (uint8_t*)p_wes;
-            for (uint32_t pi = 0; pi < p_nslots * sizeof(task_we_t); pi++) pp[pi] = 0;
+            __builtin_memset(p_wes, 0, p_nslots * sizeof(task_we_t));
             for (uint64_t i = 0; i < nfds; i++) {
                 int fd = ufds[i].fd;
                 if (fd < 0) continue;
@@ -3295,7 +3293,7 @@ static int ep_grow(epoll_state_t* st, uint32_t new_cap) {
     epoll_watch_t** new_slots = (epoll_watch_t**)kmalloc(
         (uint64_t)new_cap * sizeof(epoll_watch_t*));
     if (!new_slots) return -ENOMEM;
-    for (uint32_t i = 0; i < new_cap; i++) new_slots[i] = NULL;
+    __builtin_memset(new_slots, 0, (uint64_t)new_cap * sizeof(epoll_watch_t*));
     // Re-insert all live entries.
     for (uint32_t i = 0; i < st->cap; i++) {
         epoll_watch_t* s = st->slots[i];
@@ -3369,7 +3367,8 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     state->slots = (epoll_watch_t**)kmalloc(
         (uint64_t)EPOLL_HT_INIT_CAP * sizeof(epoll_watch_t*));
     if (!state->slots) { kfree(state); return (uint64_t)-ENOMEM; }
-    for (uint32_t i = 0; i < EPOLL_HT_INIT_CAP; i++) state->slots[i] = NULL;
+    __builtin_memset(state->slots, 0,
+                      (uint64_t)EPOLL_HT_INIT_CAP * sizeof(epoll_watch_t*));
     state->cap       = EPOLL_HT_INIT_CAP;
     state->count     = 0;
     state->has_ready = 0;

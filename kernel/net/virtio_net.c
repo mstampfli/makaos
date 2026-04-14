@@ -231,22 +231,19 @@ static int virtq_alloc(virtq_t* vq) {
     vq->desc_phys = pmm_buddy_alloc(0);
     if (!vq->desc_phys) return 0;
     vq->desc = (virtq_desc_t*)((uintptr_t)vq->desc_phys + HHDM_OFFSET);
-    for (uint32_t i = 0; i < VIRTQ_SIZE * sizeof(virtq_desc_t); i++)
-        ((uint8_t*)vq->desc)[i] = 0;
+    __builtin_memset(vq->desc, 0, VIRTQ_SIZE * sizeof(virtq_desc_t));
 
     // Available ring: 4 + 2 + 2×256 = 518 bytes, 2-byte alignment → 1 page.
     vq->avail_phys = pmm_buddy_alloc(0);
     if (!vq->avail_phys) return 0;
     vq->avail = (virtq_avail_t*)((uintptr_t)vq->avail_phys + HHDM_OFFSET);
-    for (uint32_t i = 0; i < sizeof(virtq_avail_t); i++)
-        ((uint8_t*)vq->avail)[i] = 0;
+    __builtin_memset(vq->avail, 0, sizeof(virtq_avail_t));
 
     // Used ring: 4 + 2 + 8×256 = 2054 bytes, 4-byte alignment → 1 page.
     vq->used_phys = pmm_buddy_alloc(0);
     if (!vq->used_phys) return 0;
     vq->used = (virtq_used_t*)((uintptr_t)vq->used_phys + HHDM_OFFSET);
-    for (uint32_t i = 0; i < sizeof(virtq_used_t); i++)
-        ((uint8_t*)vq->used)[i] = 0;
+    __builtin_memset(vq->used, 0, sizeof(virtq_used_t));
 
     // Build free-descriptor chain.
     for (uint16_t i = 0; i < VIRTQ_SIZE - 1; i++)

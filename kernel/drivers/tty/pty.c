@@ -387,8 +387,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     if (!pty) return -12; // ENOMEM
 
     // Zero the struct.
-    for (uint64_t i = 0; i < sizeof(pty_t); i++)
-        ((uint8_t*)pty)[i] = 0;
+    __builtin_memset(pty, 0, sizeof(pty_t));
 
     pty->master_open = 1;
     pty->slave_open_count = 1;
