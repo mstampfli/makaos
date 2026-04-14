@@ -398,7 +398,7 @@ int hda_init(void) {
     phys_addr_t corb_phys = pmm_buddy_alloc(0);
     if (!corb_phys) return 0;
     s_corb = (uint32_t*)((uintptr_t)corb_phys + HHDM_OFFSET);
-    for (int i = 0; i < 256; i++) s_corb[i] = 0;
+    __builtin_memset(s_corb, 0, 256 * sizeof(uint32_t));
 
     w8(HDA_CORBCTL, 0);
     w8(HDA_CORBSIZE, 0x02u);                               // 256 entries
@@ -414,7 +414,7 @@ int hda_init(void) {
     phys_addr_t rirb_phys = pmm_buddy_alloc(0);
     if (!rirb_phys) return 0;
     s_rirb = (uint64_t*)((uintptr_t)rirb_phys + HHDM_OFFSET);
-    for (int i = 0; i < 256; i++) s_rirb[i] = 0;
+    __builtin_memset(s_rirb, 0, 256 * sizeof(uint64_t));
 
     w8(HDA_RIRBCTL, 0);
     w8(HDA_RIRBSIZE, 0x02u);                               // 256 entries
@@ -467,7 +467,7 @@ int hda_init(void) {
     s_fifo    = (uint8_t*)((uintptr_t)fifo_phys + HHDM_OFFSET);
     s_fifo_wp = 0;
     s_fifo_rp = 0;
-    for (uint32_t i = 0; i < FIFO_BYTES; i++) s_fifo[i] = 0;
+    __builtin_memset(s_fifo, 0, FIFO_BYTES);
 
     // 13. Programme stream descriptor.
     sd_w32(SD_BDPL, (uint32_t)(bdl_phys & 0xFFFFFFFFu));

@@ -32,7 +32,8 @@ static void udp_ht_ensure_init(void) {
     s_udp_slots = (udp_sock_entry_t*)kmalloc(
         (uint64_t)UDP_HT_INIT_CAP * sizeof(udp_sock_entry_t));
     if (!s_udp_slots) return; // OOM at boot — will fail later gracefully
-    for (uint32_t i = 0; i < UDP_HT_INIT_CAP; i++) s_udp_slots[i].port = 0;
+    __builtin_memset(s_udp_slots, 0,
+                      (uint64_t)UDP_HT_INIT_CAP * sizeof(udp_sock_entry_t));
     s_udp_cap = UDP_HT_INIT_CAP;
 }
 
@@ -66,7 +67,7 @@ static int udp_ht_grow(void) {
     udp_sock_entry_t* ns = (udp_sock_entry_t*)kmalloc(
         (uint64_t)new_cap * sizeof(udp_sock_entry_t));
     if (!ns) return -ENOMEM;
-    for (uint32_t i = 0; i < new_cap; i++) ns[i].port = 0;
+    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(udp_sock_entry_t));
     for (uint32_t i = 0; i < s_udp_cap; i++)
         if (s_udp_slots[i].port)
             udp_ht_raw_insert(ns, new_cap, s_udp_slots[i].port, s_udp_slots[i].sock);
@@ -226,9 +227,7 @@ vfs_file_t* socket_open(int domain, int type) {
     socket_t* s = (socket_t*)kmalloc(sizeof(socket_t));
     if (!s) return 0;
 
-    // Zero-initialise.
-    uint8_t* p = (uint8_t*)s;
-    for (uint32_t i = 0; i < sizeof(socket_t); i++) p[i] = 0;
+    __builtin_memset(s, 0, sizeof(socket_t));
 
     s->type = (uint8_t)type;
 
@@ -337,8 +336,7 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     // Wrap the child PCB in a new socket_t / vfs_file_t.
     socket_t* cs = (socket_t*)kmalloc(sizeof(socket_t));
     if (!cs) { tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
-    uint8_t* p = (uint8_t*)cs;
-    for (uint32_t i = 0; i < sizeof(socket_t); i++) p[i] = 0;
+    __builtin_memset(cs, 0, sizeof(socket_t));
     cs->type  = SOCK_STREAM;
     cs->pcb   = child_pcb;
     cs->bound = 1;

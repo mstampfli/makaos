@@ -36,8 +36,7 @@ static inline phys_addr_t vmm_pml4_get(void) {
 phys_addr_t vmm_current_pml4(void) { return vmm_pml4_get(); }
 
 static inline void zero_page(virt_addr_t addr) {
-    uint64_t* p = (uint64_t*)addr;
-    for (int i = 0; i < 512; i++) p[i] = 0;
+    __builtin_memset((void*)addr, 0, PAGE_SIZE);
 }
 
 // Walk the 4-level page table for `vaddr` inside the PML4 at `pml4_phys`.
@@ -172,8 +171,10 @@ phys_addr_t vmm_alloc_pml4(void) {
     uint64_t* new_pml4  = (uint64_t*)(phys + HHDM_OFFSET);
     uint64_t* kern_pml4 = (uint64_t*)(g_kernel_pml4 + HHDM_OFFSET);
 
-    for (int i = 0;   i < 256; i++) new_pml4[i] = 0;             // user: empty
-    for (int i = 256; i < 512; i++) new_pml4[i] = kern_pml4[i]; // kernel: shared
+    // Lower half = user (256 × 8 = 2 KiB zeroed).
+    __builtin_memset(new_pml4, 0, 256 * sizeof(uint64_t));
+    // Upper half = shared kernel (copy 2 KiB from the kernel's PML4).
+    __builtin_memcpy(new_pml4 + 256, kern_pml4 + 256, 256 * sizeof(uint64_t));
 
     return phys;
 }
@@ -617,8 +618,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                 if (is_user) goto kill; else goto kernel_panic;
             }
             // Zero the frame (security: never expose old data to user).
-            uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
-            for (int i = 0; i < 512; i++) p[i] = 0;
+            __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
         }
 
         if (!vmm_page_map(vmm_pml4_get(), page, frame,
@@ -670,8 +670,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         // Not-present in kernel space: demand-map (kheap expansion).
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) goto kernel_panic;
-        uint64_t* p = (uint64_t*)(frame + HHDM_OFFSET);
-        for (int i = 0; i < 512; i++) p[i] = 0;
+        __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
         vmm_page_map(g_kernel_pml4, fault_addr & ~PAGE_MASK, frame, VMM_KDATA);
         return;
     }

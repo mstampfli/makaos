@@ -466,8 +466,7 @@ tcp_pcb_t* tcp_pcb_alloc(uint16_t lport) {
     if (!p) return NULL;
 
     // Zero the PCB.
-    uint8_t* b = (uint8_t*)p;
-    for (uint32_t j = 0; j < sizeof(tcp_pcb_t); j++) b[j] = 0;
+    __builtin_memset(p, 0, sizeof(tcp_pcb_t));
     p->local_ip   = net_our_ip();
     p->local_port = lport;
     p->rcv_wnd    = TCP_WINDOW;

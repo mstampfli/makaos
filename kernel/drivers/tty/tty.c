@@ -392,7 +392,7 @@ void tty_init(void) {
     wait_queue_init(&tty->waitq);
     tty->write_char = console_write_char;
 
-    for (int i = 0; i < 16; i++) tty->name[i] = 0;
+    __builtin_memset(tty->name, 0, sizeof(tty->name));
     tty->name[0] = 't'; tty->name[1] = 't'; tty->name[2] = 'y';
     tty->name[3] = '0'; tty->name[4] = '\0';
 

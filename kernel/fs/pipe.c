@@ -119,7 +119,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     pipe_buf_t* p = kmalloc(sizeof(pipe_buf_t));
     if (!p) return -ENOMEM;
 
-    for (int i = 0; i < PIPE_BUF_SIZE; i++) p->buf[i] = 0;
+    __builtin_memset(p->buf, 0, PIPE_BUF_SIZE);
     p->head = p->tail = p->count = 0;
     p->writer_refs = 1;
     p->reader_refs = 1;

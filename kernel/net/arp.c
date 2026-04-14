@@ -47,7 +47,8 @@ static void arp_cache_ensure_init(void) {
     if (s_cache) return;
     s_cache = (arp_entry_t*)kmalloc((uint64_t)ARP_HT_INIT_CAP * sizeof(arp_entry_t));
     if (!s_cache) return;
-    for (uint32_t i = 0; i < ARP_HT_INIT_CAP; i++) s_cache[i].ip_be = 0;
+    __builtin_memset(s_cache, 0,
+                      (uint64_t)ARP_HT_INIT_CAP * sizeof(arp_entry_t));
     s_cache_cap = ARP_HT_INIT_CAP;
 }
 
@@ -80,7 +81,7 @@ static int arp_cache_grow(void) {
     uint32_t new_cap = s_cache_cap * 2u;
     arp_entry_t* ns = (arp_entry_t*)kmalloc((uint64_t)new_cap * sizeof(arp_entry_t));
     if (!ns) return -1;
-    for (uint32_t i = 0; i < new_cap; i++) ns[i].ip_be = 0;
+    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(arp_entry_t));
     for (uint32_t i = 0; i < s_cache_cap; i++)
         if (s_cache[i].ip_be)
             arp_cache_raw_insert(ns, new_cap, s_cache[i].ip_be, s_cache[i].mac);

@@ -46,7 +46,7 @@ static void pid_ht_ensure_init(void) {
     if (s_pid_slots) return;
     s_pid_slots = (task_t**)kmalloc((uint64_t)PID_HT_INIT_CAP * sizeof(task_t*));
     if (!s_pid_slots) return;
-    for (uint32_t i = 0; i < PID_HT_INIT_CAP; i++) s_pid_slots[i] = NULL;
+    __builtin_memset(s_pid_slots, 0, (uint64_t)PID_HT_INIT_CAP * sizeof(task_t*));
     s_pid_cap = PID_HT_INIT_CAP;
 }
 
@@ -65,7 +65,7 @@ static int pid_ht_grow(void) {
     uint32_t new_cap = s_pid_cap * 2u;
     task_t** ns = (task_t**)kmalloc((uint64_t)new_cap * sizeof(task_t*));
     if (!ns) return -1;
-    for (uint32_t i = 0; i < new_cap; i++) ns[i] = NULL;
+    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(task_t*));
     for (uint32_t i = 0; i < s_pid_cap; i++) {
         task_t* s = s_pid_slots[i];
         if (s && s != PID_HT_TOMB) pid_ht_raw_insert(ns, new_cap, s);
@@ -170,7 +170,7 @@ static void tidx_ensure_init(task_idx_t* ht) {
     if (ht->slots) return;
     ht->slots = (task_t**)kmalloc((uint64_t)TIDX_INIT_CAP * sizeof(task_t*));
     if (!ht->slots) return;
-    for (uint32_t i = 0; i < TIDX_INIT_CAP; i++) ht->slots[i] = NULL;
+    __builtin_memset(ht->slots, 0, (uint64_t)TIDX_INIT_CAP * sizeof(task_t*));
     ht->cap = TIDX_INIT_CAP;
 }
 
@@ -210,7 +210,7 @@ static int tidx_grow(task_idx_t* ht, tidx_keyof_t keyof) {
     uint32_t new_cap = ht->cap * 2u;
     task_t** ns = (task_t**)kmalloc((uint64_t)new_cap * sizeof(task_t*));
     if (!ns) return -1;
-    for (uint32_t i = 0; i < new_cap; i++) ns[i] = NULL;
+    __builtin_memset(ns, 0, (uint64_t)new_cap * sizeof(task_t*));
     for (uint32_t i = 0; i < ht->cap; i++) {
         task_t* head = ht->slots[i];
         if (!head || head == TIDX_TOMB) continue;

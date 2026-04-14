@@ -36,7 +36,8 @@ uint8_t fd_table_init(task_files_t* f, uint32_t cap) {
     if (!f->fd_table) return 0;
     f->fd_flags = kmalloc(cap * sizeof(uint32_t));
     if (!f->fd_flags) { kfree(f->fd_table); f->fd_table = NULL; return 0; }
-    for (uint32_t i = 0; i < cap; i++) { f->fd_table[i] = NULL; f->fd_flags[i] = 0; }
+    __builtin_memset(f->fd_table, 0, cap * sizeof(vfs_file_t*));
+    __builtin_memset(f->fd_flags, 0, cap * sizeof(uint32_t));
     f->fd_capacity = cap;
     return 1;
 }
@@ -49,14 +50,12 @@ uint8_t fd_table_grow(task_files_t* f) {
     uint32_t* flg = kmalloc(new_cap * sizeof(uint32_t));
     if (!flg) { kfree(tbl); return 0; }
 
-    for (uint32_t i = 0; i < f->fd_capacity; i++) {
-        tbl[i] = f->fd_table[i];
-        flg[i] = f->fd_flags[i];
-    }
-    for (uint32_t i = f->fd_capacity; i < new_cap; i++) {
-        tbl[i] = NULL;
-        flg[i] = 0;
-    }
+    __builtin_memcpy(tbl, f->fd_table, f->fd_capacity * sizeof(vfs_file_t*));
+    __builtin_memcpy(flg, f->fd_flags, f->fd_capacity * sizeof(uint32_t));
+    __builtin_memset(tbl + f->fd_capacity, 0,
+                      (new_cap - f->fd_capacity) * sizeof(vfs_file_t*));
+    __builtin_memset(flg + f->fd_capacity, 0,
+                      (new_cap - f->fd_capacity) * sizeof(uint32_t));
 
     kfree(f->fd_table);
     kfree(f->fd_flags);

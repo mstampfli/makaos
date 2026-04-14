@@ -48,9 +48,8 @@ static void ns_ensure_init(void) {
     s_unix_ns = (unix_ns_entry_t*)kmalloc(
         (uint64_t)UNIX_NS_INIT_CAP * sizeof(unix_ns_entry_t));
     if (!s_unix_ns) return;
-    for (uint32_t i = 0; i < UNIX_NS_INIT_CAP; i++) {
-        s_unix_ns[i].sock = NULL; s_unix_ns[i].path[0] = '\0';
-    }
+    __builtin_memset(s_unix_ns, 0,
+                      (uint64_t)UNIX_NS_INIT_CAP * sizeof(unix_ns_entry_t));
     s_unix_ns_cap = UNIX_NS_INIT_CAP;
 }
 
@@ -83,7 +82,7 @@ static int ns_grow(void) {
     unix_ns_entry_t* ns2 = (unix_ns_entry_t*)kmalloc(
         (uint64_t)new_cap * sizeof(unix_ns_entry_t));
     if (!ns2) return -ENOMEM;
-    for (uint32_t i = 0; i < new_cap; i++) { ns2[i].sock = NULL; ns2[i].path[0] = '\0'; }
+    __builtin_memset(ns2, 0, (uint64_t)new_cap * sizeof(unix_ns_entry_t));
     for (uint32_t i = 0; i < s_unix_ns_cap; i++)
         if (s_unix_ns[i].sock)
             ns_raw_insert(ns2, new_cap, s_unix_ns[i].path, s_unix_ns[i].sock);
@@ -132,8 +131,7 @@ static void str_copy(char* dst, const char* src, int max) {
 }
 
 static void zero_mem(void* p, uint32_t n) {
-    uint8_t* b = (uint8_t*)p;
-    for (uint32_t i = 0; i < n; i++) b[i] = 0;
+    __builtin_memset(p, 0, n);
 }
 
 // Wake a task sleeping on a socket (blocking recv/accept/connect).
