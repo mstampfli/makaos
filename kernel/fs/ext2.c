@@ -3,6 +3,40 @@
 #include "kheap.h"
 #include "common.h"
 
+// ── Multi-task-safe scratch buffers ──────────────────────────────────────
+// Function-local 4 KiB scratch buffers must NOT live on the kstack (8 KiB
+// total) or in static/BSS (would race across preempted tasks).  Use the
+// EXT2_SCRATCH macro to kmalloc one with an automatic free on scope exit.
+//
+//   void f(...) {
+//       EXT2_SCRATCH(buf);          // kmalloc(4096), bails if OOM
+//       read_block(blk, buf);
+//       // ... no need to kfree, cleanup attribute fires on every return
+//   }
+//
+// Note: the file-scope s_blk_buf / s_blk_buf2 / s_bcache_data buffers below
+// stay static on purpose — they are in the absolute hot path and are
+// covered by ext2's implicit serialization.  See feedback memory.
+static inline void ext2_scratch_free_(uint8_t** p) {
+    if (*p) kfree(*p);
+}
+// For functions returning a value (return 0 on OOM — used by helpers
+// whose 0 sentinel means "failure"):
+#define EXT2_SCRATCH(name) \
+    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
+        (uint8_t*)kmalloc(4096); \
+    if (!name) return 0
+// For functions where -1 is the failure sentinel (vfs_read/write):
+#define EXT2_SCRATCH_NEG1(name) \
+    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
+        (uint8_t*)kmalloc(4096); \
+    if (!name) return -1
+// For void functions (silent return on OOM):
+#define EXT2_SCRATCH_VOID(name) \
+    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
+        (uint8_t*)kmalloc(4096); \
+    if (!name) return
+
 // ── Mount state ────────────────────────────────────────────────────────────
 
 static uint32_t s_part_lba        = 0;
@@ -303,7 +337,7 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         uint32_t indirect_blk = ino->i_block[12];
         if (!indirect_blk) return 0;
 
-        static uint8_t ind_buf[4096];
+        EXT2_SCRATCH(ind_buf);
         if (!read_block(indirect_blk, ind_buf)) return 0;
         uint32_t* addrs = (uint32_t*)ind_buf;
         return addrs[idx];
@@ -315,14 +349,14 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
         uint32_t dblind_blk = ino->i_block[13];
         if (!dblind_blk) return 0;
 
-        static uint8_t dbl_buf[4096];
+        EXT2_SCRATCH(dbl_buf);
         if (!read_block(dblind_blk, dbl_buf)) return 0;
         uint32_t* l1 = (uint32_t*)dbl_buf;
         uint32_t l1_idx = idx / addrs_per_blk;
         uint32_t l2_idx = idx % addrs_per_blk;
         if (!l1[l1_idx]) return 0;
 
-        static uint8_t dbl_buf2[4096];
+        EXT2_SCRATCH(dbl_buf2);
         if (!read_block(l1[l1_idx], dbl_buf2)) return 0;
         uint32_t* l2 = (uint32_t*)dbl_buf2;
         return l2[l2_idx];
@@ -341,12 +375,12 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
     uint32_t bytes_left = file_size;
     uint32_t blk_idx = 0;
 
+    EXT2_SCRATCH(dir_buf);  // hoisted out of loop — one alloc per call
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(dir_ino, blk_idx);
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t dir_buf[4096];
         if (!read_block(blk, dir_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -435,6 +469,8 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* dst = (uint8_t*)buf;
     uint64_t total = 0;
 
+    EXT2_SCRATCH_NEG1(rd_buf);  // hoisted: one alloc per syscall, freed on return
+
     while (total < len) {
         if (fd->cur_pos >= fd->file_size) break;
 
@@ -508,7 +544,6 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         }
 
         // Single block read (partial block or non-consecutive).
-        static uint8_t rd_buf[4096];
         if (!read_block(blk, rd_buf)) return -1;
         const uint8_t* src = rd_buf + off_in_blk;
         for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
@@ -531,6 +566,10 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     const uint8_t* src = (const uint8_t*)buf;
     uint64_t total = 0;
 
+    EXT2_SCRATCH(zb);      // zero-fill scratch for new blocks
+    EXT2_SCRATCH(wr_buf);  // read-modify-write scratch
+    for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
+
     while (total < len) {
         uint32_t blk_idx    = fd->cur_pos / s_block_size;
         uint32_t off_in_blk = fd->cur_pos % s_block_size;
@@ -542,15 +581,11 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
         if (!blk) {
             blk = alloc_block();
             if (!blk) break;
-            // Zero-initialize new block.
-            static uint8_t zb[4096];
-            for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
             if (!write_block(blk, zb)) { free_block(blk); break; }
             if (!inode_set_block(&fd->inode, blk_idx, blk)) { free_block(blk); break; }
         }
 
         // Read-modify-write if partial block.
-        static uint8_t wr_buf[4096];
         if (off_in_blk != 0 || to_write != s_block_size) {
             if (!read_block(blk, wr_buf)) break;
         }
@@ -654,12 +689,12 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
     uint32_t bytes_left = dir_inode.i_size;
     uint32_t blk_idx = 0;
 
+    EXT2_SCRATCH_NEG1(rdd_buf);  // hoisted out of loop
     while (bytes_left > 0 && count < max) {
         uint32_t blk = inode_get_block(&dir_inode, blk_idx);
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t rdd_buf[4096];
         if (!read_block(blk, rdd_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -712,7 +747,7 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
 
 // Allocate a free inode from any group. Returns inode number or 0.
 static uint32_t alloc_inode(void) {
-    static uint8_t ibm_buf[4096];
+    EXT2_SCRATCH(ibm_buf);
 
     for (uint32_t g = 0; g < s_num_groups; g++) {
         ext2_bgd_t bgd;
@@ -738,7 +773,7 @@ static uint32_t alloc_inode(void) {
 
 // Allocate a free block from any group. Returns block number or 0.
 static uint32_t alloc_block(void) {
-    static uint8_t bbm_buf[4096];
+    EXT2_SCRATCH(bbm_buf);
 
     for (uint32_t g = 0; g < s_num_groups; g++) {
         ext2_bgd_t bgd;
@@ -765,7 +800,7 @@ static uint32_t alloc_block(void) {
 // Free a block.
 static void free_block(uint32_t blk) {
     if (!blk) return;
-    static uint8_t fbb_buf[4096];
+    EXT2_SCRATCH_VOID(fbb_buf);
 
     // Determine which group this block belongs to.
     uint32_t rel = (blk >= s_first_data_blk) ? (blk - s_first_data_blk) : blk;
@@ -787,7 +822,7 @@ static void free_block(uint32_t blk) {
 // Free an inode.
 static void free_inode_num(uint32_t ino) {
     if (!ino) return;
-    static uint8_t fib_buf[4096];
+    EXT2_SCRATCH_VOID(fib_buf);
 
     uint32_t g   = (ino - 1) / s_inodes_per_grp;
     uint32_t bit = (ino - 1) % s_inodes_per_grp;
@@ -806,7 +841,7 @@ static void free_inode_num(uint32_t ino) {
 
 // Zero a block on disk.
 static void zero_block(uint32_t blk) {
-    static uint8_t zb_buf[4096];
+    EXT2_SCRATCH_VOID(zb_buf);
     for (uint32_t i = 0; i < s_block_size; i++) zb_buf[i] = 0;
     write_block(blk, zb_buf);
 }
@@ -823,7 +858,7 @@ static void free_inode_blocks(ext2_inode_t* inode) {
     }
 
     if (inode->i_block[12]) {
-        static uint8_t ind_free_buf[4096];
+        EXT2_SCRATCH_VOID(ind_free_buf);
         if (read_block(inode->i_block[12], ind_free_buf)) {
             uint32_t* addrs = (uint32_t*)ind_free_buf;
             for (uint32_t i = 0; i < addrs_per_blk; i++) {
@@ -836,12 +871,13 @@ static void free_inode_blocks(ext2_inode_t* inode) {
 
     // Double indirect.
     if (inode->i_block[13]) {
-        static uint8_t dind_free_buf[4096];
+        EXT2_SCRATCH_VOID(dind_free_buf);
+        // Hoist the inner buffer out of the loop — one alloc, reused per L2 read.
+        EXT2_SCRATCH_VOID(dind_free_buf2);
         if (read_block(inode->i_block[13], dind_free_buf)) {
             uint32_t* l1 = (uint32_t*)dind_free_buf;
             for (uint32_t i = 0; i < addrs_per_blk; i++) {
                 if (!l1[i]) continue;
-                static uint8_t dind_free_buf2[4096];
                 if (read_block(l1[i], dind_free_buf2)) {
                     uint32_t* l2 = (uint32_t*)dind_free_buf2;
                     for (uint32_t j = 0; j < addrs_per_blk; j++) {
@@ -872,7 +908,7 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
 
     if (idx < addrs_per_blk) {
         // Single indirect.
-        static uint8_t si_buf[4096];
+        EXT2_SCRATCH(si_buf);
         if (!inode->i_block[12]) {
             // Allocate indirect block.
             uint32_t ind_blk = alloc_block();
@@ -892,7 +928,8 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
 
     if (idx < addrs_per_blk * addrs_per_blk) {
         // Double indirect.
-        static uint8_t di_l1_buf[4096];
+        EXT2_SCRATCH(di_l1_buf);
+        EXT2_SCRATCH(di_l2_buf);
         if (!inode->i_block[13]) {
             uint32_t dind_blk = alloc_block();
             if (!dind_blk) return 0;
@@ -905,7 +942,6 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
         uint32_t l1_idx = idx / addrs_per_blk;
         uint32_t l2_idx = idx % addrs_per_blk;
 
-        static uint8_t di_l2_buf[4096];
         if (!l1[l1_idx]) {
             uint32_t l2_blk = alloc_block();
             if (!l2_blk) return 0;
@@ -941,6 +977,7 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
     uint32_t blk_idx = 0;
     uint32_t bytes_left = dir_inode.i_size;
 
+    EXT2_SCRATCH(dae_buf);  // hoisted out of the directory-walk loop
     while (1) {
         uint32_t blk;
         uint8_t new_blk = 0;
@@ -962,7 +999,6 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
             if (!blk) break;
         }
 
-        static uint8_t dae_buf[4096];
         if (!read_block(blk, dae_buf)) return 0;
 
         if (new_blk) {
@@ -1040,12 +1076,12 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
     uint32_t bytes_left = dir_inode.i_size;
     uint32_t blk_idx = 0;
 
+    EXT2_SCRATCH(dre_buf);  // hoisted out of the directory-walk loop
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(&dir_inode, blk_idx);
         blk_idx++;
         if (!blk) break;
 
-        static uint8_t dre_buf[4096];
         if (!read_block(blk, dre_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1106,7 +1142,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     if (!s_mounted) return 0;
 
     // Split into parent dir and basename.
-    static char parent_path[256];
+    char parent_path[256];
     const char* basename = path_split(path, parent_path);
     if (!basename || basename[0] == '\0') return 0;
 
@@ -1118,6 +1154,9 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     if (!read_inode(parent_ino, &parent_inode)) return 0;
 
     uint32_t existing_ino = dir_lookup(&parent_inode, basename, str_len(basename));
+
+    // Single scratch buffer reused for every block write below.
+    EXT2_SCRATCH(wr_buf);
 
     if (existing_ino) {
         // Overwrite: free all old blocks.
@@ -1135,7 +1174,6 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
             uint32_t blk = alloc_block();
             if (!blk) return 0;
 
-            static uint8_t wr_buf[4096];
             uint32_t to_write = size - written;
             if (to_write > s_block_size) to_write = s_block_size;
 
@@ -1176,14 +1214,14 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         uint32_t blk = alloc_block();
         if (!blk) { free_inode_num(new_ino); return 0; }
 
-        static uint8_t nwr_buf[4096];
+        // Reuse wr_buf from above — same scope, single allocation.
         uint32_t to_write = size - written;
         if (to_write > s_block_size) to_write = s_block_size;
 
-        for (uint32_t i = 0; i < to_write; i++) nwr_buf[i] = data[written + i];
-        for (uint32_t i = to_write; i < s_block_size; i++) nwr_buf[i] = 0;
+        for (uint32_t i = 0; i < to_write; i++) wr_buf[i] = data[written + i];
+        for (uint32_t i = to_write; i < s_block_size; i++) wr_buf[i] = 0;
 
-        if (!write_block(blk, nwr_buf)) { free_block(blk); free_inode_num(new_ino); return 0; }
+        if (!write_block(blk, wr_buf)) { free_block(blk); free_inode_num(new_ino); return 0; }
         if (!inode_set_block(&new_inode, bi, blk)) {
             free_block(blk);
             free_inode_num(new_ino);
@@ -1209,7 +1247,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 // Create an empty file.  Returns 0 if the file already exists.
 int ext2_create(const char* path) {
     if (!s_mounted) return 0;
-    static char parent_path[256];
+    char parent_path[256];
     const char* basename = path_split(path, parent_path);
     if (!basename || basename[0] == '\0') return 0;
     uint32_t parent_ino = path_to_inode(parent_path);
@@ -1360,7 +1398,7 @@ int ext2_mkdir(const char* path) {
     // Check it doesn't already exist.
     if (path_to_inode(path)) return 0; // already exists
 
-    static char md_parent[256];
+    char md_parent[256];
     const char* basename = path_split(path, md_parent);
     if (!basename || basename[0] == '\0') return 0;
 
@@ -1376,7 +1414,7 @@ int ext2_mkdir(const char* path) {
     if (!data_blk) { free_inode_num(new_ino); return 0; }
 
     // Build the data block with "." and "..".
-    static uint8_t mkdir_buf[4096];
+    EXT2_SCRATCH(mkdir_buf);
     for (uint32_t i = 0; i < s_block_size; i++) mkdir_buf[i] = 0;
 
     // "." entry.
@@ -1453,7 +1491,7 @@ int ext2_unlink(const char* path) {
     // Refuse to unlink directories.
     if ((inode.i_mode & 0xF000) == EXT2_S_IFDIR) return 0;
 
-    static char ul_parent[256];
+    char ul_parent[256];
     const char* basename = path_split(path, ul_parent);
     if (!basename || basename[0] == '\0') return 0;
 
@@ -1492,14 +1530,14 @@ int ext2_rename(const char* src, const char* dst) {
     uint8_t is_dir = ((src_inode.i_mode & 0xF000) == EXT2_S_IFDIR);
 
     // Resolve src parent/basename.
-    static char rn_src_parent[256];
+    char rn_src_parent[256];
     const char* src_base = path_split(src, rn_src_parent);
     if (!src_base || src_base[0] == '\0') return 0;
     uint32_t src_parent_ino = path_to_inode(rn_src_parent);
     if (!src_parent_ino) return 0;
 
     // Resolve dst parent/basename.
-    static char rn_dst_parent[256];
+    char rn_dst_parent[256];
     const char* dst_base = path_split(dst, rn_dst_parent);
     if (!dst_base || dst_base[0] == '\0') return 0;
     uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
