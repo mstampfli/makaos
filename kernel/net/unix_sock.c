@@ -3,6 +3,8 @@
 #include "errno.h"
 #include "sched.h"
 #include "process.h"
+#include "smp.h"
+#include "rcu.h"
 
 #ifndef O_NONBLOCK
 #define O_NONBLOCK 0x800
@@ -11,9 +13,15 @@
 #define EAGAIN 11
 #endif
 
-// ── Bind namespace ───────────────────────────────────────────────────────
-// Open-addressing hash table: path → unix_sock_t*.
-// sock==NULL means empty.  Grows at 75% load.  No fixed cap.
+// ── Bind namespace (RCU-protected) ───────────────────────────────────────
+// The whole namespace is a single object (unix_ns_table_t) published via
+// rcu_assign_pointer.  Readers walk lock-free inside rcu_read_lock().
+// Writers (bind/close) serialise on s_unix_ns_wlock, build a fresh table
+// via copy-on-write, publish it, and call_rcu the old one.
+//
+// Mutation cost is O(cap) per insert/remove, but these are control-plane
+// events (bind/close once per socket lifetime), while ns_find runs on
+// every connect() / sendto() — so the trade is exactly what RCU is for.
 
 #define UNIX_NS_INIT_CAP 32u
 
@@ -22,9 +30,14 @@ typedef struct {
     unix_sock_t* sock;  // NULL = empty slot
 } unix_ns_entry_t;
 
-static unix_ns_entry_t* s_unix_ns     = NULL;
-static uint32_t         s_unix_ns_cap = 0;
-static uint32_t         s_unix_ns_cnt = 0;
+typedef struct unix_ns_table {
+    uint32_t         cap;     // power of two
+    uint32_t         cnt;
+    unix_ns_entry_t  slots[]; // flexible
+} unix_ns_table_t;
+
+static unix_ns_table_t* s_unix_ns       = NULL;  // RCU-protected
+static spinlock_t       s_unix_ns_wlock = SPINLOCK_INIT;
 
 static int ns_streq(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
@@ -43,83 +56,104 @@ static uint32_t ns_hash_str(const char* s, uint32_t cap) {
     return h & (cap - 1u);
 }
 
-static void ns_ensure_init(void) {
-    if (s_unix_ns) return;
-    s_unix_ns = (unix_ns_entry_t*)kmalloc(
-        (uint64_t)UNIX_NS_INIT_CAP * sizeof(unix_ns_entry_t));
-    if (!s_unix_ns) return;
-    __builtin_memset(s_unix_ns, 0,
-                      (uint64_t)UNIX_NS_INIT_CAP * sizeof(unix_ns_entry_t));
-    s_unix_ns_cap = UNIX_NS_INIT_CAP;
+static unix_ns_table_t* ns_table_alloc(uint32_t cap) {
+    unix_ns_table_t* t = (unix_ns_table_t*)kmalloc(
+        sizeof(unix_ns_table_t) + (uint64_t)cap * sizeof(unix_ns_entry_t));
+    if (!t) return NULL;
+    t->cap = cap;
+    t->cnt = 0;
+    __builtin_memset(t->slots, 0, (uint64_t)cap * sizeof(unix_ns_entry_t));
+    return t;
 }
 
-static uint32_t ns_ht_find_idx(const char* path) {
-    if (!s_unix_ns) return s_unix_ns_cap;
-    uint32_t i = ns_hash_str(path, s_unix_ns_cap);
-    for (uint32_t n = 0; n < s_unix_ns_cap; n++) {
-        if (!s_unix_ns[i].sock) return s_unix_ns_cap;
-        if (ns_streq(s_unix_ns[i].path, path)) return i;
-        i = (i + 1u) & (s_unix_ns_cap - 1u);
-    }
-    return s_unix_ns_cap;
+static void ns_table_raw_insert(unix_ns_table_t* t, const char* path,
+                                  unix_sock_t* sock) {
+    uint32_t i = ns_hash_str(path, t->cap);
+    while (t->slots[i].sock) i = (i + 1u) & (t->cap - 1u);
+    ns_path_copy(t->slots[i].path, path);
+    t->slots[i].sock = sock;
+    t->cnt++;
 }
 
-static void ns_raw_insert(unix_ns_entry_t* slots, uint32_t cap,
-                           const char* path, unix_sock_t* sock) {
+static void ns_table_free_rcu(void* p) { kfree(p); }
+
+// Reader — must be inside rcu_read_lock().  The returned pointer stays
+// valid for the rest of the reader section because unix_sock_close defers
+// the entire teardown via call_rcu.
+static unix_sock_t* ns_find(const char* path) {
+    unix_ns_table_t* t = rcu_dereference(s_unix_ns);
+    if (!t) return NULL;
+    uint32_t cap = t->cap;
     uint32_t i = ns_hash_str(path, cap);
-    for (;;) {
-        if (!slots[i].sock) {
-            ns_path_copy(slots[i].path, path);
-            slots[i].sock = sock;
-            return;
-        }
+    for (uint32_t n = 0; n < cap; n++) {
+        unix_sock_t* s = t->slots[i].sock;
+        if (!s) return NULL;
+        if (ns_streq(t->slots[i].path, path)) return s;
         i = (i + 1u) & (cap - 1u);
     }
+    return NULL;
 }
 
-static int ns_grow(void) {
-    uint32_t new_cap = s_unix_ns_cap * 2u;
-    unix_ns_entry_t* ns2 = (unix_ns_entry_t*)kmalloc(
-        (uint64_t)new_cap * sizeof(unix_ns_entry_t));
-    if (!ns2) return -ENOMEM;
-    __builtin_memset(ns2, 0, (uint64_t)new_cap * sizeof(unix_ns_entry_t));
-    for (uint32_t i = 0; i < s_unix_ns_cap; i++)
-        if (s_unix_ns[i].sock)
-            ns_raw_insert(ns2, new_cap, s_unix_ns[i].path, s_unix_ns[i].sock);
-    kfree(s_unix_ns);
-    s_unix_ns = ns2; s_unix_ns_cap = new_cap;
-    return 0;
-}
-
-static unix_sock_t* ns_find(const char* path) {
-    uint32_t idx = ns_ht_find_idx(path);
-    return (idx < s_unix_ns_cap) ? s_unix_ns[idx].sock : NULL;
-}
-
+// Writer: copy-on-write, rcu_assign_pointer, defer the old table.
 static int ns_insert(const char* path, unix_sock_t* sock) {
-    ns_ensure_init();
-    if (!s_unix_ns) return -ENOMEM;
-    if (ns_ht_find_idx(path) < s_unix_ns_cap) return -EADDRINUSE;
-    if (s_unix_ns_cnt * 4u >= s_unix_ns_cap * 3u)
-        if (ns_grow() < 0) return -ENOMEM;
-    ns_raw_insert(s_unix_ns, s_unix_ns_cap, path, sock);
-    s_unix_ns_cnt++;
+    uint64_t flags = spin_lock_irqsave(&s_unix_ns_wlock);
+    unix_ns_table_t* old = s_unix_ns;
+    uint32_t old_cap = old ? old->cap : 0;
+    uint32_t old_cnt = old ? old->cnt : 0;
+
+    // Duplicate check under the writer lock.
+    if (old) {
+        uint32_t i = ns_hash_str(path, old_cap);
+        for (uint32_t n = 0; n < old_cap; n++) {
+            if (!old->slots[i].sock) break;
+            if (ns_streq(old->slots[i].path, path)) {
+                spin_unlock_irqrestore(&s_unix_ns_wlock, flags);
+                return -EADDRINUSE;
+            }
+            i = (i + 1u) & (old_cap - 1u);
+        }
+    }
+
+    uint32_t new_cap = old_cap ? old_cap : UNIX_NS_INIT_CAP;
+    if ((old_cnt + 1u) * 4u >= new_cap * 3u)
+        new_cap = old_cap ? old_cap * 2u : UNIX_NS_INIT_CAP;
+
+    unix_ns_table_t* neu = ns_table_alloc(new_cap);
+    if (!neu) { spin_unlock_irqrestore(&s_unix_ns_wlock, flags); return -ENOMEM; }
+
+    if (old) {
+        for (uint32_t i = 0; i < old->cap; i++)
+            if (old->slots[i].sock)
+                ns_table_raw_insert(neu, old->slots[i].path, old->slots[i].sock);
+    }
+    ns_table_raw_insert(neu, path, sock);
+
+    rcu_assign_pointer(s_unix_ns, neu);
+    spin_unlock_irqrestore(&s_unix_ns_wlock, flags);
+    if (old) call_rcu(ns_table_free_rcu, old);
     return 0;
 }
 
 static void ns_remove(const char* path) {
-    uint32_t idx = ns_ht_find_idx(path);
-    if (idx >= s_unix_ns_cap) return;
-    // Robin Hood deletion.
-    s_unix_ns[idx].sock = NULL; s_unix_ns[idx].path[0] = '\0';
-    uint32_t i = (idx + 1u) & (s_unix_ns_cap - 1u);
-    while (s_unix_ns[i].sock) {
-        unix_ns_entry_t tmp = s_unix_ns[i];
-        s_unix_ns[i].sock = NULL; s_unix_ns[i].path[0] = '\0';
-        ns_raw_insert(s_unix_ns, s_unix_ns_cap, tmp.path, tmp.sock);
-        i = (i + 1u) & (s_unix_ns_cap - 1u);
+    uint64_t flags = spin_lock_irqsave(&s_unix_ns_wlock);
+    unix_ns_table_t* old = s_unix_ns;
+    if (!old) { spin_unlock_irqrestore(&s_unix_ns_wlock, flags); return; }
+
+    unix_ns_table_t* neu = ns_table_alloc(old->cap);
+    if (!neu) { spin_unlock_irqrestore(&s_unix_ns_wlock, flags); return; }
+    int removed = 0;
+    for (uint32_t i = 0; i < old->cap; i++) {
+        if (!old->slots[i].sock) continue;
+        if (!removed && ns_streq(old->slots[i].path, path)) {
+            removed = 1;
+            continue;
+        }
+        ns_table_raw_insert(neu, old->slots[i].path, old->slots[i].sock);
     }
-    s_unix_ns_cnt--;
+
+    rcu_assign_pointer(s_unix_ns, neu);
+    spin_unlock_irqrestore(&s_unix_ns_wlock, flags);
+    call_rcu(ns_table_free_rcu, old);
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────
@@ -205,13 +239,11 @@ static int unix_vfs_poll(vfs_file_t* self, int events) {
     return 0;
 }
 
-void unix_sock_close(vfs_file_t* self) {
-    unix_sock_t* s = (unix_sock_t*)self->ctx;
-    if (!s) { kfree(self); return; }
-
-    // Remove from namespace if bound.
-    if (s->path[0])
-        ns_remove(s->path);
+// Deferred teardown: runs after a full RCU grace period has elapsed, so
+// every concurrent ns_find/connect/sendto that observed the sock has
+// dropped out of its reader section.  Safe to dismantle state and free.
+static void unix_sock_free_rcu(void* data) {
+    unix_sock_t* s = (unix_sock_t*)data;
 
     // Notify peer of disconnection.
     if (s->peer) {
@@ -225,7 +257,6 @@ void unix_sock_close(vfs_file_t* self) {
     unix_pending_t* p = s->backlog_head;
     while (p) {
         unix_pending_t* next = p->next;
-        // Wake the client that was waiting for accept — it'll see ECONNREFUSED.
         if (p->client) {
             p->client->state = UNIX_STATE_UNCONNECTED;
             unix_wake(p->client);
@@ -250,6 +281,20 @@ void unix_sock_close(vfs_file_t* self) {
     }
 
     kfree(s);
+}
+
+void unix_sock_close(vfs_file_t* self) {
+    unix_sock_t* s = (unix_sock_t*)self->ctx;
+    if (!s) { kfree(self); return; }
+
+    // Unpublish from the namespace first so new ns_find() cannot observe
+    // the sock after this point.  Readers that observed the sock in a
+    // prior rcu_read_lock() are still safe until they drop out — we defer
+    // the actual teardown via call_rcu below.
+    if (s->path[0])
+        ns_remove(s->path);
+
+    call_rcu(unix_sock_free_rcu, s);
     kfree(self);
 }
 
@@ -390,22 +435,29 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
 
+    // Reader section spans the namespace lookup AND the subsequent mutation
+    // of target->backlog / target->peer.  A concurrent close() on target
+    // defers the actual teardown via call_rcu, so `target` stays valid
+    // until we rcu_read_unlock.  Nothing inside the section sleeps.
+    rcu_read_lock();
     unix_sock_t* target = ns_find(path);
-    if (!target) return -ECONNREFUSED;
+    if (!target) { rcu_read_unlock(); return -ECONNREFUSED; }
 
     if (s->type == SOCK_DGRAM) {
         // SOCK_DGRAM: just remember the default destination.
         s->peer = target;
         s->state = UNIX_STATE_CONNECTED;
+        rcu_read_unlock();
         return 0;
     }
 
     // SOCK_STREAM: queue ourselves on the listener's backlog.
-    if (s->state != UNIX_STATE_UNCONNECTED && s->state != UNIX_STATE_BOUND)
-        return -EISCONN;
-    if (target->type != SOCK_STREAM) return -ECONNREFUSED;
-    if (target->state != UNIX_STATE_LISTENING) return -ECONNREFUSED;
-    if (target->backlog_count >= target->backlog_max) return -ECONNREFUSED;
+    if (s->state != UNIX_STATE_UNCONNECTED && s->state != UNIX_STATE_BOUND) {
+        rcu_read_unlock(); return -EISCONN;
+    }
+    if (target->type != SOCK_STREAM) { rcu_read_unlock(); return -ECONNREFUSED; }
+    if (target->state != UNIX_STATE_LISTENING) { rcu_read_unlock(); return -ECONNREFUSED; }
+    if (target->backlog_count >= target->backlog_max) { rcu_read_unlock(); return -ECONNREFUSED; }
 
     // Stash our own pid on the client sock so accept() can propagate it to
     // the server side as the trusted peer pid (accept() overwrites our copy
@@ -414,7 +466,7 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
 
     // Enqueue ourselves.
     unix_pending_t* pend = kmalloc(sizeof(unix_pending_t));
-    if (!pend) return -ENOMEM;
+    if (!pend) { rcu_read_unlock(); return -ENOMEM; }
     pend->next   = NULL;
     pend->client = s;
 
@@ -431,6 +483,12 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // Wake the listener if it's blocked in accept() or poll().
     unix_wake(target);
     unix_poll_wake(target);
+
+    // Drop the RCU reader section before sleeping.  From here on we only
+    // touch our own sock `s`; the listener owns `pend` and, if it closes,
+    // its deferred teardown walks the backlog and wakes us with state set
+    // to UNCONNECTED.
+    rcu_read_unlock();
 
     // Block until accept() completes the pairing (or listener closes).
     while (s->state == UNIX_STATE_CONNECTING) {
@@ -571,19 +629,23 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     if (!s) return -EBADF;
     if (s->type != SOCK_DGRAM) return -EOPNOTSUPP;
 
-    // Find the target socket.
+    // Reader section: ns_find and all subsequent derefs of target.  No
+    // sleeps inside (kmalloc is non-blocking).  If target is closed
+    // concurrently, its teardown is deferred via call_rcu so the pointer
+    // remains valid for the rest of this section.
+    rcu_read_lock();
     unix_sock_t* target;
     if (path && path[0]) {
         target = ns_find(path);
     } else {
         target = s->peer; // default peer from connect()
     }
-    if (!target) return -ECONNREFUSED;
-    if (target->type != SOCK_DGRAM) return -ECONNREFUSED;
+    if (!target) { rcu_read_unlock(); return -ECONNREFUSED; }
+    if (target->type != SOCK_DGRAM) { rcu_read_unlock(); return -ECONNREFUSED; }
 
     // Allocate message (header + data in one allocation).
     unix_dgram_t* msg = kmalloc(sizeof(unix_dgram_t) + len);
-    if (!msg) return -ENOMEM;
+    if (!msg) { rcu_read_unlock(); return -ENOMEM; }
     msg->next = NULL;
     msg->len  = len;
 
@@ -602,6 +664,7 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     unix_wake(target);
     unix_poll_wake(target);
 
+    rcu_read_unlock();
     return (int)len;
 }
 

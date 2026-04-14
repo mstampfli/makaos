@@ -56,6 +56,11 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
 // Increment the reference count.
 void shmem_ref(shmem_t* shm);
 
+// Atomic tryget — bump refcount only if it is currently > 0.  Returns
+// 1 on success, 0 if the object is mid-teardown.  Used by lookups to
+// prevent a race with concurrent destruction.
+int shmem_tryget(shmem_t* shm);
+
 // Decrement the reference count.  When it reaches 0, all physical
 // pages are freed and the shmem_t itself is freed.  If the object
 // is in the named namespace, it is removed.

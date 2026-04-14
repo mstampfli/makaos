@@ -4,10 +4,15 @@
 #include "errno.h"
 #include "cred.h"
 #include "vfs.h"
+#include "smp.h"
+#include "rcu.h"
 
-// ── Named namespace ──────────────────────────────────────────────────────
-// Open-addressing hash table: shm->name → shmem_t*.
-// Keyed by name string; shm==NULL means empty slot.  Grows at 75% load.
+// ── Named namespace (RCU-protected) ──────────────────────────────────────
+// The whole namespace is a single object (shmem_ns_table_t) published via
+// rcu_assign_pointer.  Readers walk lock-free inside rcu_read_lock() and
+// atomically acquire a reference on the found shmem_t via shmem_tryget.
+// Writers serialise on s_ns_wlock, build a fresh table, rcu_assign_pointer,
+// and call_rcu the old table.
 
 #define SHMEM_NS_INIT_CAP 32u
 
@@ -15,9 +20,14 @@ typedef struct {
     shmem_t* shm;   // NULL = empty slot
 } ns_entry_t;
 
-static ns_entry_t* s_namespace     = NULL;
-static uint32_t    s_namespace_cap = 0;
-static uint32_t    s_namespace_cnt = 0;
+typedef struct shmem_ns_table {
+    uint32_t    cap;
+    uint32_t    cnt;
+    ns_entry_t  slots[];
+} shmem_ns_table_t;
+
+static shmem_ns_table_t* s_namespace      = NULL;  // RCU-protected
+static spinlock_t        s_namespace_lock = SPINLOCK_INIT;
 
 // ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -32,47 +42,24 @@ static uint32_t shm_hash_str(const char* s, uint32_t cap) {
     return h & (cap - 1u);
 }
 
-static void shm_ns_ensure_init(void) {
-    if (s_namespace) return;
-    s_namespace = (ns_entry_t*)kmalloc(
-        (uint64_t)SHMEM_NS_INIT_CAP * sizeof(ns_entry_t));
-    if (!s_namespace) return;
-    __builtin_memset(s_namespace, 0,
-                      (uint64_t)SHMEM_NS_INIT_CAP * sizeof(ns_entry_t));
-    s_namespace_cap = SHMEM_NS_INIT_CAP;
+static shmem_ns_table_t* shm_ns_table_alloc(uint32_t cap) {
+    shmem_ns_table_t* t = (shmem_ns_table_t*)kmalloc(
+        sizeof(shmem_ns_table_t) + (uint64_t)cap * sizeof(ns_entry_t));
+    if (!t) return NULL;
+    t->cap = cap;
+    t->cnt = 0;
+    __builtin_memset(t->slots, 0, (uint64_t)cap * sizeof(ns_entry_t));
+    return t;
 }
 
-// Find slot index for name. Returns s_namespace_cap if not found.
-static uint32_t shm_ns_find_idx(const char* name) {
-    if (!s_namespace) return s_namespace_cap;
-    uint32_t i = shm_hash_str(name, s_namespace_cap);
-    for (uint32_t n = 0; n < s_namespace_cap; n++) {
-        if (!s_namespace[i].shm) return s_namespace_cap;
-        if (s_streq(s_namespace[i].shm->name, name)) return i;
-        i = (i + 1u) & (s_namespace_cap - 1u);
-    }
-    return s_namespace_cap;
+static void shm_ns_raw_insert(shmem_ns_table_t* t, shmem_t* shm) {
+    uint32_t i = shm_hash_str(shm->name, t->cap);
+    while (t->slots[i].shm) i = (i + 1u) & (t->cap - 1u);
+    t->slots[i].shm = shm;
+    t->cnt++;
 }
 
-static void shm_ns_raw_insert(ns_entry_t* slots, uint32_t cap, shmem_t* shm) {
-    uint32_t i = shm_hash_str(shm->name, cap);
-    for (;;) {
-        if (!slots[i].shm) { slots[i].shm = shm; return; }
-        i = (i + 1u) & (cap - 1u);
-    }
-}
-
-static int shm_ns_grow(void) {
-    uint32_t new_cap = s_namespace_cap * 2u;
-    ns_entry_t* ns2 = (ns_entry_t*)kmalloc((uint64_t)new_cap * sizeof(ns_entry_t));
-    if (!ns2) return -ENOMEM;
-    __builtin_memset(ns2, 0, (uint64_t)new_cap * sizeof(ns_entry_t));
-    for (uint32_t i = 0; i < s_namespace_cap; i++)
-        if (s_namespace[i].shm) shm_ns_raw_insert(ns2, new_cap, s_namespace[i].shm);
-    kfree(s_namespace);
-    s_namespace = ns2; s_namespace_cap = new_cap;
-    return 0;
-}
+static void shm_ns_table_free_rcu(void* p) { kfree(p); }
 
 // ── shmem_create ─────────────────────────────────────────────────────────
 
@@ -106,29 +93,53 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
 // ── shmem_ref ────────────────────────────────────────────────────────────
 
 void shmem_ref(shmem_t* shm) {
-    if (shm) shm->refcount++;
+    if (shm) atomic_add(&shm->refcount, 1u);
+}
+
+// Atomic tryget — increments refcount only if it is currently > 0.
+// Returns 1 on success, 0 if the object is being destroyed (count == 0).
+// Used by shmem_ns_find so a concurrent unref-to-zero cannot free the
+// object under the caller.
+int shmem_tryget(shmem_t* shm) {
+    if (!shm) return 0;
+    uint32_t old = __atomic_load_n(&shm->refcount, __ATOMIC_RELAXED);
+    for (;;) {
+        if (old == 0) return 0;
+        if (__atomic_compare_exchange_n(&shm->refcount, &old, old + 1u,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return 1;
+    }
+}
+
+// Deferred final free — runs after an RCU grace period so any concurrent
+// shmem_ns_find reader that observed the pointer has dropped out.
+static void shmem_free_rcu(void* data) {
+    shmem_t* shm = (shmem_t*)data;
+    for (uint32_t i = 0; i < shm->npages; i++) {
+        if (shm->pages[i])
+            pmm_buddy_free(shm->pages[i], 0);
+    }
+    kfree(shm->pages);
+    kfree(shm);
 }
 
 // ── shmem_unref ──────────────────────────────────────────────────────────
 
 void shmem_unref(shmem_t* shm) {
     if (!shm) return;
-    if (shm->refcount == 0) return; // safety — should never happen
-
-    if (--shm->refcount > 0) return;
-
-    // Last reference dropped — free all physical pages.
-    for (uint32_t i = 0; i < shm->npages; i++) {
-        if (shm->pages[i])
-            pmm_buddy_free(shm->pages[i], 0);
-    }
+    // Atomic decrement-and-test — only the CPU that observes the
+    // transition 1→0 owns the teardown.
+    uint32_t prev = atomic_sub(&shm->refcount, 1u);
+    if (prev != 1u) return; // still live (or was already 0 — a bug)
 
     // Remove from namespace if named.
     if (shm->name[0])
         shmem_ns_remove(shm);
 
-    kfree(shm->pages);
-    kfree(shm);
+    // Defer the physical-page and struct free until the current RCU
+    // grace period ends so any concurrent shmem_ns_find reader that
+    // observed this pointer has dropped out.
+    call_rcu(shmem_free_rcu, shm);
 }
 
 // ── shmem_get_page ───────────────────────────────────────────────────────
@@ -207,23 +218,70 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
 
 // ── shmem_ns_find ────────────────────────────────────────────────────────
 
+// Reader — lock-free inside rcu_read_lock.  Returns shm with +1 refcount
+// on success (via shmem_tryget); caller must shmem_unref when done.
+// Returns NULL if not found or if the object is mid-teardown.
 shmem_t* shmem_ns_find(const char* name) {
     if (!name || !name[0]) return NULL;
-    uint32_t idx = shm_ns_find_idx(name);
-    return (idx < s_namespace_cap) ? s_namespace[idx].shm : NULL;
+    shmem_t* result = NULL;
+    rcu_read_lock();
+    shmem_ns_table_t* t = rcu_dereference(s_namespace);
+    if (t) {
+        uint32_t cap = t->cap;
+        uint32_t i = shm_hash_str(name, cap);
+        for (uint32_t n = 0; n < cap; n++) {
+            shmem_t* shm = t->slots[i].shm;
+            if (!shm) break;
+            if (s_streq(shm->name, name)) {
+                if (shmem_tryget(shm)) result = shm;
+                break;
+            }
+            i = (i + 1u) & (cap - 1u);
+        }
+    }
+    rcu_read_unlock();
+    return result;
 }
 
 // ── shmem_ns_insert ──────────────────────────────────────────────────────
 
 int shmem_ns_insert(shmem_t* shm) {
     if (!shm || !shm->name[0]) return -EINVAL;
-    shm_ns_ensure_init();
-    if (!s_namespace) return -ENOMEM;
-    if (shm_ns_find_idx(shm->name) < s_namespace_cap) return -EEXIST;
-    if (s_namespace_cnt * 4u >= s_namespace_cap * 3u)
-        if (shm_ns_grow() < 0) return -ENOMEM;
-    shm_ns_raw_insert(s_namespace, s_namespace_cap, shm);
-    s_namespace_cnt++;
+    uint64_t flags = spin_lock_irqsave(&s_namespace_lock);
+    shmem_ns_table_t* old = s_namespace;
+    uint32_t old_cap = old ? old->cap : 0;
+    uint32_t old_cnt = old ? old->cnt : 0;
+
+    // Duplicate check directly on the live table under the writer lock.
+    if (old) {
+        uint32_t i = shm_hash_str(shm->name, old_cap);
+        for (uint32_t n = 0; n < old_cap; n++) {
+            if (!old->slots[i].shm) break;
+            if (s_streq(old->slots[i].shm->name, shm->name)) {
+                spin_unlock_irqrestore(&s_namespace_lock, flags);
+                return -EEXIST;
+            }
+            i = (i + 1u) & (old_cap - 1u);
+        }
+    }
+
+    uint32_t new_cap = old_cap ? old_cap : SHMEM_NS_INIT_CAP;
+    if ((old_cnt + 1u) * 4u >= new_cap * 3u)
+        new_cap = old_cap ? old_cap * 2u : SHMEM_NS_INIT_CAP;
+
+    shmem_ns_table_t* neu = shm_ns_table_alloc(new_cap);
+    if (!neu) { spin_unlock_irqrestore(&s_namespace_lock, flags); return -ENOMEM; }
+
+    if (old) {
+        for (uint32_t i = 0; i < old->cap; i++)
+            if (old->slots[i].shm)
+                shm_ns_raw_insert(neu, old->slots[i].shm);
+    }
+    shm_ns_raw_insert(neu, shm);
+
+    rcu_assign_pointer(s_namespace, neu);
+    spin_unlock_irqrestore(&s_namespace_lock, flags);
+    if (old) call_rcu(shm_ns_table_free_rcu, old);
     return 0;
 }
 
@@ -231,18 +289,23 @@ int shmem_ns_insert(shmem_t* shm) {
 
 void shmem_ns_remove(shmem_t* shm) {
     if (!shm || !shm->name[0]) return;
-    uint32_t idx = shm_ns_find_idx(shm->name);
-    if (idx >= s_namespace_cap) return;
-    // Robin Hood deletion.
-    s_namespace[idx].shm = NULL;
-    uint32_t i = (idx + 1u) & (s_namespace_cap - 1u);
-    while (s_namespace[i].shm) {
-        shmem_t* tmp = s_namespace[i].shm;
-        s_namespace[i].shm = NULL;
-        shm_ns_raw_insert(s_namespace, s_namespace_cap, tmp);
-        i = (i + 1u) & (s_namespace_cap - 1u);
+    uint64_t flags = spin_lock_irqsave(&s_namespace_lock);
+    shmem_ns_table_t* old = s_namespace;
+    if (!old) { spin_unlock_irqrestore(&s_namespace_lock, flags); return; }
+
+    shmem_ns_table_t* neu = shm_ns_table_alloc(old->cap);
+    if (!neu) { spin_unlock_irqrestore(&s_namespace_lock, flags); return; }
+    int removed = 0;
+    for (uint32_t i = 0; i < old->cap; i++) {
+        shmem_t* cur = old->slots[i].shm;
+        if (!cur) continue;
+        if (!removed && cur == shm) { removed = 1; continue; }
+        shm_ns_raw_insert(neu, cur);
     }
-    s_namespace_cnt--;
+
+    rcu_assign_pointer(s_namespace, neu);
+    spin_unlock_irqrestore(&s_namespace_lock, flags);
+    call_rcu(shm_ns_table_free_rcu, old);
 }
 
 // ── shmem_check_access ──────────────────────────────────────────────────
