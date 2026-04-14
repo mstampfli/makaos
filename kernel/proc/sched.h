@@ -120,3 +120,13 @@ task_t* task_idx_sid_head (uint32_t sid);
 // Performs a preemptive context switch — safe to call from IRQ context because
 // context_switch saves the IRQ stub's rsp; iretq in the stub restores it later.
 void sched_preempt(void);
+
+// ── PID hash table API (RCU-protected) ─────────────────────────────────
+// pid_ht_insert is called from sched_add on task creation.
+// pid_ht_remove is called from task_destroy on final reap — zombies
+// STAY in the table until destroy, so every specific-pid lookup is
+// O(1) for living tasks AND zombies.
+// pid_ht_find takes zero locks (RCU reader section inside).
+void     pid_ht_insert(task_t* t);
+void     pid_ht_remove(task_t* t);
+task_t*  pid_ht_find  (uint32_t pid);

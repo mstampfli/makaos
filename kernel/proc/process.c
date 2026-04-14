@@ -259,6 +259,12 @@ mm_t* task_get_mm(void* task) {
 // ── task_destroy ──────────────────────────────────────────────────────────
 void task_destroy(task_t* t) {
     if (!t) return;
+    // Remove from the pid hash table here — zombies STAY in pid_ht
+    // until they're reaped and freed, so every specific-pid lookup
+    // (kill, waitpid, setpgid, /proc/[pid]) is O(1) regardless of
+    // whether the task is alive or a zombie.  Only the final destroy
+    // removes the entry.
+    pid_ht_remove(t);
     pid_free(t->pid);
     kstack_free(t->kstack_top);
     task_mm_release(t->mm_shared);
