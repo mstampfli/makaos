@@ -6,36 +6,46 @@
 // ── Multi-task-safe scratch buffers ──────────────────────────────────────
 // Function-local 4 KiB scratch buffers must NOT live on the kstack (8 KiB
 // total) or in static/BSS (would race across preempted tasks).  Use the
-// EXT2_SCRATCH macro to kmalloc one with an automatic free on scope exit.
+// pattern below: declare the slot once at the top of the function, then
+// alloc *lazily* just before first use so we never waste an alloc on an
+// early-error path.
 //
-//   void f(...) {
-//       EXT2_SCRATCH(buf);          // kmalloc(4096), bails if OOM
+//   int f(...) {
+//       EXT2_SCRATCH_DECL(buf);          // declares uint8_t* buf = NULL
+//       if (...error...) return 0;       // no alloc happened
+//       EXT2_SCRATCH_ALLOC(buf);         // kmalloc, bails with `return 0`
 //       read_block(blk, buf);
-//       // ... no need to kfree, cleanup attribute fires on every return
+//       // ... cleanup attribute frees buf on every return path
 //   }
 //
-// Note: the file-scope s_blk_buf / s_blk_buf2 / s_bcache_data buffers below
-// stay static on purpose — they are in the absolute hot path and are
-// covered by ext2's implicit serialization.  See feedback memory.
+// Three ALLOC variants pick the right OOM return for each helper's
+// failure-sentinel convention:
+//   EXT2_SCRATCH_ALLOC(name)        -> bails with `return 0`  (most helpers)
+//   EXT2_SCRATCH_ALLOC_NEG1(name)   -> bails with `return -1` (vfs_read/readdir)
+//   EXT2_SCRATCH_ALLOC_VOID(name)   -> bails with `return`    (free_block etc.)
+//
+// kfree(NULL) is a no-op so the cleanup hook fires safely whether we
+// alloc'd or not.
+//
+// Note: the file-scope s_blk_buf / s_blk_buf2 / s_bcache_data buffers
+// below stay static on purpose — hot path, intentional speed/memory
+// tradeoff.  See feedback memory.
 static inline void ext2_scratch_free_(uint8_t** p) {
     if (*p) kfree(*p);
 }
-// For functions returning a value (return 0 on OOM — used by helpers
-// whose 0 sentinel means "failure"):
-#define EXT2_SCRATCH(name) \
-    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
-        (uint8_t*)kmalloc(4096); \
-    if (!name) return 0
-// For functions where -1 is the failure sentinel (vfs_read/write):
-#define EXT2_SCRATCH_NEG1(name) \
-    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
-        (uint8_t*)kmalloc(4096); \
-    if (!name) return -1
-// For void functions (silent return on OOM):
-#define EXT2_SCRATCH_VOID(name) \
-    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = \
-        (uint8_t*)kmalloc(4096); \
-    if (!name) return
+#define EXT2_SCRATCH_DECL(name) \
+    uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = NULL
+#define EXT2_SCRATCH_ALLOC(name) \
+    do { name = (uint8_t*)kmalloc(4096); if (!name) return 0; } while (0)
+#define EXT2_SCRATCH_ALLOC_NEG1(name) \
+    do { name = (uint8_t*)kmalloc(4096); if (!name) return -1; } while (0)
+#define EXT2_SCRATCH_ALLOC_VOID(name) \
+    do { name = (uint8_t*)kmalloc(4096); if (!name) return; } while (0)
+// Convenience: declare + alloc in one step for cases where the function
+// has already passed all early-error checks before the scratch is needed.
+#define EXT2_SCRATCH(name)       EXT2_SCRATCH_DECL(name); EXT2_SCRATCH_ALLOC(name)
+#define EXT2_SCRATCH_NEG1(name)  EXT2_SCRATCH_DECL(name); EXT2_SCRATCH_ALLOC_NEG1(name)
+#define EXT2_SCRATCH_VOID(name)  EXT2_SCRATCH_DECL(name); EXT2_SCRATCH_ALLOC_VOID(name)
 
 // ── Mount state ────────────────────────────────────────────────────────────
 
@@ -375,12 +385,13 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
     uint32_t bytes_left = file_size;
     uint32_t blk_idx = 0;
 
-    EXT2_SCRATCH(dir_buf);  // hoisted out of loop — one alloc per call
+    EXT2_SCRATCH_DECL(dir_buf);  // alloc lazily once we know there's data
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(dir_ino, blk_idx);
         blk_idx++;
         if (!blk) break;
 
+        if (!dir_buf) EXT2_SCRATCH_ALLOC(dir_buf);
         if (!read_block(blk, dir_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -469,7 +480,10 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* dst = (uint8_t*)buf;
     uint64_t total = 0;
 
-    EXT2_SCRATCH_NEG1(rd_buf);  // hoisted: one alloc per syscall, freed on return
+    // Partial-block fallback scratch — only allocated if we actually
+    // hit a non-block-aligned read.  Most reads use the multi-block DMA
+    // fast path below and never touch this buffer.
+    EXT2_SCRATCH_DECL(rd_buf);
 
     while (total < len) {
         if (fd->cur_pos >= fd->file_size) break;
@@ -544,6 +558,7 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         }
 
         // Single block read (partial block or non-consecutive).
+        if (!rd_buf) EXT2_SCRATCH_ALLOC_NEG1(rd_buf);
         if (!read_block(blk, rd_buf)) return -1;
         const uint8_t* src = rd_buf + off_in_blk;
         for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = src[i];
@@ -566,9 +581,10 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     const uint8_t* src = (const uint8_t*)buf;
     uint64_t total = 0;
 
-    EXT2_SCRATCH(zb);      // zero-fill scratch for new blocks
-    EXT2_SCRATCH(wr_buf);  // read-modify-write scratch
-    for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
+    // wr_buf is needed for every iteration of the write loop.
+    // zb is only needed when extending the file with a new block — alloc lazily.
+    EXT2_SCRATCH(wr_buf);
+    EXT2_SCRATCH_DECL(zb);
 
     while (total < len) {
         uint32_t blk_idx    = fd->cur_pos / s_block_size;
@@ -581,6 +597,10 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
         if (!blk) {
             blk = alloc_block();
             if (!blk) break;
+            if (!zb) {
+                EXT2_SCRATCH_ALLOC(zb);
+                for (uint32_t i = 0; i < s_block_size; i++) zb[i] = 0;
+            }
             if (!write_block(blk, zb)) { free_block(blk); break; }
             if (!inode_set_block(&fd->inode, blk_idx, blk)) { free_block(blk); break; }
         }
@@ -689,12 +709,13 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
     uint32_t bytes_left = dir_inode.i_size;
     uint32_t blk_idx = 0;
 
-    EXT2_SCRATCH_NEG1(rdd_buf);  // hoisted out of loop
+    EXT2_SCRATCH_DECL(rdd_buf);  // alloc lazily once we know the dir is non-empty
     while (bytes_left > 0 && count < max) {
         uint32_t blk = inode_get_block(&dir_inode, blk_idx);
         blk_idx++;
         if (!blk) break;
 
+        if (!rdd_buf) EXT2_SCRATCH_ALLOC_NEG1(rdd_buf);
         if (!read_block(blk, rdd_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1076,12 +1097,13 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
     uint32_t bytes_left = dir_inode.i_size;
     uint32_t blk_idx = 0;
 
-    EXT2_SCRATCH(dre_buf);  // hoisted out of the directory-walk loop
+    EXT2_SCRATCH_DECL(dre_buf);  // alloc lazily — empty dir = no work
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(&dir_inode, blk_idx);
         blk_idx++;
         if (!blk) break;
 
+        if (!dre_buf) EXT2_SCRATCH_ALLOC(dre_buf);
         if (!read_block(blk, dre_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1155,8 +1177,9 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 
     uint32_t existing_ino = dir_lookup(&parent_inode, basename, str_len(basename));
 
-    // Single scratch buffer reused for every block write below.
-    EXT2_SCRATCH(wr_buf);
+    // Scratch buffer reused for every block write below.  Lazily alloc'd
+    // only after we've passed all the early-error checks in each branch.
+    EXT2_SCRATCH_DECL(wr_buf);
 
     if (existing_ino) {
         // Overwrite: free all old blocks.
@@ -1170,6 +1193,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
         uint32_t written = 0;
 
+        if (n_blocks > 0) EXT2_SCRATCH_ALLOC(wr_buf);
         for (uint32_t bi = 0; bi < n_blocks; bi++) {
             uint32_t blk = alloc_block();
             if (!blk) return 0;
@@ -1210,6 +1234,10 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
     uint32_t written  = 0;
 
+    if (n_blocks > 0 && !wr_buf) {
+        wr_buf = (uint8_t*)kmalloc(4096);
+        if (!wr_buf) { free_inode_num(new_ino); return 0; }
+    }
     for (uint32_t bi = 0; bi < n_blocks; bi++) {
         uint32_t blk = alloc_block();
         if (!blk) { free_inode_num(new_ino); return 0; }
@@ -1413,8 +1441,15 @@ int ext2_mkdir(const char* path) {
     uint32_t data_blk = alloc_block();
     if (!data_blk) { free_inode_num(new_ino); return 0; }
 
-    // Build the data block with "." and "..".
-    EXT2_SCRATCH(mkdir_buf);
+    // Build the data block with "." and "..".  Manual alloc so we can
+    // unwind the inode + block allocations on OOM instead of leaking them.
+    EXT2_SCRATCH_DECL(mkdir_buf);
+    mkdir_buf = (uint8_t*)kmalloc(4096);
+    if (!mkdir_buf) {
+        free_block(data_blk);
+        free_inode_num(new_ino);
+        return 0;
+    }
     for (uint32_t i = 0; i < s_block_size; i++) mkdir_buf[i] = 0;
 
     // "." entry.
