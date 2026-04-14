@@ -160,15 +160,31 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## 8. VMA list reads vs. mutation
+## 8. VMA list reads vs. mutation — RESOLVED (Phase 8B)
 
-- **Location:** `kernel/mm/mm.c` — the per-`mm_t` VMA linked list
-- **Race:** `sys_mmap`, `sys_munmap`, `sys_brk` add/remove VMAs. Page
-  fault handler walks the list on every fault. No synchronization.
-- **Why safe on UP:** fault and syscall can't overlap.
-- **Fix phase:** Phase 8.
-- **Fix strategy:** per-address-space mutex for mutation. Fault walk
-  uses RCU (or a seqlock if the list becomes lookup-heavy).
+- **Fix:** `mm_t` now holds a writer-side spinlock `vma_lock` and
+  `mm->vmas` is an RCU-protected singly-linked list.  Readers
+  (`mm_vma_find`, page fault handler, `/proc/<pid>/maps`, user buffer
+  prefault) walk via `rcu_dereference(v->next)` inside `rcu_read_lock()`
+  with zero atomics on the hot path.  Writers (`mm_vma_add`,
+  `mm_vma_remove`, `mm_vma_find_free`, `sys_brk`, `sys_mmap` MAP_FIXED
+  unmap, `sys_munmap`) serialise on `mm->vma_lock` and publish list
+  updates via `rcu_assign_pointer`.  Removed VMAs are handed to
+  `call_rcu(vma_free_rcu)` for deferred reclamation so a concurrent
+  page-fault walker dereferencing the old `->next` stays valid until
+  the grace period ends; `vma_free_rcu` also drops the shmem ref.
+  In-place trims (cases 2/3 of `mm_vma_remove`) are safe plain-field
+  stores because readers only observe bounds via `addr >= start &&
+  addr < end`.  Split (case 4) builds the right fragment privately
+  and publishes it via `rcu_assign_pointer(v->next, right)` before
+  shrinking the left half.  `mm_clone` walks the src list under RCU,
+  snapshots each VMA into a stack array, then drops the reader before
+  calling `mm_vma_add` on the dst — so no cross-mm lock ordering is
+  required.  Page-fault demand-page path snapshots `vma->flags`,
+  `vma->shmem`, `vma->shmem_pgoff` inside the reader section (using
+  `shmem_tryget` to pin the shmem across the subsequent physical
+  work) so the actual `vmm_page_map` / `shmem_get_page` calls run
+  with no RCU or spinlock held.
 
 ---
 
