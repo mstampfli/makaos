@@ -5,6 +5,7 @@
 #include "process.h"
 #include "errno.h"
 #include "common.h"
+#include "wait.h"
 
 // ── Pipe VFS callbacks ────────────────────────────────────────────────────
 
@@ -14,17 +15,29 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint64_t total = 0;
 
     while (total < len) {
-        // Wait for data.
-        while (p->count == 0) {
+        if (p->count == 0) {
             if (p->writer_refs == 0) return (int64_t)total; // EOF
-            p->reader = g_current;
-            sched_sleep();
-            p->reader = NULL;
+
+            // Register as a waiter on the read-end's wait queue, then
+            // re-check the condition.  This closes the lost-wakeup race:
+            // if a writer fills the buffer between our check and the
+            // sleep, wait_queue_wake_all finds our entry and wakes us.
+            task_we_t node;
+            task_we_init(&node, g_current);
+            task_we_add(self->waitq, &node);
+            if (p->count == 0 && p->writer_refs != 0) {
+                sched_sleep();
+            }
+            // Remove if still present (no-op if already drained).
+            task_we_remove(self->waitq, &node);
+            continue;
         }
         dst[total++] = p->buf[p->head];
         p->head = (p->head + 1) & (PIPE_BUF_SIZE - 1);
         p->count--;
     }
+    // Wake any writer waiting for space.
+    if (p->write_file) wait_queue_wake_all(p->write_file->waitq);
     return (int64_t)total;
 }
 
@@ -56,23 +69,34 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
     }
 
     while (total < len) {
-        // Wait for space.
-        while (p->count == PIPE_BUF_SIZE) {
+        // Wait for space.  Register on the write-end's wait queue so
+        // a reader draining the buffer can wake us.
+        if (p->count == PIPE_BUF_SIZE) {
             if (p->reader_refs == 0) {
                 // Reader closed while we were blocked mid-write.
                 deliver_sigpipe();
                 return total ? (int64_t)total : (int64_t)-EPIPE;
             }
-            sched_sleep();
+
+            task_we_t node;
+            task_we_init(&node, g_current);
+            task_we_add(self->waitq, &node);
+            if (p->count == PIPE_BUF_SIZE && p->reader_refs != 0) {
+                sched_sleep();
+            }
+            task_we_remove(self->waitq, &node);
+            continue;
         }
         p->buf[p->tail] = src[total++];
         p->tail = (p->tail + 1) & (PIPE_BUF_SIZE - 1);
         p->count++;
     }
 
-    // Wake all readers and poll waiters.
+    // Wake all readers and poll waiters via the read-end's single
+    // wait queue.  Blocking readers (task_we_t) and poll/epoll
+    // waiters share the same queue — each entry's func decides what
+    // to do.
     if (p->read_file) {
-        if (p->reader) sched_wake(p->reader);
         wait_queue_wake_all(p->read_file->waitq);
     }
 
@@ -82,6 +106,10 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
 static void pipe_read_close(vfs_file_t* self) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     if (p->reader_refs > 0) p->reader_refs--;
+    // Wake any blocked writers so they can return -EPIPE.
+    if (p->reader_refs == 0 && p->write_file) {
+        wait_queue_wake_all(p->write_file->waitq);
+    }
     if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
     kfree(self);
 }
@@ -89,10 +117,9 @@ static void pipe_read_close(vfs_file_t* self) {
 static void pipe_write_close(vfs_file_t* self) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     if (p->writer_refs > 0) p->writer_refs--;
-    // Wake any reader sleeping in pipe_read so it sees EOF immediately.
-    if (p->writer_refs == 0) {
-        if (p->reader) sched_wake(p->reader);
-        if (p->read_file) wait_queue_wake_all(p->read_file->waitq);
+    // Wake any sleeping reader so they see EOF immediately.
+    if (p->writer_refs == 0 && p->read_file) {
+        wait_queue_wake_all(p->read_file->waitq);
     }
     if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
     kfree(self);
@@ -123,7 +150,6 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     p->head = p->tail = p->count = 0;
     p->writer_refs = 1;
     p->reader_refs = 1;
-    p->reader      = NULL;
 
     vfs_file_t* r = kmalloc(sizeof(vfs_file_t));
     vfs_file_t* w = kmalloc(sizeof(vfs_file_t));

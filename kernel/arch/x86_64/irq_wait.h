@@ -20,3 +20,7 @@ void irq_drain(uint8_t irq);
 // Wake all tasks sleeping on the given IRQ slot (broadcast).
 // Called from IRQ handlers after EOI.
 void irq_notify(uint8_t irq);
+
+// One-time init for the per-IRQ wait queues.  Call from kmain before
+// any driver registers an IRQ handler.
+void irq_wait_init(void);
