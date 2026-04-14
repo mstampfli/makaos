@@ -62,12 +62,12 @@
 
 // Enter an RCU reader section.  Disables preemption on the current CPU
 // so the CPU cannot reach a quiescent state until rcu_read_unlock.
-static inline void rcu_read_lock(void) {
+ALWAYS_INLINE void rcu_read_lock(void) {
     preempt_disable();
 }
 
 // Exit an RCU reader section.  Re-enables preemption.
-static inline void rcu_read_unlock(void) {
+ALWAYS_INLINE void rcu_read_unlock(void) {
     preempt_enable();
 }
 

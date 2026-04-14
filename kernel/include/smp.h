@@ -48,13 +48,13 @@
                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)
 
 // Set/clear bit n in *word.  Returns the old word.
-static inline uint32_t atomic_set_bit(volatile uint32_t* word, unsigned n) {
+ALWAYS_INLINE uint32_t atomic_set_bit(volatile uint32_t* word, unsigned n) {
     return atomic_or(word, (uint32_t)(1u << n));
 }
-static inline uint32_t atomic_clear_bit(volatile uint32_t* word, unsigned n) {
+ALWAYS_INLINE uint32_t atomic_clear_bit(volatile uint32_t* word, unsigned n) {
     return atomic_and(word, (uint32_t)~(1u << n));
 }
-static inline int test_bit(uint32_t word, unsigned n) {
+ALWAYS_INLINE int test_bit(uint32_t word, unsigned n) {
     return (word >> n) & 1u;
 }
 
@@ -62,17 +62,17 @@ static inline int test_bit(uint32_t word, unsigned n) {
 // x86 has a strong memory model: store-load is the only reorder the HW
 // actually performs.  That makes most barriers compiler-only, and only
 // full smp_mb() needs an mfence.
-static inline void smp_mb(void) {
+ALWAYS_INLINE void smp_mb(void) {
     __asm__ volatile("mfence" ::: "memory");
 }
-static inline void smp_rmb(void) {
+ALWAYS_INLINE void smp_rmb(void) {
     __asm__ volatile("" ::: "memory");   // load-load already ordered on x86
 }
-static inline void smp_wmb(void) {
+ALWAYS_INLINE void smp_wmb(void) {
     __asm__ volatile("" ::: "memory");   // store-store already ordered on x86
 }
 // Pause hint for spin loops (avoids pipeline stalls).
-static inline void cpu_relax(void) {
+ALWAYS_INLINE void cpu_relax(void) {
     __asm__ volatile("pause" ::: "memory");
 }
 
@@ -87,11 +87,11 @@ typedef struct {
 
 #define SPINLOCK_INIT { 0 }
 
-static inline void spin_lock_init(spinlock_t* l) {
+ALWAYS_INLINE void spin_lock_init(spinlock_t* l) {
     atomic_store_relaxed(&l->locked, 0u);
 }
 
-static inline void spin_lock(spinlock_t* l) {
+ALWAYS_INLINE void spin_lock(spinlock_t* l) {
     for (;;) {
         // Fast path: try to grab the lock.  Acquire ordering pairs with
         // the release in spin_unlock.
@@ -104,13 +104,13 @@ static inline void spin_lock(spinlock_t* l) {
     }
 }
 
-static inline int spin_trylock(spinlock_t* l) {
+ALWAYS_INLINE int spin_trylock(spinlock_t* l) {
     uint32_t zero = 0;
     return __atomic_compare_exchange_n(&l->locked, &zero, 1u, 0,
                                          __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 }
 
-static inline void spin_unlock(spinlock_t* l) {
+ALWAYS_INLINE void spin_unlock(spinlock_t* l) {
     atomic_store_rel(&l->locked, 0u);
 }
 
@@ -118,13 +118,13 @@ static inline void spin_unlock(spinlock_t* l) {
 // saved RFLAGS so spin_unlock_irqrestore can restore IF.  Use this for any
 // lock that can be taken from interrupt context — the plain spin_lock
 // would deadlock if the IRQ fires while we hold the lock.
-static inline uint64_t spin_lock_irqsave(spinlock_t* l) {
+ALWAYS_INLINE uint64_t spin_lock_irqsave(spinlock_t* l) {
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
     spin_lock(l);
     return flags;
 }
-static inline void spin_unlock_irqrestore(spinlock_t* l, uint64_t flags) {
+ALWAYS_INLINE void spin_unlock_irqrestore(spinlock_t* l, uint64_t flags) {
     spin_unlock(l);
     __asm__ volatile("push %0; popfq" :: "r"(flags) : "memory", "cc");
 }
@@ -142,17 +142,17 @@ typedef struct {
 
 #define TICKET_LOCK_INIT { 0, 0 }
 
-static inline void ticket_lock_init(ticket_lock_t* t) {
+ALWAYS_INLINE void ticket_lock_init(ticket_lock_t* t) {
     atomic_store_relaxed(&t->head, 0u);
     atomic_store_relaxed(&t->tail, 0u);
 }
 
-static inline void ticket_lock(ticket_lock_t* t) {
+ALWAYS_INLINE void ticket_lock(ticket_lock_t* t) {
     uint32_t my = atomic_add(&t->head, 1u);
     while (atomic_load_acq(&t->tail) != my) cpu_relax();
 }
 
-static inline void ticket_unlock(ticket_lock_t* t) {
+ALWAYS_INLINE void ticket_unlock(ticket_lock_t* t) {
     atomic_store_rel(&t->tail, atomic_load_relaxed(&t->tail) + 1u);
 }
 
