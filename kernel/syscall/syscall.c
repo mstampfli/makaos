@@ -1007,7 +1007,6 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->sid_prev = t->sid_next = NULL;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
-    t->preempt_depth    = 0;
     t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->exit_code        = 0;
