@@ -750,8 +750,16 @@ void sched_wake(task_t* proc) {
 }
 
 // Add a TASK_ZOMBIE task to its home CPU's zombie list.
+//
+// Zombies STAY in the pid hash table (s_pid_ht).  This keeps every
+// specific-pid lookup O(1) — waitpid(pid), kill(pid), /proc/[pid],
+// setpgid(pid) — regardless of whether the task is alive or a zombie.
+// Only task_destroy (the final reap) removes the entry from pid_ht.
+//
+// Zombies ARE removed from the task_idx (pgid/tgid/sid) tables so
+// that broadcast signal delivery (signal_send_pgrp, signal_send_group)
+// skips them.
 void sched_add_zombie(task_t* t) {
-    pid_ht_remove(t);
     task_idx_remove(t);
     cpu_t* home = cpu_of_task(t);
     uint64_t flags = spin_lock_irqsave(&home->rq_lock);
@@ -760,131 +768,133 @@ void sched_add_zombie(task_t* t) {
     spin_unlock_irqrestore(&home->rq_lock, flags);
 }
 
-// Walk every CPU's zombie list under that CPU's rq_lock and invoke
-// `visit` on each zombie.  `visit` returns 1 to STOP walking (entry
-// removed); 0 to keep walking.  If `visit` unlinks the entry, it is
-// responsible for fixing the link pointer it passes — see callers.
-//
-// Helper exists because zombie reaping needs to search across all CPUs
-// but the walker body is identical; factoring keeps the locking
-// correct and consistent.
-typedef int (*zombie_visit_fn)(task_t** link, task_t* z, void* data);
+// Unlink a known zombie from its home CPU's zombie list.
+// Returns 1 if unlinked, 0 if not found (already reaped).
+// Caller must not hold any rq_lock.
+static int zombie_unlink(task_t* z) {
+    if (!z) return 0;
+    cpu_t* home = cpu_of_task(z);
+    uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+    task_t** pp = &home->rq.zombie_head;
+    while (*pp && *pp != z) pp = &(*pp)->next;
+    if (!*pp) {
+        spin_unlock_irqrestore(&home->rq_lock, flags);
+        return 0;
+    }
+    *pp = z->next;
+    z->next = NULL;
+    spin_unlock_irqrestore(&home->rq_lock, flags);
+    return 1;
+}
 
-static task_t* zombie_walk_reap(zombie_visit_fn visit, void* data) {
+// Remove and return the zombie with the given pid.  O(1) when pid != 0.
+// pid == 0 is an "any zombie" query that still needs a per-CPU walk —
+// but that's a cold path used by kthread cleanup / orphan reap, so the
+// extra cost is fine.
+task_t* sched_reap_zombie(uint32_t pid) {
+    if (pid != 0) {
+        // O(1): hash lookup, state check, unlink from home CPU list.
+        task_t* z = pid_ht_find(pid);
+        if (!z || z->state != TASK_ZOMBIE) return NULL;
+        if (!zombie_unlink(z)) return NULL;
+        return z;
+    }
+    // pid == 0: find ANY zombie anywhere.
     unsigned n = num_cpus();
     for (unsigned ci = 0; ci < n; ci++) {
         cpu_t* c = &g_cpus[ci];
         uint64_t flags = spin_lock_irqsave(&c->rq_lock);
-        task_t** pp = &c->rq.zombie_head;
-        while (*pp) {
-            task_t* z = *pp;
-            if (visit(pp, z, data)) {
-                // visit() unlinked z.  Caller will call process_destroy.
-                spin_unlock_irqrestore(&c->rq_lock, flags);
-                return z;
-            }
-            // visit() returned 0 without unlinking — advance.
-            pp = &z->next;
+        task_t* z = c->rq.zombie_head;
+        if (z) {
+            c->rq.zombie_head = z->next;
+            z->next = NULL;
+            spin_unlock_irqrestore(&c->rq_lock, flags);
+            return z;
         }
         spin_unlock_irqrestore(&c->rq_lock, flags);
     }
     return NULL;
 }
 
-typedef struct { uint32_t pid; } reap_any_arg_t;
-static int reap_any_visit(task_t** link, task_t* z, void* data) {
-    reap_any_arg_t* a = (reap_any_arg_t*)data;
-    if (a->pid != 0 && z->pid != a->pid) return 0;
-    *link = z->next;
-    z->next = NULL;
-    pid_ht_remove(z);
-    return 1;
-}
-
-// Remove and return the zombie with the given pid (0 = any).
-task_t* sched_reap_zombie(uint32_t pid) {
-    reap_any_arg_t a = { pid };
-    return zombie_walk_reap(reap_any_visit, &a);
-}
-
-typedef struct { uint32_t parent_pid, target_pid; } reap_child_arg_t;
-static int reap_child_visit(task_t** link, task_t* z, void* data) {
-    reap_child_arg_t* a = (reap_child_arg_t*)data;
-    int pid_match = (a->target_pid == 0) || (z->pid == a->target_pid);
-    int is_child  = (z->ppid == a->parent_pid);
-    if (!(pid_match && is_child)) return 0;
-    *link = z->next;
-    z->next = NULL;
-    pid_ht_remove(z);
-    return 1;
-}
-
+// Remove and return a zombie that is a child of parent_pid.  O(1) when
+// target_pid != 0; O(children) when target_pid == 0 (walk parent's
+// children list — typically very small).
 task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    reap_child_arg_t a = { parent_pid, target_pid };
-    return zombie_walk_reap(reap_child_visit, &a);
+    if (target_pid != 0) {
+        // O(1): look up the specific pid, verify parent + zombie state.
+        task_t* z = pid_ht_find(target_pid);
+        if (!z || z->state != TASK_ZOMBIE || z->ppid != parent_pid)
+            return NULL;
+        if (!zombie_unlink(z)) return NULL;
+        return z;
+    }
+    // target_pid == 0: find ANY zombie child of parent_pid.  Walk the
+    // parent's own children list (maintained as task_t.children /
+    // child_next) rather than the per-CPU zombie lists — children is
+    // typically tiny and it keeps us away from cross-CPU walks.
+    task_t* parent = pid_ht_find(parent_pid);
+    if (!parent) return NULL;
+    for (task_t* c = parent->children; c; c = c->child_next) {
+        if (c->state == TASK_ZOMBIE) {
+            if (zombie_unlink(c)) return c;
+        }
+    }
+    return NULL;
 }
 
 // Check if any zombie child of parent_pid exists (non-blocking poll).
+// O(1) when target_pid != 0; O(children) otherwise.
 uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    unsigned n = num_cpus();
-    for (unsigned ci = 0; ci < n; ci++) {
-        cpu_t* c = &g_cpus[ci];
-        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
-        task_t* z = c->rq.zombie_head;
-        while (z) {
-            int pid_match = (target_pid == 0) || (z->pid == target_pid);
-            int is_child  = (z->ppid == parent_pid);
-            if (pid_match && is_child) {
-                spin_unlock_irqrestore(&c->rq_lock, flags);
-                return 1;
-            }
-            z = z->next;
-        }
-        spin_unlock_irqrestore(&c->rq_lock, flags);
+    if (target_pid != 0) {
+        task_t* z = pid_ht_find(target_pid);
+        return (z && z->state == TASK_ZOMBIE && z->ppid == parent_pid) ? 1 : 0;
     }
+    task_t* parent = pid_ht_find(parent_pid);
+    if (!parent) return 0;
+    for (task_t* c = parent->children; c; c = c->child_next)
+        if (c->state == TASK_ZOMBIE) return 1;
     return 0;
 }
 
 // ── sched_wait_pid ────────────────────────────────────────────────────────
 
-typedef struct { uint32_t pid; uint8_t found; } wait_pid_arg_t;
-
-static void find_pid_cb(task_t* t, void* data) {
-    wait_pid_arg_t* a = (wait_pid_arg_t*)data;
-    if (t->pid == a->pid) a->found = 1;
-}
-
-// Returns 1 if a matching zombie was found (or task is gone), 0 if still alive.
-// pid == 0 means "any child".
+// Returns 1 if a matching zombie was found OR the specific pid is
+// gone from the system entirely; 0 if it's still alive and we should
+// keep waiting.
+//
+// pid != 0: O(1) per retry via pid_ht_find.
+// pid == 0: O(children) per retry (walk parent's children list).
 uint8_t sched_wait_pid(uint32_t pid) {
     for (;;) {
-        // Walk every CPU's zombie list.
-        if (sched_poll_pid(pid)) return 1;
-        if (pid == 0) { sched_yield(); continue; } // any: keep waiting
-        // Specific pid: check if still alive anywhere.
-        wait_pid_arg_t a = {pid, 0};
-        sched_for_each(find_pid_cb, &a);
-        if (!a.found) return 1;
+        if (pid != 0) {
+            // O(1): look up the specific pid.  If it's gone, waitpid
+            // returns "reaped"; if it's a zombie, waitpid will reap it
+            // via sched_reap_*; otherwise keep waiting.
+            task_t* t = pid_ht_find(pid);
+            if (!t) return 1;                 // fully gone already
+            if (t->state == TASK_ZOMBIE) return 1;
+        } else {
+            // "any child" — check the current task's children list.
+            if (g_current) {
+                for (task_t* c = g_current->children; c; c = c->child_next)
+                    if (c->state == TASK_ZOMBIE) return 1;
+                if (!g_current->children) return 1; // no children at all
+            }
+        }
         sched_yield();
     }
 }
 
-// Non-blocking variant: returns 1 if zombie ready, 0 if not.
+// Non-blocking variant.  O(1) when pid != 0.
 uint8_t sched_poll_pid(uint32_t pid) {
-    unsigned n = num_cpus();
-    for (unsigned ci = 0; ci < n; ci++) {
-        cpu_t* c = &g_cpus[ci];
-        uint64_t flags = spin_lock_irqsave(&c->rq_lock);
-        task_t* z = c->rq.zombie_head;
-        while (z) {
-            if (pid == 0 || z->pid == pid) {
-                spin_unlock_irqrestore(&c->rq_lock, flags);
-                return 1;
-            }
-            z = z->next;
-        }
-        spin_unlock_irqrestore(&c->rq_lock, flags);
+    if (pid != 0) {
+        task_t* t = pid_ht_find(pid);
+        return (t && t->state == TASK_ZOMBIE) ? 1 : 0;
     }
+    // pid == 0: check the current task's children list for any zombie.
+    if (!g_current) return 0;
+    for (task_t* c = g_current->children; c; c = c->child_next)
+        if (c->state == TASK_ZOMBIE) return 1;
     return 0;
 }
 
