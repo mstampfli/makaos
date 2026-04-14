@@ -459,7 +459,7 @@ void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data) {
 // Idle process — never put on a queue, runs when all queues are empty.
 static uint8_t      s_idle_stack[PAGE_SIZE];
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
-static task_files_t s_idle_files = { .fd_table = NULL, .fd_capacity = 0, .refs = 1 };
+static task_files_t s_idle_files = { .ft = NULL, .lock = SPINLOCK_INIT, .refs = 1 };
 static task_t s_idle = {
     .pid          = 0,
     .tgid         = 0,

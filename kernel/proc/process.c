@@ -32,57 +32,79 @@ void task_mm_release(task_mm_t* m) {
 // ── task_files_t helpers ──────────────────────────────────────────────────
 #define FD_INITIAL_CAP 4
 
+// Allocate a fresh fdtable_t with `cap` zero-filled slots.
+static fdtable_t* fdtable_alloc(uint32_t cap) {
+    fdtable_t* ft = kmalloc(sizeof(fdtable_t));
+    if (!ft) return NULL;
+    ft->fd_table = kmalloc(cap * sizeof(vfs_file_t*));
+    if (!ft->fd_table) { kfree(ft); return NULL; }
+    ft->fd_flags = kmalloc(cap * sizeof(uint32_t));
+    if (!ft->fd_flags) { kfree(ft->fd_table); kfree(ft); return NULL; }
+    __builtin_memset(ft->fd_table, 0, cap * sizeof(vfs_file_t*));
+    __builtin_memset(ft->fd_flags, 0, cap * sizeof(uint32_t));
+    ft->cap = cap;
+    return ft;
+}
+
+// call_rcu callback: free an obsolete fdtable_t after its grace period.
+// Only frees the arrays + the fdtable_t struct; it does NOT close any
+// files (those were either still owned by the live table after the COW,
+// or were already vfs_close'd synchronously by the caller that dropped
+// the slot).
+static void fdtable_free_rcu(void* data) {
+    fdtable_t* ft = (fdtable_t*)data;
+    kfree(ft->fd_table);
+    kfree(ft->fd_flags);
+    kfree(ft);
+}
+
 uint8_t fd_table_init(task_files_t* f, uint32_t cap) {
-    f->fd_table = kmalloc(cap * sizeof(vfs_file_t*));
-    if (!f->fd_table) return 0;
-    f->fd_flags = kmalloc(cap * sizeof(uint32_t));
-    if (!f->fd_flags) { kfree(f->fd_table); f->fd_table = NULL; return 0; }
-    __builtin_memset(f->fd_table, 0, cap * sizeof(vfs_file_t*));
-    __builtin_memset(f->fd_flags, 0, cap * sizeof(uint32_t));
-    f->fd_capacity = cap;
+    fdtable_t* ft = fdtable_alloc(cap);
+    if (!ft) return 0;
+    __atomic_store_n(&f->ft, ft, __ATOMIC_RELEASE);
     return 1;
 }
 
+// Caller MUST hold f->lock.  Copy-on-write: publish a new, larger fdtable_t
+// with the existing slots preserved, and hand the old one to call_rcu so
+// any concurrent reader still dereferencing the old arrays stays valid
+// until their RCU reader section ends.
 uint8_t fd_table_grow(task_files_t* f) {
-    uint32_t new_cap = f->fd_capacity * 2;
+    fdtable_t* old = f->ft;
+    uint32_t old_cap = old->cap;
+    uint32_t new_cap = old_cap * 2;
 
-    vfs_file_t** tbl = kmalloc(new_cap * sizeof(vfs_file_t*));
-    if (!tbl) return 0;
-    uint32_t* flg = kmalloc(new_cap * sizeof(uint32_t));
-    if (!flg) { kfree(tbl); return 0; }
+    fdtable_t* neu = fdtable_alloc(new_cap);
+    if (!neu) return 0;
 
-    __builtin_memcpy(tbl, f->fd_table, f->fd_capacity * sizeof(vfs_file_t*));
-    __builtin_memcpy(flg, f->fd_flags, f->fd_capacity * sizeof(uint32_t));
-    __builtin_memset(tbl + f->fd_capacity, 0,
-                      (new_cap - f->fd_capacity) * sizeof(vfs_file_t*));
-    __builtin_memset(flg + f->fd_capacity, 0,
-                      (new_cap - f->fd_capacity) * sizeof(uint32_t));
+    __builtin_memcpy(neu->fd_table, old->fd_table, old_cap * sizeof(vfs_file_t*));
+    __builtin_memcpy(neu->fd_flags, old->fd_flags, old_cap * sizeof(uint32_t));
 
-    kfree(f->fd_table);
-    kfree(f->fd_flags);
-    f->fd_table    = tbl;
-    f->fd_flags    = flg;
-    f->fd_capacity = new_cap;
+    __atomic_store_n(&f->ft, neu, __ATOMIC_RELEASE);
+    call_rcu(fdtable_free_rcu, old);
     return 1;
 }
 
 task_files_t* task_files_alloc(void) {
     task_files_t* f = kmalloc(sizeof(task_files_t));
     if (!f) return NULL;
-    f->fd_table    = NULL;
-    f->fd_flags    = NULL;
-    f->fd_capacity = 0;
-    f->refs        = 1;
+    f->ft   = NULL;
+    f->refs = 1;
+    spin_lock_init(&f->lock);
     return f;
 }
 
 void task_files_release(task_files_t* f) {
     if (!f) return;
     if (--f->refs > 0) return;
-    for (uint32_t i = 0; i < f->fd_capacity; i++)
-        if (f->fd_table[i]) vfs_close(f->fd_table[i]);
-    kfree(f->fd_table);
-    kfree(f->fd_flags);
+    fdtable_t* ft = f->ft;
+    if (ft) {
+        for (uint32_t i = 0; i < ft->cap; i++)
+            if (ft->fd_table[i]) vfs_close(ft->fd_table[i]);
+        kfree(ft->fd_table);
+        kfree(ft->fd_flags);
+        kfree(ft);
+    }
     kfree(f);
 }
 
@@ -336,11 +358,15 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
-    fd_table_init(files, parent->files_shared->fd_capacity);
-    for (uint32_t i = 0; i < parent->files_shared->fd_capacity; i++) {
-        // dup each open file description so both parent and child share it
-        files->fd_table[i] = vfs_dup(parent->files_shared->fd_table[i]);
-        files->fd_flags[i] = parent->files_shared->fd_flags[i];
+    // Snapshot the parent's fdtable_t (outside RCU is fine — fork runs
+    // in the parent's own task context so its own table can't be
+    // concurrently torn down).
+    fdtable_t* pft = parent->files_shared->ft;
+    fd_table_init(files, pft->cap);
+    fdtable_t* cft = files->ft;
+    for (uint32_t i = 0; i < pft->cap; i++) {
+        cft->fd_table[i] = vfs_dup(pft->fd_table[i]);
+        cft->fd_flags[i] = pft->fd_flags[i];
     }
 
     t->pid              = pid_alloc();

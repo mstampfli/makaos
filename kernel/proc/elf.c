@@ -376,20 +376,21 @@ static vfs_file_t* resolve_stdio(const int* spec, int i) {
     if (!spec) return tty_open(0);
     int fd = spec[i];
     if (fd == -2) return vfs_null_open(); // explicit /dev/null
+
+    // Caller is the parent (g_current) setting up the child's stdio.
+    // Walk the parent's own fdtable_t directly; no task_files_t.lock
+    // needed because fork/spawn runs in the parent's own task context
+    // and its own fd table is only mutated by itself.
+    fdtable_t* ft = (g_current && g_current->files_shared)
+                    ? g_current->files_shared->ft : NULL;
+
     if (fd == -1) {
-        // Inherit from current process.
-        if (g_current && g_current->files_shared &&
-            (uint32_t)i < g_current->files_shared->fd_capacity &&
-            g_current->files_shared->fd_table[i]) {
-            return vfs_dup(g_current->files_shared->fd_table[i]);
-        }
+        if (ft && (uint32_t)i < ft->cap && ft->fd_table[i])
+            return vfs_dup(ft->fd_table[i]);
         return tty_open(0); // no parent fd — fall back to tty0
     }
-    if (g_current && g_current->files_shared &&
-        (uint32_t)fd < g_current->files_shared->fd_capacity &&
-        g_current->files_shared->fd_table[fd]) {
-        return vfs_dup(g_current->files_shared->fd_table[fd]);
-    }
+    if (ft && (uint32_t)fd < ft->cap && ft->fd_table[fd])
+        return vfs_dup(ft->fd_table[fd]);
     return tty_open(0); // requested fd doesn't exist — fall back to tty0
 }
 
@@ -414,9 +415,9 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    files->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
-    files->fd_table[1] = tty_open(0);
-    files->fd_table[2] = tty_open(0);
+    files->ft->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
+    files->ft->fd_table[1] = tty_open(0);
+    files->ft->fd_table[2] = tty_open(0);
 
     t->pid              = pid;
     t->tgid             = pid;
@@ -513,9 +514,9 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
     fd_table_init(files, 4);
-    files->fd_table[0] = resolve_stdio(stdio, 0);
-    files->fd_table[1] = resolve_stdio(stdio, 1);
-    files->fd_table[2] = resolve_stdio(stdio, 2);
+    files->ft->fd_table[0] = resolve_stdio(stdio, 0);
+    files->ft->fd_table[1] = resolve_stdio(stdio, 1);
+    files->ft->fd_table[2] = resolve_stdio(stdio, 2);
 
     t->pid              = pid;
     t->tgid             = pid;
