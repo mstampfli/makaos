@@ -45,36 +45,21 @@ void signal_send(task_t* t, int sig) {
 }
 
 // ── signal_send_group ─────────────────────────────────────────────────────
-typedef struct { uint32_t tgid; int sig; } sig_group_arg_t;
-
-static void sig_group_cb(task_t* t, void* data) {
-    sig_group_arg_t* a = (sig_group_arg_t*)data;
-    if (t->tgid == a->tgid && t != g_current && t->state != TASK_DEAD)
-        signal_send(t, a->sig);
-}
-
+// Walk the tgid hash bucket — O(threads in process), not O(total tasks).
 void signal_send_group(uint32_t tgid, int sig) {
-    if (g_current && g_current->tgid == tgid)
-        signal_send(g_current, sig);
-    sig_group_arg_t a = {tgid, sig};
-    sched_for_each(sig_group_cb, &a);
+    for (task_t* t = task_idx_tgid_head(tgid); t; t = t->tg_next) {
+        if (t->state == TASK_DEAD) continue;
+        signal_send(t, sig);
+    }
 }
 
 // ── signal_send_pgrp ─────────────────────────────────────────────────────
-// Send signal to every task in the given process group.
-typedef struct { uint32_t pgid; int sig; } sig_pgrp_arg_t;
-
-static void sig_pgrp_cb(task_t* t, void* data) {
-    sig_pgrp_arg_t* a = (sig_pgrp_arg_t*)data;
-    if (t->pgid == a->pgid && t->state != TASK_DEAD)
-        signal_send(t, a->sig);
-}
-
+// Walk the pgid hash bucket — O(procs in pgrp), not O(total tasks).
 void signal_send_pgrp(uint32_t pgid, int sig) {
-    if (g_current && g_current->pgid == pgid)
-        signal_send(g_current, sig);
-    sig_pgrp_arg_t a = {pgid, sig};
-    sched_for_each(sig_pgrp_cb, &a);
+    for (task_t* t = task_idx_pgid_head(pgid); t; t = t->pg_next) {
+        if (t->state == TASK_DEAD) continue;
+        signal_send(t, sig);
+    }
 }
 
 // ── signal_setup_frame ────────────────────────────────────────────────────
