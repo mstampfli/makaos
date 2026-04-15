@@ -161,15 +161,54 @@ void tss_init(void) {
 }
 
 // ── tss_init_ap (AP) ─────────────────────────────────────────────────────
-// Precondition: the AP has already programmed its GS_BASE to its own
-// cpu_t (via cpu_init_ap()), and the shared GDT has already been loaded
-// into this CPU's GDTR (the AP trampoline does lgdt on the same g_gdt).
+// Called from cpu_init_ap() on the AP's own stack.  Swaps the AP off the
+// trampoline's temporary GDT onto the kernel's shared g_gdt (which
+// already has a TSS descriptor pair for every possible CPU), reloads
+// segment registers, allocates IST stacks into g_cpus[id].tss, and LTRs
+// the CPU's own TSS selector.
 //
-// This is the full set of TSS-specific work an AP needs: allocate IST
-// stacks into its per-CPU tss, then LTR its descriptor.
-void tss_init_ap(void) {
-    tss_populate(&this_cpu()->tss);
-    __asm__ volatile("ltr %0" : : "r"(GDT_TSS_SELECTOR(cpu_id())) : "memory");
+// Takes cpu_id by value rather than reading this_cpu() because:
+//   (a) the segment reload below clobbers GS_BASE; this_cpu() would
+//       return a stale pointer for the rest of this function, and
+//   (b) cpu_init_ap already has the id in hand from the trampoline's
+//       startup_state, so there is no point re-deriving it.
+//
+// Does NOT touch CR4/SMEP — the BSP already enabled those, and we assume
+// feature-uniform CPUs (every serious firmware enforces this; if a board
+// ever ships asymmetric SMEP we'll gate per-CPU here).
+//
+// cpu_init_ap() wrmsrs IA32_GS_BASE AFTER this function returns — the
+// `mov %ax,%gs` in the segment reload below leaves it at zero, mirroring
+// the BSP's ordering (tss_init → cpu_init_bsp) in kmain().
+void tss_init_ap(uint32_t id) {
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
+    gdtr.limit = (uint16_t)(sizeof(g_gdt) - 1);
+    gdtr.base  = (uint64_t)g_gdt;
+    __asm__ volatile("lgdt %0" : : "m"(gdtr) : "memory");
+    __asm__ volatile(
+        "pushq $0x08\n\t"
+        "lea 1f(%%rip), %%rax\n\t"
+        "pushq %%rax\n\t"
+        "lretq\n\t"
+        "1:\n\t"
+        : : : "rax", "memory"
+    );
+    __asm__ volatile(
+        "mov $0x10, %%ax\n\t"
+        "mov %%ax, %%ds\n\t"
+        "mov %%ax, %%es\n\t"
+        "mov %%ax, %%ss\n\t"
+        "xor %%ax, %%ax\n\t"
+        "mov %%ax, %%fs\n\t"
+        "mov %%ax, %%gs\n\t"
+        : : : "ax", "memory"
+    );
+
+    // 4. Populate this CPU's TSS directly via its slot (GS_BASE is cleared).
+    tss_populate(&g_cpus[id].tss);
+
+    // 5. Load the task register for CPU `id`.
+    __asm__ volatile("ltr %0" : : "r"(GDT_TSS_SELECTOR(id)) : "memory");
 }
 
 // ── tss_set_rsp0 ─────────────────────────────────────────────────────────

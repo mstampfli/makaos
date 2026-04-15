@@ -32,6 +32,10 @@ typedef struct idt_gate_t {
 // initializes descriptors and loads idtr
 void idt_init(void);
 
+// AP-side IDT load: APs share the BSP's vector table, they only need
+// to lidt their own IDTR at it.  Call after idt_init() has run on the BSP.
+void idt_load_ap(void);
+
 // Register an IRQ handler at the given vector (e.g. 0x20 for IRQ0).
 // Used by timer drivers and future device drivers.
 void idt_irq_register(uint8_t vec, uint64_t handler_addr);

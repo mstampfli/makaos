@@ -275,8 +275,32 @@ awk '/@@@ASMDEF/ {
 }' "$ASM_OFFSETS_S" > "$ASM_OFFSETS_INC"
 
 KERNEL_ASM_OBJS=()
+# The AP trampoline is a flat binary blob — NOT an ELF64 relocatable like
+# everything else in arch/x86_64.  It is assembled to raw bytes and then
+# packaged into a .o via objcopy so the linker can place it alongside
+# kernel code and expose _binary_ap_trampoline_bin_{start,end} symbols
+# that smp_boot.c references to copy the blob into its low-memory page.
+AP_TRAMP_ASM="$KERNEL_DIR/arch/x86_64/ap_trampoline.asm"
+AP_TRAMP_OBJ="$BUILD_DIR/kernel_ap_trampoline.o"
+"$NASM" -f bin "$AP_TRAMP_ASM" -o "$BUILD_DIR/ap_trampoline.bin"
+# objcopy synthesises three absolute symbols from the binary input, but
+# it bakes the *input path* into the symbol names (dots and slashes →
+# underscores).  Run objcopy from inside BUILD_DIR so the symbols come
+# out as _binary_ap_trampoline_bin_{start,end,size} — the exact names
+# smp_boot.c declares extern.
+#
+# --rename-section parks the bytes in .rodata so they live inside the
+# kernel image (same region the final kernel.bin objcopy grabs via
+# -j .rodata).
+( cd "$BUILD_DIR" && "$OBJCOPY" -I binary -O elf64-x86-64 -B i386:x86-64 \
+    --rename-section .data=.rodata,alloc,load,readonly,data,contents \
+    ap_trampoline.bin "$(basename "$AP_TRAMP_OBJ")" )
+KERNEL_ASM_OBJS+=("$AP_TRAMP_OBJ")
+
 for src in "$KERNEL_DIR/arch/x86_64"/*.asm; do
   [ -e "$src" ] || continue
+  # Skip the trampoline — it has its own flat-binary build step above.
+  if [ "$src" = "$AP_TRAMP_ASM" ]; then continue; fi
   obj="$BUILD_DIR/kernel_$(basename "${src%.asm}").o"
   "$NASM" -f elf64 -g -F dwarf -I "$BUILD_DIR/" "$src" -o "$obj"
   KERNEL_ASM_OBJS+=("$obj")

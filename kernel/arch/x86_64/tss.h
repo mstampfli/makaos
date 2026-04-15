@@ -63,12 +63,13 @@ typedef struct __attribute__((packed)) {
 // vmm_init() and kheap is ready (uses pmm_buddy_alloc).
 void tss_init(void);
 
-// AP-side TSS setup.  Precondition: GS_BASE is already programmed to
-// point at this AP's cpu_t.  Allocates IST stacks into this_cpu()->tss,
-// sets iopb_offset, and executes `ltr GDT_TSS_SELECTOR(cpu_id())`.
-// Does NOT touch the GDT (shared with BSP), does NOT reload segments,
-// does NOT touch CR4/SMEP (BSP already did).
-void tss_init_ap(void);
+// AP-side TSS setup.  Called from cpu_init_ap() early, BEFORE GS_BASE is
+// programmed on the AP (this function clobbers GS_BASE via its segment
+// reload; the caller re-programs it immediately after).  Loads the
+// shared kernel GDT onto the AP, reloads segments, allocates IST stacks
+// into g_cpus[id].tss, and LTRs the CPU's own TSS selector.
+// Does NOT touch CR4/SMEP — BSP already did those.
+void tss_init_ap(uint32_t id);
 
 // Update TSS.RSP0 — call on every context switch so the CPU knows which
 // kernel stack to use when the next ring-3 → ring-0 transition occurs.

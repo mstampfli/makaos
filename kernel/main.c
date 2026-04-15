@@ -10,6 +10,7 @@
 #include "timer.h"
 #include "sched.h"
 #include "cpu.h"
+#include "smp_boot.h"
 #include "irq_wait.h"
 #include "ahci.h"
 #include "ext2.h"
@@ -51,6 +52,12 @@ static void init_kthread(void) {
     ahci_start_io_thread();
 
     do_initcalls_subsys();
+
+    // Phase 9-4b/c: wake every AP discovered by ACPI now that the
+    // scheduler, timers, LAPIC, VMM, and PMM are fully live.  APs
+    // land in cpu_init_ap and drop into an idle-hlt loop until
+    // Phase 9-5 wires them into the per-CPU scheduler tick.
+    smp_boot_aps();
 
     // Load userspace processes sequentially — ext2 is not thread-safe.
     static const char* envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", NULL };
