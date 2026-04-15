@@ -3,13 +3,14 @@
 #include "kheap.h"
 #include "common.h"
 #include "smp.h"
+#include "seqlock.h"
 
-// ── Multi-task-safe scratch buffers ──────────────────────────────────────
-// Function-local 4 KiB scratch buffers must NOT live on the kstack (8 KiB
-// total) or in static/BSS (would race across preempted tasks).  Use the
-// pattern below: declare the slot once at the top of the function, then
-// alloc *lazily* just before first use so we never waste an alloc on an
-// early-error path.
+// ── Multi-task / SMP-safe scratch buffers ───────────────────────────────
+// Function-local 4 KiB scratch buffers cannot live in BSS (would race
+// across CPUs) and shouldn't live on the kstack (8 KiB total — too tight
+// for nested ext2 paths).  Use the pattern below: declare the slot once
+// at the top of the function, then alloc *lazily* just before first use
+// so we never waste an alloc on an early-error path.
 //
 //   int f(...) {
 //       EXT2_SCRATCH_DECL(buf);          // declares uint8_t* buf = NULL
@@ -28,9 +29,11 @@
 // kfree(NULL) is a no-op so the cleanup hook fires safely whether we
 // alloc'd or not.
 //
-// Note: the file-scope s_blk_buf / s_blk_buf2 / s_bcache_data buffers
-// below stay static on purpose — hot path, intentional speed/memory
-// tradeoff.  See feedback memory.
+// Note: the file-scope `s_bcache_data` array below stays static on
+// purpose — it IS the block cache and its contents are SMP-safe via
+// the per-slot pin/seqlock protocol in Phase 7.2.  Anything else that
+// looks like a "shared scratch buffer" must use EXT2_SCRATCH so two
+// CPUs don't trample each other.
 static inline void ext2_scratch_free_(uint8_t** p) {
     if (*p) kfree(*p);
 }
@@ -57,12 +60,20 @@ static uint32_t s_inodes_per_grp  = 0;
 static uint32_t s_blocks_per_grp  = 0;
 static uint32_t s_inode_size      = 128; // bytes per inode on disk
 static uint32_t s_num_groups      = 0;
+// Per-group spinlocks: serialise inode/block bitmap RMW + BGD counter
+// updates within a single group.  Two CPUs allocating in different
+// groups never contend.  Allocated at mount time and never freed.
+static spinlock_t* s_group_locks  = NULL;
+// Filesystem-wide rename mutex.  Serialises ext2_rename against itself
+// so two concurrent renames cannot observe the same file briefly at
+// two names (or worse, race over the same inum across opposite
+// directions).  This is the same tactic Linux uses via its per-sb
+// s_vfs_rename_mutex — rename is rare enough that a single global
+// spinlock is not a scalability bottleneck, and it avoids the multi-
+// lock acquisition ordering complexity of dual-parent locking.
+static spinlock_t  s_rename_lock  = SPINLOCK_INIT;
 static uint32_t s_first_data_blk  = 0;   // superblock's s_first_data_block
 static uint8_t  s_mounted         = 0;
-
-// Static I/O buffers for misc operations.
-static uint8_t s_blk_buf[4096];
-static uint8_t s_blk_buf2[4096];
 
 // ── Block cache ───────────────────────────────────────────────────────────
 // Direct-mapped cache: 256 slots × 4KB = 1MB BSS.  Block number % BCACHE_SIZE
@@ -203,18 +214,41 @@ static void bcache_put(bcache_ref_t* r) {
 }
 
 
-// ── Inode cache — 2-level radix tree ──────────────────────────────────────
+// ── Inode cache — 2-level radix tree, per-leaf seqlock ──────────────────
 // Key: uint32_t inode number.  Value: ext2_inode_t (cached from disk).
-// L0 index = ino >> 8  (top 24 bits collapse into 256 buckets via masking)
-// L1 index = ino & 0xFF
+// L0 index = ino >> 8 ; L1 index = ino & 0xFF
 // Nodes are allocated on demand via kmalloc; never freed (kernel lifetime).
-// write_inode() keeps the cache coherent — no explicit invalidation needed.
+//
+// SMP concurrency model:
+//   - Each leaf carries its own seqlock.  Readers (irtree_get) loop:
+//     seq_begin → memcpy(128 B) → seq_retry.  Zero atomics on a
+//     consistent read; on a rare collision they redo the memcpy.
+//     They NEVER block on a writer — that's the entire point of using
+//     a seqlock here over a spinlock.
+//   - Writers use inode_lock / inode_unlock which call seq_write_begin
+//     / seq_write_end on the leaf.  Two CPUs writing different inodes
+//     never contend.  Two CPUs writing the SAME inode serialise on the
+//     leaf's internal write_lock for tens of nanoseconds.
+//   - The L0 / L1 pointer slots are publish-once stores; lookup is a
+//     plain acquire-load with no atomics on the hot path.  Allocation
+//     of a fresh leaf the first time we touch a given inode is
+//     serialised by `s_irtree_alloc_lock`, which only fires once per
+//     unique inode for the lifetime of the kernel.
+//
+// The leaf's `inode` field doubles as the in-memory authoritative copy
+// of the inode for read-modify-write sequences: callers do
+// `leaf = inode_lock(ino)` (which fault-loads the disk image into the
+// leaf if needed), mutate `leaf->inode`, then call inode_writeback() to
+// push the change to disk before inode_unlock.  The seqcount bump on
+// the unlock side is what lets concurrent irtree_get readers notice the
+// change without taking any lock.
 
 #define IRTREE_BITS  8
 #define IRTREE_SIZE  (1u << IRTREE_BITS)   // 256
 #define IRTREE_MASK  (IRTREE_SIZE - 1u)
 
 typedef struct {
+    seqlock_t    seq;             // per-inode seqlock; readers never block
     ext2_inode_t inode;
     uint32_t     ino;
     uint8_t      valid;
@@ -225,38 +259,93 @@ typedef struct {
 } irtree_l1_t;
 
 static irtree_l1_t* s_irtree[IRTREE_SIZE];  // L0: 256 pointers
+// Single allocation lock — only taken the first time a given inode is
+// touched.  Two CPUs racing to add the same leaf both end up sharing one.
+static spinlock_t   s_irtree_alloc_lock = SPINLOCK_INIT;
 
-static uint8_t irtree_get(uint32_t ino, ext2_inode_t* out) {
+// Lookup: plain acquire-loads down the L0 / L1 chain.  No lock needed
+// because every store in irtree_alloc is publish-once with release
+// semantics; we either see the leaf or we don't.
+static irtree_leaf_t* irtree_lookup(uint32_t ino) {
     uint32_t l0 = (ino >> IRTREE_BITS) & IRTREE_MASK;
     uint32_t l1 = ino & IRTREE_MASK;
-    if (!s_irtree[l0]) return 0;
-    irtree_leaf_t* leaf = s_irtree[l0]->leaves[l1];
-    if (!leaf || !leaf->valid || leaf->ino != ino) return 0;
-    *out = leaf->inode;
-    return 1;
+    irtree_l1_t* l1tab = __atomic_load_n(&s_irtree[l0], __ATOMIC_ACQUIRE);
+    if (!l1tab) return NULL;
+    irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1], __ATOMIC_ACQUIRE);
+    if (!leaf || leaf->ino != ino) return NULL;
+    return leaf;
 }
 
-static void irtree_put(uint32_t ino, const ext2_inode_t* inode) {
+// Allocate a fresh leaf if none exists yet.  Idempotent.  Returns NULL
+// on OOM.
+static irtree_leaf_t* irtree_alloc(uint32_t ino) {
     uint32_t l0 = (ino >> IRTREE_BITS) & IRTREE_MASK;
     uint32_t l1 = ino & IRTREE_MASK;
 
-    if (!s_irtree[l0]) {
-        s_irtree[l0] = kmalloc(sizeof(irtree_l1_t));
-        if (!s_irtree[l0]) return;
-        for (uint32_t i = 0; i < IRTREE_SIZE; i++) s_irtree[l0]->leaves[i] = NULL;
+    spin_lock(&s_irtree_alloc_lock);
+    irtree_l1_t* l1tab = s_irtree[l0];
+    if (!l1tab) {
+        l1tab = kmalloc(sizeof(irtree_l1_t));
+        if (!l1tab) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
+        for (uint32_t i = 0; i < IRTREE_SIZE; i++) l1tab->leaves[i] = NULL;
+        __atomic_store_n(&s_irtree[l0], l1tab, __ATOMIC_RELEASE);
     }
-
-    irtree_leaf_t* leaf = s_irtree[l0]->leaves[l1];
+    irtree_leaf_t* leaf = l1tab->leaves[l1];
     if (!leaf) {
         leaf = kmalloc(sizeof(irtree_leaf_t));
-        if (!leaf) return;
-        s_irtree[l0]->leaves[l1] = leaf;
+        if (!leaf) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
+        seqlock_init(&leaf->seq);
+        leaf->ino   = ino;
+        leaf->valid = 0;
+        __atomic_store_n(&l1tab->leaves[l1], leaf, __ATOMIC_RELEASE);
     }
-
-    leaf->inode = *inode;
-    leaf->ino   = ino;
-    leaf->valid = 1;
+    spin_unlock(&s_irtree_alloc_lock);
+    return leaf;
 }
+
+// Forward declaration: read the inode from disk into the leaf cache.
+// Defined further down once read_block / read_bgd are in scope.
+static uint8_t inode_load(irtree_leaf_t* leaf, uint32_t ino);
+
+// Public per-inode write-side lock: returns the leaf with its seqlock
+// held in WRITE state.  Mutators bracket their entire RMW sequence in
+// inode_lock / inode_unlock.  If the leaf is not yet populated the
+// inode is loaded from disk under the lock so the caller always sees a
+// valid `leaf->inode`.
+static irtree_leaf_t* inode_lock(uint32_t ino) {
+    irtree_leaf_t* leaf = irtree_lookup(ino);
+    if (!leaf) leaf = irtree_alloc(ino);
+    if (!leaf) return NULL;
+    seq_write_begin(&leaf->seq);
+    if (!leaf->valid) {
+        if (!inode_load(leaf, ino)) {
+            seq_write_end(&leaf->seq);
+            return NULL;
+        }
+    }
+    return leaf;
+}
+
+static void inode_unlock(irtree_leaf_t* leaf) {
+    if (leaf) seq_write_end(&leaf->seq);
+}
+
+// Brief-section reader: copy the cached inode out under a seqlock retry
+// loop.  No atomics on a consistent read.  Loops on the rare collision
+// where a writer is mid-update.
+static uint8_t irtree_get(uint32_t ino, ext2_inode_t* out) {
+    irtree_leaf_t* leaf = irtree_lookup(ino);
+    if (!leaf) return 0;
+    uint32_t s;
+    uint8_t valid;
+    do {
+        s = seq_begin(&leaf->seq);
+        valid = leaf->valid && leaf->ino == ino;
+        if (valid) *out = leaf->inode;
+    } while (seq_retry(&leaf->seq, s));
+    return valid;
+}
+
 
 // ── Low-level block I/O ────────────────────────────────────────────────────
 
@@ -320,38 +409,44 @@ static uint32_t bgd_table_block(void) {
 
 // Read BGD for group `g` into `out`.  Zero-copy: we pin the slot just
 // long enough to copy 32 bytes out.
+// Read a BGD descriptor.  Zero-copy: pin the cache slot just long
+// enough to copy 32 bytes out.  On a miss the per-call kmalloc'd
+// scratch absorbs the disk read — no shared static buffer.
 static uint8_t read_bgd(uint32_t g, ext2_bgd_t* out) {
     uint32_t offset_in_table = g * sizeof(ext2_bgd_t);
     uint32_t blk_idx = bgd_table_block() + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    bcache_ref_t r = bcache_get(blk_idx, s_blk_buf2);
+    EXT2_SCRATCH(scratch);
+    bcache_ref_t r = bcache_get(blk_idx, scratch);
     if (!r.data) return 0;
     __builtin_memcpy(out, r.data + off, sizeof(ext2_bgd_t));
     bcache_put(&r);
     return 1;
 }
 
-// Write BGD for group `g` from `in`.
+// Write BGD for group `g` from `in`.  Read-modify-write of one block.
+// Per-call scratch — two CPUs writing different groups never share the
+// scratch and so never corrupt each other.  (Two CPUs writing the SAME
+// group are serialised by the per-group lock added in Phase 8C-2.)
 static uint8_t write_bgd(uint32_t g, const ext2_bgd_t* in) {
     uint32_t offset_in_table = g * sizeof(ext2_bgd_t);
     uint32_t blk_idx = bgd_table_block() + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    if (!read_block(blk_idx, s_blk_buf2)) return 0;
-
-    uint8_t* dst = s_blk_buf2 + off;
-    const uint8_t* src = (const uint8_t*)in;
-    for (uint32_t i = 0; i < sizeof(ext2_bgd_t); i++) dst[i] = src[i];
-    return write_block(blk_idx, s_blk_buf2);
+    EXT2_SCRATCH(scratch);
+    if (!read_block(blk_idx, scratch)) return 0;
+    __builtin_memcpy(scratch + off, in, sizeof(ext2_bgd_t));
+    return write_block(blk_idx, scratch);
 }
 
 // ── Inode I/O ──────────────────────────────────────────────────────────────
 
-static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
-    if (ino == 0) return 0;
-    if (irtree_get(ino, out)) return 1;  // cache hit
-
+// Internal: load an inode from disk into the leaf cache.  Caller MUST
+// hold the leaf's seqlock writer side (i.e. be inside an inode_lock /
+// inode_unlock bracket OR be irtree_put_locked).  Returns 0 on disk
+// error.
+static uint8_t inode_load(irtree_leaf_t* leaf, uint32_t ino) {
     uint32_t g     = (ino - 1) / s_inodes_per_grp;
     uint32_t local = (ino - 1) % s_inodes_per_grp;
 
@@ -362,20 +457,34 @@ static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
     uint32_t blk_idx = bgd.bg_inode_table + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    // Zero-copy read: pin the cache slot while we copy 128 bytes of
-    // inode out.  A 4 KiB block read used to memcpy twice; now the
-    // disk-to-bcache copy happens once (on miss) and the bcache-to-out
-    // is a single tight struct copy.
-    bcache_ref_t r = bcache_get(blk_idx, s_blk_buf);
+    EXT2_SCRATCH(scratch);
+    bcache_ref_t r = bcache_get(blk_idx, scratch);
     if (!r.data) return 0;
-    __builtin_memcpy(out, r.data + off, sizeof(ext2_inode_t));
+    __builtin_memcpy(&leaf->inode, r.data + off, sizeof(ext2_inode_t));
     bcache_put(&r);
 
-    irtree_put(ino, out);  // populate cache
+    leaf->ino   = ino;
+    leaf->valid = 1;
     return 1;
 }
 
-static uint8_t write_inode(uint32_t ino, const ext2_inode_t* in) {
+// Public read: fast path is the seqlock reader (no atomics).  Slow
+// path takes the writer lock once to fault-load from disk.
+static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
+    if (ino == 0) return 0;
+    if (irtree_get(ino, out)) return 1;            // cache hit
+
+    irtree_leaf_t* leaf = inode_lock(ino);          // loads from disk
+    if (!leaf) return 0;
+    *out = leaf->inode;
+    inode_unlock(leaf);
+    return 1;
+}
+
+// Internal disk writeback shared between inode_writeback (called with
+// the leaf seqlock held) and the legacy write_inode wrapper (which
+// takes the seqlock itself).  Does NOT touch the irtree cache.
+static uint8_t inode_disk_write(uint32_t ino, const ext2_inode_t* in) {
     if (ino == 0) return 0;
     uint32_t g     = (ino - 1) / s_inodes_per_grp;
     uint32_t local = (ino - 1) % s_inodes_per_grp;
@@ -387,15 +496,20 @@ static uint8_t write_inode(uint32_t ino, const ext2_inode_t* in) {
     uint32_t blk_idx = bgd.bg_inode_table + offset_in_table / s_block_size;
     uint32_t off     = offset_in_table % s_block_size;
 
-    if (!read_block(blk_idx, s_blk_buf)) return 0;
+    EXT2_SCRATCH(scratch);
+    if (!read_block(blk_idx, scratch)) return 0;
+    __builtin_memcpy(scratch + off, in, sizeof(ext2_inode_t));
+    return write_block(blk_idx, scratch);
+}
 
-    uint8_t* dst = s_blk_buf + off;
-    const uint8_t* src = (const uint8_t*)in;
-    for (uint32_t i = 0; i < sizeof(ext2_inode_t); i++) dst[i] = src[i];
-    if (!write_block(blk_idx, s_blk_buf)) return 0;
-
-    irtree_put(ino, in);  // keep cache coherent
-    return 1;
+// Push the leaf's in-memory inode to disk.  Caller MUST hold the leaf
+// seqlock writer side (via inode_lock).  This is the only way to
+// persist an inode change after Phase 8C — the leaf cache already
+// holds the authoritative copy, so no extra memcpy or irtree_put is
+// needed.
+static uint8_t inode_writeback(irtree_leaf_t* leaf) {
+    if (!leaf || !leaf->valid) return 0;
+    return inode_disk_write(leaf->ino, &leaf->inode);
 }
 
 // ── ext2_init ──────────────────────────────────────────────────────────────
@@ -423,6 +537,14 @@ uint8_t ext2_init(uint32_t part_lba) {
 
     // Number of block groups.
     s_num_groups = (sb->s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
+
+    // One spinlock per group for bitmap RMW + BGD counter updates.
+    // Two CPUs allocating in different groups never contend.  Allocated
+    // once, never freed (kernel lifetime).
+    s_group_locks = (spinlock_t*)kmalloc(s_num_groups * sizeof(spinlock_t));
+    if (!s_group_locks) return 0;
+    for (uint32_t g = 0; g < s_num_groups; g++)
+        spin_lock_init(&s_group_locks[g]);
 
     s_mounted = 1;
     return 1;
@@ -743,10 +865,16 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
         if (fd->cur_pos > fd->file_size) fd->file_size = fd->cur_pos;
     }
 
-    // Persist updated inode (size + block pointers).
+    // Persist updated inode (size + block pointers).  Take the per-
+    // inode seqlock so a concurrent reader sees an atomic snapshot.
     fd->inode.i_size   = fd->file_size;
     fd->inode.i_blocks = ((fd->file_size + s_block_size - 1) / s_block_size) * (s_block_size / 512);
-    write_inode(fd->ino, &fd->inode);
+    irtree_leaf_t* leaf = inode_lock(fd->ino);
+    if (leaf) {
+        leaf->inode = fd->inode;
+        inode_writeback(leaf);
+        inode_unlock(leaf);
+    }
 
     return (int64_t)total;
 }
@@ -896,98 +1024,138 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
 
 // ── Allocation helpers ─────────────────────────────────────────────────────
 
-// Allocate a free inode from any group. Returns inode number or 0.
+// Allocate a free inode from any group.  Walks groups round-robin
+// (no lock during the peek); on a candidate group we take the
+// per-group spinlock, re-read the BGD under the lock, and either
+// commit the allocation or release the lock and continue to the next
+// group.  Two CPUs allocating in different groups never contend.
 static uint32_t alloc_inode(void) {
     EXT2_SCRATCH(ibm_buf);
 
     for (uint32_t g = 0; g < s_num_groups; g++) {
+        ext2_bgd_t bgd_peek;
+        if (!read_bgd(g, &bgd_peek)) continue;
+        if (bgd_peek.bg_free_inodes_count == 0) continue;
+
+        spin_lock(&s_group_locks[g]);
+        // Re-read the BGD under the lock — another CPU may have just
+        // emptied this group between the peek and the lock acquire.
         ext2_bgd_t bgd;
-        if (!read_bgd(g, &bgd)) continue;
-        if (bgd.bg_free_inodes_count == 0) continue;
-
-        if (!read_block(bgd.bg_inode_bitmap, ibm_buf)) continue;
-
+        if (!read_bgd(g, &bgd) || bgd.bg_free_inodes_count == 0) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
+        if (!read_block(bgd.bg_inode_bitmap, ibm_buf)) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
         uint32_t bit = bitmap_find_free(ibm_buf, s_inodes_per_grp);
-        if (bit == UINT32_MAX) continue;
-
+        if (bit == UINT32_MAX) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
         bitmap_set(ibm_buf, bit);
-        if (!write_block(bgd.bg_inode_bitmap, ibm_buf)) return 0;
-
+        if (!write_block(bgd.bg_inode_bitmap, ibm_buf)) {
+            spin_unlock(&s_group_locks[g]);
+            return 0;
+        }
         bgd.bg_free_inodes_count--;
         write_bgd(g, &bgd);
+        spin_unlock(&s_group_locks[g]);
 
-        uint32_t ino = g * s_inodes_per_grp + bit + 1;
-        return ino;
-    }
-    return 0; // no free inode
-}
-
-// Allocate a free block from any group. Returns block number or 0.
-static uint32_t alloc_block(void) {
-    EXT2_SCRATCH(bbm_buf);
-
-    for (uint32_t g = 0; g < s_num_groups; g++) {
-        ext2_bgd_t bgd;
-        if (!read_bgd(g, &bgd)) continue;
-        if (bgd.bg_free_blocks_count == 0) continue;
-
-        if (!read_block(bgd.bg_block_bitmap, bbm_buf)) continue;
-
-        uint32_t bit = bitmap_find_free(bbm_buf, s_blocks_per_grp);
-        if (bit == UINT32_MAX) continue;
-
-        bitmap_set(bbm_buf, bit);
-        if (!write_block(bgd.bg_block_bitmap, bbm_buf)) return 0;
-
-        bgd.bg_free_blocks_count--;
-        write_bgd(g, &bgd);
-
-        uint32_t blk = g * s_blocks_per_grp + bit + s_first_data_blk;
-        return blk;
+        return g * s_inodes_per_grp + bit + 1;
     }
     return 0;
 }
 
-// Free a block.
+// Allocate a free block from any group.  Same lock protocol as
+// alloc_inode: optimistic peek, then take the per-group lock and
+// re-validate before committing the bit.
+static uint32_t alloc_block(void) {
+    EXT2_SCRATCH(bbm_buf);
+
+    for (uint32_t g = 0; g < s_num_groups; g++) {
+        ext2_bgd_t bgd_peek;
+        if (!read_bgd(g, &bgd_peek)) continue;
+        if (bgd_peek.bg_free_blocks_count == 0) continue;
+
+        spin_lock(&s_group_locks[g]);
+        ext2_bgd_t bgd;
+        if (!read_bgd(g, &bgd) || bgd.bg_free_blocks_count == 0) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
+        if (!read_block(bgd.bg_block_bitmap, bbm_buf)) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
+        uint32_t bit = bitmap_find_free(bbm_buf, s_blocks_per_grp);
+        if (bit == UINT32_MAX) {
+            spin_unlock(&s_group_locks[g]);
+            continue;
+        }
+        bitmap_set(bbm_buf, bit);
+        if (!write_block(bgd.bg_block_bitmap, bbm_buf)) {
+            spin_unlock(&s_group_locks[g]);
+            return 0;
+        }
+        bgd.bg_free_blocks_count--;
+        write_bgd(g, &bgd);
+        spin_unlock(&s_group_locks[g]);
+
+        return g * s_blocks_per_grp + bit + s_first_data_blk;
+    }
+    return 0;
+}
+
+// Free a block.  Takes the relevant group's spinlock for the bitmap
+// RMW + BGD counter update.
 static void free_block(uint32_t blk) {
     if (!blk) return;
     EXT2_SCRATCH_VOID(fbb_buf);
 
-    // Determine which group this block belongs to.
     uint32_t rel = (blk >= s_first_data_blk) ? (blk - s_first_data_blk) : blk;
     uint32_t g   = rel / s_blocks_per_grp;
     uint32_t bit = rel % s_blocks_per_grp;
+    if (g >= s_num_groups) return;
 
+    spin_lock(&s_group_locks[g]);
     ext2_bgd_t bgd;
-    if (!read_bgd(g, &bgd)) return;
-    if (!read_block(bgd.bg_block_bitmap, fbb_buf)) return;
-
+    if (!read_bgd(g, &bgd) || !read_block(bgd.bg_block_bitmap, fbb_buf)) {
+        spin_unlock(&s_group_locks[g]);
+        return;
+    }
     if (bitmap_test(fbb_buf, bit)) {
         bitmap_clear(fbb_buf, bit);
         write_block(bgd.bg_block_bitmap, fbb_buf);
         bgd.bg_free_blocks_count++;
         write_bgd(g, &bgd);
     }
+    spin_unlock(&s_group_locks[g]);
 }
 
-// Free an inode.
+// Free an inode.  Takes the relevant group's spinlock.
 static void free_inode_num(uint32_t ino) {
     if (!ino) return;
     EXT2_SCRATCH_VOID(fib_buf);
 
     uint32_t g   = (ino - 1) / s_inodes_per_grp;
     uint32_t bit = (ino - 1) % s_inodes_per_grp;
+    if (g >= s_num_groups) return;
 
+    spin_lock(&s_group_locks[g]);
     ext2_bgd_t bgd;
-    if (!read_bgd(g, &bgd)) return;
-    if (!read_block(bgd.bg_inode_bitmap, fib_buf)) return;
-
+    if (!read_bgd(g, &bgd) || !read_block(bgd.bg_inode_bitmap, fib_buf)) {
+        spin_unlock(&s_group_locks[g]);
+        return;
+    }
     if (bitmap_test(fib_buf, bit)) {
         bitmap_clear(fib_buf, bit);
         write_block(bgd.bg_inode_bitmap, fib_buf);
         bgd.bg_free_inodes_count++;
         write_bgd(g, &bgd);
     }
+    spin_unlock(&s_group_locks[g]);
 }
 
 // Zero a block on disk.
@@ -1116,9 +1284,18 @@ static uint8_t inode_set_block(ext2_inode_t* inode, uint32_t idx, uint32_t blk_n
 // Returns 1 on success, 0 on failure.
 static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
                               uint32_t child_ino, uint8_t file_type) {
-    ext2_inode_t dir_inode;
-    if (!read_inode(dir_ino_num, &dir_inode)) return 0;
-    if (!(dir_inode.i_mode & EXT2_S_IFDIR)) return 0;
+    // Hold the parent directory inode locked across the whole add: a
+    // concurrent dir_add_entry on the same dir would race the dirent
+    // walk and the i_size / i_blocks updates.  inode_lock loads the
+    // on-disk inode into the leaf cache if needed and pins it under a
+    // seqlock writer.
+    irtree_leaf_t* dir_leaf = inode_lock(dir_ino_num);
+    if (!dir_leaf) return 0;
+    ext2_inode_t dir_inode = dir_leaf->inode;  // working copy
+    if (!(dir_inode.i_mode & EXT2_S_IFDIR)) {
+        inode_unlock(dir_leaf);
+        return 0;
+    }
 
     uint32_t name_len = str_len(name);
     // Aligned rec_len for new entry.
@@ -1136,11 +1313,11 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
         if (bytes_left == 0) {
             // Need to allocate a new block for the directory.
             blk = alloc_block();
-            if (!blk) return 0;
+            if (!blk) goto fail;
             zero_block(blk);
             if (!inode_set_block(&dir_inode, blk_idx, blk)) {
                 free_block(blk);
-                return 0;
+                goto fail;
             }
             dir_inode.i_size   += s_block_size;
             dir_inode.i_blocks += s_block_size / 512;
@@ -1150,7 +1327,7 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
             if (!blk) break;
         }
 
-        if (!read_block(blk, dae_buf)) return 0;
+        if (!read_block(blk, dae_buf)) goto fail;
 
         if (new_blk) {
             // Write entry as the only entry in this fresh block.
@@ -1160,9 +1337,8 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
             de->name_len  = (uint8_t)name_len;
             de->file_type = file_type;
             for (uint32_t i = 0; i < name_len; i++) de->name[i] = name[i];
-            if (!write_block(blk, dae_buf)) return 0;
-            write_inode(dir_ino_num, &dir_inode);
-            return 1;
+            if (!write_block(blk, dae_buf)) goto fail;
+            goto success;
         }
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1183,9 +1359,8 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
                 de->name_len  = (uint8_t)name_len;
                 de->file_type = file_type;
                 for (uint32_t i = 0; i < name_len; i++) de->name[i] = name[i];
-                if (!write_block(blk, dae_buf)) return 0;
-                write_inode(dir_ino_num, &dir_inode);
-                return 1;
+                if (!write_block(blk, dae_buf)) goto fail;
+                goto success;
             }
 
             if (slack >= new_rec_len) {
@@ -1198,9 +1373,8 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
                 new_de->name_len  = (uint8_t)name_len;
                 new_de->file_type = file_type;
                 for (uint32_t i = 0; i < name_len; i++) new_de->name[i] = name[i];
-                if (!write_block(blk, dae_buf)) return 0;
-                write_inode(dir_ino_num, &dir_inode);
-                return 1;
+                if (!write_block(blk, dae_buf)) goto fail;
+                goto success;
             }
 
             off += de->rec_len;
@@ -1214,26 +1388,44 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
         blk_idx++;
     }
 
+fail:
+    inode_unlock(dir_leaf);
     return 0;
+success:
+    // Push the local working copy into the leaf and persist to disk.
+    // Both happen under the seqlock writer side held by inode_lock, so
+    // a concurrent reader sees either the pre-update or post-update
+    // inode but never a torn snapshot.
+    dir_leaf->inode = dir_inode;
+    inode_writeback(dir_leaf);
+    inode_unlock(dir_leaf);
+    return 1;
 }
 
 // Remove a directory entry by name from the directory `dir_ino_num`.
-// Marks the entry's inode field as 0 (deleted). Returns 1 on success, 0 if not found.
+// Marks the entry's inode field as 0 (deleted).  Holds the parent
+// directory inode locked across the whole walk so a concurrent
+// dir_add_entry on the same directory cannot move dirents under us.
 static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
-    ext2_inode_t dir_inode;
-    if (!read_inode(dir_ino_num, &dir_inode)) return 0;
+    irtree_leaf_t* dir_leaf = inode_lock(dir_ino_num);
+    if (!dir_leaf) return 0;
+    ext2_inode_t dir_inode = dir_leaf->inode;
 
     uint32_t name_len = str_len(name);
     uint32_t bytes_left = dir_inode.i_size;
     uint32_t blk_idx = 0;
+    uint8_t  ok = 0;
 
-    EXT2_SCRATCH_DECL(dre_buf);  // alloc lazily — empty dir = no work
+    EXT2_SCRATCH_DECL(dre_buf);
     while (bytes_left > 0) {
         uint32_t blk = inode_get_block(&dir_inode, blk_idx);
         blk_idx++;
         if (!blk) break;
 
-        if (!dre_buf) EXT2_SCRATCH_ALLOC(dre_buf);
+        if (!dre_buf) {
+            dre_buf = (uint8_t*)kmalloc(4096);
+            if (!dre_buf) break;
+        }
         if (!read_block(blk, dre_buf)) break;
 
         uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
@@ -1248,7 +1440,8 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
                 str_cmp_n(de->name, name, name_len) == 0) {
                 de->inode = 0;
                 write_block(blk, dre_buf);
-                return 1;
+                ok = 1;
+                goto out;
             }
             off += de->rec_len;
         }
@@ -1258,7 +1451,9 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
         else
             bytes_left = 0;
     }
-    return 0;
+out:
+    inode_unlock(dir_leaf);
+    return ok;
 }
 
 // ── Path utilities ─────────────────────────────────────────────────────────
@@ -1344,7 +1539,14 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         old_inode.i_blocks = n_blocks * (s_block_size / 512);
         old_inode.i_mode   = EXT2_S_IFREG | 0644;
         old_inode.i_links_count = 1;
-        write_inode(existing_ino, &old_inode);
+        {
+            irtree_leaf_t* leaf = inode_lock(existing_ino);
+            if (leaf) {
+                leaf->inode = old_inode;
+                inode_writeback(leaf);
+                inode_unlock(leaf);
+            }
+        }
         return 1;
     }
 
@@ -1390,7 +1592,15 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     }
 
     new_inode.i_blocks = n_blocks * (s_block_size / 512);
-    write_inode(new_ino, &new_inode);
+    {
+        irtree_leaf_t* leaf = inode_lock(new_ino);
+        if (leaf) {
+            leaf->inode = new_inode;
+            leaf->valid = 1;
+            inode_writeback(leaf);
+            inode_unlock(leaf);
+        }
+    }
 
     // Add directory entry in parent.
     if (!dir_add_entry(parent_ino, basename, new_ino, EXT2_FT_REG_FILE)) {
@@ -1615,7 +1825,15 @@ int ext2_mkdir(const char* path) {
     new_inode.i_size        = s_block_size;
     new_inode.i_blocks      = s_block_size / 512;
     new_inode.i_block[0]    = data_blk;
-    write_inode(new_ino, &new_inode);
+    {
+        irtree_leaf_t* leaf = inode_lock(new_ino);
+        if (leaf) {
+            leaf->inode = new_inode;
+            leaf->valid = 1;
+            inode_writeback(leaf);
+            inode_unlock(leaf);
+        }
+    }
 
     // Add to parent directory.
     if (!dir_add_entry(parent_ino, basename, new_ino, EXT2_FT_DIR)) {
@@ -1624,19 +1842,28 @@ int ext2_mkdir(const char* path) {
         return 0;
     }
 
-    // Increment parent's links_count for ".."
-    ext2_inode_t parent_inode;
-    if (read_inode(parent_ino, &parent_inode)) {
-        parent_inode.i_links_count++;
-        write_inode(parent_ino, &parent_inode);
+    // Increment parent's links_count for ".." — RMW under per-inode lock.
+    {
+        irtree_leaf_t* pleaf = inode_lock(parent_ino);
+        if (pleaf) {
+            pleaf->inode.i_links_count++;
+            inode_writeback(pleaf);
+            inode_unlock(pleaf);
+        }
     }
 
-    // Increment used_dirs_count in parent's BGD.
+    // Increment used_dirs_count in the new inode's BGD, under the
+    // per-group lock so it doesn't race a concurrent alloc_inode in
+    // the same group.
     uint32_t g = (new_ino - 1) / s_inodes_per_grp;
-    ext2_bgd_t bgd;
-    if (read_bgd(g, &bgd)) {
-        bgd.bg_used_dirs_count++;
-        write_bgd(g, &bgd);
+    if (g < s_num_groups) {
+        spin_lock(&s_group_locks[g]);
+        ext2_bgd_t bgd;
+        if (read_bgd(g, &bgd)) {
+            bgd.bg_used_dirs_count++;
+            write_bgd(g, &bgd);
+        }
+        spin_unlock(&s_group_locks[g]);
     }
 
     return 1;
@@ -1650,12 +1877,6 @@ int ext2_unlink(const char* path) {
     uint32_t ino = path_to_inode(path);
     if (!ino) return 0;
 
-    ext2_inode_t inode;
-    if (!read_inode(ino, &inode)) return 0;
-
-    // Refuse to unlink directories.
-    if ((inode.i_mode & 0xF000) == EXT2_S_IFDIR) return 0;
-
     char ul_parent[256];
     const char* basename = path_split(path, ul_parent);
     if (!basename || basename[0] == '\0') return 0;
@@ -1663,18 +1884,36 @@ int ext2_unlink(const char* path) {
     uint32_t parent_ino = path_to_inode(ul_parent);
     if (!parent_ino) return 0;
 
-    // Remove directory entry first.
+    // Lock the target inode for the whole link-count decrement +
+    // possible free.  A concurrent open() that snapshots inode.i_dtime
+    // before our writeback would either see the old dtime (live) or the
+    // new dtime (deleted) atomically — never a torn struct.
+    irtree_leaf_t* leaf = inode_lock(ino);
+    if (!leaf) return 0;
+
+    // Refuse to unlink directories.
+    if ((leaf->inode.i_mode & 0xF000) == EXT2_S_IFDIR) {
+        inode_unlock(leaf);
+        return 0;
+    }
+
+    // Remove directory entry first (takes parent inode lock internally).
+    inode_unlock(leaf);  // drop briefly to avoid lock-order with parent
     if (!dir_remove_entry(parent_ino, basename)) return 0;
+    leaf = inode_lock(ino);
+    if (!leaf) return 0;
 
     // Decrement link count; only free inode/data when it reaches 0.
-    if (inode.i_links_count > 0) inode.i_links_count--;
-    if (inode.i_links_count == 0) {
-        free_inode_blocks(&inode);
-        inode.i_dtime = 1;
-        write_inode(ino, &inode);
+    if (leaf->inode.i_links_count > 0) leaf->inode.i_links_count--;
+    if (leaf->inode.i_links_count == 0) {
+        free_inode_blocks(&leaf->inode);
+        leaf->inode.i_dtime = 1;
+        inode_writeback(leaf);
+        inode_unlock(leaf);
         free_inode_num(ino);
     } else {
-        write_inode(ino, &inode);
+        inode_writeback(leaf);
+        inode_unlock(leaf);
     }
 
     return 1;
@@ -1683,50 +1922,75 @@ int ext2_unlink(const char* path) {
 // ── ext2_rename ───────────────────────────────────────────────────────────
 // Move/rename `src` to `dst`.  Returns 1 on success, 0 on failure.
 // If `dst` already exists as a regular file it is removed first.
+//
+// Held under s_rename_lock for the entire operation so two concurrent
+// renames cannot observe an intermediate state where the file briefly
+// exists at both names (or both nowhere).  rename is a control-plane
+// operation — taking a single global lock for it is what Linux does
+// and is fine for any reasonable workload.
 int ext2_rename(const char* src, const char* dst) {
     if (!s_mounted || !src || !dst) return 0;
 
+    spin_lock(&s_rename_lock);
+
     uint32_t src_ino = path_to_inode(src);
-    if (!src_ino) return 0;
+    if (!src_ino) { spin_unlock(&s_rename_lock); return 0; }
 
     ext2_inode_t src_inode;
-    if (!read_inode(src_ino, &src_inode)) return 0;
+    if (!read_inode(src_ino, &src_inode)) { spin_unlock(&s_rename_lock); return 0; }
 
     uint8_t is_dir = ((src_inode.i_mode & 0xF000) == EXT2_S_IFDIR);
 
     // Resolve src parent/basename.
     char rn_src_parent[256];
     const char* src_base = path_split(src, rn_src_parent);
-    if (!src_base || src_base[0] == '\0') return 0;
+    if (!src_base || src_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t src_parent_ino = path_to_inode(rn_src_parent);
-    if (!src_parent_ino) return 0;
+    if (!src_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
 
     // Resolve dst parent/basename.
     char rn_dst_parent[256];
     const char* dst_base = path_split(dst, rn_dst_parent);
-    if (!dst_base || dst_base[0] == '\0') return 0;
+    if (!dst_base || dst_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
-    if (!dst_parent_ino) return 0;
+    if (!dst_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
 
-    // If dst exists as a regular file, unlink it.
+    // If dst exists as a regular file, unlink it under its inode lock.
     uint32_t dst_ino = path_to_inode(dst);
     if (dst_ino) {
-        ext2_inode_t dst_inode;
-        if (!read_inode(dst_ino, &dst_inode)) return 0;
-        if ((dst_inode.i_mode & 0xF000) == EXT2_S_IFDIR) return 0; // refuse dir collision
+        irtree_leaf_t* dleaf = inode_lock(dst_ino);
+        if (!dleaf) { spin_unlock(&s_rename_lock); return 0; }
+        if ((dleaf->inode.i_mode & 0xF000) == EXT2_S_IFDIR) {
+            inode_unlock(dleaf);
+            spin_unlock(&s_rename_lock);
+            return 0;
+        }
+        // Drop briefly so dir_remove_entry can take the parent's lock
+        // without our holding a child lock at the same time (avoids
+        // potential parent↔child deadlock if a future codepath nests
+        // them in the opposite order).
+        inode_unlock(dleaf);
         dir_remove_entry(dst_parent_ino, dst_base);
-        free_inode_blocks(&dst_inode);
-        dst_inode.i_links_count = 0;
-        write_inode(dst_ino, &dst_inode);
+        dleaf = inode_lock(dst_ino);
+        if (dleaf) {
+            free_inode_blocks(&dleaf->inode);
+            dleaf->inode.i_links_count = 0;
+            inode_writeback(dleaf);
+            inode_unlock(dleaf);
+        }
         free_inode_num(dst_ino);
     }
 
     // Add new directory entry pointing at the same inode.
     uint8_t ft = is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
-    if (!dir_add_entry(dst_parent_ino, dst_base, src_ino, ft)) return 0;
+    if (!dir_add_entry(dst_parent_ino, dst_base, src_ino, ft)) {
+        spin_unlock(&s_rename_lock);
+        return 0;
+    }
 
     // Remove old directory entry.
     dir_remove_entry(src_parent_ino, src_base);
 
+    spin_unlock(&s_rename_lock);
     return 1;
 }
