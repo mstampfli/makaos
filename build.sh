@@ -550,7 +550,7 @@ cp "$OVMF_VARS_SRC" "$OVMF_VARS"
 qemu-system-x86_64 \
   -accel kvm \
   -cpu host \
-  -smp 1 \
+  -smp 4 \
   -m 256M \
   -nodefaults \
   -no-user-config \

@@ -146,6 +146,12 @@ typedef struct {
     void*    CreateEventEx;
 } EFI_BOOT_SERVICES;
 
+/* ── Configuration Table entry ──────────────────────────────────────────── */
+typedef struct {
+    EFI_GUID VendorGuid;
+    void*    VendorTable;
+} EFI_CONFIGURATION_TABLE;
+
 /* ── System Table ───────────────────────────────────────────────────────── */
 /* EFI_TABLE_HEADER: Signature(8) + Revision(4) + HeaderSize(4) + CRC32(4) + Reserved(4) = 24 bytes */
 typedef struct {
@@ -161,6 +167,8 @@ typedef struct {
     void*                          StdErr;
     void*                          RuntimeServices;
     EFI_BOOT_SERVICES*             BootServices;
+    size_t                         NumberOfTableEntries;
+    EFI_CONFIGURATION_TABLE*       ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
 /* ── Loaded Image Protocol ───────────────────────────────────────────────── */
@@ -267,6 +275,18 @@ static EFI_GUID g_file_info_guid = {
     {0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}
 };
 
+/* ACPI 2.0+ table GUID — points to an RSDP.  Prefer this over the
+ * ACPI 1.0 GUID because it always carries an XSDT (64-bit pointers). */
+static EFI_GUID g_acpi20_table_guid = {
+    0x8868e871, 0xe4f1, 0x11d3,
+    {0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}
+};
+/* ACPI 1.0 table GUID — RSDT-only fallback. */
+static EFI_GUID g_acpi10_table_guid = {
+    0xeb9d2d30, 0x2d88, 0x11d3,
+    {0x9a,0x16,0x00,0x90,0x27,0x3f,0xc1,0x4d}
+};
+
 /* ── boot_info_t (must match kernel/common.h exactly) ───────────────────── */
 #define E820_MAX 128
 
@@ -291,6 +311,7 @@ typedef struct __attribute__((packed)) {
     uint64_t phys_ceiling;
     uint64_t pml4_phys;
     uint64_t hhdm_offset;
+    uint64_t rsdp_phys;   /* ACPI RSDP physical address (0 = not found) */
 } boot_info_t;
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
@@ -564,6 +585,42 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* ST) {
     uint64_t pml4_phys = setup_paging(kernel_phys, phys_ceiling);
     serial_puts("pml4_phys="); serial_hex(pml4_phys);
 
+    /* ── RSDP discovery via EFI configuration tables ──────────────────────
+     * Walk SystemTable->ConfigurationTable[] matching GUIDs.  Prefer the
+     * ACPI 2.0+ entry (carries an XSDT); fall back to ACPI 1.0 (RSDT only).
+     * This is the only reliable way to find the RSDP on a UEFI system —
+     * modern firmware never leaves it in the legacy 0xE0000-0xFFFFF area.
+     */
+    uint64_t rsdp_phys = 0;
+    {
+        EFI_CONFIGURATION_TABLE* ct = ST->ConfigurationTable;
+        size_t nct = ST->NumberOfTableEntries;
+        uint64_t acpi10 = 0;
+        for (size_t i = 0; i < nct; i++) {
+            EFI_GUID* g = &ct[i].VendorGuid;
+            if (g->Data1 == g_acpi20_table_guid.Data1 &&
+                g->Data2 == g_acpi20_table_guid.Data2 &&
+                g->Data3 == g_acpi20_table_guid.Data3) {
+                int match = 1;
+                for (int k = 0; k < 8; k++)
+                    if (g->Data4[k] != g_acpi20_table_guid.Data4[k]) { match = 0; break; }
+                if (match) {
+                    rsdp_phys = (uint64_t)(uintptr_t)ct[i].VendorTable;
+                    break;
+                }
+            }
+            if (g->Data1 == g_acpi10_table_guid.Data1 &&
+                g->Data2 == g_acpi10_table_guid.Data2 &&
+                g->Data3 == g_acpi10_table_guid.Data3) {
+                int match = 1;
+                for (int k = 0; k < 8; k++)
+                    if (g->Data4[k] != g_acpi10_table_guid.Data4[k]) { match = 0; break; }
+                if (match) acpi10 = (uint64_t)(uintptr_t)ct[i].VendorTable;
+            }
+        }
+        if (!rsdp_phys) rsdp_phys = acpi10;
+    }
+
     /* Place boot_info_t just below the page tables at the top of the 32MiB window.
        Page tables occupy [kernel_phys + KERNEL_WINDOW - PT_PAGES*PAGE_SIZE, top).
        boot_info_t sits one page below that, safely away from the kernel image. */
@@ -580,6 +637,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* ST) {
     bi->kernel_phys_base = kernel_phys;
     bi->pml4_phys       = pml4_phys;
     bi->hhdm_offset     = HHDM_OFFSET;
+    bi->rsdp_phys       = rsdp_phys;
 
     /* ── 5. ExitBootServices (retry loop until key is fresh) ───────────── */
     serial_puts("Calling ExitBootServices...\n");

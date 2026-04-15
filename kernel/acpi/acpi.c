@@ -45,6 +45,15 @@ typedef struct __attribute__((packed)) {
     uint8_t length;
 } madt_entry_hdr_t;
 
+// MADT type 0: Processor Local APIC
+// One per enabled CPU in the system.
+typedef struct __attribute__((packed)) {
+    madt_entry_hdr_t hdr;
+    uint8_t  acpi_proc_id;   // ACPI processor UID (from DSDT _PR)
+    uint8_t  apic_id;        // hardware LAPIC ID
+    uint32_t flags;          // bit 0 = enabled, bit 1 = online-capable (ACPI 6+)
+} madt_lapic_t;
+
 // MADT type 1: I/O APIC
 typedef struct __attribute__((packed)) {
     madt_entry_hdr_t hdr;
@@ -53,6 +62,21 @@ typedef struct __attribute__((packed)) {
     uint32_t ioapic_phys;
     uint32_t gsi_base;
 } madt_ioapic_t;
+
+// MADT type 9: Processor Local x2APIC
+// Same purpose as type 0 but with a 32-bit APIC ID.  Used on systems
+// where the LAPIC ID would exceed 255.  The x2APIC entry lists
+// BOTH the legacy entry (type 0, truncated ID) AND the x2APIC
+// entry (type 9, full ID); per ACPI spec we prefer type 9 when both
+// are present for the same CPU, so type 9 processing overwrites any
+// earlier type 0 entry that shares the same acpi_proc_id.
+typedef struct __attribute__((packed)) {
+    madt_entry_hdr_t hdr;
+    uint16_t reserved;
+    uint32_t x2apic_id;      // full 32-bit APIC ID
+    uint32_t flags;          // bit 0 = enabled, bit 1 = online-capable
+    uint32_t acpi_proc_uid;  // ACPI processor UID
+} madt_x2apic_t;
 
 // MADT type 2: Interrupt Source Override
 typedef struct __attribute__((packed)) {
@@ -96,6 +120,24 @@ static void parse_madt(const madt_t* madt, acpi_info_t* out) {
             offset + e->length > total) break;
 
         switch (e->type) {
+        case 0: { // Processor Local APIC
+            const madt_lapic_t* la = (const madt_lapic_t*)e;
+            // Keep every entry the firmware lists, even "disabled"
+            // ones — ACPI lets firmware mark a slot as
+            // online_capable=1 (bit 1) / enabled=0 (bit 0), meaning
+            // it can be hot-started later.  Firmware on desktops
+            // usually lists only enabled CPUs.  We record both bits
+            // so the AP startup path in Phase 9-4 can decide which
+            // slots to actually kick off.
+            if (out->cpu_count < MAX_CPUS) {
+                acpi_cpu_t* c = &out->cpus[out->cpu_count++];
+                c->apic_id       = la->apic_id;
+                c->acpi_proc_id  = la->acpi_proc_id;
+                c->enabled        = (la->flags & 0x1u) ? 1 : 0;
+                c->online_capable = (la->flags & 0x2u) ? 1 : 0;
+            }
+            break;
+        }
         case 1: { // I/O APIC
             const madt_ioapic_t* io = (const madt_ioapic_t*)e;
             // Use the first IOAPIC found (systems with one IOAPIC cover GSI 0–23).
@@ -119,6 +161,31 @@ static void parse_madt(const madt_t* madt, acpi_info_t* out) {
         case 5: { // 64-bit LAPIC address override
             const madt_lapic64_t* la = (const madt_lapic64_t*)e;
             out->lapic_phys = la->lapic_phys;
+            break;
+        }
+        case 9: { // Processor Local x2APIC
+            // x2APIC entries take precedence over type 0 entries with
+            // the same ACPI proc UID — per spec, firmware that lists
+            // both expects the OS to honour the 32-bit x2APIC ID.
+            // We look up an existing entry by acpi_proc_id and replace
+            // it, or append a new one.
+            const madt_x2apic_t* xe = (const madt_x2apic_t*)e;
+            acpi_cpu_t* slot = NULL;
+            for (uint32_t i = 0; i < out->cpu_count; i++) {
+                if (out->cpus[i].acpi_proc_id == xe->acpi_proc_uid) {
+                    slot = &out->cpus[i];
+                    break;
+                }
+            }
+            if (!slot && out->cpu_count < MAX_CPUS) {
+                slot = &out->cpus[out->cpu_count++];
+            }
+            if (slot) {
+                slot->apic_id        = xe->x2apic_id;
+                slot->acpi_proc_id   = xe->acpi_proc_uid;
+                slot->enabled        = (xe->flags & 0x1u) ? 1 : 0;
+                slot->online_capable = (xe->flags & 0x2u) ? 1 : 0;
+            }
             break;
         }
         default:
