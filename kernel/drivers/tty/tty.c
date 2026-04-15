@@ -67,6 +67,10 @@ static void ldisc_flush_line(tty_t* tty) {
     // Wake every waiter on the tty's queue — blocking readers register
     // task_we_t nodes, poll/epoll registers epoll_we_t nodes.  A single
     // wake_all drains them all.
+#if PTY_TRACE
+    serial_puts_dbg("[pty-trace] ldisc_flush_line len=");
+    serial_hex_dbg((uint64_t)tty->line_len);
+#endif
     wait_queue_wake_all(&tty->waitq);
 }
 
@@ -165,6 +169,10 @@ void tty_input_char(tty_t* tty, char c) {
 
     if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
     rd_push(tty, (uint8_t)c);
+#if PTY_TRACE
+    serial_puts_dbg("[pty-trace] raw_push c=");
+    serial_hex_dbg((uint64_t)(uint8_t)c);
+#endif
     wait_queue_wake_all(&tty->waitq);
 }
 
