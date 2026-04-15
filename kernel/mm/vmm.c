@@ -661,13 +661,61 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         return; // fault resolved
 
     kill:
-        ser_str("PF-KILL ec=");  ser_hex64(ec);
-        ser_str("  CR2=");       ser_hex64(fault_addr);
-        ser_str("  RIP=");       ser_hex64(f->ip);
-        ser_str("  RSP=");       ser_hex64(f->sp);
-        ser_str("  p="); ser_hex64(is_present);
-        ser_str("  w="); ser_hex64(is_write);
-        ser_str("  x="); ser_hex64(is_ifetch);
+    {
+        // ── Header ────────────────────────────────────────────────────────
+        ser_str("\n===== PF-KILL =====\n");
+        // pid / comm: page fault handler runs in process context with
+        // IRQs enabled but preempt disabled at ISR entry, so
+        // this_cpu()->current is stable across the print path.
+        if (g_current) {
+            ser_str("  pid="); ser_hex64((uint64_t)g_current->pid);
+            ser_str("  ppid="); ser_hex64((uint64_t)g_current->ppid);
+            ser_str("  home=");ser_hex64((uint64_t)g_current->home_cpu);
+            ser_str("  comm=");
+            for (int i = 0; i < 15 && g_current->comm[i]; i++) {
+                while (!(inb(0x3F8+5) & 0x20));
+                outb(0x3F8, (uint8_t)g_current->comm[i]);
+            }
+            ser_str("\n");
+        }
+        ser_str("  ec=");   ser_hex64(ec);
+        ser_str("  CR2=");  ser_hex64(fault_addr);
+        ser_str("  RIP=");  ser_hex64(f->ip);
+        ser_str("  RSP=");  ser_hex64(f->sp);
+        ser_str("  RFLAGS=");ser_hex64(f->flags);
+        ser_str("  CS=");   ser_hex64(f->cs);
+        ser_str("  p=");ser_hex64(is_present);
+        ser_str("  w=");ser_hex64(is_write);
+        ser_str("  x=");ser_hex64(is_ifetch);
+
+        // ── User GPRs ─────────────────────────────────────────────────────
+        // The ISR stub pushed 15 GPRs before calling us, then sub'd rsp
+        // by 40 for the synthetic interrupt_frame_t.  So the GPRs live
+        // at (uint64_t*)f + 5 .. +19, in the reverse of push order:
+        //    +5 rax, +6 rbx, +7 rcx, +8 rdx, +9 rbp, +10 rsi, +11 rdi,
+        //    +12 r8,  +13 r9,  +14 r10, +15 r11, +16 r12, +17 r13,
+        //    +18 r14, +19 r15.
+        // See kernel/arch/x86_64/isr_stubs.asm PUSH_GPRS.
+        {
+            uint64_t* g = (uint64_t*)((uintptr_t)f + 5 * 8);
+            ser_str("  RAX="); ser_hex64(g[0]);
+            ser_str("  RBX="); ser_hex64(g[1]);
+            ser_str("  RCX="); ser_hex64(g[2]);
+            ser_str("  RDX="); ser_hex64(g[3]);
+            ser_str("  RBP="); ser_hex64(g[4]);
+            ser_str("  RSI="); ser_hex64(g[5]);
+            ser_str("  RDI="); ser_hex64(g[6]);
+            ser_str("  R8="); ser_hex64(g[7]);
+            ser_str("  R9="); ser_hex64(g[8]);
+            ser_str("  R10=");ser_hex64(g[9]);
+            ser_str("  R11=");ser_hex64(g[10]);
+            ser_str("  R12=");ser_hex64(g[11]);
+            ser_str("  R13=");ser_hex64(g[12]);
+            ser_str("  R14=");ser_hex64(g[13]);
+            ser_str("  R15=");ser_hex64(g[14]);
+        }
+
+        // ── VMAs ──────────────────────────────────────────────────────────
         if (g_current) {
             extern mm_t* task_get_mm(void*);
             mm_t* dbg_mm = task_get_mm(g_current);
@@ -679,24 +727,46 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                     ser_str("    ["); ser_hex64(v->start);
                     ser_str(" - ");  ser_hex64(v->end);
                     ser_str("] f="); ser_hex64(v->flags);
+                    // Is the fault addr inside this VMA?
+                    if (fault_addr >= v->start && fault_addr < v->end) {
+                        ser_str("    ^ fault addr inside, offset=");
+                        ser_hex64(fault_addr - v->start);
+                    }
                 }
                 rcu_read_unlock();
             }
         }
-        // Print top of user stack safely via page table walk
-        ser_str("  STACK@RSP:\n");
+
+        // ── User stack dump ───────────────────────────────────────────────
+        ser_str("  STACK@RSP (32 words):\n");
         {
             uint64_t sp = f->sp;
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < 32; i++) {
                 uint64_t va = sp + (uint64_t)(i * 8);
                 phys_addr_t pg = vmm_page_phys(vmm_pml4_get(), va & ~0xFFFULL);
                 if (pg == PMM_INVALID_ADDR) { ser_str("    (unmapped)\n"); break; }
                 uint64_t* kp = (uint64_t*)((pg + HHDM_OFFSET) + (va & 0xFF8ULL));
-                ser_str("    "); ser_hex64(va); ser_str(": "); ser_hex64(*kp); ser_str("\n");
+                ser_str("    "); ser_hex64(va); ser_str(": "); ser_hex64(*kp);
             }
         }
+
+        // ── Instruction bytes at faulting RIP ─────────────────────────────
+        ser_str("  CODE@RIP:\n");
+        {
+            uint64_t ip = f->ip;
+            phys_addr_t pg = vmm_page_phys(vmm_pml4_get(), ip & ~0xFFFULL);
+            if (pg == PMM_INVALID_ADDR) {
+                ser_str("    (RIP not mapped)\n");
+            } else {
+                uint64_t* kp = (uint64_t*)((pg + HHDM_OFFSET) + (ip & 0xFF8ULL));
+                ser_str("    "); ser_hex64(kp[0]);
+                ser_str("    "); ser_hex64(kp[1]);
+            }
+        }
+        ser_str("===== END PF-KILL =====\n\n");
         kill_current();
         return;
+    }
     }
 
     // ── Kernel-mode fault ─────────────────────────────────────────────────
