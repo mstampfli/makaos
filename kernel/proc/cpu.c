@@ -99,7 +99,14 @@ void cpu_init_bsp(void) {
         for (uint32_t i = 0; i < n && i < MAX_CPUS; i++)
             cpu_slot_init(i, g_acpi.cpus[i].apic_id);
 
-        g_num_cpus = (n < MAX_CPUS) ? n : MAX_CPUS;
+        // g_num_cpus tracks ONLINE CPUs, not hardware-present CPUs.
+        // Until Phase 9-4 actually wakes an AP via INIT/SIPI, only
+        // the BSP is running; iterators like synchronize_rcu() must
+        // not walk slots whose CPUs are still halted, otherwise they
+        // wait forever for an rcu_qs_count that never advances.
+        // Phase 9-4's cpu_init_ap() increments g_num_cpus atomically
+        // as each AP comes online.
+        g_num_cpus = 1;
     }
 
     // Program GS_BASE for the BSP.  Every subsequent this_cpu() call
