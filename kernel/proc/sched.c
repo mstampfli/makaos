@@ -773,6 +773,14 @@ void sched_preempt(void) {
     // The preempt_enable() path will call sched_preempt() again then.
     if (c->preempt_depth > 0) return;
     c->reschedule_pending = 0;
+    // TRACER: actual switch — every 256th.
+    {
+        static uint32_t s_preempt_cnt = 0;
+        if ((s_preempt_cnt++ & 0xFF) == 0) {
+            serial_puts_dbg("[trace] sched_preempt cnt=");
+            serial_hex_dbg(s_preempt_cnt);
+        }
+    }
     do_switch(1);
 }
 

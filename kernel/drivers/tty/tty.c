@@ -246,6 +246,16 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
     const uint8_t* src = (const uint8_t*)buf;
+    // TRACER: log every 256th tty write, plus its length.
+    {
+        static uint32_t s_tty_w_cnt = 0;
+        if ((s_tty_w_cnt++ & 0xFF) == 0) {
+            serial_puts_dbg("[trace] tty_w cnt=");
+            serial_hex_dbg(s_tty_w_cnt);
+            serial_puts_dbg("[trace]   len=");
+            serial_hex_dbg(len);
+        }
+    }
 
     // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
     if (g_current && tty->fg_pgid &&
@@ -254,6 +264,15 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
         (tty->termios.c_lflag & TOSTOP)) {
         signal_send(g_current, SIGTTOU);
         return -4; // -EINTR
+    }
+
+    // Fast path: if the backend provides a batched write_buf, use it.
+    // This avoids per-byte preempt_disable toggles (fb) and per-byte
+    // wake_all storms (pty slave) for the common case of bash/ps
+    // emitting a whole line at once.
+    if (tty->write_buf) {
+        tty->write_buf(tty, src, len);
+        return (int64_t)len;
     }
 
     if (!tty->write_char) return (int64_t)len;  // no output backend (e.g. compositor owns fb)
@@ -343,6 +362,33 @@ static void console_write_char(tty_t* tty, uint8_t c) {
     fb_term_putc((char)c);
 }
 
+// Batched version: emits the whole user buffer with a single
+// preempt_disable section, honouring OPOST|ONLCR '\n' → "\r\n" as it
+// goes.  Called from tty_vfs_write when it sees tty->write_buf != NULL.
+static void console_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
+    extern void fb_term_write(const char* buf, uint64_t len);
+    int opost_onlcr = (tty->termios.c_oflag & OPOST) &&
+                      (tty->termios.c_oflag & ONLCR);
+    if (!opost_onlcr) {
+        fb_term_write((const char*)buf, len);
+        return;
+    }
+    // ONLCR path: split into runs separated by '\n' so we can emit each
+    // run as one batched memcpy-equivalent loop, with a single "\r\n"
+    // at the boundary.  Avoids copying into a scratch buffer.
+    uint64_t run_start = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        if (buf[i] == '\n') {
+            if (i > run_start)
+                fb_term_write((const char*)(buf + run_start), i - run_start);
+            fb_term_write("\r\n", 2);
+            run_start = i + 1;
+        }
+    }
+    if (run_start < len)
+        fb_term_write((const char*)(buf + run_start), len - run_start);
+}
+
 // forward declaration — defined below tty_init
 static void tty_on_kbd_event(const kbd_event_t* ev, void* data);
 
@@ -389,6 +435,7 @@ void tty_init(void) {
     tty->line_len  = 0;
     wait_queue_init(&tty->waitq);
     tty->write_char = console_write_char;
+    tty->write_buf  = console_write_buf;
 
     __builtin_memset(tty->name, 0, sizeof(tty->name));
     tty->name[0] = 't'; tty->name[1] = 't'; tty->name[2] = 'y';
