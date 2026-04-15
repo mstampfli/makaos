@@ -4,6 +4,11 @@
 #include "input_core.h" // input_handler_t, kbd_event_t
 #include "wait.h"       // wait_queue_t
 
+// Debug trace — flip to 0 for silent release.  See pty.c for the
+// PTT / PTT1 macros that use this.  Placed in the shared header so
+// pty.c and tty.c agree.
+#define PTY_TRACE 1
+
 // ── TTY subsystem ────────────────────────────────────────────────────────
 //
 // Architecture:
