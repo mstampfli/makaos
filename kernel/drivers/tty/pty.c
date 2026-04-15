@@ -65,15 +65,11 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
     if (!mb_full(pty)) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
-    } else {
-        // TRACER: ring full → char dropped.  Log the first N drops per
-        // second to tell us if the slowdown is actually a full ring.
-        static uint32_t s_drop_cnt = 0;
-        if ((s_drop_cnt++ & 0xFF) == 0) {
-            serial_puts_dbg("[trace] pty_drop cnt=");
-            serial_hex_dbg(s_drop_cnt);
-        }
     }
+    // Full ring: drop is no longer expected for the normal single-byte
+    // echo path.  The batched pty_slave_write_buf applies real flow
+    // control instead; this per-byte fallback is only used for line-
+    // discipline echo which is at human keyboard rate.
     // Wake every waiter on the master queue — blocking readers
     // (task_we_t) and poll/epoll (epoll_we_t) share the same queue.
     wait_queue_wake_all(&pty->master_waitq);
@@ -102,16 +98,6 @@ static inline int pty_master_push_byte(pty_t* pty, uint8_t c) {
 static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
     pty_t* pty = (pty_t*)tty;
     if (!pty->master_open || !len) return;
-    // TRACER: log every 128th call with its length.
-    {
-        static uint32_t s_pty_wb_cnt = 0;
-        if ((s_pty_wb_cnt++ & 0x7F) == 0) {
-            serial_puts_dbg("[trace] pty_write_buf cnt=");
-            serial_hex_dbg(s_pty_wb_cnt);
-            serial_puts_dbg("[trace]   len=");
-            serial_hex_dbg(len);
-        }
-    }
 
     int opost_onlcr = (tty->termios.c_oflag & OPOST) &&
                       (tty->termios.c_oflag & ONLCR);
