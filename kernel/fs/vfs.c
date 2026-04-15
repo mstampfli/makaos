@@ -6,6 +6,7 @@
 #include "common.h"
 #include "fb.h"
 #include "kheap.h"
+#include "rcu.h"
 
 // ── [LEGACY] Framebuffer console device (/dev/vga) ───────────────────────
 // LEGACY: Direct write to framebuffer terminal, bypasses TTY entirely.
@@ -59,7 +60,7 @@ static int64_t vga_write(vfs_file_t* self, const void* buf, uint64_t len) {
     return (int64_t)len;
 }
 
-static void vga_close(vfs_file_t* self) { kfree(self); }
+static void vga_close(vfs_file_t* self) { kfree_rcu(self); }
 
 vfs_file_t* vfs_vga_open(void) {
     vfs_file_t* f = vfs_alloc_file();
@@ -86,7 +87,7 @@ static int64_t kbd_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)i;
 }
 
-static void generic_close(vfs_file_t* self) { kfree(self); }
+static void generic_close(vfs_file_t* self) { kfree_rcu(self); }
 
 vfs_file_t* vfs_kbd_open(void) {
     vfs_file_t* f = vfs_alloc_file();

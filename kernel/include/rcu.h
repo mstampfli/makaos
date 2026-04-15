@@ -105,6 +105,16 @@ void synchronize_rcu(void);
 typedef void (*rcu_func_t)(void* data);
 void call_rcu(rcu_func_t func, void* data);
 
+// ── Deferred kfree helper ────────────────────────────────────────────────
+// Defer a kfree of `ptr` until every concurrent RCU reader has
+// completed its critical section.  Required for any heap-allocated
+// object that might still be referenced by a reader (typically a
+// wait_queue_t drainer in wait.c) at the moment of free.
+//
+// Implementation is one line of glue; the owning caller wants a
+// readable name at the call site.
+void kfree_rcu(void* ptr);
+
 // ── Internal — called by the scheduler ───────────────────────────────────
 // Not part of the public API, but exposed so sched.c can bump the QS
 // counter from inside do_switch without pulling the full cpu_t header

@@ -11,6 +11,7 @@
 #include "sched.h"
 #include "process.h"
 #include "signal.h"
+#include "rcu.h"
 
 // ── PTY_TRACE: targeted serial trace of the pty / makaterm wake chain ───
 //
@@ -57,6 +58,10 @@ pty_t* pty_list_head(void) { return s_pty_head; }
 
 // Remove pty from s_pty_head and free it.  Called when both master_open==0
 // and slave_open_count==0.
+// pty_t contains multiple wait_queue_t heads (master_waitq,
+// slave_drain_waitq, slave.waitq) that may still be referenced by
+// a concurrent wait_queue_wake_all drainer on another CPU — kfree is
+// RCU-deferred so the real free happens after every drainer completes.
 static void pty_free_locked(pty_t* pty) {
     if (s_pty_head == pty) {
         s_pty_head = pty->next;
@@ -67,8 +72,8 @@ static void pty_free_locked(pty_t* pty) {
     }
     serial_puts_dbg("[pty] free idx=");
     serial_hex_dbg((uint64_t)(uint32_t)pty->index);
-    if (pty->master_buf) kfree(pty->master_buf);
-    kfree(pty);
+    if (pty->master_buf) kfree_rcu(pty->master_buf);
+    kfree_rcu(pty);
 }
 
 // ── Ring buffer helpers (master read buffer) ─────────────────────────────
@@ -283,8 +288,8 @@ static void pty_master_close(vfs_file_t* self) {
     // notice master_open == 0 and bail out.
     wait_queue_wake_all(&pty->slave_drain_waitq);
 
-    kfree(ctx);
-    kfree(self);
+    kfree_rcu(ctx);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 
     // If both sides are now closed, free the pty struct.
     if (pty->slave_open_count == 0)
@@ -418,8 +423,8 @@ static void pty_slave_close(vfs_file_t* self) {
     // Wake every master-side waiter so they observe EOF.
     wait_queue_wake_all(&pty->master_waitq);
 
-    kfree(ctx);
-    kfree(self);
+    kfree_rcu(ctx);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 
     // If both sides are now closed, free the pty struct.
     if (pty->slave_open_count == 0 && !pty->master_open)

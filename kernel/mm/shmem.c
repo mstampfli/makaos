@@ -358,7 +358,7 @@ void shmem_fd_close(vfs_file_t* self) {
     if (!self) return;
     shmem_t* shm = (shmem_t*)self->ctx;
     shmem_unref(shm);
-    kfree(self);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 }
 
 vfs_file_t* shmem_fd_create(shmem_t* shm) {

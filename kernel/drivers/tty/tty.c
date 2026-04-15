@@ -10,6 +10,7 @@
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
+#include "rcu.h"
 #include "signal.h"
 #include "fb.h"
 
@@ -296,8 +297,8 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
 }
 
 static void tty_vfs_close(vfs_file_t* self) {
-    kfree(self->ctx);
-    kfree(self);
+    kfree_rcu(self->ctx);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 }
 
 static int tty_vfs_poll(vfs_file_t* self, int events) {
