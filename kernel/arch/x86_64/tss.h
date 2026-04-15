@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "smp.h"     // MAX_CPUS
 
 // ── Task State Segment (64-bit) ───────────────────────────────────────────
 // In 64-bit mode the TSS is used for:
@@ -27,22 +28,47 @@ typedef struct __attribute__((packed)) {
 #define KSTACK_GUARD_SIZE   PAGE_SIZE                // unmapped guard page before each stack
 #define KSTACK_SLOT_SIZE    (KSTACK_GUARD_SIZE + KSTACK_SIZE) // 12KiB per slot
 
-// ── GDT selector for the TSS ──────────────────────────────────────────────
-// GDT layout rebuilt by tss_init() in kernel BSS:
+// ── GDT layout with one TSS descriptor per CPU ────────────────────────────
+// A 64-bit TSS descriptor occupies two 8-byte GDT slots.  To support SMP we
+// reserve a pair per possible CPU starting at slot 6, so CPU N's TSS lives
+// at GDT[6 + 2*N] / GDT[6 + 2*N + 1]:
+//
 //   0x00  null
-//   0x08  null  (placeholder; some ABIs want 32-bit CS here, we don't need it)
-//   0x10  kernel data  (SS=DS=ES=0x10)
-//   0x18  kernel code  (CS=0x18  — must match KERNEL_CS in common.h)
-//   0x20  TSS low  (64-bit TSS descriptor occupies TWO 8-byte GDT slots)
-//   0x28  TSS high
-#define GDT_TSS_SELECTOR    0x30
+//   0x08  kernel code  CS=0x08  (KERNEL_CS)
+//   0x10  kernel data  SS=0x10  (KERNEL_SS)
+//   0x18  user data32  placeholder required by sysretq
+//   0x20  user data64  SS=0x20
+//   0x28  user code64  CS=0x28
+//   0x30  TSS[0] low   ← CPU 0    (selector 0x30)
+//   0x38  TSS[0] high
+//   0x40  TSS[1] low   ← CPU 1    (selector 0x40)
+//   0x48  TSS[1] high
+//   …
+//   At MAX_CPUS CPUs the GDT has (6 + 2*MAX_CPUS) 8-byte slots.
+//
+// CPU 0 still gets selector 0x30 so single-CPU flows are bit-identical to
+// the pre-SMP kernel.  Adding a CPU is free: the BSP pre-populates every
+// slot up to MAX_CPUS at boot, pointing at &g_cpus[i].tss, and each AP
+// just executes `ltr GDT_TSS_SELECTOR(cpu_id)` during its init.
+#define GDT_FIXED_ENTRIES   6
+#define GDT_ENTRIES         (GDT_FIXED_ENTRIES + 2 * MAX_CPUS)
+#define GDT_TSS_SELECTOR(cpu_id) \
+    ((uint16_t)(((GDT_FIXED_ENTRIES) + 2u * (unsigned)(cpu_id)) << 3))
 
 // ── API ───────────────────────────────────────────────────────────────────
 
-// Rebuild the GDT (in kernel BSS) with a TSS descriptor, load it, reload
-// all segment registers, set up the TSS with IST stacks, and execute `ltr`.
-// Call once, after vmm_init() and kheap is ready (uses pmm_buddy_alloc).
+// Rebuild the GDT (in kernel BSS) with one TSS descriptor per possible CPU,
+// load it, reload all segment registers, set up the BSP's TSS with IST
+// stacks, and execute `ltr` for CPU 0.  Call once on the BSP, after
+// vmm_init() and kheap is ready (uses pmm_buddy_alloc).
 void tss_init(void);
+
+// AP-side TSS setup.  Precondition: GS_BASE is already programmed to
+// point at this AP's cpu_t.  Allocates IST stacks into this_cpu()->tss,
+// sets iopb_offset, and executes `ltr GDT_TSS_SELECTOR(cpu_id())`.
+// Does NOT touch the GDT (shared with BSP), does NOT reload segments,
+// does NOT touch CR4/SMEP (BSP already did).
+void tss_init_ap(void);
 
 // Update TSS.RSP0 — call on every context switch so the CPU knows which
 // kernel stack to use when the next ring-3 → ring-0 transition occurs.

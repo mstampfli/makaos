@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "smp.h"
+#include "tss.h"
 
 // MLFQ levels — must match sched.c.  Kept as a compile-time constant
 // here so cpu_t can size its per-CPU runqueue arrays inline.
@@ -117,6 +118,16 @@ typedef struct cpu_t {
     // Statistics — non-atomic, owner-only.
     uint64_t        sched_ticks;
     uint64_t        context_switches;
+
+    // Per-CPU Task State Segment.  The CPU reads this on every ring-3 → 0
+    // transition (rsp[0]) and on exception delivery via IST (ist[0..6]).
+    // Embedded inline — not a pointer — so syscall_entry can load RSP0
+    // with a single `mov %gs:CPU_TSS_RSP0, %rsp`.  One shared GDT in
+    // tss.c holds a TSS descriptor per CPU at slot (6 + 2*cpu_id),
+    // pointing here.  Cold field: only touched on ring transitions,
+    // kept at the end of cpu_t so the scheduler's hot cache line
+    // (current/preempt_depth/rq) stays compact.
+    tss_t           tss;
 } cpu_t;
 
 // Compile-time guarantee: the self-pointer is at offset 0.  this_cpu()
