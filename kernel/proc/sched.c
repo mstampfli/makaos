@@ -612,7 +612,13 @@ void sched_tick(void) {
         if (c->current->mlfq_ticks_left == 0)
             c->reschedule_pending = 1;
     } else {
-        c->reschedule_pending = 1;   // idle → always try to find real work
+        // Idle is running.  Setting reschedule_pending on every tick is
+        // how do_switch / pick_next discovers tasks that were enqueued
+        // via sched_yield (or any other path that doesn't go through
+        // sched_wake).  Without this, idle would only ever yield to a
+        // freshly woken task — yield-then-runnable patterns would hang
+        // until something else fired sched_wake.
+        c->reschedule_pending = 1;
     }
 
     // Check whether we need to touch shared state at all.  Reading
@@ -773,14 +779,6 @@ void sched_preempt(void) {
     // The preempt_enable() path will call sched_preempt() again then.
     if (c->preempt_depth > 0) return;
     c->reschedule_pending = 0;
-    // TRACER: actual switch — every 256th.
-    {
-        static uint32_t s_preempt_cnt = 0;
-        if ((s_preempt_cnt++ & 0xFF) == 0) {
-            serial_puts_dbg("[trace] sched_preempt cnt=");
-            serial_hex_dbg(s_preempt_cnt);
-        }
-    }
     do_switch(1);
 }
 
@@ -849,11 +847,20 @@ void sched_wake(task_t* proc) {
     proc->next = NULL;
     enqueue_on(&home->rq, proc);
 
-    // If the woken task has strictly higher priority than the currently
-    // running task on its home CPU, ask that CPU to reschedule.
+    // Decide whether to ask the target CPU to reschedule immediately.
+    //   - If it's running idle, we MUST request a switch: otherwise the
+    //     CPU would sit in hlt until its next timer tick before picking
+    //     up the freshly-woken task.  That's the root cause of the
+    //     "bash frozen after ps" live-wait: ps's last wake landed on an
+    //     idle CPU, and without this we waited a full tick (often much
+    //     more under SDL display pacing) for bash to run again.
+    //   - Otherwise, only preempt if the woken task strictly outranks
+    //     the current one — same as before.
     task_t* cur = home->current;
-    if (cur && cur != home->idle && cur->mlfq_level > 0 &&
-        proc->mlfq_level < cur->mlfq_level) {
+    if (!cur || cur == home->idle) {
+        home->reschedule_pending = 1;
+    } else if (cur->mlfq_level > 0 &&
+               proc->mlfq_level < cur->mlfq_level) {
         home->reschedule_pending = 1;
         // TODO Phase 9: if home != this_cpu, send an IPI so the target
         // CPU actually context-switches soon instead of waiting for its

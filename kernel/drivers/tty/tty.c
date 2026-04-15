@@ -246,16 +246,6 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     tty_ctx_t* ctx = (tty_ctx_t*)self->ctx;
     tty_t* tty = ctx->tty;
     const uint8_t* src = (const uint8_t*)buf;
-    // TRACER: log every 256th tty write, plus its length.
-    {
-        static uint32_t s_tty_w_cnt = 0;
-        if ((s_tty_w_cnt++ & 0xFF) == 0) {
-            serial_puts_dbg("[trace] tty_w cnt=");
-            serial_hex_dbg(s_tty_w_cnt);
-            serial_puts_dbg("[trace]   len=");
-            serial_hex_dbg(len);
-        }
-    }
 
     // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
     if (g_current && tty->fg_pgid &&

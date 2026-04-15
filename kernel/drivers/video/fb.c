@@ -71,16 +71,6 @@ void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
 }
 
 void fb_term_scroll(void) {
-    // TRACER: every 64th scroll — keeps the tracer alive while we dig
-    // into whatever caused the char-by-char slowdown.  Remove once we
-    // have the root cause.
-    {
-        static uint32_t s_scroll_cnt = 0;
-        if ((s_scroll_cnt++ & 0x3F) == 0) {
-            serial_puts_dbg("[trace] fb_scroll cnt=");
-            serial_hex_dbg(s_scroll_cnt);
-        }
-    }
     uint32_t rows = fb_rows();
     // Copy rows 1..rows-1 up to rows 0..rows-2.  dst < src so a forward
     // memcpy is safe; no memmove needed.  GCC lowers this to `rep movsb`
