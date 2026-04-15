@@ -40,6 +40,17 @@ extern task_t* g_init_task;
 // Initialise the scheduler data structures.  Call before timer_init().
 void sched_init(void);
 
+// Build a per-CPU idle task for g_cpus[id] and install it as that CPU's
+// `current` + `idle` sentinel.  sched_init() calls this for the BSP;
+// cpu_init_ap() calls it for each AP as it comes online.
+void sched_init_idle_for_cpu(uint32_t id);
+
+// Enter the idle loop on the current CPU.  Called once from cpu_init_ap
+// as the AP's final transition from "bring-up C code" into "I'm running
+// the idle task".  Never returns; on every hlt wake it re-checks the
+// runqueue via sched_yield and dispatches any work that got enqueued.
+void sched_enter_idle(void) __attribute__((noreturn));
+
 // Add a PROC_READY process to the tail of the run queue.
 void sched_add(task_t* proc);
 

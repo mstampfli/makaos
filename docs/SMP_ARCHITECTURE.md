@@ -376,12 +376,30 @@ Strict order so every phase is testable independently. Each phase boots and pass
           Under `-smp 4`, all four CPUs reach `cpu_init_ap`; APs spin
           in a `pause` loop bumping `rcu_qs_count` (halting with IRQs
           off would deadlock `synchronize_rcu()` — see PHASE9_HANDOFF).
-- 9-5 ⏳ IPI handlers (reschedule + call-function) + per-CPU LAPIC
-          timer + AP idle task.  First phase where APs actually run
-          user-visible work.
-- 9-6 ⏳ TLB shootdown (per-mm cpumask, batched range IPI, lazy TLB
-          for kernel threads).
-- 9-7 ⏳ multi-CPU soak: `stress -c 4`, per-process DOOM, cross-CPU
+- 9-5 ✅ Per-CPU CPU-state bring-up on APs (CR0/CR4/PAT/syscall MSRs),
+          per-CPU idle task on its own kstack + kernel PML4, IPI
+          handlers (reschedule / call / tlb-flush stub), `sched_wake`
+          + `wake_pending` lost-wakeup protection, `synchronize_rcu`
+          uses cpu_relax, `fb_term_putc` IRQ-safe spinlock, `do_switch`
+          early-return advances `rcu_qs_count`.  APs fully online,
+          running their own idle loop, receiving IPIs, advancing RCU
+          QS — but `pick_home_cpu()` is still pinned to CPU 0 because
+          the per-subsystem cross-CPU wait-queue paths (pty / epoll /
+          waitpid / pipe / unix-sock / ahci rendezvous) have their own
+          lost-wakeup patterns that need individual audit.  See
+          SMP_KNOWN_RACES.md entries 17–24.
+- 9-6 ⏳ Per-subsystem wait-queue audit.  Go through each sleeper
+          and waker for pty / tty / epoll / poll / waitpid / pipe /
+          unix socket / ahci rendezvous under `-smp 4` round-robin
+          with a concrete reproducer.  Every sleeper must do
+          `register → re-check → sleep` with a barrier; every waker
+          must commit the condition BEFORE calling `wait_queue_wake_all`
+          (or `sched_wake` for non-queue paths).  When clean, flip
+          `pick_home_cpu()` back to round-robin.
+- 9-7 ⏳ TLB shootdown (per-mm cpumask, batched range IPI, lazy TLB
+          for kernel threads).  Previously slated for 9-6; slipped one
+          phase because 9-6 is now the per-subsystem audit.
+- 9-8 ⏳ multi-CPU soak: `stress -c 4`, per-process DOOM, cross-CPU
           signals, cleanup of any "Phase 9 TODO" comments.
 
 ---

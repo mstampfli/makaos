@@ -29,6 +29,9 @@ uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
 extern void lapic_spurious_entry(void);
+extern void ipi_reschedule_entry(void);
+extern void ipi_call_entry(void);
+extern void ipi_tlb_flush_entry(void);
 
 static void serial_init_and_say(void) {
     outb(0x3F8 + 1, 0x00);
@@ -160,6 +163,12 @@ void kmain(void) {
     ioapic_init(&g_acpi);
     pic_disable();
     idt_irq_register(VEC_LAPIC_SPURIOUS, (uint64_t)lapic_spurious_entry);
+    // Phase 9-5: IPI vectors.  The IDT is shared across all CPUs, so
+    // registering here is a one-time BSP step that every AP picks up
+    // for free via idt_load_ap().
+    idt_irq_register(VEC_IPI_RESCHEDULE, (uint64_t)ipi_reschedule_entry);
+    idt_irq_register(VEC_IPI_CALL,       (uint64_t)ipi_call_entry);
+    idt_irq_register(VEC_IPI_TLB_FLUSH,  (uint64_t)ipi_tlb_flush_entry);
 
     // ── CPU structures ────────────────────────────────────────────────────
     tss_init();

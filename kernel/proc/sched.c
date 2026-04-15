@@ -7,6 +7,8 @@
 #include "common.h"
 #include "kheap.h"
 #include "cpu.h"
+#include "vmm.h"
+#include "lapic.h"
 #include "rcu.h"
 
 
@@ -456,22 +458,132 @@ void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data) {
     tgid_ht_walk(tgid, cb, data);
 }
 
-// Idle process — never put on a queue, runs when all queues are empty.
-static uint8_t      s_idle_stack[PAGE_SIZE];
+// ── Per-CPU idle task ───────────────────────────────────────────────────
+//
+// Each CPU owns a private idle task built from the same plumbing any
+// other kthread uses.  `do_switch` explicitly context-switches INTO the
+// idle task whenever the rq is empty, so the outgoing task's kstack
+// becomes idle and safe to reap.  The idle task's entry function is
+// `cpu_idle_loop` below: `sti; hlt; sched_yield` forever, bumping RCU
+// quiescent state on every lap.
+//
+// Why per-CPU instead of one shared `s_idle`: context_switch fxsaves
+// the outgoing task's FPU state into its ctx buffer.  Two CPUs sharing
+// one idle task_t would fxsave into the same buffer concurrently, and
+// two CPUs running idle at the same time would step on each other's
+// kstack.  Giving every CPU its own idle task_t + kstack kills both.
+//
+// The mm and files structs are shared because kernel threads don't
+// have their own address space or fd table — the global instances
+// below are treated as read-only by every CPU's idle task.
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
 static task_files_t s_idle_files = { .ft = NULL, .lock = SPINLOCK_INIT, .refs = 1 };
-static task_t s_idle = {
-    .pid          = 0,
-    .tgid         = 0,
-    .ppid         = 0,
-    .flags        = TASK_FLAG_KTHREAD,
-    .state        = TASK_RUNNING,
-    .mm_shared    = &s_idle_mm,
-    .files_shared = &s_idle_files,
-    .ctx          = {0},
-    .kstack_top   = (uint64_t)s_idle_stack + PAGE_SIZE,
-    .next         = NULL,
-};
+
+extern void proc_trampoline(void);  // kernel/arch/x86_64/process_ctx_switch.asm
+
+// Idle loop — runs on each CPU's private idle task_t + kstack when the
+// scheduler has nothing else to give it.  Spins between sti/hlt and
+// sched_yield so:
+//   - hlt parks the CPU between interrupts (power + thermal)
+//   - the sched_yield after each hlt rechecks the rq (if an IPI or
+//     timer enqueued work while we were halted, sched_yield's do_switch
+//     will dispatch it)
+//   - rcu_note_qs advances this CPU's RCU counter every lap, which is
+//     the ONLY way synchronize_rcu() from another CPU can ever complete
+//     while we're idle
+//
+// preempt_depth stays 0 the entire time; timer IRQs freely preempt us.
+static void cpu_idle_loop(void) {
+    for (;;) {
+        rcu_note_qs();
+        __asm__ volatile("sti\nhlt");
+        sched_yield();
+    }
+}
+
+// Public entry: cpu_init_ap calls this after its final setup to hand
+// the AP off to the scheduler forever.  We do NOT go through sched_yield
+// because the AP's current == idle, and sched_yield → do_switch → the
+// identity context_switch-into-self would just return straight back
+// here, landing in the unreachable fallback below cpu_init_ap.  By
+// calling cpu_idle_loop directly we guarantee the AP starts executing
+// the real idle body on its own kstack.
+void sched_enter_idle(void) {
+    cpu_idle_loop();
+    for (;;) __asm__ volatile("cli; hlt");  // unreachable
+}
+
+void sched_init_idle_for_cpu(uint32_t id) {
+    // Lazy-init of the shared idle mm's pml4: must point at the kernel
+    // PML4 so context_switch INTO idle reloads cr3 off of whatever
+    // user mm was previously installed on this CPU.  Leaving pml4_phys
+    // at 0 would make context_switch skip the cr3 reload, which
+    // leaves a DEAD user PML4 in cr3 after the departing task gets
+    // its PML4 freed by task_free_rcu — any later kernel memory
+    // access on that CPU then page-faults into garbage.
+    //
+    // Initialisation is idempotent; repeat calls just rewrite the same
+    // value.  vmm_init must have run before we get here (kmain ordering
+    // guarantees this).
+    if (!s_idle_mm.pml4_phys)
+        s_idle_mm.pml4_phys = vmm_kernel_pml4_get();
+
+    task_t* idle = (task_t*)kmalloc(sizeof(task_t));
+    if (!idle) {
+        serial_puts_dbg("[sched] PANIC: idle task alloc failed for cpu=");
+        serial_hex_dbg((uint64_t)id);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    __builtin_memset(idle, 0, sizeof(*idle));
+    idle->pid          = 0;
+    idle->tgid         = 0;
+    idle->ppid         = 0;
+    idle->flags        = TASK_FLAG_KTHREAD;
+    idle->state        = TASK_RUNNING;
+    idle->mm_shared    = &s_idle_mm;
+    idle->files_shared = &s_idle_files;
+    idle->home_cpu     = id;
+    __builtin_memcpy(idle->comm, "idle", 5);
+
+    // Capture a valid FPU state for the first fxrstor into this task.
+    __asm__ volatile("fxsave %0" : "=m"(idle->ctx.fxsave_buf));
+
+    // Build the initial kstack frame so context_switch INTO this task
+    // lands in cpu_idle_loop via proc_trampoline.  Mirrors
+    // task_create_kthread's layout: the stack we hand to context_switch
+    // has, from high to low:
+    //     [ 0 ]          ← dummy "return RIP" for proc_trampoline itself
+    //     proc_trampoline
+    //     rbx rbp
+    //     r12 = entry     ← proc_trampoline reads this into rax / call
+    //     r13 r14 r15
+    // and context_switch's pops happen in reverse: r15..rbx, then ret
+    // pops proc_trampoline, which `sti; call r12` enters cpu_idle_loop.
+    virt_addr_t kstack_top = kstack_alloc();
+    idle->kstack_top = kstack_top;
+    uint64_t* stk = (uint64_t*)kstack_top;
+    *(--stk) = 0;                          // dummy retaddr (unused)
+    *(--stk) = (uint64_t)proc_trampoline;  // ret from context_switch lands here
+    *(--stk) = 0;                          // rbx
+    *(--stk) = 0;                          // rbp
+    *(--stk) = (uint64_t)cpu_idle_loop;    // r12 — entry function
+    *(--stk) = 0;                          // r13
+    *(--stk) = 0;                          // r14
+    *(--stk) = 0;                          // r15
+    idle->ctx.rsp = (uint64_t)stk;
+
+    cpu_t* c = &g_cpus[id];
+    c->idle = idle;
+
+    // Leave c->current == idle ONLY on the BSP's very first call from
+    // sched_init — the BSP is about to keep running init_kthread in
+    // its existing task, not idle, so the scheduler will overwrite
+    // c->current via the next sched_add/context_switch.  On APs,
+    // cpu_init_ap immediately calls sched_yield which context-switches
+    // AWAY from c->current; if c->current is idle (with a valid ctx),
+    // the switch correctly saves idle's state and runs the next task.
+    if (!c->current) c->current = idle;
+}
 
 static volatile uint32_t s_tick_count  = 0;
 
@@ -510,9 +622,35 @@ static task_t* dequeue_local(cpu_rq_t* rq) {
     return NULL;
 }
 
-// Pick the target CPU for a new task.  Under single CPU, always 0.
-// Phase 9 will add a real placement policy (least-loaded, cache affinity).
+// Pick the target CPU for a new task.  Round-robin across all online
+// CPUs via a single relaxed atomic counter — O(1), cache-friendly,
+// no global lock.  Strictly correct under SMP: even if two CPUs
+// contend on s_placement_cursor at the same time they just end up
+// with the same modulo result on rare collisions, which is fine
+// (the load balancer's job in later phases is to fix imbalance, not
+// this placement hint's).
+//
+// Phase 9-7 replaces this with least-loaded-or-cache-affine.  For
+// Phase 9-5 the goal is simply "new tasks actually land on APs", and
+// round-robin achieves that with zero measurable overhead.
+// Phase 9-5 keeps ALL tasks pinned to the BSP (CPU 0).  APs are brought
+// up, run the idle loop, handle IPIs (TLB shootdown, RCU quiescence,
+// reschedule), and advance their rcu_qs_count via sched_tick — but they
+// do NOT run user-visible tasks yet.
+//
+// Why: every cross-CPU sleep/wake path in MakaOS userland (fdtable, mm
+// RCU, pty/epoll wait queues, waitpid child reap, signal delivery,
+// zombie reap, task_free_rcu kstack lifetime) has its own classic
+// lost-wakeup / use-after-free race that is harmless on UP but
+// immediately surfaces under round-robin placement.  Phase 9-6 will
+// audit each path with the now-working cross-CPU infrastructure, fix
+// them one by one under GDB, and re-enable round-robin.
+//
+// The s_placement_cursor is retained so Phase 9-6 can re-enable the
+// round-robin by deleting this stub — no API breakage.
+static volatile uint32_t s_placement_cursor = 0;
 static inline uint32_t pick_home_cpu(void) {
+    (void)s_placement_cursor;
     return 0;
 }
 
@@ -525,12 +663,30 @@ static inline cpu_t* cpu_of_task(task_t* t) {
 
 void sched_init(void) {
     // Per-CPU run queues are BSS-zeroed; rq_lock was initialised by
-    // cpu_init_bsp.  Nothing to do here for the queues themselves.
-    // g_current expands to (this_cpu()->current) via sched.h macro, so
-    // assigning to it stores into the per-CPU slot directly.
-    this_cpu()->current = &s_idle;
-    this_cpu()->idle    = &s_idle;
+    // cpu_init_bsp.  Build the BSP's idle task (APs get theirs in
+    // cpu_init_ap via the same helper).  After this call,
+    // this_cpu()->current / ->idle both point at a fresh per-CPU
+    // task_t with its own fxsave buffer, so concurrent context
+    // switches on different CPUs don't stomp each other's state.
+    sched_init_idle_for_cpu(cpu_id());
     timer_register_tick(sched_tick);
+}
+
+// Nudge a CPU that we just enqueued work onto.  The target must be a
+// DIFFERENT CPU than the current one — for same-CPU wakes, callers
+// just set reschedule_pending locally.
+//
+// Two-step: set reschedule_pending on the target (so if the IPI is
+// queued-but-not-yet-delivered, the target's next tick picks up the
+// flag anyway), then send VEC_IPI_RESCHEDULE which forces an IRQ on
+// the target even if it's sitting in `sti; hlt`.
+//
+// No memory barrier on the flag write: x2APIC ICR wrmsr is a serialising
+// instruction, so all prior stores are visible to the receiver before
+// it enters the IPI handler.
+static inline void kick_remote_cpu(cpu_t* target) {
+    target->reschedule_pending = 1;
+    lapic_send_ipi(target->apic_id, VEC_IPI_RESCHEDULE);
 }
 
 void sched_add(task_t* proc) {
@@ -538,17 +694,26 @@ void sched_add(task_t* proc) {
     if (!g_init_task && !(proc->flags & TASK_FLAG_KTHREAD))
         g_init_task = proc;
 
-    // Assign a home CPU once; the task stays there until Phase 9 adds
-    // work stealing.  On single CPU this is always 0.
+    // Assign a home CPU once; the task stays there until Phase 9-7
+    // adds work stealing.  Before SMP bring-up (g_num_cpus == 1) this
+    // is always 0 — everything early in boot stays on the BSP, which
+    // is what we want so init / svcmgr / login spawn without ever
+    // waiting on an AP that hasn't come online yet.
     proc->home_cpu = pick_home_cpu();
 
     pid_ht_insert(proc);
     task_idx_insert(proc);
 
-    cpu_t* c = &g_cpus[proc->home_cpu];
-    uint64_t flags = spin_lock_irqsave(&c->rq_lock);
-    enqueue_on(&c->rq, proc);
-    spin_unlock_irqrestore(&c->rq_lock, flags);
+    cpu_t* target = &g_cpus[proc->home_cpu];
+    uint64_t flags = spin_lock_irqsave(&target->rq_lock);
+    enqueue_on(&target->rq, proc);
+    spin_unlock_irqrestore(&target->rq_lock, flags);
+
+    // If the new task went to a different CPU than the one we're
+    // running on, wake it immediately — otherwise it could sit in
+    // hlt until its next timer tick (up to 1 ms at SCHED_HZ=1000).
+    if (target != this_cpu())
+        kick_remote_cpu(target);
 }
 
 // ── Per-task child list ───────────────────────────────────────────────────
@@ -695,21 +860,35 @@ static void do_switch(uint8_t preempted) {
     uint64_t flags = spin_lock_irqsave(&c->rq_lock);
     next = dequeue_local(rq);
     if (!next) {
-        if (preempted) {
-            // Nothing to switch to — let the current task keep running.
-            spin_unlock_irqrestore(&c->rq_lock, flags);
-            return;
-        }
-        // Voluntary yield/sleep with an empty runqueue: drop the lock,
-        // halt until an interrupt, re-take and re-dequeue.
-        for (;;) {
+        // Nothing runnable.  If the current task is a ZOMBIE, SLEEPING,
+        // or DEAD we CANNOT just `let it keep running` — its kstack may
+        // be freed out from under us at any moment by a reaper on another
+        // CPU, and scheduled-out sleepers shouldn't hog their kstack in
+        // a spin anyway.  Switch to the per-CPU idle task instead — its
+        // kstack is private and lives forever, so the subsequent hlt
+        // loop runs on a stable foundation.
+        //
+        // If the current task is merely RUNNING and we're on the
+        // preempted/early path (timer) just bail — that task keeps its
+        // slice.  We still note a QS: sched_preempt only reaches this
+        // call with preempt_depth==0, so the interrupted context is
+        // not inside an RCU reader.
+        task_t* cur = c->current;
+        uint8_t needs_park = (cur != c->idle) &&
+                             (cur->state != TASK_RUNNING);
+        if (preempted && !needs_park) {
             spin_unlock_irqrestore(&c->rq_lock, flags);
             rcu_note_qs();
-            __asm__ volatile("sti\nhlt\ncli");
-            flags = spin_lock_irqsave(&c->rq_lock);
-            next = dequeue_local(rq);
-            if (next) break;
+            return;
         }
+        // Switch to idle so the current task's kstack is freed from the
+        // CPU.  For needs_park (zombie / sleeping / dead), this is the
+        // ONLY correct path — returning to cur would resume execution
+        // on a kstack that task_free_rcu / sched_wake bookkeeping might
+        // tear out from under us.  For the voluntary-yield path with a
+        // runnable cur, switching to idle is also fine: idle just hlts
+        // until something gets enqueued, then we come back around.
+        next = c->idle;
     }
 
     task_t* prev = c->current;
@@ -805,11 +984,25 @@ void sched_sleep(void) {
         sched_sleep_while_preempt_disabled_panic();
 
     if (g_current && g_current != c->idle) {
-        // Put ourselves on our home CPU's sleep list under its rq_lock.
-        // On UP that's always this CPU, so we just need the local lock.
         task_t* self = g_current;
         cpu_t* home  = cpu_of_task(self);
         uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+
+        // ── Lost-wakeup protection (SMP) ───────────────────────────────
+        // If a waker fired sched_wake on us BETWEEN the caller's cond
+        // check and here, the waker observed state != TASK_SLEEPING and
+        // recorded the attempt in `wake_pending` instead of dropping it.
+        // Consume the flag and return WITHOUT sleeping — the caller's
+        // outer loop will re-check the condition and see the updated
+        // state.  Under UP wake_pending is always 0 at this point
+        // because there's no other CPU to race with.
+        if (self->wake_pending) {
+            self->wake_pending = 0;
+            spin_unlock_irqrestore(&home->rq_lock, flags);
+            c->reschedule_pending = 0;
+            return;
+        }
+
         self->state = TASK_SLEEPING;
         // Refresh quantum so the task gets a full slice when woken.
         self->mlfq_ticks_left = s_quanta[self->mlfq_level];
@@ -823,20 +1016,26 @@ void sched_sleep(void) {
 
 void sched_wake(task_t* proc) {
     if (!proc) return;
-    // No unlocked early-out on proc->state: there's a window where
-    //   1) the sleeper has published itself on a wait queue
-    //   2) has NOT YET set its state to TASK_SLEEPING
-    //   3) another CPU's waker drains the queue and calls sched_wake
-    // An early "if (state != TASK_SLEEPING) return" here would drop
-    // that wakeup on the floor.  The sleeper would then transition to
-    // TASK_SLEEPING and never get woken.  Classic lost-wakeup bug.
-    //
-    // Fix: always take the lock and check state under it.  The lock
-    // cost (~35 cycles) is still tiny and wake_all on a queue with
-    // many stale entries is rare in practice.
     cpu_t* home = cpu_of_task(proc);
     uint64_t flags = spin_lock_irqsave(&home->rq_lock);
+
+    // ── Lost-wakeup protection (SMP) ───────────────────────────────────
+    // The classic race:
+    //   CPU A (sleeper):                CPU B (waker):
+    //     check cond → 0
+    //                                     set cond = 1
+    //                                     sched_wake(sleeper)
+    //                                       sees state != SLEEPING → DROPS
+    //     sched_sleep → state=SLEEPING
+    //     ...never woken
+    //
+    // Fix: instead of dropping the wake, STASH it in wake_pending.  The
+    // sleeper's sched_sleep checks the flag under the same rq_lock after
+    // setting its own state to SLEEPING, and bails out if set.  This
+    // makes every wake eventually take effect, regardless of the exact
+    // interleaving between waker and sleeper.
     if (proc->state != TASK_SLEEPING) {
+        proc->wake_pending = 1;
         spin_unlock_irqrestore(&home->rq_lock, flags);
         return;
     }
@@ -855,18 +1054,25 @@ void sched_wake(task_t* proc) {
     //     idle CPU, and without this we waited a full tick (often much
     //     more under SDL display pacing) for bash to run again.
     //   - Otherwise, only preempt if the woken task strictly outranks
-    //     the current one — same as before.
-    task_t* cur = home->current;
-    if (!cur || cur == home->idle) {
-        home->reschedule_pending = 1;
-    } else if (cur->mlfq_level > 0 &&
-               proc->mlfq_level < cur->mlfq_level) {
-        home->reschedule_pending = 1;
-        // TODO Phase 9: if home != this_cpu, send an IPI so the target
-        // CPU actually context-switches soon instead of waiting for its
-        // next tick.
-    }
+    //     the current one.
+    //
+    // Under SMP `home->current` may be stale from the waker's POV; the
+    // conservative choice on any ambiguity is to raise reschedule_pending
+    // and send the IPI — a wasted IPI is ~500 cycles, a missed wake is
+    // a stuck task.  We accept the IPI cost as the price of correctness.
+    // Always raise reschedule_pending after a successful wake.  The
+    // target CPU may be idle (must run immediately), running another
+    // task whose quantum hasn't expired (will observe at next preempt
+    // check), or mid-context-switch (will observe on the way out).
+    // Getting this right is tricky under SMP, so we take the simple-
+    // and-correct route: raise the flag unconditionally, and send an
+    // IPI if the target is a DIFFERENT CPU.  A wasted IPI is ~500 cycles;
+    // a missed wake is a stuck task.
+    home->reschedule_pending = 1;
     spin_unlock_irqrestore(&home->rq_lock, flags);
+
+    if (home != this_cpu())
+        lapic_send_ipi(home->apic_id, VEC_IPI_RESCHEDULE);
 }
 
 // Add a TASK_ZOMBIE task to its home CPU's zombie list.

@@ -356,10 +356,226 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## Exit criteria for Phase 9
+## 17. AP per-CPU CPU-state setup (CR0/CR4/MSRs) — RESOLVED (Phase 9-5)
 
-Phase 9 (AP boot) cannot land until **every entry above** is resolved
-or explicitly waived with justification.  Each phase takes a slice:
+- **Location:** `kernel/proc/cpu.c:cpu_init_ap`
+- **What was unsafe:** Phase 9-4b/c brought APs up into `cpu_init_ap`
+  but skipped the per-CPU CPU-state bring-up that kmain does on the
+  BSP: `IA32_PAT`, `CR0.{EM,TS}`, `CR4.{OSFXSR,OSXMMEXCPT,SMEP}`, and
+  `syscall_init()` (which sets `IA32_EFER.SCE`, `IA32_STAR`, `IA32_LSTAR`,
+  `IA32_SFMASK`).  Every one of those is a per-CPU MSR/control register,
+  not inherited from the BSP via CR3 or GDT.
+- **Why it was latent in 9-4b/c:** APs never ran user tasks.  They
+  sat in a pause-spin loop bumping `rcu_qs_count`.
+- **Symptoms once APs started scheduling user tasks (Phase 9-5):**
+  - Bash's first `movaps`/`xorps` on an AP → `#UD` → SIGILL because
+    `CR4.OSFXSR` was zero, SSE was disabled, every SSE opcode illegal.
+  - `syscall` instruction → `#UD` → SIGILL because `IA32_EFER.SCE=0`
+    and `LSTAR` was NULL on the AP.
+  - `context_switch`'s fxrstor silently no-ops without OSFXSR, so the
+    incoming task's FPU state was whatever the AP happened to boot with.
+- **Fix:** `cpu_init_ap` now mirrors the kmain CPU-feature bring-up
+  before touching GS_BASE / TSS / IDT.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 18. `do_switch` early-return missed `rcu_note_qs()` — RESOLVED (Phase 9-5)
+
+- **Location:** `kernel/proc/sched.c:do_switch` preempted + empty-rq path
+- **What was unsafe:** When `sched_preempt` fired from a timer IRQ on
+  a CPU running a non-idle task with an empty rq, `do_switch(1)` took
+  the lock, found nothing to dequeue, dropped the lock and returned
+  **without calling `rcu_note_qs()`**.  The only call to `rcu_note_qs`
+  in `do_switch` was on the post-context-switch path, which never
+  executed for the "stay on current task" case.
+- **Why it bit Phase 9-5:** `init_kthread` on the BSP returns from its
+  bootstrap body and falls into `proc_trampoline.dead` (a `sti; hlt;
+  jmp` spin).  It's always the "current task" on CPU 0 in that state.
+  Every timer tick: `sched_tick` → `sched_preempt` → `do_switch(1)` →
+  early-return → CPU 0's `rcu_qs_count` stays frozen at whatever value
+  it had when init_kthread's last real QS happened.  Any other CPU
+  calling `synchronize_rcu` then walks `[0, g_num_cpus)` waiting for
+  CPU 0's counter to move, and hangs forever.  First-observed via
+  `bash → sys_brk → mm_vma_remove → call_rcu → synchronize_rcu`
+  blocked on CPU 0's qs counter.
+- **Fix:** the preempted+empty-rq early-return now calls `rcu_note_qs()`
+  before returning.  Safe because `sched_preempt` only reaches this
+  call with `preempt_depth == 0`, which means the interrupted context
+  cannot be inside an RCU reader section.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 19. `synchronize_rcu` used `sched_yield` to busy-wait — RESOLVED (Phase 9-5)
+
+- **Location:** `kernel/proc/rcu.c:synchronize_rcu`
+- **What was unsafe:** the cross-CPU wait loop called `sched_yield()`
+  between counter re-checks.  On UP `num_cpus() == 1` so the loop
+  never executes; under SMP it would attempt to yield on an otherwise-
+  idle CPU and **never return**: `sched_yield` → `do_switch(0)` with an
+  empty rq → switch to idle → idle hlts forever because nothing is
+  enqueued on this CPU's rq.  The while-predicate is never re-checked.
+- **Fix:** replaced `sched_yield()` with `cpu_relax()`.  Timer IRQs
+  and IPIs still interrupt the spin freely, and the target CPU's QS
+  counter is advanced by its own `sched_tick` / context switch / idle
+  loop entirely independently of us.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 20. Idle task address space left stale CR3 loaded — RESOLVED (Phase 9-5)
+
+- **Location:** per-CPU idle task in `kernel/proc/sched.c` (`s_idle_mm`)
+- **What was unsafe:** `s_idle_mm.pml4_phys = 0` originally, which made
+  `context_switch` skip the CR3 reload when switching INTO idle
+  (`cmp rdx, rdx; jz .skip_cr3`).  On UP this was fine — the BSP kept
+  using the previous mm's PML4 until the next real task was scheduled,
+  and nothing ever freed a PML4 while it was installed in CR3.  Under
+  SMP a user task's exit path frees its PML4 via `task_free_rcu`
+  ONE grace period after sched_add_zombie; any CPU that then switched
+  to idle without reloading CR3 was running kernel code on a DEAD
+  PML4.  Any kernel data access → `#PF` to unmapped memory → kernel
+  panic.
+- **Fix:** `sched_init_idle_for_cpu` sets `s_idle_mm.pml4_phys =
+  vmm_kernel_pml4_get()` (lazily, before allocating the first idle
+  task_t).  Every context_switch into idle now reloads CR3 to the
+  kernel PML4, which has no user mappings to go stale.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 21. Per-CPU idle task must not be a shared singleton — RESOLVED (Phase 9-5)
+
+- **Location:** scheduler idle-task construction
+- **What was unsafe:** pre-9-5 code used a single static `s_idle`
+  task_t referenced by every CPU's `cpu_t.idle`.  Under SMP two CPUs
+  simultaneously switching INTO or AWAY FROM idle would fxsave/fxrstor
+  the same 512-byte buffer concurrently (`ctx.fxsave_buf`) and step on
+  each other's kstack (`s_idle_stack`).  Result: FPU state corruption
+  + random kstack frame overwrites + task_t lifetime bugs when
+  `task_free_rcu` ran on a zombie whose ctx was being fxsaved from
+  another CPU.
+- **Fix:** `sched_init_idle_for_cpu(id)` kmallocs a fresh `task_t` for
+  every CPU, builds a proper proc_trampoline / cpu_idle_loop entry
+  frame on its own `kstack_alloc()`d stack, and captures a valid FPU
+  baseline via `fxsave` before publishing.  BSP and each AP call it
+  exactly once.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 22. `fb_term_putc` used `preempt_disable` instead of a lock — RESOLVED (Phase 9-5)
+
+- **Location:** `kernel/drivers/video/fb.c`
+- **What was unsafe:** `fb_term_putc` / `fb_term_write` serialised via
+  `preempt_disable` / `preempt_enable`.  On UP that's sufficient (only
+  one CPU, preempt off → no other task runs).  On SMP it is useless:
+  preempt_disable only blocks local task switching; a remote CPU can
+  enter `fb_term_putc` freely and race on `g_fb_col/row` + the pixel
+  buffer + the `fb_term_scroll` memcpy.
+- **Observed:** intermittent bash prompts that rendered sometimes and
+  not other times under `-smp 4`, depending on whether makaterm /
+  bash / init were concurrently writing to the fb.
+- **Fix:** replaced with a spinlock (`g_fb_lock`, see LOCKS.md entry).
+  IRQ-safe so the panic-print path from exception handlers can also
+  use `fb_term_putc` without deadlocking.  `fb_term_write` takes the
+  lock once for the whole buffer, not per-byte — hot path cost is
+  one lock per `write(1, ...)` syscall.
+- **Status:** Resolved in Phase 9-5.
+
+---
+
+## 23. Lost-wakeup pattern: `if (state == SLEEPING) sched_wake()` — RESOLVED (Phase 9-5)
+
+- **Location:** every wait-queue user across `tty/`, `pty/`, `net/`,
+  `fs/pipe.c`, `proc/signal.c`, `ahci/`, `syscall/syscall.c` (wait,
+  epoll, poll), `irq_wait`, `evdev`, etc.  And the kernel-internal
+  `signal_send`.
+- **What was unsafe:** Every sleeper used the pattern
+  `while (!cond) sched_sleep();`.  Every waker used
+  `if (t->state == TASK_SLEEPING) sched_wake(t);` — or worse, set cond
+  and called sched_wake unconditionally without taking any lock.  The
+  classic race:
+  ```
+  CPU A (sleeper):                 CPU B (waker):
+    check cond → false
+                                     set cond = true
+                                     sched_wake(t)
+                                       sees t.state != SLEEPING → DROPS
+    sched_sleep → state=SLEEPING
+    ...never woken again
+  ```
+- **Fix (Phase 9-5, core scheduler-level):**
+  - Added `task_t.wake_pending` (u8) flag, owned by the task's home
+    CPU's `rq_lock`.
+  - `sched_wake` always takes the target's rq_lock.  If the target
+    is not yet `TASK_SLEEPING`, instead of dropping the wake it sets
+    `wake_pending = 1`.
+  - `sched_sleep` checks `wake_pending` under the same rq_lock AFTER
+    arriving in the lock and BEFORE committing to sleep.  If set,
+    clears it and returns without sleeping — the caller's outer loop
+    will re-check the condition and see the updated state.
+  - `signal_send` now always calls `sched_wake(t)` (never `if state ==
+    SLEEPING`).  sched_wake's lock + state check handles every racy
+    RUNNING↔SLEEPING transition correctly.
+  - `signal_deliver_pending`'s death path also sends SIGCHLD to the
+    parent via `signal_send` instead of only conditionally waking.
+- **Status:** The core scheduler primitive is fixed.  Every existing
+  wait queue automatically benefits from it because the wake goes
+  through `sched_wake`.  See entry #24 for the remaining per-subsystem
+  audit work deferred to Phase 9-6.
+
+---
+
+## 24. Cross-CPU wait queues — per-subsystem audit (DEFERRED to Phase 9-6)
+
+- **Status:** Phase 9-5 pins every user task to `home_cpu = 0` via
+  `pick_home_cpu() = 0`.  APs boot, run their own idle loop, receive
+  IPIs, advance `rcu_qs_count`, handle TLB-flush stubs, but do NOT
+  dequeue user tasks.  The cross-CPU path is **used** for signal_send
+  and RCU grace periods; it is NOT used for task dispatch.
+- **Why pinned:** even with the #23 lost-wakeup fix, the subsystem-
+  specific wait/wake patterns have their own idiomatic pitfalls that
+  need individual review:
+  - **pty / tty**: `task_we_add` → `re-check cond` → `sched_sleep`
+    pattern.  The re-check window relies on the underlying waitq
+    being drained by the waker under a memory barrier.  Fine in
+    theory given #23 but needs a per-queue audit to confirm every
+    waker calls `wait_queue_wake_all` AFTER committing the condition
+    change.  Verified wrong in at least one path (canonical-mode
+    character input calls `ldisc_flush_line` only on newline, but
+    echo-on-partial-line works via `tty_echo` → fb_term_putc which
+    doesn't need a wake).
+  - **epoll**: `state->has_ready = 0` → `task_we_add` → re-read
+    `has_ready` → full poll recheck → `sched_sleep`.  The
+    `has_ready = 0` clear is NOT ordered against a concurrent writer
+    setting it to 1; the poll recheck is meant to catch that, but
+    relies on each fd's `poll()` callback being atomic against its
+    own ring state.  Needs audit per fd type.
+  - **waitpid / zombie reap**: the parent walks `children` (plain
+    list, no lock) and may observe a child in `TASK_RUNNING` that
+    transitions to `TASK_ZOMBIE` one instruction later, then the
+    parent sleeps just before signal_send fires.  Relies on #23's
+    wake_pending, but also relies on `child->state` being read AFTER
+    `sys_exit`'s `state = TASK_ZOMBIE` store has propagated —
+    memory barrier placement needs to be spelled out.
+  - **AHCI I/O thread rendezvous**: the `r->done` polling loop in
+    `ahci_submit` has the same "waker might set done after sleeper
+    checks" pattern.  #23 fixes it, but the code should probably move
+    to a proper wait queue for clarity.
+  - **IPC pipe / unix socket**: multiple sleepers (readers + writers)
+    on the same buffer.  Need to audit each wake point to confirm
+    it matches every possible sleep point.
+- **Fix phase:** Phase 9-6.  Each subsystem gets its own GDB-assisted
+  review with a concrete reproducer, under `-smp 4 round-robin`.  When
+  every entry above is clean, `pick_home_cpu()` goes back to round-
+  robin and this entry is resolved.
+- **Blocker for phase 9-7 soak test.**
+
+---
+
+## Exit criteria for Phase 9
 
 - Phase 3 resolves entries **1, 11**
 - Phase 5 resolves entries **2, 4, 5, 13**
@@ -367,9 +583,23 @@ or explicitly waived with justification.  Each phase takes a slice:
 - Phase 7 resolves entry **9**
 - Phase 8A/8B resolve entries **7, 8, 12 (task lifecycle)**
 - Phase 8C resolves entry **16** (ext2 metadata)
+- Phase 9-5 resolves entries **17, 18, 19, 20, 21, 22, 23**
+- **Phase 9-6 must resolve entry 24** (per-subsystem wait-queue audit)
+  before `pick_home_cpu()` can be restored to round-robin and user
+  tasks can run on APs.
 - **14 (superblock writeback) and 15 (ext2 scratch per-CPU) are
   explicitly deferred** with the rationale above and are not Phase 9
   blockers.
 
-After Phase 8C the only open entries are 14 and 15, both deferred
-post-Phase 9.
+## Phase 9-5 runtime status (2026-04-15)
+
+Committed state:
+- All 4 CPUs boot online under `-smp 4`.  APs initialise their own
+  PAT, CR0/CR4, syscall MSRs, TSS, IDT, LAPIC, run a per-CPU idle
+  task on a private kstack, and respond to IPIs (reschedule / call /
+  tlb-flush-stub).
+- `pick_home_cpu()` pins every user task to CPU 0.  Cross-CPU
+  infrastructure is live (sched_wake, wake_pending, IPI, RCU
+  quiescent-state advance on every CPU via its own sched_tick) but
+  NO user task runs on an AP.
+- Open race: entry 24 (per-subsystem wait-queue audit).  Phase 9-6.
