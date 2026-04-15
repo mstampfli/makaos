@@ -202,27 +202,36 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                   : tty->termios.c_cc[VMIN];
     if (vmin == 0) vmin = 1; // always read at least 1
 
-    // Block until at least vmin bytes are available.  Each iteration
-    // registers a fresh task_we_t on the tty's wait queue, then
-    // re-checks the buffer.  Registration BEFORE the check closes the
-    // lost-wakeup race: if input arrives between our check and the
-    // sched_sleep, wait_queue_wake_all will find our entry and wake us.
+    // Block until at least one byte is available, using the canonical
+    // Phase 9-6 wait-queue pattern:
+    //
+    //   Phase 1 — unregistered fast check.  If data already exists we
+    //             skip the queue dance entirely.
+    //   Phase 2 — register task_we_t on tty->waitq BEFORE the real
+    //             check, so any future wake_all finds us.
+    //   Phase 3 — re-check under the registration.  Catches the race
+    //             where input landed between Phase 1 and Phase 2 and
+    //             fired wake_all before we were on the queue.
+    //   Phase 4 — sched_sleep.  If the waker ran between Phase 2 and
+    //             here, sched_sleep's wake_pending interlock bails
+    //             out without actually parking.
+    //   task_we_remove on every exit path — stack entry must leave
+    //             the queue before its frame is dropped.
     //
     // Signals with SIG_DFL-ignore disposition (SIGCHLD, SIGWINCH) must
     // NOT interrupt the read — they're silently discarded on the syscall
     // return path, and returning EINTR here causes an infinite loop
     // since the signal stays queued until signal_deliver_pending runs.
     for (;;) {
+        if (!rb_empty(tty->rd_head, tty->rd_tail)) break;
+
         task_we_t node;
         task_we_init(&node, g_current);
         task_we_add(&tty->waitq, &node);
 
-        if (!rb_empty(tty->rd_head, tty->rd_tail)) {
-            task_we_remove(&tty->waitq, &node);
-            break;
-        }
+        if (rb_empty(tty->rd_head, tty->rd_tail))
+            sched_sleep();
 
-        sched_sleep();
         task_we_remove(&tty->waitq, &node);
 
         if (signal_has_actionable(&g_current->sigstate))
