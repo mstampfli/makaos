@@ -1,7 +1,8 @@
 bits 64
 
+%include "asm_offsets.inc"    ; defines CPU_TSS_RSP0 = offset of tss.rsp[0] in cpu_t
+
 extern syscall_dispatch
-extern g_tss                  ; TSS struct in tss.c — RSP0 is at byte offset 4
 extern g_syscall_user_rsp     ; scratch qword in syscall.c to stash user RSP
 extern g_syscall_user_rip     ; scratch qword in syscall.c to stash user RIP
 extern g_syscall_user_rflags  ; scratch qword in syscall.c to stash user RFLAGS
@@ -52,8 +53,11 @@ syscall_entry:
     mov [rel g_syscall_arg5], r8
     mov [rel g_syscall_arg6], r9
 
-    ; 2. Switch to kernel stack (TSS.RSP0, byte offset 4 in tss_t).
-    mov rsp, [rel g_tss + 4]
+    ; 2. Switch to kernel stack.  RSP0 lives in the current CPU's per-CPU
+    ;    TSS embedded inside cpu_t, reachable via the GS segment whose
+    ;    base is programmed to &g_cpus[cpu_id()] by cpu_init_bsp/ap.
+    ;    CPU_TSS_RSP0 is generated from C at build time (asm_offsets.c).
+    mov rsp, [gs:CPU_TSS_RSP0]
 
     ; 3. Re-enable interrupts — we're on a safe kernel stack now.
     sti
@@ -144,7 +148,7 @@ syscall_entry:
     ; 12. Return to user space via iretq (sysretq has a KVM bug where
     ;     SS doesn't get RPL=3 OR'd in, giving SS=0x20 instead of 0x23).
     mov r10, rsp            ; save user RSP in r10
-    mov rsp, [rel g_tss + 4] ; switch to kstack top (TSS.RSP0)
+    mov rsp, [gs:CPU_TSS_RSP0] ; switch to kstack top (this CPU's TSS.RSP0)
 
     push qword 0x23         ; SS = user data64 with RPL=3
     push r10                 ; RSP = saved user RSP
