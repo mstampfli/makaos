@@ -1,9 +1,10 @@
 #pragma once
 #include "common.h"
+#include "smp.h"     // for MAX_CPUS
 
 // ── ACPI table discovery ──────────────────────────────────────────────────
-// Parses RSDP → RSDT/XSDT → MADT to locate LAPIC and IOAPIC base addresses
-// and ISA IRQ override mappings.
+// Parses RSDP → RSDT/XSDT → MADT to locate LAPIC and IOAPIC base addresses,
+// ISA IRQ override mappings, and the list of every CPU in the system.
 //
 // We support both ACPI 1.0 (RSDT, 32-bit table pointers) and ACPI 2.0+
 // (XSDT, 64-bit table pointers).  QEMU OVMF produces ACPI 2.0.
@@ -21,12 +22,28 @@ typedef struct {
     uint16_t flags;         // MPS INTI flags: bits[1:0]=polarity, bits[3:2]=trigger
 } acpi_override_t;
 
+// One discovered CPU entry (MADT type 0: Processor Local APIC, or
+// type 9: Processor Local x2APIC).  We keep them in discovery order.
+typedef struct {
+    uint32_t apic_id;        // LAPIC (or x2APIC) ID — the hardware identifier
+    uint32_t acpi_proc_id;   // ACPI processor UID (informational)
+    uint8_t  enabled;        // 1 = CPU is already enabled at boot
+    uint8_t  online_capable; // 1 = CPU can be brought online (ACPI 6+)
+} acpi_cpu_t;
+
 typedef struct {
     uint64_t        lapic_phys;     // Local APIC physical base address
     uint64_t        ioapic_phys;    // I/O APIC physical base address
     uint32_t        ioapic_gsi_base;// first GSI handled by this IOAPIC
     acpi_override_t overrides[ACPI_MAX_OVERRIDES];
     uint8_t         override_count;
+
+    // Per-CPU list populated from MADT.  The BSP is whichever entry has
+    // its LAPIC ID matching the current CPU's LAPIC ID at runtime; the
+    // ACPI tables themselves don't mark which one is the BSP.
+    acpi_cpu_t      cpus[MAX_CPUS];
+    uint32_t        cpu_count;      // number of entries populated
+
     uint8_t         ok;             // 1 if parsing succeeded
 } acpi_info_t;
 
