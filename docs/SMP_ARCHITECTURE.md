@@ -383,19 +383,30 @@ Strict order so every phase is testable independently. Each phase boots and pass
           uses cpu_relax, `fb_term_putc` IRQ-safe spinlock, `do_switch`
           early-return advances `rcu_qs_count`.  APs fully online,
           running their own idle loop, receiving IPIs, advancing RCU
-          QS — but `pick_home_cpu()` is still pinned to CPU 0 because
-          the per-subsystem cross-CPU wait-queue paths (pty / epoll /
-          waitpid / pipe / unix-sock / ahci rendezvous) have their own
-          lost-wakeup patterns that need individual audit.  See
-          SMP_KNOWN_RACES.md entries 17–24.
-- 9-6 ⏳ Per-subsystem wait-queue audit.  Go through each sleeper
-          and waker for pty / tty / epoll / poll / waitpid / pipe /
-          unix socket / ahci rendezvous under `-smp 4` round-robin
-          with a concrete reproducer.  Every sleeper must do
-          `register → re-check → sleep` with a barrier; every waker
-          must commit the condition BEFORE calling `wait_queue_wake_all`
-          (or `sched_wake` for non-queue paths).  When clean, flip
-          `pick_home_cpu()` back to round-robin.
+          QS — `pick_home_cpu()` pinned to CPU 0 pending 9-6.  See
+          SMP_KNOWN_RACES.md entries 17–23.
+- 9-6 ✅ Per-subsystem wait-queue audit + round-robin.  Seven
+          commits, zero new locks, one new reproducer binary:
+          9-6  (ea17ed2) userland/apps/smp_test — deterministic C
+                          reproducer for waitpid, pipe, epoll,
+                          AF_UNIX, parallel AHCI reads.
+          9-6a (ec2c276) lock-free per-task `children` list (Treiber
+                          stack).  sys_exit batch-reparents to init
+                          in one CAS.  Dead walkers deleted.
+          9-6b (c4c30b4) pty/tty canonical pattern audit;
+                          tty_vfs_read phase-1 fast check added.
+          9-6c (2504e98) explicit atomic release/acquire on epoll
+                          has_ready flag.
+          9-6d (46d89fd) pipe read/write signal-interruptible.
+          9-6e (927624b) unix socket signal-interruptible on all
+                          six sched_sleep sites.
+          9-6f (953cb7a) AHCI lock-free MPSC of stack-allocated
+                          requests — eliminates fixed-ring multi-
+                          producer race and sched_yield busy-wait.
+          9-6g (this commit) pick_home_cpu round-robin across every
+                          online CPU; SMP_KNOWN_RACES entry 24 →
+                          RESOLVED.  See the entry for the full
+                          per-subsystem resolution map.
 - 9-7 ⏳ TLB shootdown (per-mm cpumask, batched range IPI, lazy TLB
           for kernel threads).  Previously slated for 9-6; slipped one
           phase because 9-6 is now the per-subsystem audit.

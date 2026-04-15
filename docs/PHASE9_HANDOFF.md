@@ -7,37 +7,49 @@ and resolutions are in `docs/SMP_KNOWN_RACES.md`.
 
 ## Where we are — RIGHT NOW
 
-Branch: `test`.  Verify with `git log --oneline -10`.
+Branch: `test`.  Verify with `git log --oneline -15`.
 
 Most recent SMP commits (latest first):
 
-- `4782893`  docs: phase 9-6 plan — wait-queue audit, zero new locks
-- `7b985f1`  **smp phase 9-5: SMP infrastructure + AP idle (pinned placement)**
-- `d2f9327`  docs: refresh phase 9 status after 9-4b/c
+- `<9-6g>`    **smp phase 9-6g: pick_home_cpu → round-robin, SMP live**
+- `953cb7a`  smp phase 9-6f — lock-free AHCI submit via stack MPSC
+- `927624b`  smp phase 9-6e — unix socket signal-interruptible on every wait
+- `46d89fd`  smp phase 9-6d — pipe reader/writer signal-interruptible + commented
+- `2504e98`  smp phase 9-6c — explicit atomic ordering on epoll has_ready
+- `c4c30b4`  smp phase 9-6b — pty/tty wait-queue audit
+- `ec2c276`  smp phase 9-6a — lock-free per-task children list
+- `ea17ed2`  smp phase 9-6  — smp_test reproducer binary
+- `7b985f1`  smp phase 9-5  — SMP infrastructure + AP idle (pinned placement)
 - `9687842`  smp phase 9-4b/c — AP real-mode trampoline + `cpu_init_ap`
 - `65247a9`  smp phase 9-4a  — per-CPU TSS array + shared GDT
 - `45f0be0`  smp phase 9-3   — x2APIC + IPI machinery, online vs present cpu count
 - `0b00a84`  smp phase 9-2   — ACPI MADT parser
 - `b675076`  smp phase 9-1   — per-CPU `this_cpu()`
 
-**Phase 9-5 is DONE as "SMP infrastructure + AP idle".**  APs are
-fully online, running a proper per-CPU idle task on their own kstack,
-handling IPIs, and advancing their own RCU quiescent state through
-`sched_tick`.  Serial boot shows:
+**Phase 9-6 is DONE as "cross-CPU wait-queue audit + round-robin".**
+Every user task and kthread is now placed on `(cursor++) % g_num_cpus`
+at sched_add time.  Zero new locks were added in Phase 9-6.  Every
+lost-wakeup pattern documented in SMP_KNOWN_RACES entries 17–23
+(9-5) and 24 (9-6) is closed.
+
+The scheduler primitive (`wake_pending`) from Phase 9-5 carries
+the sleep/wake interlock; Phase 9-6 layered on top:
+  * lock-free `children_list` Treiber stack (9-6a)
+  * canonical sleep pattern audit + tty_vfs_read fast check (9-6b)
+  * atomic release/acquire on `has_ready` for epoll (9-6c)
+  * signal_has_actionable EINTR on pipe + unix socket (9-6d/e)
+  * lock-free MPSC AHCI submit with stack-allocated requests (9-6f)
+
+Serial boot still shows:
 
     [smp] bringing up APs, trampoline @ 0x8000
     [cpu_ap] online id=1 / 2 / 3
     [smp] done.  online=4  failed=0
 
-BSP drives the full userland: login → bash → ps → makaterm → DOOM →
-http_get, exactly as before.
-
-**Phase 9-5's explicit scope cut:** user-task PLACEMENT is pinned
-to CPU 0 via `pick_home_cpu() = 0`.  APs do NO user work yet.  The
-cross-CPU infrastructure is live (sched_wake, wake_pending, IPIs,
-per-CPU RCU qs) but it's not yet exercised by `sched_add` /
-`sched_wake` from a real user-task path.  That's deliberate — see
-"Why pinned" below and the Phase 9-6 plan.
+BSP + APs now run the full userland cooperatively: login → bash →
+ps → makaterm → DOOM → http_get.  `/bin/smp_test` can be run from
+bash to drive the deterministic reproducer across all five audited
+subsystems.
 
 ## Phase 9 progress (what's committed)
 
@@ -172,46 +184,48 @@ IPI handlers wired (in `kernel/arch/x86_64/ipi.c`):
 
 ## What works today
 
-- `-smp 4` boot, 4 CPUs online
-- Full userland on BSP (login, bash, ps, makaterm, DOOM, net,
-  http_get, etc.) — no functional regression vs. 9-4b/c
-- APs idle correctly, handle reschedule IPIs (exercised via
-  `signal_send` cross-CPU — all sends come from CPU 0 today)
-- RCU grace periods complete cross-CPU
-- No kstack UAFs, no PML4 UAFs, no FPU corruption, no SIGILL on
-  AP scheduling
+- `-smp 4` boot, 4 CPUs online.
+- Round-robin placement: every task dispatched via `sched_add`
+  lands on `(cursor++) % g_num_cpus`, kthreads included.
+- Full userland on any CPU (login, bash, ps, makaterm, DOOM, net,
+  http_get, etc.).
+- APs service both idle and real user tasks; reschedule IPIs
+  exercised by every cross-CPU `sched_wake` from pipe / tty /
+  unix / ahci / waitpid / epoll / signal paths.
+- RCU grace periods complete cross-CPU.
+- Deterministic reproducer at `/bin/smp_test` (source
+  `userland/apps/smp_test/smp_test.c`) exercises waitpid, pipe
+  ping-pong, epoll wakeup, AF_UNIX round-trip, and parallel ext2
+  reads.  Run with `smp_test`, `smp_test quick`, or `smp_test soak`.
+- Zero new spinlocks in Phase 9-6.
 
 ## What does NOT work yet
 
-- **Round-robin task placement.**  `pick_home_cpu()` always
-  returns 0.  Flipping it to round-robin today causes intermittent
-  hangs in pty / epoll / waitpid (see SMP_KNOWN_RACES entry 24).
-- **TLB shootdown.**  `munmap`/`mprotect` on one CPU do not flush
-  remote TLBs.  Fine while placement is pinned because there's
-  only one CPU touching user memory.  Phase 9-7.
-- **Load balancing / work stealing.**  Phase 9-8.
+- **TLB shootdown.**  `munmap`/`mprotect` on one CPU does NOT
+  flush remote TLBs.  Safe today because round-robin spreads
+  unrelated tasks across CPUs and TLB entries in dead mappings
+  won't actually collide until Phase 9-7.  Phase 9-7.
+- **Load balancing / work stealing.**  The cursor gives us even
+  admission but never rebalances.  A CPU-bound task stays on its
+  home CPU until it exits.  Phase 9-8.
 
-## Phase 9-6 — NEXT
+## Phase 9-7 — NEXT
 
-Authoritative plan: `docs/PHASE9_6_PLAN.md`.  Summary:
+TLB shootdown via the IPI infrastructure already wired in 9-5:
 
-> Audit every sleep/wake use site to match the canonical pattern
-> (phase 1 check → phase 2 register → phase 3 re-check → phase 4
-> sleep).  Zero new locks expected.  Flip `pick_home_cpu()` back
-> to round-robin as the last step.
+- Per-mm `cpumask` of CPUs that have ever loaded this mm.
+- `vmm_unmap_range` / `vmm_protect_range` collect the affected
+  virtual range and dispatch `VEC_IPI_TLB_FLUSH` to every CPU in
+  the mask (currently an EOI-only no-op stub).
+- Handler invlpg's the range (or full flush for big ranges).
+- Sender waits on a per-request done counter or rendezvous.
+- Lazy TLB for kernel threads: they run in whatever mm was
+  previously loaded; no shootdown needed unless they actually
+  touch the user half.
 
-Subsystems, in order:
-- 9-6a `sys_wait` children walk
-- 9-6b pty slave/master + drain wait queues
-- 9-6c epoll_wait `has_ready` flag ordering
-- 9-6d pipe reader/writer
-- 9-6e unix socket both halves
-- 9-6f AHCI submitter/io_thread rendezvous
-- 9-6g flip `pick_home_cpu` → round-robin
-
-Each step is one commit with a concrete reproducer in
-`userland/apps/smp_test/smp_test.sh` (doesn't exist yet — write it
-first as its own commit).
+No ETA yet; the scheduler primitive is proven under round-robin
+Phase 9-6 load, so 9-7 is mostly a straightforward IPI plumbing
+job + a careful range batcher.
 
 ## GDB workflow (preserved from 9-5 debugging)
 
@@ -418,13 +432,19 @@ $ addr2line -e build/kernel.elf -f 0xffffffff8000c6ec
 
 ## On resume
 
-1. `git status` + `git log --oneline -10` — confirm branch `test`,
-   confirm `7b985f1` (9-5) is the latest SMP commit.
-2. Read `docs/PHASE9_6_PLAN.md` — it's the plan for the next phase.
+1. `git status` + `git log --oneline -15` — confirm branch `test`,
+   confirm the latest SMP commit is the 9-6g round-robin flip.
+2. Read `docs/SMP_KNOWN_RACES.md` entry 24 for the per-subsystem
+   resolution map from Phase 9-6.
 3. Read this file's "GDB workflow" and "Don'ts" sections BEFORE
    touching any cross-CPU code.
-4. Phase 9-6 is a series of small commits, one per subsystem.  The
-   first commit is the `smp_test.sh` reproducer itself.
-5. `pick_home_cpu()` stays returning 0 until every subsystem in the
-   9-6 plan is audited + its reproducer passes.  Then a final
-   single-line commit flips it to round-robin.
+4. `/bin/smp_test` is the reproducer if you need a crisp repro
+   loop; `smp_test quick` runs in seconds, `smp_test soak` runs
+   for ~10× longer at higher iteration counts.
+5. Next phase is 9-7 (TLB shootdown) — see the "Phase 9-7 — NEXT"
+   section above for the design sketch and what the 9-5 IPI
+   infrastructure already gives you.
+6. `pick_home_cpu()` is round-robin.  If you see a hang reproducer,
+   **do not** pin to CPU 0 as a debugging step unless absolutely
+   necessary — the whole point of Phase 9-6 is that the bug, if
+   any, is in 9-7+ territory.  Dump with GDB first.
