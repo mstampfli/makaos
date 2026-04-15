@@ -5,6 +5,20 @@ UP** but **will be a bug the instant APs boot**.  Every entry lists
 which phase is scheduled to fix it.  Phase 9 (AP bring-up) will not be
 allowed to proceed until this list is empty.
 
+> **Phase 9 status (2026-04-15):** APs are online.  Commits `b675076`
+> (9-1), `0b00a84` (9-2), `45f0be0` (9-3), `65247a9` (9-4a), `9687842`
+> (9-4b/c) landed in that order.  Under `-smp 4`, all four CPUs reach
+> `cpu_init_ap` and the BSP runs the full userland.  APs still do NO
+> work — they spin in a `pause`-loop that bumps `rcu_qs_count` only,
+> so the scheduler has never scheduled on anything but CPU 0.
+>
+> This means the entries below that talk about cross-CPU data-plane
+> races have been **tested against AP-existence** (memory barriers,
+> atomics, cache-line ownership) but NOT against **multi-CPU
+> execution**.  Phase 9-5 (per-CPU idle task + AP timer + IPI
+> reschedule) is the commit that first actually runs user-visible
+> work on APs.  Re-verify this file once 9-5 lands.
+
 Format:
 - **Location** — file:symbol
 - **Race** — what's unsafe
@@ -50,8 +64,12 @@ Format:
   goes through the owning CPU's `rq_lock` (IRQ-safe spinlock).
 - **Cross-CPU wake:** `sched_wake(t)` takes `g_cpus[t->home_cpu].rq_lock`
   directly and enqueues on the target CPU's run queue.  Sets
-  `reschedule_pending` on the target.  TODO Phase 9: if target CPU is
-  idle/halted, send IPI — currently relies on the next timer tick.
+  `reschedule_pending` on the target.  TODO Phase 9-5: if target CPU
+  is idle/halted, send `VEC_IPI_RESCHEDULE` so the target notices
+  without waiting for its next timer tick.  Until 9-5 lands, a task
+  enqueued onto an AP's run queue would sit there forever because APs
+  have no timer and no IPI handler yet — this is why `sched_add()`
+  still pins to CPU 0.
 - **Single lock, SMP-safe.**  On one CPU the lock is always
   uncontended (`lock cmpxchg` = ~20 cycles).  Under SMP the lock
   serializes only the few ops that touch the target CPU's rq, which
