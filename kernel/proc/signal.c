@@ -186,14 +186,43 @@ void signal_deliver_pending(void) {
         return;
 
     // User handler: only deliverable on the syscall return path.
+    // signal_setup_frame writes a sigframe on the user stack and
+    // redirects sysretq / iretq to the handler entry — it can only
+    // work when we're about to return to user space via one of those
+    // instructions, which the kernel signals by setting
+    // g_signal_in_syscall=1.
     if (handler != (uint64_t)SIG_DFL && g_signal_in_syscall &&
         !(g_current->flags & TASK_FLAG_KTHREAD)) {
         signal_setup_frame(sig, ka);
         return;
     }
 
-    // SIG_DFL (or non-syscall path): print diagnostic for fatal hw signals,
-    // then terminate.
+    // Non-syscall path (e.g. called from do_switch after a
+    // context_switch wake) — the task has a custom handler but
+    // we're not on a path that can set up a user frame right now.
+    // DEFER: re-set the pending bit so the next signal_deliver_pending
+    // call (which WILL be on a syscall return path, when the task
+    // next enters the kernel and exits it) can install the frame.
+    // Pre-fix: the code fell through to the fatal-terminate block
+    // below, silently killing any task that woke up via context
+    // switch with a pending custom-handler signal.  Observed: during
+    // the pty/makaterm freeze, bash PF-crashed (SIGSEGV to self),
+    // which sent SIGCHLD to makaterm.  makaterm had a custom SIGCHLD
+    // handler and was parked in epoll_wait.  do_switch woke it,
+    // called signal_deliver_pending with g_signal_in_syscall=0, the
+    // custom-handler gate failed, and the kernel zombified makaterm
+    // via the fatal-non-hw fall-through.  Fix: re-queue the signal
+    // and return so the task continues running; it will re-enter
+    // signal_deliver_pending on its next syscall-return where the
+    // gate succeeds.
+    if (handler != (uint64_t)SIG_DFL &&
+        !(g_current->flags & TASK_FLAG_KTHREAD)) {
+        atomic_or(&ss->pending, 1u << (uint32_t)(sig - 1));
+        return;
+    }
+
+    // SIG_DFL (and non-ignored) or kernel thread: print diagnostic
+    // for fatal hw signals, then terminate.
     if (sig == SIGSEGV || sig == SIGBUS || sig == SIGFPE || sig == SIGILL) {
         static const char* names[] = {
             [SIGSEGV] = "SIGSEGV",
