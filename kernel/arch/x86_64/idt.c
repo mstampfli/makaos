@@ -2,9 +2,8 @@
 #include "signal.h"
 #include "sched.h"
 #include "tss.h"
+#include "cpu.h"
 #include "fb.h"
-
-extern tss_t g_tss;
 
 /* Kept as NULL for UEFI boots — legacy symbol referenced by signal.c */
 volatile uint16_t* g_vga = (volatile uint16_t*)0;
@@ -144,7 +143,7 @@ void isr13_gp(interrupt_frame_t* f, uint64_t ec) {
     serial_puts_idt("FLG=");  serial_hex_idt(f->flags);
     serial_puts_idt("RSP=");  serial_hex_idt(f->sp);
     serial_puts_idt("SS=");   serial_hex_idt(f->ss);
-    serial_puts_idt("RSP0="); serial_hex_idt(g_tss.rsp[0]);
+    serial_puts_idt("RSP0="); serial_hex_idt(this_cpu()->tss.rsp[0]);
 
     // Error code breakdown: [15:3]=selector index, [2]=TI, [1]=IDT, [0]=EXT
     if (ec) {

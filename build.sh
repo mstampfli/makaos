@@ -92,7 +92,7 @@ EFI_CFLAGS=(
 )
 
 # ── Kernel source files to exclude ────────────────────────────────────────
-KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c ac97.c"
+KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c ac97.c asm_offsets.c"
 
 echo "[+] Building user binaries"
 
@@ -261,11 +261,24 @@ for dir in "${KERNEL_SUBDIRS[@]}"; do
   done
 done
 
+# ── asm-offsets: C struct offsets exported to NASM ────────────────────────
+# Compile asm_offsets.c to an assembly listing; grep the "->NAME $val NAME"
+# marker lines we planted there; rewrite them as NASM `%define`s.  This
+# lets syscall_entry.asm reach inside cpu_t without hardcoding offsets.
+ASM_OFFSETS_SRC="$KERNEL_DIR/arch/x86_64/asm_offsets.c"
+ASM_OFFSETS_S="$BUILD_DIR/asm_offsets.s"
+ASM_OFFSETS_INC="$BUILD_DIR/asm_offsets.inc"
+"$CLANG" "${KERNEL_CFLAGS[@]}" "${KERNEL_INCLUDES[@]}" -S "$ASM_OFFSETS_SRC" -o "$ASM_OFFSETS_S"
+# Planted lines look like:  .ascii "@@@ASMDEF CPU_TSS_RSP0 796"
+awk '/@@@ASMDEF/ {
+    for (i = 1; i <= NF; i++) if ($i == "\"@@@ASMDEF") { name=$(i+1); val=$(i+2); gsub(/"/,"",val); printf "%%define %s %s\n", name, val; next }
+}' "$ASM_OFFSETS_S" > "$ASM_OFFSETS_INC"
+
 KERNEL_ASM_OBJS=()
 for src in "$KERNEL_DIR/arch/x86_64"/*.asm; do
   [ -e "$src" ] || continue
   obj="$BUILD_DIR/kernel_$(basename "${src%.asm}").o"
-  "$NASM" -f elf64 -g -F dwarf "$src" -o "$obj"
+  "$NASM" -f elf64 -g -F dwarf -I "$BUILD_DIR/" "$src" -o "$obj"
   KERNEL_ASM_OBJS+=("$obj")
 done
 

@@ -1,17 +1,17 @@
 #include "tss.h"
 #include "vmm.h"
 #include "pmm.h"
-
-// ── Static TSS ───────────────────────────────────────────────────────────
-// One TSS for the whole system (single CPU).  Placed in .bss so it is
-// zeroed before tss_init() runs.
-tss_t g_tss;
+#include "cpu.h"     // g_cpus[], this_cpu(), cpu_id()
 
 // ── GDT in kernel BSS ─────────────────────────────────────────────────────
-// We rebuild the GDT here so we can append a 64-bit TSS descriptor (16 bytes
-// = two 8-byte slots).  Keeping CS=0x18 and SS/DS/ES=0x10 means we never
-// have to reload segment registers after the lgdt — they still point to valid
-// descriptors at the same selectors.
+// One table shared by every CPU.  It holds the six fixed descriptors
+// (null + kernel/user code/data) followed by a TSS descriptor pair for
+// every possible CPU (slots [6 + 2*i .. 6 + 2*i + 1], pointing at
+// &g_cpus[i].tss).  The BSP fills every descriptor at boot; APs just
+// `ltr` their own selector during cpu_init_ap(), no relocation needed.
+//
+// GDT_ENTRIES = GDT_FIXED_ENTRIES + 2 * MAX_CPUS (see tss.h).  At
+// MAX_CPUS=64 this is 6 + 128 = 134 slots = 1072 bytes — trivial.
 //
 // 64-bit TSS descriptor layout (two consecutive 64-bit words):
 //   Word 0 (low):
@@ -31,25 +31,19 @@ tss_t g_tss;
 //   Word 1 (high):
 //     [31: 0] base[63:32]
 //     [63:32] reserved (must be 0)
-static uint64_t g_gdt[8];  // 8 × 8 bytes = 64 bytes; zeroed by BSS clear
+static uint64_t g_gdt[GDT_ENTRIES];
 
-// Slot counter and dynamic base for kstack_alloc
+// Slot counter and dynamic base for kstack_alloc.
 static uint32_t g_kstack_slots = 0;
 static virt_addr_t g_kstack_region_base = 0;
 
-// ── Internal: get physical address of kernel PML4 ───────────────────────
-// vmm_kernel_pml4_get is exposed in vmm.h.
-// kstack_alloc must target the KERNEL PML4 (not whatever CR3 happens to be),
-// because stacks must be mapped in the kernel's own address space and then
-// inherited by all processes via the shallow-copied upper half.
-
-// ── Internal: write TSS descriptor into g_gdt[6] and g_gdt[7] ──────────
-static void gdt_write_tss(void) {
-    uint64_t base  = (uint64_t)&g_tss;
+// ── Internal: write one TSS descriptor pair pointing at &g_cpus[id].tss ─
+static void gdt_write_tss_slot(uint32_t id) {
+    uint64_t base  = (uint64_t)&g_cpus[id].tss;
     uint32_t limit = (uint32_t)(sizeof(tss_t) - 1);
+    uint32_t lo_idx = GDT_FIXED_ENTRIES + 2u * id;
 
-    // Low word
-    g_gdt[6] =
+    g_gdt[lo_idx] =
         ((uint64_t)(limit & 0xFFFFU))              |   // limit[15:0]
         ((uint64_t)(base  & 0xFFFFU)       << 16)  |   // base[15:0]
         ((uint64_t)((base >> 16) & 0xFFU)  << 32)  |   // base[23:16]
@@ -57,17 +51,28 @@ static void gdt_write_tss(void) {
         ((uint64_t)((limit >> 16) & 0xFU)  << 48)  |   // limit[19:16]
         ((uint64_t)((base >> 24) & 0xFFU)  << 56);     // base[31:24]
 
-    // High word: upper 32 bits of base, rest 0
-    g_gdt[7] = (uint64_t)(base >> 32);
+    g_gdt[lo_idx + 1] = (uint64_t)(base >> 32);
 }
 
-// ── tss_init ─────────────────────────────────────────────────────────────
-void tss_init(void) {
-    // 1. Populate the TSS: set iopb_offset so the CPU finds no IOPB.
-    //    IST stacks allocated below after the GDT is live.
-    g_tss.iopb_offset = (uint16_t)sizeof(tss_t);
+// ── Internal: fill out one cpu_t.tss — IST stacks + iopb ───────────────
+// Called once per CPU after its cpu_t is reachable via this_cpu() or
+// g_cpus[i]. Allocates IST stacks via kstack_alloc (which maps into the
+// kernel PML4, so every CPU sees them).  No LTR yet — the caller decides
+// when to load the task register.
+//
+//   IST1 → #DF (double fault, vector 8)
+//   IST2 → #NMI (non-maskable interrupt, vector 2)
+static void tss_populate(tss_t* tss) {
+    tss->iopb_offset = (uint16_t)sizeof(tss_t);
+    tss->ist[0] = (uint64_t)kstack_alloc(); // IST1
+    tss->ist[1] = (uint64_t)kstack_alloc(); // IST2
+    // Sensible initial RSP0; scheduler will overwrite per context switch.
+    tss->rsp[0] = tss->ist[0];
+}
 
-    // 2. Build the new GDT.
+// ── tss_init (BSP) ───────────────────────────────────────────────────────
+void tss_init(void) {
+    // 1. Build the fixed-selector portion of the GDT.
     //
     //   0x00  null
     //   0x08  kernel code  CS=0x08  (KERNEL_CS)   L=1, DPL=0
@@ -75,8 +80,7 @@ void tss_init(void) {
     //   0x18  user data32           placeholder required by sysretq for compat mode
     //   0x20  user data64  SS=0x20  (USER_SS&~3)  DPL=3
     //   0x28  user code64  CS=0x28  (USER_CS&~3)  L=1, DPL=3
-    //   0x30  TSS low   (filled by gdt_write_tss)
-    //   0x38  TSS high
+    //   0x30…  per-CPU TSS descriptor pairs (filled by gdt_write_tss_slot)
     //
     // STAR encodes: kernel base = 0x08 (CS=0x08, SS=0x08+8=0x10 ✓)
     //               user   base = 0x18 (sysretq: SS=0x18+8=0x20, CS=0x18+16=0x28 ✓)
@@ -86,10 +90,12 @@ void tss_init(void) {
     g_gdt[3] = 0x00CFF3000000FFFFULL; // user data32  0x18  (DPL=3 placeholder)
     g_gdt[4] = 0x00CFF3000000FFFFULL; // user data64  SS=0x20  DPL=3
     g_gdt[5] = 0x00AFFA000000FFFFULL; // user code64  CS=0x28  L=1, DPL=3
-    g_gdt[6] = 0x0000000000000000ULL; // TSS low  (filled below)
-    g_gdt[7] = 0x0000000000000000ULL; // TSS high
 
-    gdt_write_tss();
+    // 2. Populate every possible CPU's TSS descriptor up front.  The base
+    //    addresses (&g_cpus[i].tss) are BSS constants known at link time,
+    //    so APs never need to patch the GDT — they just LTR their slot.
+    for (uint32_t i = 0; i < MAX_CPUS; i++)
+        gdt_write_tss_slot(i);
 
     // 3. Load the new GDT.
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
@@ -110,6 +116,9 @@ void tss_init(void) {
     );
 
     // 5. Reload data-segment registers to KERNEL_SS=0x10.
+    //    NOTE: the `mov %ax,%gs` here with ax=0 CLEARS GS_BASE.  The BSP
+    //    therefore MUST call cpu_init_bsp() AFTER tss_init() to re-program
+    //    IA32_GS_BASE; kmain handles that ordering explicitly.
     __asm__ volatile(
         "mov $0x10, %%ax\n\t"
         "mov %%ax, %%ds\n\t"
@@ -121,26 +130,19 @@ void tss_init(void) {
         : : : "ax", "memory"
     );
 
-    // 6. Allocate IST stacks AFTER the GDT/TSS are live so we can use
-    //    vmm_page_map.  We allocate BEFORE ltr because ltr only reads the
-    //    descriptor; the IST pointers are read at interrupt delivery time.
-    //
-    //    IST1 → #DF (double fault, vector 8)
-    //    IST2 → #NMI (non-maskable interrupt, vector 2)
-    g_tss.ist[0] = (uint64_t)kstack_alloc(); // IST1
-    g_tss.ist[1] = (uint64_t)kstack_alloc(); // IST2
+    // 6. Populate BSP's TSS.  We can't use this_cpu() here — GS_BASE was
+    //    just cleared and cpu_init_bsp() hasn't run yet — so talk to the
+    //    slot directly via its well-known index (BSP is always g_cpus[0]).
+    tss_populate(&g_cpus[0].tss);
 
-    // Set RSP0 to something sane (will be overwritten per-process by sched).
-    // Use IST1's top as a temporary safe value.
-    g_tss.rsp[0] = g_tss.ist[0];
-
-    // 7. Load the TSS register.
-    __asm__ volatile("ltr %0" : : "r"((uint16_t)GDT_TSS_SELECTOR) : "memory");
+    // 7. Load the task register for CPU 0.
+    __asm__ volatile("ltr %0" : : "r"(GDT_TSS_SELECTOR(0)) : "memory");
 
     // 8. Enable SMEP (CR4 bit 20) if the CPU supports it.
     //    SMEP: kernel cannot execute user-space pages.
     //    Check CPUID leaf 7, EBX bit 7 before setting — writing unsupported
-    //    CR4 bits causes #GP.
+    //    CR4 bits causes #GP.  APs inherit CR4 from the BSP via the
+    //    trampoline so this runs once here.
     {
         uint32_t ebx = 0;
         __asm__ volatile(
@@ -158,9 +160,25 @@ void tss_init(void) {
     }
 }
 
+// ── tss_init_ap (AP) ─────────────────────────────────────────────────────
+// Precondition: the AP has already programmed its GS_BASE to its own
+// cpu_t (via cpu_init_ap()), and the shared GDT has already been loaded
+// into this CPU's GDTR (the AP trampoline does lgdt on the same g_gdt).
+//
+// This is the full set of TSS-specific work an AP needs: allocate IST
+// stacks into its per-CPU tss, then LTR its descriptor.
+void tss_init_ap(void) {
+    tss_populate(&this_cpu()->tss);
+    __asm__ volatile("ltr %0" : : "r"(GDT_TSS_SELECTOR(cpu_id())) : "memory");
+}
+
 // ── tss_set_rsp0 ─────────────────────────────────────────────────────────
+// Called on every context switch.  Writes RSP0 of the current CPU's TSS
+// so the next ring-3 → ring-0 transition lands on the scheduled task's
+// kernel stack.  Uses this_cpu() because the scheduler runs with
+// preemption disabled and IRQs off, so the CPU identity is stable.
 void tss_set_rsp0(uint64_t rsp0) {
-    g_tss.rsp[0] = rsp0;
+    this_cpu()->tss.rsp[0] = rsp0;
 }
 
 // ── kstack_alloc ─────────────────────────────────────────────────────────
