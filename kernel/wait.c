@@ -180,14 +180,11 @@ int task_wake_func(wake_entry_t* we) {
 
 int epoll_wake_func(wake_entry_t* we) {
     epoll_we_t* ewe = (epoll_we_t*)we;
-    // RELEASE store pairs with the sleeper's ACQUIRE load in sys_epoll_wait.
-    // Together with the underlying wait_queue_wake_all ACQ_REL on the
-    // sleeper's wait queue, this gives us a straight happens-before
-    // chain: waker's ring push → has_ready=1 → state->wq wake_all →
-    // sleeper observes has_ready=1 OR sleeper is woken directly.
-    // See the detailed commentary in sys_epoll_wait for the full
-    // ordering proof.
+    serial_puts_dbg("[ewake] wq=");
+    serial_hex_dbg((uint64_t)ewe->epoll_wq);
     __atomic_store_n(ewe->p_has_ready, 1, __ATOMIC_RELEASE);
-    wait_queue_wake_all(ewe->epoll_wq);  // wake anyone sleeping on the epoll fd
-    return WQ_KEEP;                      // stay in the file's waitq forever
+    serial_puts_dbg("[ewake] wake_state_wq\n");
+    wait_queue_wake_all(ewe->epoll_wq);
+    serial_puts_dbg("[ewake] done\n");
+    return WQ_KEEP;
 }
