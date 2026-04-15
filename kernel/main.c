@@ -154,7 +154,14 @@ void kmain(void) {
     // ── CPU structures ────────────────────────────────────────────────────
     tss_init();
     syscall_init();
-    cpu_init_bsp();           // per-CPU state for the BSP (Phase 1 SMP)
+    // cpu_init_bsp programs GS_BASE.  It MUST run after tss_init: the
+    // GDT-reload sequence inside tss_init writes 0 to %gs (a selector
+    // load), which on x86-64 clears the GS_BASE MSR as a side effect.
+    // Any wrmsr we did before tss_init would be wiped out.  Anything
+    // before this line that calls this_cpu() / preempt_disable would
+    // dereference %gs:0 == NULL → triple fault.  None of the early
+    // boot subsystems need this_cpu(); they're verified clean.
+    cpu_init_bsp();
     irq_wait_init();          // per-IRQ wait queues (Phase 3 SMP)
 
     // ── Scheduler + timer — sched_init must precede timer_init ───────────
