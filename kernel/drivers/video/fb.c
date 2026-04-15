@@ -1,6 +1,7 @@
 #include "fb.h"
 #include "font.h"
 #include "preempt.h"
+#include "common.h"
 
 fb_info_t g_fb = {0};
 
@@ -70,6 +71,16 @@ void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
 }
 
 void fb_term_scroll(void) {
+    // TRACER: every 64th scroll — keeps the tracer alive while we dig
+    // into whatever caused the char-by-char slowdown.  Remove once we
+    // have the root cause.
+    {
+        static uint32_t s_scroll_cnt = 0;
+        if ((s_scroll_cnt++ & 0x3F) == 0) {
+            serial_puts_dbg("[trace] fb_scroll cnt=");
+            serial_hex_dbg(s_scroll_cnt);
+        }
+    }
     uint32_t rows = fb_rows();
     // Copy rows 1..rows-1 up to rows 0..rows-2.  dst < src so a forward
     // memcpy is safe; no memmove needed.  GCC lowers this to `rep movsb`
@@ -98,14 +109,10 @@ void fb_term_scroll(void) {
     g_fb_row = rows - 1;
 }
 
-void fb_term_putc(char c) {
-    // Serialize against preemption: two tasks writing to the console
-    // concurrently would race on g_fb_row/col AND on framebuffer pixels
-    // (especially during scroll, which touches the whole screen).
-    // Holding preempt off across one character is cheap and guarantees
-    // clean output.
-    preempt_disable();
-
+// Internal: emit a single character assuming the caller already holds
+// preempt_disable.  No locking of its own.  Factored out of fb_term_putc
+// so fb_term_write can reuse it inside one big preempt-disabled section.
+static inline void fb_term_putc_locked(char c) {
     uint32_t cols = fb_cols();
     uint32_t rows = fb_rows();
 
@@ -113,19 +120,16 @@ void fb_term_putc(char c) {
         fb_clear();
         g_fb_row = 0;
         g_fb_col = 0;
-        preempt_enable();
         return;
     }
     if (c == '\r') {
         g_fb_col = 0;
-        preempt_enable();
         return;
     }
     if (c == '\n') {
         g_fb_col = 0;
         g_fb_row++;
         if (g_fb_row >= rows) fb_term_scroll();
-        preempt_enable();
         return;
     }
     if (c == '\b' || c == 127) {
@@ -133,7 +137,6 @@ void fb_term_putc(char c) {
             g_fb_col--;
             fb_putc_at(g_fb_col, g_fb_row, ' ', g_fb_fg, g_fb_bg);
         }
-        preempt_enable();
         return;
     }
     if (g_fb_col >= cols) {
@@ -143,6 +146,29 @@ void fb_term_putc(char c) {
     }
     fb_putc_at(g_fb_col, g_fb_row, c, g_fb_fg, g_fb_bg);
     g_fb_col++;
+}
 
+void fb_term_putc(char c) {
+    // Serialize against preemption: two tasks writing to the console
+    // concurrently would race on g_fb_row/col AND on framebuffer pixels
+    // (especially during scroll, which touches the whole screen).
+    // Holding preempt off across one character is cheap and guarantees
+    // clean output.
+    preempt_disable();
+    fb_term_putc_locked(c);
+    preempt_enable();
+}
+
+// Batched writer: take preempt_disable once for the whole user buffer
+// instead of once per byte.  This is the hot path for tty0 writes from
+// bash / ps / login, where `write(1, buf, len)` would otherwise fire
+// `len` preempt_disable/enable cycles and `len` checks of
+// reschedule_pending — on a long output line that's thousands of
+// unnecessary scheduler round-trips.
+void fb_term_write(const char* buf, uint64_t len) {
+    if (!buf || !len) return;
+    preempt_disable();
+    for (uint64_t i = 0; i < len; i++)
+        fb_term_putc_locked(buf[i]);
     preempt_enable();
 }

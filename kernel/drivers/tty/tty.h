@@ -58,6 +58,13 @@ typedef struct tty_t {
     // Called by the line discipline to echo input or for tty write().
     void (*write_char)(struct tty_t* tty, uint8_t c);
 
+    // Optional batched output: if non-NULL, tty_vfs_write uses this to
+    // emit the whole user buffer at once, avoiding per-byte preempt
+    // toggles and wake_all storms.  Implementations must still honour
+    // the ONLCR '\n' → "\r\n" translation internally.  If NULL, the
+    // per-byte write_char path is used.
+    void (*write_buf)(struct tty_t* tty, const uint8_t* buf, uint64_t len);
+
     // ── ANSI escape sequence filter state (canonical mode) ───────────────
     // 0=normal, 1=saw ESC, 2=inside CSI (ESC [)
     uint8_t esc_state;

@@ -57,6 +57,12 @@ void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg);
 void fb_term_putc(char c);
 void fb_term_scroll(void);
 
+/* Batched writer used by the tty0 output backend: emits `len` bytes
+ * with a single preempt_disable across the whole loop, so preempt is
+ * toggled once per write() syscall instead of once per byte.  Honours
+ * the same special characters as fb_term_putc (\r \n \b \f). */
+void fb_term_write(const char* buf, uint64_t len);
+
 /* Set foreground/background from VGA attribute byte (low nibble=fg, high=bg) */
 static inline void fb_set_attr(uint8_t attr) {
     g_fb_fg = fb_vga_color(attr & 0xF);
