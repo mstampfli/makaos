@@ -3671,15 +3671,41 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
         if (count > 0) break;
         if (timeout_ms == 0) break;
 
-        // Sleep on epoll's own wq. Persistent epoll_we_t entries on each watched
-        // fd's waitq call epoll_wake_func → set state->has_ready=1 and wake state->wq.
-        // Zero per-wakeup allocation after epoll_ctl(ADD).
-        state->has_ready = 0;
+        // Canonical Phase 9-6 wait-queue registration, with the epoll-
+        // specific has_ready fast-path flag on top.
+        //
+        // Ordering contract (see wait.c:epoll_wake_func for the paired
+        // waker side).  The absolute critical rule is:
+        //
+        //   (1) clear has_ready RELAXED — it will be release-ordered by
+        //       task_we_add's CAS below.
+        //   (2) task_we_add (__ATOMIC_RELEASE on success) publishes the
+        //       stack entry AND the has_ready clear in one op.
+        //   (3) re-read has_ready with ACQUIRE, pairing with the
+        //       waker's RELEASE store in epoll_wake_func.
+        //   (4) fall back to a full poll re-scan under state->lock if
+        //       the flag didn't catch it — the poll callback reads the
+        //       actual fd state which is linearised by its own
+        //       lock-free ring or per-queue lock.
+        //
+        // Every interleaving of a waker vs this sleeper maps to one
+        // of:
+        //   (a) waker's has_ready store is globally visible before the
+        //       sleeper's ACQUIRE load → sleeper sees 1, skips sleep.
+        //   (b) waker's task_we xchg on state->wq happens after our
+        //       CAS on the same cache line → waker drains our entry
+        //       → task_wake_func → sched_wake → wake_pending → sched_sleep
+        //       bails.
+        //   (c) waker's data push committed but has_ready and wake
+        //       both raced against our registration → poll re-scan
+        //       under state->lock reads the authoritative ring state
+        //       and returns ready.
+        // There is no interleaving that loses a wake.
+        __atomic_store_n(&state->has_ready, 0, __ATOMIC_RELAXED);
         task_we_init(&task_we, g_current);
         task_we_add(&state->wq, &task_we);
 
-        // Re-check after registering to close the race window.
-        int ep_recheck = state->has_ready;
+        int ep_recheck = __atomic_load_n(&state->has_ready, __ATOMIC_ACQUIRE);
         if (!ep_recheck) {
             spin_lock(&state->lock);
             for (uint32_t i = 0; i < state->cap && !ep_recheck; i++) {
