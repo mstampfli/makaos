@@ -175,21 +175,15 @@ void signal_deliver_pending(void) {
         g_fb_fg = saved_fg;
     }
 
-    // Reparent any children to init before we vanish.
+    // Reparent any children to init before we vanish.  Batched CAS
+    // splice — see task_children_reparent in sched.c for the
+    // memory-ordering contract.
     extern task_t* g_init_task;
-    task_t* child = g_current->children;
-    while (child) {
-        task_t* next_child = child->child_next;
-        if (g_init_task && g_init_task != g_current) {
-            child->ppid = g_init_task->pid;
-            task_child_add(g_init_task, child);
-        } else {
-            child->ppid = 0;
-            child->child_next = NULL;
-        }
-        child = next_child;
+    if (g_init_task && g_init_task != g_current) {
+        task_children_reparent(g_current, g_init_task);
+    } else {
+        g_current->children = NULL;
     }
-    g_current->children = NULL;
 
     // Drop the fd table now so peers see EOF immediately (matching sys_exit).
     if (g_current->files_shared) {

@@ -717,22 +717,170 @@ void sched_add(task_t* proc) {
 }
 
 // ── Per-task child list ───────────────────────────────────────────────────
+//
+// The children list is a lock-free Treiber stack: head pointer is
+// parent->children, intra-list link is task_t.child_next.
+//
+// Writers:
+//   - fork / spawn:  parent calls task_child_add(self, new_child).
+//                    "self" is the running CPU, so from the parent's
+//                    POV this is a self-write — but ANOTHER task
+//                    exiting concurrently and reparenting into the
+//                    same parent (only happens if parent == g_init_task)
+//                    is a cross-CPU writer.  CAS-prepend serialises.
+//   - exit reparent: the exiting task walks its OWN children (no
+//                    contention — only the exiter touches that list
+//                    during the walk) and splices the whole chain
+//                    onto g_init_task->children via one CAS.  Batch
+//                    splice turns N reparents into O(1) atomics.
+//
+// Reader (also reaper):
+//   - sys_wait:      calls task_children_reap(self, pid, ...) which
+//                    atomically XCHG's the whole children chain to
+//                    NULL, walks it privately looking for a matching
+//                    zombie, CAS-splices the survivors back on top of
+//                    anything a concurrent writer added in the
+//                    meantime.  Uses one XCHG + one CAS per wait
+//                    iteration, independent of children count.
+//
+// Why lock-free, not a spinlock:
+//   Uncontested cost is the same (~20 cycles for one atomic op), but
+//   under mass-exit reparenting-to-init the writers scale linearly
+//   instead of serialising on a single lock.  And sys_exit's batch
+//   splice is O(1) atomics no matter how many orphans it has.  No
+//   new spinlock means no new LOCKS.md entry and no new acquisition
+//   order to reason about.
+//
+// x86-64 ordering notes (relied on throughout):
+//   - CAS-release pairs with xchg-acquire: any store made by a
+//     writer before its successful CAS is visible to a reader after
+//     its xchg drains the list.
+//   - child->child_next writes inside task_child_add_chain happen
+//     BEFORE the final CAS that publishes the chain head, so readers
+//     see fully-initialised links.
+//   - child->state = TASK_ZOMBIE in sys_exit is sequenced before
+//     sched_add_zombie's rq_lock operations and before
+//     signal_send → sched_wake → parent rq_lock, which in turn
+//     pairs with sched_sleep's rq_lock acquire.  So a parent that
+//     re-walks its children after a wake is guaranteed to see any
+//     child that became a zombie on another CPU.
 
+// Prepend a single child to parent's children list with one CAS.
 void task_child_add(task_t* parent, task_t* child) {
-    child->child_next  = parent->children;
-    parent->children   = child;
+    task_t* old_head = __atomic_load_n(&parent->children, __ATOMIC_RELAXED);
+    do {
+        child->child_next = old_head;
+    } while (!__atomic_compare_exchange_n(&parent->children, &old_head, child,
+                                            /*weak=*/0,
+                                            __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED));
 }
 
-void task_child_remove(task_t* parent, task_t* child) {
-    task_t** pp = &parent->children;
-    while (*pp) {
-        if (*pp == child) {
-            *pp = child->child_next;
-            child->child_next = NULL;
-            return;
+// Prepend an entire chain (head…tail already linked via child_next)
+// onto parent's children list with one CAS.  Used by sys_exit's
+// reparenting loop to move every orphan to g_init_task in one op.
+// Caller supplies both endpoints; intermediate next pointers are
+// already set up.  No-op if head is NULL.
+void task_child_add_chain(task_t* parent, task_t* head, task_t* tail) {
+    if (!head || !tail) return;
+    task_t* old_head = __atomic_load_n(&parent->children, __ATOMIC_RELAXED);
+    do {
+        tail->child_next = old_head;
+    } while (!__atomic_compare_exchange_n(&parent->children, &old_head, head,
+                                            /*weak=*/0,
+                                            __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED));
+}
+
+// Atomically drain parent's children list, walk it looking for a
+// reapable zombie, and splice the survivors back.
+//
+//   parent      — who we're waiting on behalf of (= g_current normally).
+//   target_pid  — 0 for "any child", else require child->pid == target_pid.
+//   out_found   — if non-null, set to 1 iff at least one child matched
+//                 target_pid (regardless of zombie state).  Used by the
+//                 caller to distinguish "no match → ECHILD" from "match
+//                 found but still running → sleep".
+//
+// Returns the reaped zombie (unlinked from the children list; caller
+// is responsible for sched_reap_zombie + process_destroy) or NULL.
+//
+// Walker guarantee: any writer that published a child via
+// task_child_add{,_chain} BEFORE this function's XCHG is visible in
+// the private chain.  Writers that race with the XCHG land on the
+// fresh empty head; the next call will pick them up.
+task_t* task_children_reap(task_t* parent, uint32_t target_pid,
+                            uint8_t* out_found) {
+    if (out_found) *out_found = 0;
+    if (!parent) return NULL;
+
+    task_t* chain = __atomic_exchange_n(&parent->children, (task_t*)NULL,
+                                          __ATOMIC_ACQ_REL);
+    if (!chain) return NULL;
+
+    task_t*  zombie     = NULL;
+    task_t*  keep_head  = NULL;
+    task_t*  keep_tail  = NULL;
+    uint8_t  found      = 0;
+
+    task_t* c = chain;
+    while (c) {
+        task_t* next = c->child_next;
+        c->child_next = NULL;
+
+        uint8_t matches = (target_pid == 0 || c->pid == target_pid);
+        if (matches) found = 1;
+
+        if (!zombie && matches && c->state == TASK_ZOMBIE) {
+            zombie = c;
+        } else {
+            // Keep on the survivor chain.  Push-to-head preserves
+            // nothing about original order, which is fine — the
+            // children list is unordered.
+            c->child_next = keep_head;
+            keep_head = c;
+            if (!keep_tail) keep_tail = c;
         }
-        pp = &(*pp)->child_next;
+        c = next;
     }
+
+    if (out_found) *out_found = found;
+
+    if (keep_head)
+        task_child_add_chain(parent, keep_head, keep_tail);
+
+    return zombie;
+}
+
+// Move every child of `from` onto `to`'s children list in a single
+// splice, updating each child's ppid in-flight.  Used by the exit
+// paths (sys_exit + signal.c fatal kill) to reparent orphans to init.
+//
+// Only the dying task walks its own children list here, so the drain
+// is a plain load — no race with itself.  The publish onto `to` is
+// the canonical CAS-prepend via task_child_add_chain.
+void task_children_reparent(task_t* from, task_t* to) {
+    if (!from || !to || from == to) return;
+
+    task_t* chain = from->children;
+    from->children = NULL;
+    if (!chain) return;
+
+    task_t* head = NULL;
+    task_t* tail = NULL;
+    uint32_t new_ppid = to->pid;
+
+    task_t* c = chain;
+    while (c) {
+        task_t* next = c->child_next;
+        c->ppid = new_ppid;
+        c->child_next = head;
+        head = c;
+        if (!tail) tail = c;
+        c = next;
+    }
+
+    task_child_add_chain(to, head, tail);
 }
 
 // ── sched_tick ────────────────────────────────────────────────────────────
@@ -1140,88 +1288,6 @@ task_t* sched_reap_zombie(uint32_t pid) {
         spin_unlock_irqrestore(&c->rq_lock, flags);
     }
     return NULL;
-}
-
-// Remove and return a zombie that is a child of parent_pid.  O(1) when
-// target_pid != 0; O(children) when target_pid == 0 (walk parent's
-// children list — typically very small).
-task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    if (target_pid != 0) {
-        // O(1): look up the specific pid, verify parent + zombie state.
-        task_t* z = pid_ht_find(target_pid);
-        if (!z || z->state != TASK_ZOMBIE || z->ppid != parent_pid)
-            return NULL;
-        if (!zombie_unlink(z)) return NULL;
-        return z;
-    }
-    // target_pid == 0: find ANY zombie child of parent_pid.  Walk the
-    // parent's own children list (maintained as task_t.children /
-    // child_next) rather than the per-CPU zombie lists — children is
-    // typically tiny and it keeps us away from cross-CPU walks.
-    task_t* parent = pid_ht_find(parent_pid);
-    if (!parent) return NULL;
-    for (task_t* c = parent->children; c; c = c->child_next) {
-        if (c->state == TASK_ZOMBIE) {
-            if (zombie_unlink(c)) return c;
-        }
-    }
-    return NULL;
-}
-
-// Check if any zombie child of parent_pid exists (non-blocking poll).
-// O(1) when target_pid != 0; O(children) otherwise.
-uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid) {
-    if (target_pid != 0) {
-        task_t* z = pid_ht_find(target_pid);
-        return (z && z->state == TASK_ZOMBIE && z->ppid == parent_pid) ? 1 : 0;
-    }
-    task_t* parent = pid_ht_find(parent_pid);
-    if (!parent) return 0;
-    for (task_t* c = parent->children; c; c = c->child_next)
-        if (c->state == TASK_ZOMBIE) return 1;
-    return 0;
-}
-
-// ── sched_wait_pid ────────────────────────────────────────────────────────
-
-// Returns 1 if a matching zombie was found OR the specific pid is
-// gone from the system entirely; 0 if it's still alive and we should
-// keep waiting.
-//
-// pid != 0: O(1) per retry via pid_ht_find.
-// pid == 0: O(children) per retry (walk parent's children list).
-uint8_t sched_wait_pid(uint32_t pid) {
-    for (;;) {
-        if (pid != 0) {
-            // O(1): look up the specific pid.  If it's gone, waitpid
-            // returns "reaped"; if it's a zombie, waitpid will reap it
-            // via sched_reap_*; otherwise keep waiting.
-            task_t* t = pid_ht_find(pid);
-            if (!t) return 1;                 // fully gone already
-            if (t->state == TASK_ZOMBIE) return 1;
-        } else {
-            // "any child" — check the current task's children list.
-            if (g_current) {
-                for (task_t* c = g_current->children; c; c = c->child_next)
-                    if (c->state == TASK_ZOMBIE) return 1;
-                if (!g_current->children) return 1; // no children at all
-            }
-        }
-        sched_yield();
-    }
-}
-
-// Non-blocking variant.  O(1) when pid != 0.
-uint8_t sched_poll_pid(uint32_t pid) {
-    if (pid != 0) {
-        task_t* t = pid_ht_find(pid);
-        return (t && t->state == TASK_ZOMBIE) ? 1 : 0;
-    }
-    // pid == 0: check the current task's children list for any zombie.
-    if (!g_current) return 0;
-    for (task_t* c = g_current->children; c; c = c->child_next)
-        if (c->state == TASK_ZOMBIE) return 1;
-    return 0;
 }
 
 // ── sched_for_each ────────────────────────────────────────────────────────
