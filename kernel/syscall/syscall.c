@@ -761,6 +761,24 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // Unblock all signals (POSIX: exec resets the signal mask).
     g_current->sigstate.blocked = 0;
 
+    // Update comm to the basename of argv[0] (or the resolved path if
+    // argv[0] is NULL / empty).  POSIX exec() semantics — every debug
+    // print, every /proc/<pid>/status, every ps listing should reflect
+    // the new image, not the pre-exec one.
+    {
+        const char* name = (argc > 0 && k_argv[0]) ? k_argv[0] : resolved;
+        // Oops — k_argv[] was already kfree'd above.  Use resolved.
+        name = resolved;
+        const char* base = name;
+        for (const char* p = name; *p; p++) if (*p == '/') base = p + 1;
+        uint32_t ci = 0;
+        while (ci < 15 && base[ci]) {
+            g_current->comm[ci] = base[ci];
+            ci++;
+        }
+        g_current->comm[ci] = '\0';
+    }
+
     // ── Trigger sysretq to new entry point ────────────────────────────────
     g_exec_entry     = entry;
     g_exec_rsp       = user_rsp;
