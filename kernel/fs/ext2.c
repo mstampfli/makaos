@@ -4,6 +4,7 @@
 #include "common.h"
 #include "smp.h"
 #include "seqlock.h"
+#include "rcu.h"
 
 // ── Multi-task / SMP-safe scratch buffers ───────────────────────────────
 // Function-local 4 KiB scratch buffers cannot live in BSS (would race
@@ -893,8 +894,8 @@ static int64_t ext2_vfs_seek(vfs_file_t* self, int64_t offset, int whence) {
 }
 
 static void ext2_vfs_close(vfs_file_t* self) {
-    if (self->ctx) kfree(self->ctx);
-    kfree(self);
+    if (self->ctx) kfree_rcu(self->ctx);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 }
 
 // ── ext2_open ──────────────────────────────────────────────────────────────

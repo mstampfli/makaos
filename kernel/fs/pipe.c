@@ -6,6 +6,7 @@
 #include "errno.h"
 #include "common.h"
 #include "wait.h"
+#include "rcu.h"
 
 // ── Pipe VFS callbacks ────────────────────────────────────────────────────
 
@@ -137,8 +138,11 @@ static void pipe_read_close(vfs_file_t* self) {
     if (p->reader_refs == 0 && p->write_file) {
         wait_queue_wake_all(p->write_file->waitq);
     }
-    if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
-    kfree(self);
+    // Defer both frees — the vfs_file_t has an embedded _waitq that
+    // may still be held by a concurrent wait_queue_wake_all drainer
+    // on another CPU.  kfree_rcu waits out any in-flight RCU reader.
+    if (p->reader_refs == 0 && p->writer_refs == 0) kfree_rcu(p);
+    kfree_rcu(self);
 }
 
 static void pipe_write_close(vfs_file_t* self) {
@@ -148,8 +152,8 @@ static void pipe_write_close(vfs_file_t* self) {
     if (p->writer_refs == 0 && p->read_file) {
         wait_queue_wake_all(p->read_file->waitq);
     }
-    if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
-    kfree(self);
+    if (p->reader_refs == 0 && p->writer_refs == 0) kfree_rcu(p);
+    kfree_rcu(self);
 }
 
 // poll: check readiness without blocking.

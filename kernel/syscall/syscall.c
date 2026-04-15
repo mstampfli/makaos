@@ -3464,6 +3464,29 @@ static void epoll_watch_unregister(epoll_watch_t* w, vfs_file_t* f) {
     w->has_entry2 = 0;
 }
 
+// RCU free helper for epoll_watch_t.  An epoll_watch_t's entry/entry2
+// may be in a wait_queue_t chain that a concurrent wait_queue_wake_all
+// on another CPU is currently walking as an RCU reader.  Plain kfree
+// right after unregister is a use-after-free in that window.
+// call_rcu defers the real kfree until every concurrent drainer has
+// completed its RCU reader section.  See kernel/wait.c commentary.
+static void epoll_watch_free_rcu(void* data) {
+    kfree(data);
+}
+
+// RCU free helper for epoll_state_t (closing epoll fd).  The state is
+// referenced by every epoll_we_t as `ewe->p_has_ready = &state->has_ready`
+// and `ewe->epoll_wq = &state->wq`.  A concurrent wait_queue_wake_all
+// draining a watched fd's waitq may be running epoll_wake_func on an
+// entry that points into state — we must not free state until every
+// such drainer has finished.  Same RCU grace period that covers the
+// epoll_watch_t frees also covers state.
+static void epoll_state_free_rcu(void* data) {
+    epoll_state_t* state = (epoll_state_t*)data;
+    kfree(state->slots);
+    kfree(state);
+}
+
 // VFS ops for the epoll fd itself.
 static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
@@ -3484,10 +3507,12 @@ static void epoll_close(vfs_file_t* self) {
             vfs_file_t* f = (files && (uint32_t)w->fd < files->ft->cap)
                             ? files->ft->fd_table[w->fd] : NULL;
             epoll_watch_unregister(w, f);
-            kfree(w);
+            call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
         }
-        kfree(state->slots);
-        kfree(state);
+        // Defer state free too — epoll_we_t entries in watched-fd waitqs
+        // still point into state->wq / state->has_ready until the
+        // grace period elapses.  Same grace period as the watches above.
+        call_rcu(epoll_state_free_rcu, state);
     }
     kfree(self);
 }
@@ -3587,7 +3612,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         epoll_watch_unregister(w, wf);
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
-        kfree(w);
+        call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
         serial_puts_dbg("[epoll] DEL fd=");
         serial_hex_dbg((uint64_t)(uint32_t)tfd);
         ret = 0;
