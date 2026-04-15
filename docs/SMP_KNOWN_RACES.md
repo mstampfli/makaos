@@ -272,6 +272,72 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
+## 15. ext2 metadata scratch is kmalloc-per-call — DEFERRED OPT
+
+- **Location:** `kernel/fs/ext2.c` — every metadata helper that needs a
+  4 KiB scratch buffer (read_bgd, write_bgd, inode_load, write_inode,
+  free_block, free_inode_num, alloc_block, alloc_inode, dir_*) does
+  `kmalloc(4096)` via `EXT2_SCRATCH_ALLOC`.
+- **Cost today:** ~10–20 ns per metadata op for the slab pop.  Invisible
+  next to a typical ms-scale ahci_read on a cache miss; on a bcache
+  hit it's wasted because the scratch is never written.
+- **Fix plan:** once Phase 4-proper lands per-CPU magazines / per-CPU
+  scratch slots, change `EXT2_SCRATCH_ALLOC` to point at
+  `this_cpu()->ext2_scratch` instead of going through kmalloc.  Zero
+  alloc cost and all existing call sites get the speedup for free
+  because they already use the macro.
+- **Why deferred:** the bottleneck won't show up until APs are running
+  and ext2 is hot.  We measure first, then optimise.  Phase 4-proper
+  is itself deferred until post-Phase 9, so this rides on its coat-tails.
+- **Not a Phase 9 blocker.**
+
+---
+
+## 14. ext2 superblock free-counter writeback — DEFERRED
+
+- **Location:** `kernel/fs/ext2.c` — superblock `s_free_blocks_count` /
+  `s_free_inodes_count` and the matching BGD per-group counters.
+- **Status today:** the kernel reads the superblock at mount and never
+  writes it back.  We update the in-memory BGD counters under the
+  per-group lock (Phase 8C-2) but the on-disk superblock totals stay
+  stale until next mount, which `fsck` would flag.
+- **Why deferred:** correct mount/unmount + free-counter writeback is
+  its own small project (sync points, ordering, crash safety) and is
+  orthogonal to the SMP-safety work Phase 8 is about.  No ongoing
+  in-memory race exists — readers just see slightly stale counts.
+- **Fix phase:** later, post-Phase 9.  Track here so we don't forget.
+
+---
+
+## 16. ext2 metadata mutation — RESOLVED (Phase 8C)
+
+- **Fix:** every per-inode RMW (write_inode tail in vfs_write, mkdir,
+  unlink, rename, ext2_write_file overwrite/create) now goes through
+  `inode_lock(ino)` → mutate `leaf->inode` → `inode_writeback(leaf)` →
+  `inode_unlock(leaf)`.  The leaf carries a per-inode seqlock so
+  readers (`irtree_get`) take zero atomics on a consistent snapshot
+  and writers serialise per inode without contending across inodes.
+- **dir_add_entry / dir_remove_entry** hold the parent directory's
+  inode lock across the whole dirent walk so concurrent dirent
+  mutations on the same directory cannot tear the rec_len chain.
+- **alloc_inode / alloc_block / free_block / free_inode_num** now hold
+  a per-block-group spinlock from a `s_group_locks[]` array allocated
+  at mount time.  Two CPUs allocating in different groups never
+  contend; two CPUs allocating in the same group serialise on that
+  one group's lock.  The mkdir `bg_used_dirs_count++` update also
+  takes the per-group lock.
+- **ext2_rename** is wrapped in a single global `s_rename_lock`
+  spinlock for the whole operation — same approach as Linux's
+  per-superblock `s_vfs_rename_mutex`.  Rename is rare and avoiding
+  the dual-parent lock-ordering complexity is worth a single
+  uncontended spinlock acquire on the rename hot path.
+- **Static `s_blk_buf` / `s_blk_buf2`** are gone — they were a latent
+  SMP corruption vector (multiple CPUs writing the same 4 KiB BSS
+  scratch).  Replaced with per-call `EXT2_SCRATCH` (kmalloc with the
+  `__cleanup__` attribute auto-freeing on scope exit).
+
+---
+
 ## Exit criteria for Phase 9
 
 Phase 9 (AP boot) cannot land until **every entry above** is resolved
@@ -281,7 +347,11 @@ or explicitly waived with justification.  Each phase takes a slice:
 - Phase 5 resolves entries **2, 4, 5, 13**
 - Phase 6 resolves entries **3, 6, 10, 12**
 - Phase 7 resolves entry **9**
-- Phase 8 resolves entries **7, 8, 12 (task lifecycle)**
+- Phase 8A/8B resolve entries **7, 8, 12 (task lifecycle)**
+- Phase 8C resolves entry **16** (ext2 metadata)
+- **14 (superblock writeback) and 15 (ext2 scratch per-CPU) are
+  explicitly deferred** with the rationale above and are not Phase 9
+  blockers.
 
-After Phase 8 finishes, re-audit this file.  Any entry still open is a
-blocker for Phase 9.
+After Phase 8C the only open entries are 14 and 15, both deferred
+post-Phase 9.
