@@ -519,12 +519,13 @@ static uint64_t sys_exit(uint64_t code) {
 
         // Wake parent and deliver SIGCHLD so it can reap background jobs.
         // Skip zombie parents (they can't handle anything any more).
+        // signal_send unconditionally calls sched_wake under the target
+        // rq_lock, so the racy "if state == TASK_SLEEPING" check that
+        // used to gate the second sched_wake call is gone — it was an
+        // SMP lost-wakeup waiting to happen.
         task_t* parent = sched_find_pid(g_current->ppid);
-        if (parent && parent->state != TASK_ZOMBIE) {
+        if (parent && parent->state != TASK_ZOMBIE)
             signal_send(parent, SIGCHLD);
-            if (parent->state == TASK_SLEEPING)
-                sched_wake(parent);
-        }
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");

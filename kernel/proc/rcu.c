@@ -63,10 +63,24 @@ void synchronize_rcu(void) {
     for (unsigned i = 0; i < n; i++) {
         if (i == cpu_id()) continue;  // already handled above
         while (atomic_load_relaxed(&g_cpus[i].rcu_qs_count) == snap[i]) {
-            // Yield so our own CPU can make forward progress and also
-            // so the target CPU has a chance to run.  On UP (num_cpus==1)
-            // this loop never executes.
-            sched_yield();
+            // Busy-wait with pause.  We deliberately do NOT sched_yield
+            // here: sched_yield on an otherwise-idle CPU drops into
+            // do_switch's sti/hlt loop and never returns, so the while
+            // predicate is never re-checked and this thread hangs
+            // forever waiting for a counter it can't observe.
+            //
+            // cpu_relax() is the correct primitive: it's a single
+            // `pause` that tells the CPU we're in a spin loop (so
+            // store-buffer ordering and SMT co-scheduling can react),
+            // and it lets timer IRQs and IPIs continue firing on this
+            // CPU — so our own preempt check, sched_tick, and any
+            // cross-CPU wake can still make progress.
+            //
+            // The target CPU will advance its counter via its own
+            // timer tick (sched_preempt → do_switch → rcu_note_qs),
+            // a context switch, or its idle loop — none of which
+            // depend on us yielding.  So we just spin and watch.
+            cpu_relax();
         }
     }
 

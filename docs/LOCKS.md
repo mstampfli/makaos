@@ -156,6 +156,54 @@ locked. The cross-CPU wake path is a simple lock-on-target pattern.
 
 ---
 
+## `g_fb_lock` — `kernel/drivers/video/fb.c`
+
+**Guards:** `fb_term_putc` / `fb_term_write` serialization across CPUs.
+Protects `g_fb_col`, `g_fb_row`, the framebuffer scroll memcpy, and
+the per-cell pixel writes that back `fb_putc_at`.
+
+**Added:** Phase 9-5 (SMP bring-up).
+
+**Why a lock here:**
+- Pre-SMP, `fb_term_putc` wrapped its body in `preempt_disable` /
+  `preempt_enable`. On UP that's sufficient because only one CPU can
+  be executing any kernel code at a time. Under SMP it's useless:
+  preempt_disable only blocks the LOCAL CPU from switching tasks; it
+  has zero effect on a remote CPU calling `fb_term_putc` concurrently.
+- Observed symptom before the fix (`-smp 4`, round-robin placement):
+  user-visible bash prompts would render on some boots and not on
+  others, depending on whether another CPU happened to be mid-scroll
+  or mid-character-write when bash's prompt hit the code path. Cursor
+  coordinates tore, scroll memcpy ran concurrently with character
+  writes, and whole character cells vanished.
+- Lock-free alternatives considered and rejected:
+  - **Per-CPU fb buffers with a merge kthread**: adds latency, breaks
+    the "any printk comes out instantly" panic-path invariant.
+  - **Seqlock on g_fb_col/row**: doesn't cover the pixel memory that
+    `fb_putc_at` and `fb_term_scroll` write. Readers don't exist —
+    this is all writer contention — so seqlock is the wrong primitive.
+  - **Ring of "draw commands" consumed by one CPU**: serialises worse
+    than just taking the lock, and complicates the panic path.
+
+**IRQ-safety:** `spin_lock_irqsave` / `spin_unlock_irqrestore`. The
+panic-print path inside `#PF` / `#GP` / `#UD` exception handlers calls
+`fb_term_putc` from IRQ/trap context — a plain `spin_lock` could
+deadlock if the holder gets interrupted by a fault that also tries to
+print.
+
+**Critical section contents:** one character's worth of
+`fb_term_putc_locked`: a few field reads/writes on `g_fb_col/row`,
+one call to `fb_putc_at` (which writes 8×16 pixels), and on wrap or
+`\n` maybe a `fb_term_scroll` (a `rep movsb`-sized memcpy + a
+final-row clear). No sleeps, no allocations, no cross-CPU reads.
+
+**Call-site granularity:** the batched writer `fb_term_write` takes
+the lock **once** for the whole buffer, not per-byte. bash writing a
+4 KiB line takes the lock once (4 KiB `fb_term_putc_locked` loop),
+not 4 096 times. This is the hot path.
+
+---
+
 ## Planned locks (not yet added — for Phase 3–8)
 
 Each entry will be added as the phase lands, with the same justification
@@ -308,7 +356,7 @@ user-page fault never happens with a spinlock held.
 | 6 | 8 writer-only (arp / udp / unix-ns / shmem-ns / tcp-pcb / 3×task_idx) + 1 epoll-per-fd | ~11 |
 | 7 | 0 (seqlocks) | ~11 |
 | 8 | per-object mutexes (not global) | ~11 + per-object |
-| 9 | 0 | ~11 |
+| 9 | 1 (g_fb_lock — Phase 9-5 SMP bring-up) | ~12 |
 
 After Phase 4 proper lands (post-SMP, per-CPU magazines), g_pmm_lock
 collapses to a rarely-taken depot lock and doesn't change the total

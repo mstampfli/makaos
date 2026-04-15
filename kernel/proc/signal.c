@@ -39,9 +39,19 @@ void signal_send(task_t* t, int sig) {
     // Set the pending bit atomically.  Coalesces repeat sends (classic POSIX).
     atomic_or(&t->sigstate.pending, bit);
 
-    // Wake the task if sleeping.
-    if (t->state == TASK_SLEEPING)
-        sched_wake(t);
+    // Always go through sched_wake.  The previous "if (t->state ==
+    // TASK_SLEEPING) sched_wake(t)" optimisation is a lost-wakeup bug
+    // under SMP: between the sender's racy state read and the sleeper
+    // actually parking itself in the sleep list, the sleeper's state
+    // transitions RUNNING→SLEEPING, and the sender — having observed
+    // RUNNING — skips the wake entirely.  The sleeper then enters
+    // sched_sleep, sees wake_pending==0 (sched_wake was never called),
+    // and sleeps forever.
+    //
+    // sched_wake handles the state check under the target's rq_lock
+    // and falls back to wake_pending for any racy not-yet-SLEEPING
+    // case, so it is always safe and cheap to call.
+    sched_wake(t);
 }
 
 // ── signal_send_group ─────────────────────────────────────────────────────
@@ -192,10 +202,16 @@ void signal_deliver_pending(void) {
     g_current->state = TASK_ZOMBIE;
     sched_add_zombie(g_current);
 
-    // Wake parent if it's sleeping in sys_wait.
+    // Notify the parent — exactly the same path sys_exit takes.  This
+    // was previously only `sched_wake(parent)` and only when state was
+    // SLEEPING, which dropped SIGCHLD entirely AND was a textbook
+    // lost-wakeup race.  Mirror sys_exit: signal_send sets the pending
+    // bit (so sys_wait's signal-driven retry runs) AND unconditionally
+    // calls sched_wake under the target's rq_lock, which handles every
+    // RUNNING/SLEEPING/in-flight transition correctly.
     task_t* parent = sched_find_pid(g_current->ppid);
-    if (parent && parent->state == TASK_SLEEPING)
-        sched_wake(parent);
+    if (parent && parent->state != TASK_ZOMBIE)
+        signal_send(parent, SIGCHLD);
 
     sched_yield();
     for (;;) __asm__ volatile("hlt");

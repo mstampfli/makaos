@@ -1,6 +1,7 @@
 #include "fb.h"
 #include "font.h"
 #include "preempt.h"
+#include "smp.h"
 #include "common.h"
 
 fb_info_t g_fb = {0};
@@ -9,6 +10,20 @@ uint32_t g_fb_col = 0;
 uint32_t g_fb_row = 0;
 uint32_t g_fb_fg  = 0x00FFFFFF; /* white */
 uint32_t g_fb_bg  = 0x00000000; /* black */
+
+// ── fb_term SMP serialization ────────────────────────────────────────────
+// preempt_disable is enough on UP (only one CPU, no concurrency at all)
+// but useless on SMP — two CPUs in fb_term_putc at the same moment both
+// see `g_fb_col/row` and the pixel buffer, racing on every read and
+// overwriting each other's character cells, stomping the scroll memcpy
+// in the middle, etc.  Observed under -smp 4: bash would print a prompt
+// that visibly rendered on some boots and not on others, depending on
+// whether another CPU happened to be in fb_term during the write.
+//
+// Use an IRQ-safe spinlock — fb_term_putc is called from the panic path
+// inside interrupt handlers (#GP / page fault prints), so we can't let a
+// holder get preempted by an IRQ that then tries to retake the same lock.
+static spinlock_t g_fb_lock = SPINLOCK_INIT;
 
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
     g_fb.base_virt = fb_phys + HHDM_OFFSET;
@@ -139,26 +154,23 @@ static inline void fb_term_putc_locked(char c) {
 }
 
 void fb_term_putc(char c) {
-    // Serialize against preemption: two tasks writing to the console
-    // concurrently would race on g_fb_row/col AND on framebuffer pixels
-    // (especially during scroll, which touches the whole screen).
-    // Holding preempt off across one character is cheap and guarantees
-    // clean output.
-    preempt_disable();
+    // IRQ-safe spinlock: serialises fb_term across CPUs AND across the
+    // panic path that runs inside IRQ handlers (#PF, #GP).  preempt_disable
+    // alone is not enough — it only blocks the LOCAL CPU from switching
+    // tasks, it has no effect on a remote CPU writing the same pixels.
+    uint64_t flags = spin_lock_irqsave(&g_fb_lock);
     fb_term_putc_locked(c);
-    preempt_enable();
+    spin_unlock_irqrestore(&g_fb_lock, flags);
 }
 
-// Batched writer: take preempt_disable once for the whole user buffer
+// Batched writer: take the fb lock once for the whole user buffer
 // instead of once per byte.  This is the hot path for tty0 writes from
 // bash / ps / login, where `write(1, buf, len)` would otherwise fire
-// `len` preempt_disable/enable cycles and `len` checks of
-// reschedule_pending — on a long output line that's thousands of
-// unnecessary scheduler round-trips.
+// `len` lock/unlock cycles.
 void fb_term_write(const char* buf, uint64_t len) {
     if (!buf || !len) return;
-    preempt_disable();
+    uint64_t flags = spin_lock_irqsave(&g_fb_lock);
     for (uint64_t i = 0; i < len; i++)
         fb_term_putc_locked(buf[i]);
-    preempt_enable();
+    spin_unlock_irqrestore(&g_fb_lock, flags);
 }

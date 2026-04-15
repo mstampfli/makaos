@@ -28,6 +28,9 @@ extern mouse_irq_handler
 extern ahci_irq_handler
 extern hda_irq_handler
 extern virtio_net_irq_handler
+extern ipi_reschedule_handler
+extern ipi_call_handler
+extern ipi_tlb_flush_handler
 extern lapic_eoi          ; void lapic_eoi(void) — writes 0 to LAPIC EOI reg
 
 
@@ -137,5 +140,52 @@ virtio_net_irq_entry:
 ; spurious interrupt — just return.
 global lapic_spurious_entry
 lapic_spurious_entry:
+    iretq
+
+; ── VEC_IPI_RESCHEDULE (0x40) ────────────────────────────────────────────
+; Sent by sched_wake / sched_add when a runnable task has been placed on
+; this CPU's run queue by a remote CPU.  The handler sets
+; this_cpu()->reschedule_pending, then the tail of this stub calls
+; sched_preempt() which actually runs the context switch if we're at
+; a preemptible point (same pattern as timer_irq_handler).
+;
+; IMPORTANT: this stub may be entered while the victim CPU was sitting
+; in `sti; hlt` inside do_switch's idle loop.  That's the whole point —
+; the hlt wakes, the handler runs, sched_preempt picks up the new task,
+; we context-switch away from the idle caller.  The caller's saved RSP
+; (inside do_switch's prologue) gets restored on the way back, but by
+; the time we iret out we are on a completely different task's stack,
+; because do_switch's loop re-enters on the returned-to stack and then
+; its own spin_lock_irqsave+dequeue_local picks up the task.
+global ipi_reschedule_entry
+ipi_reschedule_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call ipi_reschedule_handler
+    POP_GPRS
+    iretq
+
+; ── VEC_IPI_CALL (0x42) ──────────────────────────────────────────────────
+; Generic cross-CPU function call: drain this CPU's MPSC call queue.
+; One wrmsr of sender → handler here → sender spins on per-call done flag.
+global ipi_call_entry
+ipi_call_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call ipi_call_handler
+    POP_GPRS
+    iretq
+
+; ── VEC_IPI_TLB_FLUSH (0x41) ─────────────────────────────────────────────
+; Phase 9-6 owns the real implementation; today this stub exists so a
+; stray fire doesn't land on the generic #GP path.  Handler drains the
+; CPU's shootdown slot and invlpg's the range (Phase 9-6).  For Phase
+; 9-5 the handler is an EOI-only no-op.
+global ipi_tlb_flush_entry
+ipi_tlb_flush_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call ipi_tlb_flush_handler
+    POP_GPRS
     iretq
 
