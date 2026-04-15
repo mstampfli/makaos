@@ -28,4 +28,25 @@ void asm_offsets(void);
 void asm_offsets(void) {
     DEFINE(CPU_TSS_RSP0,
            __builtin_offsetof(cpu_t, tss) + __builtin_offsetof(tss_t, rsp[0]));
+
+    // Per-CPU syscall / signal / exec scratch — see cpu_t commentary
+    // for the race this fixes.
+    DEFINE(CPU_SC_USER_RSP,    __builtin_offsetof(cpu_t, syscall_user_rsp));
+    DEFINE(CPU_SC_USER_RIP,    __builtin_offsetof(cpu_t, syscall_user_rip));
+    DEFINE(CPU_SC_USER_RFLAGS, __builtin_offsetof(cpu_t, syscall_user_rflags));
+    DEFINE(CPU_SC_USER_RBP,    __builtin_offsetof(cpu_t, syscall_user_rbp));
+    DEFINE(CPU_SC_USER_RBX,    __builtin_offsetof(cpu_t, syscall_user_rbx));
+    DEFINE(CPU_SC_USER_R12,    __builtin_offsetof(cpu_t, syscall_user_r12));
+    DEFINE(CPU_SC_USER_R13,    __builtin_offsetof(cpu_t, syscall_user_r13));
+    DEFINE(CPU_SC_USER_R14,    __builtin_offsetof(cpu_t, syscall_user_r14));
+    DEFINE(CPU_SC_USER_R15,    __builtin_offsetof(cpu_t, syscall_user_r15));
+    DEFINE(CPU_SC_ARG5,        __builtin_offsetof(cpu_t, syscall_arg5));
+    DEFINE(CPU_SC_ARG6,        __builtin_offsetof(cpu_t, syscall_arg6));
+    DEFINE(CPU_SIG_DELIVER,    __builtin_offsetof(cpu_t, signal_deliver));
+    DEFINE(CPU_SIG_IN_SYSCALL, __builtin_offsetof(cpu_t, signal_in_syscall));
+    DEFINE(CPU_SIG_RDI,        __builtin_offsetof(cpu_t, signal_rdi));
+    DEFINE(CPU_EXEC_REQUESTED, __builtin_offsetof(cpu_t, exec_requested));
+    DEFINE(CPU_EXEC_ENTRY,     __builtin_offsetof(cpu_t, exec_entry));
+    DEFINE(CPU_EXEC_RSP,       __builtin_offsetof(cpu_t, exec_rsp));
+    DEFINE(CPU_EXEC_PML4,      __builtin_offsetof(cpu_t, exec_pml4));
 }

@@ -1,27 +1,27 @@
 #include "signal.h"
 #include "process.h"
 #include "sched.h"
+#include "cpu.h"
 #include "common.h"
 #include "fb.h"
 
-// ── Globals from syscall.c ────────────────────────────────────────────────
-// These are set here to redirect the syscall return path to a signal handler.
-extern uint64_t g_syscall_user_rsp;
-extern uint64_t g_syscall_user_rip;
-extern uint64_t g_syscall_user_rflags;
-extern uint64_t g_syscall_user_rbp;
-extern uint64_t g_syscall_user_rbx;
-extern uint64_t g_syscall_user_r12;
-extern uint64_t g_syscall_user_r13;
-extern uint64_t g_syscall_user_r14;
-extern uint64_t g_syscall_user_r15;
-// Set to 1 (handler entry) or 2 (sigreturn restore) by signal/syscall code.
-extern uint8_t  g_signal_deliver;
-// rdi value to pass to the signal handler (the signal number).
-extern uint64_t g_signal_rdi;
-// Set to 1 by syscall_dispatch while calling signal_deliver_pending.
-// Allows signal_deliver_pending to know it's safe to set up user frames.
-extern uint8_t  g_signal_in_syscall;
+// ── Per-CPU syscall / signal scratch ─────────────────────────────────────
+// These used to be globals in syscall.c, but under SMP round-robin the
+// scratch data raced between concurrent syscalls on different CPUs.
+// They now live inside cpu_t (see kernel/include/cpu.h); signal.c
+// accesses them via this_cpu()->field aliases for readability.
+#define g_syscall_user_rsp    (this_cpu()->syscall_user_rsp)
+#define g_syscall_user_rip    (this_cpu()->syscall_user_rip)
+#define g_syscall_user_rflags (this_cpu()->syscall_user_rflags)
+#define g_syscall_user_rbp    (this_cpu()->syscall_user_rbp)
+#define g_syscall_user_rbx    (this_cpu()->syscall_user_rbx)
+#define g_syscall_user_r12    (this_cpu()->syscall_user_r12)
+#define g_syscall_user_r13    (this_cpu()->syscall_user_r13)
+#define g_syscall_user_r14    (this_cpu()->syscall_user_r14)
+#define g_syscall_user_r15    (this_cpu()->syscall_user_r15)
+#define g_signal_deliver      (this_cpu()->signal_deliver)
+#define g_signal_rdi          (this_cpu()->signal_rdi)
+#define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
 // ── signal_send ───────────────────────────────────────────────────────────
 // Atomically set the pending bit.  Cross-CPU senders never race with the
