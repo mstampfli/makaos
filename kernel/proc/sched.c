@@ -1014,6 +1014,37 @@ static void do_switch(uint8_t preempted) {
     cpu_rq_t* rq = &c->rq;
     task_t*   next;
 
+    // ── Deferred preemption for mid-exit tasks ──────────────────────────
+    //
+    // A preempted (timer-triggered) switch MUST NOT yank a task off its
+    // own kstack after sys_exit / signal.c has transitioned it to
+    // TASK_ZOMBIE or TASK_DEAD but before it has finished the exit
+    // unwinding (signal_send(parent, SIGCHLD), sched_yield).  If we let
+    // do_switch(1) context-switch away from such a task, its saved rsp
+    // points inside sys_exit, and because the task's state is already
+    // ZOMBIE it is never re-entered via any runqueue — the parent waits
+    // forever for a SIGCHLD that never gets sent, and the zombie never
+    // reaches the final hlt loop.  Observed in the wild during
+    // interactive bash under pty: a command's exit hangs when a timer
+    // tick arrives between `state = TASK_ZOMBIE` and `signal_send`.
+    //
+    // The fix: if preempted and cur is mid-exit, bail out of do_switch
+    // WITHOUT switching.  The exiting task will reach its own voluntary
+    // sched_yield (do_switch(0), preempted=0) within a handful of
+    // instructions and that path handles the zombie correctly (next =
+    // idle, cur not requeued, kstack left on zombie_head until reap).
+    // The deferred preempt is fine — reschedule_pending stays set, and
+    // the next tick picks it up after the voluntary switch.
+    task_t* cur_check = c->current;
+    if (preempted && cur_check != c->idle &&
+        (cur_check->state == TASK_ZOMBIE || cur_check->state == TASK_DEAD)) {
+        // Bump rcu qs — the task is at a non-RCU-reader point (it's
+        // running its own sys_exit tail), so the current CPU is
+        // quiescent even though we don't context-switch.
+        rcu_note_qs();
+        return;
+    }
+
     // Pick the next runnable task under the local rq_lock.  If nothing
     // is ready and this is a voluntary yield/sleep, halt until an IRQ
     // wakes something — releasing the lock across the hlt so wakers
