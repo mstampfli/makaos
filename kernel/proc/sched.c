@@ -930,6 +930,21 @@ void sched_tick(void) {
     cpu_t*    c  = this_cpu();
     cpu_rq_t* rq = &c->rq;
 
+    // ── Heartbeat — "this CPU is still ticking" ───────────────────────
+    // Print once per ~second per CPU so serial.txt shows whether a
+    // freeze is a real lost-wakeup (all CPUs parked in idle, heartbeats
+    // still flowing) or a kernel wedge (some CPU's heartbeat stops).
+    // Uses the locked serial_puts_dbg so SMP-safe.  Debug aid — flip
+    // the #define to 0 to silence.
+#define SCHED_TICK_HEARTBEAT 1
+#if SCHED_TICK_HEARTBEAT
+    c->sched_ticks++;
+    if ((c->sched_ticks & 0x3FF) == 0) {  // every 1024 ticks ≈ 1 sec at 1kHz
+        serial_puts_dbg("[hb] cpu");
+        serial_hex_dbg((uint64_t)c->id);
+    }
+#endif
+
     // ── Local-only work (no lock) ───────────────────────────────────────
     // Tick down the running task's quantum.
     if (c->current && c->current != c->idle) {
