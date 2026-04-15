@@ -6,6 +6,7 @@
 #include "signal.h"
 #include "tsc.h"
 #include "common.h"
+#include "rcu.h"
 
 // ── Per-client event ring buffer ──────────────────────────────────────────
 // Each open("/dev/input/event0") allocates one of these.
@@ -153,9 +154,9 @@ static void evdev_vfs_close(vfs_file_t* self) {
             if (*pp == c) { *pp = c->next; break; }
             pp = &(*pp)->next;
         }
-        kfree(c);
+        kfree_rcu(c);
     }
-    kfree(self);
+    kfree_rcu(self);  // vfs_file_t has embedded _waitq
 }
 
 // ── evdev_open ────────────────────────────────────────────────────────────

@@ -105,3 +105,12 @@ void call_rcu(rcu_func_t func, void* data) {
     synchronize_rcu();
     func(data);
 }
+
+// ── Deferred kfree — convenience wrapper ──────────────────────────────
+// Used by anything that frees heap memory which may still be
+// referenced by a concurrent RCU reader (wait_queue_t drainer,
+// pid_ht lookup, vma walker, etc.).  Bypasses the per-caller boilerplate
+// of writing a kfree trampoline every time.
+#include "kheap.h"
+static void kfree_rcu_cb(void* data) { kfree(data); }
+void kfree_rcu(void* ptr) { call_rcu(kfree_rcu_cb, ptr); }

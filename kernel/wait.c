@@ -1,5 +1,6 @@
 #include "wait.h"
 #include "sched.h"
+#include "rcu.h"
 
 // ── Wait queue — lock-free drain, lock-free push, locked remove ──────────
 //
@@ -58,7 +59,35 @@ void wq_remove(wait_queue_t* wq, wake_entry_t* we) {
 // Each live entry (dead==0) has its func invoked.  Entries returning
 // WQ_KEEP are re-pushed onto the queue.
 //
-// Zero locks.  The xchg is the only atomic op on the hot path.
+// Lifetime / RCU discipline:
+//
+//   A wait_queue_t entry may be owned by a heap-allocated struct (e.g.
+//   epoll_watch_t) that can be freed concurrently with a drain.  The
+//   classic use-after-free:
+//
+//     CPU A: wait_queue_wake_all(wq)
+//              xchg → private `chain` containing entry X
+//              walk...                                  (reads X->func)
+//     CPU B: close(fd) → wq_remove(wq, X) → kfree(X)
+//
+//   Between CPU A's xchg and the read of X->func, CPU B runs the
+//   close path and kfree's the memory backing X.  CPU A then reads
+//   garbage (or, with PMM_DEBUG_ALWAYS_ZERO, exact zeros) from X->func
+//   and calls it — kernel #PF on instruction fetch at 0.
+//
+//   Fix: the drain walk is an RCU reader section.  Every heap-backed
+//   wait-queue entry must be freed via call_rcu, not plain kfree, so
+//   that the actual free is deferred until after any concurrent
+//   drainer has completed.  Stack-allocated entries (task_we_t) don't
+//   need this — the owning thread can't return from its sleep until
+//   the drain has already called sched_wake on it, and the drain
+//   finishes its func call before letting go of the entry.
+//
+//   The hot path is still nearly lock-free: rcu_read_lock is a single
+//   pair of inc/dec on a per-CPU counter (no atomic ops on this CPU),
+//   and call_rcu is a single atomic push onto a per-CPU deferred list.
+//   We pay grace-period latency (~a few ticks) on the cold close path,
+//   which is fine.
 void wait_queue_wake_all(wait_queue_t* wq) {
     if (!wq) return;
 
@@ -68,6 +97,9 @@ void wait_queue_wake_all(wait_queue_t* wq) {
     // entries, which will be on the fresh chain, not this one).
     wake_entry_t* chain = __atomic_exchange_n(&wq->head, (wake_entry_t*)NULL,
                                                 __ATOMIC_ACQ_REL);
+    if (!chain) return;
+
+    rcu_read_lock();
 
     // Walk the detached chain.  next pointers are stable because we
     // own the chain now.
@@ -88,6 +120,8 @@ void wait_queue_wake_all(wait_queue_t* wq) {
         }
         chain = next;
     }
+
+    rcu_read_unlock();
 }
 
 // ── wait_queue_wake_one ──────────────────────────────────────────────────
@@ -103,6 +137,8 @@ void wait_queue_wake_one(wait_queue_t* wq) {
     wake_entry_t* chain = __atomic_exchange_n(&wq->head, (wake_entry_t*)NULL,
                                                 __ATOMIC_ACQ_REL);
     if (!chain) return;
+
+    rcu_read_lock();
 
     // Fire func on the first live entry.
     wake_entry_t* fired = NULL;
@@ -127,6 +163,8 @@ void wait_queue_wake_one(wait_queue_t* wq) {
         int keep = fired->func(fired);
         if (keep == WQ_KEEP) wq_add(wq, fired);
     }
+
+    rcu_read_unlock();
 }
 
 // ── wake callbacks ────────────────────────────────────────────────────────
