@@ -5,6 +5,9 @@
 #include "tss.h"
 #include "idt.h"
 #include "smp_boot.h"
+#include "sched.h"
+#include "process.h"
+#include "syscall.h"
 
 // ── Per-CPU slot array ───────────────────────────────────────────────────
 // MAX_CPUS slots in BSS.  Slot 0 is the bootstrap processor and is
@@ -135,63 +138,108 @@ unsigned num_cpus(void) { return g_num_cpus; }
 //
 // Order is the mirror image of the BSP's kmain sequence:
 //
-//   1. tss_init_ap(id)       — lgdt g_gdt + segment reload (clobbers GS)
-//                              + allocate IST stacks + LTR this CPU's TSS
-//   2. program GS_BASE        — this_cpu() is usable from now on
-//   3. idt_load_ap()          — lidt the shared kernel vector table
-//   4. lapic_init_ap()        — enable x2APIC on this CPU, reset LVT/SVR
-//   5. release bump to g_num_cpus (ATOMIC RELEASE) — the BSP's
+//   1. tss_init_ap(id)            — lgdt g_gdt + segment reload (clobbers GS)
+//                                    + allocate IST stacks + LTR this CPU's TSS
+//   2. program GS_BASE             — this_cpu() is usable from now on
+//   3. idt_load_ap()               — lidt the shared kernel vector table
+//   4. lapic_init_ap()             — enable x2APIC on this CPU, reset LVT/SVR
+//   5. sched_init_idle_for_cpu(id) — kmalloc+init this CPU's idle sentinel
+//                                    task and hang it off cpu_t.current
+//   6. lapic_timer_start(SCHED_HZ) — arm this CPU's own periodic LAPIC
+//                                    timer so sched_tick fires locally
+//   7. release bump to g_num_cpus (ATOMIC RELEASE) — the BSP's
 //      bring_up_one_ap spin exits after observing this, so every store
 //      we make above must be globally visible first.
-//   6. enter idle loop (`sti; hlt`).  Phase 9-5+ replaces this with the
-//      real scheduler idle — for now we just hand the CPU to the CPU,
-//      IRQs-off, so LAPIC timer interrupts don't hit an AP that the
-//      scheduler has never heard of.
+//   8. sched_yield() into the scheduler.  The AP's rq is empty so
+//      do_switch() drops into its sti;hlt idle loop, waking on every
+//      timer tick and every VEC_IPI_RESCHEDULE.  sched_tick + context
+//      switches advance rcu_qs_count through the normal path, so RCU
+//      grace periods complete without the Phase 9-4 pause-spinner.
 //
 // Never returns.
+#define SCHED_HZ 1000
 __attribute__((noreturn))
 void cpu_init_ap(uint32_t id) {
-    // Step 1: take over the GDT, allocate IST stacks, load our TR.
+    // Per-CPU feature MSRs + CR0/CR4 bits that the BSP sets in kmain
+    // early-init — none of these live in CR3 / GDT / IDT, so APs inherit
+    // NONE of them from the trampoline's mode switch and we must repeat
+    // the work here byte-for-byte.
+    //
+    // IA32_PAT (0x277): keep entry 1 as write-combining so user-mapped
+    // framebuffer pages benefit from WC aggregation on this CPU too.
+    // Mismatched PAT across CPUs would silently corrupt rendering.
+    {
+        uint32_t pat_lo = 0x00010406;
+        uint32_t pat_hi = 0x00070406;
+        __asm__ volatile("wrmsr" : : "a"(pat_lo), "d"(pat_hi), "c"(0x277U));
+    }
+
+    // CR0/CR4 — FPU/SSE enable.  Observed bug when this was missing:
+    // userland bash tripped #UD (→ SIGILL) on its first movaps/xorps
+    // because CR4.OSFXSR wasn't set, SSE was disabled on the AP, and
+    // the CPU treated every SSE opcode as invalid.  context_switch's
+    // fxrstor also silently no-ops without OSFXSR, so the incoming
+    // task's FPU state is whatever the AP happened to boot with.
+    {
+        uint64_t cr0, cr4;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~((uint64_t)(1u << 2));   // clear EM (x87 emulation off)
+        cr0 &= ~((uint64_t)(1u << 3));   // clear TS (no task-switch trap)
+        __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
+
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 9);              // OSFXSR:    enable FXSAVE/FXRSTOR + SSE
+        cr4 |= (1ULL << 10);             // OSXMMEXCPT: enable unmasked-SIMD-FP #XM
+        // SMEP — mirror the BSP's tss_init() setup so user pages can't be
+        // executed in kernel mode on any CPU.  Probe CPUID leaf 7 EBX[7]
+        // before writing; writing unsupported CR4 bits #GPs.
+        {
+            uint32_t ebx = 0;
+            __asm__ volatile(
+                "mov $7, %%eax\n\t"
+                "xor %%ecx, %%ecx\n\t"
+                "cpuid\n\t"
+                : "=b"(ebx) : : "eax", "ecx", "edx"
+            );
+            if (ebx & (1u << 7)) cr4 |= (1ULL << 20);
+        }
+        __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+    }
+
     tss_init_ap(id);
-
-    // Step 2: program GS_BASE so this_cpu() starts returning our slot.
-    //         cpu_slot_init already ran for every discovered CPU during
-    //         cpu_init_bsp, so &g_cpus[id] is a fully-formed cpu_t with
-    //         self=&g_cpus[id], id=id, apic_id=apic_id, zeroed rq, etc.
     wrmsr_u64(MSR_IA32_GS_BASE, (uint64_t)&g_cpus[id]);
-
-    // Step 3: install the shared IDT on this CPU.
     idt_load_ap();
-
-    // Step 4: bring up the LAPIC in x2APIC mode on this CPU.  Timer is
-    //         NOT started here; Phase 9-5 wires the AP into the
-    //         scheduler and starts its periodic tick.
     lapic_init_ap();
 
-    // Step 5: announce we're online.  RELEASE ordering pairs with the
-    //         BSP's acquire-load in bring_up_one_ap() — everything we
-    //         wrote above becomes visible before the counter bump.
+    // Per-CPU syscall MSRs: IA32_EFER.SCE, STAR, LSTAR, SFMASK.  These
+    // are the registers the `syscall` instruction consults to decide
+    // the target CS/SS, entry RIP, and RFLAGS mask.  All four are
+    // per-CPU MSRs — unset on an AP they'd leave `syscall` as an
+    // invalid opcode, which is exactly the #UD → SIGILL path bash
+    // hit on AP 1/2 before this call was added.
+    syscall_init();
+
+    // Per-CPU idle task — must exist before do_switch runs, because
+    // every path through do_switch references this_cpu()->idle to
+    // decide whether to re-enqueue the outgoing task.
+    sched_init_idle_for_cpu(id);
+
+    // Arm this CPU's LAPIC timer.  Vector VEC_LAPIC_TIMER is already
+    // in the shared IDT (BSP registered it in timer_init), so the
+    // first tick will land in irq0_entry → timer_irq_handler →
+    // sched_tick on THIS CPU, advancing its own rq quantum + rcu_qs.
+    lapic_timer_start(SCHED_HZ);
+
     __atomic_fetch_add(&g_num_cpus, 1u, __ATOMIC_RELEASE);
 
     serial_puts_dbg("[cpu_ap] online id=");
     serial_hex_dbg((uint64_t)id);
 
-    // Step 6: idle spin.  We CANNOT hlt here: IRQs are still off (the
-    //         scheduler hasn't installed per-CPU timer/IPI handlers for
-    //         APs yet — that's Phase 9-5), so a halted AP would never
-    //         wake, and — more importantly — its rcu_qs_count would
-    //         never advance.  synchronize_rcu() walks [0, g_num_cpus)
-    //         and waits on every CPU's qs counter; a stuck AP would
-    //         deadlock the first RCU writer the BSP reaches (e.g.
-    //         the fdtable/mm-VMA grace periods in the bash exec path).
-    //
-    //         Instead, spin with `pause` and bump rcu_qs_count every
-    //         iteration.  That keeps RCU grace periods completing at
-    //         line rate while we wait for Phase 9-5 to give this CPU
-    //         real work.  Not power-efficient; deliberately so — the
-    //         correct fix is a real idle task, not hlt-without-a-tick.
-    for (;;) {
-        __atomic_fetch_add(&this_cpu()->rcu_qs_count, 1, __ATOMIC_RELAXED);
-        __asm__ volatile("pause" ::: "memory");
-    }
+    // Hand off to the scheduler's idle loop.  We cannot use sched_yield
+    // here: this CPU's current == idle, so do_switch would do an
+    // identity context-switch-to-self and return straight back here —
+    // the AP would never actually run the idle body.  sched_enter_idle
+    // calls cpu_idle_loop directly so the AP starts executing
+    // sti/hlt/sched_yield forever on its own kstack.
+    sched_enter_idle();
 }

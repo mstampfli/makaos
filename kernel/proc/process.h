@@ -106,6 +106,28 @@ typedef struct __attribute__((aligned(16))) task_t {
 
     uint8_t       mlfq_level;
     uint8_t       mlfq_ticks_left;
+
+    // Wake pending flag — SMP lost-wakeup protection.
+    //
+    // The classic sleeper race on every wait loop:
+    //   CPU A:                    CPU B (waker):
+    //     check cond → 0
+    //                               set cond = 1
+    //                               sched_wake(sleeper)
+    //                                 sees state != SLEEPING → DROPS wake
+    //     sched_sleep → SLEEPING
+    //     ...forever
+    //
+    // Fix: sched_wake sets this flag under the target's rq_lock EVEN IF
+    // the target isn't yet in TASK_SLEEPING state.  sched_sleep then
+    // checks the flag under the same lock AFTER setting state=SLEEPING
+    // and bails out of the sleep if set (transitioning back to READY
+    // and returning immediately).  Guarantees every wake eventually
+    // takes effect, with exactly one lock per op.
+    //
+    // Owned by the task's home-CPU rq_lock; written by sched_wake,
+    // consumed by sched_sleep.
+    uint8_t       wake_pending;
     // preempt_depth moved to cpu_t (per-CPU, not per-task).  Preemption
     // is a property of the executing context, not of the task itself —
     // a non-running task can't be preempted.
