@@ -2,6 +2,9 @@
 #include "common.h"
 #include "acpi.h"
 #include "lapic.h"
+#include "tss.h"
+#include "idt.h"
+#include "smp_boot.h"
 
 // ── Per-CPU slot array ───────────────────────────────────────────────────
 // MAX_CPUS slots in BSS.  Slot 0 is the bootstrap processor and is
@@ -119,3 +122,76 @@ void cpu_init_bsp(void) {
 // because they depend on this_cpu() which needs the full cpu_t definition.
 unsigned cpu_id(void)   { return this_cpu_read_u32(id); }
 unsigned num_cpus(void) { return g_num_cpus; }
+
+// ── cpu_init_ap ──────────────────────────────────────────────────────────
+// The trampoline jumps here in 64-bit long mode with:
+//   - rdi = logical cpu_id (index into g_cpus[])
+//   - rsp = 16 KiB AP-private kernel stack (from kstack_alloc on the BSP)
+//   - IRQs off, CR3 = kernel PML4, SMEP/WP/NXE already on
+//
+// We must NOT touch this_cpu()/cpu_id()/preempt_disable until GS_BASE is
+// programmed — everything below is careful to use the `id` parameter or
+// g_cpus[id] directly until the MSR write completes.
+//
+// Order is the mirror image of the BSP's kmain sequence:
+//
+//   1. tss_init_ap(id)       — lgdt g_gdt + segment reload (clobbers GS)
+//                              + allocate IST stacks + LTR this CPU's TSS
+//   2. program GS_BASE        — this_cpu() is usable from now on
+//   3. idt_load_ap()          — lidt the shared kernel vector table
+//   4. lapic_init_ap()        — enable x2APIC on this CPU, reset LVT/SVR
+//   5. release bump to g_num_cpus (ATOMIC RELEASE) — the BSP's
+//      bring_up_one_ap spin exits after observing this, so every store
+//      we make above must be globally visible first.
+//   6. enter idle loop (`sti; hlt`).  Phase 9-5+ replaces this with the
+//      real scheduler idle — for now we just hand the CPU to the CPU,
+//      IRQs-off, so LAPIC timer interrupts don't hit an AP that the
+//      scheduler has never heard of.
+//
+// Never returns.
+__attribute__((noreturn))
+void cpu_init_ap(uint32_t id) {
+    // Step 1: take over the GDT, allocate IST stacks, load our TR.
+    tss_init_ap(id);
+
+    // Step 2: program GS_BASE so this_cpu() starts returning our slot.
+    //         cpu_slot_init already ran for every discovered CPU during
+    //         cpu_init_bsp, so &g_cpus[id] is a fully-formed cpu_t with
+    //         self=&g_cpus[id], id=id, apic_id=apic_id, zeroed rq, etc.
+    wrmsr_u64(MSR_IA32_GS_BASE, (uint64_t)&g_cpus[id]);
+
+    // Step 3: install the shared IDT on this CPU.
+    idt_load_ap();
+
+    // Step 4: bring up the LAPIC in x2APIC mode on this CPU.  Timer is
+    //         NOT started here; Phase 9-5 wires the AP into the
+    //         scheduler and starts its periodic tick.
+    lapic_init_ap();
+
+    // Step 5: announce we're online.  RELEASE ordering pairs with the
+    //         BSP's acquire-load in bring_up_one_ap() — everything we
+    //         wrote above becomes visible before the counter bump.
+    __atomic_fetch_add(&g_num_cpus, 1u, __ATOMIC_RELEASE);
+
+    serial_puts_dbg("[cpu_ap] online id=");
+    serial_hex_dbg((uint64_t)id);
+
+    // Step 6: idle spin.  We CANNOT hlt here: IRQs are still off (the
+    //         scheduler hasn't installed per-CPU timer/IPI handlers for
+    //         APs yet — that's Phase 9-5), so a halted AP would never
+    //         wake, and — more importantly — its rcu_qs_count would
+    //         never advance.  synchronize_rcu() walks [0, g_num_cpus)
+    //         and waits on every CPU's qs counter; a stuck AP would
+    //         deadlock the first RCU writer the BSP reaches (e.g.
+    //         the fdtable/mm-VMA grace periods in the bash exec path).
+    //
+    //         Instead, spin with `pause` and bump rcu_qs_count every
+    //         iteration.  That keeps RCU grace periods completing at
+    //         line rate while we wait for Phase 9-5 to give this CPU
+    //         real work.  Not power-efficient; deliberately so — the
+    //         correct fix is a real idle task, not hlt-without-a-tick.
+    for (;;) {
+        __atomic_fetch_add(&this_cpu()->rcu_qs_count, 1, __ATOMIC_RELAXED);
+        __asm__ volatile("pause" ::: "memory");
+    }
+}

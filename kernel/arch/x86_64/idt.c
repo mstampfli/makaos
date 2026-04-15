@@ -241,3 +241,10 @@ void idt_init(void) {
 void idt_irq_register(uint8_t vec, uint64_t handler_addr) {
     idt_gate_set(vec, handler_addr, KERNEL_CS, 0, IDT_ATTR_INTGATE);
 }
+
+// AP-side IDT load — the vector table itself is shared, so APs only need
+// to point IDTR at it.  Called from cpu_init_ap after the shared GDT is
+// installed; the BSP already ran idt_init() which populated idt[].
+void idt_load_ap(void) {
+    lidt(idt, sizeof(idt) - 1);
+}
