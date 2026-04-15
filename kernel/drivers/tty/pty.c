@@ -12,6 +12,39 @@
 #include "process.h"
 #include "signal.h"
 
+// ── PTY_TRACE: targeted serial trace of the pty / makaterm wake chain ───
+//
+// When enabled, every sleep and wake event in pty_master_write /
+// pty_slave_read / pty_master_read / pty_slave_write_buf emits a short
+// one-line trace to the serial port (via the locked serial_*_dbg
+// helpers).  Used to diagnose the "bash-in-makaterm frozen, no echo"
+// hang by showing exactly which link in the chain is silent:
+//
+//   keyboard → evdev → makadisplay → unix socket → makaterm →
+//   pty_master_write → tty_input_char → wake_all(pty->slave.waitq)
+//   → pty_slave_read (bash) returns with the input byte
+//
+// Flip to 0 for silent release builds.  Every trace is one serial
+// message, taking the g_serial_lock for the duration of a single
+// locked dump — bounded latency, SMP-safe.
+#define PTY_TRACE 1
+
+#if PTY_TRACE
+#  define PTT(tag) do { \
+        serial_puts_dbg("[pty-trace] " tag " pid="); \
+        serial_hex_dbg((uint64_t)(g_current ? g_current->pid : 0)); \
+    } while (0)
+#  define PTT1(tag, lbl, val) do { \
+        serial_puts_dbg("[pty-trace] " tag " pid="); \
+        serial_hex_dbg((uint64_t)(g_current ? g_current->pid : 0)); \
+        serial_puts_dbg("  " lbl "="); \
+        serial_hex_dbg((uint64_t)(val)); \
+    } while (0)
+#else
+#  define PTT(tag)              do { } while (0)
+#  define PTT1(tag, lbl, val)   do { } while (0)
+#endif
+
 // ── Live PTY list ───────────────────────────────────────────────────────
 // Singly-linked list of all PTYs that still have at least one fd open.
 // Each node is kmalloc'd in pty_alloc and freed when both master and all
@@ -72,6 +105,7 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
     // discipline echo which is at human keyboard rate.
     // Wake every waiter on the master queue — blocking readers
     // (task_we_t) and poll/epoll (epoll_we_t) share the same queue.
+    PTT1("slave_write_char.wake", "c", (uint64_t)c);
     wait_queue_wake_all(&pty->master_waitq);
 }
 
@@ -129,8 +163,10 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
         }
 
         // Wake the master reader so it can start draining.
-        if (pushed_any)
+        if (pushed_any) {
+            PTT1("slave_write_buf.wake_master", "pushed", i);
             wait_queue_wake_all(&pty->master_waitq);
+        }
 
         // Phase 2: if there's still data left, the ring is full — block
         // until the master drains some space.
@@ -175,6 +211,7 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     }
     // Block until data available.  Register a task_we_t on the
     // master's wait queue, then re-check — closes the lost-wakeup race.
+    PTT1("master_read.enter", "mb_empty", mb_empty(pty));
     for (;;) {
         if (!mb_empty(pty)) break;
         if (!pty->slave_open_count) return 0;  // EOF: slave closed
@@ -183,7 +220,9 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
         task_we_init(&node, g_current);
         task_we_add(&pty->master_waitq, &node);
         if (mb_empty(pty) && pty->slave_open_count) {
+            PTT("master_read.sleep");
             sched_sleep();
+            PTT("master_read.wake");
         }
         task_we_remove(&pty->master_waitq, &node);
 
@@ -200,6 +239,7 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     // Backpressure: if we drained anything, wake slave writers that
     // might be blocked waiting for ring space.
     if (got) wait_queue_wake_all(&pty->slave_drain_waitq);
+    PTT1("master_read.return", "got", got);
     return (int64_t)got;
 }
 
@@ -209,9 +249,12 @@ static int64_t pty_master_write(vfs_file_t* self, const void* buf, uint64_t len)
     pty_t* pty = ctx->pty;
     const uint8_t* src = (const uint8_t*)buf;
 
+    PTT1("master_write.enter", "len", len);
+
     for (uint64_t i = 0; i < len; i++) {
         tty_input_char(&pty->slave, (char)src[i]);
     }
+    PTT1("master_write.exit", "len", len);
     return (int64_t)len;
 }
 
@@ -279,19 +322,30 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (vmin == 0) vmin = 1;
 
     for (;;) {
-        if (tty->rd_head != tty->rd_tail) break;
-        if (!ctx->pty->master_open) return 0; // EOF
+        if (tty->rd_head != tty->rd_tail) {
+            PTT1("slave_read.wake.data", "head", tty->rd_head);
+            break;
+        }
+        if (!ctx->pty->master_open) {
+            PTT("slave_read.eof");
+            return 0; // EOF
+        }
 
         task_we_t node;
         task_we_init(&node, g_current);
         task_we_add(&tty->waitq, &node);
+        PTT1("slave_read.registered", "waitq", (uint64_t)&tty->waitq);
         if (tty->rd_head == tty->rd_tail && ctx->pty->master_open) {
+            PTT("slave_read.sleep");
             sched_sleep();
+            PTT("slave_read.wake");
         }
         task_we_remove(&tty->waitq, &node);
 
-        if (signal_has_actionable(&g_current->sigstate))
+        if (signal_has_actionable(&g_current->sigstate)) {
+            PTT("slave_read.eintr");
             return -4; // EINTR
+        }
     }
 
     while (got < len) {
@@ -303,6 +357,7 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (!(tty->termios.c_lflag & ICANON) && got >= vmin) break;
     }
 
+    PTT1("slave_read.return", "got", got);
     return (int64_t)got;
 }
 
