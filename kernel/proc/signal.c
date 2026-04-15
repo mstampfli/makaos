@@ -79,11 +79,33 @@ void signal_send_pgrp(uint32_t pgid, int sig) {
 // ── signal_setup_frame ────────────────────────────────────────────────────
 // Build a sigframe_t on the user's stack and redirect the syscall return to
 // the handler.  Only call this when g_signal_in_syscall == 1.
+//
+// ABI: x86-64 System V reserves a 128-byte "red zone" below the current
+// user rsp for leaf function scratch (locals, register spills).  When
+// the kernel delivers a signal, it MUST NOT clobber this area — POSIX
+// applies the same rule, and compilers emit code that stores important
+// data (including struct sigaction locals and saved register spills
+// from callers) in that region.  Skipping the red zone is a hard
+// requirement, not an optimisation.
+//
+// Pre-fix: this routine placed the sigframe at (user_rsp -
+// sizeof(sigframe_t)), writing directly into the red zone of both the
+// current leaf and any pending restore state in the caller's spill
+// slots.  The observed symptom was bash crashing at RIP=0 after a
+// `ret` from set_signal_handler, because the caller's red-zone spill
+// of its own return address (or the callee-saved register holding a
+// function pointer) was being overwritten with sigframe bytes during
+// SIGCHLD delivery on the sys_sigaction return path.  See the PF-KILL
+// dump in serial.txt: bash at 0x47b27f (set_signal_handler, right
+// after the sigaction syscall), RIP=0 ifetch fault, every gpr zero
+// except RCX which holds the post-syscall instruction pointer.
 static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     uint64_t user_rsp = g_syscall_user_rsp;
 
-    // Place sigframe below current RSP, 16-byte aligned.
-    uint64_t frame_base = (user_rsp - sizeof(sigframe_t)) & ~(uint64_t)0xF;
+    // Skip the 128-byte red zone, then place the sigframe below it,
+    // 16-byte aligned as required for stack-passed arguments.
+    uint64_t frame_base = (user_rsp - 128 - sizeof(sigframe_t))
+                            & ~(uint64_t)0xF;
     sigframe_t* frame = (sigframe_t*)frame_base;
 
     frame->rip    = g_syscall_user_rip;
