@@ -34,6 +34,7 @@ static void pty_free_locked(pty_t* pty) {
     }
     serial_puts_dbg("[pty] free idx=");
     serial_hex_dbg((uint64_t)(uint32_t)pty->index);
+    if (pty->master_buf) kfree(pty->master_buf);
     kfree(pty);
 }
 
@@ -64,10 +65,109 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
     if (!mb_full(pty)) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
+    } else {
+        // TRACER: ring full → char dropped.  Log the first N drops per
+        // second to tell us if the slowdown is actually a full ring.
+        static uint32_t s_drop_cnt = 0;
+        if ((s_drop_cnt++ & 0xFF) == 0) {
+            serial_puts_dbg("[trace] pty_drop cnt=");
+            serial_hex_dbg(s_drop_cnt);
+        }
     }
     // Wake every waiter on the master queue — blocking readers
     // (task_we_t) and poll/epoll (epoll_we_t) share the same queue.
     wait_queue_wake_all(&pty->master_waitq);
+}
+
+// Push one OPOST'd byte into the master ring.  Returns 1 on success,
+// 0 if the ring is full (caller must block or give up).
+static inline int pty_master_push_byte(pty_t* pty, uint8_t c) {
+    if (mb_full(pty)) return 0;
+    pty->master_buf[pty->m_head] = c;
+    pty->m_head = mb_next(pty->m_head);
+    return 1;
+}
+
+// Batched slave writer: push the whole buffer into the master ring in
+// one go, then fire ONE wake_all at the end instead of one per byte.
+// ONLCR translation happens here so the ring contains already-OPOST'd
+// bytes and the terminal emulator sees proper "\r\n" sequences.
+//
+// Backpressure: if the ring fills mid-write, the writer blocks on
+// pty->slave_drain_waitq until pty_master_read drains some space.
+// Linux does the same thing; it's how POSIX ptys achieve lossless
+// flow control without allocating an unbounded number of tty_buffer
+// chunks.  Wakes the master waitq once per batch chunk so the reader
+// can start draining before we've finished.
+static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
+    pty_t* pty = (pty_t*)tty;
+    if (!pty->master_open || !len) return;
+    // TRACER: log every 128th call with its length.
+    {
+        static uint32_t s_pty_wb_cnt = 0;
+        if ((s_pty_wb_cnt++ & 0x7F) == 0) {
+            serial_puts_dbg("[trace] pty_write_buf cnt=");
+            serial_hex_dbg(s_pty_wb_cnt);
+            serial_puts_dbg("[trace]   len=");
+            serial_hex_dbg(len);
+        }
+    }
+
+    int opost_onlcr = (tty->termios.c_oflag & OPOST) &&
+                      (tty->termios.c_oflag & ONLCR);
+
+    uint64_t i = 0;
+    while (i < len) {
+        // Phase 1: push as much as fits without blocking.
+        int pushed_any = 0;
+        while (i < len) {
+            uint8_t c = buf[i];
+            if (opost_onlcr && c == '\n') {
+                if (!pty_master_push_byte(pty, '\r')) break;
+                // Commit the '\r' before trying '\n'.  If '\n' fails we
+                // restart this char (still at i).
+                if (!pty_master_push_byte(pty, '\n')) {
+                    // Uncommit the '\r' we just wrote — walk the head
+                    // back.  No reader can have consumed it yet because
+                    // we haven't fired wake_all.
+                    pty->m_head = (pty->m_head - 1) & (PTY_MASTER_BUF - 1);
+                    break;
+                }
+                i++;
+                pushed_any = 1;
+                continue;
+            }
+            if (!pty_master_push_byte(pty, c)) break;
+            i++;
+            pushed_any = 1;
+        }
+
+        // Wake the master reader so it can start draining.
+        if (pushed_any)
+            wait_queue_wake_all(&pty->master_waitq);
+
+        // Phase 2: if there's still data left, the ring is full — block
+        // until the master drains some space.
+        if (i < len) {
+            // Master might have gone away during our wait.
+            if (!pty->master_open) break;
+
+            task_we_t node;
+            task_we_init(&node, g_current);
+            task_we_add(&pty->slave_drain_waitq, &node);
+            // Re-check under the registration to close the lost-wakeup
+            // window.  If the ring drained between phase 1's last push
+            // and the task_we_add above, pty_master_read already fired
+            // a wake, which would have found no waiters — so without the
+            // recheck we'd sleep forever.
+            if (mb_full(pty) && pty->master_open)
+                sched_sleep();
+            task_we_remove(&pty->slave_drain_waitq, &node);
+
+            // Master closed while we slept — bail out.
+            if (!pty->master_open) break;
+        }
+    }
 }
 
 // ── Master fd VFS operations ─────────────────────────────────────────────
@@ -111,6 +211,9 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
         out[got++] = pty->master_buf[pty->m_tail];
         pty->m_tail = mb_next(pty->m_tail);
     }
+    // Backpressure: if we drained anything, wake slave writers that
+    // might be blocked waiting for ring space.
+    if (got) wait_queue_wake_all(&pty->slave_drain_waitq);
     return (int64_t)got;
 }
 
@@ -147,6 +250,9 @@ static void pty_master_close(vfs_file_t* self) {
     // sleep on slave.waitq, poll/epoll waiters too — one wake_all
     // fires both.
     wait_queue_wake_all(&pty->slave.waitq);
+    // Also wake any slave writer blocked on a full ring — they'll
+    // notice master_open == 0 and bail out.
+    wait_queue_wake_all(&pty->slave_drain_waitq);
 
     kfree(ctx);
     kfree(self);
@@ -227,6 +333,14 @@ static int64_t pty_slave_write(vfs_file_t* self, const void* buf, uint64_t len) 
         (tty->termios.c_lflag & TOSTOP)) {
         signal_send(g_current, SIGTTOU);
         return -4; // -EINTR
+    }
+
+    // Fast path: batched writer handles ONLCR + ring push + ONE wake_all
+    // at the end, instead of one wake_all per byte.  This is the hot
+    // path for bash / ps / ls writing to stdout on a pty slave.
+    if (tty->write_buf) {
+        tty->write_buf(tty, (const uint8_t*)buf, len);
+        return (int64_t)len;
     }
 
     if (!tty->write_char) return (int64_t)len; // discard
@@ -389,12 +503,15 @@ static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg)
 // ── pty_alloc — create a new PTY pair ────────────────────────────────────
 
 int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
-    // Allocate a fresh pty struct.  No fixed cap — just OOM on failure.
     pty_t* pty = (pty_t*)kmalloc(sizeof(pty_t));
     if (!pty) return -12; // ENOMEM
 
-    // Zero the struct.
     __builtin_memset(pty, 0, sizeof(pty_t));
+
+    // Out-of-line ring buffer so the pty_t struct stays small and the
+    // ring size can be retuned without touching the struct layout.
+    pty->master_buf = (uint8_t*)kmalloc(PTY_MASTER_BUF);
+    if (!pty->master_buf) { kfree(pty); return -12; }
 
     pty->master_open = 1;
     pty->slave_open_count = 1;
@@ -438,6 +555,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     tty->winsize.ws_ypixel = 400;
 
     tty->write_char = pty_slave_write_char;
+    tty->write_buf  = pty_slave_write_buf;
 
     // Name: "pts/N"
     tty->name[0] = 'p'; tty->name[1] = 't'; tty->name[2] = 's';
@@ -468,6 +586,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     master->ctx         = mctx;
     master->waitq           = &master->_waitq; wait_queue_init(master->waitq);
     wait_queue_init(&pty->master_waitq);
+    wait_queue_init(&pty->slave_drain_waitq);
     master->secondary_waitq = &pty->master_waitq;  // woken by pty_master_push
     master->flags       = 0;
     master->refcount    = 1;

@@ -18,16 +18,28 @@
 // The master side is a plain fd: write injects input into the slave,
 // read receives the slave's output.
 
-#define PTY_MASTER_BUF 4096 // master-side read ring buffer size (power of 2)
+// Master-side read ring buffer.  Must be a power of two for the
+// `(i + 1) & (PTY_MASTER_BUF - 1)` mask.  Allocated out-of-line so the
+// pty_t struct itself stays small (fits in a slab cache) and the ring
+// size can be tuned without changing sizeof(pty_t).
+//
+// 64 KiB is big enough to absorb a typical `ps` / `ls -la` / `cat
+// biglog.txt` burst between terminal reader drains.  When full, the
+// slave writer blocks on `slave_drain_waitq` and is woken whenever the
+// master side drains bytes — classic flow control, no drops.
+#define PTY_MASTER_BUF 65536u
 
 typedef struct pty {
     tty_t        slave;                        // full tty with line discipline
-    uint8_t      master_buf[PTY_MASTER_BUF];   // ring: slave output → master read
+    uint8_t*     master_buf;                    // ring: slave output → master read (kmalloc'd)
     uint32_t     m_head;                        // master ring head (write position)
     uint32_t     m_tail;                        // master ring tail (read position)
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
-    wait_queue_t   master_waitq;                // wait queue for master-side
+    wait_queue_t master_waitq;                  // wait queue for master-side
                                                 // blocking reads + poll/epoll
+    wait_queue_t slave_drain_waitq;             // wait queue for slave-side writers
+                                                // blocked on a full ring — woken by
+                                                // pty_master_read after it drains
     int          master_open;                   // master fd still open?
     int          slave_open_count;              // refcount of open slave fds
     int          index;                         // pty number (for /dev/pts/N)
