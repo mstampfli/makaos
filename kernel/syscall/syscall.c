@@ -3742,6 +3742,8 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
         __atomic_store_n(&state->has_ready, 0, __ATOMIC_RELAXED);
         task_we_init(&task_we, g_current);
         task_we_add(&state->wq, &task_we);
+        serial_puts_dbg("[epwait] add pid=");
+        serial_hex_dbg((uint64_t)g_current->pid);
 
         int ep_recheck = __atomic_load_n(&state->has_ready, __ATOMIC_ACQUIRE);
         if (!ep_recheck) {
@@ -3761,11 +3763,17 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             spin_unlock(&state->lock);
         }
         if (!ep_recheck) {
+            serial_puts_dbg("[epwait] sleep pid=");
+            serial_hex_dbg((uint64_t)g_current->pid);
             g_current->sleep_until_ns = infinite ? 0 : deadline;
             sched_sleep();
             g_current->sleep_until_ns = 0;
+            serial_puts_dbg("[epwait] wake pid=");
+            serial_hex_dbg((uint64_t)g_current->pid);
+        } else {
+            serial_puts_dbg("[epwait] skip-sleep pid=");
+            serial_hex_dbg((uint64_t)g_current->pid);
         }
-        // Remove the task entry (wq_remove is a no-op if already removed by wake).
         task_we_remove(&state->wq, &task_we);
 
     } while (infinite || tsc_read_ns() < deadline);
