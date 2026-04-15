@@ -14,29 +14,47 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* dst = (uint8_t*)buf;
     uint64_t total = 0;
 
+    // Canonical Phase 9-6 pattern.  Outer while provides phase 1
+    // (quick check), task_we_add provides phase 2, the second check
+    // under registration provides phase 3, sched_sleep is phase 4.
+    // task_we_remove runs on every exit path (continue, break,
+    // return-EINTR, return-count).
     while (total < len) {
         if (p->count == 0) {
-            if (p->writer_refs == 0) return (int64_t)total; // EOF
+            if (p->writer_refs == 0) {
+                // EOF: wake writers (there shouldn't be any, but a
+                // racing close might have left SIGPIPE waiters) and
+                // return what we've got (possibly 0).
+                if (p->write_file)
+                    wait_queue_wake_all(p->write_file->waitq);
+                return (int64_t)total;
+            }
 
-            // Register as a waiter on the read-end's wait queue, then
-            // re-check the condition.  This closes the lost-wakeup race:
-            // if a writer fills the buffer between our check and the
-            // sleep, wait_queue_wake_all finds our entry and wakes us.
             task_we_t node;
             task_we_init(&node, g_current);
             task_we_add(self->waitq, &node);
             if (p->count == 0 && p->writer_refs != 0) {
                 sched_sleep();
             }
-            // Remove if still present (no-op if already drained).
             task_we_remove(self->waitq, &node);
+
+            // Interrupt semantics: return what we have so far (0 or
+            // a partial read is both fine per POSIX), or -EINTR if
+            // we haven't read anything yet.  SIGCHLD/SIGWINCH with
+            // SIG_DFL are ignored here — they must not abort a read.
+            if (signal_has_actionable(&g_current->sigstate)) {
+                if (total > 0) return (int64_t)total;
+                return (int64_t)-EINTR;
+            }
             continue;
         }
         dst[total++] = p->buf[p->head];
         p->head = (p->head + 1) & (PIPE_BUF_SIZE - 1);
         p->count--;
     }
-    // Wake any writer waiting for space.
+    // Wake any writer waiting for space.  Commit order: the drain
+    // above happens BEFORE the wake_all xchg, so any writer that
+    // wakes sees the new p->count.
     if (p->write_file) wait_queue_wake_all(p->write_file->waitq);
     return (int64_t)total;
 }
@@ -69,11 +87,12 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
     }
 
     while (total < len) {
-        // Wait for space.  Register on the write-end's wait queue so
-        // a reader draining the buffer can wake us.
+        // Canonical Phase 9-6 pattern.  Phase 1 is the top-of-loop
+        // full check; phase 2 is task_we_add; phase 3 is the
+        // re-check under the registration; phase 4 is sched_sleep;
+        // every exit path removes the entry first.
         if (p->count == PIPE_BUF_SIZE) {
             if (p->reader_refs == 0) {
-                // Reader closed while we were blocked mid-write.
                 deliver_sigpipe();
                 return total ? (int64_t)total : (int64_t)-EPIPE;
             }
@@ -85,6 +104,14 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
                 sched_sleep();
             }
             task_we_remove(self->waitq, &node);
+
+            // Interruptible: partial write returns success so far,
+            // otherwise -EINTR.  SIGCHLD/SIGWINCH with SIG_DFL do
+            // not abort.
+            if (signal_has_actionable(&g_current->sigstate)) {
+                if (total > 0) return (int64_t)total;
+                return (int64_t)-EINTR;
+            }
             continue;
         }
         p->buf[p->tail] = src[total++];
@@ -92,10 +119,10 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
         p->count++;
     }
 
-    // Wake all readers and poll waiters via the read-end's single
-    // wait queue.  Blocking readers (task_we_t) and poll/epoll
-    // waiters share the same queue — each entry's func decides what
-    // to do.
+    // Commit all pushes BEFORE wake_all's xchg — any reader drained
+    // from the queue after this xchg will observe the new p->count
+    // thanks to the ACQ_REL on the xchg pairing with the reader's
+    // subsequent lock acquire in sched_sleep.
     if (p->read_file) {
         wait_queue_wake_all(p->read_file->waitq);
     }
