@@ -35,11 +35,6 @@
 // g_vga is defined in idt.c — also used by vfs.c.
 extern volatile uint16_t* g_vga;
 
-// Forward declarations for serial debug helpers (defined near bottom of file).
-static void serial_putc(char c);
-static void serial_puts(const char* s);
-static void serial_hex_u32(uint32_t v);
-
 // Scratch storage for the user register state saved at syscall entry.
 uint64_t g_syscall_user_rsp    = 0;
 uint64_t g_syscall_user_rip    = 0;
@@ -3920,18 +3915,9 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t buf_ptr) {
     return (copy_to_user((void*)buf_ptr, &ru, sizeof(ru)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 
-// ── serial helper (debug only) ────────────────────────────────────────────
-static void serial_putc(char c) {
-    while (!(inb(0x3F8 + 5) & 0x20));
-    outb(0x3F8, (uint8_t)c);
-}
-static void serial_puts(const char* s) {
-    for (; *s; s++) serial_putc(*s);
-}
-static void serial_hex_u32(uint32_t v) {
-    const char* h = "0123456789abcdef";
-    for (int i = 28; i >= 0; i -= 4) serial_putc(h[(v >> i) & 0xF]);
-}
+// Per-file serial helpers were deleted as part of Phase 9-6 post-fix.
+// See the w_sys_exit / w_sys_open rewrites to serial_puts_dbg and the
+// commentary in native_syscall_dispatch.
 
 // ── Syscall jump table ────────────────────────────────────────────────────
 // Every handler has the uniform signature (arg1, arg2, arg3, arg4).  Handlers
@@ -3949,9 +3935,10 @@ static uint64_t w_sys_write(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
 static uint64_t w_sys_exit(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)b; (void)c; (void)d;
     if (g_current && g_current->pid > 2) {
-        serial_puts("[exit] pid="); serial_hex_u32((uint32_t)g_current->pid);
-        serial_puts(" code="); serial_hex_u32((uint32_t)a);
-        serial_putc('\n');
+        serial_puts_dbg("[exit] pid=");
+        serial_hex_dbg((uint64_t)g_current->pid);
+        serial_puts_dbg(" code=");
+        serial_hex_dbg((uint64_t)a);
     }
     return sys_exit(a);
 }
@@ -3959,13 +3946,17 @@ static uint64_t w_sys_open(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d;
     uint64_t ret = sys_open(a, b, c);
     if (g_current && g_current->pid > 2) {
-        serial_puts("[open] pid="); serial_hex_u32((uint32_t)g_current->pid);
-        serial_putc(' ');
-        serial_puts((const char*)a);
-        serial_puts(" -> ");
-        if ((int64_t)ret < 0) { serial_puts("ERR "); serial_hex_u32((uint32_t)(-(int64_t)ret)); }
-        else { serial_puts("fd="); serial_hex_u32((uint32_t)ret); }
-        serial_putc('\n');
+        serial_puts_dbg("[open] pid=");
+        serial_hex_dbg((uint64_t)g_current->pid);
+        serial_puts_dbg(" path=");
+        serial_puts_dbg((const char*)a);
+        if ((int64_t)ret < 0) {
+            serial_puts_dbg(" ERR=");
+            serial_hex_dbg((uint64_t)(-(int64_t)ret));
+        } else {
+            serial_puts_dbg(" fd=");
+            serial_hex_dbg(ret);
+        }
     }
     return ret;
 }
@@ -4371,11 +4362,21 @@ static const sys_handler_t s_syscall_table[100] = {
 uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                                   uint64_t arg3, uint64_t arg4) {
     uint64_t ret;
-    // Mirror stdout/stderr writes to serial for debugging.
-    if (nr == SYS_WRITE && (arg1 == 1 || arg1 == 2) && arg3 > 0) {
-        const char* s = (const char*)arg2;
-        for (uint64_t i = 0; i < arg3; i++) serial_putc(s[i]);
-    }
+    // Pre-9-7 this mirrored every stdout/stderr byte to port 0x3F8 as a
+    // debug aid.  That's catastrophically wrong under SMP: per-byte
+    // unlocked `inb(0x3F8+5); outb(0x3F8, c)` from every CPU on every
+    // write(2) hangs the UART state machine, spins forever on the TX-
+    // empty bit, and (observed in GDB) parks whichever task happens to
+    // be writing mid-busy-poll.  The cost is also enormous on the hot
+    // path: bash writing "hello\n" to stdout was 6 port-polled byte
+    // spins per write, serialised through a shared non-locked port.
+    //
+    // The mirror is gone.  Kernel-side debug goes through the locked
+    // serial_*_dbg helpers in common.h (called from cold paths like
+    // [exit]/[open] logging), which is bounded and safe.  User-space
+    // stdout/stderr goes to the real tty / pty.  Serial debug output
+    // from the kernel is still available; it's just not every single
+    // byte of every user write.
 
     sys_handler_t h = (nr < (uint64_t)(sizeof(s_syscall_table) / sizeof(s_syscall_table[0])))
                       ? s_syscall_table[nr] : NULL;

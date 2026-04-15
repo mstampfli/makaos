@@ -52,19 +52,77 @@ __attribute__((no_caller_saved_registers)) void insw_irq(uint16_t port, void* ad
 __attribute__((no_caller_saved_registers)) void outsw_irq(uint16_t port, const void* addr, uint32_t count);
 
 // ── Quick serial debug helpers ───────────────────────────────────────────
-static inline void serial_putc_dbg(char c) {
+//
+// These wrap a raw x86 16550 UART at port 0x3F8.  The port is a single
+// serialised hardware register, so concurrent access from multiple CPUs
+// corrupts both the TX FIFO and the LSR-bit-5 busy-wait.  We serialise
+// writers with a self-contained spinlock that does NOT depend on smp.h
+// (common.h is too low in the include tree to pull in spinlock_t).
+//
+// Locking discipline:
+//   - Disable IRQs on this CPU first (cli).  That stops any IRQ handler
+//     from re-entering serial and self-deadlocking on the same CPU.
+//   - Acquire the global lock via atomic xchg — one cache-line op.
+//   - Drain the whole message inline; the LSR-poll + outb stays as-is
+//     and runs under the lock so two CPUs never interleave bytes.
+//   - Release the lock, restore the prior IRQ flag.
+//
+// The lock is valid from very early boot (plain BSS-zero initial state)
+// through panic (panic path takes the lock; worst case it spins briefly
+// if another CPU was mid-write, then proceeds).
+//
+// Performance: the UART itself is the bottleneck (port I/O is slow).
+// Adding one xchg per message is noise next to the port write.  Per-
+// byte locking would be wasteful — the helpers below take the lock ONCE
+// per call so the whole "[net] rx\n" goes out under a single critical
+// section.
+
+extern volatile uint32_t g_serial_lock;
+
+static inline uint64_t serial_lock_irqsave(void) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(rflags));
+    uint32_t zero = 0;
+    while (!__atomic_compare_exchange_n(&g_serial_lock, &zero, 1u, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        zero = 0;
+        while (__atomic_load_n(&g_serial_lock, __ATOMIC_RELAXED))
+            __asm__ volatile("pause");
+    }
+    return rflags;
+}
+
+static inline void serial_unlock_irqrestore(uint64_t rflags) {
+    __atomic_store_n(&g_serial_lock, 0u, __ATOMIC_RELEASE);
+    if (rflags & (1ull << 9)) __asm__ volatile("sti");
+}
+
+// Raw unlocked primitive — only callable while holding the serial lock.
+static inline void serial_raw_putc(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
     outb(0x3F8, (uint8_t)c);
 }
-static inline void serial_puts_dbg(const char* s) {
-    for (; *s; s++) serial_putc_dbg(*s);
+
+static inline void serial_putc_dbg(char c) {
+    uint64_t f = serial_lock_irqsave();
+    serial_raw_putc(c);
+    serial_unlock_irqrestore(f);
 }
+
+static inline void serial_puts_dbg(const char* s) {
+    uint64_t f = serial_lock_irqsave();
+    for (; *s; s++) serial_raw_putc(*s);
+    serial_unlock_irqrestore(f);
+}
+
 static inline void serial_hex_dbg(uint64_t v) {
+    uint64_t f = serial_lock_irqsave();
     for (int i = 60; i >= 0; i -= 4) {
         uint8_t n = (uint8_t)((v >> i) & 0xF);
-        serial_putc_dbg(n < 10 ? '0' + n : 'A' + (n - 10));
+        serial_raw_putc(n < 10 ? '0' + n : 'A' + (n - 10));
     }
-    serial_putc_dbg('\n');
+    serial_raw_putc('\n');
+    serial_unlock_irqrestore(f);
 }
 
 #define KERNEL_CS    0x08   // kernel code segment selector

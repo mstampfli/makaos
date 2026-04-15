@@ -28,6 +28,11 @@ phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
 uint64_t    LOADER_RESERVED_SIZE = 0;
 
+// Defined by the serial_*_dbg helpers in common.h.  Plain BSS init
+// (zero) is already the unlocked state, so no explicit initialization
+// is required before the first serial print.
+volatile uint32_t g_serial_lock = 0;
+
 extern void lapic_spurious_entry(void);
 extern void ipi_reschedule_entry(void);
 extern void ipi_call_entry(void);
