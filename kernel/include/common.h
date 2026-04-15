@@ -113,6 +113,14 @@ typedef struct __attribute__((packed)) boot_info_t {
 
     /* HHDM offset (constant = 0xFFFF800000000000) */
     uint64_t hhdm_offset;
+
+    /* ACPI RSDP physical address — discovered by the UEFI bootloader
+     * from the EFI System Table's configuration tables.  0 if not
+     * found (kernel falls back to scanning the legacy BIOS area).
+     * Required for Phase 9 SMP: the MADT is reachable only via the
+     * RSDP → XSDT → MADT chain, and UEFI-booted systems don't leave
+     * the RSDP in the legacy 0xE0000-0xFFFFF region. */
+    uint64_t rsdp_phys;
 } boot_info_t;
 
 extern phys_addr_t KERNEL_BASE_PHYS;

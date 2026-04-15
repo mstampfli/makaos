@@ -130,7 +130,10 @@ void kmain(void) {
     pic_init(0x20, 0x28);
 
     // ── ACPI — parse tables so lapic/ioapic init can consume g_acpi ──────
-    g_acpi = acpi_parse(0);
+    // The UEFI bootloader walked the EFI config tables and passed the
+    // RSDP physical address to us in boot_info.  Pass it through so
+    // acpi_parse doesn't have to guess.
+    g_acpi = acpi_parse(info->rsdp_phys);
     if (!g_acpi.ok) {
         g_acpi.lapic_phys      = 0xFEE00000ULL;
         g_acpi.ioapic_phys     = 0xFEC00000ULL;
