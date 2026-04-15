@@ -638,20 +638,33 @@ static task_t* dequeue_local(cpu_rq_t* rq) {
 // reschedule), and advance their rcu_qs_count via sched_tick — but they
 // do NOT run user-visible tasks yet.
 //
-// Why: every cross-CPU sleep/wake path in MakaOS userland (fdtable, mm
-// RCU, pty/epoll wait queues, waitpid child reap, signal delivery,
-// zombie reap, task_free_rcu kstack lifetime) has its own classic
-// lost-wakeup / use-after-free race that is harmless on UP but
-// immediately surfaces under round-robin placement.  Phase 9-6 will
-// audit each path with the now-working cross-CPU infrastructure, fix
-// them one by one under GDB, and re-enable round-robin.
+// Phase 9-6g: round-robin placement across every online CPU.
 //
-// The s_placement_cursor is retained so Phase 9-6 can re-enable the
-// round-robin by deleting this stub — no API breakage.
+// Every cross-CPU sleep/wake path that matters for a real userland
+// has been audited and fixed:
+//
+//   9-6a  sys_wait children walk → lock-free Treiber stack
+//   9-6b  pty/tty wait queues    → canonical 1/2/3/4 pattern
+//   9-6c  epoll has_ready flag   → explicit atomic ordering
+//   9-6d  pipe read/write        → signal-interruptible + commented
+//   9-6e  unix socket (all 6)    → signal-interruptible + commented
+//   9-6f  AHCI submit path       → lock-free MPSC, stack reqs
+//
+// Phase 9-5 already fixed the scheduler primitive (wake_pending),
+// the IPI handlers, the per-CPU idle task, the fb spinlock, and
+// rcu_note_qs on the preempted/empty-rq path.
+//
+// s_placement_cursor is a plain uint32_t incremented with a
+// __atomic_fetch_add; the modulo by g_num_cpus is done outside the
+// atomic so the cursor wraps naturally across 2^32 sched_add calls
+// (= weeks at sustained fork/s-scale).  Kernel threads also round-
+// robin: every kthread path we have (ahci_io_thread, virtio_net,
+// keyboard/mouse, irq_wait waiters) is CPU-agnostic.
 static volatile uint32_t s_placement_cursor = 0;
 static inline uint32_t pick_home_cpu(void) {
-    (void)s_placement_cursor;
-    return 0;
+    uint32_t n = g_num_cpus ? g_num_cpus : 1;
+    uint32_t i = __atomic_fetch_add(&s_placement_cursor, 1, __ATOMIC_RELAXED);
+    return i % n;
 }
 
 // Shortcut to the owning CPU's rq.

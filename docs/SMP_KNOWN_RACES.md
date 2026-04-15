@@ -528,50 +528,70 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 
 ---
 
-## 24. Cross-CPU wait queues — per-subsystem audit (DEFERRED to Phase 9-6)
+## 24. Cross-CPU wait queues — per-subsystem audit — RESOLVED (Phase 9-6)
 
-- **Status:** Phase 9-5 pins every user task to `home_cpu = 0` via
-  `pick_home_cpu() = 0`.  APs boot, run their own idle loop, receive
-  IPIs, advance `rcu_qs_count`, handle TLB-flush stubs, but do NOT
-  dequeue user tasks.  The cross-CPU path is **used** for signal_send
-  and RCU grace periods; it is NOT used for task dispatch.
-- **Why pinned:** even with the #23 lost-wakeup fix, the subsystem-
-  specific wait/wake patterns have their own idiomatic pitfalls that
-  need individual review:
-  - **pty / tty**: `task_we_add` → `re-check cond` → `sched_sleep`
-    pattern.  The re-check window relies on the underlying waitq
-    being drained by the waker under a memory barrier.  Fine in
-    theory given #23 but needs a per-queue audit to confirm every
-    waker calls `wait_queue_wake_all` AFTER committing the condition
-    change.  Verified wrong in at least one path (canonical-mode
-    character input calls `ldisc_flush_line` only on newline, but
-    echo-on-partial-line works via `tty_echo` → fb_term_putc which
-    doesn't need a wake).
-  - **epoll**: `state->has_ready = 0` → `task_we_add` → re-read
-    `has_ready` → full poll recheck → `sched_sleep`.  The
-    `has_ready = 0` clear is NOT ordered against a concurrent writer
-    setting it to 1; the poll recheck is meant to catch that, but
-    relies on each fd's `poll()` callback being atomic against its
-    own ring state.  Needs audit per fd type.
-  - **waitpid / zombie reap**: the parent walks `children` (plain
-    list, no lock) and may observe a child in `TASK_RUNNING` that
-    transitions to `TASK_ZOMBIE` one instruction later, then the
-    parent sleeps just before signal_send fires.  Relies on #23's
-    wake_pending, but also relies on `child->state` being read AFTER
-    `sys_exit`'s `state = TASK_ZOMBIE` store has propagated —
-    memory barrier placement needs to be spelled out.
-  - **AHCI I/O thread rendezvous**: the `r->done` polling loop in
-    `ahci_submit` has the same "waker might set done after sleeper
-    checks" pattern.  #23 fixes it, but the code should probably move
-    to a proper wait queue for clarity.
-  - **IPC pipe / unix socket**: multiple sleepers (readers + writers)
-    on the same buffer.  Need to audit each wake point to confirm
-    it matches every possible sleep point.
-- **Fix phase:** Phase 9-6.  Each subsystem gets its own GDB-assisted
-  review with a concrete reproducer, under `-smp 4 round-robin`.  When
-  every entry above is clean, `pick_home_cpu()` goes back to round-
-  robin and this entry is resolved.
-- **Blocker for phase 9-7 soak test.**
+- **Status:** Phase 9-6 audited and fixed every cross-CPU sleep/wake
+  path listed below.  `pick_home_cpu()` now round-robins across every
+  online CPU (Phase 9-6g).  Every user task and kthread dispatched
+  via `sched_add` lands on a CPU chosen by a simple atomic cursor;
+  AHCI, pty/tty, pipe, unix socket, waitpid, and epoll all survive
+  the resulting cross-CPU traffic.
+- **Resolutions:**
+  - **waitpid / zombie reap (Phase 9-6a, commit ec2c276)**: the
+    per-task `children` list is now a lock-free Treiber stack.
+    Producers (`task_child_add`, `task_child_add_chain`) CAS-prepend
+    with `__ATOMIC_RELEASE`; the reaper (`task_children_reap`) does
+    an `xchg`-drain with `__ATOMIC_ACQUIRE`, walks the private chain
+    for a matching zombie, and CAS-splices the survivors back.
+    `sys_exit` now uses `task_children_reparent` which snapshots
+    its own children list and splices the whole chain onto init in
+    one CAS — O(1) atomics per mass-exit instead of O(orphans).
+    All dead legacy helpers (`sched_reap_child_zombie`,
+    `sched_has_child_zombie`, `sched_wait_pid`, `sched_poll_pid`,
+    `task_child_remove`) deleted.
+  - **pty / tty (Phase 9-6b, commit c4c30b4)**: every
+    sleeper/waker pair verified canonical.  `tty_vfs_read` now has
+    a phase-1 fast check so it doesn't always `task_we_add` when
+    data is already present.  All four waiters (master_waitq,
+    tty->waitq, slave_drain_waitq, tty_vfs_read) remove their
+    stack entry on every exit path including EINTR.  Wakers commit
+    the ring push BEFORE `wait_queue_wake_all` throughout.
+  - **epoll has_ready flag (Phase 9-6c, commit 2504e98)**:
+    `epoll_wake_func`'s `has_ready=1` is now an `__ATOMIC_RELEASE`
+    store.  `sys_epoll_wait` clears with RELAXED before `task_we_add`
+    (so the CAS-release carries the clear) and re-reads with
+    `__ATOMIC_ACQUIRE`.  The full poll re-scan under `state->lock`
+    stays as the tiebreaker.  No new lock, no new smp_mb.
+  - **pipe (Phase 9-6d, commit 46d89fd)**: `pipe_read` and
+    `pipe_write` now return `-EINTR` (or the partial byte count so
+    far) when `signal_has_actionable` fires.  Pre-9-6d they were
+    effectively uninterruptible because the outer loop just
+    re-checked and re-slept through every signal.  Commit-before-
+    wake ordering already correct.
+  - **unix socket (Phase 9-6e, commit 927624b)**: all six
+    `sched_sleep` sites (accept, connect, send, recv stream, recv
+    dgram, recvfd) now call `signal_has_actionable` after
+    `task_we_remove` and return `-EINTR` (or NULL for accept/recvfd
+    where the API can't carry an errno).  Canonical pattern was
+    already in place.
+  - **AHCI rendezvous (Phase 9-6f, commit 953cb7a)**: pre-9-6f
+    submission was a fixed-size ring with multi-producer writes
+    to `s_req_tail` (genuine SMP bug) and a `sched_yield` busy-wait
+    on ring-full (hard-rule violation).  Replaced with a lock-free
+    MPSC of stack-allocated `ahci_req_t` — submitters CAS-prepend
+    on `s_req_head`, the kthread `xchg`-drains, reverses for FIFO,
+    and processes each entry.  `r->done` is now
+    `__ATOMIC_RELEASE` / `__ATOMIC_ACQUIRE` paired.
+- **Placement flip (Phase 9-6g):** `pick_home_cpu()` returns
+  `__atomic_fetch_add(&cursor, 1) % g_num_cpus`.  Every task
+  dispatched via `sched_add` lands on whichever CPU the cursor
+  points at; no kthread pinning because every kthread path is
+  CPU-agnostic (ahci_io_thread, virtio_net, keyboard/mouse,
+  irq_wait waiters all communicate via shared state + wait queues,
+  not per-CPU registers).
+- **Not a blocker for 9-7**: Phase 9-7 (TLB shootdown) and 9-8
+  (work stealing) can proceed without further wait-queue work.
+- **Locks added by Phase 9-6:** zero.
 
 ---
 
@@ -584,22 +604,29 @@ See LOCKS.md entries for exact writer-lock / call_rcu usage.
 - Phase 8A/8B resolve entries **7, 8, 12 (task lifecycle)**
 - Phase 8C resolves entry **16** (ext2 metadata)
 - Phase 9-5 resolves entries **17, 18, 19, 20, 21, 22, 23**
-- **Phase 9-6 must resolve entry 24** (per-subsystem wait-queue audit)
-  before `pick_home_cpu()` can be restored to round-robin and user
-  tasks can run on APs.
+- Phase 9-6 resolves entry **24** (per-subsystem wait-queue audit
+  + lock-free children list + lock-free AHCI MPSC + round-robin).
 - **14 (superblock writeback) and 15 (ext2 scratch per-CPU) are
   explicitly deferred** with the rationale above and are not Phase 9
   blockers.
 
-## Phase 9-5 runtime status (2026-04-15)
+## Phase 9-6 runtime status (2026-04-15)
 
 Committed state:
 - All 4 CPUs boot online under `-smp 4`.  APs initialise their own
   PAT, CR0/CR4, syscall MSRs, TSS, IDT, LAPIC, run a per-CPU idle
   task on a private kstack, and respond to IPIs (reschedule / call /
   tlb-flush-stub).
-- `pick_home_cpu()` pins every user task to CPU 0.  Cross-CPU
-  infrastructure is live (sched_wake, wake_pending, IPI, RCU
-  quiescent-state advance on every CPU via its own sched_tick) but
-  NO user task runs on an AP.
-- Open race: entry 24 (per-subsystem wait-queue audit).  Phase 9-6.
+- `pick_home_cpu()` round-robins across every online CPU.  New
+  tasks (user and kernel) land on CPU `(cursor++) % g_num_cpus`
+  via `__atomic_fetch_add`.
+- Every cross-CPU wait-queue path has been audited (see entry 24
+  for the per-subsystem summary).  Zero new locks were added by
+  Phase 9-6; `children_list` became a lock-free Treiber stack and
+  the AHCI submission ring became a lock-free MPSC of stack-
+  allocated requests.
+- Reproducer: `userland/apps/smp_test` exercises waitpid, pipe,
+  epoll, AF_UNIX, and parallel AHCI reads end-to-end with
+  deterministic pass/fail.
+- Next: Phase 9-7 (TLB shootdown) and 9-8 (work stealing + load
+  balance).
