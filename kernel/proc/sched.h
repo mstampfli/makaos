@@ -55,8 +55,29 @@ void sched_enter_idle(void) __attribute__((noreturn));
 void sched_add(task_t* proc);
 
 // ── Per-task child list helpers ───────────────────────────────────────────
-void task_child_add   (task_t* parent, task_t* child);
-void task_child_remove(task_t* parent, task_t* child);
+//
+// Lock-free Treiber stack.  See task_child_add's commentary in sched.c
+// for the full design and the memory-ordering contract.
+
+// Prepend one child to parent's list.  One CAS.  Safe from any CPU.
+void task_child_add(task_t* parent, task_t* child);
+
+// Prepend an entire pre-linked chain (head..tail via child_next) onto
+// parent's list in one CAS.  Used by sys_exit to batch-reparent every
+// orphan onto g_init_task.
+void task_child_add_chain(task_t* parent, task_t* head, task_t* tail);
+
+// Drain parent's children list, look for a zombie matching target_pid
+// (0 = any).  Returns the reaped child (unlinked) or NULL.  Splices
+// survivors back.  *out_found (optional) is set iff at least one child
+// matched target_pid regardless of state — used by sys_wait to
+// distinguish ECHILD from "wait and retry".
+task_t* task_children_reap(task_t* parent, uint32_t target_pid,
+                            uint8_t* out_found);
+
+// Move every child of `from` onto `to`'s list, updating ppid to
+// `to->pid` in the process.  Used by the exit / fatal-signal paths.
+void task_children_reparent(task_t* from, task_t* to);
 
 // Called on every timer tick (by timer_irq_handler via timer_register_tick).
 // Picks the next PROC_READY process and context-switches into it.
@@ -75,29 +96,15 @@ void sched_sleep(void);
 // Does nothing if the process is not PROC_SLEEPING.
 void sched_wake(task_t* proc);
 
-// Block current task until a zombie with the given pid exists (0=any).
-// Returns 1 when zombie is ready, 1 if already gone.
-uint8_t sched_wait_pid(uint32_t pid);
-
-// Non-blocking: returns 1 if a zombie with the given pid (0=any) is ready.
-uint8_t sched_poll_pid(uint32_t pid);
-
 // Add a zombie task to the zombie list (call from sys_exit before yielding).
 void sched_add_zombie(task_t* t);
 
 // Remove and return the zombie with the given pid (0 = any child).
-// Does NOT check parent — use sched_reap_child_zombie for waitpid.
 // Returns NULL if not found.  Caller is responsible for process_destroy.
+// sys_wait goes through task_children_reap (children list walk) and
+// calls sched_reap_zombie with the exact pid to unlink it from the
+// per-CPU zombie list.
 task_t* sched_reap_zombie(uint32_t pid);
-
-// Reap a zombie that is a child of parent_pid.
-// target_pid == 0: any child; target_pid != 0: that specific pid.
-// Returns NULL if not found.
-task_t* sched_reap_child_zombie(uint32_t parent_pid, uint32_t target_pid);
-
-// Non-blocking: check if a zombie child of parent_pid exists.
-// target_pid == 0: any child; target_pid != 0: that specific pid.
-uint8_t sched_has_child_zombie(uint32_t parent_pid, uint32_t target_pid);
 
 // Walk every task in every MLFQ level, calling cb(t, data) for each.
 void sched_for_each(void (*cb)(task_t*, void*), void* data);

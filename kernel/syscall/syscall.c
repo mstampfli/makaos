@@ -491,20 +491,17 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // exit_code / pid for waitpid — fds are not part of that contract.
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
-        // Move all children to init's children list and update their ppid.
-        task_t* child = g_current->children;
-        while (child) {
-            task_t* next_child = child->child_next;
-            if (g_init_task && g_init_task != g_current) {
-                child->ppid = g_init_task->pid;
-                task_child_add(g_init_task, child);
-            } else {
-                child->ppid = 0;
-                child->child_next = NULL;
-            }
-            child = next_child;
+        // Reparent every direct child onto g_init_task in one batched
+        // CAS splice (task_children_reparent drains our own list — no
+        // race, only self touches it here — then CAS-prepends the
+        // whole chain onto init's list).  If we ARE init or init is
+        // absent, just clear our list; orphaned children live until
+        // their own exit reaps them.
+        if (g_init_task && g_init_task != g_current) {
+            task_children_reparent(g_current, g_init_task);
+        } else {
+            g_current->children = NULL;
         }
-        g_current->children = NULL;
 
         // Drop the fd table now so peers (pipes, sockets, ttys) see EOF
         // immediately rather than at reap time.
@@ -1077,38 +1074,29 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
     uint32_t target_pid = (signed_pid == -1) ? 0 : (uint32_t)signed_pid;
 
     for (;;) {
-        // No children at all → ECHILD.
-        if (!g_current->children) return (uint64_t)-ECHILD;
-
-        // Walk children list looking for a zombie to reap.
-        task_t*  prev        = NULL;
-        task_t*  child       = g_current->children;
-        task_t*  zombie      = NULL;
-        task_t*  zombie_prev = NULL;
-        uint8_t  found_target = 0;
-
-        while (child) {
-            if (target_pid == 0 || child->pid == target_pid) {
-                found_target = 1;
-                if (child->state == TASK_ZOMBIE && !zombie) {
-                    zombie      = child;
-                    zombie_prev = prev;
-                }
-            }
-            prev  = child;
-            child = child->child_next;
-        }
-
-        // Specific pid not in our children list → ECHILD.
-        if (target_pid != 0 && !found_target) return (uint64_t)-ECHILD;
+        // Atomic drain + walk + splice.  Lock-free: one xchg grabs the
+        // whole children chain into a private list, we walk it without
+        // any other CPU touching it, and if a zombie matches we unlink
+        // it and splice the survivors back via one CAS.  Any
+        // cross-CPU writer (e.g. another task reparenting orphans to
+        // init) that races with our drain lands on the freshly-empty
+        // head; the next iteration picks it up.
+        //
+        // Memory-ordering contract: the xchg is ACQ_REL.  It pairs
+        // with the CAS-release in every task_child_add / _chain call
+        // ever made on this list.  Any writer that published a child
+        // via task_child_add before our xchg is fully visible to us
+        // on the private chain — including the child's state field
+        // (x86 TSO plus the lock-chain through sched_wake/sched_sleep
+        // gives us sequential consistency on every wake cycle).
+        uint8_t  found = 0;
+        task_t*  zombie = task_children_reap(g_current, target_pid, &found);
 
         if (zombie) {
-            // Remove from children list.
-            if (zombie_prev) zombie_prev->child_next = zombie->child_next;
-            else             g_current->children     = zombie->child_next;
-            zombie->child_next = NULL;
-
-            // Also remove from global zombie list.
+            // Also remove from the home CPU's zombie list (locked
+            // there).  Until this returns the zombie is still
+            // referenceable by /proc/[pid] / kill(pid) etc.; afterwards
+            // only this wait owns it.
             sched_reap_zombie(zombie->pid);
 
             int32_t  code       = zombie->exit_code;
@@ -1130,10 +1118,29 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
             return (uint64_t)child_pid;
         }
 
-        // No zombie yet.
+        // No reapable zombie in the drained chain.
+        //
+        // ECHILD cases:
+        //   target_pid != 0 && !found — no child with that pid at all.
+        //   target_pid == 0 && children list is entirely empty (reload
+        //     the head after the splice-back; if it's NULL we had zero
+        //     children and none were added in the meantime).
+        if (target_pid != 0 && !found) return (uint64_t)-ECHILD;
+        if (target_pid == 0 &&
+            __atomic_load_n(&g_current->children, __ATOMIC_ACQUIRE) == NULL)
+            return (uint64_t)-ECHILD;
+
         if (options & WNOHANG) return 0;
 
-        // Block until a child exits and wakes us (see sys_exit / signal.c).
+        // Block until a child exits and wakes us.  sys_exit /
+        // signal.c's fatal path funnels through signal_send(parent,
+        // SIGCHLD), which always calls sched_wake under the target's
+        // rq_lock.  If the wake arrived between our reap pass above
+        // and here, sched_sleep observes wake_pending under rq_lock
+        // and returns immediately without parking — the outer loop
+        // then re-drains and sees the zombie.  If the wake arrives
+        // after we've parked, sched_wake moves us off sleep_head and
+        // back to the run queue, and we resume normally.
         sched_sleep();
     }
 }
