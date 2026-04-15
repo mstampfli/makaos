@@ -518,10 +518,36 @@ static void pmm_buddy_free_locked(phys_addr_t addr, uint8_t order) {
 }
 
 // ── Public buddy API — takes g_pmm_lock ───────────────────────────────
+//
+// Debug kill-switch: if PMM_DEBUG_ALWAYS_ZERO is 1, every freshly
+// allocated frame is zeroed before it leaves the allocator.  This
+// costs one 4 KiB memset per order-0 alloc (~500 cycles on modern
+// x86), so it's a measurable slowdown on every fork, every brk
+// growth, every demand-page, every CoW break.  But it turns every
+// "uninitialised frame contents leak into user memory" bug into a
+// benign clean read.
+//
+// Use during debugging: flip to 1, see if the PF-KILL / corruption
+// symptom disappears.  If yes → some caller is handing out frames
+// without zeroing → audit every pmm_buddy_alloc() caller.  If no →
+// the corruption source is elsewhere.
+//
+// Independent of this switch, the specific paths that MUST zero
+// (demand-page anon, CoW break destination, intermediate page
+// tables, vmm_alloc_pml4) already do so.  This switch only changes
+// whether UNREACHED paths are also covered.
+#define PMM_DEBUG_ALWAYS_ZERO 1
+
 phys_addr_t pmm_buddy_alloc(uint8_t order) {
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
   phys_addr_t r = pmm_buddy_alloc_locked(order);
   spin_unlock_irqrestore(&g_pmm_lock, flags);
+#if PMM_DEBUG_ALWAYS_ZERO
+  if (r != PMM_INVALID_ADDR) {
+    uint64_t bytes = (uint64_t)PAGE_SIZE << order;
+    __builtin_memset((void*)(r + HHDM_OFFSET), 0, bytes);
+  }
+#endif
   return r;
 }
 
