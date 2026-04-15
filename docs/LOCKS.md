@@ -357,6 +357,7 @@ user-page fault never happens with a spinlock held.
 | 7 | 0 (seqlocks) | ~11 |
 | 8 | per-object mutexes (not global) | ~11 + per-object |
 | 9 | 1 (g_fb_lock — Phase 9-5 SMP bring-up) | ~12 |
+| 9-6 | 0 (audit only — children list Treiber stack, AHCI MPSC) | ~12 |
 
 After Phase 4 proper lands (post-SMP, per-CPU magazines), g_pmm_lock
 collapses to a rarely-taken depot lock and doesn't change the total
