@@ -8,6 +8,8 @@
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
+#include "wait.h"
+#include "smp.h"
 
 // ── PCI class codes for AHCI ──────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
@@ -148,11 +150,17 @@ static phys_addr_t s_dma_phys;
 // Callers submit requests and sleep; the kthread processes them serially
 // (it's the sole owner of the AHCI hardware) and wakes each caller on
 // completion.  Before the kthread starts, do_rw uses direct polling.
+//
+// Phase 9-6f: each request is a stack-allocated struct on the submitter's
+// own kstack.  Submitters CAS-prepend onto s_req_head (lock-free MPSC
+// Treiber stack); the kthread atomically xchg-drains the list, reverses
+// it to restore FIFO order, and processes each entry.  No fixed ring,
+// no producer ordering bug, no ring-full backpressure, no new locks.
 
-#define AHCI_MAX_REQS  32
 #define AHCI_MAX_PAGES 16  // max pages per scatter-gather request (64KB)
 
-typedef struct {
+typedef struct ahci_req {
+    struct ahci_req* next;  // MPSC link — writers CAS onto s_req_head
     uint64_t lba;
     void*    buf;           // kernel-space buffer (used if page_count == 0)
     uint32_t count;         // sector count
@@ -169,10 +177,43 @@ typedef struct {
     uint32_t first_page_offset;  // byte offset within pages[0]
 } ahci_req_t;
 
-static ahci_req_t  s_req_ring[AHCI_MAX_REQS];
-static volatile uint8_t s_req_head = 0;   // kthread consumes here
-static volatile uint8_t s_req_tail = 0;   // producers insert here
-static task_t*     s_io_thread = NULL;     // the kthread task_t
+static task_t* s_io_thread = NULL;     // the kthread task_t
+
+// Phase 9-6f: AHCI submit is an unbounded lock-free MPSC of
+// stack-allocated ahci_req_t pointers.  One CAS per producer, one
+// xchg per consumer drain, zero new locks.
+//
+// Compared to the pre-9-6f fixed-ring design, this trades:
+//   - static ring storage (AHCI_MAX_REQS * sizeof(ahci_req_t))
+//     for stack allocation in the submitter's own frame (the
+//     request is valid until ahci_submit returns because the
+//     submitter is sleeping in its own frame on r->done).
+//   - multi-producer index race on s_req_tail (which was a real
+//     SMP bug under round-robin placement — two producers could
+//     claim the same slot) for lock-free CAS-prepend onto one
+//     head pointer.
+//   - busy-yield on ring-full (violated the "no busy-wait" rule)
+//     for no-ring-full: the MPSC is bounded only by the number
+//     of live tasks.
+//
+// Correctness chain:
+//   1. Producer fills every field of its on-stack ahci_req_t.
+//   2. Producer CAS-prepends onto s_req_head (ATOMIC_RELEASE on
+//      success).  Fields are ordered before the release.
+//   3. Producer calls wait_queue_wake_all(&s_io_thread_wq), which
+//      is an ACQ_REL xchg on the kthread's wait queue — ordered
+//      after the CAS.
+//   4. kthread drains s_io_thread_wq (finds its own task_we_t),
+//      wakes, re-enters its loop, __atomic_exchange_n's s_req_head
+//      to NULL grabbing the whole producer chain, reverses the
+//      chain to restore FIFO, and walks it.  The xchg's acquire
+//      pairs with every producer's CAS-release.
+//   5. kthread processes the request, stores r->done=1 with
+//      __ATOMIC_RELEASE, sched_wake(r->waiter).
+//   6. Producer's sched_sleep loop reads r->done with
+//      __ATOMIC_ACQUIRE; pairs with step 5.
+static ahci_req_t* volatile s_req_head = NULL;
+static wait_queue_t         s_io_thread_wq;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -384,59 +425,107 @@ static void scatter_copy(uint8_t* dma, uint32_t bytes,
     }
 }
 
-static void ahci_io_thread(void) {
-    for (;;) {
-        // Sleep until there's work.
-        while (s_req_head == s_req_tail)
-            sched_sleep();
+// Process one request end-to-end: copy in (for writes), issue the DMA
+// command(s), copy out (for reads), publish r->done and wake the waiter.
+static void ahci_process_one(ahci_req_t* r) {
+    uint64_t lba   = r->lba;
+    uint32_t count = r->count;
+    uint8_t  write = r->write;
+    uint8_t  ok    = 1;
 
-        // Process one request.
-        ahci_req_t* r = &s_req_ring[s_req_head];
-        uint64_t lba   = r->lba;
-        uint32_t count = r->count;
-        uint8_t  write = r->write;
-        uint8_t  ok    = 1;
+    uint8_t  scatter = (r->page_count > 0);
+    uint8_t* p8      = (uint8_t*)r->buf;  // used only if !scatter
+    uint32_t sg_off  = 0;                 // byte offset into scatter buffer
 
-        // Linear (kernel buffer) or scatter-gather (user pages)?
-        uint8_t  scatter = (r->page_count > 0);
-        uint8_t* p8      = (uint8_t*)r->buf;  // used only if !scatter
-        uint32_t sg_off  = 0;  // byte offset into scatter buffer
+    while (count > 0 && ok) {
+        uint32_t n     = count < DMA_SECTORS ? count : DMA_SECTORS;
+        uint32_t bytes = n * 512;
+        uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
 
-        while (count > 0 && ok) {
-            uint32_t n     = count < DMA_SECTORS ? count : DMA_SECTORS;
-            uint32_t bytes = n * 512;
-            uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
-
-            if (write) {
-                if (scatter)
-                    scatter_copy(dma, bytes, r->pages, r->page_count,
-                                 r->first_page_offset, sg_off, 1);
-                else
-                    __builtin_memcpy(dma, p8, bytes);
-            }
-
-            ok = issue_one(lba, n, write, 1);
-
-            if (ok && !write) {
-                if (scatter)
-                    scatter_copy(dma, bytes, r->pages, r->page_count,
-                                 r->first_page_offset, sg_off, 0);
-                else
-                    __builtin_memcpy(p8, dma, bytes);
-            }
-
-            if (!scatter) p8 += bytes;
-            sg_off += bytes;
-            lba    += n;
-            count  -= n;
+        if (write) {
+            if (scatter)
+                scatter_copy(dma, bytes, r->pages, r->page_count,
+                             r->first_page_offset, sg_off, 1);
+            else
+                __builtin_memcpy(dma, p8, bytes);
         }
 
-        r->result = ok;
-        r->done   = 1;
-        __asm__ volatile("" ::: "memory");  // compiler barrier
-        if (r->waiter) sched_wake(r->waiter);
+        ok = issue_one(lba, n, write, 1);
 
-        s_req_head = (s_req_head + 1) % AHCI_MAX_REQS;
+        if (ok && !write) {
+            if (scatter)
+                scatter_copy(dma, bytes, r->pages, r->page_count,
+                             r->first_page_offset, sg_off, 0);
+            else
+                __builtin_memcpy(p8, dma, bytes);
+        }
+
+        if (!scatter) p8 += bytes;
+        sg_off += bytes;
+        lba    += n;
+        count  -= n;
+    }
+
+    r->result = ok;
+    // RELEASE store pairs with the submitter's ACQUIRE load of r->done
+    // in ahci_submit's sleep loop.  All the r->buf / scatter-gather
+    // memcpy's above are ordered before this store.
+    __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
+    if (r->waiter) sched_wake(r->waiter);
+}
+
+static void ahci_io_thread(void) {
+    task_we_t self;
+
+    for (;;) {
+        // Canonical Phase 9-6 wait pattern on the kthread's own
+        // queue, with the MPSC drain as the condition.
+        //
+        // Phase 1: peek.
+        ahci_req_t* chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
+                                                  __ATOMIC_ACQUIRE);
+        if (!chain) {
+            // Phase 2: register on the kthread wait queue.
+            task_we_init(&self, g_current);
+            task_we_add(&s_io_thread_wq, &self);
+
+            // Phase 3: re-check — a producer may have CAS-pushed
+            // between phase 1 and phase 2.
+            chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
+                                          __ATOMIC_ACQUIRE);
+            if (!chain) sched_sleep();  // phase 4
+            task_we_remove(&s_io_thread_wq, &self);
+
+            // After waking we may still have an empty list (spurious
+            // wake from a producer that saw the non-empty queue and
+            // didn't bother waking): fall back through to another
+            // xchg before processing.  But only drain once on the
+            // post-wake path; the outer for(;;) re-enters and runs
+            // phase 1 again with a fresh peek.
+            if (!chain) {
+                chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
+                                              __ATOMIC_ACQUIRE);
+                if (!chain) continue;
+            }
+        }
+
+        // Drain order is LIFO (CAS-prepend onto head); reverse in
+        // place so we process requests in the order they were
+        // submitted (FIFO) — matches the pre-9-6f fixed-ring behaviour.
+        ahci_req_t* fifo = NULL;
+        while (chain) {
+            ahci_req_t* next = chain->next;
+            chain->next = fifo;
+            fifo = chain;
+            chain = next;
+        }
+
+        while (fifo) {
+            ahci_req_t* r = fifo;
+            fifo = r->next;
+            r->next = NULL;
+            ahci_process_one(r);
+        }
     }
 }
 
@@ -458,7 +547,30 @@ static void* resolve_to_hhdm(void* buf) {
     return (void*)(phys + HHDM_OFFSET + (va & 0xFFFULL));
 }
 
-// ── Submit a request to the I/O thread and sleep until completion ────��────
+// ── Submit a request to the I/O thread and sleep until completion ────────
+
+// CAS-prepend an ahci_req_t onto s_req_head.  The request's `next`
+// pointer is written inside the CAS loop so a producer retry is safe.
+// Pairs (release) with the kthread's xchg-acquire drain.
+static inline void ahci_req_push(ahci_req_t* r) {
+    ahci_req_t* old_head = __atomic_load_n(&s_req_head, __ATOMIC_RELAXED);
+    do {
+        r->next = old_head;
+    } while (!__atomic_compare_exchange_n(&s_req_head, &old_head, r,
+                                            /*weak=*/0,
+                                            __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED));
+}
+
+// Block until the kthread publishes r->done=1 (release).  Uses the
+// canonical sleep pattern: the read is under ACQUIRE so it pairs
+// with the kthread's RELEASE store.
+static inline void ahci_wait_done(ahci_req_t* r) {
+    for (;;) {
+        if (__atomic_load_n(&r->done, __ATOMIC_ACQUIRE)) return;
+        sched_sleep();
+    }
+}
 
 static uint8_t ahci_submit(uint64_t lba, void* buf, uint32_t count,
                             uint8_t write) {
@@ -468,35 +580,31 @@ static uint8_t ahci_submit(uint64_t lba, void* buf, uint32_t count,
     // static buffers) so this is a safety net — the fast path is a no-op.
     void* kbuf = resolve_to_hhdm(buf);
 
-    // Find a slot in the ring.
-    uint8_t next_tail = (s_req_tail + 1) % AHCI_MAX_REQS;
+    // Stack-allocate the request in the caller's own frame.  It lives
+    // until ahci_wait_done returns below; the kthread's reference is
+    // bounded by that interval.
+    ahci_req_t r;
+    r.next              = NULL;
+    r.lba               = lba;
+    r.buf               = kbuf;
+    r.count             = count;
+    r.write             = write;
+    r.waiter            = g_current;
+    r.done              = 0;
+    r.result            = 0;
+    r.page_count        = 0;
+    r.first_page_offset = 0;
 
-    // If ring is full, spin-yield until a slot opens.
-    while (next_tail == s_req_head)
-        sched_yield();
+    ahci_req_push(&r);
 
-    ahci_req_t* r = &s_req_ring[s_req_tail];
-    r->lba    = lba;
-    r->buf    = kbuf;
-    r->count  = count;
-    r->write  = write;
-    r->waiter = g_current;
-    r->done   = 0;
-    r->result = 0;
-    r->page_count = 0;
-    r->first_page_offset = 0;
-    __asm__ volatile("" ::: "memory");  // ensure fields visible before tail bump
+    // Wake the I/O thread if it's parked.  The wake path is the
+    // kthread's own wait queue, not a direct sched_wake by name, so
+    // any future kthread identity (init-time restart) is handled
+    // transparently.
+    wait_queue_wake_all(&s_io_thread_wq);
 
-    s_req_tail = next_tail;
-
-    // Wake the I/O thread if it's sleeping.
-    if (s_io_thread) sched_wake(s_io_thread);
-
-    // Sleep until the I/O thread sets done=1 and wakes us.
-    while (!r->done)
-        sched_sleep();
-
-    return r->result;
+    ahci_wait_done(&r);
+    return r.result;
 }
 
 // ── Scatter-gather submit: resolve user pages and DMA directly ───────────
@@ -527,34 +635,29 @@ static uint8_t ahci_submit_sg(uint64_t lba, void* user_buf,
         pmm_pin(pin_addrs[i]);
     }
 
-    // Submit with scatter-gather.
-    uint8_t next_tail = (s_req_tail + 1) % AHCI_MAX_REQS;
-    while (next_tail == s_req_head)
-        sched_yield();
-
-    ahci_req_t* r = &s_req_ring[s_req_tail];
-    r->lba    = lba;
-    r->buf    = NULL;
-    r->count  = count;
-    r->write  = write;
-    r->waiter = g_current;
-    r->done   = 0;
-    r->result = 0;
-    r->page_count        = npages;
-    r->first_page_offset = first_off;
+    ahci_req_t r;
+    r.next              = NULL;
+    r.lba               = lba;
+    r.buf               = NULL;
+    r.count             = count;
+    r.write             = write;
+    r.waiter            = g_current;
+    r.done              = 0;
+    r.result            = 0;
+    r.page_count        = npages;
+    r.first_page_offset = first_off;
     for (uint32_t i = 0; i < npages; i++)
-        r->pages[i] = (uint8_t*)page_ptrs[i];
-    __asm__ volatile("" ::: "memory");
+        r.pages[i] = (uint8_t*)page_ptrs[i];
 
-    s_req_tail = next_tail;
-    if (s_io_thread) sched_wake(s_io_thread);
-    while (!r->done) sched_sleep();
+    ahci_req_push(&r);
+    wait_queue_wake_all(&s_io_thread_wq);
+    ahci_wait_done(&r);
 
     // Unpin after DMA is complete.
     for (uint32_t i = 0; i < npages; i++)
         pmm_unpin(pin_addrs[i]);
 
-    return r->result;
+    return r.result;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -583,6 +686,7 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
 
 void ahci_start_io_thread(void) {
     if (g_ahci_irq == 0xFF) return;  // no MSI — stay in polling mode
+    wait_queue_init(&s_io_thread_wq);
     s_io_thread = task_create_kthread(ahci_io_thread, pid_alloc());
     if (s_io_thread) sched_add(s_io_thread);
 }
