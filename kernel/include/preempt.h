@@ -46,42 +46,46 @@
 //      to N→N+1.
 //
 // These functions are marked ALWAYS_INLINE so they compile to literal
-// single instructions at every call site, regardless of -O level.  Early
-// boot is safe because g_cpus[] is BSS-zeroed.
+// single-instruction operations at every call site.  After the cpu.h
+// gs-relative refactor:
+//
+//   preempt_disable()  →  incl %gs:offset(preempt_depth)
+//   preempt_enable()   →  decl %gs:offset(preempt_depth)  + setnz
+//                        + maybe-call sched_preempt
+//
+// That's literally one ~1-cycle instruction on the common path.  No
+// indirection through this_cpu(), no register pressure, no memory
+// load to fetch the cpu_t pointer.
 
 // sched_preempt lives in sched.c; declared here so preempt_enable can
 // call it from the inline body.
 void sched_preempt(void);
 
 ALWAYS_INLINE void preempt_disable(void) {
-    // `incl [mem]`: single-instruction atomic w.r.t. IRQs on this CPU.
-    __asm__ volatile("incl %0"
-                     : "+m"(this_cpu()->preempt_depth)
-                     :
-                     : "memory");
+    // `incl %gs:offset` — single instruction, single cycle.  Atomic
+    // against IRQs on this CPU (x86 never preempts mid-instruction);
+    // no LOCK prefix because the memory is per-CPU.
+    this_cpu_inc_u32(preempt_depth);
 }
 
 ALWAYS_INLINE void preempt_enable(void) {
-    volatile uint32_t* p = &this_cpu()->preempt_depth;
+    // Defensive: ignore imbalanced calls.  Reading the field via a
+    // gs-relative load is one instruction; the branch predicts
+    // not-taken in the common case (counter > 0 about to drop to 0).
+    if (UNLIKELY(this_cpu_read_u32(preempt_depth) == 0)) return;
 
-    // Defensive: ignore imbalanced calls.  Outside the inline asm so it
-    // doesn't bloat the fast path — one branch that predicts not-taken.
-    if (UNLIKELY(*p == 0)) return;
+    // `decl %gs:offset; setnz %al` — atomic post-decrement on this
+    // CPU's counter, captures whether the result is non-zero in one
+    // instruction pair.  No LOCK prefix.
+    uint8_t nonzero = this_cpu_dec_u32_nonzero(preempt_depth);
 
-    // `decl [mem]` sets ZF=1 iff the post-decrement value is zero.
-    // Capture ZF via setnz to decide whether to invoke sched_preempt.
-    uint8_t nonzero;
-    __asm__ volatile("decl %0\n\tsetnz %1"
-                     : "+m"(*p), "=r"(nonzero)
-                     :
-                     : "memory", "cc");
-
-    // Depth just hit zero — if the scheduler wanted to preempt us while
-    // we were in the critical section, do the context switch now.
+    // Depth just hit zero — if the scheduler wanted to preempt us
+    // while we were in the critical section, do the context switch
+    // now.
     if (!nonzero) sched_preempt();
 }
 
 // Returns non-zero if preemption is currently disabled on this CPU.
 ALWAYS_INLINE int preempt_disabled(void) {
-    return this_cpu()->preempt_depth > 0;
+    return this_cpu_read_u32(preempt_depth) > 0;
 }
