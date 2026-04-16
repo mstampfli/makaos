@@ -122,9 +122,13 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                 return 0;
             }
 
-            // Zero the frame.
+            // Zero the frame with one rep stosb instead of 4096 byte
+            // stores from a plain C loop — the latter was measurably
+            // slow on TCG for a ~2 MiB bash ELF (500 pages × 4 KiB
+            // zero + up to 4 KiB copy = multi-MiB of byte-at-a-time
+            // loads/stores per exec).
             uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-            for (int j = 0; j < (int)PAGE_SIZE; j++) fptr[j] = 0;
+            __builtin_memset(fptr, 0, PAGE_SIZE);
 
             // Copy file data that falls in this page.
             virt_addr_t page_end = page + PAGE_SIZE;
@@ -143,7 +147,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                 if (file_off + nbytes <= size) {
                     const uint8_t* src = data + file_off;
                     uint8_t* dst = fptr + frame_off;
-                    for (uint64_t b = 0; b < nbytes; b++) dst[b] = src[b];
+                    __builtin_memcpy(dst, src, nbytes);
                 }
             }
 
@@ -245,7 +249,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
     uint8_t* kbuf = (uint8_t*)kmalloc(pages * PAGE_SIZE);
     if (!kbuf) return 0;
     // Zero the kernel shadow buffer.
-    for (uint64_t b = 0; b < pages * PAGE_SIZE; b++) kbuf[b] = 0;
+    __builtin_memset(kbuf, 0, pages * PAGE_SIZE);
 
     // Map each page.
     for (uint64_t p = 0; p < pages; p++) {
@@ -253,7 +257,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
         if (frame == PMM_INVALID_ADDR) { kfree(kbuf); return 0; }
         // Zero the physical frame.
         uint8_t* fp = (uint8_t*)(frame + HHDM_OFFSET);
-        for (uint32_t j = 0; j < PAGE_SIZE; j++) fp[j] = 0;
+        __builtin_memset(fp, 0, PAGE_SIZE);
         vmm_page_map(pml4, ubase + p * PAGE_SIZE, frame, VMM_UDATA);
     }
 
@@ -291,8 +295,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
     for (int32_t i = (int32_t)envc - 1; i >= 0; i--) {
         uint64_t l = 0; while (envp[i][l]) l++; l++;
         off -= l;
-        const uint8_t* src = (const uint8_t*)envp[i];
-        for (uint64_t b = 0; b < l; b++) kbuf[off + b] = src[b];
+        __builtin_memcpy(kbuf + off, envp[i], l);
         envp_va[i] = ubase + off;
     }
     envp_va[envc] = 0;
@@ -301,8 +304,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
     for (int32_t i = (int32_t)argc - 1; i >= 0; i--) {
         uint64_t l = 0; while (argv[i][l]) l++; l++;
         off -= l;
-        const uint8_t* src = (const uint8_t*)argv[i];
-        for (uint64_t b = 0; b < l; b++) kbuf[off + b] = src[b];
+        __builtin_memcpy(kbuf + off, argv[i], l);
         argv_va[i] = ubase + off;
     }
     argv_va[argc] = 0;
@@ -358,7 +360,7 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
         if (frame == PMM_INVALID_ADDR) { kfree(argv_va); kfree(envp_va); kfree(kbuf); return 0; }
         uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
         const uint8_t* src = kbuf + p * PAGE_SIZE;
-        for (uint32_t b = 0; b < PAGE_SIZE; b++) dst[b] = src[b];
+        __builtin_memcpy(dst, src, PAGE_SIZE);
     }
 
     kfree(argv_va);
