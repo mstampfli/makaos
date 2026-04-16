@@ -153,14 +153,26 @@ static inline void fb_term_putc_locked(char c) {
     g_fb_col++;
 }
 
+// Non-IRQ-masking lock.  We previously used spin_lock_irqsave to also
+// serialise against the panic path (#PF / #GP / #DF dumping to fb from
+// inside an IRQ handler).  The problem: fb_term_scroll is a ~2.5 MiB
+// framebuffer memcpy (~50-100 ms under TCG), and keeping it under cli
+// starved timer IRQs on this CPU for that entire window — long enough
+// to freeze `ls` when it scrolled many lines back-to-back.  On the
+// panic path we can accept briefly garbled output; a 100 ms kernel-
+// wide IRQ blackout cannot be accepted on the hot write() path.
+//
+// preempt_disable stops this CPU from being switched mid-copy (so the
+// lock is never held across a context switch); remote CPUs contend on
+// the spinlock as normal.  Panic paths don't call these wrappers: they
+// use fb_panic_str which writes pixels directly without taking the
+// lock, which is the correct behaviour for a dying kernel anyway.
 void fb_term_putc(char c) {
-    // IRQ-safe spinlock: serialises fb_term across CPUs AND across the
-    // panic path that runs inside IRQ handlers (#PF, #GP).  preempt_disable
-    // alone is not enough — it only blocks the LOCAL CPU from switching
-    // tasks, it has no effect on a remote CPU writing the same pixels.
-    uint64_t flags = spin_lock_irqsave(&g_fb_lock);
+    preempt_disable();
+    spin_lock(&g_fb_lock);
     fb_term_putc_locked(c);
-    spin_unlock_irqrestore(&g_fb_lock, flags);
+    spin_unlock(&g_fb_lock);
+    preempt_enable();
 }
 
 // Batched writer: take the fb lock once for the whole user buffer
@@ -169,8 +181,10 @@ void fb_term_putc(char c) {
 // `len` lock/unlock cycles.
 void fb_term_write(const char* buf, uint64_t len) {
     if (!buf || !len) return;
-    uint64_t flags = spin_lock_irqsave(&g_fb_lock);
+    preempt_disable();
+    spin_lock(&g_fb_lock);
     for (uint64_t i = 0; i < len; i++)
         fb_term_putc_locked(buf[i]);
-    spin_unlock_irqrestore(&g_fb_lock, flags);
+    spin_unlock(&g_fb_lock);
+    preempt_enable();
 }
