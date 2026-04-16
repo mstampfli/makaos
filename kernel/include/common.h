@@ -97,12 +97,31 @@ static inline void serial_unlock_irqrestore(uint64_t rflags) {
     if (rflags & (1ull << 9)) __asm__ volatile("sti");
 }
 
-// Raw unlocked primitive — only callable while holding the serial lock.
+// Raw unlocked primitive — only callable while holding the serial lock,
+// or from early boot / panic paths where the system is already dead.
 static inline void serial_raw_putc(char c) {
     while (!(inb(0x3F8 + 5) & 0x20));
     outb(0x3F8, (uint8_t)c);
 }
 
+// ── Debug serial output — gated by KERNEL_DEBUG_SERIAL ──────────────────
+//
+// serial_*_dbg helpers write to port 0x3F8 under g_serial_lock.  Cheap
+// individually, but scattered through the syscall dispatch (spawn,
+// socket, bind, listen, accept, connect, shm_open, fb_map, …), every
+// app startup or connect() goes through dozens of them.  At ~10 KB/s
+// serial bandwidth, that alone makes ps scroll visibly.
+//
+// KERNEL_DEBUG_SERIAL = 0 compiles every serial_*_dbg call to a no-op;
+// call sites are still valid syntax, but produce zero instructions.
+// Flip to 1 when you actively want kernel trace in serial.txt.
+//
+// This gate does NOT silence the PF-KILL handler in vmm.c, which uses
+// its own local ser_str / ser_hex64 helpers — those are always on
+// because they're the only diagnostic we get from a fatal crash.
+#define KERNEL_DEBUG_SERIAL 0
+
+#if KERNEL_DEBUG_SERIAL
 static inline void serial_putc_dbg(char c) {
     uint64_t f = serial_lock_irqsave();
     serial_raw_putc(c);
@@ -124,6 +143,11 @@ static inline void serial_hex_dbg(uint64_t v) {
     serial_raw_putc('\n');
     serial_unlock_irqrestore(f);
 }
+#else
+static inline void serial_putc_dbg(char c)         { (void)c; }
+static inline void serial_puts_dbg(const char* s)  { (void)s; }
+static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
+#endif
 
 #define KERNEL_CS    0x08   // kernel code segment selector
 #define KERNEL_SS    0x10   // kernel data/stack segment selector
