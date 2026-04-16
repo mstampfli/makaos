@@ -144,8 +144,19 @@ typedef struct {
 // Statically allocated by the subsystem that wants keyboard events.
 // Register once at init; the core keeps a pointer (no heap allocation).
 
+// Handler flag bits.
+//
+// INPUT_HANDLER_CONSOLE marks the kernel console TTY's handler.  When a
+// userland grabber is active (e.g. a GUI compositor opens /dev/input/event0
+// to consume raw events), console handlers are skipped so VINTR/VSUSP/ECHO
+// on tty0 doesn't fire from keystrokes the compositor owns.  Mirrors the
+// Linux KD_GRAPHICS model where the console stops reacting to keyboard
+// input while X/Wayland holds the device.
+#define INPUT_HANDLER_CONSOLE  (1u << 0)
+
 typedef struct input_handler_t {
     const char* name;                            // for debugging
+    uint32_t    flags;                           // INPUT_HANDLER_*
     void (*event)(const kbd_event_t*, void*);    // called per event
     void* data;                                  // passed back to event()
     struct input_handler_t* next;                // internal list linkage
@@ -159,5 +170,14 @@ void input_register_handler(input_handler_t* h);
 void input_unregister_handler(input_handler_t* h);
 
 // Called by the keyboard driver (from the keyboard thread, process context).
-// Iterates all registered handlers synchronously.
+// Iterates all registered handlers synchronously, honouring the grab
+// counter (console handlers skipped while grabbed).
 void input_emit(const kbd_event_t* ev);
+
+// ── Keyboard grab ────────────────────────────────────────────────────────
+// Bump the grab refcount when a userland process takes exclusive ownership
+// of keyboard input (currently: any open fd on /dev/input/event0).  Drop it
+// on close.  While non-zero, console-flagged handlers do not see events.
+// Safe against concurrent open/close via __atomic_* on a uint32_t.
+void input_kbd_grab(void);
+void input_kbd_ungrab(void);
