@@ -138,8 +138,9 @@ void shmem_unref(shmem_t* shm) {
 
     // Defer the physical-page and struct free until the current RCU
     // grace period ends so any concurrent shmem_ns_find reader that
-    // observed this pointer has dropped out.
-    call_rcu(shmem_free_rcu, shm);
+    // observed this pointer has dropped out.  Expedited: invoked from
+    // the last close() or last unmap of a shm fd — user-syscall latency.
+    call_rcu_expedited(shmem_free_rcu, shm);
 }
 
 // ── shmem_get_page ───────────────────────────────────────────────────────

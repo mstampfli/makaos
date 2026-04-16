@@ -258,9 +258,10 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
         did_work = 1;
         if (v->start >= start && v->end <= end) {
             // Case 1: entirely covered — unlink via rcu_assign_pointer,
-            // then defer the free.
+            // then defer the free.  Expedited: mm_vma_remove is called
+            // from munmap / MAP_FIXED replace, user-syscall return path.
             rcu_assign_pointer(*pp, v->next);
-            call_rcu(vma_free_rcu, v);
+            call_rcu_expedited(vma_free_rcu, v);
             continue;
         }
         if (v->start < start && v->end > end) {

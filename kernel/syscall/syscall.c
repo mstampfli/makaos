@@ -461,7 +461,8 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
         if (v->start == heap_vma_start) {
             if (new_brk <= heap_vma_start) {
                 rcu_assign_pointer(*pp, v->next);
-                call_rcu(vma_free_rcu, v);
+                // Expedited: user-visible brk() return latency matters.
+                call_rcu_expedited(vma_free_rcu, v);
             } else {
                 v->end = new_brk;  // in-place shrink — safe under RCU
             }
@@ -1433,7 +1434,8 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
             vma_t* v = *pp2;
             if (v->start == heap_start) {
                 rcu_assign_pointer(*pp2, v->next);
-                call_rcu(vma_free_rcu, v);
+                // Expedited: user-visible brk()/munmap return latency matters.
+                call_rcu_expedited(vma_free_rcu, v);
                 break;
             }
             pp2 = &v->next;

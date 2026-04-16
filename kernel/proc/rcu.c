@@ -191,6 +191,11 @@ void call_rcu(rcu_func_t func, void* data) {
     func(data);
 }
 
+void call_rcu_expedited(rcu_func_t func, void* data) {
+    synchronize_rcu_expedited();
+    func(data);
+}
+
 // ── Deferred kfree — convenience wrapper ──────────────────────────────
 // Used by anything that frees heap memory which may still be
 // referenced by a concurrent RCU reader (wait_queue_t drainer,
