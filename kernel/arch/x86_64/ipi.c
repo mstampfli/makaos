@@ -25,6 +25,7 @@
 #include "cpu.h"
 #include "sched.h"
 #include "smp.h"
+#include "tlb.h"
 
 // ── VEC_IPI_RESCHEDULE ──────────────────────────────────────────────────
 //
@@ -132,11 +133,10 @@ void ipi_call_handler(void) {
 
 // ── VEC_IPI_TLB_FLUSH ───────────────────────────────────────────────────
 //
-// Phase 9-5: no-op.  Phase 9-6 drains a per-CPU shootdown slot with
-// {start, end, flush_all, done_count} and invlpg's the range (or reloads
-// CR3 if flush_all).  Leaving the handler wired up now means enabling
-// the vector on the BSP in idt_init() doesn't explode the first time a
-// future caller tests it.
+// Phase 9-7 body: drain the per-CPU shootdown MPSC in tlb.c, run every
+// descriptor (invlpg for small ranges, CR3 reload for large/full), and
+// publish done back to each sender.  EOI was already issued by the asm
+// stub; we just do the work.
 void ipi_tlb_flush_handler(void) {
-    /* Phase 9-6 lands the real body. */
+    tlb_shootdown_drain();
 }
