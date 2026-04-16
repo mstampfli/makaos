@@ -146,6 +146,9 @@ static void evdev_vfs_close(vfs_file_t* self) {
             pp = &(*pp)->next;
         }
         kfree(c);
+        // Drop the grab taken in evdev_open.  Paired 1:1 with the open,
+        // so nested compositor fds refcount correctly.
+        input_kbd_ungrab();
     }
     kfree(self);
 }
@@ -183,6 +186,11 @@ vfs_file_t* evdev_open(void) {
     f->path[0]     = '\0';
 
     c->file = f;  // back-pointer for poll wakeups
+
+    // Grab the keyboard: while this fd is open the console stops reacting
+    // to keystrokes (see input_emit + INPUT_HANDLER_CONSOLE).  Paired with
+    // the ungrab in evdev_vfs_close.
+    input_kbd_grab();
 
     return f;
 }
