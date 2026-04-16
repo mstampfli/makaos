@@ -82,78 +82,100 @@ static uint8_t  s_mounted         = 0;
 // for indirect blocks (read once per file, hit cache on every subsequent
 // data block lookup) and repeated reads of the same data block.
 
-// ── Zero-copy block cache ────────────────────────────────────────────────
-// Direct-mapped, 256 slots × 4 KiB = 1 MiB BSS.  Block number % BCACHE_SIZE
-// picks the slot.  The hot read path (`bcache_get`) returns a pointer
-// straight into the cache — **no memcpy on a hit**.  The caller must
-// `bcache_put` the returned ref when done, which drops the per-slot pin
-// count so a concurrent writer can eventually refill that slot.
+// ── Zero-copy block cache — N-way set-associative ───────────────────────
 //
-// Correctness protocol (pin + double-check):
+// 64 sets × 4 ways = 256 slots × 4 KiB = 1 MiB BSS (same total size as the
+// old direct-mapped layout).  Block → set index is `blk & (NSETS-1)`; the
+// 4 ways within a set are searched linearly on lookup and LRU-evicted on
+// miss.  This eliminates the direct-mapped thrash where two hot blocks
+// with the same low-order bits collide forever — measured as visible
+// ~0.3 s stalls on workloads like `ls /bin` where the directory inode
+// block and a file inode block mapped to the same slot.
 //
-//   Reader:                         Writer (bcache_fill):
-//     pin++                           trylock(wlock)
-//     smp_mb                          if (pin != 0)        unlock & skip
-//     if (tag == blk) return          save old_tag
-//     pin--                           tag = INVALID        // poison
-//                                     smp_mb
-//                                     if (pin != 0) {      // lost the race
-//                                         tag = old_tag
-//                                         unlock & skip
-//                                     }
-//                                     memcpy(data, src)
-//                                     smp_wmb
-//                                     tag = blk
-//                                     unlock
+// Per-way state (bcache_way_t) is unchanged in protocol from the old
+// direct-mapped bcache_meta_t: a trylock for writer mutual exclusion, an
+// atomic `tag`, and an atomic reader `pin` count so the hot reader path
+// stays zero-copy and lock-free.
 //
-// Race proof sketch: if reader's (pin++; mb; tag_load) ordering places
-// pin++ before writer's (tag_store_INVALID; mb; pin_load), then writer's
-// second pin_load sees the reader's pin and bails (tag restored; reader
-// sees old tag, either matches or not, no torn data).  If pin++ is after
-// writer's mb, then reader's tag_load is after writer's tag_store_INVALID
-// by program order through the mb — reader sees INVALID and bails.
-// Either way, reader never returns a pointer into a slot that is being
-// rewritten.
+// LRU: per-way `last_use` — a monotonically-increasing uint64 bumped on
+// every hit.  On miss, eviction picks the unpinned way with the smallest
+// `last_use`.  If every way is pinned we fall back to the scratch buffer
+// (miss still satisfies the caller) and drop the cache update — matches
+// old behaviour when a pinned slot blocks a fill.
 //
-// On slot conflict (writer finds pinned slot holding a different block),
-// the writer silently drops the cache update — next reader will miss and
-// re-fetch from disk.  Writers (miss-fill, write-back, readahead) are
-// rare compared to reads, so the dropped update is harmless.
+// Correctness protocol (unchanged per way): pin + double-check, see the
+// sequence below.  Because each way has its own meta, two different ways
+// of the same set can be updated independently with no contention.
+//
+//   Reader (one way):              Writer (bcache_fill_way):
+//     pin++                          trylock(wlock)
+//     smp_mb                         if (pin != 0)           unlock & skip
+//     if (tag == blk) return         save old_tag
+//     pin--                          tag = INVALID      // poison
+//                                    smp_mb
+//                                    if (pin != 0) {    // lost the race
+//                                        tag = old_tag
+//                                        unlock & skip
+//                                    }
+//                                    memcpy(data, src)
+//                                    smp_wmb
+//                                    tag = blk
+//                                    unlock
+//
+// The lookup pass over the 4 ways performs one pin++/tag-load/pin-- per
+// way until the matching tag is found.  4 atomics in the miss case is a
+// cheap tax compared to one disk round-trip (tens of thousands of cycles).
 
-#define BCACHE_SIZE    256u
+#define BCACHE_NSETS   64u    // power of 2
+#define BCACHE_WAYS    4u
+#define BCACHE_SIZE    (BCACHE_NSETS * BCACHE_WAYS)
 #define BCACHE_INVALID 0xFFFFFFFFu
 
 typedef struct {
-    spinlock_t wlock;      // writer mutual exclusion (trylock only)
-    uint32_t   tag;        // block number, BCACHE_INVALID = empty
-    uint32_t   pin;        // atomic: number of active readers holding data[]
-} bcache_meta_t;
+    spinlock_t wlock;          // writer mutual exclusion (trylock only)
+    uint32_t   tag;            // block number, BCACHE_INVALID = empty
+    uint32_t   pin;            // atomic: number of active readers holding data[]
+    uint64_t   last_use;       // LRU counter — bumped on each hit
+} bcache_way_t;
 
-static uint8_t       s_bcache_data[BCACHE_SIZE][4096];
-static bcache_meta_t s_bcache_meta[BCACHE_SIZE];
+static uint8_t      s_bcache_data[BCACHE_NSETS][BCACHE_WAYS][4096];
+static bcache_way_t s_bcache_meta[BCACHE_NSETS][BCACHE_WAYS];
+// Global monotonic LRU clock — bumped on every hit.  Atomic because many
+// readers may tick it concurrently.  Overflow is safe (we compare by
+// subtraction wrapping through uint64 — 2^64 hits is not reachable).
+static volatile uint64_t s_bcache_clock;
 
 // Handle returned by bcache_get.  Caller keeps it on the stack and passes
 // a pointer to bcache_put when done.  `data` is NULL on I/O error.
 typedef struct {
-    const uint8_t* data;    // either the pinned cache slot or `scratch`
+    const uint8_t* data;    // either the pinned cache way or `scratch`
     uint32_t       blk;
-    uint8_t        pinned;  // 1 = release holds a slot pin; 0 = scratch fallback
+    uint16_t       set;     // which set the pin was taken from
+    uint16_t       way;     // which way within the set
+    uint8_t        pinned;  // 1 = release holds a way pin; 0 = scratch fallback
 } bcache_ref_t;
 
+static inline uint32_t bcache_set_of(uint32_t blk) {
+    return blk & (BCACHE_NSETS - 1u);
+}
+
 static void bcache_init(void) {
-    for (uint32_t i = 0; i < BCACHE_SIZE; i++) {
-        spin_lock_init(&s_bcache_meta[i].wlock);
-        s_bcache_meta[i].tag = BCACHE_INVALID;
-        s_bcache_meta[i].pin = 0;
+    for (uint32_t s = 0; s < BCACHE_NSETS; s++) {
+        for (uint32_t w = 0; w < BCACHE_WAYS; w++) {
+            spin_lock_init(&s_bcache_meta[s][w].wlock);
+            s_bcache_meta[s][w].tag      = BCACHE_INVALID;
+            s_bcache_meta[s][w].pin      = 0;
+            s_bcache_meta[s][w].last_use = 0;
+        }
     }
 }
 
-// Publish fresh data into a cache slot.  Silently skips on conflict: if
-// the slot is currently pinned by any reader, the update is dropped and
-// the caller's data lives only in their buffer.
-static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
-    uint32_t slot = blk % BCACHE_SIZE;
-    bcache_meta_t* m = &s_bcache_meta[slot];
+// Publish fresh data into a specific way of a specific set.  Silently
+// skips on conflict: if the way is currently pinned by any reader, the
+// update is dropped and the caller's data lives only in their buffer.
+static void bcache_fill_way(uint32_t set, uint32_t way, uint32_t blk,
+                             const uint8_t* data, uint32_t len) {
+    bcache_way_t* m = &s_bcache_meta[set][way];
     if (!spin_trylock(&m->wlock)) return;
     if (__atomic_load_n(&m->pin, __ATOMIC_ACQUIRE) != 0) {
         spin_unlock(&m->wlock);
@@ -168,10 +190,41 @@ static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
         spin_unlock(&m->wlock);
         return;
     }
-    __builtin_memcpy(s_bcache_data[slot], data, len);
+    __builtin_memcpy(s_bcache_data[set][way], data, len);
     smp_wmb();                                    // data stores retire before tag publish
     m->tag = blk;
     spin_unlock(&m->wlock);
+}
+
+// Top-level fill: pick an unpinned LRU way in `blk`'s set and publish
+// there.  If no way is unpinned (4 readers on 4 different blocks, rare)
+// the update is dropped — no correctness impact.
+static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
+    uint32_t set = bcache_set_of(blk);
+
+    // Prefer an empty/invalid way first — no eviction cost.
+    uint32_t victim = BCACHE_WAYS;
+    uint64_t oldest = ~(uint64_t)0;
+    for (uint32_t w = 0; w < BCACHE_WAYS; w++) {
+        bcache_way_t* m = &s_bcache_meta[set][w];
+        if (__atomic_load_n(&m->tag, __ATOMIC_RELAXED) == BCACHE_INVALID
+            && __atomic_load_n(&m->pin, __ATOMIC_RELAXED) == 0) {
+            victim = w;
+            break;
+        }
+    }
+    // Otherwise: LRU-unpinned.
+    if (victim == BCACHE_WAYS) {
+        for (uint32_t w = 0; w < BCACHE_WAYS; w++) {
+            bcache_way_t* m = &s_bcache_meta[set][w];
+            if (__atomic_load_n(&m->pin, __ATOMIC_RELAXED) != 0) continue;
+            uint64_t lu = m->last_use;
+            if (lu < oldest) { oldest = lu; victim = w; }
+        }
+    }
+    if (victim >= BCACHE_WAYS) return;  // all 4 ways pinned → drop.
+
+    bcache_fill_way(set, victim, blk, data, len);
 }
 
 // Acquire a block.  On a cache hit, `ref.data` points directly into the
@@ -182,20 +235,26 @@ static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
 // Returns `ref.data == NULL` on I/O error.  Caller must `bcache_put(&ref)`
 // on success to drop any held pin.
 static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
-    bcache_ref_t r = { NULL, blk, 0 };
-    uint32_t slot = blk % BCACHE_SIZE;
-    bcache_meta_t* m = &s_bcache_meta[slot];
+    bcache_ref_t r = { NULL, blk, 0, 0, 0 };
+    uint32_t set = bcache_set_of(blk);
 
-    // Fast path — optimistic pin, then verify the tag.  On x86 the
-    // atomic_fetch_add is a single `lock xadd` and implies a full barrier.
-    __atomic_fetch_add(&m->pin, 1u, __ATOMIC_ACQ_REL);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&m->tag, __ATOMIC_ACQUIRE) == blk) {
-        r.data   = s_bcache_data[slot];
-        r.pinned = 1;
-        return r;
+    // Fast path — walk the 4 ways, optimistic pin + verify tag.
+    for (uint32_t w = 0; w < BCACHE_WAYS; w++) {
+        bcache_way_t* m = &s_bcache_meta[set][w];
+        __atomic_fetch_add(&m->pin, 1u, __ATOMIC_ACQ_REL);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&m->tag, __ATOMIC_ACQUIRE) == blk) {
+            // Hit.  Bump LRU and return the pinned way.
+            m->last_use = __atomic_add_fetch(&s_bcache_clock, 1u,
+                                               __ATOMIC_RELAXED);
+            r.data   = s_bcache_data[set][w];
+            r.set    = (uint16_t)set;
+            r.way    = (uint16_t)w;
+            r.pinned = 1;
+            return r;
+        }
+        __atomic_fetch_sub(&m->pin, 1u, __ATOMIC_RELEASE);
     }
-    __atomic_fetch_sub(&m->pin, 1u, __ATOMIC_RELEASE);
 
     // Slow path — go to disk.
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
@@ -207,8 +266,8 @@ static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
 
 static void bcache_put(bcache_ref_t* r) {
     if (r->pinned) {
-        uint32_t slot = r->blk % BCACHE_SIZE;
-        __atomic_fetch_sub(&s_bcache_meta[slot].pin, 1u, __ATOMIC_RELEASE);
+        __atomic_fetch_sub(&s_bcache_meta[r->set][r->way].pin, 1u,
+                           __ATOMIC_RELEASE);
         r->pinned = 0;
     }
     r->data = NULL;
