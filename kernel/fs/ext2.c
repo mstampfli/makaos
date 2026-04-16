@@ -894,8 +894,8 @@ static int64_t ext2_vfs_seek(vfs_file_t* self, int64_t offset, int whence) {
 }
 
 static void ext2_vfs_close(vfs_file_t* self) {
-    if (self->ctx) kfree_rcu(self->ctx);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    if (self->ctx) kfree(self->ctx);
+    kfree(self);
 }
 
 // ── ext2_open ──────────────────────────────────────────────────────────────

@@ -81,42 +81,23 @@ int evdev_getraw(uint8_t* buf, int max) {
 
 static void evdev_on_event(const kbd_event_t* kbd, void* data) {
     (void)data;
-
-    // Always push raw scancode for /dev/kbdraw consumers.
     raw_push(kbd->scancode);
-
-    serial_puts_dbg("[evdev] emit key=");
-    serial_hex_dbg((uint64_t)kbd->keycode);
-
-    if (!s_clients) {
-        serial_puts_dbg("[evdev] no clients\n");
-        return;
-    }
-
-    // Build a Linux-compatible input_event.
+    if (!s_clients) return;
     input_event_t ev = {
         .time_ns = tsc_read_ns(),
         .type    = EV_KEY,
         .code    = kbd->keycode,
         .value   = kbd->pressed ? 1 : 0,
     };
-
-    // Fan out to every open /dev/input/event0 client.
     for (evdev_client_t* c = s_clients; c; c = c->next) {
         ring_push(c, &ev);
         input_event_t syn = { .time_ns = ev.time_ns, .type = EV_SYN, .code = 0, .value = 0 };
         ring_push(c, &syn);
-        serial_puts_dbg("[evdev] ring_push head=");
-        serial_hex_dbg((uint64_t)c->head);
         if (c->reader) {
             sched_wake(c->reader);
             c->reader = NULL;
         }
-        if (c->file) {
-            serial_puts_dbg("[evdev] wake_all waitq=");
-            serial_hex_dbg((uint64_t)c->file->waitq);
-            wait_queue_wake_all(c->file->waitq);
-        }
+        if (c->file) wait_queue_wake_all(c->file->waitq);
     }
 }
 
@@ -164,9 +145,9 @@ static void evdev_vfs_close(vfs_file_t* self) {
             if (*pp == c) { *pp = c->next; break; }
             pp = &(*pp)->next;
         }
-        kfree_rcu(c);
+        kfree(c);
     }
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    kfree(self);
 }
 
 // ── evdev_open ────────────────────────────────────────────────────────────

@@ -87,9 +87,9 @@ static int64_t membuf_seek(vfs_file_t* self, int64_t offset, int whence) {
 
 static void membuf_close(vfs_file_t* self) {
     membuf_ctx_t* ctx = (membuf_ctx_t*)self->ctx;
-    kfree_rcu(ctx->buf);
-    kfree_rcu(ctx);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    kfree(ctx->buf);
+    kfree(ctx);
+    kfree(self);
 }
 
 // Wrap a heap buffer in a vfs_file_t.  Takes ownership of buf.

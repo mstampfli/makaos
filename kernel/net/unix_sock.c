@@ -285,7 +285,7 @@ static void unix_sock_free_rcu(void* data) {
 
 void unix_sock_close(vfs_file_t* self) {
     unix_sock_t* s = (unix_sock_t*)self->ctx;
-    if (!s) { kfree_rcu(self); return; }
+    if (!s) { kfree(self); return; }
 
     // Unpublish from the namespace first so new ns_find() cannot observe
     // the sock after this point.  Readers that observed the sock in a
@@ -295,7 +295,7 @@ void unix_sock_close(vfs_file_t* self) {
         ns_remove(s->path);
 
     call_rcu(unix_sock_free_rcu, s);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    kfree(self);
 }
 
 // ── unix_sock_open ───────────────────────────────────────────────────────

@@ -180,11 +180,7 @@ int task_wake_func(wake_entry_t* we) {
 
 int epoll_wake_func(wake_entry_t* we) {
     epoll_we_t* ewe = (epoll_we_t*)we;
-    serial_puts_dbg("[ewake] wq=");
-    serial_hex_dbg((uint64_t)ewe->epoll_wq);
     __atomic_store_n(ewe->p_has_ready, 1, __ATOMIC_RELEASE);
-    serial_puts_dbg("[ewake] wake_state_wq\n");
     wait_queue_wake_all(ewe->epoll_wq);
-    serial_puts_dbg("[ewake] done\n");
     return WQ_KEEP;
 }
