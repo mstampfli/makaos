@@ -3477,16 +3477,6 @@ static void epoll_watch_free_rcu(void* data) {
 // RCU free helper for epoll_state_t (closing epoll fd).  The state is
 // referenced by every epoll_we_t as `ewe->p_has_ready = &state->has_ready`
 // and `ewe->epoll_wq = &state->wq`.  A concurrent wait_queue_wake_all
-// draining a watched fd's waitq may be running epoll_wake_func on an
-// entry that points into state — we must not free state until every
-// such drainer has finished.  Same RCU grace period that covers the
-// epoll_watch_t frees also covers state.
-static void epoll_state_free_rcu(void* data) {
-    epoll_state_t* state = (epoll_state_t*)data;
-    kfree(state->slots);
-    kfree(state);
-}
-
 // VFS ops for the epoll fd itself.
 static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
@@ -3509,10 +3499,8 @@ static void epoll_close(vfs_file_t* self) {
             epoll_watch_unregister(w, f);
             call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
         }
-        // Defer state free too — epoll_we_t entries in watched-fd waitqs
-        // still point into state->wq / state->has_ready until the
-        // grace period elapses.  Same grace period as the watches above.
-        call_rcu(epoll_state_free_rcu, state);
+        kfree(state->slots);
+        kfree(state);
     }
     kfree(self);
 }
@@ -3598,8 +3586,6 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         epoll_watch_register(state, w, wf);
         ep_ht_insert_raw(state->slots, state->cap, w);
         state->count++;
-        serial_puts_dbg("[epoll] ADD fd=");
-        serial_hex_dbg((uint64_t)(uint32_t)tfd);
         ret = 0;
         break;
     }
@@ -3613,8 +3599,6 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
         call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
-        serial_puts_dbg("[epoll] DEL fd=");
-        serial_hex_dbg((uint64_t)(uint32_t)tfd);
         ret = 0;
         break;
     }
@@ -3742,8 +3726,6 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
         __atomic_store_n(&state->has_ready, 0, __ATOMIC_RELAXED);
         task_we_init(&task_we, g_current);
         task_we_add(&state->wq, &task_we);
-        serial_puts_dbg("[epwait] add pid=");
-        serial_hex_dbg((uint64_t)g_current->pid);
 
         int ep_recheck = __atomic_load_n(&state->has_ready, __ATOMIC_ACQUIRE);
         if (!ep_recheck) {
@@ -3763,16 +3745,9 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             spin_unlock(&state->lock);
         }
         if (!ep_recheck) {
-            serial_puts_dbg("[epwait] sleep pid=");
-            serial_hex_dbg((uint64_t)g_current->pid);
             g_current->sleep_until_ns = infinite ? 0 : deadline;
             sched_sleep();
             g_current->sleep_until_ns = 0;
-            serial_puts_dbg("[epwait] wake pid=");
-            serial_hex_dbg((uint64_t)g_current->pid);
-        } else {
-            serial_puts_dbg("[epwait] skip-sleep pid=");
-            serial_hex_dbg((uint64_t)g_current->pid);
         }
         task_we_remove(&state->wq, &task_we);
 

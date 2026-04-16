@@ -542,7 +542,7 @@ static void pmm_buddy_free_locked(phys_addr_t addr, uint8_t order) {
 // at 1: any code path that reads stale bytes is broken regardless.
 // Frame zeroing is ~500 cycles per 4 KiB page (memset rep stosq);
 // dominated by the actual DRAM write bandwidth, not the loop.
-#define PMM_DEBUG_ALWAYS_ZERO 1
+#define PMM_DEBUG_ALWAYS_ZERO 0
 
 phys_addr_t pmm_buddy_alloc(uint8_t order) {
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);

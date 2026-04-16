@@ -72,8 +72,8 @@ static void pty_free_locked(pty_t* pty) {
     }
     serial_puts_dbg("[pty] free idx=");
     serial_hex_dbg((uint64_t)(uint32_t)pty->index);
-    if (pty->master_buf) kfree_rcu(pty->master_buf);
-    kfree_rcu(pty);
+    if (pty->master_buf) kfree(pty->master_buf);
+    kfree(pty);
 }
 
 // ── Ring buffer helpers (master read buffer) ─────────────────────────────
@@ -288,8 +288,8 @@ static void pty_master_close(vfs_file_t* self) {
     // notice master_open == 0 and bail out.
     wait_queue_wake_all(&pty->slave_drain_waitq);
 
-    kfree_rcu(ctx);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    kfree(ctx);
+    kfree(self);
 
     // If both sides are now closed, free the pty struct.
     if (pty->slave_open_count == 0)
@@ -423,8 +423,8 @@ static void pty_slave_close(vfs_file_t* self) {
     // Wake every master-side waiter so they observe EOF.
     wait_queue_wake_all(&pty->master_waitq);
 
-    kfree_rcu(ctx);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq
+    kfree(ctx);
+    kfree(self);
 
     // If both sides are now closed, free the pty struct.
     if (pty->slave_open_count == 0 && !pty->master_open)

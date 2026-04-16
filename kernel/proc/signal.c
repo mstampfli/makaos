@@ -36,20 +36,6 @@ void signal_send(task_t* t, int sig) {
     if (sig == SIGKILL)
         t->sigstate.blocked &= ~bit;
 
-    // Trace every non-SIGCHLD/SIGWINCH send so we can see which kernel
-    // path is sending fatal signals to bash/makaterm during the
-    // freeze investigation.  SIGCHLD / SIGWINCH are filtered because
-    // they spam on every command exit / window resize.
-    if (sig != SIGCHLD && sig != SIGWINCH) {
-        serial_puts_dbg("[sigsend] to=");
-        serial_hex_dbg((uint64_t)t->pid);
-        serial_puts_dbg("  sig=");
-        serial_hex_dbg((uint64_t)sig);
-        serial_puts_dbg("  from=");
-        serial_hex_dbg((uint64_t)(g_current ? g_current->pid : 0));
-        serial_puts_dbg("\n");
-    }
-
     // Set the pending bit atomically.  Coalesces repeat sends (classic POSIX).
     atomic_or(&t->sigstate.pending, bit);
 
@@ -239,23 +225,6 @@ void signal_deliver_pending(void) {
         fb_term_putc('\n');
         g_fb_fg = saved_fg;
     }
-
-    // Always trace to serial so we can see silent fatal kills
-    // (SIGKILL/SIGTERM/SIGPIPE/SIGHUP/SIGINT/SIGTTIN/SIGTTOU/etc.)
-    // during the pty/makaterm freeze investigation.  This uses the
-    // locked serial_puts_dbg helpers so it's SMP-safe.
-    serial_puts_dbg("[fatal] pid=");
-    serial_hex_dbg((uint64_t)g_current->pid);
-    serial_puts_dbg("  sig=");
-    serial_hex_dbg((uint64_t)sig);
-    serial_puts_dbg("  comm=");
-    for (int i = 0; i < 15 && g_current->comm[i]; i++) {
-        // Route to the locked debug path one byte at a time for simplicity;
-        // this path is rare so the per-byte lock overhead is fine.
-        char buf[2] = { g_current->comm[i], 0 };
-        serial_puts_dbg(buf);
-    }
-    serial_puts_dbg("\n");
 
     // Reparent any children to init before we vanish.  Batched CAS
     // splice — see task_children_reparent in sched.c for the

@@ -7,7 +7,7 @@
 // Debug trace — flip to 0 for silent release.  See pty.c for the
 // PTT / PTT1 macros that use this.  Placed in the shared header so
 // pty.c and tty.c agree.
-#define PTY_TRACE 1
+#define PTY_TRACE 0
 
 // ── TTY subsystem ────────────────────────────────────────────────────────
 //

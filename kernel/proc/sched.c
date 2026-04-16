@@ -936,7 +936,7 @@ void sched_tick(void) {
     // still flowing) or a kernel wedge (some CPU's heartbeat stops).
     // Uses the locked serial_puts_dbg so SMP-safe.  Debug aid — flip
     // the #define to 0 to silence.
-#define SCHED_TICK_HEARTBEAT 1
+#define SCHED_TICK_HEARTBEAT 0
 #if SCHED_TICK_HEARTBEAT
     c->sched_ticks++;
     if ((c->sched_ticks & 0x3FF) == 0) {  // every 1024 ticks ≈ 1 sec at 1kHz
