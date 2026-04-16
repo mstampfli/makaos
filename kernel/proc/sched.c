@@ -128,10 +128,13 @@ static pid_ht_state_t* pid_ht_grow_locked(pid_ht_state_t* old,
 }
 
 // Reclaim an old pid_ht_state_t after a grow.  Must be called with the
-// writer lock NOT held, because synchronize_rcu may yield.
+// writer lock NOT held, because synchronize_rcu may yield.  Uses the
+// expedited grace period — pid_ht_grow runs inside pid_ht_insert on
+// the user-syscall path (every task spawn), so sub-ms latency here
+// matters even though the grow itself is rare.
 static void pid_ht_reclaim_state(pid_ht_state_t* old) {
     if (!old) return;
-    synchronize_rcu();
+    synchronize_rcu_expedited();
     kfree(old->slots);
     kfree(old);
 }
