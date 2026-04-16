@@ -3567,7 +3567,7 @@ static void epoll_close(vfs_file_t* self) {
             vfs_file_t* f = (files && (uint32_t)w->fd < files->ft->cap)
                             ? files->ft->fd_table[w->fd] : NULL;
             epoll_watch_unregister(w, f);
-            call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
+            call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
         }
         kfree(state->slots);
         kfree(state);
@@ -3668,7 +3668,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         epoll_watch_unregister(w, wf);
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
-        call_rcu(epoll_watch_free_rcu, w);  // defer free — see commentary
+        call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
         ret = 0;
         break;
     }

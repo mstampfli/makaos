@@ -245,7 +245,7 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
                 if (nf == PMM_INVALID_ADDR) return 0;
                 uint8_t* s = (uint8_t*)(phys + HHDM_OFFSET);
                 uint8_t* d = (uint8_t*)(nf + HHDM_OFFSET);
-                for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+                __builtin_memcpy(d, s, PAGE_SIZE);
                 *pte = nf | leaf;
                 invlpg(va);
                 pmm_ref_dec(phys);
@@ -263,7 +263,7 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             phys_addr_t frame = pmm_buddy_alloc(0);
             if (frame == PMM_INVALID_ADDR) return 0;
             uint8_t* p = (uint8_t*)(frame + HHDM_OFFSET);
-            for (int b = 0; b < (int)PAGE_SIZE; b++) p[b] = 0;
+            __builtin_memset(p, 0, PAGE_SIZE);
             pte = vmm_pte_get(pml4_phys, va, 1, inter);
             if (!pte) { pmm_buddy_free(frame, 0); return 0; }
             *pte = frame | leaf;
@@ -450,7 +450,7 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
 
                         uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
                         uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
-                        for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+                        __builtin_memcpy(d, s, PAGE_SIZE);
 
                         dst_pt[si] = dst_frame | leaf_flags;
                         continue;
@@ -582,7 +582,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         }
                         uint8_t* s = (uint8_t*)(old_frame + HHDM_OFFSET);
                         uint8_t* d = (uint8_t*)(new_frame + HHDM_OFFSET);
-                        for (int b = 0; b < (int)PAGE_SIZE; b++) d[b] = s[b];
+                        __builtin_memcpy(d, s, PAGE_SIZE);
 
                         vmm_page_map(vmm_pml4_get(), page, new_frame,
                                      mm_vma_pte_flags(vma_flags));
