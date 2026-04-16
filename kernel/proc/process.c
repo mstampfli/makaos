@@ -88,7 +88,11 @@ uint8_t fd_table_grow(task_files_t* f) {
     __builtin_memcpy(neu->fd_flags, old->fd_flags, old_cap * sizeof(uint32_t));
 
     __atomic_store_n(&f->ft, neu, __ATOMIC_RELEASE);
-    call_rcu(fdtable_free_rcu, old);
+    // Expedited: fd_table_grow runs from inside open()/dup()/socket()
+    // on the user-syscall path.  The first few fds in a new process
+    // always hit this (FD_INITIAL_CAP=4), so login, shells, and every
+    // spawn pay the grace-period wait on the critical path.
+    call_rcu_expedited(fdtable_free_rcu, old);
     return 1;
 }
 
@@ -441,8 +445,8 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     // Copy parent's FPU/SSE state so fxrstor on the child doesn't #GP
     // on invalid MXCSR bits from uninitialized memory.
-    for (int _i = 0; _i < 512; _i++)
-        t->ctx.fxsave_buf[_i] = parent->ctx.fxsave_buf[_i];
+    __builtin_memcpy(t->ctx.fxsave_buf, parent->ctx.fxsave_buf,
+                     sizeof(t->ctx.fxsave_buf));
 
     return t;
 }

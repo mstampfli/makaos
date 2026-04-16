@@ -630,3 +630,23 @@ Committed state:
   deterministic pass/fail.
 - Next: Phase 9-7 (TLB shootdown) and 9-8 (work stealing + load
   balance).
+
+## Open issues (track, not block)
+
+### pty-bash freeze under spam (2026-04-16)
+
+- **Symptom:** the bash running inside makaterm (pty slave) occasionally
+  stops responding after sustained input.  Compositor and physical-
+  console bash stay responsive — not a global sched hang.  No PF-KILL,
+  no panic; bash simply stops reading more from the pty slave.
+- **Suspected location:** one of the Phase 9-6 canonical wait sites in
+  pty (slave_read / master_read / slave_write wake_master) or the tty
+  line-discipline wake path.  Both follow the 4-phase pattern but the
+  pty master fd and the tty slave fd share two wait queues the producer
+  must wake in both directions — one side may be getting missed.
+- **Repro:** open a bash in the display-manager terminal (makaterm),
+  type or paste for a while, occasionally freezes mid-line.
+- **Workaround:** kill the makaterm window and reopen.
+- **Not blocking 9-7 / 9-8 / expedited RCU.**  Independent of any
+  address-space / TLB / grace-period work; will be investigated with
+  targeted pty wait-queue tracing in a separate pass.
