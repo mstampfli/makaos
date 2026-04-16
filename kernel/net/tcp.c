@@ -551,8 +551,9 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
     }
     spin_unlock_irqrestore(&s_pcb_wlock, flags);
     // Defer the actual free until every in-flight reader has dropped
-    // its reference.
-    call_rcu(tcp_pcb_free_rcu, pcb);
+    // its reference.  Expedited: close() on a TCP socket releases its
+    // PCB here, on the user-syscall return path.
+    call_rcu_expedited(tcp_pcb_free_rcu, pcb);
 }
 
 int tcp_connect(tcp_pcb_t* pcb, uint32_t dst_ip_be, uint16_t dst_port) {

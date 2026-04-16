@@ -241,7 +241,9 @@ static void sock_close(vfs_file_t* self) {
     if (s->type == SOCK_DGRAM && s->bound)
         udp_table_remove(s->local_port);
 
-    call_rcu(sock_free_rcu, s);
+    // Expedited: this path is close() on an inet socket — user-syscall
+    // return blocks on the RCU grace period without it.
+    call_rcu_expedited(sock_free_rcu, s);
     kfree(self);
 }
 
