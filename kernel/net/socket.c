@@ -225,7 +225,7 @@ static void sock_free_rcu(void* data) {
 
 static void sock_close(vfs_file_t* self) {
     socket_t* s = (socket_t*)self->ctx;
-    if (!s) { kfree_rcu(self); return; }
+    if (!s) { kfree(self); return; }
 
     if (s->type == SOCK_STREAM && s->pcb) {
         // Detach the poll backpointer first so the TCP layer can't touch
@@ -242,7 +242,7 @@ static void sock_close(vfs_file_t* self) {
         udp_table_remove(s->local_port);
 
     call_rcu(sock_free_rcu, s);
-    kfree_rcu(self);  // vfs_file_t has embedded _waitq — same UAF window
+    kfree(self);
 }
 
 static int64_t sock_seek(vfs_file_t* self, int64_t offset, int whence) {
