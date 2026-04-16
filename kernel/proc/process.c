@@ -172,6 +172,13 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->wake_pending     = 0;
     t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
+    t->sigstate.sigframe_rsp = 0;
+    // Zero the whole handlers[] array.  task_t comes out of kmalloc
+    // uninitialised, so handlers[].sa_handler could hold slab garbage.
+    // On first signal delivery the kernel would treat that garbage as
+    // a canonical user pointer and iretq into non-canonical memory,
+    // #GP'ing the kernel.  SIG_DFL == 0 is exactly what memset gives us.
+    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     t->umask            = 0022u; // default umask: rwxr-xr-x
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
@@ -391,7 +398,15 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     t->mlfq_ticks_left  = 0;
     t->wake_pending     = 0;
     t->sigstate.pending = 0;
-    t->sigstate.blocked = 0;
+    // fork(): inherit the parent's signal mask and sigactions, matching
+    // POSIX.  exec() later clears user handlers back to SIG_DFL (see
+    // sys_exec).  Copy the whole handlers array so sa_mask/sa_flags
+    // come with; signum 0 is never used but copying it is free.
+    t->sigstate.blocked = parent->sigstate.blocked;
+    t->sigstate.sigframe_rsp = 0;
+    __builtin_memcpy(t->sigstate.handlers,
+                     parent->sigstate.handlers,
+                     sizeof(t->sigstate.handlers));
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) __builtin_memcpy(t->cwd, parent->cwd, KPATH_MAX);
     for (int _i = 0; _i < 16;  _i++) t->comm[_i] = parent->comm[_i];
