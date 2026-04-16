@@ -97,6 +97,24 @@ ALWAYS_INLINE void rcu_read_unlock(void) {
 // Panics if called with preempt_depth > 0.
 void synchronize_rcu(void);
 
+// ── synchronize_rcu_expedited ────────────────────────────────────────────
+// Same contract as synchronize_rcu() — returns only after every pre-
+// existing reader section has ended — but faster on SMP.  Instead of
+// waiting for each remote CPU to naturally pass through a quiescent
+// state (next tick, context switch, or idle hlt), the expedited path
+// IPIs every CPU with a no-op callback: the moment the IPI handler runs
+// with preempt_depth==0, the target has provably left any reader
+// section it was in when the grace period began.
+//
+// Latency: ~µs in the common "no reader active" case (just IPI RTT).
+// Worst case falls back to the classic wait loop — same as
+// synchronize_rcu().
+//
+// Use this from non-hot paths that care about latency (unveil / cred
+// updates from a user-visible syscall, signal handler rebuild, etc.).
+// Hot paths should prefer call_rcu() which is asynchronous entirely.
+void synchronize_rcu_expedited(void);
+
 // Asynchronous reclamation: after a grace period elapses, call
 // func(data).  Phase 2 implementation is synchronous (equivalent to
 // synchronize_rcu(); func(data);), which is correct but blocks the

@@ -26,6 +26,8 @@
 #include "sched.h"
 #include "smp.h"
 #include "tlb.h"
+#include "ipi.h"
+#include "lapic.h"
 
 // ── VEC_IPI_RESCHEDULE ──────────────────────────────────────────────────
 //
@@ -72,17 +74,8 @@ void ipi_reschedule_handler(void) {
 // kept minimal but complete so future users (TLB shootdown, cross-CPU
 // kick) just populate the queue and send the IPI — no further kernel
 // plumbing needed.
-typedef struct ipi_call_slot {
-    void     (*fn)(void*);
-    void*     arg;
-    volatile uint32_t done;     // 0 = pending, 1 = complete
-    struct ipi_call_slot* next;
-} ipi_call_slot_t;
-
 // Per-CPU MPSC head — senders push, owner pops in ipi_call_handler.
-// Lives here (not in cpu_t) because Phase 9-5 does not yet expose the
-// type to other subsystems; moving it into cpu.h after 9-6 is a no-op
-// rename.  Zero-initialised by BSS.
+// ipi_call_slot_t is defined in ipi.h (public API).  Zero-init by BSS.
 static ipi_call_slot_t* s_call_head[MAX_CPUS];
 
 // Push onto the target CPU's MPSC queue.  Lock-free via xchg on the
@@ -99,6 +92,27 @@ void smp_call_push(uint32_t cpu, ipi_call_slot_t* slot) {
             return;
         cpu_relax();
     }
+}
+
+// Fire-and-wait: stack-allocate a slot, push it, IPI the target, spin
+// until done.  40 bytes on kstack — negligible even under deep syscall
+// frames.  If `cpu` is ourselves we'd deadlock waiting for our own IPI,
+// so run fn inline in that case (the caller almost always means "every
+// CPU including me" and handles self separately, but be defensive).
+void smp_call_function_single(uint32_t cpu, void (*fn)(void*), void* arg) {
+    if (cpu == this_cpu()->id) { fn(arg); return; }
+
+    ipi_call_slot_t slot;
+    slot.fn   = fn;
+    slot.arg  = arg;
+    slot.done = 0;
+    slot.next = NULL;
+
+    smp_call_push(cpu, &slot);
+    lapic_send_ipi(g_cpus[cpu].apic_id, VEC_IPI_CALL);
+
+    while (!__atomic_load_n(&slot.done, __ATOMIC_ACQUIRE))
+        cpu_relax();
 }
 
 void ipi_call_handler(void) {
