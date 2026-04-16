@@ -1136,6 +1136,27 @@ static void do_switch(uint8_t preempted) {
     rcu_note_qs();
 
     tss_set_rsp0(next->kstack_top);
+
+    // ── Phase 9-7 TLB shootdown bookkeeping ──────────────────────────────
+    // Update the per-mm cpumasks *before* touching CR3.  The mask is
+    // "CPUs whose CR3 currently points at this mm's pml4" — a pure
+    // accounting shadow of CR3.  Only user mms participate (kthreads
+    // run in whatever pml4 was previously loaded → lazy TLB; they hold
+    // no user mappings themselves, so any pending shootdown for a user
+    // mm need not target them).
+    //
+    // Clear prev's bit first: after context_switch writes CR3 for a
+    // different mm, this CPU's TLB for prev's user entries is gone
+    // (we don't use global pages, so mov-to-cr3 is a full flush).
+    // If prev's mm equals next's mm (two tasks sharing one address
+    // space, e.g. threads), context_switch will skip the CR3 write,
+    // and we set the same bit right back below — net no-op.
+    uint32_t cpu_id = c->id;
+    if (prev->mm_shared && prev->mm_shared->mm)
+        task_mm_cpumask_clear(prev->mm_shared, cpu_id);
+    if (next->mm_shared && next->mm_shared->mm)
+        task_mm_cpumask_set(next->mm_shared, cpu_id);
+
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
     signal_deliver_pending();

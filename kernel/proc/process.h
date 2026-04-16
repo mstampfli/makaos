@@ -47,11 +47,45 @@ typedef struct __attribute__((aligned(16))) {
 // ── Shared address space (ref-counted) ───────────────────────────────────
 // All tasks sharing the same virtual address space point to one task_mm_t.
 // Freed when refs drops to 0.
+//
+// cpumask: bit N is set iff CPU N has ever loaded this mm into its CR3
+// since the last "TLB consistent" event.  Used by Phase 9-7 TLB shootdown
+// to scope IPIs to exactly the CPUs that could possibly have stale TLB
+// entries for this address space.  One word = up to MAX_CPUS=64 CPUs, which
+// matches cpu.h's ceiling; if MAX_CPUS grows this becomes cpumask_t[N].
+//
+// Updated lock-free via __atomic_fetch_or on the load side.  A CPU only
+// *clears* its own bit when the shootdown handler has actually flushed —
+// done atomically with a fetch_and so we never race a concurrent load
+// marking the same CPU back in.
+typedef uint64_t cpumask_t;
+
 typedef struct {
     phys_addr_t pml4_phys;
     mm_t*       mm;         // VMA list + brk; NULL for kernel threads
     uint32_t    refs;
+    cpumask_t   cpu_mask;   // CPUs that have this mm in their TLB
 } task_mm_t;
+
+// ── cpumask helpers for task_mm_t.cpu_mask ───────────────────────────────
+// Lock-free set/clear/read.  Callers run with preemption disabled in the
+// set/clear paths (the context switch holds rq_lock + IRQs off), so a
+// concurrent update from this CPU is impossible; the atomics defend only
+// against cross-CPU concurrent updates (another CPU may be clearing its
+// own bit from an IPI handler while we set ours here).
+ALWAYS_INLINE void task_mm_cpumask_set(task_mm_t* m, uint32_t cpu) {
+    if (!m) return;
+    __atomic_fetch_or(&m->cpu_mask, (cpumask_t)1u << cpu, __ATOMIC_ACQUIRE);
+}
+
+ALWAYS_INLINE void task_mm_cpumask_clear(task_mm_t* m, uint32_t cpu) {
+    if (!m) return;
+    __atomic_fetch_and(&m->cpu_mask, ~((cpumask_t)1u << cpu), __ATOMIC_RELEASE);
+}
+
+ALWAYS_INLINE cpumask_t task_mm_cpumask_read(task_mm_t* m) {
+    return m ? __atomic_load_n(&m->cpu_mask, __ATOMIC_ACQUIRE) : 0;
+}
 
 // ── Shared file descriptor table (ref-counted) ───────────────────────────
 // All tasks sharing the same fd table point to one task_files_t.
