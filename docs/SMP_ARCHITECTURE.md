@@ -407,9 +407,29 @@ Strict order so every phase is testable independently. Each phase boots and pass
                           online CPU; SMP_KNOWN_RACES entry 24 →
                           RESOLVED.  See the entry for the full
                           per-subsystem resolution map.
-- 9-7 ⏳ TLB shootdown (per-mm cpumask, batched range IPI, lazy TLB
-          for kernel threads).  Previously slated for 9-6; slipped one
-          phase because 9-6 is now the per-subsystem audit.
+- 9-7 ✅ TLB shootdown.  Three commits, zero new locks, one new IPI
+          handler body:
+          9-7 (1/3) (f57fb28) task_mm_t.cpu_mask — per-mm atomic cpumask
+                          bit set on CR3 load, cleared on switch-away,
+                          zeroed at task_mm_release.  Kthreads skipped
+                          (lazy TLB — they run in whatever pml4 was
+                          previously loaded, hold no user mappings).
+          9-7 (2/3) (4881b56) kernel/mm/tlb.{h,c}: per-CPU lock-free MPSC
+                          of stack-allocated tlb_flush_slot_t, sender
+                          walks cpumask → queue-push + IPI per target →
+                          self-flush inline → spin-wait on done.
+                          Receiver coalesces: full-flush marker OR
+                          total pages > 32 → one mov-to-cr3; else per-
+                          slot invlpg.  VEC_IPI_TLB_FLUSH stub replaced
+                          with real body calling tlb_shootdown_drain.
+          9-7 (3/3) (673be73) wired into sys_munmap, sys_brk shrink,
+                          sys_mmap MAP_FIXED replace.  CoW break in
+                          vmm_get_user_pages deliberately not wired —
+                          local invlpg is correct, remote readers keep
+                          a consistent RO view of the shared frame.
+                          sys_exec and task_mm_release also not wired
+                          (sole owner on those paths; cpumask already
+                          zero by the time the pml4 is freed).
 - 9-8 ⏳ multi-CPU soak: `stress -c 4`, per-process DOOM, cross-CPU
           signals, cleanup of any "Phase 9 TODO" comments.
 
