@@ -36,6 +36,19 @@ typedef struct tlb_flush_slot {
 
 static tlb_flush_slot_t* s_tlb_head[MAX_CPUS];
 
+// ── Per-sender slot pool ────────────────────────────────────────────────
+// A sender needs one outgoing slot per remote target.  We can't put
+// MAX_CPUS slots on the kstack (2 KiB would consume a quarter of the
+// 8 KiB kstack — observed stack corruption on deep syscall chains).
+// Instead keep a per-sender-CPU row here in BSS:
+//     s_send_slots[sender_cpu][target_cpu]
+// Only ONE shootdown is in flight per sender at a time (the entire
+// tlb_flush_common runs under preempt_disable — see below), so the row
+// owned by `me` is exclusively ours.  Target slots are populated only
+// for actual targets; we don't care what's in the unused cells.
+// Bounded at compile time: 64 * 64 * 32 B = 128 KiB BSS, no heap.
+static tlb_flush_slot_t s_send_slots[MAX_CPUS][MAX_CPUS];
+
 // Invalidate one 4 KiB page on the current CPU.  Non-global entries only;
 // we don't use global pages, so invlpg is sufficient (no CR4.PGE dance).
 ALWAYS_INLINE void tlb_invlpg(uint64_t va) {
@@ -164,10 +177,12 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
     // see every bit any CPU has published before this point.
     cpumask_t targets = task_mm_cpumask_read(mm);
 
-    // Remote-target descriptors on our own kstack.  MAX_CPUS == 64 so
-    // the worst case is 64 slots * 32 bytes = 2 KiB — fits comfortably
-    // on the 16 KiB kstack.
-    tlb_flush_slot_t slots[MAX_CPUS];
+    // Remote-target descriptors live in the per-sender row of the global
+    // pool.  Exclusive ownership is guaranteed by preempt_disable: no
+    // context switch, no reentrancy on this CPU until tlb_flush_common
+    // returns, so no second caller can touch our row.  See the
+    // s_send_slots definition above for the size rationale.
+    tlb_flush_slot_t* my_slots = s_send_slots[me];
     uint32_t slot_idx = 0;
 
     // Phase 1: publish descriptors + IPIs.
@@ -175,7 +190,7 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
         if (!(targets & ((cpumask_t)1u << cpu))) continue;
         if (cpu == me) { self_hit = 1; continue; }
 
-        tlb_flush_slot_t* s = &slots[slot_idx++];
+        tlb_flush_slot_t* s = &my_slots[slot_idx++];
         s->start = start;
         s->end   = end;
         s->done  = 0;
@@ -197,7 +212,7 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
     // cost as Linux.  Bounded: critical sections are short and the
     // receiver work is O(pages invalidated), so max latency is small.
     for (uint32_t i = 0; i < slot_idx; i++) {
-        while (!__atomic_load_n(&slots[i].done, __ATOMIC_ACQUIRE))
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE))
             cpu_relax();
     }
 
