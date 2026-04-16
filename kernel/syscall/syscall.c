@@ -10,6 +10,7 @@
 #include "mm.h"
 #include "shmem.h"
 #include "vmm.h"
+#include "tlb.h"
 #include "pmm.h"
 #include "kheap.h"
 #include "vfs.h"
@@ -471,6 +472,12 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     spin_unlock(&mm->vma_lock);
 
     mm->brk = new_brk;
+
+    // Remote CPUs running other threads of this process may still hold
+    // TLB entries for pages we just freed.  Flush them before returning
+    // so a stale translation doesn't allow a racing thread to read/write
+    // memory that's already been handed back to the buddy allocator.
+    tlb_flush_range(g_current->mm_shared, new_brk, old_brk);
     return new_brk;
 }
 
@@ -1785,6 +1792,11 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             }
         }
         mm_vma_remove(mm, addr, addr + len);
+        // MAP_FIXED replaces any existing mapping in [addr, addr+len) —
+        // invalidate the now-stale translations on every remote CPU
+        // that still has this mm in CR3.  The new mapping that follows
+        // demand-pages in, so no eager fill is needed here.
+        tlb_flush_range(g_current->mm_shared, addr, addr + len);
         vaddr = addr;
     } else if (addr) {
         addr &= ~PAGE_MASK;
@@ -1901,6 +1913,13 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
 
     // Remove VMA descriptors covering the range (this also unrefs shmem).
     mm_vma_remove(mm, addr, addr + len);
+
+    // Shoot down any remote CPU that still has this mm in CR3 so its
+    // TLB doesn't keep a stale, now-invalid translation alive.  Self
+    // flush is handled inline by tlb_flush_range.  For single-CPU
+    // processes this is a local invlpg loop; for multithreaded apps
+    // it IPIs just the CPUs that currently run a thread in this mm.
+    tlb_flush_range(g_current->mm_shared, addr, addr + len);
     return 0;
 }
 
