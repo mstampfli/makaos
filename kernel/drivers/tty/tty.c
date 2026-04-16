@@ -450,7 +450,12 @@ void tty_init(void) {
     tty->name[3] = '0'; tty->name[4] = '\0';
 
     // Register with input_core so keyboard events flow in via tty_on_kbd_event.
+    // INPUT_HANDLER_CONSOLE tells input_emit to skip us while a GUI grabber
+    // holds the keyboard — otherwise a Ctrl+C typed in a compositor window
+    // also fires VINTR on tty0, which sends SIGINT to tty0's fg_pgid (the
+    // compositor's child process tree).  Linux: identical to KD_GRAPHICS.
     tty->input_handler.name  = tty->name;
+    tty->input_handler.flags = INPUT_HANDLER_CONSOLE;
     tty->input_handler.event = tty_on_kbd_event;
     tty->input_handler.data  = tty;
     tty->input_handler.next  = NULL;
