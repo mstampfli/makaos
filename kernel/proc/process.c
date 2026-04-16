@@ -22,6 +22,12 @@ task_mm_t* task_mm_alloc(phys_addr_t pml4, mm_t* mm) {
 void task_mm_release(task_mm_t* m) {
     if (!m) return;
     if (--m->refs > 0) return;
+    // Sanity: on final release every task that referenced this mm has
+    // exited or exec'd, and do_switch's mask-clear ran as they left
+    // their CPUs.  If a bit is still set here it's an accounting bug,
+    // not a real CPU holding the pml4 — defensive zero so no future
+    // tlb_flush_range tries to IPI a freed address space.
+    m->cpu_mask = 0;
     // Use VMA-aware free: skip freeing physical frames for shared VMAs
     // (shmem owns those frames — they're freed when the shmem refcount hits 0).
     vmm_free_user_ex(m->pml4_phys, m->mm);
