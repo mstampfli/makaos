@@ -1036,7 +1036,13 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending = 0;
+    // spawn() creates a fresh program image — SIG_DFL everywhere, empty
+    // mask.  SIG_DFL == 0, so a memset of handlers[] is the init.  Not
+    // doing this left handlers[] as slab garbage, which later faulted
+    // iretq with a non-canonical rip on first signal delivery.
     t->sigstate.blocked = 0;
+    t->sigstate.sigframe_rsp = 0;
+    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
     t->umask            = g_current->umask;
