@@ -99,6 +99,24 @@ void signal_send_pgrp(uint32_t pgid, int sig) {
 // dump in serial.txt: bash at 0x47b27f (set_signal_handler, right
 // after the sigaction syscall), RIP=0 ifetch fault, every gpr zero
 // except RCX which holds the post-syscall instruction pointer.
+// Boundary check: `addr` must be a canonical user address AND the
+// `len`-byte range starting there must stay in the low canonical half
+// [0, 2^47).  The non-canonical gap between 2^47 and HHDM_OFFSET
+// (0xFFFF800000000000) must also be rejected — any address there
+// #GPs the moment the CPU tries to ring-transition back to it via
+// iretq.  Using HHDM_OFFSET as the ceiling here would silently let
+// non-canonical pointers through and is the bug that produced the
+// Ctrl+C iretq #GP on makaterm.
+#define USER_ADDR_CEIL (1ULL << 47)
+
+static inline int sig_user_range_ok(uint64_t addr, uint64_t len) {
+    if (!addr) return 0;
+    if (addr >= USER_ADDR_CEIL) return 0;
+    if (addr + len < addr) return 0;               // wrap
+    if (addr + len > USER_ADDR_CEIL) return 0;
+    return 1;
+}
+
 static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     uint64_t user_rsp = g_syscall_user_rsp;
 
@@ -106,6 +124,43 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     // 16-byte aligned as required for stack-passed arguments.
     uint64_t frame_base = (user_rsp - 128 - sizeof(sigframe_t))
                             & ~(uint64_t)0xF;
+
+    // Validate: the whole [frame_base-8, user_rsp) window must live in
+    // the user half.  If user_rsp is garbage (e.g. a buggy handler
+    // clobbered it before raising another signal), writing the sigframe
+    // would clobber kernel memory.  Kill the task with SIGSEGV instead.
+    if (!sig_user_range_ok(frame_base - 8, sizeof(sigframe_t) + 8)) {
+        // Force-queue SIGKILL for the next delivery cycle.  We can't
+        // kill the task inline from here — the terminate block below
+        // is the only safe place (drops fds, reparents children,
+        // zombifies), and it wants a fall-through, not a nested call.
+        // Leaving the signal pending-with-no-handler means the next
+        // signal_deliver_pending takes the SIG_DFL-terminate path.
+        atomic_or(&g_current->sigstate.pending,
+                  1u << (uint32_t)(SIGKILL - 1));
+        g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
+        return;
+    }
+
+    // Handler/restorer must be canonical user pointers too.  signal_send
+    // has no idea where they came from; we could have stored an older
+    // corrupted value (pre-validation) across exec.  Belt + braces.
+    // Using USER_ADDR_CEIL (= 2^47) rejects the non-canonical gap,
+    // unlike a naive >= HHDM_OFFSET check.
+    if (ka->sa_handler >= USER_ADDR_CEIL ||
+        (ka->sa_restorer != 0 && ka->sa_restorer >= USER_ADDR_CEIL)) {
+        // Force-queue SIGKILL for the next delivery cycle.  We can't
+        // kill the task inline from here — the terminate block below
+        // is the only safe place (drops fds, reparents children,
+        // zombifies), and it wants a fall-through, not a nested call.
+        // Leaving the signal pending-with-no-handler means the next
+        // signal_deliver_pending takes the SIG_DFL-terminate path.
+        atomic_or(&g_current->sigstate.pending,
+                  1u << (uint32_t)(SIGKILL - 1));
+        g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
+        return;
+    }
+
     sigframe_t* frame = (sigframe_t*)frame_base;
 
     frame->rip    = g_syscall_user_rip;

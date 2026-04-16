@@ -1620,6 +1620,23 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
 // ── sys_sigaction ─────────────────────────────────────────────────────────
 // sigaction(sig, act_ptr, oldact_ptr)
 // act_ptr / oldact_ptr point to a user-space struct matching k_sigaction_t.
+//
+// Handler / restorer are stored verbatim in sigstate.handlers[] and later
+// loaded into g_syscall_user_rip by signal_setup_frame.  That rip then
+// flows through iretq, which #GPs on a non-canonical address.  A user
+// passing an uninitialised struct sigaction can therefore crash the
+// process at signal-delivery time with a very distant RIP.  Validate
+// at the boundary so `sigstate.handlers[]` is guaranteed to only hold
+// {SIG_DFL, SIG_IGN, canonical user pointer below HHDM_OFFSET}.
+static inline int sigaction_addr_ok(uint64_t a) {
+    // 0 = SIG_DFL, 1 = SIG_IGN — always allowed.
+    if (a <= 1) return 1;
+    // Real handler/restorer must live in the low canonical half:
+    // bits 47–63 all zero → a < 2^47.  Anything in the non-canonical
+    // gap [2^47, HHDM_OFFSET) would #GP iretq at ring transition.
+    return a < (1ULL << 47);
+}
+
 static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
     if (sig == SIGKILL || sig == SIGSEGV) return (uint64_t)-EINVAL;
@@ -1627,18 +1644,20 @@ static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_pt
     k_sigaction_t* ka = &g_current->sigstate.handlers[sig];
 
     if (oldact_ptr) {
-        k_sigaction_t* old = (k_sigaction_t*)oldact_ptr;
-        old->sa_handler  = ka->sa_handler;
-        old->sa_restorer = ka->sa_restorer;
-        old->sa_mask     = ka->sa_mask;
-        old->sa_flags    = ka->sa_flags;
+        k_sigaction_t snap = *ka;  // atomic-enough copy for !SMP-writer
+        if (copy_to_user((void*)oldact_ptr, &snap, sizeof(snap)) != 0)
+            return (uint64_t)-EFAULT;
     }
     if (act_ptr) {
-        k_sigaction_t* act = (k_sigaction_t*)act_ptr;
-        ka->sa_handler  = act->sa_handler;
-        ka->sa_restorer = act->sa_restorer;
-        ka->sa_mask     = act->sa_mask;
-        ka->sa_flags    = act->sa_flags;
+        k_sigaction_t newact;
+        if (copy_from_user(&newact, (const void*)act_ptr, sizeof(newact)) != 0)
+            return (uint64_t)-EFAULT;
+        if (!sigaction_addr_ok(newact.sa_handler))  return (uint64_t)-EINVAL;
+        if (!sigaction_addr_ok(newact.sa_restorer)) return (uint64_t)-EINVAL;
+        ka->sa_handler  = newact.sa_handler;
+        ka->sa_restorer = newact.sa_restorer;
+        ka->sa_mask     = newact.sa_mask;
+        ka->sa_flags    = newact.sa_flags;
     }
     return 0;
 }
@@ -1648,9 +1667,15 @@ static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_pt
 // set_ptr / oldset_ptr point to uint32_t signal masks.
 static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_ptr) {
     uint32_t* blocked = &g_current->sigstate.blocked;
-    if (oldset_ptr) *(uint32_t*)oldset_ptr = *blocked;
+    if (oldset_ptr) {
+        uint32_t snap = *blocked;
+        if (copy_to_user((void*)oldset_ptr, &snap, sizeof(snap)) != 0)
+            return (uint64_t)-EFAULT;
+    }
     if (set_ptr) {
-        uint32_t set = *(uint32_t*)set_ptr;
+        uint32_t set;
+        if (copy_from_user(&set, (const void*)set_ptr, sizeof(set)) != 0)
+            return (uint64_t)-EFAULT;
         set &= ~(1u << (SIGKILL - 1));  // SIGKILL can never be blocked
         if (how == SIG_BLOCK)        *blocked |= set;
         else if (how == SIG_UNBLOCK) *blocked &= ~set;
@@ -1668,21 +1693,39 @@ static uint64_t sys_sigreturn(void) {
 
     if (!frame_base) return (uint64_t)-EINVAL;
 
-    sigframe_t* frame = (sigframe_t*)frame_base;
+    // Copy the sigframe out of user space with full validation.  If we
+    // dereferenced the user pointer directly, a corrupted sigframe_rsp
+    // (e.g. handler clobbered it, or the trampoline was called with a
+    // stale context after exec) could feed a non-canonical rip/rsp into
+    // iretq and crash the kernel.
+    sigframe_t frame;
+    if (copy_from_user(&frame, (const void*)frame_base, sizeof(frame)) != 0)
+        return (uint64_t)-EFAULT;
+
+    // Restored rip/rsp must be canonical user addresses — anything else
+    // would fault iretq at ring-transition time.  The low canonical
+    // half is [0, 2^47); the non-canonical gap starts at 2^47.  Using
+    // HHDM_OFFSET (2^47 OR'd with the kernel-half bit pattern) would
+    // miss the whole gap and let a poisoned rip through.
+    if (frame.rip >= (1ULL << 47) || frame.rsp >= (1ULL << 47))
+        return (uint64_t)-EINVAL;
 
     // Restore user register context via the globals that syscall_entry.asm reads.
-    g_syscall_user_rip    = frame->rip;
-    g_syscall_user_rsp    = frame->rsp;
-    g_syscall_user_rflags = frame->rflags;
-    g_syscall_user_rbp    = frame->rbp;
-    g_syscall_user_rbx    = frame->rbx;
-    g_syscall_user_r12    = frame->r12;
-    g_syscall_user_r13    = frame->r13;
-    g_syscall_user_r14    = frame->r14;
-    g_syscall_user_r15    = frame->r15;
+    g_syscall_user_rip    = frame.rip;
+    g_syscall_user_rsp    = frame.rsp;
+    // Preserve kernel-managed flag bits (IF=1, reserved bit 1).  Never
+    // let user clear IF via a crafted sigframe.
+    g_syscall_user_rflags = (frame.rflags & 0xCD5) | 0x202;
+    g_syscall_user_rbp    = frame.rbp;
+    g_syscall_user_rbx    = frame.rbx;
+    g_syscall_user_r12    = frame.r12;
+    g_syscall_user_r13    = frame.r13;
+    g_syscall_user_r14    = frame.r14;
+    g_syscall_user_r15    = frame.r15;
 
     // Restore the signal mask that was active before the handler ran.
-    g_current->sigstate.blocked = frame->blocked;
+    // SIGKILL must never be masked.
+    g_current->sigstate.blocked = frame.blocked & ~(1u << (SIGKILL - 1));
     g_current->sigstate.sigframe_rsp = 0;
 
     // Ask syscall_entry.asm to override rcx/r11/rsp/rbp/rbx/r12-r15 before sysretq.

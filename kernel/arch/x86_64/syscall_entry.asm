@@ -87,6 +87,20 @@ syscall_entry:
     pop rsi
     pop rdi
 
+    ; ── CRITICAL: from here down we read per-CPU scratch slots
+    ; (CPU_SIG_DELIVER, CPU_SC_USER_RIP/RSP/RFLAGS, CPU_EXEC_*) that
+    ; belong to THIS syscall's invocation.  If a timer IRQ fires
+    ; between these reads and iretq, sched_tick can preempt us,
+    ; run an arbitrary other task through its own signal_setup_frame,
+    ; which overwrites the very slots we're about to consume.  When
+    ; our CPU resumes we'd load the other task's rip/rsp into rcx/rsp
+    ; and iretq into a non-canonical RIP belonging to a different
+    ; process — observed as #GP at iretq with RIP=0x481374C985480000
+    ; during Ctrl+C SIGINT delivery to makaterm (the foreign payload
+    ; there disassembles to test rcx,rcx / jz, i.e. some other task's
+    ; real code).  Keep interrupts off for the entire consume window.
+    cli
+
     ; 8. Restore sysretq operands (reverse order of step 4).
     pop  rcx         ; user RIP   — still on kernel stack
     pop  r11         ; user RFLAGS — still on kernel stack
@@ -126,8 +140,7 @@ syscall_entry:
     mov r14, [gs:CPU_SC_USER_R14]
     mov r15, [gs:CPU_SC_USER_R15]
 .no_signal:
-    ; 11. Disable interrupts before return to user (mandatory).
-    cli
+    ; (cli already executed at top of consume window — do not re-cli.)
 
     ; 12. Return to user space via iretq (sysretq has a KVM bug where
     ;     SS doesn't get RPL=3 OR'd in, giving SS=0x20 instead of 0x23).
