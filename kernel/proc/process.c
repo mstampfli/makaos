@@ -343,7 +343,16 @@ void task_destroy(task_t* t) {
     // pid_ht_find / signal_send_pgrp / sched_for_each etc. may hold
     // a task_t pointer from a recent lookup — they must be allowed
     // to finish before the storage disappears.
-    call_rcu(task_free_rcu, t);
+    //
+    // Expedited grace period: task_destroy runs inside do_switch's
+    // tail, after we've already context-switched INTO the next task.
+    // That "next" task is otherwise stalled until the grace period
+    // closes — per-process reap latency directly visible as the
+    // trailing delay after ls / ps / short shells exit.  User
+    // confirmed classic vs expedited here makes no difference to
+    // the separate `ls` hang (which is pre-existing and unrelated
+    // to the reap path), so expedited stays as the better default.
+    call_rcu_expedited(task_free_rcu, t);
 }
 
 // ── task_fork ─────────────────────────────────────────────────────────────
