@@ -3958,19 +3958,28 @@ typedef uint64_t (*sys_handler_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 static uint64_t w_sys_write(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d; return sys_write(a, b, c);
 }
+// Debug knob: trace every sys_exit / sys_open to the serial port.
+// Useful for bringing up new userland but LOUD on the hot path — ps
+// alone issues dozens of opens/closes per run.  Flip to 1 only when
+// you want the trace.
+#define SYSCALL_DEBUG_TRACE_EXIT_OPEN 0
+
 static uint64_t w_sys_exit(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)b; (void)c; (void)d;
+#if SYSCALL_DEBUG_TRACE_EXIT_OPEN
     if (g_current && g_current->pid > 2) {
         serial_puts_dbg("[exit] pid=");
         serial_hex_dbg((uint64_t)g_current->pid);
         serial_puts_dbg(" code=");
         serial_hex_dbg((uint64_t)a);
     }
+#endif
     return sys_exit(a);
 }
 static uint64_t w_sys_open(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d;
     uint64_t ret = sys_open(a, b, c);
+#if SYSCALL_DEBUG_TRACE_EXIT_OPEN
     if (g_current && g_current->pid > 2) {
         serial_puts_dbg("[open] pid=");
         serial_hex_dbg((uint64_t)g_current->pid);
@@ -3984,6 +3993,7 @@ static uint64_t w_sys_open(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
             serial_hex_dbg(ret);
         }
     }
+#endif
     return ret;
 }
 static uint64_t w_sys_close(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
