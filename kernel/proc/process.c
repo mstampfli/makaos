@@ -15,6 +15,7 @@ task_mm_t* task_mm_alloc(phys_addr_t pml4, mm_t* mm) {
     m->pml4_phys = pml4;
     m->mm        = mm;
     m->refs      = 1;
+    m->cpu_mask  = 0;   // TLB shootdown mask: no CPU has loaded this yet
     return m;
 }
 
