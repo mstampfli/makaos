@@ -166,9 +166,11 @@ IPI handlers wired (in `kernel/arch/x86_64/ipi.c`):
   hlt, iretq returns into `cli`, the outer loop re-locks,
   dequeues the task, proceeds naturally.
 - `VEC_IPI_CALL`: drains a per-CPU MPSC queue of
-  `{fn, arg, done}` slots.  Skeleton only — no callers yet,
-  Phase 9-7's TLB shootdown is the first user.
-- `VEC_IPI_TLB_FLUSH`: EOI-only no-op until 9-7.
+  `{fn, arg, done}` slots.  Skeleton only — still has no
+  in-tree callers; reserved for future cross-CPU run-fn work.
+- `VEC_IPI_TLB_FLUSH`: drains a per-CPU MPSC of
+  `tlb_flush_slot_t` descriptors and invlpg's (or CR3-reloads
+  on coalesce) — see kernel/mm/tlb.c.  Wired in Phase 9-7.
 
 **Why pinned (the explicit 9-5 scope cut):**
 - Every cross-CPU wait-queue subsystem (pty, epoll, waitpid, pipe,
@@ -201,31 +203,40 @@ IPI handlers wired (in `kernel/arch/x86_64/ipi.c`):
 
 ## What does NOT work yet
 
-- **TLB shootdown.**  `munmap`/`mprotect` on one CPU does NOT
-  flush remote TLBs.  Safe today because round-robin spreads
-  unrelated tasks across CPUs and TLB entries in dead mappings
-  won't actually collide until Phase 9-7.  Phase 9-7.
 - **Load balancing / work stealing.**  The cursor gives us even
   admission but never rebalances.  A CPU-bound task stays on its
   home CPU until it exits.  Phase 9-8.
 
-## Phase 9-7 — NEXT
+## Phase 9-7 — DONE
 
-TLB shootdown via the IPI infrastructure already wired in 9-5:
+TLB shootdown landed in three commits (f57fb28, 4881b56, 673be73):
 
-- Per-mm `cpumask` of CPUs that have ever loaded this mm.
-- `vmm_unmap_range` / `vmm_protect_range` collect the affected
-  virtual range and dispatch `VEC_IPI_TLB_FLUSH` to every CPU in
-  the mask (currently an EOI-only no-op stub).
-- Handler invlpg's the range (or full flush for big ranges).
-- Sender waits on a per-request done counter or rendezvous.
-- Lazy TLB for kernel threads: they run in whatever mm was
-  previously loaded; no shootdown needed unless they actually
-  touch the user half.
+- `task_mm_t.cpu_mask` — per-mm atomic cpumask, bit N set iff CPU N
+  currently has this mm's pml4 in CR3.  Updated lock-free via
+  `__atomic_fetch_or` / `fetch_and` at every CR3 load in `do_switch`,
+  right before the `context_switch` asm call.  Kernel threads do not
+  participate (lazy TLB) — they run in whatever pml4 was previously
+  loaded and hold no user mappings.
+- `kernel/mm/tlb.{h,c}` — per-CPU lock-free MPSC of stack-allocated
+  `tlb_flush_slot_t{start, end, done, next}`.  Sender walks the cpumask
+  snapshot (ACQUIRE), pushes one slot per remote target via CAS, fires
+  `lapic_send_ipi(target->apic_id, VEC_IPI_TLB_FLUSH)`, self-flushes
+  inline, then spin-waits on each slot's `done` with `cpu_relax`.
+  Zero heap, zero lock.
+- Receiver (`tlb_shootdown_drain`, called from the IPI handler in
+  `ipi.c`) detaches the entire list in one `__atomic_exchange_n`,
+  reverses LIFO→FIFO, coalesces (any full-flush marker OR total
+  pages > 32 → one `mov cr3, cr3`; else per-slot invlpg loop), then
+  RELEASE-stores `done=1` so the sender sees completion.
+- Callers wired: `sys_munmap`, `sys_brk` shrink, `sys_mmap` MAP_FIXED
+  evict.  CoW break is deliberately left with local invlpg only —
+  remote CPUs retain a correct RO view of the shared frame until they
+  CoW-break on their own.  `sys_exec` and `task_mm_release` have
+  cpumask already zero (sole owner) and need no IPI.
 
-No ETA yet; the scheduler primitive is proven under round-robin
-Phase 9-6 load, so 9-7 is mostly a straightforward IPI plumbing
-job + a careful range batcher.
+`VEC_IPI_TLB_FLUSH` is no longer a stub — its body drains the MPSC
+and runs the work.  The infrastructure-only commits were tested
+dormant; wiring only landed once the primitive was proven buildable.
 
 ## GDB workflow (preserved from 9-5 debugging)
 
@@ -441,10 +452,10 @@ $ addr2line -e build/kernel.elf -f 0xffffffff8000c6ec
 4. `/bin/smp_test` is the reproducer if you need a crisp repro
    loop; `smp_test quick` runs in seconds, `smp_test soak` runs
    for ~10× longer at higher iteration counts.
-5. Next phase is 9-7 (TLB shootdown) — see the "Phase 9-7 — NEXT"
-   section above for the design sketch and what the 9-5 IPI
-   infrastructure already gives you.
+5. Next phase is 9-8 (load balancing / work stealing).  Phase 9-7
+   (TLB shootdown) is DONE — see the "Phase 9-7 — DONE" section above
+   for the implementation and design trade-offs.
 6. `pick_home_cpu()` is round-robin.  If you see a hang reproducer,
    **do not** pin to CPU 0 as a debugging step unless absolutely
    necessary — the whole point of Phase 9-6 is that the bug, if
-   any, is in 9-7+ territory.  Dump with GDB first.
+   any, is in 9-8+ territory.  Dump with GDB first.
