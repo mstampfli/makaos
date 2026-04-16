@@ -123,6 +123,15 @@ void synchronize_rcu_expedited(void);
 typedef void (*rcu_func_t)(void* data);
 void call_rcu(rcu_func_t func, void* data);
 
+// Expedited variant of call_rcu — use only on user-syscall-return
+// latency paths (munmap, brk-shrink, close of the last fd for a
+// sock/shmem/vma).  Forces the grace period closed via IPI instead
+// of waiting for every CPU's next natural quiescent state.  Don't
+// use from hot paths or paths that already run in batches — the
+// IPIs add per-remote-CPU cost that classic RCU's tick-piggyback
+// avoids.  See rcu.c for the full trade-off.
+void call_rcu_expedited(rcu_func_t func, void* data);
+
 // ── Deferred kfree helper ────────────────────────────────────────────────
 // Defer a kfree of `ptr` until every concurrent RCU reader has
 // completed its critical section.  Required for any heap-allocated

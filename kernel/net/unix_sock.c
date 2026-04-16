@@ -294,7 +294,8 @@ void unix_sock_close(vfs_file_t* self) {
     if (s->path[0])
         ns_remove(s->path);
 
-    call_rcu(unix_sock_free_rcu, s);
+    // Expedited: close() on an AF_UNIX socket — user-syscall latency.
+    call_rcu_expedited(unix_sock_free_rcu, s);
     kfree(self);
 }
 
