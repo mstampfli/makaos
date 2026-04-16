@@ -81,6 +81,22 @@ static void init_kthread(void) {
 
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
+
+    // init_kthread has finished its work (subsystem init, AP boot, userland
+    // launch).  Previously, falling off the end landed in proc_trampoline's
+    // `.dead: sti; hlt; jmp` loop — which kept this task TASK_RUNNING on
+    // CPU 0 forever.  Every ~ms the timer tick re-queued it, so any user
+    // task with home_cpu=0 fought init_kthread for scheduling slots.
+    // Observed symptom: every 4th `ls` (round-robin puts one in four on
+    // CPU 0) took ~400 ms inside vfs_read instead of ~5 ms.
+    //
+    // Park permanently: transition to TASK_DEAD and yield.  The next
+    // do_switch on CPU 0 sees state != RUNNING, won't re-enqueue us, and
+    // picks whichever user/kernel task is actually runnable there.
+    g_current->state = TASK_DEAD;
+    sched_yield();
+    // Unreachable — do_switch reaps us via process_destroy.
+    for (;;) __asm__ volatile("hlt");
 }
 
 // ── kmain ─────────────────────────────────────────────────────────────────
