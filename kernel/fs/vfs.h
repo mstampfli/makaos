@@ -47,6 +47,7 @@ typedef struct vfs_file_t {
     uint32_t      flags;         // open flags (O_APPEND, O_NONBLOCK etc.)
     uint32_t refcount; // reference count; 0 = static object (never freed)
     uint32_t rights;   // RIGHT_* bitmask; checked before every operation
+    uint32_t ino;      // ext2 inode number (0 for non-file fds); page cache key
     char     path[256]; // absolute path for ext2 files (empty for devices/pipes)
 } vfs_file_t;
 

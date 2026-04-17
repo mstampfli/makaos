@@ -3,6 +3,7 @@
 #include "process.h"
 #include "mm.h"
 #include "vmm.h"
+#include "vfs.h"
 
 // ── ELF64 constants ───────────────────────────────────────────────────────
 #define ELF_MAGIC   0x464C457FU  // 0x7F 'E' 'L' 'F' as little-endian uint32
@@ -87,11 +88,15 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid);
 //   out_phnum      — number of program-header entries (AT_PHNUM).
 //   out_phent      — size of one program-header entry (AT_PHENT).
 // Returns 1 on success, 0 on failure.
+// backing_file: if non-NULL, segments are mapped lazily (file-backed VMAs,
+//   pages faulted in from disk on first access).  The file is dup'd per VMA.
+//   If NULL, segments are loaded eagerly from the in-memory `data` buffer.
 uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                       phys_addr_t* out_pml4, mm_t** out_mm, uint64_t* out_entry,
                       uint64_t* out_phdr_vaddr,
                       uint16_t* out_phnum,
-                      uint16_t* out_phent);
+                      uint16_t* out_phent,
+                      vfs_file_t* backing_file);
 
 // Full process launch with argc/argv/envp/auxv stack setup.
 // Equivalent to elf_load but calls elf_setup_stack so argv[0] etc. are
@@ -109,9 +114,19 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
                            const int stdio[3]);
 
 // Convenience: read the ext2 file at `path`, then elf_load_with_argv.
+// Permission-checked: walks the path with the current task's cred and
+// verifies the exec bit before loading.  Use for syscall-path exec.
 task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
                             const char* const* argv, const char* const* envp,
                             const int stdio[3]);
+
+// Kernel-trusted exec: same as elf_exec_from_ext2 but skips all permission
+// checks.  Use ONLY for kernel-initiated loads where the path is a compiled-in
+// constant and cred checking is unnecessary (init_kthread launching login,
+// svcmgr, etc.).
+task_t* elf_exec_kernel(const char* path, uint32_t pid,
+                         const char* const* argv, const char* const* envp,
+                         const int stdio[3]);
 
 // Build the SysV AMD64 initial user stack for a newly exec'd process.
 // Maps a fresh stack page into `pml4`, copies argv/envp strings onto it,
@@ -130,3 +145,10 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
 
 // Convenience: read the file at `path` from ext2 (up to 8 MiB), call elf_load.
 task_t* elf_load_from_ext2(const char* path, uint32_t pid);
+
+// Shared read primitive: seek f to EOF for exact size, kmalloc exact buffer,
+// read all bytes, log serial timing.  Fills *out_size, *out_t0, *out_t1.
+// Returns kmalloc'd buffer (caller must kfree), or NULL on failure.
+// Used by every ELF load path so timing/allocation logic is consistent.
+uint8_t* elf_read_buf(vfs_file_t* f, int64_t* out_size,
+                       uint64_t* out_t0, uint64_t* out_t1);

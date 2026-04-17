@@ -127,6 +127,13 @@ uint8_t ext2_init(uint32_t part_lba);
 // Returns heap-allocated vfs_file_t* (close with vfs_close), or NULL.
 vfs_file_t* ext2_open(const char* path);
 
+// Open a file by its already-resolved inode number.  Skips the path walk
+// entirely — use this when the caller already holds the inode from a prior
+// ext2_lookup_path() call.  `path` is optional (stored in f->path for
+// fstat/ftruncate); pass NULL if unavailable.
+// Returns heap-allocated vfs_file_t* (close with vfs_close), or NULL.
+vfs_file_t* ext2_open_ino(uint32_t ino, const char* path);
+
 // List directory at `path`. Fills `entries` (up to `max`).
 // Skips "." and ".." and deleted entries (inode==0).
 // Returns count of entries written, or -1 on error.

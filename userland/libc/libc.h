@@ -47,11 +47,15 @@ typedef volatile int       sig_atomic_t;
 typedef unsigned long      ulong_t;
 typedef int64_t            off_t;
 typedef uint32_t           socklen_t;
-#ifndef _BOOL_DEFINED
-#define _BOOL_DEFINED
-typedef _Bool              bool;
-#define true  1
-#define false 0
+#if !defined(__bool_true_false_are_defined) && !defined(__cplusplus)
+#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+     /* C23+: bool/true/false are keywords — nothing to define */
+#  else
+     typedef _Bool bool;
+#    define true  1
+#    define false 0
+#  endif
+#  define __bool_true_false_are_defined 1
 #endif
 
 // stdint min/max macros

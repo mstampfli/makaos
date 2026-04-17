@@ -4,6 +4,7 @@
 #include "vmm.h"
 #include "common.h"
 #include "rcu.h"
+#include "vfs.h"
 
 /* ── C library stubs required by the compiler ────────────────────────────
  *
@@ -77,6 +78,7 @@ mm_t* mm_create(void) {
 void vma_free_rcu(void* data) {
     vma_t* v = (vma_t*)data;
     if (v->shmem) shmem_unref(v->shmem);
+    if (v->file)  vfs_close(v->file);
     kfree(v);
 }
 
@@ -94,12 +96,15 @@ uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags)
 
     vma_t* vma = kmalloc(sizeof(vma_t));
     if (!vma) return 0;
-    vma->start      = start;
-    vma->end        = end;
-    vma->flags      = flags;
-    vma->next       = NULL;
-    vma->shmem      = NULL;
+    vma->start       = start;
+    vma->end         = end;
+    vma->flags       = flags;
+    vma->next        = NULL;
+    vma->shmem       = NULL;
     vma->shmem_pgoff = 0;
+    vma->file        = NULL;
+    vma->file_off    = 0;
+    vma->file_len    = 0;
 
     spin_lock(&mm->vma_lock);
 
@@ -122,6 +127,58 @@ uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags)
         vma_t* prev = mm->vmas;
         while (prev->next && prev->next->start < start) prev = prev->next;
         vma->next = prev->next;                 // private initialisation
+        rcu_assign_pointer(prev->next, vma);
+    }
+    spin_unlock(&mm->vma_lock);
+    return 1;
+}
+
+// ── mm_vma_add_file ───────────────────────────────────────────────────────
+// Insert a fully-initialised file-backed VMA in one pass.
+// All fields — including file, file_off, file_len — are set before the VMA
+// is published via rcu_assign_pointer, so no reader ever sees VMA_FILE with
+// a NULL file pointer.  No second lock acquisition needed.
+uint8_t mm_vma_add_file(mm_t* mm, virt_addr_t start, virt_addr_t end,
+                          uint32_t prot_flags,
+                          struct vfs_file_t* file,
+                          uint64_t file_off, uint64_t file_len) {
+    if (!mm || !file)      return 0;
+    if (start >= end)      return 0;
+    if (start & PAGE_MASK) return 0;
+    if (end   & PAGE_MASK) return 0;
+
+    vma_t* vma = kmalloc(sizeof(vma_t));
+    if (!vma) return 0;
+
+    // Fully initialise before insertion — VMA is private until rcu_assign_pointer.
+    vma->start       = start;
+    vma->end         = end;
+    vma->flags       = VMA_FILE | prot_flags;
+    vma->next        = NULL;
+    vma->shmem       = NULL;
+    vma->shmem_pgoff = 0;
+    vma->file        = vfs_dup(file);
+    vma->file_off    = file_off;
+    vma->file_len    = file_len;
+
+    spin_lock(&mm->vma_lock);
+
+    for (vma_t* v = mm->vmas; v; v = v->next) {
+        if (start < v->end && end > v->start) {
+            spin_unlock(&mm->vma_lock);
+            vfs_close(vma->file);
+            kfree(vma);
+            return 0;
+        }
+    }
+
+    if (!mm->vmas || start < mm->vmas->start) {
+        vma->next = mm->vmas;
+        rcu_assign_pointer(mm->vmas, vma);
+    } else {
+        vma_t* prev = mm->vmas;
+        while (prev->next && prev->next->start < start) prev = prev->next;
+        vma->next = prev->next;
         rcu_assign_pointer(prev->next, vma);
     }
     spin_unlock(&mm->vma_lock);
@@ -152,6 +209,7 @@ void mm_destroy(mm_t* mm) {
     while (v) {
         vma_t* next = v->next;
         if (v->shmem) shmem_unref(v->shmem);
+        if (v->file)  vfs_close(v->file);
         kfree(v);
         v = next;
     }
@@ -178,10 +236,13 @@ mm_t* mm_clone(const mm_t* src) {
     // the RCU reader before calling mm_vma_add (which allocates and takes
     // dst's writer lock).
     typedef struct {
-        virt_addr_t start, end;
-        uint32_t    flags;
-        struct shmem* shmem;
-        uint32_t      shmem_pgoff;
+        virt_addr_t        start, end;
+        uint32_t           flags;
+        struct shmem*      shmem;
+        uint32_t           shmem_pgoff;
+        struct vfs_file_t* file;
+        uint64_t           file_off;
+        uint64_t           file_len;
     } snap_t;
     // Bound: count entries first.
     uint32_t n = 0;
@@ -203,6 +264,9 @@ mm_t* mm_clone(const mm_t* src) {
         snap[i].flags       = v->flags;
         snap[i].shmem       = v->shmem;
         snap[i].shmem_pgoff = v->shmem_pgoff;
+        snap[i].file        = v->file;
+        snap[i].file_off    = v->file_off;
+        snap[i].file_len    = v->file_len;
     }
     rcu_read_unlock();
     uint32_t cnt = i;
@@ -213,13 +277,20 @@ mm_t* mm_clone(const mm_t* src) {
             mm_destroy(dst);
             return NULL;
         }
-        if (snap[k].shmem) {
+        if (snap[k].shmem || snap[k].file) {
             rcu_read_lock();
             vma_t* dv = mm_vma_find(dst, snap[k].start);
             if (dv) {
-                dv->shmem       = snap[k].shmem;
-                dv->shmem_pgoff = snap[k].shmem_pgoff;
-                shmem_ref(snap[k].shmem);
+                if (snap[k].shmem) {
+                    dv->shmem       = snap[k].shmem;
+                    dv->shmem_pgoff = snap[k].shmem_pgoff;
+                    shmem_ref(snap[k].shmem);
+                }
+                if (snap[k].file) {
+                    dv->file     = vfs_dup(snap[k].file);
+                    dv->file_off = snap[k].file_off;
+                    dv->file_len = snap[k].file_len;
+                }
             }
             rcu_read_unlock();
         }

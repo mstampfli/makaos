@@ -12,6 +12,8 @@
 #include "sched.h"
 #include "perm.h"
 #include "cred.h"
+#include "kprintf.h"
+#include "tsc.h"
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
@@ -21,7 +23,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                       phys_addr_t* out_pml4, mm_t** out_mm, uint64_t* out_entry,
                       uint64_t* out_phdr_vaddr,
                       uint16_t* out_phnum,
-                      uint16_t* out_phent) {
+                      uint16_t* out_phent,
+                      vfs_file_t* backing_file) {
     if (!data || size < sizeof(Elf64_Ehdr)) return 0;
 
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)data;
@@ -95,63 +98,65 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         if (ph->p_memsz == 0)      continue;
 
         // Convert ELF flags to VMA flags.
-        uint32_t vma_flags = VMA_ANON;
-        if (ph->p_flags & PF_R) vma_flags |= VMA_R;
-        if (ph->p_flags & PF_W) vma_flags |= VMA_W;
-        if (ph->p_flags & PF_X) vma_flags |= VMA_X;
+        uint32_t prot_flags = 0;
+        if (ph->p_flags & PF_R) prot_flags |= VMA_R;
+        if (ph->p_flags & PF_W) prot_flags |= VMA_W;
+        if (ph->p_flags & PF_X) prot_flags |= VMA_X;
 
         virt_addr_t seg_start = (ph->p_vaddr + load_bias) & ~PAGE_MASK;
         virt_addr_t seg_end   = (ph->p_vaddr + load_bias + ph->p_memsz + PAGE_MASK) & ~PAGE_MASK;
 
-        if (!mm_vma_add(mm, seg_start, seg_end, vma_flags)) {
-            mm_destroy(mm);
-            vmm_free_user(pml4);
-            pmm_buddy_free(pml4, 0);
-            return 0;
-        }
-
-        // Map and populate pages eagerly (file data + zero BSS).
-        uint64_t pte_flags = mm_vma_pte_flags(vma_flags);
-
-        for (virt_addr_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
-            phys_addr_t frame = pmm_buddy_alloc(0);
-            if (frame == PMM_INVALID_ADDR) {
+        if (backing_file) {
+            // ── Lazy path: file-backed VMA, pages faulted in on demand ────
+            // file_off: ELF file offset for the start of this page-aligned
+            //   segment.  p_offset & PAGE_MASK == p_vaddr & PAGE_MASK (ELF
+            //   alignment invariant), so rounding down to page is safe.
+            uint64_t file_off = ph->p_offset & ~(uint64_t)PAGE_MASK;
+            // file_len: bytes from file_off that are file-backed (rest = BSS).
+            uint64_t file_len = (ph->p_offset & PAGE_MASK) + ph->p_filesz;
+            if (!mm_vma_add_file(mm, seg_start, seg_end, prot_flags,
+                                 backing_file, file_off, file_len)) {
                 mm_destroy(mm);
                 vmm_free_user(pml4);
                 pmm_buddy_free(pml4, 0);
                 return 0;
             }
-
-            // Zero the frame with one rep stosb instead of 4096 byte
-            // stores from a plain C loop — the latter was measurably
-            // slow on TCG for a ~2 MiB bash ELF (500 pages × 4 KiB
-            // zero + up to 4 KiB copy = multi-MiB of byte-at-a-time
-            // loads/stores per exec).
-            uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-            __builtin_memset(fptr, 0, PAGE_SIZE);
-
-            // Copy file data that falls in this page.
-            virt_addr_t page_end = page + PAGE_SIZE;
-            // File data range: [p_vaddr+bias, p_vaddr+bias + p_filesz)
-            virt_addr_t file_start_va = ph->p_vaddr + load_bias;
-            virt_addr_t file_end_va   = ph->p_vaddr + load_bias + ph->p_filesz;
-
-            if (file_start_va < page_end && file_end_va > page) {
-                virt_addr_t copy_start = (file_start_va > page) ? file_start_va : page;
-                virt_addr_t copy_end   = (file_end_va < page_end) ? file_end_va : page_end;
-                uint64_t    frame_off  = copy_start - page;
-                // file_off is relative to segment start in file, not biased VA
-                uint64_t    file_off   = ph->p_offset + (copy_start - file_start_va);
-                uint64_t    nbytes     = copy_end - copy_start;
-
-                if (file_off + nbytes <= size) {
-                    const uint8_t* src = data + file_off;
-                    uint8_t* dst = fptr + frame_off;
-                    __builtin_memcpy(dst, src, nbytes);
-                }
+        } else {
+            // ── Eager path: allocate and populate all pages now ────────────
+            uint32_t vma_flags = VMA_ANON | prot_flags;
+            if (!mm_vma_add(mm, seg_start, seg_end, vma_flags)) {
+                mm_destroy(mm);
+                vmm_free_user(pml4);
+                pmm_buddy_free(pml4, 0);
+                return 0;
             }
+            uint64_t pte_flags = mm_vma_pte_flags(vma_flags);
+            for (virt_addr_t page = seg_start; page < seg_end; page += PAGE_SIZE) {
+                phys_addr_t frame = pmm_buddy_alloc(0);
+                if (frame == PMM_INVALID_ADDR) {
+                    mm_destroy(mm);
+                    vmm_free_user(pml4);
+                    pmm_buddy_free(pml4, 0);
+                    return 0;
+                }
+                uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
+                __builtin_memset(fptr, 0, PAGE_SIZE);
 
-            vmm_page_map(pml4, page, frame, pte_flags);
+                virt_addr_t page_end      = page + PAGE_SIZE;
+                virt_addr_t file_start_va = ph->p_vaddr + load_bias;
+                virt_addr_t file_end_va   = ph->p_vaddr + load_bias + ph->p_filesz;
+                if (file_start_va < page_end && file_end_va > page) {
+                    virt_addr_t copy_start = (file_start_va > page) ? file_start_va : page;
+                    virt_addr_t copy_end   = (file_end_va < page_end) ? file_end_va : page_end;
+                    uint64_t    frame_off  = copy_start - page;
+                    uint64_t    file_off   = ph->p_offset + (copy_start - file_start_va);
+                    uint64_t    nbytes     = copy_end - copy_start;
+                    if (file_off + nbytes <= size) {
+                        __builtin_memcpy(fptr + frame_off, data + file_off, nbytes);
+                    }
+                }
+                vmm_page_map(pml4, page, frame, pte_flags);
+            }
         }
 
         if (seg_end > seg_end_max) seg_end_max = seg_end;
@@ -405,7 +410,7 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
     uint64_t    entry;
 
     if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       NULL, NULL, NULL)) return NULL;
+                       NULL, NULL, NULL, NULL)) return NULL;
 
     // Allocate task + shared resources.
     task_t* t = kmalloc(sizeof(task_t));
@@ -494,7 +499,7 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     uint64_t phdr_vaddr = 0;
     uint16_t phnum = 0, phent = 0;
     if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       &phdr_vaddr, &phnum, &phent)) return NULL;
+                       &phdr_vaddr, &phnum, &phent, NULL)) return NULL;
 
     // Build the initial user stack with argc/argv/envp/auxv.
     uint64_t user_rsp = elf_setup_stack(pml4, argv, envp, entry,
@@ -585,17 +590,91 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     return t;
 }
 
+// ── elf_read_buf ──────────────────────────────────────────────────────────
+// Shared read primitive used by every ELF load path (spawn, exec, kernel).
+//
+// Seeks f to EOF to get the exact file size, allocates a precisely-sized
+// kmalloc buffer, reads all bytes, and logs the read timing to serial.
+// Returns the buffer (caller must kfree) and fills *out_size, *out_t0,
+// *out_t1 for map-phase timing downstream.  Returns NULL on any failure.
+//
+// 32 MiB hard cap guards against malformed or hostile binaries exhausting
+// kernel heap before lazy-load / demand-paging is implemented.
+#define ELF_LOAD_MAX (32ULL * 1024ULL * 1024ULL)
+
+uint8_t* elf_read_buf(vfs_file_t* f, int64_t* out_size,
+                       uint64_t* out_t0, uint64_t* out_t1) {
+    if (!f || !f->seek) return NULL;
+    int64_t file_size = f->seek(f, 0, 2 /*SEEK_END*/);
+    if (file_size <= 0 || (uint64_t)file_size > ELF_LOAD_MAX) return NULL;
+    f->seek(f, 0, 0 /*SEEK_SET*/);
+
+    uint8_t* buf = (uint8_t*)kmalloc((uint64_t)file_size);
+    if (!buf) return NULL;
+
+    uint64_t t0 = tsc_read_ns();
+    int64_t n = vfs_read(f, buf, (uint64_t)file_size);
+    uint64_t t1 = tsc_read_ns();
+    kprintf("[elf] read %s: %u bytes in %u us\n",
+            f->path[0] ? f->path : "?",
+            (uint32_t)file_size,
+            (uint32_t)((t1 - t0) / 1000u));
+
+    if (n != file_size) { kfree(buf); return NULL; }
+
+    *out_size = file_size;
+    *out_t0   = t0;
+    *out_t1   = t1;
+    return buf;
+}
+
+static task_t* elf_load_vfs(vfs_file_t* f, uint32_t pid) {
+    int64_t  file_size; uint64_t t0, t1;
+    uint8_t* buf = elf_read_buf(f, &file_size, &t0, &t1);
+    if (!buf) return NULL;
+
+    task_t* t = elf_load(buf, (uint64_t)file_size, pid);
+    uint64_t t2 = tsc_read_ns();
+    kprintf("[elf] map  %s: %u us  total %u us\n",
+            f->path[0] ? f->path : "?",
+            (uint32_t)((t2 - t1) / 1000u),
+            (uint32_t)((t2 - t0) / 1000u));
+    kfree(buf);
+    return t;
+}
+
+static task_t* elf_load_vfs_with_argv(vfs_file_t* f, uint32_t pid,
+                                       const char* const* argv,
+                                       const char* const* envp,
+                                       const int stdio[3]) {
+    int64_t  file_size; uint64_t t0, t1;
+    uint8_t* buf = elf_read_buf(f, &file_size, &t0, &t1);
+    if (!buf) return NULL;
+
+    task_t* t = elf_load_with_argv(buf, (uint64_t)file_size, pid, argv, envp, stdio);
+    uint64_t t2 = tsc_read_ns();
+    kprintf("[elf] map  %s: %u us  total %u us\n",
+            f->path[0] ? f->path : "?",
+            (uint32_t)((t2 - t1) / 1000u),
+            (uint32_t)((t2 - t0) / 1000u));
+    kfree(buf);
+    return t;
+}
+
 // ── elf_exec_from_ext2 ────────────────────────────────────────────────────
 task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
                             const char* const* argv, const char* const* envp,
                             const int stdio[3]) {
     // ── Execute permission check (path-aware walk + exec bit) ────────────
+    // exec_ino is declared outside the block so it survives into the open
+    // call below — eliminating the redundant second path walk.
+    uint32_t exec_ino;
     {
         cred_t root_cred; cred_init_root(&root_cred);
         const cred_t* c = (g_current && g_current->files_shared)
                           ? &g_current->cred : &root_cred;
         int exec_err = 0;
-        uint32_t exec_ino = ext2_lookup_path(path, c, &exec_err);
+        exec_ino = ext2_lookup_path(path, c, &exec_err);
         if (!exec_ino) return NULL;
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
@@ -608,41 +687,37 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
         if (vfs_check_exec(&ip, c, &setuid_uid) != 0) return NULL;
     }
 
-    vfs_file_t* f = ext2_open(path);
+    // Open by the already-resolved inode — no second path walk.
+    vfs_file_t* f = ext2_open_ino(exec_ino, path);
     if (!f) return NULL;
 
-    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL;
-    uint8_t* buf = kmalloc(MAX_ELF);
-    if (!buf) { vfs_close(f); return NULL; }
-
-    int64_t n = vfs_read(f, buf, MAX_ELF);
+    task_t* t = elf_load_vfs_with_argv(f, pid, argv, envp, stdio);
     vfs_close(f);
+    return t;
+}
 
-    if (n <= 0) { kfree(buf); return NULL; }
-
-    task_t* t = elf_load_with_argv(buf, (uint64_t)n, pid, argv, envp, stdio);
-    kfree(buf);
+// ── elf_exec_kernel ───────────────────────────────────────────────────────
+// Kernel-internal exec: trusted path, no permission check, no cred.
+// Used by init_kthread to launch the first userspace processes, which are
+// compiled-in trusted binaries — checking permissions against root_cred
+// is correct but wasteful busywork when the kernel is its own authority.
+task_t* elf_exec_kernel(const char* path, uint32_t pid,
+                         const char* const* argv, const char* const* envp,
+                         const int stdio[3]) {
+    uint32_t ino = ext2_lookup_path_raw(path);
+    if (!ino) return NULL;
+    vfs_file_t* f = ext2_open_ino(ino, path);
+    if (!f) return NULL;
+    task_t* t = elf_load_vfs_with_argv(f, pid, argv, envp, stdio);
+    vfs_close(f);
     return t;
 }
 
 // ── elf_load_from_ext2 ────────────────────────────────────────────────────
-// Read the file at `path` from the ext2 filesystem into a kernel buffer,
-// then call elf_load.
 task_t* elf_load_from_ext2(const char* path, uint32_t pid) {
     vfs_file_t* f = ext2_open(path);
     if (!f) return NULL;
-
-    // Read up to 1 MiB.
-    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB — large enough for doom
-    uint8_t* buf = kmalloc((uint64_t)MAX_ELF);
-    if (!buf) { vfs_close(f); return NULL; }
-
-    int64_t n = vfs_read(f, buf, MAX_ELF);
+    task_t* t = elf_load_vfs(f, pid);
     vfs_close(f);
-
-    if (n <= 0) { kfree(buf); return NULL; }
-
-    task_t* t = elf_load(buf, (uint64_t)n, pid);
-    kfree(buf);
     return t;
 }

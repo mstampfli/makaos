@@ -3,6 +3,8 @@
 #include "idt.h"
 #include "mm.h"
 #include "shmem.h"
+#include "vfs.h"
+#include "pcache.h"
 #include "process.h"
 #include "sched.h"
 #include "rcu.h"
@@ -612,6 +614,9 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         virt_addr_t    vma_start = 0;
         uint32_t       vma_shmem_pgoff = 0;
         struct shmem*  vma_shmem = NULL;
+        vfs_file_t*    vma_file  = NULL;
+        uint64_t       vma_file_off = 0;
+        uint64_t       vma_file_len = 0;
         int            have_vma = 0;
         rcu_read_lock();
         {
@@ -622,20 +627,166 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                 vma_shmem_pgoff = vma->shmem_pgoff;
                 if (vma->shmem && shmem_tryget(vma->shmem))
                     vma_shmem = vma->shmem;
+                if ((vma->flags & VMA_FILE) && vma->file)
+                    vma_file = vfs_tryget(vma->file);
+                vma_file_off = vma->file_off;
+                vma_file_len = vma->file_len;
                 have_vma = 1;
             }
         }
         rcu_read_unlock();
 
         if (!have_vma) { if (is_user) goto kill; else goto kernel_panic; }
-        if (is_write  && !(vma_flags & VMA_W)) { if (vma_shmem) shmem_unref(vma_shmem); if (is_user) goto kill; else goto kernel_panic; }
-        if (is_ifetch && !(vma_flags & VMA_X)) { if (vma_shmem) shmem_unref(vma_shmem); if (is_user) goto kill; else goto kernel_panic; }
+        if (is_write  && !(vma_flags & VMA_W)) {
+            if (vma_shmem) shmem_unref(vma_shmem);
+            if (vma_file)  vfs_close(vma_file);
+            if (is_user) goto kill; else goto kernel_panic;
+        }
+        if (is_ifetch && !(vma_flags & VMA_X)) {
+            if (vma_shmem) shmem_unref(vma_shmem);
+            if (vma_file)  vfs_close(vma_file);
+            if (is_user) goto kill; else goto kernel_panic;
+        }
 
         // Demand-page: resolve the physical frame.
         virt_addr_t page = fault_addr & ~PAGE_MASK;
         phys_addr_t frame;
 
-        if (vma_shmem) {
+        if (vma_file) {
+            // ── File-backed page with page cache ──────────────────────────
+            // Enable IRQs before any blocking disk read.  AHCI is IRQ-driven;
+            // iretq restores user RFLAGS (IF=1) on return, so no cli needed.
+            __asm__ volatile("sti");
+
+            // pg_file_idx: index of this page within the backing file.
+            // vma_file_off is page-aligned (elf_load_into rounds down), so
+            // the shift is exact.
+            uint64_t pg_off      = (uint64_t)(page - vma_start);
+            uint32_t pg_file_idx = (uint32_t)((vma_file_off + pg_off) >> PAGE_SHIFT);
+            uint32_t ino         = vma_file->ino;
+
+            // clean_frame: on-disk page content (from cache or fresh read).
+            // clean_in_cache == 1 → cache holds a ref; caller must pmm_ref_inc
+            //                       before installing as a PTE.
+            // clean_in_cache == 0 → alloc ref IS the only ref (no inc needed
+            //                       for a sole-owner PTE, but must pmm_ref_dec
+            //                       if we're making a private copy instead).
+            phys_addr_t clean_frame;
+            uint8_t     clean_in_cache;
+
+            clean_frame = (ino != 0) ? pcache_get(ino, pg_file_idx)
+                                     : PMM_INVALID_ADDR;
+
+            if (clean_frame != PMM_INVALID_ADDR) {
+                // Cache hit — no disk I/O.
+                clean_in_cache = 1;
+                if (g_current)
+                    __atomic_fetch_add(&g_current->pf_cache, 1, __ATOMIC_RELAXED);
+            } else {
+                // Cache miss: read from disk.
+                if (g_current)
+                    __atomic_fetch_add(&g_current->pf_disk, 1, __ATOMIC_RELAXED);
+                clean_frame = pmm_buddy_alloc(0);
+                if (clean_frame == PMM_INVALID_ADDR) {
+                    vfs_close(vma_file);
+                    if (is_user) goto kill; else goto kernel_panic;
+                }
+                uint8_t* dst = (uint8_t*)(clean_frame + HHDM_OFFSET);
+                __builtin_memset(dst, 0, PAGE_SIZE);
+                if (pg_off < vma_file_len) {
+                    uint64_t src_off = vma_file_off + pg_off;
+                    uint64_t bytes   = PAGE_SIZE;
+                    if (pg_off + bytes > vma_file_len)
+                        bytes = vma_file_len - pg_off;
+                    vma_file->seek(vma_file, (int64_t)src_off, 0 /*SEEK_SET*/);
+                    vma_file->read(vma_file, dst, bytes);
+                }
+
+                if (ino != 0) {
+                    // Offer to cache.  pcache_insert takes the alloc ref and
+                    // returns: our frame (inserted) or a racer's frame (ours
+                    // freed).  PMM_INVALID_ADDR means OOM on entry node.
+                    phys_addr_t c = pcache_insert(ino, pg_file_idx, clean_frame);
+                    if (c != PMM_INVALID_ADDR) {
+                        clean_frame    = c;
+                        clean_in_cache = 1;
+                    } else {
+                        // Entry OOM: use frame directly, not cached.
+                        clean_in_cache = 0;
+                    }
+                } else {
+                    clean_in_cache = 0;
+                }
+
+                // ── Read-ahead: prefetch pages N+1..N+7 into pcache ──────────
+                // After a disk miss we pre-fetch the next RA_PAGES consecutive
+                // file pages through the same VFS handle (still open here).
+                // Each goes through ext2→ahci_read as a normal NCQ command so
+                // the HBA sees multiple queued reads and can reorder them for
+                // optimal rotational latency.  Future faults on those pages
+                // are then 100% cache hits — no additional disk I/O.
+                //
+                // We only do read-ahead when:
+                //   (a) the file has an inode (ino != 0, ext2-backed), and
+                //   (b) vma_file_len tells us there is more file data ahead.
+                // If OOM, we stop early (non-fatal — the missed pages will just
+                // fault from disk later).  We skip pages already in cache so a
+                // sequential fault stream doesn't double-read.
+                if (ino != 0) {
+#define RA_PAGES 7
+                    for (uint32_t ra = 1; ra <= RA_PAGES; ra++) {
+                        uint64_t ra_pg_off = pg_off + (uint64_t)ra * PAGE_SIZE;
+                        if (ra_pg_off >= vma_file_len) break;
+                        uint32_t ra_pg_idx = pg_file_idx + ra;
+                        if (pcache_get(ino, ra_pg_idx) != PMM_INVALID_ADDR)
+                            continue;  // already cached, skip
+                        phys_addr_t ra_frame = pmm_buddy_alloc(0);
+                        if (ra_frame == PMM_INVALID_ADDR) break;  // OOM
+                        uint8_t* ra_dst = (uint8_t*)(ra_frame + HHDM_OFFSET);
+                        __builtin_memset(ra_dst, 0, PAGE_SIZE);
+                        uint64_t ra_src_off = vma_file_off + ra_pg_off;
+                        uint64_t ra_bytes   = PAGE_SIZE;
+                        if (ra_pg_off + ra_bytes > vma_file_len)
+                            ra_bytes = vma_file_len - ra_pg_off;
+                        vma_file->seek(vma_file, (int64_t)ra_src_off, 0);
+                        vma_file->read(vma_file, ra_dst, ra_bytes);
+                        // pcache_insert: on success cache owns the alloc ref.
+                        // On race (another CPU just inserted same page):
+                        //   returns existing frame; our ra_frame is freed.
+                        // On OOM for the entry node:
+                        //   returns PMM_INVALID_ADDR; we must free ra_frame.
+                        phys_addr_t ra_c = pcache_insert(ino, ra_pg_idx, ra_frame);
+                        if (ra_c == PMM_INVALID_ADDR)
+                            pmm_ref_dec(ra_frame);  // OOM on entry alloc
+                        // else: ra_c owns the ref (either our frame or racer's)
+                    }
+#undef RA_PAGES
+                }
+            }
+            vfs_close(vma_file);
+
+            // RO segments (text/rodata): share clean_frame directly.
+            // RW segments (data/BSS):    private copy — cache keeps clean.
+            if (vma_flags & VMA_W) {
+                frame = pmm_buddy_alloc(0);
+                if (frame == PMM_INVALID_ADDR) {
+                    if (!clean_in_cache) pmm_ref_dec(clean_frame);
+                    if (is_user) goto kill; else goto kernel_panic;
+                }
+                __builtin_memcpy((void*)(frame       + HHDM_OFFSET),
+                                 (void*)(clean_frame + HHDM_OFFSET),
+                                 PAGE_SIZE);
+                if (!clean_in_cache) pmm_ref_dec(clean_frame);
+                // frame: rc == 1 (alloc ref) → PTE ref.
+            } else {
+                // RO: reuse clean_frame as the PTE frame.
+                if (clean_in_cache)
+                    pmm_ref_inc(clean_frame); // +1 for PTE; cache keeps its own.
+                // else: rc == 1 (alloc ref) → PTE ref directly.
+                frame = clean_frame;
+            }
+
+        } else if (vma_shmem) {
             uint32_t pg_idx = (uint32_t)((page - vma_start) / PAGE_SIZE)
                               + vma_shmem_pgoff;
             frame = shmem_get_page(vma_shmem, pg_idx);
@@ -653,8 +804,11 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
         if (!vmm_page_map(vmm_pml4_get(), page, frame,
                           mm_vma_pte_flags(vma_flags))) {
-            if (!vma_shmem) pmm_buddy_free(frame, 0);
+            // Free the frame we prepared but couldn't map.
+            // shmem frames are owned by the shmem object; anon/file frames
+            // are PMM-ref-counted (rc == 1 here → pmm_ref_dec frees them).
             if (vma_shmem) shmem_unref(vma_shmem);
+            else pmm_ref_dec(frame);
             if (is_user) goto kill; else goto kernel_panic;
         }
         if (vma_shmem) shmem_unref(vma_shmem);

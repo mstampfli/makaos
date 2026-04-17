@@ -10,6 +10,7 @@
 #define VMA_ANON   (1U << 3)   // anonymous (backed by zero pages)
 #define VMA_SHARED (1U << 4)   // shared mapping (backed by shmem_t)
 #define VMA_MMIO   (1U << 5)   // physical MMIO mapping (not CoW-able, not swappable)
+#define VMA_FILE   (1U << 6)   // file-backed mapping (lazy ELF load; demand-paged from disk)
 // W^X enforced: kernel refuses to create a VMA with both VMA_W and VMA_X.
 
 // ── Virtual Memory Area ───────────────────────────────────────────────────
@@ -17,20 +18,25 @@
 // Backed by physical frames allocated on demand (first access triggers #PF).
 //
 // Linux equivalent: struct vm_area_struct
-struct shmem;  // forward declaration — defined in shmem.h
+struct shmem;     // forward declaration — defined in shmem.h
+struct vfs_file_t; // forward declaration — defined in vfs.h
 
 typedef struct vma_t {
     virt_addr_t     start;      // inclusive, page-aligned
     virt_addr_t     end;        // exclusive, page-aligned  (end - start = region size)
-    uint32_t        flags;      // VMA_R | VMA_W | VMA_X | VMA_ANON | VMA_SHARED
+    uint32_t        flags;      // VMA_R | VMA_W | VMA_X | VMA_ANON | VMA_SHARED | VMA_FILE
     struct vma_t*   next;       // intrusive singly-linked list, sorted by start
 
     // Shared memory backing (NULL for private anonymous VMAs).
-    // When non-NULL, physical pages come from the shmem object rather than
-    // being privately allocated.  Multiple VMAs (across processes) can point
-    // to the same shmem_t.  The shmem's refcount tracks all references.
-    struct shmem*   shmem;      // backing shared memory object
+    struct shmem*   shmem;      // backing shared memory object (VMA_SHARED)
     uint32_t        shmem_pgoff;// page offset into the shmem object
+
+    // File backing (VMA_FILE only).  `file` is ref-counted via vfs_dup/vfs_close.
+    // On page fault: read PAGE_SIZE bytes from file at (file_off + page_in_vma).
+    // Bytes beyond file_len (the BSS tail) are zero-filled.
+    struct vfs_file_t* file;     // open file handle (one ref per VMA)
+    uint64_t           file_off; // file offset corresponding to vma->start
+    uint64_t           file_len; // bytes in file backing this VMA (rest = zero/BSS)
 } vma_t;
 
 // ── Memory descriptor ─────────────────────────────────────────────────────
@@ -64,9 +70,19 @@ typedef struct mm_t {
 // Allocate and zero-init a new mm_t.
 mm_t* mm_create(void);
 
-// Add a VMA to mm.  Regions must not overlap.
+// Add an anonymous VMA to mm.  Regions must not overlap.
 // Returns 1 on success, 0 on overlap or alloc failure.
 uint8_t mm_vma_add(mm_t* mm, virt_addr_t start, virt_addr_t end, uint32_t flags);
+
+// Add a file-backed VMA (VMA_FILE).  `file` is dup'd — caller retains its
+// own reference and must still call vfs_close when done with it.
+// `file_off` is the file byte offset for vma_start; `file_len` is the number
+// of file-backed bytes (pages beyond this offset are zero-filled, i.e. BSS).
+// Returns 1 on success, 0 on failure.
+uint8_t mm_vma_add_file(mm_t* mm, virt_addr_t start, virt_addr_t end,
+                         uint32_t prot_flags,
+                         struct vfs_file_t* file,
+                         uint64_t file_off, uint64_t file_len);
 
 // Look up the VMA containing `addr`.  Returns NULL if none.
 //
