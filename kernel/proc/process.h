@@ -204,6 +204,11 @@ typedef struct __attribute__((aligned(16))) task_t {
     struct task_t* tg_next;
     struct task_t* sid_prev;
     struct task_t* sid_next;
+
+    // Page-fault stats for demand-paged (VMA_FILE) pages.
+    // Incremented atomically in isr14_page_fault; logged at task exit.
+    uint32_t pf_disk;   // pages read from disk (cache miss)
+    uint32_t pf_cache;  // pages served from page cache (cache hit)
 } task_t;
 
 typedef task_t process_t;

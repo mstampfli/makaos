@@ -2,6 +2,7 @@
 #include "idt.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "pcache.h"
 #include "kheap.h"
 #include "tss.h"
 #include "syscall.h"
@@ -57,9 +58,12 @@ static void serial_init_and_say(void) {
 // svcmgr owns all userspace services (reads /etc/services/*.svc).
 
 static void init_kthread(void) {
-    ahci_start_io_thread();
-
     do_initcalls_subsys();
+
+    // ahci_init() (called above via do_initcalls_subsys) has now set
+    // g_ahci_irq.  ahci_start_io_thread() reads g_ahci_irq to decide
+    // whether to arm the NCQ path; it must run AFTER ahci_init().
+    ahci_start_io_thread();
 
     // Phase 9-4b/c: wake every AP discovered by ACPI now that the
     // scheduler, timers, LAPIC, VMM, and PMM are fully live.  APs
@@ -76,8 +80,8 @@ static void init_kthread(void) {
     static const int login_stdio[3]  = { -1, -1, -1 }; // inherit tty0
     static const int svcmgr_stdio[3] = { -2, -2, -2 }; // /dev/null
 
-    task_t* login  = elf_exec_from_ext2("/bin/login",  pid_alloc(), login_argv,  envp, login_stdio);
-    task_t* svcmgr = elf_exec_from_ext2("/bin/svcmgr", pid_alloc(), svcmgr_argv, envp, svcmgr_stdio);
+    task_t* login  = elf_exec_kernel("/bin/login",  pid_alloc(), login_argv,  envp, login_stdio);
+    task_t* svcmgr = elf_exec_kernel("/bin/svcmgr", pid_alloc(), svcmgr_argv, envp, svcmgr_stdio);
 
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
@@ -178,6 +182,7 @@ void kmain(void) {
     pmm_buddy_init_from_map(info->e820_map, info->e820_count);
     kheap_init();
     vmm_init(info->pml4_phys);
+    pcache_init();
 
     // ── Interrupt controllers ─────────────────────────────────────────────
     lapic_init(g_acpi.lapic_phys);

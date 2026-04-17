@@ -5,58 +5,63 @@
 #include "common.h"
 #include "idt.h"
 #include "lapic.h"
-#include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
 #include "wait.h"
 #include "smp.h"
 
-// ── PCI class codes for AHCI ──────────────────────────────────────────────
+// ── PCI class codes ────────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
 #define PCI_SUBCLASS_AHCI  0x06
 #define AHCI_BAR           5       // ABAR = BAR5
 
-// ── HBA register offsets / bits ───────────────────────────────────────────
-// GHC register
+// ── HBA register bits ─────────────────────────────────────────────────────
 #define HBA_GHC_AE   (1u << 31)   // AHCI Enable
 #define HBA_GHC_IE   (1u << 1)    // Interrupt Enable (global)
 #define HBA_GHC_HR   (1u << 0)    // HBA Reset
 
-// Port CMD register
-#define PORT_CMD_ST   (1u << 0)   // Start (DMA engine)
+// HBA CAP bits
+#define HBA_CAP_SNCQ (1u << 30)   // Supports Native Command Queuing
+
+// Port CMD
+#define PORT_CMD_ST   (1u << 0)   // Start
 #define PORT_CMD_FRE  (1u << 4)   // FIS Receive Enable
 #define PORT_CMD_FR   (1u << 14)  // FIS Receive Running
 #define PORT_CMD_CR   (1u << 15)  // Command List Running
 
-// Port SSTS register: device detection in bits 3:0
+// Port SSTS
 #define PORT_SSTS_DET_PRESENT  0x3
 
-// Port TFD register: task file status bits
+// Port TFD
 #define PORT_TFD_BSY  (1u << 7)
 #define PORT_TFD_DRQ  (1u << 3)
 
-// Port IS register: error flags
+// Port IS / IE bits
+#define PORT_IS_DHRS  (1u << 0)   // Device to Host Register FIS received
+#define PORT_IS_SDBS  (1u << 3)   // Set Device Bits FIS received (NCQ done)
 #define PORT_IS_TFES  (1u << 30)  // Task File Error Status
 
-// Port IE (Interrupt Enable) bits
-#define PORT_IE_DHRS  (1u << 0)   // Device to Host Register FIS (command done)
-#define PORT_IE_TFES  (1u << 30)  // Task File Error
+#define PORT_IE_DHRS  (1u << 0)
+#define PORT_IE_SDBS  (1u << 3)
+#define PORT_IE_TFES  (1u << 30)
 
 // Signatures
 #define SATA_SIG_ATA   0x00000101u
 #define SATA_SIG_ATAPI 0xEB140101u
 
 // ATA commands
-#define ATA_CMD_READ_DMA_EXT   0x25u
-#define ATA_CMD_WRITE_DMA_EXT  0x35u
+#define ATA_CMD_READ_DMA_EXT         0x25u
+#define ATA_CMD_WRITE_DMA_EXT        0x35u
+#define ATA_CMD_READ_FPDMA_QUEUED    0x60u   // NCQ read
+#define ATA_CMD_WRITE_FPDMA_QUEUED   0x61u   // NCQ write
 
-// FIS types
+// FIS type
 #define FIS_TYPE_H2D  0x27u
 
-// ── On-disk structures (MMIO layout) ─────────────────────────────────────
+// ── HBA MMIO register structures ─────────────────────────────────────────
 
 typedef volatile struct {
-    uint32_t clb;       // 0x00 Command List Base Address
+    uint32_t clb;       // 0x00 Command List Base
     uint32_t clbu;      // 0x04 Command List Base Upper
     uint32_t fb;        // 0x08 FIS Base Address
     uint32_t fbu;       // 0x0C FIS Base Upper
@@ -66,165 +71,147 @@ typedef volatile struct {
     uint32_t rsv0;
     uint32_t tfd;       // 0x20 Task File Data
     uint32_t sig;       // 0x24 Signature
-    uint32_t ssts;      // 0x28 Serial ATA Status
-    uint32_t sctl;      // 0x2C Serial ATA Control
-    uint32_t serr;      // 0x30 Serial ATA Error
-    uint32_t sact;      // 0x34 Serial ATA Active
+    uint32_t ssts;      // 0x28 SATA Status
+    uint32_t sctl;      // 0x2C SATA Control
+    uint32_t serr;      // 0x30 SATA Error
+    uint32_t sact;      // 0x34 SATA Active (NCQ in-flight bitmask)
     uint32_t ci;        // 0x38 Command Issue
     uint32_t sntf;      // 0x3C SATA Notification
     uint32_t fbs;       // 0x40 FIS-based Switching
     uint32_t rsv1[11];
     uint32_t vendor[4];
-} hba_port_t;           // 0x80 bytes per port
+} hba_port_t;
 
 typedef volatile struct {
-    uint32_t   cap;     // 0x00 Capabilities
-    uint32_t   ghc;     // 0x04 Global Host Control
-    uint32_t   is;      // 0x08 Interrupt Status
-    uint32_t   pi;      // 0x0C Ports Implemented
-    uint32_t   vs;      // 0x10 Version
-    uint32_t   ccc_ctl; // 0x14
-    uint32_t   ccc_pts; // 0x18
-    uint32_t   em_loc;  // 0x1C
-    uint32_t   em_ctl;  // 0x20
-    uint32_t   cap2;    // 0x24
-    uint32_t   bohc;    // 0x28
+    uint32_t   cap;
+    uint32_t   ghc;
+    uint32_t   is;
+    uint32_t   pi;
+    uint32_t   vs;
+    uint32_t   ccc_ctl;
+    uint32_t   ccc_pts;
+    uint32_t   em_loc;
+    uint32_t   em_ctl;
+    uint32_t   cap2;
+    uint32_t   bohc;
     uint8_t    rsv[0xA0 - 0x2C];
     uint8_t    vendor[0x100 - 0xA0];
-    hba_port_t ports[32];  // starts at 0x100
+    hba_port_t ports[32];
 } hba_mem_t;
 
-// ── DMA buffer structures (in RAM, physical addresses given to AHCI) ───────
+// ── DMA structures ─────────────────────────────────────────────────────────
 
-// Command header: 32 bytes, 32 per port → 1 KB command list
 typedef struct {
-    uint16_t flags;    // bits4:0=CFL, bit6=W(write), rest=0
-    uint16_t prdtl;    // number of PRD entries
-    uint32_t prdbc;    // PRD byte count (filled by hardware)
-    uint32_t ctba;     // command table base address (low 32)
-    uint32_t ctbau;    // command table base address (high 32)
+    uint16_t flags;    // [4:0]=CFL, [6]=W, [7]=P(prefetch)
+    uint16_t prdtl;    // PRDT length (number of entries)
+    uint32_t prdbc;    // PRDT byte count (filled by HBA)
+    uint32_t ctba;     // command table base (low)
+    uint32_t ctbau;    // command table base (high)
     uint32_t rsv[4];
 } __attribute__((packed)) cmd_header_t;  // 32 bytes
 
-// Physical Region Descriptor entry
 typedef struct {
-    uint32_t dba;      // data buffer physical address (low 32)
-    uint32_t dbau;     // data buffer physical address (high 32)
+    uint32_t dba;      // data buffer physical address (low)
+    uint32_t dbau;     // data buffer physical address (high)
     uint32_t rsv;
-    uint32_t dbc;      // byte count (bits 21:0), bit31 = interrupt on completion
+    uint32_t dbc;      // byte count-1 (bits[21:0]), bit[31]=interrupt on completion
 } __attribute__((packed)) prdt_entry_t;  // 16 bytes
 
-// Command table: FIS area + optional ATAPI area + PRDT
+// Command table: one full 4KB page per slot.
+// Header (128 bytes) + 248 PRDT entries × 16 bytes = 128 + 3968 = 4096 bytes.
+// 248 entries × 4 KiB/entry = ~992 KiB max per NCQ command — more than enough
+// for any realistic single I/O (AHCI_DMA_SECTORS = 1024 sectors = 512 KiB).
 typedef struct {
-    uint8_t     cfis[64];  // Command FIS (H2D)
-    uint8_t     acmd[16];  // ATAPI command (unused)
-    uint8_t     rsv[48];   // Reserved
-    prdt_entry_t prdt[1];  // One PRD entry (up to 4MB per command)
-} __attribute__((packed)) cmd_table_t;   // 144 bytes
+    uint8_t      cfis[64];    // Command FIS (H2D)
+    uint8_t      acmd[16];    // ATAPI command (unused)
+    uint8_t      rsv[48];     // Reserved
+    prdt_entry_t prdt[248];   // Physical Region Descriptor Table
+} __attribute__((packed)) cmd_table_t;   // exactly 4096 bytes
 
 // ── Driver state ──────────────────────────────────────────────────────────
 
-static hba_mem_t*  s_hba  = NULL;  // virtual address of ABAR
-static hba_port_t* s_port = NULL;  // the first active port
+static hba_mem_t*  s_hba  = NULL;
+static hba_port_t* s_port = NULL;
 
-// IRQ line (0–15) assigned to the AHCI controller, 0xFF = unknown/disabled.
-uint8_t g_ahci_irq = 0xFF;   // read by ahci_irq_entry in irq_stubs.asm
+// NCQ support: set at init from HBA CAP.SNCQ + device IDENTIFY.
+// If 0, use READ/WRITE_DMA_EXT with a single slot.
+static uint8_t  s_ncq    = 0;
+static uint32_t s_nslots = 1;    // 1–32; capped by HBA CAP.NCS
 
+// MSI-X table (16 bytes per entry, mapped via vmm_map_mmio).
+static volatile uint32_t* s_msix_entry = NULL;  // points at entry 0
+
+// ── Per-slot command tables ───────────────────────────────────────────────
+// One 4KB page per slot, holds cmd_table_t.  Each slot always points to its
+// own table so concurrent commands never share memory.
+#define MAX_NCQ_SLOTS  32
+static phys_addr_t s_ctbl_phys[MAX_NCQ_SLOTS];
+
+// Shared command list (4KB = 32 × 128-byte cmd_header_t, one per slot).
+static phys_addr_t s_cmdlist_phys;
+
+// FIS receive buffer (4KB).
+static phys_addr_t s_fis_phys;
+
+// ── va_to_phys ────────────────────────────────────────────────────────────
+// Convert any kernel virtual address to its physical address.
+// Two kernel address ranges:
+//   [HHDM_OFFSET, 0xFFFFFFFF80000000)  → HHDM direct mapping
+//   [0xFFFFFFFF80000000, ...)           → kernel text / data / BSS
+static inline phys_addr_t va_to_phys(const void* va) {
+    uint64_t v = (uint64_t)va;
+    if (v >= 0xFFFFFFFF80000000ULL)
+        return v - 0xFFFFFFFF80000000ULL + KERNEL_BASE_PHYS;
+    return v - HHDM_OFFSET;
+}
+
+// ── Slot management ───────────────────────────────────────────────────────
+//
+// s_free_mask:   bit N=1 → slot N is free (may be CAS-allocated)
+// s_active_mask: bit N=1 → slot N has an in-flight NCQ command
+//                (or a non-NCQ command if s_ncq==0)
+//
+// Slot allocation: CAS on s_free_mask in slot_alloc().
+// Slot release:    OR back into s_free_mask by the IRQ handler when done.
+//
+// SACT / CI write race:
+//   Multiple CPUs can be in issue_ncq() simultaneously (different slots).
+//   Both SACT and CI are memory-mapped 32-bit registers; a read-modify-write
+//   (|=) from two CPUs is NOT atomic.  s_ci_lock serialises the SACT|=bit
+//   and CI|=bit pair so each slot's "SACT before CI" ordering is guaranteed
+//   and no write is lost.  The critical section is ≤ 4 MMIO writes, so the
+//   spinlock is held for nanoseconds — no starvation risk.
+static volatile uint32_t s_free_mask;
+static volatile uint32_t s_active_mask;
+static spinlock_t         s_ci_lock;
+
+// s_slot_avail_wq: tasks sleeping here are waiting for a free slot.
+// Woken by the IRQ handler whenever it releases one or more slots.
+static wait_queue_t   s_slot_avail_wq;
+
+// Per-slot wait queue, done flag, and result.
+// IRQ handler sets s_slot_done[slot]=1 (RELEASE) and wakes s_slot_wq[slot].
+// Submitter checks s_slot_done[slot] (ACQUIRE) in slot_wait().
+static wait_queue_t   s_slot_wq[MAX_NCQ_SLOTS];
+static volatile uint8_t s_slot_done[MAX_NCQ_SLOTS];
+static volatile uint8_t s_slot_result[MAX_NCQ_SLOTS];
+
+// Set to 1 by ahci_start_io_thread() after sched_init() completes.
+// Gates the IRQ/NCQ path; pre-scheduler code uses do_rw_direct().
+static uint8_t s_irq_ready = 0;
+
+// IRQ line / logical slot (kept for compatibility with irq_stubs.asm).
+uint8_t g_ahci_irq = 0xFF;
 extern void ahci_irq_entry(void);
-
-// Physical addresses of DMA buffers (given to AHCI in CLB/FB/CTBA).
-// Virtual addresses = phys + HHDM_OFFSET (all PMM allocations are in RAM ⊂ HHDM).
-static phys_addr_t s_cmdlist_phys;   // 4 KB, holds 32 × cmd_header_t
-static phys_addr_t s_fis_phys;       // 4 KB, FIS receive buffer
-static phys_addr_t s_cmdtbl_phys;    // 4 KB, cmd_table_t for slot 0
-
-// DMA bounce buffer: callers may pass static kernel pointers (not HHDM-based),
-// so we always DMA into/out of this PMM-allocated buffer and memcpy manually.
-// order=3 → 8 pages = 32 KB = 64 sectors per chunk.
-#define DMA_ORDER   3
-#define DMA_SECTORS (8u * PAGE_SIZE / 512u)   // 64 sectors = 32 KB
-static phys_addr_t s_dma_phys;
-
-// ── I/O request queue ────────────────────────────────────────────────────
-// After the scheduler starts, all disk I/O goes through a dedicated kthread.
-// Callers submit requests and sleep; the kthread processes them serially
-// (it's the sole owner of the AHCI hardware) and wakes each caller on
-// completion.  Before the kthread starts, do_rw uses direct polling.
-//
-// Phase 9-6f: each request is a stack-allocated struct on the submitter's
-// own kstack.  Submitters CAS-prepend onto s_req_head (lock-free MPSC
-// Treiber stack); the kthread atomically xchg-drains the list, reverses
-// it to restore FIFO order, and processes each entry.  No fixed ring,
-// no producer ordering bug, no ring-full backpressure, no new locks.
-
-#define AHCI_MAX_PAGES 16  // max pages per scatter-gather request (64KB)
-
-typedef struct ahci_req {
-    struct ahci_req* next;  // MPSC link — writers CAS onto s_req_head
-    uint64_t lba;
-    void*    buf;           // kernel-space buffer (used if page_count == 0)
-    uint32_t count;         // sector count
-    uint8_t  write;
-    task_t*  waiter;
-    volatile uint8_t done;
-    uint8_t  result;
-    // Scatter-gather: pre-resolved HHDM page pointers for user buffers.
-    // If page_count > 0, the kthread scatters/gathers DMA data across
-    // these pages instead of using `buf`.  Each entry points to the
-    // start of a 4KB page (via HHDM).
-    uint8_t* pages[AHCI_MAX_PAGES];
-    uint32_t page_count;         // 0 = use buf; >0 = scatter-gather
-    uint32_t first_page_offset;  // byte offset within pages[0]
-} ahci_req_t;
-
-static task_t* s_io_thread = NULL;     // the kthread task_t
-
-// Phase 9-6f: AHCI submit is an unbounded lock-free MPSC of
-// stack-allocated ahci_req_t pointers.  One CAS per producer, one
-// xchg per consumer drain, zero new locks.
-//
-// Compared to the pre-9-6f fixed-ring design, this trades:
-//   - static ring storage (AHCI_MAX_REQS * sizeof(ahci_req_t))
-//     for stack allocation in the submitter's own frame (the
-//     request is valid until ahci_submit returns because the
-//     submitter is sleeping in its own frame on r->done).
-//   - multi-producer index race on s_req_tail (which was a real
-//     SMP bug under round-robin placement — two producers could
-//     claim the same slot) for lock-free CAS-prepend onto one
-//     head pointer.
-//   - busy-yield on ring-full (violated the "no busy-wait" rule)
-//     for no-ring-full: the MPSC is bounded only by the number
-//     of live tasks.
-//
-// Correctness chain:
-//   1. Producer fills every field of its on-stack ahci_req_t.
-//   2. Producer CAS-prepends onto s_req_head (ATOMIC_RELEASE on
-//      success).  Fields are ordered before the release.
-//   3. Producer calls wait_queue_wake_all(&s_io_thread_wq), which
-//      is an ACQ_REL xchg on the kthread's wait queue — ordered
-//      after the CAS.
-//   4. kthread drains s_io_thread_wq (finds its own task_we_t),
-//      wakes, re-enters its loop, __atomic_exchange_n's s_req_head
-//      to NULL grabbing the whole producer chain, reverses the
-//      chain to restore FIFO, and walks it.  The xchg's acquire
-//      pairs with every producer's CAS-release.
-//   5. kthread processes the request, stores r->done=1 with
-//      __ATOMIC_RELEASE, sched_wake(r->waiter).
-//   6. Producer's sched_sleep loop reads r->done with
-//      __ATOMIC_ACQUIRE; pairs with step 5.
-static ahci_req_t* volatile s_req_head = NULL;
-static wait_queue_t         s_io_thread_wq;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 static void udelay(uint32_t us) {
-    // Burn ~1 µs per iteration at ~1 GHz (TCG is slow, add slack).
     for (volatile uint32_t i = 0; i < us * 200; i++);
 }
 
 static void port_stop(hba_port_t* p) {
     p->cmd &= ~(PORT_CMD_ST | PORT_CMD_FRE);
-    // Wait for CR and FR to clear (up to 500 ms).
     for (int i = 0; i < 500; i++) {
         if (!(p->cmd & (PORT_CMD_FR | PORT_CMD_CR))) break;
         udelay(1000);
@@ -232,577 +219,697 @@ static void port_stop(hba_port_t* p) {
 }
 
 static void port_start(hba_port_t* p) {
-    // Wait for CR to clear first.
     while (p->cmd & PORT_CMD_CR) udelay(100);
     p->cmd |= PORT_CMD_FRE | PORT_CMD_ST;
 }
 
-// ── Port initialization ───────────────────────────────────────────────────
+// ── Port initialisation ───────────────────────────────────────────────────
 
 static void port_init(hba_port_t* p) {
     port_stop(p);
 
-    // Allocate DMA buffers from the PMM (returns 4KB-aligned physical addresses).
-    s_cmdlist_phys = pmm_buddy_alloc(0);          // 4 KB  — command list
-    s_fis_phys     = pmm_buddy_alloc(0);          // 4 KB  — FIS receive buffer
-    s_cmdtbl_phys  = pmm_buddy_alloc(0);          // 4 KB  — command table
-    s_dma_phys     = pmm_buddy_alloc(DMA_ORDER);  // 32 KB — bounce buffer
+    // Shared structures
+    s_cmdlist_phys = pmm_buddy_alloc(0);
+    s_fis_phys     = pmm_buddy_alloc(0);
+    __builtin_memset((void*)(s_cmdlist_phys + HHDM_OFFSET), 0, PAGE_SIZE);
+    __builtin_memset((void*)(s_fis_phys     + HHDM_OFFSET), 0, PAGE_SIZE);
 
-    // Zero all three buffers via HHDM.
-    uint8_t* cl = (uint8_t*)(s_cmdlist_phys + HHDM_OFFSET);
-    uint8_t* fb = (uint8_t*)(s_fis_phys     + HHDM_OFFSET);
-    uint8_t* ct = (uint8_t*)(s_cmdtbl_phys  + HHDM_OFFSET);
-    __builtin_memset(cl, 0, 4096);
-    __builtin_memset(fb, 0, 4096);
-    __builtin_memset(ct, 0, 4096);
-    uint8_t* dma = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
-    __builtin_memset(dma, 0, (1u << DMA_ORDER) * PAGE_SIZE);
+    // Per-slot command tables (one 4KB page each).
+    // s_nslots is set before port_init is called.
+    cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
+    for (uint32_t i = 0; i < s_nslots; i++) {
+        s_ctbl_phys[i] = pmm_buddy_alloc(0);
+        __builtin_memset((void*)(s_ctbl_phys[i] + HHDM_OFFSET), 0, PAGE_SIZE);
+        hdr[i].ctba  = (uint32_t)(s_ctbl_phys[i] & 0xFFFFFFFF);
+        hdr[i].ctbau = (uint32_t)(s_ctbl_phys[i] >> 32);
+    }
 
-    // Point command header 0 at the command table.
-    cmd_header_t* hdr = (cmd_header_t*)cl;
-    hdr[0].ctba  = (uint32_t)(s_cmdtbl_phys & 0xFFFFFFFF);
-    hdr[0].ctbau = (uint32_t)(s_cmdtbl_phys >> 32);
+    // Slot management
+    s_free_mask   = (s_nslots == 32) ? 0xFFFFFFFFu : ((1u << s_nslots) - 1u);
+    s_active_mask = 0;
+    spin_lock_init(&s_ci_lock);
+    wait_queue_init(&s_slot_avail_wq);
+    for (uint32_t i = 0; i < s_nslots; i++) {
+        wait_queue_init(&s_slot_wq[i]);
+        s_slot_done[i]   = 0;
+        s_slot_result[i] = 0;
+    }
 
-    // Program port registers.
+    // Program port registers
     p->clb  = (uint32_t)(s_cmdlist_phys & 0xFFFFFFFF);
     p->clbu = (uint32_t)(s_cmdlist_phys >> 32);
     p->fb   = (uint32_t)(s_fis_phys & 0xFFFFFFFF);
     p->fbu  = (uint32_t)(s_fis_phys >> 32);
-
-    // Clear pending interrupts and errors.
-    p->is   = p->is;    // write-to-clear
+    p->is   = p->is;    // W1C — clear pending
     p->serr = p->serr;
 
-    // Enable interrupts for this port: command completion + errors.
-    p->ie = PORT_IE_DHRS | PORT_IE_TFES;
+    // Enable port interrupts.
+    // DHRS: D2H FIS (non-NCQ command done).
+    // SDBS: Set Device Bits FIS (NCQ command done).
+    // TFES: task file error.
+    p->ie = PORT_IE_DHRS | PORT_IE_SDBS | PORT_IE_TFES;
 
     port_start(p);
 }
 
-// ── AHCI IRQ handler (called from ahci_irq_entry after early EOI) ─────────
+// ── IRQ handler ───────────────────────────────────────────────────────────
+// Called from ahci_irq_entry (asm stub) after lapic_eoi().
+// Runs on whichever CPU the MSI-X lowest-priority delivery chose.
+// Wakes the task that submitted the completed slot — usually on a different CPU.
+
 void ahci_irq_handler(void) {
     if (!s_hba || !s_port) return;
 
-    // Read which ports fired (write-to-clear after handling).
     uint32_t hba_is = s_hba->is;
     if (!hba_is) return;
 
-    // Clear port IS (each bit is W1C).
     uint32_t port_is = s_port->is;
-    s_port->is = port_is;
+    s_port->is = port_is;   // W1C
+    s_hba->is  = hba_is;    // W1C
 
-    // Clear the HBA global IS for the port we handled.
-    s_hba->is = hba_is;
-
-    irq_notify(g_ahci_irq);
-}
-
-// ── Issue one chunk command via bounce buffer ─────────────────────────────
-// count must be <= DMA_SECTORS.
-// `use_irq`: 0 = busy-poll (early boot), 1 = IRQ-wait (kthread).
-
-static uint8_t issue_one(uint64_t lba, uint32_t count, uint8_t write,
-                          uint8_t use_irq) {
-    hba_port_t* p = s_port;
-
-    // Wait for port idle: BSY=0 and DRQ=0.
-    for (int i = 0; i < 100000; i++) {
-        if (!(p->tfd & (PORT_TFD_BSY | PORT_TFD_DRQ))) break;
-        if (i == 99999) return 0;
-        udelay(10);
+    if (port_is & PORT_IS_TFES) {
+        // Task file error: fail all active slots.  The port is now dirty;
+        // leaving it is safe for a restart (next submit re-issues).
+        uint32_t active = __atomic_exchange_n(&s_active_mask, 0u, __ATOMIC_ACQ_REL);
+        uint32_t mask = active;
+        while (mask) {
+            uint32_t slot = (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1u;
+            s_slot_result[slot] = 0;
+            __atomic_store_n(&s_slot_done[slot], 1u, __ATOMIC_RELEASE);
+            wait_queue_wake_all(&s_slot_wq[slot]);
+        }
+        __atomic_fetch_or(&s_free_mask, active, __ATOMIC_RELEASE);
+        wait_queue_wake_all(&s_slot_avail_wq);
+        return;
     }
 
-    uint32_t bytes = count * 512;
+    // Detect completed slots.
+    // NCQ:     device clears SACT bits (via Set Device Bits FIS).
+    // Non-NCQ: HBA clears CI bits when D2H FIS is received.
+    uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
+    uint32_t done;
+    if (s_ncq)
+        done = active & ~s_port->sact;
+    else
+        done = active & ~s_port->ci;
 
-    // Command header (slot 0).
+    if (!done) return;
+
+    // Release from active_mask before waking waiters so a woken task
+    // that loops and re-submits immediately won't see its slot as active.
+    __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
+
+    uint32_t mask = done;
+    while (mask) {
+        uint32_t slot = (uint32_t)__builtin_ctz(mask);
+        mask &= mask - 1u;
+        s_slot_result[slot] = 1;
+        __atomic_store_n(&s_slot_done[slot], 1u, __ATOMIC_RELEASE);
+        wait_queue_wake_all(&s_slot_wq[slot]);
+    }
+
+    // Free slots AFTER waking waiters so slot_avail_wq wake is last.
+    __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&s_slot_avail_wq);
+}
+
+// ── Slot allocation ───────────────────────────────────────────────────────
+// Returns a slot index 0..(s_nslots-1).  Sleeps if all slots are in use.
+// Guaranteed to eventually return a free slot.
+
+static uint32_t slot_alloc(void) {
+    for (;;) {
+        uint32_t free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
+        if (free) {
+            uint32_t slot = (uint32_t)__builtin_ctz(free);
+            uint32_t bit  = 1u << slot;
+            if (__atomic_compare_exchange_n(&s_free_mask, &free, free & ~bit,
+                                             0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                return slot;
+            // CAS failed (another CPU grabbed a slot concurrently): retry.
+            continue;
+        }
+        // No free slots: register on the avail wait queue.
+        task_we_t we;
+        task_we_init(&we, g_current);
+        task_we_add(&s_slot_avail_wq, &we);
+        // Double-check under queue registration (lost-wakeup guard).
+        free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
+        if (free) {
+            task_we_remove(&s_slot_avail_wq, &we);
+            continue;
+        }
+        sched_sleep();
+        task_we_remove(&s_slot_avail_wq, &we);
+    }
+}
+
+// ── PRDT builder ─────────────────────────────────────────────────────────
+// Build PRDT entries for a contiguous physical buffer.
+// Returns the number of entries written (≤ 248).
+
+static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes) {
+    uint32_t n = 0;
+    while (bytes > 0) {
+        // Stay within the current 4 KiB page boundary.
+        uint32_t off   = (uint32_t)(phys & (PAGE_SIZE - 1));
+        uint32_t chunk = PAGE_SIZE - off;
+        if (chunk > bytes) chunk = bytes;
+        prdt[n].dba  = (uint32_t)(phys & 0xFFFFFFFFu);
+        prdt[n].dbau = (uint32_t)(phys >> 32);
+        prdt[n].rsv  = 0;
+        prdt[n].dbc  = (chunk - 1u) & 0x3FFFFFu;
+        n++;
+        phys  += chunk;
+        bytes -= chunk;
+    }
+    return n;
+}
+
+// Build PRDT from an array of distinct physical page addresses.
+// pages[i] = 4 KiB-aligned physical frame; first_off = offset in pages[0].
+// Returns number of entries written.
+
+static uint32_t build_prdt_pages(prdt_entry_t* prdt,
+                                  phys_addr_t* pages, uint32_t npages,
+                                  uint32_t first_off, uint32_t bytes) {
+    uint32_t n = 0, rem = bytes;
+    for (uint32_t i = 0; i < npages && rem > 0; i++) {
+        uint32_t off   = (i == 0) ? first_off : 0u;
+        uint32_t chunk = PAGE_SIZE - off;
+        if (chunk > rem) chunk = rem;
+        phys_addr_t phys = pages[i] + off;
+        prdt[n].dba  = (uint32_t)(phys & 0xFFFFFFFFu);
+        prdt[n].dbau = (uint32_t)(phys >> 32);
+        prdt[n].rsv  = 0;
+        prdt[n].dbc  = (chunk - 1u) & 0x3FFFFFu;
+        n++;
+        rem -= chunk;
+    }
+    return n;
+}
+
+// ── Command issue ─────────────────────────────────────────────────────────
+// Program the command header and FIS for `slot`, then pull the CI/SACT
+// trigger.  The PRDT must already be written into s_ctbl_phys[slot].prdt[].
+// nprdt: number of PRDT entries already written.
+
+static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
+                      uint8_t write, uint16_t nprdt) {
+    hba_port_t* p = s_port;
+
+    // Command header
     cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
-    hdr[0].flags = 5 | (write ? (1u << 6) : 0);
-    hdr[0].prdtl = 1;
-    hdr[0].prdbc = 0;
+    // CFL=5, W=write, P=prefetch for reads (helps HBA pipeline the PRDT fetch)
+    hdr[slot].flags  = 5u | (write ? (1u << 6) : (1u << 7));
+    hdr[slot].prdtl  = nprdt;
+    hdr[slot].prdbc  = 0;
+    // ctba/ctbau already set in port_init and never change.
 
-    // PRD entry → points at bounce buffer.
-    cmd_table_t* ct = (cmd_table_t*)(s_cmdtbl_phys + HHDM_OFFSET);
-    ct->prdt[0].dba  = (uint32_t)(s_dma_phys & 0xFFFFFFFF);
-    ct->prdt[0].dbau = (uint32_t)(s_dma_phys >> 32);
-    ct->prdt[0].rsv  = 0;
-    ct->prdt[0].dbc  = (bytes - 1) & 0x3FFFFF;
-
-    // H2D FIS.
-    uint8_t* fis = ct->cfis;
+    // H2D FIS
+    uint8_t* fis = ((cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET))->cfis;
     __builtin_memset(fis, 0, 64);
-    fis[0]  = FIS_TYPE_H2D;
-    fis[1]  = 0x80;
-    fis[2]  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
-    fis[4]  = (uint8_t)(lba        & 0xFF);
-    fis[5]  = (uint8_t)((lba >>  8) & 0xFF);
-    fis[6]  = (uint8_t)((lba >> 16) & 0xFF);
-    fis[7]  = 0x40;
-    fis[8]  = (uint8_t)((lba >> 24) & 0xFF);
-    fis[9]  = (uint8_t)((lba >> 32) & 0xFF);
-    fis[10] = (uint8_t)((lba >> 40) & 0xFF);
-    fis[12] = (uint8_t)(count       & 0xFF);
-    fis[13] = (uint8_t)((count >> 8) & 0xFF);
+    fis[0] = FIS_TYPE_H2D;
+    fis[1] = 0x80;  // C=1 (command register)
 
+    if (s_ncq) {
+        // NCQ FIS: sector count in Feature register; tag in Count register.
+        fis[2]  = write ? ATA_CMD_WRITE_FPDMA_QUEUED : ATA_CMD_READ_FPDMA_QUEUED;
+        fis[3]  = (uint8_t)(nsectors        & 0xFFu);  // feature lo = count lo
+        fis[4]  = (uint8_t)(lba             & 0xFFu);
+        fis[5]  = (uint8_t)((lba >>  8)     & 0xFFu);
+        fis[6]  = (uint8_t)((lba >> 16)     & 0xFFu);
+        fis[7]  = 0x40;                                // LBA48 mode
+        fis[8]  = (uint8_t)((lba >> 24)     & 0xFFu);
+        fis[9]  = (uint8_t)((lba >> 32)     & 0xFFu);
+        fis[10] = (uint8_t)((lba >> 40)     & 0xFFu);
+        fis[11] = (uint8_t)((nsectors >> 8) & 0xFFu);  // feature hi = count hi
+        fis[12] = (uint8_t)(slot << 3);                 // count lo = NCQ tag
+        fis[13] = 0;
+    } else {
+        // Non-NCQ DMA EXT: sector count in Count register.
+        fis[2]  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
+        fis[4]  = (uint8_t)(lba             & 0xFFu);
+        fis[5]  = (uint8_t)((lba >>  8)     & 0xFFu);
+        fis[6]  = (uint8_t)((lba >> 16)     & 0xFFu);
+        fis[7]  = 0x40;
+        fis[8]  = (uint8_t)((lba >> 24)     & 0xFFu);
+        fis[9]  = (uint8_t)((lba >> 32)     & 0xFFu);
+        fis[10] = (uint8_t)((lba >> 40)     & 0xFFu);
+        fis[12] = (uint8_t)(nsectors        & 0xFFu);
+        fis[13] = (uint8_t)((nsectors >> 8) & 0xFFu);
+    }
+
+    // Clear port IS / SERR before issuing.
     p->is   = p->is;
     p->serr = p->serr;
 
-    p->ci   = 1u;
+    uint32_t bit = 1u << slot;
 
-    if (use_irq) {
-        // Hybrid: spin briefly for fast DMA, fall back to IRQ sleep.
-        for (int spin = 0; spin < 4000; spin++) {
-            if (!(p->ci & 1u)) goto done;
-            if (p->is & PORT_IS_TFES) return 0;
-        }
-        irq_drain(g_ahci_irq);
-        do {
-            if (p->is & PORT_IS_TFES) return 0;
-            irq_wait(g_ahci_irq);
-        } while (p->ci & 1u);
-    } else {
-        // Polling: used during early boot (no scheduler).
-        for (int i = 0; i < 3000000; i++) {
-            if (!(p->ci & 1u)) break;
-            if (p->is & PORT_IS_TFES) return 0;
-            if (i == 2999999) return 0;
-            udelay(10);
-        }
-    }
-done:
-    return (p->is & PORT_IS_TFES) ? 0 : 1;
+    // s_ci_lock serialises SACT|=bit, CI|=bit, and active_mask|=bit as a
+    // single unit.  active_mask MUST be set AFTER the command is visible to
+    // the device (after CI write) so the IRQ handler never sees a slot as
+    // "active but not yet issued" — which would cause it to compute a false
+    // completion and wake the waiter before any data is transferred.
+    // Correct ordering (inside the lock):
+    //   1. sact  — tells device this tag is now active (NCQ only)
+    //   2. active_mask — must be visible BEFORE ci so the IRQ handler can
+    //      never miss a completion (device could complete the instant ci is
+    //      written; if active_mask isn't set yet, the IRQ computes done=0 and
+    //      slot_wait sleeps forever until the next unrelated IRQ rescans).
+    //   3. ci — actually issues the command to the device
+    // Holding s_ci_lock prevents a concurrent CPU's sact/ci RMW from racing.
+    spin_lock(&s_ci_lock);
+    if (s_ncq) p->sact |= bit;   // NCQ: set SACT before CI (AHCI spec)
+    __atomic_fetch_or(&s_active_mask, bit, __ATOMIC_RELEASE);  // AFTER sact, BEFORE ci
+    p->ci |= bit;
+    spin_unlock(&s_ci_lock);
 }
 
-// ── Direct I/O (polling) — used before kthread starts ─────────────────────
+// ── Slot wait ─────────────────────────────────────────────────────────────
+// Sleep until the IRQ handler marks s_slot_done[slot] = 1.
+
+static void slot_wait(uint32_t slot) {
+    for (;;) {
+        if (__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) return;
+        task_we_t we;
+        task_we_init(&we, g_current);
+        task_we_add(&s_slot_wq[slot], &we);
+        // Re-check under queue registration (lost-wakeup guard).
+        if (__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) {
+            task_we_remove(&s_slot_wq[slot], &we);
+            return;
+        }
+        sched_sleep();
+        task_we_remove(&s_slot_wq[slot], &we);
+    }
+}
+
+// ── Pre-scheduler polling path ────────────────────────────────────────────
+// Slot 0, per-slot command table, direct zero-copy DMA to destination.
+// Runs single-threaded (BSP only, interrupts off) before sched_init().
+// PRDT entries are built page-by-page so physically-discontiguous buffers
+// (stack, BSS, HHDM heap) are all handled correctly.
 
 static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
                              uint8_t write) {
     if (!s_port) return 0;
-    uint8_t* p8 = (uint8_t*)buf;
+    hba_port_t* p = s_port;
 
     while (count > 0) {
-        uint32_t n     = count < DMA_SECTORS ? count : DMA_SECTORS;
-        uint32_t bytes = n * 512;
-        uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
+        // ATA sector count field is 16 bits; cap at 65535 (0 means 65536).
+        uint32_t n     = (count < 0xFFFFu) ? count : 0xFFFFu;
+        uint32_t bytes = n * 512u;
 
-        if (write) __builtin_memcpy(dma, p8, bytes);
+        // Wait for port idle.
+        for (int i = 0; i < 100000; i++) {
+            if (!(p->tfd & (PORT_TFD_BSY | PORT_TFD_DRQ))) break;
+            if (i == 99999) return 0;
+            udelay(10);
+        }
 
-        if (!issue_one(lba, n, write, 0)) return 0;
+        // Build PRDT page-by-page so physical discontinuities are handled.
+        cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
+        cmd_table_t*  ct  = (cmd_table_t*)(s_ctbl_phys[0] + HHDM_OFFSET);
 
-        if (!write) __builtin_memcpy(p8, dma, bytes);
+        uint8_t*  p8      = (uint8_t*)buf;
+        uint32_t  rem     = bytes;
+        uint16_t  nprdt   = 0;
+        while (rem > 0 && nprdt < 248u) {
+            uint32_t pg_off = (uint32_t)((uint64_t)p8 & (PAGE_SIZE - 1u));
+            uint32_t chunk  = PAGE_SIZE - pg_off;
+            if (chunk > rem)     chunk = rem;
+            // DBC field: bits[21:0], value = byte_count - 1; max 4MB - 2.
+            if (chunk > 0x3FFFFEu) chunk = 0x3FFFFEu;
+            phys_addr_t pa = va_to_phys(p8);
+            ct->prdt[nprdt].dba  = (uint32_t)(pa & 0xFFFFFFFFu);
+            ct->prdt[nprdt].dbau = (uint32_t)(pa >> 32);
+            ct->prdt[nprdt].rsv  = 0;
+            ct->prdt[nprdt].dbc  = chunk - 1u;
+            p8  += chunk;
+            rem -= chunk;
+            nprdt++;
+        }
+        if (rem) return 0;   // buffer too fragmented (should never happen)
 
-        p8    += bytes;
+        hdr[0].flags = 5u | (write ? (1u << 6) : 0u);
+        hdr[0].prdtl = nprdt;
+        hdr[0].prdbc = 0;
+
+        // Build H2D Register FIS.
+        uint8_t* fis = ct->cfis;
+        __builtin_memset(fis, 0, 64);
+        fis[0]  = FIS_TYPE_H2D;
+        fis[1]  = 0x80;   // C=1 (command)
+        fis[2]  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
+        fis[4]  = (uint8_t)(lba         & 0xFFu);
+        fis[5]  = (uint8_t)((lba >>  8) & 0xFFu);
+        fis[6]  = (uint8_t)((lba >> 16) & 0xFFu);
+        fis[7]  = 0x40;   // LBA mode
+        fis[8]  = (uint8_t)((lba >> 24) & 0xFFu);
+        fis[9]  = (uint8_t)((lba >> 32) & 0xFFu);
+        fis[10] = (uint8_t)((lba >> 40) & 0xFFu);
+        fis[12] = (uint8_t)(n           & 0xFFu);
+        fis[13] = (uint8_t)((n >>    8) & 0xFFu);
+
+        p->is   = p->is;    // W1C: clear pending interrupts
+        p->serr = p->serr;
+        p->ci   = 1u;       // slot 0
+
+        // Busy-poll until slot 0 clears from CI.
+        for (int i = 0; i < 3000000; i++) {
+            if (!(p->ci & 1u)) break;
+            if (p->is & PORT_IS_TFES) return 0;
+            if (i == 2999999)  return 0;
+            udelay(10);
+        }
+        if (p->is & PORT_IS_TFES) return 0;
+
+        buf    = (uint8_t*)buf + bytes;
         lba   += n;
         count -= n;
     }
     return 1;
 }
 
-// ── I/O kthread ──────────────────────────────────────────────────────────
-// Sole owner of the AHCI hardware after boot.  Processes requests serially,
-// uses IRQ-based wait, wakes the submitter when done.
+// ── NCQ submit helpers ────────────────────────────────────────────────────
 
-// Copy between a DMA bounce buffer and a scatter-gather page list.
-// `to_dma`=1: pages→dma (write path). `to_dma`=0: dma→pages (read path).
-static void scatter_copy(uint8_t* dma, uint32_t bytes,
-                         uint8_t** pages, uint32_t page_count,
-                         uint32_t first_offset, uint32_t buf_offset,
-                         uint8_t to_dma) {
-    uint32_t pos = buf_offset;  // position in the logical user buffer
-    uint32_t done = 0;
-    while (done < bytes) {
-        // Which page does `pos` land in?
-        uint32_t abs = first_offset + pos;
-        uint32_t pg  = abs / PAGE_SIZE;
-        uint32_t off = abs % PAGE_SIZE;
-        if (pg >= page_count) break;
-        uint32_t chunk = PAGE_SIZE - off;
-        if (chunk > bytes - done) chunk = bytes - done;
-        uint8_t* p = pages[pg] + off;
-        if (to_dma) __builtin_memcpy(dma + done, p, chunk);
-        else        __builtin_memcpy(p, dma + done, chunk);
-        done += chunk;
-        pos  += chunk;
-    }
-}
+// Submit one NCQ/DMA command for any kernel virtual buffer.
+// Handles three kernel VA ranges:
+//   HHDM  [HHDM_OFFSET, 0xFFFFFFFF80000000) → phys = va - HHDM_OFFSET  (fast)
+//   All others (kernel stacks, BSS, etc.)    → vmm_page_phys page-table walk
+// PRDT is built page-by-page so physically-discontiguous mappings
+// (e.g. kernel stacks allocated as individual PMM pages) are always correct.
 
-// Process one request end-to-end: copy in (for writes), issue the DMA
-// command(s), copy out (for reads), publish r->done and wake the waiter.
-static void ahci_process_one(ahci_req_t* r) {
-    uint64_t lba   = r->lba;
-    uint32_t count = r->count;
-    uint8_t  write = r->write;
-    uint8_t  ok    = 1;
+static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
+                                  uint8_t write) {
+    uint32_t bytes = count * 512u;
+    uint32_t slot  = slot_alloc();
 
-    uint8_t  scatter = (r->page_count > 0);
-    uint8_t* p8      = (uint8_t*)r->buf;  // used only if !scatter
-    uint32_t sg_off  = 0;                 // byte offset into scatter buffer
+    cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
 
-    while (count > 0 && ok) {
-        uint32_t n     = count < DMA_SECTORS ? count : DMA_SECTORS;
-        uint32_t bytes = n * 512;
-        uint8_t* dma   = (uint8_t*)(s_dma_phys + HHDM_OFFSET);
+    // Build PRDT page-by-page: resolve each page's physical address
+    // individually so we're correct regardless of VA range.
+    uint8_t*    p8    = (uint8_t*)buf;
+    uint32_t    rem   = bytes;
+    uint16_t    nprdt = 0;
+    phys_addr_t kpml4 = 0;   // lazy-init only if we need a page-table walk
 
-        if (write) {
-            if (scatter)
-                scatter_copy(dma, bytes, r->pages, r->page_count,
-                             r->first_page_offset, sg_off, 1);
-            else
-                __builtin_memcpy(dma, p8, bytes);
+    while (rem > 0 && nprdt < 248u) {
+        uint32_t pg_off = (uint32_t)((uint64_t)p8 & (PAGE_SIZE - 1u));
+        uint32_t chunk  = PAGE_SIZE - pg_off;
+        if (chunk > rem)      chunk = rem;
+        if (chunk > 0x3FFFFEu) chunk = 0x3FFFFEu;
+
+        uint64_t  v = (uint64_t)p8;
+        phys_addr_t pa;
+        if (v >= HHDM_OFFSET && v < 0xFFFFFFFF80000000ULL) {
+            pa = v - HHDM_OFFSET;                         // HHDM: O(1)
+        } else {
+            if (!kpml4) kpml4 = vmm_kernel_pml4_get();   // page-table walk
+            pa = vmm_page_phys(kpml4, v & ~(uint64_t)(PAGE_SIZE - 1u)) + pg_off;
         }
 
-        ok = issue_one(lba, n, write, 1);
-
-        if (ok && !write) {
-            if (scatter)
-                scatter_copy(dma, bytes, r->pages, r->page_count,
-                             r->first_page_offset, sg_off, 0);
-            else
-                __builtin_memcpy(p8, dma, bytes);
-        }
-
-        if (!scatter) p8 += bytes;
-        sg_off += bytes;
-        lba    += n;
-        count  -= n;
+        ct->prdt[nprdt].dba  = (uint32_t)(pa & 0xFFFFFFFFu);
+        ct->prdt[nprdt].dbau = (uint32_t)(pa >> 32);
+        ct->prdt[nprdt].rsv  = 0;
+        ct->prdt[nprdt].dbc  = chunk - 1u;
+        p8  += chunk;
+        rem -= chunk;
+        nprdt++;
     }
 
-    r->result = ok;
-    // RELEASE store pairs with the submitter's ACQUIRE load of r->done
-    // in ahci_submit's sleep loop.  All the r->buf / scatter-gather
-    // memcpy's above are ordered before this store.
-    __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
-    if (r->waiter) sched_wake(r->waiter);
+    s_slot_done[slot]   = 0;
+    s_slot_result[slot] = 0;
+    issue_cmd(slot, lba, count, write, nprdt);
+    slot_wait(slot);
+    return s_slot_result[slot];
 }
 
-static void ahci_io_thread(void) {
-    task_we_t self;
+// Submit using a pre-resolved scatter-gather page list (user-space path).
+// pages[i]: HHDM kernel pointer to the start of each 4 KiB user page.
+// first_off: byte offset within pages[0].
 
-    for (;;) {
-        // Canonical Phase 9-6 wait pattern on the kthread's own
-        // queue, with the MPSC drain as the condition.
-        //
-        // Phase 1: peek.
-        ahci_req_t* chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
-                                                  __ATOMIC_ACQUIRE);
-        if (!chain) {
-            // Phase 2: register on the kthread wait queue.
-            task_we_init(&self, g_current);
-            task_we_add(&s_io_thread_wq, &self);
-
-            // Phase 3: re-check — a producer may have CAS-pushed
-            // between phase 1 and phase 2.
-            chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
-                                          __ATOMIC_ACQUIRE);
-            if (!chain) sched_sleep();  // phase 4
-            task_we_remove(&s_io_thread_wq, &self);
-
-            // After waking we may still have an empty list (spurious
-            // wake from a producer that saw the non-empty queue and
-            // didn't bother waking): fall back through to another
-            // xchg before processing.  But only drain once on the
-            // post-wake path; the outer for(;;) re-enters and runs
-            // phase 1 again with a fresh peek.
-            if (!chain) {
-                chain = __atomic_exchange_n(&s_req_head, (ahci_req_t*)NULL,
-                                              __ATOMIC_ACQUIRE);
-                if (!chain) continue;
-            }
-        }
-
-        // Drain order is LIFO (CAS-prepend onto head); reverse in
-        // place so we process requests in the order they were
-        // submitted (FIFO) — matches the pre-9-6f fixed-ring behaviour.
-        ahci_req_t* fifo = NULL;
-        while (chain) {
-            ahci_req_t* next = chain->next;
-            chain->next = fifo;
-            fifo = chain;
-            chain = next;
-        }
-
-        while (fifo) {
-            ahci_req_t* r = fifo;
-            fifo = r->next;
-            r->next = NULL;
-            ahci_process_one(r);
-        }
-    }
-}
-
-// ── Resolve user-space buffer to HHDM kernel pointer ────────���────────────
-// If `buf` is a user-space address (lower half), walk the current process's
-// page tables to find the physical frame and return the HHDM pointer.
-// If `buf` is already a kernel address (upper half / HHDM), return as-is.
-// This lets the I/O kthread safely access the buffer from any context,
-// since HHDM is always mapped regardless of which process's CR3 is loaded.
-// NOTE: only works for buffers that fit within a single page.  For multi-page
-// buffers, the caller must ensure each page is resolved (or use a kernel buf).
-static void* resolve_to_hhdm(void* buf) {
-    uint64_t va = (uint64_t)buf;
-    if (va >= HHDM_OFFSET) return buf;  // already kernel space
-    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-    uint64_t page_va = va & ~0xFFFULL;
-    phys_addr_t phys = vmm_page_phys(pml4, page_va);
-    if (phys == PMM_INVALID_ADDR) return buf;  // can't resolve — hope for the best
-    return (void*)(phys + HHDM_OFFSET + (va & 0xFFFULL));
-}
-
-// ── Submit a request to the I/O thread and sleep until completion ────────
-
-// CAS-prepend an ahci_req_t onto s_req_head.  The request's `next`
-// pointer is written inside the CAS loop so a producer retry is safe.
-// Pairs (release) with the kthread's xchg-acquire drain.
-static inline void ahci_req_push(ahci_req_t* r) {
-    ahci_req_t* old_head = __atomic_load_n(&s_req_head, __ATOMIC_RELAXED);
-    do {
-        r->next = old_head;
-    } while (!__atomic_compare_exchange_n(&s_req_head, &old_head, r,
-                                            /*weak=*/0,
-                                            __ATOMIC_RELEASE,
-                                            __ATOMIC_RELAXED));
-}
-
-// Block until the kthread publishes r->done=1 (release).  Uses the
-// canonical sleep pattern: the read is under ACQUIRE so it pairs
-// with the kthread's RELEASE store.
-static inline void ahci_wait_done(ahci_req_t* r) {
-    for (;;) {
-        if (__atomic_load_n(&r->done, __ATOMIC_ACQUIRE)) return;
-        sched_sleep();
-    }
-}
-
-static uint8_t ahci_submit(uint64_t lba, void* buf, uint32_t count,
-                            uint8_t write) {
-    // Resolve user-space buffer to HHDM pointer so the kthread can access it.
-    // Multi-page buffers: we resolve page-by-page by checking if buf is in
-    // user space.  For now, all callers pass kernel-space buffers (block cache,
-    // static buffers) so this is a safety net — the fast path is a no-op.
-    void* kbuf = resolve_to_hhdm(buf);
-
-    // Stack-allocate the request in the caller's own frame.  It lives
-    // until ahci_wait_done returns below; the kthread's reference is
-    // bounded by that interval.
-    ahci_req_t r;
-    r.next              = NULL;
-    r.lba               = lba;
-    r.buf               = kbuf;
-    r.count             = count;
-    r.write             = write;
-    r.waiter            = g_current;
-    r.done              = 0;
-    r.result            = 0;
-    r.page_count        = 0;
-    r.first_page_offset = 0;
-
-    ahci_req_push(&r);
-
-    // Wake the I/O thread if it's parked.  The wake path is the
-    // kthread's own wait queue, not a direct sched_wake by name, so
-    // any future kthread identity (init-time restart) is handled
-    // transparently.
-    wait_queue_wake_all(&s_io_thread_wq);
-
-    ahci_wait_done(&r);
-    return r.result;
-}
-
-// ── Scatter-gather submit: resolve user pages and DMA directly ───────────
-// Called from ext2's multi-block path.  Resolves the user buffer pages
-// via vmm_get_user_pages() so the kthread can write DMA data directly
-// to the user's physical frames via HHDM — zero extra copies.
-
-static uint8_t ahci_submit_sg(uint64_t lba, void* user_buf,
-                               uint32_t count, uint8_t write) {
-    uint64_t va = (uint64_t)user_buf;
-    uint32_t total_bytes = count * 512;
-    uint32_t first_off = (uint32_t)(va & 0xFFF);
-    uint32_t npages = (first_off + total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    if (npages > AHCI_MAX_PAGES) return 0;  // too large for scatter list
-
-    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-    void* page_ptrs[AHCI_MAX_PAGES];
-    if (!vmm_get_user_pages(pml4, va, npages, page_ptrs))
-        return 0;
-
-    // Pin every resolved frame so CoW fork won't share them while DMA
-    // is in flight.  The kthread writes via HHDM — if fork CoW-shared
-    // the frame, the child would see DMA data it shouldn't.
-    phys_addr_t pin_addrs[AHCI_MAX_PAGES];
-    for (uint32_t i = 0; i < npages; i++) {
-        pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
-        pmm_pin(pin_addrs[i]);
-    }
-
-    ahci_req_t r;
-    r.next              = NULL;
-    r.lba               = lba;
-    r.buf               = NULL;
-    r.count             = count;
-    r.write             = write;
-    r.waiter            = g_current;
-    r.done              = 0;
-    r.result            = 0;
-    r.page_count        = npages;
-    r.first_page_offset = first_off;
+static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
+                                uint32_t first_off, uint32_t count,
+                                uint8_t write) {
+    phys_addr_t phys_pages[130];
     for (uint32_t i = 0; i < npages; i++)
-        r.pages[i] = (uint8_t*)page_ptrs[i];
+        phys_pages[i] = (phys_addr_t)((uint64_t)pages[i] - HHDM_OFFSET);
 
-    ahci_req_push(&r);
-    wait_queue_wake_all(&s_io_thread_wq);
-    ahci_wait_done(&r);
+    uint32_t bytes = count * 512u;
+    uint32_t slot  = slot_alloc();
 
-    // Unpin after DMA is complete.
-    for (uint32_t i = 0; i < npages; i++)
-        pmm_unpin(pin_addrs[i]);
+    cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
+    uint16_t nprdt = (uint16_t)build_prdt_pages(ct->prdt, phys_pages, npages,
+                                                  first_off, bytes);
 
-    return r.result;
+    s_slot_done[slot]   = 0;
+    s_slot_result[slot] = 0;
+    issue_cmd(slot, lba, count, write, nprdt);
+    slot_wait(slot);
+    return s_slot_result[slot];
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 
 uint8_t ahci_read(uint64_t lba, void* buf, uint32_t count) {
     if (!s_port) return 0;
-    if (s_io_thread) return ahci_submit(lba, buf, count, 0);
+    if (s_irq_ready) return ahci_submit_hhdm(lba, buf, count, 0);
     return do_rw_direct(lba, buf, count, 0);
 }
 
 uint8_t ahci_write(uint64_t lba, const void* buf, uint32_t count) {
     if (!s_port) return 0;
-    if (s_io_thread) return ahci_submit(lba, (void*)buf, count, 1);
+    if (s_irq_ready) return ahci_submit_hhdm(lba, (void*)buf, count, 1);
     return do_rw_direct(lba, (void*)buf, count, 1);
 }
 
-// Read directly into a user-space buffer via scatter-gather.
-// Resolves user pages to HHDM, DMA bounce → pages.  Zero extra copies.
+// Read directly into a user-space buffer (zero-copy scatter-gather).
+// Resolves user virtual pages to physical frames via page tables,
+// then builds a multi-entry PRDT so the HBA DMA's into user memory directly.
 uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
     if (!s_port) return 0;
-    if (s_io_thread) return ahci_submit_sg(lba, user_buf, count, 0);
-    return do_rw_direct(lba, user_buf, count, 0);
+    if (!s_irq_ready) return do_rw_direct(lba, user_buf, count, 0);
+
+    uint64_t va        = (uint64_t)user_buf;
+    uint32_t total_bytes = count * 512u;
+    uint32_t first_off = (uint32_t)(va & 0xFFFu);
+    uint32_t npages    = (first_off + total_bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
+
+    if (npages > 130u) return 0;
+
+    phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+    void* page_ptrs[130];
+    if (!vmm_get_user_pages(pml4, va, npages, page_ptrs)) return 0;
+
+    // Pin pages so CoW fork doesn't share a frame while DMA is in flight.
+    phys_addr_t pin_addrs[130];
+    for (uint32_t i = 0; i < npages; i++) {
+        pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
+        pmm_pin(pin_addrs[i]);
+    }
+
+    uint8_t ok = ahci_submit_sg(lba, (uint8_t**)page_ptrs, npages,
+                                  first_off, count, 0);
+
+    for (uint32_t i = 0; i < npages; i++)
+        pmm_unpin(pin_addrs[i]);
+
+    return ok;
 }
 
-// ── Start the I/O kthread (call after sched_init) ────────────────────────
+// Parallel multi-page read into PMM-allocated frames.
+//
+// Submits `nframes` independent NCQ read commands simultaneously (all in-flight
+// at once), then waits for each to complete.  With NCQ the HBA can re-order and
+// pipeline the reads for optimal rotational latency — especially useful for
+// read-ahead where all target pages are known upfront.
+//
+// frames[i]:  physical address of a pre-allocated 4 KiB PMM frame (must be from
+//             pmm_buddy_alloc(0)), or PMM_INVALID_ADDR to skip slot i.
+// lba:        first LBA; each page reads 8 sectors (lba + i*8).
+// nframes:    1..32 (capped at MAX_NCQ_SLOTS).
+//
+// Returns a bitmask: bit i = 1 if frames[i] was successfully filled.
+// Caller owns all frames regardless of success — free on failure.
+uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
+    if (!s_port || !s_irq_ready || !nframes) return 0;
+    if (nframes > MAX_NCQ_SLOTS) nframes = MAX_NCQ_SLOTS;
+
+    uint32_t slots[MAX_NCQ_SLOTS];
+    uint32_t submitted_mask = 0;
+
+    // Submit all reads before waiting for any (maximises HBA parallelism).
+    for (uint32_t i = 0; i < nframes; i++) {
+        if (frames[i] == PMM_INVALID_ADDR) { slots[i] = 0xFFu; continue; }
+
+        uint32_t slot = slot_alloc();
+        slots[i] = slot;
+
+        cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
+        uint16_t nprdt = (uint16_t)build_prdt(ct->prdt, frames[i], PAGE_SIZE);
+
+        s_slot_done[slot]   = 0;
+        s_slot_result[slot] = 0;
+        issue_cmd(slot, lba + (uint64_t)i * (PAGE_SIZE / 512u),
+                  PAGE_SIZE / 512u, 0, nprdt);
+        submitted_mask |= (1u << i);
+    }
+
+    // Now collect results.
+    uint32_t result_mask = 0;
+    for (uint32_t i = 0; i < nframes; i++) {
+        if (!(submitted_mask & (1u << i))) continue;
+        slot_wait(slots[i]);
+        if (s_slot_result[slots[i]]) result_mask |= (1u << i);
+    }
+    return result_mask;
+}
+
+// ── Start IRQ path (call after sched_init) ────────────────────────────────
 
 void ahci_start_io_thread(void) {
-    if (g_ahci_irq == 0xFF) return;  // no MSI — stay in polling mode
-    wait_queue_init(&s_io_thread_wq);
-    s_io_thread = task_create_kthread(ahci_io_thread, pid_alloc());
-    if (s_io_thread) sched_add(s_io_thread);
+    // In the NCQ design there is no dedicated I/O kthread.  Any CPU that
+    // calls ahci_read/ahci_write allocates a free command slot, issues the
+    // NCQ command, and sleeps on its per-slot wait queue until the IRQ
+    // handler wakes it.  This function just arms the IRQ path.
+    if (g_ahci_irq == 0xFF) return;  // no MSI/MSI-X — stay in polling mode
+    s_irq_ready = 1;
 }
 
 // ── ahci_init ─────────────────────────────────────────────────────────────
 
 uint8_t ahci_init(void) {
-    // 1. Find AHCI controller on PCI bus.
+    // 1. Locate AHCI controller.
     pci_device_t dev;
     if (!pci_find(PCI_CLASS_STORAGE, PCI_SUBCLASS_AHCI, &dev)) return 0;
 
     // 2. Enable MMIO + bus mastering.
     pci_enable(dev.bus, dev.dev, dev.fn);
 
-    // 2b. Disable MSI and MSI-X to force legacy INTx through the 8259A PIC.
-    //     ich9-ahci may use MSI-X (cap 0x11) even if MSI (cap 0x05) is off.
-    {
-        uint32_t status = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x04) >> 16;
-        if (status & (1u << 4)) {
-            uint8_t cap = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x34) & 0xFC;
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                uint8_t  id = dw & 0xFF;
-                if (id == 0x05)        // MSI: Enable = bit 16
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 16));
-                else if (id == 0x11)   // MSI-X: Enable = bit 31
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 31));
-                cap = ((dw >> 8) & 0xFF) & 0xFC;
-            }
-        }
-    }
-
-    // 3. Map ABAR (BAR5) into kernel virtual space.
+    // 3. Map ABAR (BAR5).
     uint64_t abar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn, AHCI_BAR);
     if (!abar_phys) return 0;
-
     s_hba = (hba_mem_t*)vmm_map_mmio(abar_phys, sizeof(hba_mem_t));
 
     // 4. Enable AHCI mode.
     s_hba->ghc |= HBA_GHC_AE;
 
-    // 5. Find the first port that has a SATA drive.
+    // 5. Detect NCQ support and slot count from HBA CAP.
+    //    CAP.SNCQ (bit 30): HBA supports NCQ.
+    //    CAP.NCS  (bits[12:8]): number of command slots - 1 (0-based).
+    s_ncq    = (s_hba->cap & HBA_CAP_SNCQ) ? 1u : 0u;
+    s_nslots = ((s_hba->cap >> 8) & 0x1Fu) + 1u;
+    if (s_nslots > MAX_NCQ_SLOTS) s_nslots = MAX_NCQ_SLOTS;
+    if (!s_ncq) s_nslots = 1u;   // non-NCQ: single slot (device is serial)
+
+    // 6. Find the first SATA port with a drive.
     uint32_t pi = s_hba->pi;
     for (int i = 0; i < 32; i++) {
         if (!(pi & (1u << i))) continue;
-
         hba_port_t* p = &s_hba->ports[i];
-
-        // Check device presence: SSTS.DET == 3 (device + communication).
-        if ((p->ssts & 0xF) != PORT_SSTS_DET_PRESENT) continue;
-
-        // Accept SATA drives only (not ATAPI, PM, etc.).
+        if ((p->ssts & 0xFu) != PORT_SSTS_DET_PRESENT) continue;
         if (p->sig != SATA_SIG_ATA) continue;
 
         s_port = p;
         port_init(p);
 
-        // 6. Enable global HBA interrupt delivery.
+        // 7. Enable global HBA interrupt delivery.
         s_hba->ghc |= HBA_GHC_IE;
 
-        // 7. Enable MSI and register the ISR.
+        // 8. Wire up the IRQ: try MSI-X first, fall back to MSI.
         //
-        // MSI bypasses the IOAPIC and PIC entirely: the device writes a
-        // LAPIC-format message directly to memory when it needs attention.
-        // We locate the MSI capability, program the LAPIC address and vector,
-        // then enable MSI.  No PIIX3/PIRQ table programming needed.
+        // MSI-X (cap 0x11):
+        //   Programs the table entry with lowest-priority delivery so the
+        //   interrupt is routed to whichever CPU currently has the lowest
+        //   task priority — naturally distributing IRQ load without any
+        //   per-request steering.
+        //   Table entry format (16 bytes, MMIO):
+        //     [0] msg_addr_lo  [1] msg_addr_hi  [2] msg_data  [3] vector_ctrl
+        //
+        // MSI addr for lowest-priority delivery (Intel SDM §10.11.1):
+        //   bit[2]   = DM (destination mode 1 = logical addressing)
+        //   bit[3]   = RH (redirection hint 1 = use lowest-priority arbitration)
+        //   bits[19:12] = destination 0xFF (all CPUs in flat logical model)
+        //   0xFEE00000 | (0xFF<<12) | (1<<3) | (1<<2) = 0xFEEFF00C
+        //
+        // MSI data for lowest-priority delivery (delivery mode 001):
+        //   bits[10:8] = 001 → (1u<<8)
+        //   bits[7:0]  = vector
         {
-            // Locate the MSI capability (ID = 0x05) in the PCI cap list.
             uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                                   0x34u) & 0xFCu);
-            int msi_found = 0;
+                                                    0x34u) & 0xFCu);
+            uint8_t msix_cap = 0, msi_cap = 0;
             while (cap) {
                 uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                if ((dw & 0xFFu) == 0x05u) {  // MSI capability
-                    // Message Control register (bits [31:16] of dword at cap).
-                    // bit 16 = Enable, bits [19:17] = Multiple Message Enable.
-                    // We request single message (MME = 000).
-                    uint32_t mc = dw;
-
-                    // Write MSI address (LAPIC address for BSP).
-                    uint64_t msi_addr = lapic_msi_addr();
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
-
-                    int is_64bit = (mc >> 23) & 1u;
-                    if (is_64bit) {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                        cap + 8u, (uint32_t)(msi_addr >> 32));
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                        cap + 12u, lapic_msi_data(VEC_AHCI_MSI));
-                    } else {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                        cap + 8u, lapic_msi_data(VEC_AHCI_MSI));
-                    }
-
-                    // Enable MSI (bit 16), single message (MME=000).
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                    (mc & ~(0x7u << 20)) | (1u << 16));
-
-                    msi_found = 1;
-                    break;
-                }
+                uint8_t  id = dw & 0xFFu;
+                if (id == 0x11u && !msix_cap) msix_cap = cap;
+                if (id == 0x05u && !msi_cap)  msi_cap  = cap;
                 cap = (uint8_t)((dw >> 8) & 0xFCu);
             }
 
-            // Register IDT entry and set the irq_wait key.
-            // g_ahci_irq is repurposed as a logical slot index for irq_wait().
-            // We reuse slot 11 (matches old PIIX3 IRQ) — irq_wait has 16 slots.
-            g_ahci_irq = 11u;
-            idt_irq_register(VEC_AHCI_MSI, (uint64_t)ahci_irq_entry);
+            int irq_armed = 0;
 
-            if (!msi_found) {
-                // Fallback: should not happen on QEMU AHCI, but handle it.
-                // Without MSI the driver will never get IRQs — AHCI will poll.
-                g_ahci_irq = 0xFF;
+            if (msix_cap) {
+                // MSI-X: read table offset and BIR from cap+4.
+                uint32_t tbl_dw  = pci_cfg_read32(dev.bus, dev.dev, dev.fn,
+                                                    msix_cap + 4u);
+                uint32_t bir     = tbl_dw & 0x7u;
+                uint32_t tbl_off = tbl_dw & ~0x7u;
+                uint64_t bar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn,
+                                                  (uint8_t)bir);
+                if (bar_phys) {
+                    // Map just the 16-byte entry 0 (we only use one vector).
+                    s_msix_entry = (volatile uint32_t*)
+                                   vmm_map_mmio(bar_phys + tbl_off, 16u);
+
+                    // Fixed delivery to BSP LAPIC — works in both xAPIC and
+                    // x2APIC modes.  Lowest-priority (mode 001) is NOT
+                    // supported in x2APIC and silently drops the interrupt.
+                    uint32_t msi_addr = (uint32_t)lapic_msi_addr();
+                    uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
+
+                    s_msix_entry[0] = msi_addr;   // addr_lo
+                    s_msix_entry[1] = 0;           // addr_hi
+                    s_msix_entry[2] = msi_data;    // data
+                    s_msix_entry[3] = 0;           // vector_ctrl: bit0=0 → unmasked
+
+                    // Enable MSI-X in message control (bit 31).
+                    // Also clear Function Mask (bit 30) so vectors fire.
+                    uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
+                    mc = (mc | (1u << 31)) & ~(1u << 30);
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
+
+                    irq_armed = 1;
+                }
             }
+
+            if (!irq_armed && msi_cap) {
+                // MSI fallback: Fixed delivery to BSP LAPIC.
+                uint32_t mc      = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msi_cap);
+                int      is_64   = (mc >> 23) & 1;
+                uint32_t msi_addr = (uint32_t)lapic_msi_addr();
+                uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
+
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                msi_cap + 4u, msi_addr);
+                if (is_64) {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi_cap + 8u,  0u);
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi_cap + 12u, msi_data);
+                } else {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi_cap + 8u,  msi_data);
+                }
+                // Enable MSI (bit 16), single message (MME=000).
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi_cap,
+                                (mc & ~(0x7u << 20)) | (1u << 16));
+
+                irq_armed = 1;
+            }
+
+            idt_irq_register(VEC_AHCI_MSI, (uint64_t)ahci_irq_entry);
+            g_ahci_irq = irq_armed ? 11u : 0xFFu;
         }
 
         return 1;

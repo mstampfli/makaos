@@ -196,6 +196,8 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
     t->comm[0] = '\0'; // set by elf_load_with_argv or task_fork
+    t->pf_disk  = 0;
+    t->pf_cache = 0;
 
     // Security: always start with root credentials and full permissions.
     // fork() (task_fork) explicitly copies cred/pledge/unveil from the parent

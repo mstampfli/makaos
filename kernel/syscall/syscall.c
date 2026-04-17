@@ -17,6 +17,7 @@
 #include "ext2.h"
 #include "elf.h"
 #include "tsc.h"
+#include "kprintf.h"
 #include "fb.h"
 #include "tty.h"
 #include "evdev.h"
@@ -286,8 +287,10 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         // ext2 path.  fsn.inode_nr is already resolved by fs_lookup above —
         // no second ext2_lookup_path call needed.
         if (fsr == 0) {
-            // File exists.  O_EXCL already handled above.
-            (void)fsn.inode_nr; // inode known; ext2_open re-opens by path (stateless)
+            // File exists and fsn.inode_nr is already resolved by fs_lookup.
+            // Open by inode directly — no second path walk.
+            f = ext2_open_ino(fsn.inode_nr, path);
+            if (f) goto got_file;
         } else {
             // fsr == -ENOENT && O_CREAT: check write+exec on parent directory.
             char parent[512];
@@ -513,6 +516,15 @@ static uint64_t sys_exit(uint64_t code) {
             g_current->files_shared = NULL;
         }
 
+        // Log page-cache stats for demand-paged (VMA_FILE) processes.
+        if (g_current->pf_disk || g_current->pf_cache) {
+            uint32_t total = g_current->pf_disk + g_current->pf_cache;
+            uint32_t pct   = total ? (g_current->pf_cache * 100u / total) : 0u;
+            kprintf("[pf] %s: %u disk  %u cache  (%u%% warm)\n",
+                    g_current->comm,
+                    g_current->pf_disk, g_current->pf_cache, pct);
+        }
+
         g_current->exit_code = (int32_t)(int)code;
         g_current->state = TASK_ZOMBIE;
         sched_add_zombie(g_current);
@@ -677,10 +689,10 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     k_envp[envc] = NULL;
 
     // ── Execute permission check (path-aware walk + exec bit) ────────────
+    int exec_err = 0;
+    uint32_t exec_ino = ext2_lookup_path(resolved, &g_current->cred, &exec_err);
+    if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
     {
-        int exec_err = 0;
-        uint32_t exec_ino = ext2_lookup_path(resolved, &g_current->cred, &exec_err);
-        if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
         inode_perm_t exec_ip = {
@@ -693,17 +705,26 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
             goto enoent;
     }
 
-    // ── Load ELF ──────────────────────────────────────────────────────────
-    vfs_file_t* f = ext2_open(resolved);
+    // ── Load ELF — lazy (file-backed VMAs, pages faulted in on demand) ───────
+    // exec_ino already resolved above; ext2_open_ino skips the second walk.
+    // Read only the ELF header + program headers (first PAGE_SIZE bytes).
+    // elf_load_into parses the phdrs from this buffer and creates VMA_FILE
+    // VMAs backed by `f`; no pages are allocated here.  The file ref is
+    // dup'd per VMA; we vfs_close our own ref below.
+    vfs_file_t* f = ext2_open_ino(exec_ino, resolved);
     if (!f) { goto enoent; }
 
-    const uint64_t MAX_ELF = 8ULL * 1024ULL * 1024ULL; // 8 MiB
-    uint8_t* buf = kmalloc(MAX_ELF);
-    if (!buf) { vfs_close(f); goto oom; }
-
-    int64_t n = vfs_read(f, buf, MAX_ELF);
-    vfs_close(f);
-    if (n <= 0) { kfree(buf); goto enoent; }
+    // kmalloc so the buffer is HHDM-mapped — ahci_submit_hhdm requires
+    // buf in HHDM (phys = va - HHDM_OFFSET).  Kernel stack is at
+    // 0xFFFFFFFF80... which is NOT HHDM, causing DMA to a wrong PA.
+    uint8_t* hdr_buf = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!hdr_buf) { vfs_close(f); goto oom; }
+    uint64_t t0 = tsc_read_ns();
+    int64_t hdr_n = f->read(f, hdr_buf, PAGE_SIZE);
+    uint64_t t1 = tsc_read_ns();
+    if (hdr_n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr_buf); vfs_close(f); goto enoexec; }
+    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+            resolved, (uint32_t)((t1 - t0) / 1000u));
 
     phys_addr_t new_pml4;
     mm_t*       new_mm;
@@ -711,12 +732,15 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     uint64_t    phdr_vaddr = 0;
     uint16_t    phnum = 0, phent = 0;
 
-    if (!elf_load_into(buf, (uint64_t)n, &new_pml4, &new_mm, &entry,
-                       &phdr_vaddr, &phnum, &phent)) {
-        kfree(buf);
+    if (!elf_load_into(hdr_buf, (uint64_t)hdr_n, &new_pml4, &new_mm, &entry,
+                       &phdr_vaddr, &phnum, &phent, f)) {
+        kfree(hdr_buf);
+        vfs_close(f);
         goto enoexec;
     }
-    kfree(buf);
+    kfree(hdr_buf);
+    // VMAs hold their own refs; release ours.
+    vfs_close(f);
 
     // ── Build user stack with argv/envp/auxv ──────────────────────────────
     uint64_t user_rsp = elf_setup_stack(new_pml4,
@@ -786,6 +810,10 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
         }
         g_current->comm[ci] = '\0';
     }
+
+    // Reset page-fault stats for the new image.
+    g_current->pf_disk  = 0;
+    g_current->pf_cache = 0;
 
     // ── Trigger sysretq to new entry point ────────────────────────────────
     g_exec_entry     = entry;
