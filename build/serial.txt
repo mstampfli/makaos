@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x000000000004349B
+kernel.bin size=0x00000000000454A3
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x000000000004349B
+kernel loaded, bytes=0x00000000000454A3
 phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
@@ -22,3 +22,23 @@ K
 [net] IP 10.0.2.15 GW 10.0.2.2
 [net] MAC 52:54:00:12:34:56
 [net] ready
+[elf] read /bin/login: 106920 bytes in 984 us
+[elf] map  /bin/login: 810 us  total 1795 us
+[elf] read /bin/svcmgr: 110912 bytes in 1097 us
+[elf] map  /bin/svcmgr: 1240 us  total 2338 us
+[elf] read /bin/net: 111208 bytes in 1686 us
+[elf] map  /bin/net: 776 us  total 2463 us
+[elf] read /bin/bash: 1073520 bytes in 4842 us
+[elf] map  /bin/bash: 1104 us  total 5947 us
+[elf] lazy /bin/ls: header 160 us (demand-paged)
+[pf] ls: 4 disk  6 cache  (60% warm)
+[elf] lazy /bin/ps: header 234 us (demand-paged)
+[pf] ps: 3 disk  1 cache  (25% warm)
+[elf] lazy /bin/ls: header 273 us (demand-paged)
+[pf] ls: 0 disk  10 cache  (100% warm)
+[elf] lazy /bin/ps: header 221 us (demand-paged)
+[pf] ps: 0 disk  4 cache  (100% warm)
+[elf] lazy /bin/ls: header 399 us (demand-paged)
+[pf] ls: 0 disk  10 cache  (100% warm)
+[elf] lazy /bin/ps: header 230 us (demand-paged)
+[pf] ps: 0 disk  4 cache  (100% warm)

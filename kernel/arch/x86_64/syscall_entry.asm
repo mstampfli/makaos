@@ -110,11 +110,27 @@ syscall_entry:
     cmp byte [gs:CPU_EXEC_REQUESTED], 0
     je  .sysret_normal
     mov byte [gs:CPU_EXEC_REQUESTED], 0
-    mov rcx, [gs:CPU_EXEC_ENTRY]
-    mov r11, 0x202              ; RFLAGS: IF=1 + reserved bit
-    mov rsp, [gs:CPU_EXEC_RSP]
+    mov rcx, [gs:CPU_EXEC_ENTRY]   ; new RIP
+    mov r11, 0x202                  ; new RFLAGS: IF=1 + reserved
+    mov rsp, [gs:CPU_EXEC_RSP]     ; new RSP
     mov rax, [gs:CPU_EXEC_PML4]
-    mov cr3, rax
+    mov cr3, rax                    ; switch address space
+    ; Clear all GPRs except rcx (RIP) and r11 (RFLAGS) so the new process
+    ; does not inherit kernel values — specifically RAX which just held the
+    ; PML4 physical address and would be used as a pointer by the entry code.
+    xor  eax, eax
+    xor  ebx, ebx
+    xor  edx, edx
+    xor  esi, esi
+    xor  edi, edi
+    xor  ebp, ebp
+    xor  r8d,  r8d
+    xor  r9d,  r9d
+    xor  r10d, r10d
+    xor  r12d, r12d
+    xor  r13d, r13d
+    xor  r14d, r14d
+    xor  r15d, r15d
 
 .sysret_normal:
     ; 10. Check if a user signal handler is being delivered, or sigreturn.

@@ -1,11 +1,11 @@
-	.text
 	.file	"asm_offsets.c"
+	.text
 	.globl	asm_offsets                     # -- Begin function asm_offsets
-	.p2align	4, 0x90
+	.p2align	4
 	.type	asm_offsets,@function
 asm_offsets:                            # @asm_offsets
 .Lfunc_begin0:
-	.file	0 "/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
+	.file	0 "/home/kali/Documents/dev/MakaOS/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
 	.loc	0 28 0                          # kernel/arch/x86_64/asm_offsets.c:28:0
 	.cfi_sections .debug_frame
 	.cfi_startproc
@@ -187,13 +187,13 @@ asm_offsets:                            # @asm_offsets
 .Lstr_offsets_base0:
 	.section	.debug_str,"MS",@progbits,1
 .Linfo_string0:
-	.asciz	"Debian clang version 19.1.7 (3+b1)" # string offset=0
+	.asciz	"Debian clang version 21.1.8 (3+b1)" # string offset=0
 .Linfo_string1:
 	.asciz	"kernel/arch/x86_64/asm_offsets.c" # string offset=35
 .Linfo_string2:
-	.asciz	"/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM" # string offset=68
+	.asciz	"/home/kali/Documents/dev/MakaOS/bootloader-kernel-in-NASM" # string offset=68
 .Linfo_string3:
-	.asciz	"asm_offsets"                   # string offset=131
+	.asciz	"asm_offsets"                   # string offset=126
 	.section	.debug_str_offsets,"",@progbits
 	.long	.Linfo_string0
 	.long	.Linfo_string1
@@ -208,7 +208,7 @@ asm_offsets:                            # @asm_offsets
 .Laddr_table_base0:
 	.quad	.Lfunc_begin0
 .Ldebug_addr_end0:
-	.ident	"Debian clang version 19.1.7 (3+b1)"
+	.ident	"Debian clang version 21.1.8 (3+b1)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
 	.section	.debug_line,"",@progbits

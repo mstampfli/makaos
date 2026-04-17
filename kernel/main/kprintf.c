@@ -7,7 +7,11 @@ typedef __builtin_va_list va_list;
 #define va_end(ap)          __builtin_va_end(ap)
 #define va_arg(ap, type)    __builtin_va_arg(ap, type)
 
-static void kp_putc(char c) { serial_putc_dbg(c); }
+static void kp_putc(char c) {
+    uint64_t f = serial_lock_irqsave();
+    serial_raw_putc(c);
+    serial_unlock_irqrestore(f);
+}
 
 static void kp_puts(const char* s) {
     if (!s) { kp_puts("(null)"); return; }

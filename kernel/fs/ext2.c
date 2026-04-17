@@ -581,7 +581,7 @@ uint8_t ext2_init(uint32_t part_lba) {
 
     // Superblock is at byte offset 1024 from partition start = LBA part_lba + 2
     // (each sector is 512 bytes, so 1024 = 2 sectors).
-    static uint8_t sb_buf[1024];
+    uint8_t sb_buf[1024];
     if (!ahci_read(part_lba + 2, sb_buf, 2)) return 0;
 
     ext2_superblock_t* sb = (ext2_superblock_t*)sb_buf;
@@ -680,6 +680,117 @@ static uint32_t inode_get_block(const ext2_inode_t* ino, uint32_t idx) {
 
     // Triple indirect not implemented — too large for our use case.
     return 0;
+}
+
+// ── inode_build_run ────────────────────────────────────────────────────────
+// Resolve a run of consecutive physical blocks starting at logical blk_idx.
+// Unlike calling inode_get_block per block, indirect metadata is pinned once
+// for the whole probe: no repeated bcache_get/put/kmalloc per block.
+//
+// Returns the run length (>= 1) and sets *phys_start to the first physical
+// block number.  *phys_start == 0 means the first block is sparse/unallocated;
+// the caller should zero-fill rather than DMA.
+//
+// The run is bounded by max_run AND by the boundary of the current indirect
+// level (direct 0-11, singly-indirect 12..12+N-1, doubly-indirect …).  The
+// outer read loop issues additional calls for the next region if needed.
+//
+// On kmalloc failure for scratch, falls back to inode_get_block (correct but
+// slower).  The fast path is always correct; the fallback is just less fast.
+static uint32_t inode_build_run(const ext2_inode_t* ino, uint32_t blk_idx,
+                                  uint32_t max_run, uint32_t* phys_start)
+{
+    if (max_run == 0) { *phys_start = 0; return 1; }
+    uint32_t addrs_per_blk = s_block_size / 4;
+
+    // ── Direct range (logical blocks 0–11) ────────────────────────────────
+    if (blk_idx < 12) {
+        uint32_t first = ino->i_block[blk_idx];
+        *phys_start = first;
+        if (!first || max_run == 1) return 1;
+        // Extend within the direct window; stop at 12 (boundary with indirect).
+        uint32_t direct_lim = 12u - blk_idx;
+        if (direct_lim > max_run) direct_lim = max_run;
+        uint32_t run = 1;
+        for (; run < direct_lim; run++)
+            if (ino->i_block[blk_idx + run] != first + run) break;
+        return run;
+    }
+
+    // ── Singly-indirect range (logical 12 .. 12+addrs_per_blk-1) ─────────
+    uint32_t si_rel = blk_idx - 12u;
+    if (si_rel < addrs_per_blk) {
+        uint32_t ind_phys = ino->i_block[12];
+        if (!ind_phys) { *phys_start = 0; return 1; }
+
+        // Pin the indirect block once; read all block pointers from it in a
+        // single pass with no further bcache_get per block.
+        uint8_t* scratch = (uint8_t*)kmalloc(4096);
+        if (!scratch) {
+            // OOM fallback: resolve the single starting block via the slow path.
+            *phys_start = inode_get_block(ino, blk_idx);
+            return 1;
+        }
+        bcache_ref_t r = bcache_get(ind_phys, scratch);
+        if (!r.data) { kfree(scratch); *phys_start = 0; return 1; }
+
+        const uint32_t* arr = (const uint32_t*)r.data;
+        uint32_t first = arr[si_rel];
+        *phys_start = first;
+        uint32_t run = 1;
+        if (first && max_run > 1) {
+            uint32_t lim = addrs_per_blk - si_rel;
+            if (lim > max_run) lim = max_run;
+            for (; run < lim; run++)
+                if (arr[si_rel + run] != first + run) break;
+        }
+        bcache_put(&r);
+        kfree(scratch);
+        return run;
+    }
+
+    // ── Doubly-indirect range ─────────────────────────────────────────────
+    uint32_t di_rel = blk_idx - 12u - addrs_per_blk;
+    if (di_rel < addrs_per_blk * addrs_per_blk) {
+        uint32_t l1_idx    = di_rel / addrs_per_blk;
+        uint32_t l2_rel    = di_rel % addrs_per_blk;
+        uint32_t dind_phys = ino->i_block[13];
+        if (!dind_phys) { *phys_start = 0; return 1; }
+
+        // Read L1 (doubly-indirect) block to find the L2 block number.
+        uint8_t* s1 = (uint8_t*)kmalloc(4096);
+        if (!s1) { *phys_start = inode_get_block(ino, blk_idx); return 1; }
+        bcache_ref_t r1 = bcache_get(dind_phys, s1);
+        if (!r1.data) { kfree(s1); *phys_start = 0; return 1; }
+        uint32_t l2_phys = ((const uint32_t*)r1.data)[l1_idx];
+        bcache_put(&r1);
+        kfree(s1);
+        if (!l2_phys) { *phys_start = 0; return 1; }
+
+        // Pin the L2 block once; probe the full run from it.
+        uint8_t* s2 = (uint8_t*)kmalloc(4096);
+        if (!s2) { *phys_start = inode_get_block(ino, blk_idx); return 1; }
+        bcache_ref_t r2 = bcache_get(l2_phys, s2);
+        if (!r2.data) { kfree(s2); *phys_start = 0; return 1; }
+
+        const uint32_t* arr = (const uint32_t*)r2.data;
+        uint32_t first = arr[l2_rel];
+        *phys_start = first;
+        uint32_t run = 1;
+        if (first && max_run > 1) {
+            uint32_t lim = addrs_per_blk - l2_rel;
+            if (lim > max_run) lim = max_run;
+            for (; run < lim; run++)
+                if (arr[l2_rel + run] != first + run) break;
+        }
+        bcache_put(&r2);
+        kfree(s2);
+        return run;
+    }
+
+    // Triple-indirect not implemented — fall back to per-block resolution.
+    *phys_start = inode_get_block(ino, blk_idx);
+    return 1;
 }
 
 // ── Directory lookup ───────────────────────────────────────────────────────
@@ -790,9 +901,9 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* dst = (uint8_t*)buf;
     uint64_t total = 0;
 
-    // Partial-block fallback scratch — only allocated if we actually
-    // hit a non-block-aligned read.  Most reads use the multi-block DMA
-    // fast path below and never touch this buffer.
+    // Partial-block scratch — only allocated for non-block-aligned reads
+    // (first/last partial block of a seek'd read).  The fast path below
+    // bypasses the bcache entirely for full-block aligned reads.
     EXT2_SCRATCH_DECL(rd_buf);
 
     while (total < len) {
@@ -807,6 +918,59 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         if (to_copy > remain_blk)  to_copy = remain_blk;
         if (to_copy > remain_file) to_copy = remain_file;
 
+        // ── Fast path: block-aligned, full-block reads ────────────────────
+        // inode_build_run pins the appropriate indirect block once and probes
+        // all consecutive physical blocks in a tight loop — no per-block
+        // bcache_get/kmalloc.  Then a single ahci_read DMA covers the whole
+        // run, regardless of whether blocks are consecutive or not (a non-
+        // consecutive boundary just shortens the run; the outer loop retries).
+        // Even a run of 1 block uses direct DMA instead of going through
+        // bcache, eliminating pin/seqlock overhead on the cold path.
+        if (off_in_blk == 0 && to_copy == s_block_size) {
+            uint32_t max_run = (uint32_t)((len - total) / s_block_size);
+            uint32_t file_blks_left = (remain_file + s_block_size - 1) / s_block_size;
+            if (max_run > file_blks_left) max_run = file_blks_left;
+            if (max_run == 0) max_run = 1;
+            uint32_t dma_cap = AHCI_DMA_SECTORS / s_sectors_per_blk;
+            if (max_run > dma_cap) max_run = dma_cap;
+
+            uint32_t phys_blk;
+            uint32_t run   = inode_build_run(&fd->inode, blk_idx, max_run, &phys_blk);
+            uint32_t bytes = run * s_block_size;
+
+            if (!phys_blk) {
+                // Sparse block(s): zero-fill without any disk I/O.
+                __builtin_memset(dst + total, 0, bytes);
+            } else {
+                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                uint32_t sectors = run * s_sectors_per_blk;
+                uint8_t* dest    = dst + total;
+                // User-space buffer → scatter-gather zero-copy via HHDM page
+                // resolution.  Kernel buffer (ELF loader, etc.) → plain
+                // ahci_read into the HHDM-mapped kmalloc'd staging buffer.
+                uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
+                if (is_user) {
+                    if (!ahci_read_user(lba, dest, sectors)) return -1;
+                } else {
+                    if (!ahci_read(lba, dest, sectors)) return -1;
+                }
+                // Warm the block cache from the just-DMA'd data so a second
+                // exec of the same binary is a pure cache hit.  bcache_fill
+                // silently drops updates for currently-pinned slots — harmless.
+                for (uint32_t i = 0; i < run; i++)
+                    bcache_fill(phys_blk + i,
+                                dest + (uint64_t)i * s_block_size,
+                                s_block_size);
+            }
+            total       += bytes;
+            fd->cur_pos += bytes;
+            continue;
+        }
+
+        // ── Slow path: partial block ──────────────────────────────────────
+        // Handles the first/last partial block of a mis-aligned or
+        // end-of-file read.  Go through bcache so future aligned reads of
+        // the same block get a zero-copy cache hit.
         uint32_t blk = inode_get_block(&fd->inode, blk_idx);
         if (!blk) {
             for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = 0;
@@ -814,64 +978,13 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
             fd->cur_pos += to_copy;
             continue;
         }
-
-        // Multi-block fast path: if we're block-aligned and reading full
-        // blocks, coalesce consecutive physical blocks into one large DMA.
-        // This turns 125 separate 4KB reads into ~4 large 32KB reads.
-        if (off_in_blk == 0 && to_copy == s_block_size) {
-            uint32_t run = 1;
-            uint32_t max_run = (len - total) / s_block_size;
-            uint32_t file_blks = (fd->file_size - fd->cur_pos) / s_block_size;
-            if (max_run > file_blks) max_run = file_blks;
-            // DMA_SECTORS = 64, each block = 8 sectors → max 8 blocks per DMA
-            uint32_t dma_max = 64 / s_sectors_per_blk;
-            if (max_run > dma_max) max_run = dma_max;
-
-            while (run < max_run) {
-                uint32_t next_blk = inode_get_block(&fd->inode, blk_idx + run);
-                if (next_blk != blk + run) break;
-                run++;
-            }
-
-            if (run > 1) {
-                // Multi-block coalesced DMA.
-                uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
-                uint32_t sectors = run * s_sectors_per_blk;
-                uint8_t* dest = dst + total;
-
-                // User-space buffer → scatter-gather zero-copy.
-                // Kernel buffer (ELF loader, etc.) → plain ahci_read
-                // (kthread can access HHDM addresses directly).
-                uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
-                if (is_user) {
-                    if (!ahci_read_user(lba, dest, sectors)) return -1;
-                } else {
-                    if (!ahci_read(lba, dest, sectors)) return -1;
-                }
-
-                // Populate the block cache from the DMA buffer.  bcache_fill
-                // silently skips any slot that is currently pinned by a
-                // concurrent reader — harmless, next lookup will re-read.
-                for (uint32_t r = 0; r < run; r++)
-                    bcache_fill(blk + r, dest + r * s_block_size, s_block_size);
-                uint32_t bytes = run * s_block_size;
-                total       += bytes;
-                fd->cur_pos += bytes;
-                continue;
-            }
-        }
-
-        // Single block read (partial block or non-consecutive).  Pin
-        // the cache slot, copy just `to_copy` bytes from `off_in_blk`
-        // straight into the user dst — no intermediate scratch memcpy.
         if (!rd_buf) EXT2_SCRATCH_ALLOC_NEG1(rd_buf);
         bcache_ref_t r = bcache_get(blk, rd_buf);
         if (!r.data) return -1;
         __builtin_memcpy(dst + total, r.data + off_in_blk, to_copy);
         bcache_put(&r);
-
-        total        += to_copy;
-        fd->cur_pos  += to_copy;
+        total       += to_copy;
+        fd->cur_pos += to_copy;
     }
 
     return (int64_t)total;
@@ -957,53 +1070,92 @@ static void ext2_vfs_close(vfs_file_t* self) {
     kfree(self);
 }
 
+// ── ext2_open_by_ino (internal) ────────────────────────────────────────────
+// Build a vfs_file_t for an already-resolved inode number.  `path` is stored
+// in f->path for fstat/ftruncate; pass NULL if unavailable (f->path will be
+// empty).
+//
+// Change 1 (double-lookup fix): callers that already hold the inode number
+// from a prior ext2_lookup_path() call use this directly, avoiding a second
+// full path walk.
+//
+// Change 4 (indirect-block prefetch): after reading the inode, eagerly warm
+// the bcache for the singly- and doubly-indirect block maps.  One AHCI read
+// at open time amortises the cold-miss cost over every inode_build_run() call
+// during the file's lifetime — the first indirect-range block lookup is
+// guaranteed to be a cache hit.
+static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
+    ext2_inode_t inode;
+    if (!read_inode(ino, &inode)) return NULL;
+    if (!(inode.i_mode & EXT2_S_IFREG)) return NULL;
+
+    // Prefetch indirect block maps into bcache.  A single scratch buffer
+    // covers both reads; we just pin-and-release to trigger the fill.
+    // Skipped silently on OOM — the warm path will still work, just with
+    // one extra cold miss.
+    {
+        uint8_t* pre = (uint8_t*)kmalloc(4096);
+        if (pre) {
+            if (inode.i_block[12]) {
+                bcache_ref_t r = bcache_get(inode.i_block[12], pre);
+                bcache_put(&r);
+            }
+            if (inode.i_block[13]) {
+                bcache_ref_t r = bcache_get(inode.i_block[13], pre);
+                bcache_put(&r);
+            }
+            kfree(pre);
+        }
+    }
+
+    ext2_fd_t* fd = (ext2_fd_t*)kmalloc(sizeof(ext2_fd_t));
+    if (!fd) return NULL;
+    fd->ino       = ino;
+    fd->cur_pos   = 0;
+    fd->file_size = inode.i_size;
+    fd->inode     = inode;
+
+    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    if (!f) { kfree(fd); return NULL; }
+
+    f->read            = ext2_vfs_read;
+    f->write           = ext2_vfs_write;
+    f->seek            = ext2_vfs_seek;
+    f->close           = ext2_vfs_close;
+    f->poll            = NULL;
+    f->ioctl           = NULL;
+    f->ctx             = fd;
+    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->flags           = 0;
+    f->refcount        = 1;
+    f->rights          = 0;
+    f->ino             = ino;
+
+    uint32_t pi = 0;
+    if (path)
+        while (pi < 255 && path[pi]) { f->path[pi] = path[pi]; pi++; }
+    f->path[pi] = '\0';
+    return f;
+}
+
 // ── ext2_open ──────────────────────────────────────────────────────────────
 
 vfs_file_t* ext2_open(const char* path) {
     if (!s_mounted) return NULL;
-
     uint32_t ino = path_to_inode(path);
     if (!ino) return NULL;
+    return ext2_open_by_ino(ino, path);
+}
 
-    ext2_inode_t inode;
-    if (!read_inode(ino, &inode)) return NULL;
+// ── ext2_open_ino ──────────────────────────────────────────────────────────
+// Public: open by inode number when the caller already holds it (e.g. after
+// ext2_lookup_path()).  Eliminates the second path walk in elf_exec_from_ext2
+// and any other caller that already has the inode from a prior lookup.
 
-    // Must be a regular file.
-    if (!(inode.i_mode & EXT2_S_IFREG)) return NULL;
-
-    ext2_fd_t* fd = kmalloc(sizeof(ext2_fd_t));
-    if (!fd) return NULL;
-
-    fd->ino       = ino;
-    fd->cur_pos   = 0;
-    fd->file_size = inode.i_size;
-    // Copy inode.
-    uint8_t* dst = (uint8_t*)&fd->inode;
-    const uint8_t* src = (const uint8_t*)&inode;
-    for (uint32_t i = 0; i < sizeof(ext2_inode_t); i++) dst[i] = src[i];
-
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
-    if (!f) { kfree(fd); return NULL; }
-
-    f->read     = ext2_vfs_read;
-    f->write    = ext2_vfs_write;   // caller enforces O_RDONLY by clearing this
-    f->seek     = ext2_vfs_seek;
-    f->close    = ext2_vfs_close;
-    f->poll           = NULL;             // ext2 files are always ready
-    f->ioctl          = NULL;
-    f->ctx            = fd;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0;   // stamped by sys_open after open; zero for internal opens
-    // Store absolute path for fstat/ftruncate.
-    uint32_t pi = 0;
-    if (path) {
-        while (pi < 255 && path[pi]) { f->path[pi] = path[pi]; pi++; }
-    }
-    f->path[pi] = '\0';
-    return f;
+vfs_file_t* ext2_open_ino(uint32_t ino, const char* path) {
+    if (!s_mounted || !ino) return NULL;
+    return ext2_open_by_ino(ino, path);
 }
 
 // ── ext2_readdir ───────────────────────────────────────────────────────────
