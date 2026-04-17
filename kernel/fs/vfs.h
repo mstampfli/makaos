@@ -34,6 +34,11 @@ typedef struct vfs_file_t {
     // Returns 1 if ready, 0 if not.  May be NULL (means always ready).
     int     (*poll )(struct vfs_file_t* self, int events);
 
+    // Positional read: read `len` bytes at absolute `offset` without modifying
+    // the file position.  Thread-safe: does not race with seek/read on shared fds.
+    // May be NULL (falls back to seek+read, racy under SMP).
+    int64_t (*pread)(struct vfs_file_t* self, void* buf, uint64_t len, uint64_t offset);
+
     // Ioctl: device-specific control.  May be NULL (means not supported).
     int64_t (*ioctl)(struct vfs_file_t* self, uint64_t request, uint64_t arg);
 

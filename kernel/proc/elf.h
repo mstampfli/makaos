@@ -77,7 +77,8 @@ typedef struct __attribute__((packed)) {
 // Load ELF segments into a new PML4 and create a task for process `pid`.
 // `data` points to the full ELF binary in kernel memory; `size` is its byte length.
 // Returns the fully initialised task_t* (ready to sched_add), or NULL on error.
-task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid);
+task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
+                 vfs_file_t* backing_file);
 
 // Load ELF segments into a new PML4 WITHOUT creating a task.
 // Used by exec: caller provides its own task and replaces its address space.
@@ -111,7 +112,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
 // Returns fully-initialised task_t* (ready to sched_add), or NULL.
 task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
                            const char* const* argv, const char* const* envp,
-                           const int stdio[3]);
+                           const int stdio[3], vfs_file_t* backing_file);
 
 // Convenience: read the ext2 file at `path`, then elf_load_with_argv.
 // Permission-checked: walks the path with the current task's cred and

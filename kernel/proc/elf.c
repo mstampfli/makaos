@@ -404,13 +404,14 @@ static vfs_file_t* resolve_stdio(const int* spec, int i) {
 // ── elf_load ──────────────────────────────────────────────────────────────
 // Full task creation: address space + kstack + fd_table.
 // stdio: array of 3 fd specs (see resolve_stdio). Pass NULL to open tty0.
-task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
+task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
+                 vfs_file_t* backing_file) {
     phys_addr_t pml4;
     mm_t*       mm;
     uint64_t    entry;
 
     if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       NULL, NULL, NULL, NULL)) return NULL;
+                       NULL, NULL, NULL, backing_file)) return NULL;
 
     // Allocate task + shared resources.
     task_t* t = kmalloc(sizeof(task_t));
@@ -492,14 +493,14 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid) {
 //   NULL = open tty0 for all three (safe for init process with no parent)
 task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
                            const char* const* argv, const char* const* envp,
-                           const int stdio[3]) {
+                           const int stdio[3], vfs_file_t* backing_file) {
     phys_addr_t pml4;
     mm_t*       mm;
     uint64_t    entry;
     uint64_t phdr_vaddr = 0;
     uint16_t phnum = 0, phent = 0;
     if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       &phdr_vaddr, &phnum, &phent, NULL)) return NULL;
+                       &phdr_vaddr, &phnum, &phent, backing_file)) return NULL;
 
     // Build the initial user stack with argc/argv/envp/auxv.
     uint64_t user_rsp = elf_setup_stack(pml4, argv, envp, entry,
@@ -629,17 +630,18 @@ uint8_t* elf_read_buf(vfs_file_t* f, int64_t* out_size,
 }
 
 static task_t* elf_load_vfs(vfs_file_t* f, uint32_t pid) {
-    int64_t  file_size; uint64_t t0, t1;
-    uint8_t* buf = elf_read_buf(f, &file_size, &t0, &t1);
-    if (!buf) return NULL;
-
-    task_t* t = elf_load(buf, (uint64_t)file_size, pid);
-    uint64_t t2 = tsc_read_ns();
-    kprintf("[elf] map  %s: %u us  total %u us\n",
+    uint8_t* hdr = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!hdr) return NULL;
+    f->seek(f, 0, 0);
+    uint64_t t0 = tsc_read_ns();
+    int64_t n = vfs_read(f, hdr, PAGE_SIZE);
+    uint64_t t1 = tsc_read_ns();
+    if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
+    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
             f->path[0] ? f->path : "?",
-            (uint32_t)((t2 - t1) / 1000u),
-            (uint32_t)((t2 - t0) / 1000u));
-    kfree(buf);
+            (uint32_t)((t1 - t0) / 1000u));
+    task_t* t = elf_load(hdr, (uint64_t)n, pid, f);
+    kfree(hdr);
     return t;
 }
 
@@ -647,17 +649,18 @@ static task_t* elf_load_vfs_with_argv(vfs_file_t* f, uint32_t pid,
                                        const char* const* argv,
                                        const char* const* envp,
                                        const int stdio[3]) {
-    int64_t  file_size; uint64_t t0, t1;
-    uint8_t* buf = elf_read_buf(f, &file_size, &t0, &t1);
-    if (!buf) return NULL;
-
-    task_t* t = elf_load_with_argv(buf, (uint64_t)file_size, pid, argv, envp, stdio);
-    uint64_t t2 = tsc_read_ns();
-    kprintf("[elf] map  %s: %u us  total %u us\n",
+    uint8_t* hdr = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!hdr) return NULL;
+    f->seek(f, 0, 0);
+    uint64_t t0 = tsc_read_ns();
+    int64_t n = vfs_read(f, hdr, PAGE_SIZE);
+    uint64_t t1 = tsc_read_ns();
+    if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
+    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
             f->path[0] ? f->path : "?",
-            (uint32_t)((t2 - t1) / 1000u),
-            (uint32_t)((t2 - t0) / 1000u));
-    kfree(buf);
+            (uint32_t)((t1 - t0) / 1000u));
+    task_t* t = elf_load_with_argv(hdr, (uint64_t)n, pid, argv, envp, stdio, f);
+    kfree(hdr);
     return t;
 }
 

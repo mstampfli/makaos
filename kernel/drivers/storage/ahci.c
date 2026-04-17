@@ -307,31 +307,40 @@ void ahci_irq_handler(void) {
     // Detect completed slots.
     // NCQ:     device clears SACT bits (via Set Device Bits FIS).
     // Non-NCQ: HBA clears CI bits when D2H FIS is received.
-    uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
-    uint32_t done;
-    if (s_ncq)
-        done = active & ~s_port->sact;
-    else
-        done = active & ~s_port->ci;
+    //
+    // Loop until SACT/CI stabilises.  W1C of port_is clears ALL pending
+    // interrupt bits atomically, including bits for completions that arrived
+    // between our IS read and our IS W1C write.  Those completions have
+    // their SACT bit cleared by the device but no new IRQ will fire (IS
+    // was already W1C'd).  Re-scanning SACT in a loop drains them before
+    // we return from the ISR.
+    for (;;) {
+        uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
+        uint32_t done;
+        if (s_ncq)
+            done = active & ~s_port->sact;
+        else
+            done = active & ~s_port->ci;
 
-    if (!done) return;
+        if (!done) break;
 
-    // Release from active_mask before waking waiters so a woken task
-    // that loops and re-submits immediately won't see its slot as active.
-    __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
+        // Release from active_mask before waking waiters so a woken task
+        // that re-submits immediately won't see its slot as still active.
+        __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
 
-    uint32_t mask = done;
-    while (mask) {
-        uint32_t slot = (uint32_t)__builtin_ctz(mask);
-        mask &= mask - 1u;
-        s_slot_result[slot] = 1;
-        __atomic_store_n(&s_slot_done[slot], 1u, __ATOMIC_RELEASE);
-        wait_queue_wake_all(&s_slot_wq[slot]);
+        uint32_t mask = done;
+        while (mask) {
+            uint32_t slot = (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1u;
+            s_slot_result[slot] = 1;
+            __atomic_store_n(&s_slot_done[slot], 1u, __ATOMIC_RELEASE);
+            wait_queue_wake_all(&s_slot_wq[slot]);
+        }
+
+        // Free slots AFTER waking waiters so slot_avail_wq wake is last.
+        __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
+        wait_queue_wake_all(&s_slot_avail_wq);
     }
-
-    // Free slots AFTER waking waiters so slot_avail_wq wake is last.
-    __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&s_slot_avail_wq);
 }
 
 // ── Slot allocation ───────────────────────────────────────────────────────
@@ -461,10 +470,6 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
         fis[13] = (uint8_t)((nsectors >> 8) & 0xFFu);
     }
 
-    // Clear port IS / SERR before issuing.
-    p->is   = p->is;
-    p->serr = p->serr;
-
     uint32_t bit = 1u << slot;
 
     // s_ci_lock serialises SACT|=bit, CI|=bit, and active_mask|=bit as a
@@ -490,6 +495,32 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
 // ── Slot wait ─────────────────────────────────────────────────────────────
 // Sleep until the IRQ handler marks s_slot_done[slot] = 1.
 
+// Rescan SACT/CI for completions that the ISR may have missed due to
+// interrupt coalescing: W1C of port_is can clear a completion's IS bit
+// before the ISR reads SACT, leaving the slot done in hardware but with
+// no further IRQ coming.  Called from slot_wait after each wakeup and
+// from the ISR's drain loop.
+static void ahci_rescan_completions(void) {
+    if (!s_port) return;
+    for (;;) {
+        uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
+        if (!active) return;
+        uint32_t done = s_ncq ? (active & ~s_port->sact) : (active & ~s_port->ci);
+        if (!done) return;
+        __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
+        uint32_t mask = done;
+        while (mask) {
+            uint32_t s = (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1u;
+            s_slot_result[s] = 1;
+            __atomic_store_n(&s_slot_done[s], 1u, __ATOMIC_RELEASE);
+            wait_queue_wake_all(&s_slot_wq[s]);
+        }
+        __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
+        wait_queue_wake_all(&s_slot_avail_wq);
+    }
+}
+
 static void slot_wait(uint32_t slot) {
     for (;;) {
         if (__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) return;
@@ -503,6 +534,8 @@ static void slot_wait(uint32_t slot) {
         }
         sched_sleep();
         task_we_remove(&s_slot_wq[slot], &we);
+        // Rescan for completions the ISR missed (IRQ coalescing race).
+        ahci_rescan_completions();
     }
 }
 
@@ -797,13 +830,21 @@ uint8_t ahci_init(void) {
     // 4. Enable AHCI mode.
     s_hba->ghc |= HBA_GHC_AE;
 
-    // 5. Detect NCQ support and slot count from HBA CAP.
-    //    CAP.SNCQ (bit 30): HBA supports NCQ.
-    //    CAP.NCS  (bits[12:8]): number of command slots - 1 (0-based).
-    s_ncq    = (s_hba->cap & HBA_CAP_SNCQ) ? 1u : 0u;
-    s_nslots = ((s_hba->cap >> 8) & 0x1Fu) + 1u;
-    if (s_nslots > MAX_NCQ_SLOTS) s_nslots = MAX_NCQ_SLOTS;
-    if (!s_ncq) s_nslots = 1u;   // non-NCQ: single slot (device is serial)
+    // 5. Force non-NCQ mode regardless of what HBA CAP reports.
+    //
+    // QEMU's AHCI NCQ (FPDMA) AIO backend intermittently stalls: CI is
+    // cleared (QEMU fetched the command descriptor) but the Set Device Bits
+    // FIS is never sent, so SACT stays set and slot_wait sleeps forever.
+    // This manifests as ~1/6 boots where login's first disk read never
+    // completes.
+    //
+    // Non-NCQ READ/WRITE DMA EXT (0x25/0x35) are rock-solid under QEMU:
+    // the HBA clears CI directly when it receives the D2H FIS, no device
+    // FIS round-trip needed.  We lose nothing — there is no rotational-seek
+    // benefit to NCQ on a virtual disk, and s_nslots=1 is already the
+    // effective limit when NCQ is disabled.
+    s_ncq    = 0u;
+    s_nslots = 1u;
 
     // 6. Find the first SATA port with a drive.
     uint32_t pi = s_hba->pi;
