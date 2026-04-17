@@ -698,8 +698,14 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                     uint64_t bytes   = PAGE_SIZE;
                     if (pg_off + bytes > vma_file_len)
                         bytes = vma_file_len - pg_off;
-                    vma_file->seek(vma_file, (int64_t)src_off, 0 /*SEEK_SET*/);
-                    vma_file->read(vma_file, dst, bytes);
+                    // pread: positional read — no seek position shared with other
+                    // CPUs using the same vfs_file_t (lazy-loaded ELF VMAs).
+                    if (vma_file->pread)
+                        vma_file->pread(vma_file, dst, bytes, src_off);
+                    else {
+                        vma_file->seek(vma_file, (int64_t)src_off, 0 /*SEEK_SET*/);
+                        vma_file->read(vma_file, dst, bytes);
+                    }
                 }
 
                 if (ino != 0) {
@@ -748,8 +754,12 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         uint64_t ra_bytes   = PAGE_SIZE;
                         if (ra_pg_off + ra_bytes > vma_file_len)
                             ra_bytes = vma_file_len - ra_pg_off;
-                        vma_file->seek(vma_file, (int64_t)ra_src_off, 0);
-                        vma_file->read(vma_file, ra_dst, ra_bytes);
+                        if (vma_file->pread)
+                            vma_file->pread(vma_file, ra_dst, ra_bytes, ra_src_off);
+                        else {
+                            vma_file->seek(vma_file, (int64_t)ra_src_off, 0);
+                            vma_file->read(vma_file, ra_dst, ra_bytes);
+                        }
                         // pcache_insert: on success cache owns the alloc ref.
                         // On race (another CPU just inserted same page):
                         //   returns existing frame; our ra_frame is freed.

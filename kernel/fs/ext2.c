@@ -990,6 +990,83 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     return (int64_t)total;
 }
 
+// Positional read: like ext2_vfs_read but at an explicit offset, no cur_pos change.
+// Thread-safe for concurrent pread calls on shared vfs_file_t (page fault path).
+static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_t offset) {
+    ext2_fd_t* fd = (ext2_fd_t*)self->ctx;
+    if (!fd) return -1;
+
+    uint8_t* dst = (uint8_t*)buf;
+    uint64_t total = 0;
+    uint32_t cur_pos = (uint32_t)offset;   // local — never written back to fd
+
+    EXT2_SCRATCH_DECL(rd_buf);
+
+    while (total < len) {
+        if (cur_pos >= fd->file_size) break;
+
+        uint32_t blk_idx     = cur_pos / s_block_size;
+        uint32_t off_in_blk  = cur_pos % s_block_size;
+        uint32_t remain_file = fd->file_size - cur_pos;
+        uint32_t remain_blk  = s_block_size - off_in_blk;
+
+        uint32_t to_copy = (uint32_t)(len - total);
+        if (to_copy > remain_blk)  to_copy = remain_blk;
+        if (to_copy > remain_file) to_copy = remain_file;
+
+        if (off_in_blk == 0 && to_copy == s_block_size) {
+            uint32_t max_run = (uint32_t)((len - total) / s_block_size);
+            uint32_t file_blks_left = (remain_file + s_block_size - 1) / s_block_size;
+            if (max_run > file_blks_left) max_run = file_blks_left;
+            if (max_run == 0) max_run = 1;
+            uint32_t dma_cap = AHCI_DMA_SECTORS / s_sectors_per_blk;
+            if (max_run > dma_cap) max_run = dma_cap;
+
+            uint32_t phys_blk;
+            uint32_t run   = inode_build_run(&fd->inode, blk_idx, max_run, &phys_blk);
+            uint32_t bytes = run * s_block_size;
+
+            if (!phys_blk) {
+                __builtin_memset(dst + total, 0, bytes);
+            } else {
+                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                uint32_t sectors = run * s_sectors_per_blk;
+                uint8_t* dest    = dst + total;
+                uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
+                if (is_user) {
+                    if (!ahci_read_user(lba, dest, sectors)) return -1;
+                } else {
+                    if (!ahci_read(lba, dest, sectors)) return -1;
+                }
+                for (uint32_t i = 0; i < run; i++)
+                    bcache_fill(phys_blk + i,
+                                dest + (uint64_t)i * s_block_size,
+                                s_block_size);
+            }
+            total   += bytes;
+            cur_pos += bytes;
+            continue;
+        }
+
+        uint32_t blk = inode_get_block(&fd->inode, blk_idx);
+        if (!blk) {
+            for (uint32_t i = 0; i < to_copy; i++) dst[total + i] = 0;
+            total   += to_copy;
+            cur_pos += to_copy;
+            continue;
+        }
+        if (!rd_buf) EXT2_SCRATCH_ALLOC_NEG1(rd_buf);
+        bcache_ref_t r = bcache_get(blk, rd_buf);
+        if (!r.data) return -1;
+        __builtin_memcpy(dst + total, r.data + off_in_blk, to_copy);
+        bcache_put(&r);
+        total   += to_copy;
+        cur_pos += to_copy;
+    }
+
+    return (int64_t)total;
+}
+
 // Write `len` bytes from `buf` at fd->cur_pos, growing the file as needed.
 static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     ext2_fd_t* fd = (ext2_fd_t*)self->ctx;
@@ -1121,6 +1198,7 @@ static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
     f->read            = ext2_vfs_read;
     f->write           = ext2_vfs_write;
     f->seek            = ext2_vfs_seek;
+    f->pread           = ext2_vfs_pread;
     f->close           = ext2_vfs_close;
     f->poll            = NULL;
     f->ioctl           = NULL;
