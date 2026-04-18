@@ -13,3 +13,6 @@ Every solution must meet all of the following requirements without exception. Th
 - **Correct and safe**: all userspace pointers must be validated before dereference. No static buffers inside functions that are called from multiple tasks. No silent truncation of paths, PIDs, or counts.
 
 If the correct solution is more complex than a quick hack, implement the correct solution. Do not implement the hack and leave a TODO. This kernel competes with Linux — design accordingly.
+
+## Performance is paramount
+Performance is the single most important constraint. Every implementation must be optimized for maximum throughput, minimum latency, and zero unnecessary overhead. Never make compromises — always implement the perfect solution for a large-scale OS competing with Linux. No "good enough" implementations, no deferred optimizations, no acceptable regressions. If a design choice trades performance for convenience, choose performance.
