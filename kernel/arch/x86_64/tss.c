@@ -230,7 +230,10 @@ virt_addr_t kstack_alloc(void) {
                                & ~(2ULL * 1024 * 1024 - 1);
     }
 
-    uint32_t slot = g_kstack_slots++;
+    // Atomic: concurrent kstack_alloc on different CPUs would otherwise
+    // race and hand out the same VA to two tasks, silently corrupting
+    // whichever mapping lost the vmm_page_map write.
+    uint32_t slot = __atomic_fetch_add(&g_kstack_slots, 1, __ATOMIC_RELAXED);
 
     // Base of this slot's stack pages (guard page immediately below this).
     virt_addr_t stack_base = g_kstack_region_base
