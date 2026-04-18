@@ -4,6 +4,7 @@
 #include "mm.h"
 #include "signal.h"
 #include "tss.h"
+#include "wait.h"
 #include "vfs.h"
 #include "cred.h"
 #include "pledge.h"
@@ -162,6 +163,20 @@ typedef struct __attribute__((aligned(16))) task_t {
     // Owned by the task's home-CPU rq_lock; written by sched_wake,
     // consumed by sched_sleep.
     uint8_t       wake_pending;
+
+    // Persistent wait entry — lives in the task struct instead of the
+    // caller's stack frame so a drain firing AFTER sched_sleep returned
+    // via wake_pending (from an unrelated sched_wake: signal delivery,
+    // etc.) can safely read its fields even if the WAIT_EVENT caller's
+    // stack frame has already been popped.  Stack-local task_we_t had
+    // a use-after-free window: if drain ran after the waiter's frame
+    // popped, func/task bytes were garbage → either a silent no-op
+    // (my earlier lost-wakeup fix) or a kernel #UD panic on a corrupt
+    // func pointer (observed at ip=0xEFC).  Living inside task_t
+    // eliminates the window entirely — memory lifetime == task lifetime.
+    // Only one at a time per task is fine: WAIT_EVENT sleeps are never
+    // nested (you can't sleep while already sleeping).
+    task_we_t     sleep_we;
     // preempt_depth moved to cpu_t (per-CPU, not per-task).  Preemption
     // is a property of the executing context, not of the task itself —
     // a non-running task can't be preempted.

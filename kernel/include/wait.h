@@ -195,15 +195,20 @@ ALWAYS_INLINE void task_we_remove(wait_queue_t* wq, task_we_t* twe) {
 //   - return  — exits the enclosing function
 //   - break   — exits the WAIT_EVENT_HOOK (treat as "cond is now true")
 //   - continue — re-checks cond_expr without another sleep cycle
+//
+// Uses g_current->sleep_we (persistent per-task) rather than a stack
+// local so a late drain — one that fires after sched_sleep returned via
+// wake_pending and the caller's frame popped — never dereferences
+// freed memory.  Nested WAIT_EVENT is not supported (would clobber
+// sleep_we), but a sleeping task can't call WAIT_EVENT anyway.
 #define WAIT_EVENT_HOOK(wq, cond_expr, hook_stmt) \
     do { \
         while (!(cond_expr)) { \
-            task_we_t _we; \
-            task_we_init(&_we, g_current); \
-            task_we_add((wq), &_we); \
+            task_we_init(&g_current->sleep_we, g_current); \
+            task_we_add((wq), &g_current->sleep_we); \
             if (!(cond_expr)) \
                 sched_sleep(); \
-            task_we_remove((wq), &_we); \
+            task_we_remove((wq), &g_current->sleep_we); \
             hook_stmt; \
         } \
     } while (0)

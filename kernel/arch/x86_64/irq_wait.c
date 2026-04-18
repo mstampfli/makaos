@@ -65,16 +65,15 @@ void irq_wait(uint8_t irq) {
         return;
     }
 
-    task_we_t node;
-    task_we_init(&node, g_current);
-    task_we_add(&s_wq[irq], &node);
+    // Use g_current->sleep_we (persistent) rather than a stack local so
+    // a drain firing after sched_sleep returns via wake_pending and our
+    // frame pops can never dereference freed memory.
+    task_we_init(&g_current->sleep_we, g_current);
+    task_we_add(&s_wq[irq], &g_current->sleep_we);
 
     sched_sleep();
     __asm__ volatile("sti");
-    // Always remove — sched_sleep may return via wake_pending without
-    // the drain having fired, leaving a dangling stack pointer on the
-    // queue.
-    task_we_remove(&s_wq[irq], &node);
+    task_we_remove(&s_wq[irq], &g_current->sleep_we);
 }
 
 void irq_drain(uint8_t irq) {
