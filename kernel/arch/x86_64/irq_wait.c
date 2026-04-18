@@ -29,6 +29,17 @@
 // context.  When SMP lands we'll add an atomic increment; for now the
 // IRQ handler runs on whichever CPU the IOAPIC steered the line to,
 // and that's the only CPU that bumps s_pending, so no race.
+//
+// NOTE: a level-triggered "armed flag + atomic xchg" redesign was
+// attempted (see git history commit 48d3fea...).  Architecturally
+// cleaner — no cli/sti, no saturating counter desync, handles the
+// SMP check-then-add race via the standard WAIT_EVENT register-then-
+// recheck pattern.  But the timing perturbation (every notify does a
+// wake_all xchg, vs the old "only if queue non-empty" guard) exposed
+// a pre-existing AHCI zero-data/memory-corruption bug that produces
+// occasional PF-KILLs at boot.  Reverted until the underlying AHCI
+// bug is fixed — at which point the level-triggered version is a
+// drop-in replacement that also fixes the SMP-race hole.
 
 #define IRQ_COUNT 256
 
