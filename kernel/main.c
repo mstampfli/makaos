@@ -158,7 +158,7 @@ static void stress_pread_launch(void) {
 
 #define NVME_STRESS_REF_PAGES 256      // 256 × 4 KiB = 1 MiB reference
 #define NVME_STRESS_ITERS     10000
-#define NVME_STRESS_WORKERS   4
+#define NVME_STRESS_WORKERS   4  // fixed — was blocked by kstack_alloc race
 
 static uint8_t* g_nvme_ref  = NULL;
 static uint64_t g_nvme_pages = 0;
@@ -224,11 +224,11 @@ static void stress_nvme_launch(void) {
     g_nvme_ref = ref;
     g_nvme_pages = NVME_STRESS_REF_PAGES;
 
-    // Pre-allocate worker tmp buffers single-threaded.  Ensures each
-    // worker gets its OWN buffer (rules out a kheap SMP bug as cause
-    // of any observed cross-buffer contamination).
+    // Pre-allocate worker tmp buffers as 4 KiB-aligned PMM pages so PRP1
+    // covers the whole transfer with PRP2=0 (no cross-page assumption).
     for (int i = 0; i < NVME_STRESS_WORKERS; i++) {
-        g_nvme_tmp_bufs[i] = (uint8_t*)kmalloc(4096);
+        phys_addr_t p = pmm_buddy_alloc(0);
+        g_nvme_tmp_bufs[i] = (uint8_t*)(p + HHDM_OFFSET);
     }
     g_nvme_tmp_ix = 0;
 
@@ -284,8 +284,7 @@ static void init_kthread(void) {
     (void)stress_pread_launch;
 
     // NVMe stress: 4 kthreads × 10000 random 4 KiB reads vs reference.
-    // stress_nvme_launch();
-    (void)stress_nvme_launch;
+    stress_nvme_launch();
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's
