@@ -66,17 +66,34 @@ static pte_t* vmm_pte_get(phys_addr_t pml4_phys, virt_addr_t vaddr,
     for (int i = 0; i < 3; i++) {
         uint64_t idx   = (vaddr >> shifts[i]) & 0x1FF;
         uint64_t* tbl  = (uint64_t*)(cur + HHDM_OFFSET);
-        uint64_t  entry = tbl[idx];
+        uint64_t  entry = __atomic_load_n(&tbl[idx], __ATOMIC_ACQUIRE);
 
         if (!(entry & PAGE_PRESENT)) {
             if (!create) return NULL;
 
             phys_addr_t new_frame = pmm_buddy_alloc(0);
             if (new_frame == PMM_INVALID_ADDR) return NULL;
-
             zero_page(new_frame + HHDM_OFFSET);
-            entry = new_frame | inter_flags | PAGE_PRESENT;
-            tbl[idx] = entry;
+
+            uint64_t desired = new_frame | inter_flags | PAGE_PRESENT;
+            uint64_t expected = 0;
+            // CAS the table entry from "empty" to "our new PT".  Two CPUs
+            // racing on the same intermediate slot would otherwise each
+            // allocate a PT page and write tbl[idx]; the last write wins
+            // and the loser's PT is orphaned.  Descendants written by the
+            // loser land in the orphaned PT and are invisible to anyone
+            // doing the page walk, producing the classic all-zeros kstack
+            // symptom after a subsequent map hits the orphaned PT.
+            if (__atomic_compare_exchange_n(&tbl[idx], &expected, desired,
+                                               0, __ATOMIC_ACQ_REL,
+                                               __ATOMIC_ACQUIRE)) {
+                entry = desired;
+            } else {
+                // Another CPU populated it first — free our alloc and
+                // use theirs.  `expected` now holds the winning entry.
+                pmm_buddy_free(new_frame, 0);
+                entry = expected;
+            }
         }
 
         cur = entry & PAGE_ADDR_MASK;
