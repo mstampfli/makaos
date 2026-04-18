@@ -31,22 +31,12 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
                 return (int64_t)total;
             }
 
-            task_we_t node;
-            task_we_init(&node, g_current);
-            task_we_add(self->waitq, &node);
-            if (p->count == 0 && p->writer_refs != 0) {
-                sched_sleep();
-            }
-            task_we_remove(self->waitq, &node);
-
-            // Interrupt semantics: return what we have so far (0 or
-            // a partial read is both fine per POSIX), or -EINTR if
-            // we haven't read anything yet.  SIGCHLD/SIGWINCH with
-            // SIG_DFL are ignored here — they must not abort a read.
-            if (signal_has_actionable(&g_current->sigstate)) {
-                if (total > 0) return (int64_t)total;
-                return (int64_t)-EINTR;
-            }
+            WAIT_EVENT_HOOK(self->waitq,
+                            p->count != 0 || p->writer_refs == 0,
+                            if (signal_has_actionable(&g_current->sigstate)) {
+                                if (total > 0) return (int64_t)total;
+                                return (int64_t)-EINTR;
+                            });
             continue;
         }
         dst[total++] = p->buf[p->head];
@@ -98,21 +88,12 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
                 return total ? (int64_t)total : (int64_t)-EPIPE;
             }
 
-            task_we_t node;
-            task_we_init(&node, g_current);
-            task_we_add(self->waitq, &node);
-            if (p->count == PIPE_BUF_SIZE && p->reader_refs != 0) {
-                sched_sleep();
-            }
-            task_we_remove(self->waitq, &node);
-
-            // Interruptible: partial write returns success so far,
-            // otherwise -EINTR.  SIGCHLD/SIGWINCH with SIG_DFL do
-            // not abort.
-            if (signal_has_actionable(&g_current->sigstate)) {
-                if (total > 0) return (int64_t)total;
-                return (int64_t)-EINTR;
-            }
+            WAIT_EVENT_HOOK(self->waitq,
+                            p->count != PIPE_BUF_SIZE || p->reader_refs == 0,
+                            if (signal_has_actionable(&g_current->sigstate)) {
+                                if (total > 0) return (int64_t)total;
+                                return (int64_t)-EINTR;
+                            });
             continue;
         }
         p->buf[p->tail] = src[total++];

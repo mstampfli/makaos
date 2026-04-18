@@ -350,27 +350,17 @@ void ahci_irq_handler(void) {
 static uint32_t slot_alloc(void) {
     for (;;) {
         uint32_t free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
-        if (free) {
-            uint32_t slot = (uint32_t)__builtin_ctz(free);
-            uint32_t bit  = 1u << slot;
-            if (__atomic_compare_exchange_n(&s_free_mask, &free, free & ~bit,
-                                             0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-                return slot;
-            // CAS failed (another CPU grabbed a slot concurrently): retry.
+        if (!free) {
+            WAIT_EVENT(&s_slot_avail_wq,
+                       __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE) != 0);
             continue;
         }
-        // No free slots: register on the avail wait queue.
-        task_we_t we;
-        task_we_init(&we, g_current);
-        task_we_add(&s_slot_avail_wq, &we);
-        // Double-check under queue registration (lost-wakeup guard).
-        free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
-        if (free) {
-            task_we_remove(&s_slot_avail_wq, &we);
-            continue;
-        }
-        sched_sleep();
-        task_we_remove(&s_slot_avail_wq, &we);
+        uint32_t slot = (uint32_t)__builtin_ctz(free);
+        uint32_t bit  = 1u << slot;
+        if (__atomic_compare_exchange_n(&s_free_mask, &free, free & ~bit,
+                                         0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return slot;
+        // CAS failed (another CPU grabbed concurrently): retry.
     }
 }
 
@@ -486,6 +476,12 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
     //   3. ci — actually issues the command to the device
     // Holding s_ci_lock prevents a concurrent CPU's sact/ci RMW from racing.
     spin_lock(&s_ci_lock);
+    // Drain stale port_is before issuing CI.  MSI-X is edge-triggered on
+    // IS 0→1.  If a stale DHRS bit is still set from a prior completion
+    // whose ISR already ran, the next completion's DHRS sets the same bit
+    // (already 1) → no edge → no MSI → slot_wait hangs.  W1C clears any
+    // leftover bits so the next completion produces a clean 0→1 edge.
+    p->is = p->is;
     if (s_ncq) p->sact |= bit;   // NCQ: set SACT before CI (AHCI spec)
     __atomic_fetch_or(&s_active_mask, bit, __ATOMIC_RELEASE);  // AFTER sact, BEFORE ci
     p->ci |= bit;
@@ -522,21 +518,12 @@ static void ahci_rescan_completions(void) {
 }
 
 static void slot_wait(uint32_t slot) {
-    for (;;) {
-        if (__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) return;
-        task_we_t we;
-        task_we_init(&we, g_current);
-        task_we_add(&s_slot_wq[slot], &we);
-        // Re-check under queue registration (lost-wakeup guard).
-        if (__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) {
-            task_we_remove(&s_slot_wq[slot], &we);
-            return;
-        }
-        sched_sleep();
-        task_we_remove(&s_slot_wq[slot], &we);
-        // Rescan for completions the ISR missed (IRQ coalescing race).
-        ahci_rescan_completions();
-    }
+    // Post-wake hook: rescan for completions the ISR may have missed due
+    // to IRQ coalescing (W1C of port_is can clear a completion's IS bit
+    // before the ISR reads SACT/CI).
+    WAIT_EVENT_HOOK(&s_slot_wq[slot],
+                    __atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE),
+                    ahci_rescan_completions());
 }
 
 // ── Pre-scheduler polling path ────────────────────────────────────────────
@@ -635,49 +622,72 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
 // PRDT is built page-by-page so physically-discontiguous mappings
 // (e.g. kernel stacks allocated as individual PMM pages) are always correct.
 
+// Poison sentinel: written to first 8 bytes of read buffer before DMA.
+// If DMA completes "successfully" but didn't overwrite it, we know the
+// read silently failed (QEMU AHCI quirk where PRDBC is not updated).
+// Retry up to AHCI_MAX_RETRIES times before giving up.
+#define AHCI_READ_POISON  0xDEAD5A5ADEADBEEFULL
+#define AHCI_MAX_RETRIES  5
+
 static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
                                   uint8_t write) {
+    if (!buf || !count) return 0;
+
     uint32_t bytes = count * 512u;
-    uint32_t slot  = slot_alloc();
 
-    cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
+    for (uint32_t attempt = 0; attempt < AHCI_MAX_RETRIES; attempt++) {
+        uint32_t slot = slot_alloc();
+        cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
 
-    // Build PRDT page-by-page: resolve each page's physical address
-    // individually so we're correct regardless of VA range.
-    uint8_t*    p8    = (uint8_t*)buf;
-    uint32_t    rem   = bytes;
-    uint16_t    nprdt = 0;
-    phys_addr_t kpml4 = 0;   // lazy-init only if we need a page-table walk
+        uint8_t*    p8    = (uint8_t*)buf;
+        uint32_t    rem   = bytes;
+        uint16_t    nprdt = 0;
+        phys_addr_t kpml4 = 0;
 
-    while (rem > 0 && nprdt < 248u) {
-        uint32_t pg_off = (uint32_t)((uint64_t)p8 & (PAGE_SIZE - 1u));
-        uint32_t chunk  = PAGE_SIZE - pg_off;
-        if (chunk > rem)      chunk = rem;
-        if (chunk > 0x3FFFFEu) chunk = 0x3FFFFEu;
+        while (rem > 0 && nprdt < 248u) {
+            uint32_t pg_off = (uint32_t)((uint64_t)p8 & (PAGE_SIZE - 1u));
+            uint32_t chunk  = PAGE_SIZE - pg_off;
+            if (chunk > rem)      chunk = rem;
+            if (chunk > 0x3FFFFEu) chunk = 0x3FFFFEu;
 
-        uint64_t  v = (uint64_t)p8;
-        phys_addr_t pa;
-        if (v >= HHDM_OFFSET && v < 0xFFFFFFFF80000000ULL) {
-            pa = v - HHDM_OFFSET;                         // HHDM: O(1)
-        } else {
-            if (!kpml4) kpml4 = vmm_kernel_pml4_get();   // page-table walk
-            pa = vmm_page_phys(kpml4, v & ~(uint64_t)(PAGE_SIZE - 1u)) + pg_off;
+            uint64_t  v = (uint64_t)p8;
+            phys_addr_t pa;
+            if (v >= HHDM_OFFSET && v < 0xFFFFFFFF80000000ULL) {
+                pa = v - HHDM_OFFSET;
+            } else {
+                if (!kpml4) kpml4 = vmm_kernel_pml4_get();
+                pa = vmm_page_phys(kpml4, v & ~(uint64_t)(PAGE_SIZE - 1u)) + pg_off;
+            }
+
+            ct->prdt[nprdt].dba  = (uint32_t)(pa & 0xFFFFFFFFu);
+            ct->prdt[nprdt].dbau = (uint32_t)(pa >> 32);
+            ct->prdt[nprdt].rsv  = 0;
+            ct->prdt[nprdt].dbc  = chunk - 1u;
+            p8  += chunk;
+            rem -= chunk;
+            nprdt++;
         }
 
-        ct->prdt[nprdt].dba  = (uint32_t)(pa & 0xFFFFFFFFu);
-        ct->prdt[nprdt].dbau = (uint32_t)(pa >> 32);
-        ct->prdt[nprdt].rsv  = 0;
-        ct->prdt[nprdt].dbc  = chunk - 1u;
-        p8  += chunk;
-        rem -= chunk;
-        nprdt++;
+        volatile uint64_t* sentinel = (volatile uint64_t*)buf;
+        if (!write && bytes >= 8)
+            *sentinel = AHCI_READ_POISON;
+
+        s_slot_done[slot]   = 0;
+        s_slot_result[slot] = 0;
+        issue_cmd(slot, lba, count, write, nprdt);
+        slot_wait(slot);
+
+        if (!s_slot_result[slot])
+            continue;  // HBA error — retry
+
+        // If sentinel survived, DMA didn't deliver data — retry.
+        if (!write && bytes >= 8 && *sentinel == AHCI_READ_POISON)
+            continue;
+
+        return 1;  // success
     }
 
-    s_slot_done[slot]   = 0;
-    s_slot_result[slot] = 0;
-    issue_cmd(slot, lba, count, write, nprdt);
-    slot_wait(slot);
-    return s_slot_result[slot];
+    return 0;  // all retries exhausted
 }
 
 // Submit using a pre-resolved scatter-gather page list (user-space path).
@@ -784,6 +794,9 @@ uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
         cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
         uint16_t nprdt = (uint16_t)build_prdt(ct->prdt, frames[i], PAGE_SIZE);
 
+        // Poison first 8 bytes so we can detect zero-data DMA on collect.
+        *(volatile uint64_t*)(frames[i] + HHDM_OFFSET) = AHCI_READ_POISON;
+
         s_slot_done[slot]   = 0;
         s_slot_result[slot] = 0;
         issue_cmd(slot, lba + (uint64_t)i * (PAGE_SIZE / 512u),
@@ -796,12 +809,21 @@ uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
     for (uint32_t i = 0; i < nframes; i++) {
         if (!(submitted_mask & (1u << i))) continue;
         slot_wait(slots[i]);
-        if (s_slot_result[slots[i]]) result_mask |= (1u << i);
+        if (!s_slot_result[slots[i]]) continue;
+        // Verify DMA actually delivered data (sentinel check).
+        volatile uint64_t* p = (volatile uint64_t*)(frames[i] + HHDM_OFFSET);
+        if (*p == AHCI_READ_POISON) continue;  // zero-data DMA — skip
+        result_mask |= (1u << i);
     }
     return result_mask;
 }
 
 // ── Start IRQ path (call after sched_init) ────────────────────────────────
+
+void ahci_poll_completions(void) {
+    if (!s_irq_ready) return;
+    ahci_rescan_completions();
+}
 
 void ahci_start_io_thread(void) {
     // In the NCQ design there is no dedicated I/O kthread.  Any CPU that
@@ -809,6 +831,19 @@ void ahci_start_io_thread(void) {
     // NCQ command, and sleeps on its per-slot wait queue until the IRQ
     // handler wakes it.  This function just arms the IRQ path.
     if (g_ahci_irq == 0xFF) return;  // no MSI/MSI-X — stay in polling mode
+
+    // Drain stale port_is / hba_is left by polling-mode reads.
+    // MSI-X is edge-triggered (fires on 0→1 IS transition).  If DHRS is
+    // already set from the last do_rw_direct completion, the first IRQ-path
+    // command's completion sets DHRS again → no edge → no MSI → slot_wait
+    // sleeps forever.  W1C both registers so the first real IRQ fires.
+    if (s_port) {
+        s_port->is  = s_port->is;   // W1C all pending port interrupt bits
+        s_port->serr = s_port->serr; // W1C any stale errors
+    }
+    if (s_hba)
+        s_hba->is = s_hba->is;      // W1C global IS
+
     s_irq_ready = 1;
 }
 

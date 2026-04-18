@@ -165,6 +165,105 @@ ALWAYS_INLINE void task_we_remove(wait_queue_t* wq, task_we_t* twe) {
     wq_remove(wq, &twe->we);
 }
 
+// ── WAIT_EVENT — unified sleep-until-condition primitive ─────────────────
+//
+// The canonical sleeper pattern in 4 phases:
+//   1. check condition (fast path — already true, return)
+//   2. register on wait queue
+//   3. re-check condition (catches wake that arrived between 1 and 2)
+//   4. sched_sleep (the wake_pending interlock inside sched_sleep
+//      handles wake events that arrive between 3 and the state=SLEEPING
+//      commit; see sched_sleep comments)
+//   5. ALWAYS remove from wait queue (even on early wake via wake_pending
+//      from unrelated callers — signal delivery, defensive watchdogs,
+//      etc. — to prevent a dangling stack pointer being left on the queue)
+//
+// Usage:
+//   WAIT_EVENT(&my_queue, data_is_ready);
+//
+// The condition is re-evaluated on each wake.  Spurious wakes are handled
+// by looping.  Callers must still drive their own state machine if they
+// need to do work between wakes; this macro only handles the sleep side.
+#define WAIT_EVENT(wq, cond_expr) \
+    WAIT_EVENT_HOOK((wq), (cond_expr), (void)0)
+
+// Like WAIT_EVENT, but runs `hook_stmt` after every sleep+remove cycle.
+// Use for post-wake work that must run between spurious wakes — e.g.
+// re-polling hardware completion registers or performing a signal check.
+//
+// The hook can use return/break/continue:
+//   - return  — exits the enclosing function
+//   - break   — exits the WAIT_EVENT_HOOK (treat as "cond is now true")
+//   - continue — re-checks cond_expr without another sleep cycle
+#define WAIT_EVENT_HOOK(wq, cond_expr, hook_stmt) \
+    do { \
+        while (!(cond_expr)) { \
+            task_we_t _we; \
+            task_we_init(&_we, g_current); \
+            task_we_add((wq), &_we); \
+            if (!(cond_expr)) \
+                sched_sleep(); \
+            task_we_remove((wq), &_we); \
+            hook_stmt; \
+        } \
+    } while (0)
+
+// ── wait_group_t — multi-queue waiter ────────────────────────────────────
+//
+// For select/poll and similar: register on N queues, sleep until ANY of
+// them wakes us (or the condition is already true), then cleanly
+// unregister from ALL of them.
+//
+// The caller provides the backing storage for the task_we_t and
+// wait_queue_t* arrays.  This lets the caller choose stack (small N) or
+// heap (large N) without forcing an allocator call into this header.
+//
+// Usage:
+//   task_we_t      wes[N];
+//   wait_queue_t*  wqs[N];
+//   wait_group_t   wg;
+//   wait_group_init(&wg, wes, wqs, N);
+//   for (i = 0 ; i < M ; i++) wait_group_add(&wg, queue_for_i);
+//   if (!any_ready()) sched_sleep();
+//   wait_group_cleanup(&wg);
+//
+// Each wait_group_add subscribes g_current to the queue.  Passing a NULL
+// queue is silently skipped (handy when iterating optional per-fd queues).
+// Cleanup removes from every registered queue even if the task was woken
+// via only one of them.
+typedef struct {
+    task_we_t*      wes;
+    wait_queue_t**  wqs;
+    uint32_t        max;
+    uint32_t        used;
+} wait_group_t;
+
+ALWAYS_INLINE void wait_group_init(wait_group_t* wg, task_we_t* wes,
+                                    wait_queue_t** wqs, uint32_t max) {
+    wg->wes  = wes;
+    wg->wqs  = wqs;
+    wg->max  = max;
+    wg->used = 0;
+}
+
+// Subscribe `task` to `wq`.  No-op if wq is NULL or the group is full.
+// Caller passes g_current (same style as task_we_init).
+ALWAYS_INLINE void wait_group_add(wait_group_t* wg, wait_queue_t* wq,
+                                    struct task_t* task) {
+    if (!wq || wg->used >= wg->max) return;
+    task_we_init(&wg->wes[wg->used], task);
+    task_we_add(wq, &wg->wes[wg->used]);
+    wg->wqs[wg->used] = wq;
+    wg->used++;
+}
+
+// Unregister from every queue the group is subscribed to.
+ALWAYS_INLINE void wait_group_cleanup(wait_group_t* wg) {
+    for (uint32_t i = 0; i < wg->used; i++)
+        task_we_remove(wg->wqs[i], &wg->wes[i]);
+    wg->used = 0;
+}
+
 // ── epoll_we_t helpers ───────────────────────────────────────────────────
 
 ALWAYS_INLINE void epoll_we_init(epoll_we_t* ewe, wait_queue_t* epoll_wq,

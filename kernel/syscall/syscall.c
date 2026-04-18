@@ -3282,57 +3282,43 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
         }
         if (count > 0) break;
         if (!sel_infinite && timeout_ns == 0) break;
-        // Register one task_we_t per watched fd (on both queues if secondary exists).
-        // 2*nfds slots worst-case; unused slots stay zeroed.
+
+        // 2*nfds worst case (primary + secondary waitq per fd).  Allocate
+        // both the task_we_t[] and wait_queue_t*[] in one buffer.
         uint32_t sel_nslots = nfds * 2;
-        task_we_t* sel_wes = (task_we_t*)kmalloc(sel_nslots * sizeof(task_we_t));
-        uint32_t sel_used = 0;
-        if (sel_wes) {
-            __builtin_memset(sel_wes, 0, sel_nslots * sizeof(task_we_t));
+        size_t   alloc_bytes = sel_nslots * (sizeof(task_we_t) + sizeof(wait_queue_t*));
+        void*    sel_buf = kmalloc(alloc_bytes);
+        if (sel_buf) {
+            __builtin_memset(sel_buf, 0, alloc_bytes);
+            task_we_t*     wes = (task_we_t*)sel_buf;
+            wait_queue_t** wqs = (wait_queue_t**)(wes + sel_nslots);
+            wait_group_t   wg;
+            wait_group_init(&wg, wes, wqs, sel_nslots);
+
             for (uint32_t fd = 0; fd < nfds; fd++) {
                 if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
                     !FD_ISSET(fd, &eset)) continue;
                 vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
-                if (sel_used < sel_nslots) {
-                    task_we_init(&sel_wes[sel_used], g_current);
-                    task_we_add(f->waitq, &sel_wes[sel_used]);
-                    sel_used++;
-                }
-                if (f->secondary_waitq && sel_used < sel_nslots) {
-                    task_we_init(&sel_wes[sel_used], g_current);
-                    task_we_add(f->secondary_waitq, &sel_wes[sel_used]);
-                    sel_used++;
-                }
+                wait_group_add(&wg, f->waitq, g_current);
+                wait_group_add(&wg, f->secondary_waitq, g_current);
             }
-        }
-        // Re-check after registering — close race between first check and add.
-        int sel_recheck = 0;
-        for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
-            vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-            if (!f) continue;
-            if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
-                (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
-        }
-        if (!sel_recheck) {
-            g_current->sleep_until_ns = sel_infinite ? 0 : deadline;
-            sched_sleep();
-            g_current->sleep_until_ns = 0;
-        }
-        // Remove all entries still on a queue (wq_remove is a no-op if already gone).
-        if (sel_wes) {
-            uint32_t si = 0;
-            for (uint32_t fd = 0; fd < nfds && si < sel_used; fd++) {
-                if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
-                    !FD_ISSET(fd, &eset)) continue;
+
+            // Re-check after registering — close race between first check and add.
+            int sel_recheck = 0;
+            for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
                 vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
-                if (si < sel_used) { task_we_remove(f->waitq, &sel_wes[si]); si++; }
-                if (f->secondary_waitq && si < sel_used) {
-                    task_we_remove(f->secondary_waitq, &sel_wes[si]); si++;
-                }
+                if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
+                    (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
             }
-            kfree(sel_wes);
+            if (!sel_recheck) {
+                g_current->sleep_until_ns = sel_infinite ? 0 : deadline;
+                sched_sleep();
+                g_current->sleep_until_ns = 0;
+            }
+            wait_group_cleanup(&wg);
+            kfree(sel_buf);
         }
     } while (sel_infinite || tsc_read_ns() < deadline);
 
@@ -3378,61 +3364,45 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         }
         if (count > 0) break;
         if (timeout_ms == 0) break;
-        // Register one task_we_t per watched fd (on both queues if secondary exists).
+
         uint32_t p_nslots = (uint32_t)nfds * 2;
-        task_we_t* p_wes = (task_we_t*)kmalloc(p_nslots * sizeof(task_we_t));
-        uint32_t p_used = 0;
-        if (p_wes) {
-            __builtin_memset(p_wes, 0, p_nslots * sizeof(task_we_t));
+        size_t   p_bytes  = p_nslots * (sizeof(task_we_t) + sizeof(wait_queue_t*));
+        void*    p_buf    = kmalloc(p_bytes);
+        if (p_buf) {
+            __builtin_memset(p_buf, 0, p_bytes);
+            task_we_t*     wes = (task_we_t*)p_buf;
+            wait_queue_t** wqs = (wait_queue_t**)(wes + p_nslots);
+            wait_group_t   wg;
+            wait_group_init(&wg, wes, wqs, p_nslots);
+
             for (uint64_t i = 0; i < nfds; i++) {
                 int fd = ufds[i].fd;
                 if (fd < 0) continue;
                 vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
                                 ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
-                if (p_used < p_nslots) {
-                    task_we_init(&p_wes[p_used], g_current);
-                    task_we_add(f->waitq, &p_wes[p_used]);
-                    p_used++;
-                }
-                if (f->secondary_waitq && p_used < p_nslots) {
-                    task_we_init(&p_wes[p_used], g_current);
-                    task_we_add(f->secondary_waitq, &p_wes[p_used]);
-                    p_used++;
-                }
+                wait_group_add(&wg, f->waitq, g_current);
+                wait_group_add(&wg, f->secondary_waitq, g_current);
             }
-        }
-        // Re-check after registering — close race between first check and add.
-        int recheck = 0;
-        for (uint64_t i = 0; i < nfds; i++) {
-            int fd = ufds[i].fd;
-            if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-            if (!f) continue;
-            if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
-                ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
-                fd_has_hup(f)) { recheck = 1; break; }
-        }
-        if (!recheck) {
-            g_current->sleep_until_ns = infinite ? 0 : deadline;
-            sched_sleep();
-            g_current->sleep_until_ns = 0;
-        }
-        // Remove all entries still on a queue.
-        if (p_wes) {
-            uint32_t pi = 0;
-            for (uint64_t i = 0; i < nfds && pi < p_used; i++) {
+
+            // Re-check after registering — close race between first check and add.
+            int recheck = 0;
+            for (uint64_t i = 0; i < nfds; i++) {
                 int fd = ufds[i].fd;
                 if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
-                                ? files->ft->fd_table[fd] : NULL;
+                vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
-                if (pi < p_used) { task_we_remove(f->waitq, &p_wes[pi]); pi++; }
-                if (f->secondary_waitq && pi < p_used) {
-                    task_we_remove(f->secondary_waitq, &p_wes[pi]); pi++;
-                }
+                if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
+                    ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
+                    fd_has_hup(f)) { recheck = 1; break; }
             }
-            kfree(p_wes);
+            if (!recheck) {
+                g_current->sleep_until_ns = infinite ? 0 : deadline;
+                sched_sleep();
+                g_current->sleep_until_ns = 0;
+            }
+            wait_group_cleanup(&wg);
+            kfree(p_buf);
         }
     } while (infinite || tsc_read_ns() < deadline);
 

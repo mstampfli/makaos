@@ -20,6 +20,12 @@ uint8_t ahci_init(void);
 // and sleeps on a per-slot wait queue until the IRQ handler wakes it.
 void ahci_start_io_thread(void);
 
+// Poll for completed commands that the ISR may have missed (lost MSI-X).
+// Called from sched_tick on every timer interrupt as a fallback — adds
+// negligible overhead (a few MMIO reads) but guarantees no command hangs
+// longer than one tick (~1ms) due to a lost interrupt.
+void ahci_poll_completions(void);
+
 // Read `count` 512-byte sectors starting at 48-bit LBA `lba` into `buf`.
 // `buf` must be a kernel HHDM pointer (va = phys + HHDM_OFFSET).
 // Returns 1 on success, 0 on error.
