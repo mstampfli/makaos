@@ -9,49 +9,38 @@
 //
 // Design:
 //   - 1024-bucket hash table, each bucket protected by its own spinlock.
-//     No global lock: concurrent fault handlers on different CPUs operate
-//     on different buckets independently.
-//   - Cache entries are kmalloc'd nodes in per-bucket intrusive linked lists.
+//     No global lock on the hot path: concurrent fault handlers on different
+//     CPUs operate on different buckets independently.
+//   - CLOCK eviction: all entries form a circular doubly-linked list.
+//     A background reclaim kthread sweeps the CLOCK hand, clearing accessed
+//     bits and evicting cold pages to maintain a free-page buffer.
 //   - PMM refcounting: the cache holds ONE PMM ref per cached frame.
-//     Callers add their own ref (pmm_ref_inc) for each PTE that maps the frame.
-//     When a process exits, vmm_free_user_ex pmm_ref_dec's PTE refs; the
-//     cache ref keeps the frame alive for the next exec.
+//     Callers add their own ref (pmm_ref_inc) for each PTE that maps it.
 //
-// Sharing policy:
-//   - Read-only segments (text/rodata): shared directly — PTE maps the
-//     cached frame with RO flags; pmm_ref_inc adds the PTE ref.
-//   - Writable segments (data/BSS): copy-on-exec — private frame allocated,
-//     memcpy'd from cached clean copy, mapped with RW flags.  The cache
-//     always retains the clean on-disk version.
-//
-// The cache currently grows without eviction (kernel has ample RAM for
-// the small number of binaries typically executed).  pcache_evict_inode
-// flushes all entries for one inode — call it on file write or unlink to
-// prevent stale reads.
+// Reclaim policy:
+//   - Target: cache may use up to 80% of (free_pages + cached_pages).
+//   - The remaining 20% stays genuinely free for instant allocation.
+//   - The reclaim kthread wakes when cache exceeds target and evicts
+//     CLOCK victims until the target is restored.  Proactive — allocators
+//     never block on reclaim.
 
 void        pcache_init(void);
 
-// Look up (ino, pg_idx).  Returns the cached frame address if found, or
-// PMM_INVALID_ADDR on miss.  The cache's own ref keeps the frame alive;
-// caller MUST pmm_ref_inc() before mapping the frame into a PTE.
-// ino == 0 always misses (non-ext2 files are not cacheable).
+// Look up (ino, pg_idx).  Returns cached frame or PMM_INVALID_ADDR on miss.
+// Sets the CLOCK accessed bit on hit.
+// Caller MUST pmm_ref_inc() the returned frame before mapping into a PTE.
 phys_addr_t pcache_get(uint32_t ino, uint32_t pg_idx);
 
-// Offer a freshly-read frame to the cache.  The cache claims ownership of
-// the frame's alloc ref (rc == 1 from pmm_buddy_alloc).
-//
-// Returns the frame that is now in the cache:
-//   - If this call inserted it: returns `frame` (same as input).
-//   - If a racing CPU already inserted the same (ino, pg_idx): frees `frame`
-//     (pmm_ref_dec) and returns the existing frame.
-//   - On OOM (can't alloc cache entry): returns PMM_INVALID_ADDR and leaves
-//     `frame` untouched (rc == 1, caller owns it as a PTE ref).
-//
-// After a non-INVALID return, call pmm_ref_inc(result) for your PTE.
-// After PMM_INVALID_ADDR, use `frame` directly as the sole PTE ref (no inc).
+// Insert a freshly-read frame.  Cache claims the alloc ref (rc==1).
+// Returns the cached frame (may differ from input on race).
+// PMM_INVALID_ADDR on OOM.
 phys_addr_t pcache_insert(uint32_t ino, uint32_t pg_idx, phys_addr_t frame);
 
-// Evict all entries for `ino`.  pmm_ref_dec's the cached frame for each
-// evicted entry.  Call on file write or unlink so subsequent faults re-read
-// from disk.
+// Evict all entries for an inode (call on write/unlink).
 void        pcache_evict_inode(uint32_t ino);
+
+// Current number of cached pages.
+uint64_t    pcache_count_get(void);
+
+// Spawn the background reclaim kthread.  Call after sched_init().
+void        pcache_start_reclaim_thread(void);

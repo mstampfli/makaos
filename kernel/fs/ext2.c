@@ -363,26 +363,39 @@ static irtree_leaf_t* irtree_alloc(uint32_t ino) {
     return leaf;
 }
 
-// Forward declaration: read the inode from disk into the leaf cache.
-// Defined further down once read_block / read_bgd are in scope.
-static uint8_t inode_load(irtree_leaf_t* leaf, uint32_t ino);
+// Forward decl: read inode from disk into a caller-owned buffer.
+// No locking — safe to call without holding anything.
+static uint8_t inode_load_into(uint32_t ino, ext2_inode_t* out);
 
 // Public per-inode write-side lock: returns the leaf with its seqlock
-// held in WRITE state.  Mutators bracket their entire RMW sequence in
-// inode_lock / inode_unlock.  If the leaf is not yet populated the
-// inode is loaded from disk under the lock so the caller always sees a
-// valid `leaf->inode`.
+// held in WRITE state.
+//
+// Critical design rule: we NEVER hold the seqlock across disk I/O.  If
+// the leaf needs loading, we do the I/O into a local buffer FIRST, then
+// briefly take the seqlock to publish.  Holding a seqlock across a
+// blocking AHCI read would cause every concurrent reader (via irtree_get
+// → seq_begin) to spin for milliseconds — and forever if the I/O hangs.
+//
+// Benign race: two CPUs may load the same inode concurrently; both
+// publish identical bytes.  Last-writer-wins is correct.
 static irtree_leaf_t* inode_lock(uint32_t ino) {
     irtree_leaf_t* leaf = irtree_lookup(ino);
     if (!leaf) leaf = irtree_alloc(ino);
     if (!leaf) return NULL;
-    seq_write_begin(&leaf->seq);
+
     if (!leaf->valid) {
-        if (!inode_load(leaf, ino)) {
-            seq_write_end(&leaf->seq);
-            return NULL;
+        ext2_inode_t tmp;
+        if (!inode_load_into(ino, &tmp)) return NULL;
+        seq_write_begin(&leaf->seq);
+        if (!leaf->valid) {              // re-check under write lock
+            leaf->inode = tmp;
+            leaf->ino   = ino;
+            leaf->valid = 1;
         }
+        seq_write_end(&leaf->seq);
     }
+
+    seq_write_begin(&leaf->seq);
     return leaf;
 }
 
@@ -506,7 +519,7 @@ static uint8_t write_bgd(uint32_t g, const ext2_bgd_t* in) {
 // hold the leaf's seqlock writer side (i.e. be inside an inode_lock /
 // inode_unlock bracket OR be irtree_put_locked).  Returns 0 on disk
 // error.
-static uint8_t inode_load(irtree_leaf_t* leaf, uint32_t ino) {
+static uint8_t inode_load_into(uint32_t ino, ext2_inode_t* out) {
     uint32_t g     = (ino - 1) / s_inodes_per_grp;
     uint32_t local = (ino - 1) % s_inodes_per_grp;
 
@@ -520,11 +533,8 @@ static uint8_t inode_load(irtree_leaf_t* leaf, uint32_t ino) {
     EXT2_SCRATCH(scratch);
     bcache_ref_t r = bcache_get(blk_idx, scratch);
     if (!r.data) return 0;
-    __builtin_memcpy(&leaf->inode, r.data + off, sizeof(ext2_inode_t));
+    __builtin_memcpy(out, r.data + off, sizeof(ext2_inode_t));
     bcache_put(&r);
-
-    leaf->ino   = ino;
-    leaf->valid = 1;
     return 1;
 }
 

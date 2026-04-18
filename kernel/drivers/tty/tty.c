@@ -231,21 +231,10 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     // NOT interrupt the read — they're silently discarded on the syscall
     // return path, and returning EINTR here causes an infinite loop
     // since the signal stays queued until signal_deliver_pending runs.
-    for (;;) {
-        if (!rb_empty(tty->rd_head, tty->rd_tail)) break;
-
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&tty->waitq, &node);
-
-        if (rb_empty(tty->rd_head, tty->rd_tail))
-            sched_sleep();
-
-        task_we_remove(&tty->waitq, &node);
-
-        if (signal_has_actionable(&g_current->sigstate))
-            return -4; // -EINTR
-    }
+    WAIT_EVENT_HOOK(&tty->waitq,
+                    !rb_empty(tty->rd_head, tty->rd_tail),
+                    if (signal_has_actionable(&g_current->sigstate))
+                        return -4 /*EINTR*/;);
 
     // Drain up to len bytes.
     while (got < len) {

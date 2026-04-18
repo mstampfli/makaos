@@ -171,10 +171,26 @@ void wait_queue_wake_one(wait_queue_t* wq) {
 
 int task_wake_func(wake_entry_t* we) {
     task_we_t* twe = (task_we_t*)we;
-    if (twe->task) {
+    // Do NOT clear twe->task.  A spurious double-drain of the same we is
+    // harmless — sched_wake is idempotent (the 2nd call finds state !=
+    // SLEEPING and sets wake_pending, which the task consumes on its
+    // next sched_sleep).  Clearing task caused a lost wakeup in this
+    // sequence:
+    //   1. push we (task_we_init sets task=login, task_we_add pushes)
+    //   2. wake_all drains → this func runs → sched_wake(login), clear
+    //   3. same stack slot is pushed again (next iteration of slot_alloc
+    //      / tty_vfs_read / etc), task_we_init resets task=login
+    //   4. another wake_all drains → reads task... and saw NULL somehow
+    //      (between steps 3 and 4, something made task read back as NULL
+    //      — either a memory ordering artifact visible to a remote CPU,
+    //      or the same we being processed twice within a single wake_all
+    //      due to a self-loop in chain->next).  Skipping sched_wake here
+    //      meant the real wake never fired; login stayed TASK_SLEEPING
+    //      on sleep_head forever with wake_pending=0.
+    // Leaving task set eliminates that failure mode: every drain that
+    // reaches here calls sched_wake on the actual task.
+    if (twe->task)
         sched_wake(twe->task);
-        twe->task = NULL;  // idempotent — clear so double-wakes are harmless
-    }
     return WQ_REMOVE;
 }
 

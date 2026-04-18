@@ -29,9 +29,11 @@ static spinlock_t g_pmm_lock = SPINLOCK_INIT;
 // without going through the public lock-taking wrappers.
 static phys_addr_t pmm_buddy_alloc_locked(uint8_t order);
 static void        pmm_buddy_free_locked(phys_addr_t addr, uint8_t order);
+static void        pmm_count_free_pages(void);
 
 static phys_addr_t g_phys_ceiling = 0;
 static uint64_t    g_total_frames = 0;
+static volatile uint64_t g_free_pages = 0;  // approximate free page count
 
 // Free List Overlay: lives in the first 16 bytes of a free frame.
 typedef struct free_block {
@@ -418,6 +420,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
       current += order_to_bytes(current_order);
     }
   }
+
+  pmm_count_free_pages();
 }
 
 // Internal implementation — caller holds g_pmm_lock.
@@ -471,6 +475,7 @@ static phys_addr_t pmm_buddy_alloc_locked(uint8_t order) {
               g_frame_refcount[fi + k] = 1;
   }
 
+  __atomic_fetch_sub(&g_free_pages, order_to_pages(order), __ATOMIC_RELAXED);
   return allocated_phys;
 }
 
@@ -517,6 +522,16 @@ static void pmm_buddy_free_locked(phys_addr_t addr, uint8_t order) {
   free_list_push(order, addr);
 }
 
+// Called from pmm_init after all usable memory has been freed into the buddy.
+static void pmm_count_free_pages(void) {
+    uint64_t count = 0;
+    for (uint8_t o = 0; o <= MAX_ORDER; o++) {
+        free_block_t* b = g_free_lists[o];
+        while (b) { count += order_to_pages(o); b = b->next; }
+    }
+    __atomic_store_n(&g_free_pages, count, __ATOMIC_RELEASE);
+}
+
 // ── Public buddy API — takes g_pmm_lock ───────────────────────────────
 //
 // Debug kill-switch: if PMM_DEBUG_ALWAYS_ZERO is 1, every freshly
@@ -560,6 +575,7 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
 void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
   pmm_buddy_free_locked(addr, order);
+  __atomic_fetch_add(&g_free_pages, order_to_pages(order), __ATOMIC_RELAXED);
   spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
@@ -778,6 +794,9 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size) {
 }
 
 uint64_t pmm_total_frames_get(void) { return g_total_frames; }
+uint64_t pmm_free_pages_get(void) {
+    return __atomic_load_n(&g_free_pages, __ATOMIC_RELAXED);
+}
 
 // ── Per-frame refcount API ───────────────────────────────────────────────
 
@@ -799,8 +818,10 @@ void pmm_ref_dec(phys_addr_t addr) {
     }
     g_frame_refcount[fi]--;
     int last_ref = (g_frame_refcount[fi] == 0);
-    if (last_ref)
+    if (last_ref) {
         pmm_buddy_free_locked(addr, 0);
+        __atomic_fetch_add(&g_free_pages, 1, __ATOMIC_RELAXED);
+    }
     spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 

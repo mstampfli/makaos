@@ -179,18 +179,8 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
             // Master might have gone away during our wait.
             if (!pty->master_open) break;
 
-            task_we_t node;
-            task_we_init(&node, g_current);
-            task_we_add(&pty->slave_drain_waitq, &node);
-            // Re-check under the registration to close the lost-wakeup
-            // window.  If the ring drained between phase 1's last push
-            // and the task_we_add above, pty_master_read already fired
-            // a wake, which would have found no waiters — so without the
-            // recheck we'd sleep forever.
-            if (mb_full(pty) && pty->master_open)
-                sched_sleep();
-            task_we_remove(&pty->slave_drain_waitq, &node);
-
+            WAIT_EVENT(&pty->slave_drain_waitq,
+                       !mb_full(pty) || !pty->master_open);
             // Master closed while we slept — bail out.
             if (!pty->master_open) break;
         }
@@ -217,23 +207,12 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     // Block until data available.  Register a task_we_t on the
     // master's wait queue, then re-check — closes the lost-wakeup race.
     PTT1("master_read.enter", "mb_empty", mb_empty(pty));
-    for (;;) {
-        if (!mb_empty(pty)) break;
-        if (!pty->slave_open_count) return 0;  // EOF: slave closed
-
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&pty->master_waitq, &node);
-        if (mb_empty(pty) && pty->slave_open_count) {
-            PTT("master_read.sleep");
-            sched_sleep();
-            PTT("master_read.wake");
-        }
-        task_we_remove(&pty->master_waitq, &node);
-
-        if (signal_has_actionable(&g_current->sigstate))
-            return -4; // EINTR
-    }
+    if (mb_empty(pty) && !pty->slave_open_count) return 0; // EOF
+    WAIT_EVENT_HOOK(&pty->master_waitq,
+                    !mb_empty(pty) || !pty->slave_open_count,
+                    if (signal_has_actionable(&g_current->sigstate))
+                        return -4 /*EINTR*/;);
+    if (mb_empty(pty)) return 0;  // woke on EOF
 
     uint8_t* out = (uint8_t*)buf;
     uint64_t got = 0;
@@ -326,32 +305,12 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
                   : tty->termios.c_cc[VMIN];
     if (vmin == 0) vmin = 1;
 
-    for (;;) {
-        if (tty->rd_head != tty->rd_tail) {
-            PTT1("slave_read.wake.data", "head", tty->rd_head);
-            break;
-        }
-        if (!ctx->pty->master_open) {
-            PTT("slave_read.eof");
-            return 0; // EOF
-        }
-
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&tty->waitq, &node);
-        PTT1("slave_read.registered", "waitq", (uint64_t)&tty->waitq);
-        if (tty->rd_head == tty->rd_tail && ctx->pty->master_open) {
-            PTT("slave_read.sleep");
-            sched_sleep();
-            PTT("slave_read.wake");
-        }
-        task_we_remove(&tty->waitq, &node);
-
-        if (signal_has_actionable(&g_current->sigstate)) {
-            PTT("slave_read.eintr");
-            return -4; // EINTR
-        }
-    }
+    if (tty->rd_head == tty->rd_tail && !ctx->pty->master_open) return 0; // EOF
+    WAIT_EVENT_HOOK(&tty->waitq,
+                    tty->rd_head != tty->rd_tail || !ctx->pty->master_open,
+                    if (signal_has_actionable(&g_current->sigstate))
+                        return -4 /*EINTR*/;);
+    if (tty->rd_head == tty->rd_tail) return 0;  // woke on EOF
 
     while (got < len) {
         if (tty->rd_head == tty->rd_tail) break;

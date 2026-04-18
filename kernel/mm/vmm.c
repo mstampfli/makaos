@@ -700,11 +700,22 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         bytes = vma_file_len - pg_off;
                     // pread: positional read — no seek position shared with other
                     // CPUs using the same vfs_file_t (lazy-loaded ELF VMAs).
+                    int64_t pread_rc;
                     if (vma_file->pread)
-                        vma_file->pread(vma_file, dst, bytes, src_off);
+                        pread_rc = vma_file->pread(vma_file, dst, bytes, src_off);
                     else {
                         vma_file->seek(vma_file, (int64_t)src_off, 0 /*SEEK_SET*/);
-                        vma_file->read(vma_file, dst, bytes);
+                        pread_rc = vma_file->read(vma_file, dst, bytes);
+                    }
+                    if (pread_rc <= 0) {
+                        ser_str("\n[PF] pread failed: fault=");
+                        ser_hex64(fault_addr);
+                        ser_str(" rc="); ser_hex64((uint64_t)pread_rc);
+                        ser_str(" off="); ser_hex64(src_off);
+                        ser_str("\n");
+                        pmm_ref_dec(clean_frame);
+                        vfs_close(vma_file);
+                        goto kill;
                     }
                 }
 
@@ -754,11 +765,16 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         uint64_t ra_bytes   = PAGE_SIZE;
                         if (ra_pg_off + ra_bytes > vma_file_len)
                             ra_bytes = vma_file_len - ra_pg_off;
+                        int64_t ra_rc;
                         if (vma_file->pread)
-                            vma_file->pread(vma_file, ra_dst, ra_bytes, ra_src_off);
+                            ra_rc = vma_file->pread(vma_file, ra_dst, ra_bytes, ra_src_off);
                         else {
                             vma_file->seek(vma_file, (int64_t)ra_src_off, 0);
-                            vma_file->read(vma_file, ra_dst, ra_bytes);
+                            ra_rc = vma_file->read(vma_file, ra_dst, ra_bytes);
+                        }
+                        if (ra_rc <= 0) {
+                            pmm_ref_dec(ra_frame);  // read failed — discard
+                            continue;
                         }
                         // pcache_insert: on success cache owns the alloc ref.
                         // On race (another CPU just inserted same page):

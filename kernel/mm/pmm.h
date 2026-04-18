@@ -46,6 +46,7 @@ typedef struct slab_cache_t {
 
 phys_addr_t pmm_highest_address_get(void);
 uint64_t    pmm_total_frames_get(void);
+uint64_t    pmm_free_pages_get(void);
 
 // ── Per-frame refcount (Copy-on-Write) ────────────────────────────────────
 // Every frame starts at refcount 1 on alloc.  CoW fork increments it.

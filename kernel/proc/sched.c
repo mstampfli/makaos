@@ -10,6 +10,7 @@
 #include "vmm.h"
 #include "lapic.h"
 #include "rcu.h"
+#include "ahci.h"
 
 
 // ── MLFQ parameters ───────────────────────────────────────────────────────
@@ -929,6 +930,10 @@ void task_children_reparent(task_t* from, task_t* to) {
 //   - Mutating runqueue heads/tails during priority boost.
 void sched_tick(void) {
     s_tick_count++;
+
+    // Fallback for lost MSI-X: rescan AHCI completions every tick.
+    // If an IRQ was swallowed, this catches it within ~1ms.
+    ahci_poll_completions();
 
     cpu_t*    c  = this_cpu();
     cpu_rq_t* rq = &c->rq;

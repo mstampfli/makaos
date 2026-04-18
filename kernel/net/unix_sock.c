@@ -380,18 +380,12 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
     // every exit path (including EINTR), commit-before-wake on the
     // connect() side (which calls unix_wake(target) after installing
     // pend in backlog_head).
-    for (;;) {
-        if (listener->backlog_head) break;
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&listener->waitq, &node);
-        if (!listener->backlog_head) sched_sleep();
-        task_we_remove(&listener->waitq, &node);
-        // If listener was closed while we slept, bail out.
-        if (listener->state != UNIX_STATE_LISTENING) return NULL;
-        // Signal interrupted accept — SIGCHLD / SIGWINCH are filtered.
-        if (signal_has_actionable(&g_current->sigstate)) return NULL;
-    }
+    WAIT_EVENT_HOOK(&listener->waitq,
+                    listener->backlog_head != NULL
+                        || listener->state != UNIX_STATE_LISTENING,
+                    if (signal_has_actionable(&g_current->sigstate))
+                        return NULL;);
+    if (listener->state != UNIX_STATE_LISTENING) return NULL;
 
     // Dequeue the first pending connection.
     unix_pending_t* pend = listener->backlog_head;
@@ -498,19 +492,10 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // Block until accept() completes the pairing (or listener closes).
     // Canonical Phase 9-6 pattern; always remove on exit, including
     // EINTR path below.
-    while (s->state == UNIX_STATE_CONNECTING) {
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&s->waitq, &node);
-        if (s->state == UNIX_STATE_CONNECTING) sched_sleep();
-        task_we_remove(&s->waitq, &node);
-        if (signal_has_actionable(&g_current->sigstate)) {
-            // POSIX: if connect() is interrupted before it completes,
-            // return -EINTR.  The server side still has `pend` queued;
-            // it will be reaped when the listener closes or reassigns.
-            return -EINTR;
-        }
-    }
+    WAIT_EVENT_HOOK(&s->waitq,
+                    s->state != UNIX_STATE_CONNECTING,
+                    if (signal_has_actionable(&g_current->sigstate))
+                        return -EINTR;);
 
     if (s->state != UNIX_STATE_CONNECTED) {
         // Listener closed or rejected us.
@@ -557,19 +542,13 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
             // pattern: task_we_add → re-check → sched_sleep → remove.
             // commit-before-wake on the peer's recv drain side
             // (unix_sock_recv fires unix_wake(s->peer) after cbuf_read).
-            if (total < len) {
-                if (peer->buf_count >= UNIX_BUF_SIZE) {
-                    if (f->flags & O_NONBLOCK)
-                        return total > 0 ? (int)total : -EAGAIN;
-                    task_we_t node;
-                    task_we_init(&node, g_current);
-                    task_we_add(&s->waitq, &node);
-                    if (peer->buf_count >= UNIX_BUF_SIZE) sched_sleep();
-                    task_we_remove(&s->waitq, &node);
-                    if (signal_has_actionable(&g_current->sigstate)) {
-                        return total > 0 ? (int)total : -EINTR;
-                    }
-                }
+            if (total < len && peer->buf_count >= UNIX_BUF_SIZE) {
+                if (f->flags & O_NONBLOCK)
+                    return total > 0 ? (int)total : -EAGAIN;
+                WAIT_EVENT_HOOK(&s->waitq,
+                                peer->buf_count < UNIX_BUF_SIZE,
+                                if (signal_has_actionable(&g_current->sigstate))
+                                    return total > 0 ? (int)total : -EINTR;);
             }
         }
         return (int)total;
@@ -592,18 +571,15 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
         // Block until data available or peer disconnects.  Canonical
         // Phase 9-6 pattern; commit-before-wake on the peer's send
         // side (unix_sock_send calls unix_wake(peer) after cbuf_write).
-        for (;;) {
-            if (s->buf_count != 0) break;
+        if (s->buf_count == 0) {
             if (s->state == UNIX_STATE_DISCONNECTED) return 0; // EOF
             if (f->flags & O_NONBLOCK) return -EAGAIN;
-
-            task_we_t node;
-            task_we_init(&node, g_current);
-            task_we_add(&s->waitq, &node);
-            if (s->buf_count == 0 && s->state != UNIX_STATE_DISCONNECTED)
-                sched_sleep();
-            task_we_remove(&s->waitq, &node);
-            if (signal_has_actionable(&g_current->sigstate)) return -EINTR;
+            WAIT_EVENT_HOOK(&s->waitq,
+                            s->buf_count != 0
+                                || s->state == UNIX_STATE_DISCONNECTED,
+                            if (signal_has_actionable(&g_current->sigstate))
+                                return -EINTR;);
+            if (s->buf_count == 0) return 0; // EOF
         }
 
         uint32_t got = cbuf_read(s, buf, len);
@@ -617,18 +593,15 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
     }
 
     // SOCK_DGRAM: dequeue one message.
-    for (;;) {
-        if (s->dgram_head) break;
+    if (!s->dgram_head) {
         if (s->state == UNIX_STATE_DISCONNECTED) return 0;
         if (f->flags & O_NONBLOCK) return -EAGAIN;
-
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&s->waitq, &node);
-        if (!s->dgram_head && s->state != UNIX_STATE_DISCONNECTED)
-            sched_sleep();
-        task_we_remove(&s->waitq, &node);
-        if (signal_has_actionable(&g_current->sigstate)) return -EINTR;
+        WAIT_EVENT_HOOK(&s->waitq,
+                        s->dgram_head != NULL
+                            || s->state == UNIX_STATE_DISCONNECTED,
+                        if (signal_has_actionable(&g_current->sigstate))
+                            return -EINTR;);
+        if (!s->dgram_head) return 0;
     }
 
     unix_dgram_t* msg = s->dgram_head;
@@ -755,18 +728,14 @@ vfs_file_t* unix_sock_recvfd(vfs_file_t* sock) {
     // Block until an fd is available or peer disconnects.  Canonical
     // Phase 9-6 pattern; caller maps NULL on signal interruption to
     // whatever errno it prefers (sys_recvfd → -EINTR path).
-    for (;;) {
-        if (anc->count != 0) break;
+    if (anc->count == 0) {
         if (s->state == UNIX_STATE_DISCONNECTED && !s->peer) return NULL;
-
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&s->waitq, &node);
-        if (anc->count == 0 &&
-            !(s->state == UNIX_STATE_DISCONNECTED && !s->peer))
-            sched_sleep();
-        task_we_remove(&s->waitq, &node);
-        if (signal_has_actionable(&g_current->sigstate)) return NULL;
+        WAIT_EVENT_HOOK(&s->waitq,
+                        anc->count != 0
+                            || (s->state == UNIX_STATE_DISCONNECTED && !s->peer),
+                        if (signal_has_actionable(&g_current->sigstate))
+                            return NULL;);
+        if (anc->count == 0) return NULL;
     }
 
     uint8_t idx = anc->head;

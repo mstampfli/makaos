@@ -480,14 +480,9 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
     }
 
     // UDP: wait for a datagram (or EAGAIN in nonblock).
-    for (;;) {
-        if (s->udp_rx_head) break;
+    if (!s->udp_rx_head) {
         if (nonblock) return -EAGAIN;
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&s->waitq, &node);
-        if (!s->udp_rx_head) sched_sleep();
-        task_we_remove(&s->waitq, &node);
+        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
     }
 
     skbuff_t* skb = s->udp_rx_head;
@@ -546,14 +541,9 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
 
     int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
 
-    for (;;) {
-        if (s->udp_rx_head) break;
+    if (!s->udp_rx_head) {
         if (nonblock) return -EAGAIN;
-        task_we_t node;
-        task_we_init(&node, g_current);
-        task_we_add(&s->waitq, &node);
-        if (!s->udp_rx_head) sched_sleep();
-        task_we_remove(&s->waitq, &node);
+        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
     }
 
     skbuff_t* skb = s->udp_rx_head;

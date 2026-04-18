@@ -65,6 +65,9 @@ static void init_kthread(void) {
     // whether to arm the NCQ path; it must run AFTER ahci_init().
     ahci_start_io_thread();
 
+    // Start the page cache reclaim kthread (CLOCK eviction).
+    pcache_start_reclaim_thread();
+
     // Phase 9-4b/c: wake every AP discovered by ACPI now that the
     // scheduler, timers, LAPIC, VMM, and PMM are fully live.  APs
     // land in cpu_init_ap and drop into an idle-hlt loop until
