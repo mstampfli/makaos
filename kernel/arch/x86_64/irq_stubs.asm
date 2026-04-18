@@ -28,6 +28,7 @@ extern mouse_irq_handler
 extern ahci_irq_handler
 extern hda_irq_handler
 extern virtio_net_irq_handler
+extern nvme_irq_handler
 extern ipi_reschedule_handler
 extern ipi_call_handler
 extern ipi_tlb_flush_handler
@@ -131,6 +132,15 @@ virtio_net_irq_entry:
     PUSH_GPRS
     call lapic_eoi
     call virtio_net_irq_handler
+    POP_GPRS
+    iretq
+
+; ── VEC_NVME_IO (0x35): NVMe I/O completion MSI-X ───────────────────────
+global nvme_irq_entry
+nvme_irq_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call nvme_irq_handler
     POP_GPRS
     iretq
 
