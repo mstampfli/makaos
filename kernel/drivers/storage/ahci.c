@@ -427,10 +427,13 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
                       uint8_t write, uint16_t nprdt) {
     hba_port_t* p = s_port;
 
-    // Command header
+    // Command header.  AHCI spec §5.5.1 requires P (prefetch, bit 7) to
+    // be 0 for NCQ commands — setting it makes the HBA prefetch stale
+    // PRDT entries and return garbage data.
     cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
-    // CFL=5, W=write, P=prefetch for reads (helps HBA pipeline the PRDT fetch)
-    hdr[slot].flags  = 5u | (write ? (1u << 6) : (1u << 7));
+    uint16_t flags = 5u | (write ? (1u << 6) : 0u);
+    if (!s_ncq && !write) flags |= (1u << 7);  // P only for non-NCQ reads
+    hdr[slot].flags  = flags;
     hdr[slot].prdtl  = nprdt;
     hdr[slot].prdbc  = 0;
     // ctba/ctbau already set in port_init and never change.
@@ -488,11 +491,18 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
     // runs in IRQ context via sched_tick → ahci_poll_completions.  If the
     // timer IRQ fires on this CPU while we hold the lock here in process
     // context, its rescan would self-deadlock.
+    // Issue sequence matching Linux libahci.c ahci_qc_issue():
+    //   NCQ: writel(1<<tag, SACT); writel(1<<tag, CI);
+    //   non-NCQ: writel(1<<tag, CI);
+    // AHCI registers are RW1/RW1S — writing a 1-bit sets only that bit,
+    // so `p->ci = bit` is safe even though two CPUs may issue different
+    // slots concurrently.  DO NOT W1C port->is here — that can discard
+    // a pending IRQ bit for a prior command that hasn't been processed
+    // yet.  The ISR is the only site that should W1C port->is.
     uint64_t ci_flags = spin_lock_irqsave(&s_ci_lock);
-    p->is = p->is;
-    if (s_ncq) p->sact |= bit;   // NCQ: set SACT before CI (AHCI spec)
-    __atomic_fetch_or(&s_active_mask, bit, __ATOMIC_RELEASE);  // AFTER sact, BEFORE ci
-    p->ci |= bit;
+    if (s_ncq) p->sact = bit;                              // RW1S
+    __atomic_fetch_or(&s_active_mask, bit, __ATOMIC_RELEASE);
+    p->ci = bit;                                            // RW1
     spin_unlock_irqrestore(&s_ci_lock, ci_flags);
 }
 
@@ -665,6 +675,42 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
 // zero cost at s_nslots=1 (submits were already effectively serial).
 // When NCQ is re-enabled with s_nslots>1, replace this with per-slot
 // state that's not reused by later submitters.
+// PRDT trace ring buffer: records the last N entries submitted so that
+// post-mortem dump in the GP/PF handler can see what physical addresses
+// DMA was targeting at the moment of crash.
+#define AHCI_TRACE_N 128
+struct ahci_trace_entry {
+    uint64_t lba;
+    uint64_t va;
+    uint64_t pa;
+    uint32_t chunk;
+    uint32_t slot;
+};
+static struct ahci_trace_entry s_ahci_trace[AHCI_TRACE_N];
+static volatile uint32_t       s_ahci_trace_head = 0;
+
+void ahci_trace(uint64_t lba, uint64_t va, uint64_t pa,
+                uint32_t chunk, uint32_t slot) {
+    uint32_t i = __atomic_fetch_add(&s_ahci_trace_head, 1, __ATOMIC_RELAXED);
+    struct ahci_trace_entry* e = &s_ahci_trace[i % AHCI_TRACE_N];
+    e->lba = lba; e->va = va; e->pa = pa;
+    e->chunk = chunk; e->slot = slot;
+}
+
+void ahci_trace_dump(void) {
+    extern void kprintf(const char*, ...);
+    uint32_t head = __atomic_load_n(&s_ahci_trace_head, __ATOMIC_RELAXED);
+    uint32_t start = head > AHCI_TRACE_N ? head - AHCI_TRACE_N : 0;
+    kprintf("=== AHCI trace (last %u of %u) ===\n",
+            (uint32_t)(head - start), head);
+    for (uint32_t i = start; i < head; i++) {
+        struct ahci_trace_entry* e = &s_ahci_trace[i % AHCI_TRACE_N];
+        kprintf("  [%u] slot=%u lba=%lx va=%lx pa=%lx chunk=%x\n",
+                i, e->slot, e->lba, e->va, e->pa, e->chunk);
+    }
+    kprintf("=== END trace ===\n");
+}
+
 static volatile uint32_t s_submit_busy = 0;
 static wait_queue_t      s_submit_busy_wq = { NULL, SPINLOCK_INIT };
 
@@ -709,6 +755,12 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
                 if (!kpml4) kpml4 = vmm_kernel_pml4_get();
                 pa = vmm_page_phys(kpml4, v & ~(uint64_t)(PAGE_SIZE - 1u)) + pg_off;
             }
+
+            // Trace-log every PRDT entry.  Buffer (ring) will show the
+            // last N submissions leading up to any crash.
+            extern void ahci_trace(uint64_t lba, uint64_t va, uint64_t pa,
+                                    uint32_t chunk, uint32_t slot);
+            ahci_trace(lba, v, (uint64_t)pa, chunk, slot);
 
             ct->prdt[nprdt].dba  = (uint32_t)(pa & 0xFFFFFFFFu);
             ct->prdt[nprdt].dbau = (uint32_t)(pa >> 32);
@@ -919,21 +971,19 @@ uint8_t ahci_init(void) {
     // 4. Enable AHCI mode.
     s_hba->ghc |= HBA_GHC_AE;
 
-    // 5. Force non-NCQ mode regardless of what HBA CAP reports.
+    // 5. Enable NCQ from HBA CAP.
     //
-    // QEMU's AHCI NCQ (FPDMA) AIO backend intermittently stalls: CI is
-    // cleared (QEMU fetched the command descriptor) but the Set Device Bits
-    // FIS is never sent, so SACT stays set and slot_wait sleeps forever.
-    // This manifests as ~1/6 boots where login's first disk read never
-    // completes.
-    //
-    // Non-NCQ READ/WRITE DMA EXT (0x25/0x35) are rock-solid under QEMU:
-    // the HBA clears CI directly when it receives the D2H FIS, no device
-    // FIS round-trip needed.  We lose nothing — there is no rotational-seek
-    // benefit to NCQ on a virtual disk, and s_nslots=1 is already the
-    // effective limit when NCQ is disabled.
-    s_ncq    = 0u;
-    s_nslots = 1u;
+    // The committed submit path serializes via s_submit_busy mutex AND
+    // verifies each read via the POISON sentinel with bounded retry, so
+    // spurious SACT completions (a documented QEMU AHCI NCQ quirk and an
+    // occasional issue on real hardware, see Linux libata history) are
+    // guarded.  Retrying within the same slot re-issues the command to
+    // the HBA until POISON is overwritten with real data.
+    uint32_t cap = s_hba->cap;
+    uint8_t  ncs = (uint8_t)(((cap >> 8) & 0x1Fu) + 1u);
+    uint8_t  sncq = (cap & HBA_CAP_SNCQ) ? 1u : 0u;
+    s_ncq    = sncq;
+    s_nslots = sncq ? (ncs > MAX_NCQ_SLOTS ? MAX_NCQ_SLOTS : ncs) : 1u;
 
     // 6. Find the first SATA port with a drive.
     uint32_t pi = s_hba->pi;
