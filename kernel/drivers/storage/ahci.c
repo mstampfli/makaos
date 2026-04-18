@@ -315,6 +315,14 @@ void ahci_irq_handler(void) {
     // was already W1C'd).  Re-scanning SACT in a loop drains them before
     // we return from the ISR.
     for (;;) {
+        // Hold s_ci_lock across the active_mask+ci read.  issue_cmd
+        // writes active_mask BEFORE ci under the same lock.  Without
+        // this lock the ISR observes the window where active_mask bit
+        // is set but ci bit still 0, computes done = bit & ~0 = bit,
+        // and falsely completes a slot whose DMA hasn't been submitted
+        // yet — subsequent slot reuse then corrupts the in-flight PRDT
+        // and DMA lands in the wrong buffer.
+        uint64_t flags = spin_lock_irqsave(&s_ci_lock);
         uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
         uint32_t done;
         if (s_ncq)
@@ -322,11 +330,12 @@ void ahci_irq_handler(void) {
         else
             done = active & ~s_port->ci;
 
-        if (!done) break;
+        if (!done) { spin_unlock_irqrestore(&s_ci_lock, flags); break; }
 
         // Release from active_mask before waking waiters so a woken task
         // that re-submits immediately won't see its slot as still active.
         __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
+        spin_unlock_irqrestore(&s_ci_lock, flags);
 
         uint32_t mask = done;
         while (mask) {
@@ -475,17 +484,16 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
     //      slot_wait sleeps forever until the next unrelated IRQ rescans).
     //   3. ci — actually issues the command to the device
     // Holding s_ci_lock prevents a concurrent CPU's sact/ci RMW from racing.
-    spin_lock(&s_ci_lock);
-    // Drain stale port_is before issuing CI.  MSI-X is edge-triggered on
-    // IS 0→1.  If a stale DHRS bit is still set from a prior completion
-    // whose ISR already ran, the next completion's DHRS sets the same bit
-    // (already 1) → no edge → no MSI → slot_wait hangs.  W1C clears any
-    // leftover bits so the next completion produces a clean 0→1 edge.
+    // irqsave: s_ci_lock is also taken in ahci_rescan_completions, which
+    // runs in IRQ context via sched_tick → ahci_poll_completions.  If the
+    // timer IRQ fires on this CPU while we hold the lock here in process
+    // context, its rescan would self-deadlock.
+    uint64_t ci_flags = spin_lock_irqsave(&s_ci_lock);
     p->is = p->is;
     if (s_ncq) p->sact |= bit;   // NCQ: set SACT before CI (AHCI spec)
     __atomic_fetch_or(&s_active_mask, bit, __ATOMIC_RELEASE);  // AFTER sact, BEFORE ci
     p->ci |= bit;
-    spin_unlock(&s_ci_lock);
+    spin_unlock_irqrestore(&s_ci_lock, ci_flags);
 }
 
 // ── Slot wait ─────────────────────────────────────────────────────────────
@@ -494,16 +502,32 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
 // Rescan SACT/CI for completions that the ISR may have missed due to
 // interrupt coalescing: W1C of port_is can clear a completion's IS bit
 // before the ISR reads SACT, leaving the slot done in hardware but with
-// no further IRQ coming.  Called from slot_wait after each wakeup and
-// from the ISR's drain loop.
+// no further IRQ coming.  Called from slot_wait after each wakeup.
+//
+// MUST hold s_ci_lock across the active_mask+ci read.  issue_cmd sets
+// active_mask BEFORE ci (so the ISR — which only fires AFTER ci is set —
+// never races with it).  But this rescan can run from ANY wake (including
+// a cross-slot wake from slot_avail_wq), i.e. during the issue_cmd window
+// where active_mask is already set but ci is not.  Without the lock, rescan
+// computes done = active & ~ci = bit & ~0 = bit → false completion on a slot
+// whose DMA hasn't been submitted yet → s_slot_done is set and slot is freed
+// while the real DMA is still in flight → subsequent allocator reuses the
+// slot, overwrites the PRDT, and DMA writes data to the wrong buffer.
 static void ahci_rescan_completions(void) {
     if (!s_port) return;
     for (;;) {
+        // irqsave: callable from IRQ context (sched_tick path) AND
+        // process context (slot_wait hook).  The lock is also taken by
+        // issue_cmd in process context; a timer IRQ firing on the CPU
+        // that holds it would self-deadlock without disabling IRQs.
+        uint64_t flags = spin_lock_irqsave(&s_ci_lock);
         uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
-        if (!active) return;
+        if (!active) { spin_unlock_irqrestore(&s_ci_lock, flags); return; }
         uint32_t done = s_ncq ? (active & ~s_port->sact) : (active & ~s_port->ci);
-        if (!done) return;
+        if (!done)   { spin_unlock_irqrestore(&s_ci_lock, flags); return; }
         __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
+        spin_unlock_irqrestore(&s_ci_lock, flags);
+
         uint32_t mask = done;
         while (mask) {
             uint32_t s = (uint32_t)__builtin_ctz(mask);
@@ -629,11 +653,38 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
 #define AHCI_READ_POISON  0xDEAD5A5ADEADBEEFULL
 #define AHCI_MAX_RETRIES  5
 
+// Serialize ahci_submit_hhdm across all submitters.
+//
+// With s_nslots=1 (non-NCQ fallback for QEMU), slot_alloc's CAS already
+// ensures exclusive slot ownership.  But the post-slot_wait checks of
+// s_slot_result[slot] race against the NEXT submitter's reset of that
+// same array (B: `s_slot_result[slot] = 0` before issue), which can
+// cause A to spuriously retry and, in concert with the retry-path
+// PRDT rebuild, opens a window where concurrent DMA targets cross-
+// contaminate buffers.  Full serialization eliminates the race and is
+// zero cost at s_nslots=1 (submits were already effectively serial).
+// When NCQ is re-enabled with s_nslots>1, replace this with per-slot
+// state that's not reused by later submitters.
+static volatile uint32_t s_submit_busy = 0;
+static wait_queue_t      s_submit_busy_wq = { NULL, SPINLOCK_INIT };
+
 static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
                                   uint8_t write) {
     if (!buf || !count) return 0;
 
     uint32_t bytes = count * 512u;
+
+    // Acquire exclusive submit: spin-CAS with sleep-fallback.
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&s_submit_busy, &expected, 1u, 0,
+                                           __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            break;
+        WAIT_EVENT(&s_submit_busy_wq,
+                   __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0);
+    }
+
+    uint8_t rc = 0;
 
     for (uint32_t attempt = 0; attempt < AHCI_MAX_RETRIES; attempt++) {
         uint32_t slot = slot_alloc();
@@ -684,10 +735,13 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
         if (!write && bytes >= 8 && *sentinel == AHCI_READ_POISON)
             continue;
 
-        return 1;  // success
+        rc = 1;  // success
+        break;
     }
 
-    return 0;  // all retries exhausted
+    __atomic_store_n(&s_submit_busy, 0u, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&s_submit_busy_wq);
+    return rc;
 }
 
 // Submit using a pre-resolved scatter-gather page list (user-space path).
