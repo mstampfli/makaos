@@ -400,11 +400,23 @@ static uint8_t io_submit_async(nvme_sqe_t* cmd) {
     s_iosq[tail] = *cmd;
     uint32_t new_tail = (tail + 1) % NVME_IOQ_DEPTH;
     s_iosq_tail = new_tail;
-    __asm__ volatile("" ::: "memory");
+    // SFENCE drains the store buffer so the device's DMA-read of the
+    // SQE observes the full 64 bytes before it sees the new tail via
+    // the doorbell.  The plain compiler barrier was insufficient under
+    // heavy SMP contention — QEMU occasionally pulled a stale SQE field
+    // and returned success with an un-DMA'd buffer (observed as single-
+    // byte mismatches under 4-worker stress).
+    __asm__ volatile("sfence" ::: "memory");
     *sq_doorbell(NVME_IOQ_ID) = new_tail;  // MMIO: serializing write
     spin_unlock_irqrestore(&s_iosq_lock, flags);
 
     WAIT_EVENT(&req->wq, __atomic_load_n(&req->done, __ATOMIC_ACQUIRE));
+    // Full fence: the ISR's RELEASE on req->done pairs with our ACQUIRE
+    // above for its own writes, but the DMA into the caller's buffer is
+    // an *external* write outside the release chain.  MFENCE here drains
+    // any speculative loads of the buffer that this CPU issued before
+    // DMA became globally visible, forcing subsequent loads to re-fetch.
+    __asm__ volatile("mfence" ::: "memory");
     uint16_t status = req->status;
     cid_push(cid);
     return (status >> 1) == 0;
@@ -428,6 +440,14 @@ void nvme_irq_handler(void) {
         // Persistent per-CID slot — no lookup, no xchg, no UAF risk.
         nvme_request_t* req = &s_req[cqe.cid];
         req->status = cqe.status_phase;
+        // Full fence so the device's preceding DMA to the command buffer
+        // is globally ordered before the waker observes done=1.  MSI-X
+        // delivery already orders the device's DMA ahead of the interrupt
+        // itself on x86, but a waiter CPU that observed an early done=1
+        // from a stale cache line before MSI-X propagated would read
+        // stale buffer bytes — seen as a single-byte mismatch at i/o
+        // load under 4-worker stress.
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
         __atomic_store_n(&req->done, 1u, __ATOMIC_RELEASE);
         wait_queue_wake_all(&req->wq);
     }
