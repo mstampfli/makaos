@@ -35,6 +35,7 @@
 #define VEC_AHCI_MSI         0x32   // AHCI MSI
 #define VEC_HDA_MSI          0x33   // HDA MSI
 #define VEC_VIRTIO_NET       0x34   // virtio-net MSI (RX+TX shared)
+#define VEC_NVME_IO          0x35   // NVMe I/O completion (single-queue, step 3)
 
 // IPI vectors — reserved for SMP work (Phase 9-5 and onwards).
 #define VEC_IPI_RESCHEDULE   0x40   // wake an idle CPU so it picks up a task

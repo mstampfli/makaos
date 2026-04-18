@@ -960,6 +960,43 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     }
 
 kernel_panic:
-    // Kernel protection violation or reserved-bit fault — unrecoverable.
+    {
+        // Unrecoverable kernel-mode page fault — dump enough context to
+        // diagnose.  Uses the local serial helpers so it works even
+        // after the locked kprintf path has been blown.
+        ser_str("\n===== KERNEL PF-PANIC =====\n");
+        ser_str("  ec=");   ser_hex64(ec);
+        ser_str("  CR2=");  ser_hex64(fault_addr);
+        ser_str("  RIP=");  ser_hex64(f->ip);
+        ser_str("  RSP=");  ser_hex64(f->sp);
+        ser_str("  CS=");   ser_hex64(f->cs);
+        ser_str("  p=");    ser_hex64(is_present);
+        ser_str("  w=");    ser_hex64(is_write);
+        ser_str("  x=");    ser_hex64(is_ifetch);
+        if (g_current) {
+            ser_str("\n  pid=");  ser_hex64((uint64_t)g_current->pid);
+            ser_str("  comm=");
+            for (int i = 0; i < 15 && g_current->comm[i]; i++) {
+                while (!(inb(0x3F8+5) & 0x20));
+                outb(0x3F8, (uint8_t)g_current->comm[i]);
+            }
+            ser_str("  kstack_top=");
+            ser_hex64((uint64_t)g_current->kstack_top);
+        }
+        // Dump up to 10 q-words of the stack so we can see call frames.
+        ser_str("\n  STACK@RSP:\n");
+        {
+            uint64_t sp = f->sp;
+            for (int i = 0; i < 10; i++) {
+                uint64_t va = sp + (uint64_t)(i * 8);
+                phys_addr_t pg = vmm_page_phys(g_kernel_pml4, va & ~0xFFFULL);
+                if (pg == PMM_INVALID_ADDR) { ser_str("    (unmapped)\n"); break; }
+                uint64_t* kp = (uint64_t*)((pg + HHDM_OFFSET) + (va & 0xFF8ULL));
+                ser_str("    "); ser_hex64(va);
+                ser_str(": ");   ser_hex64(*kp);
+            }
+        }
+        ser_str("===== END =====\n\n");
+    }
     for (;;) __asm__ volatile("cli; hlt");
 }

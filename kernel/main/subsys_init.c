@@ -4,6 +4,7 @@
 #include "tty.h"
 #include "evdev.h"
 #include "ahci.h"
+#include "nvme.h"
 #include "ext2.h"
 #include "keyboard.h"
 #include "mouse.h"
@@ -31,6 +32,14 @@ DEFINE_INITCALL(evdev, INITCALL_LEVEL_EARLY,
 
 // ahci: needs PCI (already done in kmain before do_initcalls_early)
 DEFINE_INITCALL(ahci, INITCALL_LEVEL_EARLY, .fn = _ahci_init);
+
+// nvme: also needs PCI; runs after ahci so boot paths are discovered in
+// a consistent order.  Returns gracefully if no NVMe controller exists.
+static int _nvme_init(void) { nvme_init(); return 0; }
+DEFINE_INITCALL(nvme, INITCALL_LEVEL_EARLY,
+    .fn   = _nvme_init,
+    .deps = INITCALL_DEPS("ahci"),
+);
 
 // ext2: needs ahci to be initialised first
 DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,

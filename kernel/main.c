@@ -14,6 +14,7 @@
 #include "smp_boot.h"
 #include "irq_wait.h"
 #include "ahci.h"
+#include "nvme.h"
 #include "ext2.h"
 #include "elf.h"
 #include "tsc.h"
@@ -148,6 +149,98 @@ static void stress_pread_launch(void) {
     }
 }
 
+// ── stress_nvme — hammer the NVMe I/O path ──────────────────────────────
+// At boot, reads the first NVME_STRESS_REF_PAGES pages of the NVMe disk
+// sequentially (single-threaded) into an in-memory reference.  Then
+// spawns NVME_STRESS_WORKERS kthreads, each doing NVME_STRESS_ITERS
+// random 4 KiB reads and byte-comparing against the reference.  Any
+// mismatch is a bug in the NVMe submit/completion path.
+
+#define NVME_STRESS_REF_PAGES 256      // 256 × 4 KiB = 1 MiB reference
+#define NVME_STRESS_ITERS     10000
+#define NVME_STRESS_WORKERS   4
+
+static uint8_t* g_nvme_ref  = NULL;
+static uint64_t g_nvme_pages = 0;
+static uint8_t* g_nvme_tmp_bufs[16] = {0};  // pre-allocated, one per worker
+static volatile uint32_t g_nvme_tmp_ix = 0;
+
+static void stress_nvme_worker(void) {
+    uint32_t my_ix = __atomic_fetch_add(&g_nvme_tmp_ix, 1, __ATOMIC_RELAXED);
+    uint8_t* tmp = g_nvme_tmp_bufs[my_ix];
+    uint64_t seed = 0xA5A5DEADBEEFCAFEULL ^ ((uint64_t)g_current->pid << 16);
+    uint64_t fails = 0, errs = 0;
+
+    kprintf("[nvme-stress] pid=%u START pages=%lu\n",
+            g_current->pid, g_nvme_pages);
+
+    for (uint64_t i = 0; i < NVME_STRESS_ITERS; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t pg  = (seed >> 16) % g_nvme_pages;
+        uint64_t lba = pg * 8;  // 4K page = 8 × 512 B LBAs
+
+        if (!nvme_read(lba, tmp, 8)) {
+            errs++;
+            kprintf("[nvme-stress] pid=%u i=%lu READ FAILED lba=%lx\n",
+                    g_current->pid, i, lba);
+            continue;
+        }
+        uint8_t* ref = g_nvme_ref + pg * 4096;
+        uint64_t first = (uint64_t)-1;
+        for (uint64_t j = 0; j < 4096; j++)
+            if (tmp[j] != ref[j]) { first = j; break; }
+        if (first != (uint64_t)-1) {
+            fails++;
+            kprintf("[nvme-stress] pid=%u i=%lu MISMATCH lba=%lx "
+                    "first_diff=+%lu got=%x want=%x\n",
+                    g_current->pid, i, lba, first,
+                    (uint32_t)tmp[first], (uint32_t)ref[first]);
+        }
+    }
+
+    kprintf("[nvme-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu\n",
+            g_current->pid, (uint32_t)NVME_STRESS_ITERS, fails, errs);
+
+    // tmp is from g_nvme_tmp_bufs[] — freed by launch harness.
+    g_current->state = TASK_DEAD; sched_yield();
+    for (;;) __asm__ volatile("hlt");
+}
+
+static void stress_nvme_launch(void) {
+    // Build the reference by reading the first N pages SINGLE-THREADED.
+    uint64_t ref_bytes = (uint64_t)NVME_STRESS_REF_PAGES * 4096;
+    uint8_t* ref = (uint8_t*)kmalloc(ref_bytes);
+    if (!ref) { kprintf("[nvme-stress] OOM ref\n"); return; }
+
+    kprintf("[nvme-stress] building reference (%lu pages, %lu bytes)\n",
+            (uint64_t)NVME_STRESS_REF_PAGES, ref_bytes);
+    for (uint64_t pg = 0; pg < NVME_STRESS_REF_PAGES; pg++) {
+        if (!nvme_read(pg * 8, ref + pg * 4096, 8)) {
+            kprintf("[nvme-stress] ref read failed at page %lu\n", pg);
+            kfree(ref);
+            return;
+        }
+    }
+    g_nvme_ref = ref;
+    g_nvme_pages = NVME_STRESS_REF_PAGES;
+
+    // Pre-allocate worker tmp buffers single-threaded.  Ensures each
+    // worker gets its OWN buffer (rules out a kheap SMP bug as cause
+    // of any observed cross-buffer contamination).
+    for (int i = 0; i < NVME_STRESS_WORKERS; i++) {
+        g_nvme_tmp_bufs[i] = (uint8_t*)kmalloc(4096);
+    }
+    g_nvme_tmp_ix = 0;
+
+    kprintf("[nvme-stress] reference built; launching %u workers x %u iters\n",
+            (uint32_t)NVME_STRESS_WORKERS, (uint32_t)NVME_STRESS_ITERS);
+
+    for (int i = 0; i < NVME_STRESS_WORKERS; i++) {
+        task_t* t = task_create_kthread(stress_nvme_worker, pid_alloc());
+        if (t) sched_add(t);
+    }
+}
+
 // ── init_kthread ──────────────────────────────────────────────────────────
 // Runs in process context after the scheduler and timer are live.
 // Calls do_initcalls_subsys() then spawns login and svcmgr.
@@ -189,6 +282,10 @@ static void init_kthread(void) {
     // Kept in-tree so future changes to the submit path can be validated.
     // stress_pread_launch();
     (void)stress_pread_launch;
+
+    // NVMe stress: 4 kthreads × 10000 random 4 KiB reads vs reference.
+    // stress_nvme_launch();
+    (void)stress_nvme_launch;
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's

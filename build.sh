@@ -584,6 +584,11 @@ dd if="$BUILD_DIR/ext2.img" of="$BUILD_DIR/disk.img" bs=512 seek=$EXT2_LBA conv=
 
 stat -c "%n %s" "$BUILD_DIR/disk.img"
 
+if [ -n "$NO_QEMU" ]; then
+  echo "[+] Build complete — NO_QEMU set, skipping QEMU launch"
+  exit 0
+fi
+
 echo "[+] Running QEMU (UEFI/OVMF)"
 
 OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
