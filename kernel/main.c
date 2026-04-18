@@ -24,6 +24,9 @@
 #include "tty.h"
 #include "evdev.h"
 #include "initcall.h"
+#include "kheap.h"
+#include "vfs.h"
+#include "kprintf.h"
 
 phys_addr_t KERNEL_BASE_PHYS     = 0;
 uint64_t    KERNEL_SIZE          = 0;
@@ -50,6 +53,99 @@ static void serial_init_and_say(void) {
     outb(0x3F8, 'K');
     while (!(inb(0x3F8 + 5) & 0x20));
     outb(0x3F8, '\n');
+}
+
+// ── stress_pread — hammer AHCI pread path to catch data corruption ───────
+// One-boot stress: reads /bin/bash in full once as a reference, then
+// does N random 4 KiB pread()s and byte-compares each against the
+// reference.  Any short read, error, or data mismatch is printed with
+// enough context to diagnose.  Runs in parallel with login/bash so the
+// AHCI slot contention is realistic.
+
+#define STRESS_PREAD_ITERS 10000
+#define STRESS_PREAD_WORKERS 4
+
+static volatile uint32_t g_stress_done_count = 0;
+
+static void stress_pread_worker(void) {
+    vfs_file_t* f = ext2_open("/bin/bash");
+    if (!f) { kprintf("[stress] open /bin/bash failed\n");
+             __atomic_fetch_add(&g_stress_done_count, 1, __ATOMIC_RELAXED);
+             g_current->state = TASK_DEAD; sched_yield(); for(;;) __asm__("hlt"); }
+
+    int64_t size = f->seek(f, 0, SEEK_END);
+    f->seek(f, 0, SEEK_SET);
+    if (size <= 0) { kprintf("[stress] size<=0 %lu\n", (uint64_t)size);
+                     f->close(f);
+                     __atomic_fetch_add(&g_stress_done_count, 1, __ATOMIC_RELAXED);
+                     g_current->state = TASK_DEAD; sched_yield(); for(;;) __asm__("hlt"); }
+
+    uint8_t* ref = kmalloc((uint64_t)size);
+    int64_t nr = f->pread(f, ref, (uint64_t)size, 0);
+    if (nr != size) {
+        kprintf("[stress] pid=%u ref-read short: %lu/%lu\n",
+                g_current->pid, (uint64_t)nr, (uint64_t)size);
+        kfree(ref); f->close(f);
+        __atomic_fetch_add(&g_stress_done_count, 1, __ATOMIC_RELAXED);
+        g_current->state = TASK_DEAD; sched_yield(); for(;;) __asm__("hlt");
+    }
+
+    uint8_t* tmp = kmalloc(4096);
+    uint64_t seed = 0xC0FFEE00DEADBEEFULL ^ ((uint64_t)g_current->pid << 16);
+    uint64_t fails = 0, shorts = 0, errs = 0;
+    uint64_t pages = ((uint64_t)size + 4095) / 4096;
+
+    kprintf("[stress] pid=%u START size=%lu pages=%lu\n",
+            g_current->pid, (uint64_t)size, pages);
+
+    for (uint64_t i = 0; i < STRESS_PREAD_ITERS; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t pg  = (seed >> 16) % pages;
+        uint64_t off = pg * 4096;
+        uint64_t want = ((uint64_t)size - off) < 4096 ? (uint64_t)size - off : 4096;
+
+        int64_t got = f->pread(f, tmp, want, off);
+        if (got < 0) {
+            errs++;
+            kprintf("[stress] pid=%u i=%lu pread ERR=%lu off=%lx\n",
+                    g_current->pid, i, (uint64_t)got, off);
+            continue;
+        }
+        if ((uint64_t)got != want) {
+            shorts++;
+            kprintf("[stress] pid=%u i=%lu SHORT got=%lu want=%lu off=%lx\n",
+                    g_current->pid, i, (uint64_t)got, want, off);
+            continue;
+        }
+        uint64_t first = (uint64_t)-1;
+        for (uint64_t j = 0; j < want; j++)
+            if (tmp[j] != ref[off + j]) { first = j; break; }
+        if (first != (uint64_t)-1) {
+            fails++;
+            kprintf("[stress] pid=%u i=%lu MISMATCH off=%lx first_diff=+%lu "
+                    "got=%x want=%x\n",
+                    g_current->pid, i, off, first,
+                    (uint32_t)tmp[first], (uint32_t)ref[off + first]);
+        }
+    }
+
+    kprintf("[stress] pid=%u DONE iters=%u mismatches=%lu shorts=%lu errs=%lu\n",
+            g_current->pid, (uint32_t)STRESS_PREAD_ITERS,
+            fails, shorts, errs);
+
+    kfree(tmp); kfree(ref); f->close(f);
+    __atomic_fetch_add(&g_stress_done_count, 1, __ATOMIC_RELAXED);
+    g_current->state = TASK_DEAD; sched_yield();
+    for (;;) __asm__ volatile("hlt");
+}
+
+static void stress_pread_launch(void) {
+    kprintf("[stress] launching %d workers x %d pread iters each\n",
+            STRESS_PREAD_WORKERS, STRESS_PREAD_ITERS);
+    for (int i = 0; i < STRESS_PREAD_WORKERS; i++) {
+        task_t* t = task_create_kthread(stress_pread_worker, pid_alloc());
+        if (t) sched_add(t);
+    }
 }
 
 // ── init_kthread ──────────────────────────────────────────────────────────
@@ -88,6 +184,11 @@ static void init_kthread(void) {
 
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
+
+    // Regression-test harness: uncomment to stress AHCI concurrent pread.
+    // Kept in-tree so future changes to the submit path can be validated.
+    // stress_pread_launch();
+    (void)stress_pread_launch;
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's

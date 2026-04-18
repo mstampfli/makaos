@@ -605,7 +605,7 @@ qemu-system-x86_64 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
-  -display sdl \
+  -display none \
   -audiodev pa,id=snd0,server=/run/user/1000/pulse/native \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
