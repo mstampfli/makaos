@@ -171,6 +171,10 @@ void isr13_gp(interrupt_frame_t* f, uint64_t ec) {
     }
     serial_puts_idt("=== END #GP ===\n");
 
+    // Dump recent AHCI submissions — DMA-to-wrong-address is our suspect.
+    extern void ahci_trace_dump(void);
+    ahci_trace_dump();
+
     if (from_user(f)) {
         signal_send(g_current, SIGSEGV);
         signal_deliver_pending();

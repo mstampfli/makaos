@@ -4,10 +4,10 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x000000000004549B
+kernel.bin size=0x00000000000474A3
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x000000000004549B
-phys_ceiling=0x0000000100000000
+kernel loaded, bytes=0x00000000000474A3
+phys_ceiling=0x0000010000000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
 ExitBootServices OK
@@ -22,115 +22,167 @@ K
 [net] IP 10.0.2.15 GW 10.0.2.2
 [net] MAC 52:54:00:12:34:56
 [net] ready
-[elf] lazy /bin/login: header 96 us (demand-paged)
-[elf] lazy /bin/svcmgr: header 139 us (demand-paged)
+[elf] lazy /bin/login: header 142 us (demand-paged)
+[elf] lazy /bin/svcmgr: header 195 us (demand-paged)
+[stress] launching 4 workers x 10000 pread iters each
+[stress] pid=17 START size=1073520 pages=263
+[elf] la[stress] pid=zy 19/ START size=b1073520i pn/netages=:263
+ header 1243 us (demand-paged)
+[stress] pid=20 START size=1073520 pages=263
+[stress] pid=18 START size=1073520 pages=263
 
-===== PF-KILL =====
-  pid=0x000000000000000E
-  ppid=0x0000000000000000
-  home=0x0000000000000000
-  comm=login
-  ec=0x0000000000000006
-  CR2=0x000000000000002B
-  RIP=0x000000000040DD78
-  RSP=0x00007FFFFFFFDEA8
-  RFLAGS=0x0000000000010202
-  CS=0x000000000000002B
-  p=0x0000000000000000
-  w=0x0000000000000001
-  x=0x0000000000000000
-  RAX=0x000000000000002B
-  RBX=0x0000000000000000
-  RCX=0x0000000000000001
-  RDX=0x00007FFFFFFFDEC8
-  RBP=0x0000000000000000
-  RSI=0x00007FFFFFFFDEB8
-  RDI=0x0000000000000001
-  R8=0x0000000000000000
-  R9=0xFFFF8000018610A0
-  R10=0x0000000000000000
-  R11=0xFFFF800000000000
-  R12=0x0000000000400000
-  R13=0x00007FFFFFFFDEB0
-  R14=0x0000000000000000
-  R15=0x0000000000000000
-  VMAs:
-    [0x0000000000400000
- - 0x0000000000410000
-] f=0x0000000000000045
-    [0x0000000000410000
- - 0x000000000045E000
-] f=0x0000000000000043
-    [0x00007FFFFFDFE000
- - 0x00007FFFFFFFE000
-] f=0x000000000000000B
-  STACK@RSP (32 words):
-    0x00007FFFFFFFDEA8
-: 0x0000000000400021
-    0x00007FFFFFFFDEB0
-: 0x0000000000000001
-    0x00007FFFFFFFDEB8
-: 0x00007FFFFFFFDFC5
-    0x00007FFFFFFFDEC0
-: 0x0000000000000000
-    0x00007FFFFFFFDEC8
-: 0x00007FFFFFFFDFD0
-    0x00007FFFFFFFDED0
-: 0x00007FFFFFFFDFDA
-    0x00007FFFFFFFDED8
-: 0x00007FFFFFFFDFE5
-    0x00007FFFFFFFDEE0
-: 0x0000000000000000
-    0x00007FFFFFFFDEE8
-: 0x0000000000000003
-    0x00007FFFFFFFDEF0
-: 0x0000000000000000
-    0x00007FFFFFFFDEF8
-: 0x0000000000000004
-    0x00007FFFFFFFDF00
-: 0x0000000000000038
-    0x00007FFFFFFFDF08
-: 0x0000000000000005
-    0x00007FFFFFFFDF10
-: 0x0000000000000002
-    0x00007FFFFFFFDF18
-: 0x0000000000000006
-    0x00007FFFFFFFDF20
-: 0x0000000000001000
-    0x00007FFFFFFFDF28
-: 0x0000000000000009
-    0x00007FFFFFFFDF30
-: 0x0000000000400000
-    0x00007FFFFFFFDF38
-: 0x000000000000000B
-    0x00007FFFFFFFDF40
-: 0x0000000000000000
-    0x00007FFFFFFFDF48
-: 0x000000000000000C
-    0x00007FFFFFFFDF50
-: 0x0000000000000000
-    0x00007FFFFFFFDF58
-: 0x000000000000000D
-    0x00007FFFFFFFDF60
-: 0x0000000000000000
-    0x00007FFFFFFFDF68
-: 0x000000000000000E
-    0x00007FFFFFFFDF70
-: 0x0000000000000000
-    0x00007FFFFFFFDF78
-: 0x0000000000000010
-    0x00007FFFFFFFDF80
-: 0x0000000000000000
-    0x00007FFFFFFFDF88
-: 0x0000000000000011
-    0x00007FFFFFFFDF90
-: 0x0000000000000064
-    0x00007FFFFFFFDF98
-: 0x0000000000000019
-    0x00007FFFFFFFDFA0
-: 0x00007FFFFFFFDFF0
-  CODE@RIP:
-    0x0000000000000000
-    0x0000000000000000
-===== END PF-KILL =====
-
+=== #GP FAULT ===
+ec=0000000000000000
+RIP=FFFFFFFF8000EE46
+CS=0000000000000008
+FLG=0000000000010006
+RSP=FFFFFFFF80247E28
+SS=0000000000000010
+RSP0=FFFFFFFF80248000
+PID=0000000000000012
+PPID=000000000000000A
+KSTK=FFFFFFFF80248000
+CMD=
+STACK@RSP:
+FFFF80000FEDB000
+0000000000000001
+FFFFFFFF800010F0
+00000000000005A0
+FFFFFFFF80247EC8
+FFFFFFFF8001C2DA
+FFFFFFFF800A71E0
+0001000A0000110A
+=== END #GP ===
+=== AHCI trace (last 128 of 9355) ===
+  [9227] slot=1 lba=2ea0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9228] slot=2 lba=3418 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9229] slot=1 lba=2e20 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9230] slot=1 lba=2f38 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9231] slot=1 lba=2fb8 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9232] slot=2 lba=306c va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9233] slot=1 lba=2ee0 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9234] slot=1 lba=338e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9235] slot=2 lba=2fc0 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9236] slot=1 lba=33ee va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9237] slot=1 lba=30f4 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9238] slot=1 lba=2f68 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9239] slot=1 lba=2ee8 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9240] slot=2 lba=351a va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9241] slot=1 lba=34b8 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9242] slot=2 lba=3000 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9243] slot=1 lba=3184 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9244] slot=1 lba=337e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9245] slot=2 lba=3326 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9246] slot=1 lba=3592 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9247] slot=1 lba=3490 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9248] slot=1 lba=304c va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9249] slot=1 lba=35ec va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9250] slot=1 lba=3144 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9251] slot=1 lba=34c8 va=ffff80000e1bd000 pa=e1bd000 chunk=400
+  [9252] slot=1 lba=34ca va=ffff80000e1bd800 pa=e1bd800 chunk=800
+  [9253] slot=2 lba=316c va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9254] slot=1 lba=3266 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9255] slot=1 lba=327e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9256] slot=2 lba=2f28 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9257] slot=1 lba=32f6 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9258] slot=1 lba=357a va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9259] slot=2 lba=3502 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9260] slot=1 lba=3440 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9261] slot=1 lba=3346 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9262] slot=2 lba=30bc va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9263] slot=1 lba=34a0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9264] slot=2 lba=3084 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9265] slot=1 lba=321e va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9266] slot=1 lba=2ee8 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9267] slot=2 lba=2fe8 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9268] slot=1 lba=31f4 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9269] slot=1 lba=2e30 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9270] slot=1 lba=3406 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9271] slot=1 lba=3064 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9272] slot=1 lba=33de va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9273] slot=1 lba=30cc va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9274] slot=1 lba=3174 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9275] slot=2 lba=35ec va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9276] slot=1 lba=31dc va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9277] slot=1 lba=34a0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9278] slot=2 lba=302c va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9279] slot=1 lba=2ea8 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9280] slot=1 lba=2ee0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9281] slot=2 lba=3064 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9282] slot=1 lba=35b2 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9283] slot=1 lba=2ed8 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9284] slot=2 lba=331e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9285] slot=1 lba=32be va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9286] slot=1 lba=326e va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9287] slot=2 lba=337e va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9288] slot=2 lba=322e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9289] slot=1 lba=34fa va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9290] slot=1 lba=353a va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9291] slot=1 lba=358a va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9292] slot=1 lba=2e28 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9293] slot=2 lba=3074 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9294] slot=1 lba=3204 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9295] slot=1 lba=2ea8 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9296] slot=1 lba=3154 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9297] slot=1 lba=2e58 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9298] slot=1 lba=3572 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9299] slot=2 lba=3024 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9300] slot=1 lba=316c va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9301] slot=1 lba=33be va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9302] slot=1 lba=33e6 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9303] slot=2 lba=35aa va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9304] slot=1 lba=2f00 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9305] slot=1 lba=35c2 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9306] slot=2 lba=34e2 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9307] slot=1 lba=2ee0 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9308] slot=2 lba=331e va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9309] slot=1 lba=35ec va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9310] slot=1 lba=2e60 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9311] slot=1 lba=2e88 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9312] slot=1 lba=3562 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9313] slot=1 lba=3184 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9314] slot=1 lba=349e va=ffff80000e1bb000 pa=e1bb000 chunk=400
+  [9315] slot=1 lba=2ee0 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9316] slot=1 lba=3124 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9317] slot=1 lba=3266 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9318] slot=1 lba=34c0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9319] slot=2 lba=2f68 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9320] slot=1 lba=319c va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9321] slot=2 lba=31c4 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9322] slot=1 lba=350a va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9323] slot=1 lba=31ac va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9324] slot=1 lba=325e va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9325] slot=1 lba=3184 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9326] slot=1 lba=34c8 va=ffff80000e1bd000 pa=e1bd000 chunk=400
+  [9327] slot=1 lba=2e30 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9328] slot=2 lba=3124 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9329] slot=1 lba=2e60 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9330] slot=1 lba=3164 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9331] slot=2 lba=2e70 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9332] slot=1 lba=2fe8 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9333] slot=1 lba=35c2 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9334] slot=2 lba=32fe va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9335] slot=1 lba=2e70 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9336] slot=1 lba=2f10 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9337] slot=2 lba=3522 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9338] slot=1 lba=34ca va=ffff80000e1bd800 pa=e1bd800 chunk=800
+  [9339] slot=1 lba=307c va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9340] slot=1 lba=35aa va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9341] slot=1 lba=3420 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9342] slot=1 lba=34b0 va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9343] slot=1 lba=2f98 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9344] slot=1 lba=2f90 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9345] slot=1 lba=32f6 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9346] slot=1 lba=30d4 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9347] slot=1 lba=2e40 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9348] slot=1 lba=32be va=ffff80000e1bf000 pa=e1bf000 chunk=1000
+  [9349] slot=2 lba=2e90 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+  [9350] slot=1 lba=2e90 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9351] slot=1 lba=350a va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9352] slot=1 lba=328e va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9353] slot=2 lba=3024 va=ffff80000e1bb000 pa=e1bb000 chunk=1000
+  [9354] slot=1 lba=35d2 va=ffff80000e1bd000 pa=e1bd000 chunk=1000
+=== END trace ===
+[stress] pid=20 DONE iters=10000 mismatches=0 shorts=0 errs=0
+[stress] pid=17 DONE iters=10000 mismatches=0 shorts=0 errs=0
+[stress] pid=19 DONE iters=10000 mismatches=0 shorts=0 errs=0

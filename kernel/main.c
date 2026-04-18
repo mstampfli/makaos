@@ -185,10 +185,7 @@ static void init_kthread(void) {
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
 
-    // Regression-test harness: uncomment to stress AHCI concurrent pread.
-    // Kept in-tree so future changes to the submit path can be validated.
-    // stress_pread_launch();
-    (void)stress_pread_launch;
+    stress_pread_launch();
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's
