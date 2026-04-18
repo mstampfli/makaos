@@ -1132,10 +1132,20 @@ static void do_switch(uint8_t preempted) {
     c->current  = next;     // g_current expands to this via the sched.h macro
     c->context_switches++;
 
-    // Release the rq_lock BEFORE context_switch.  Holding it across
-    // the switch would deadlock: the new task might try to take the
-    // same lock before the old task's unlock ever runs.
-    spin_unlock_irqrestore(&c->rq_lock, flags);
+    // Release the rq_lock BEFORE context_switch — holding it across
+    // the switch deadlocks: the new task might try to take the same
+    // lock before the old task's unlock ever runs.  But we keep IRQs
+    // DISABLED across the switch.  Re-enabling here opens a window
+    // where prev's kstack is still in use (RSP still on it) but
+    // c->current already points at next.  An IRQ in that window whose
+    // handler wakes prev elsewhere creates two-CPUs-on-one-kstack
+    // concurrency (prev's ctx.rsp is stale but valid, and a remote CPU
+    // can pick prev off its rq and resume on the same kstack we're
+    // still using).  context_switch's ret restores IF from RFLAGS in
+    // the incoming task's saved frame, so the incoming task wakes with
+    // the correct IF state — we only suppress IRQs across the switch
+    // itself.
+    spin_unlock(&c->rq_lock);
 
     // Every context switch is an RCU quiescent state for this CPU: the
     // outgoing task can no longer be in a reader section, and the
