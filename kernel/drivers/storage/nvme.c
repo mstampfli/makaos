@@ -19,6 +19,7 @@
 #include "wait.h"
 #include "sched.h"
 #include "smp.h"
+#include "preempt.h"
 
 // ── PCI class codes ─────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE    0x01
@@ -411,11 +412,6 @@ static uint8_t io_submit_async(nvme_sqe_t* cmd) {
     spin_unlock_irqrestore(&s_iosq_lock, flags);
 
     WAIT_EVENT(&req->wq, __atomic_load_n(&req->done, __ATOMIC_ACQUIRE));
-    // Full fence: the ISR's RELEASE on req->done pairs with our ACQUIRE
-    // above for its own writes, but the DMA into the caller's buffer is
-    // an *external* write outside the release chain.  MFENCE here drains
-    // any speculative loads of the buffer that this CPU issued before
-    // DMA became globally visible, forcing subsequent loads to re-fetch.
     __asm__ volatile("mfence" ::: "memory");
     uint16_t status = req->status;
     cid_push(cid);
@@ -428,6 +424,19 @@ static uint8_t io_submit_async(nvme_sqe_t* cmd) {
 // most one waiter ever — wake_all is O(1).
 void nvme_irq_handler(void) {
     if (!s_iocq) return;
+    // CRITICAL: the ISR body below calls wait_queue_wake_all → task_wake_func
+    // → sched_wake (which sets reschedule_pending) and wait_queue_wake_all
+    // also calls rcu_read_lock/unlock.  rcu_read_unlock's preempt_enable
+    // hits zero here (IRQ fired outside a preempt-disabled section) and,
+    // seeing reschedule_pending set by our own sched_wake, would call
+    // sched_preempt → do_switch → trailing `sti`.  That `sti` re-enables
+    // IRQs INSIDE this handler.  A fresh NVMe MSI-X then nests on top of
+    // us, races on s_iocq_head, double-consumes the same CQE slot, and
+    // wakes a worker whose DMA never landed — the "prev-iter buffer"
+    // data-mismatch bug.  Bump preempt_depth for the entire handler so
+    // rcu_read_unlock can never drop to zero here, and manually decrement
+    // at exit (NOT preempt_enable, which would re-trigger the same path).
+    preempt_disable();
     while (1) {
         volatile uint16_t* sp_ptr =
             (volatile uint16_t*)&s_iocq[s_iocq_head].status_phase;
@@ -453,6 +462,9 @@ void nvme_irq_handler(void) {
     }
     // Acknowledge consumed CQEs — ring the CQ head doorbell.
     *cq_doorbell(NVME_IOQ_ID) = s_iocq_head;
+    // Manual decrement — calling preempt_enable() would itself re-open
+    // the same bug (checks reschedule_pending → sched_preempt → `sti`).
+    this_cpu()->preempt_depth--;
 }
 
 // Expose asm stub.

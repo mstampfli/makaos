@@ -158,7 +158,7 @@ static void stress_pread_launch(void) {
 
 #define NVME_STRESS_REF_PAGES 256      // 256 × 4 KiB = 1 MiB reference
 #define NVME_STRESS_ITERS     10000
-#define NVME_STRESS_WORKERS   4  // fixed — was blocked by kstack_alloc race
+#define NVME_STRESS_WORKERS   4  // target: 4-way concurrent correctness
 
 static uint8_t* g_nvme_ref  = NULL;
 static uint64_t g_nvme_pages = 0;
