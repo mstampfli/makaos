@@ -659,6 +659,7 @@ void sched_init_idle_for_cpu(uint32_t id) {
     idle->mm_shared    = &s_idle_mm;
     idle->files_shared = &s_idle_files;
     idle->home_cpu     = id;
+    idle->last_ran_cpu = id;
     __builtin_memcpy(idle->comm, "idle", 5);
 
     // Capture a valid FPU state for the first fxrstor into this task.
@@ -791,7 +792,14 @@ static inline uint32_t pick_home_cpu(void) {
 }
 
 // Shortcut to the owning CPU's rq.
+// Where to enqueue / look up this task for wake / wait / sleep list
+// ops.  Prefer last_ran_cpu (cache-warm) over home_cpu (static).  If
+// last_ran_cpu is stale / OOB, fall back to home_cpu.  Relaxed load is
+// fine — even a torn read just means we enqueue on a cold CPU, which
+// work stealing will re-balance on its next idle cycle.
 static inline cpu_t* cpu_of_task(task_t* t) {
+    uint32_t lr = __atomic_load_n(&t->last_ran_cpu, __ATOMIC_RELAXED);
+    if (lr < MAX_CPUS) return &g_cpus[lr];
     return &g_cpus[t->home_cpu];
 }
 
@@ -835,7 +843,8 @@ void sched_add(task_t* proc) {
     // is always 0 — everything early in boot stays on the BSP, which
     // is what we want so init / svcmgr / login spawn without ever
     // waiting on an AP that hasn't come online yet.
-    proc->home_cpu = pick_home_cpu();
+    proc->home_cpu     = pick_home_cpu();
+    proc->last_ran_cpu = proc->home_cpu;    // initial affinity
 
     pid_ht_insert(proc);
     task_idx_insert(proc);
@@ -1257,6 +1266,11 @@ static void do_switch(uint8_t preempted) {
 
     next->state = TASK_RUNNING;
     c->current  = next;     // g_current expands to this via the sched.h macro
+    // Cache-affinity hint: remember where this task last ran so
+    // sched_wake can route future wakes to the same CPU.  Plain
+    // store — only the owning CPU reads this value with a relaxed
+    // load, races are benign (stale ≤ one context switch window).
+    next->last_ran_cpu = c->id;
     c->context_switches++;
 
     // Release the rq_lock BEFORE context_switch — holding it across
