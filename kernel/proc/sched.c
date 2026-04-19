@@ -485,6 +485,103 @@ static task_files_t s_idle_files = { .ft = NULL, .lock = SPINLOCK_INIT, .refs = 
 
 extern void proc_trampoline(void);  // kernel/arch/x86_64/process_ctx_switch.asm
 
+// ── Work-stealing: pull-on-idle from random remote CPUs ─────────────────
+//
+// Called from the idle loop when this CPU has nothing to run.  Picks up
+// to STEAL_ATTEMPTS random victims, skipping any whose nr_running is
+// below STEAL_MIN_TASKS (never take a CPU's only task).  For each
+// chosen victim, tries to steal up to STEAL_BATCH tasks from that
+// CPU's highest-priority non-empty level, preserving MLFQ priority
+// across the migration.
+//
+// Random victim selection is O(1) — scanning all CPUs for "busiest"
+// would itself become the bottleneck on a 64-core system (Go's
+// runtime, Tokio, and musl-sched-lib all converged on random for this
+// reason).  With K=4 retries and half-batch steal, expected steal cost
+// is 1-2 CAS per idle wake-up regardless of system size.
+#define STEAL_ATTEMPTS   4u
+#define STEAL_BATCH      16u   // upper bound on tasks moved per victim
+#define STEAL_MIN_TASKS  2u    // never steal a CPU's sole task
+
+// Simple per-CPU xorshift64 — seeded from TSC+cpu_id on first use.
+// Stored in cpu_t::steal_rng (added below).  No cross-CPU contention.
+static inline uint32_t steal_rng_next(cpu_t* c) {
+    uint64_t x = c->steal_rng;
+    if (UNLIKELY(x == 0)) {
+        extern uint64_t tsc_read_ns(void);
+        x = tsc_read_ns() ^ ((uint64_t)c->id * 0x9E3779B97F4A7C15ULL);
+        if (x == 0) x = 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    c->steal_rng = x;
+    return (uint32_t)x;
+}
+
+uint8_t sched_try_steal(cpu_t* self);   // forward decl for idle loop
+uint8_t sched_try_steal(cpu_t* self) {
+    unsigned n = num_cpus();
+    if (n < 2) return 0;
+
+    uint8_t took_any = 0;
+    for (uint32_t a = 0; a < STEAL_ATTEMPTS; a++) {
+        uint32_t r = steal_rng_next(self) % n;
+        if (&g_cpus[r] == self) continue;   // skip ourselves
+        cpu_t* victim = &g_cpus[r];
+        uint32_t vr = __atomic_load_n(&victim->rq.nr_running,
+                                        __ATOMIC_RELAXED);
+        if (vr < STEAL_MIN_TASKS) continue;
+
+        // Pick the victim's highest-priority non-empty level so we
+        // preserve priority across migration.
+        for (uint8_t lvl = 0; lvl < MLFQ_LEVELS; lvl++) {
+            chaselev_deque_t* vdq = &victim->rq.levels[lvl];
+            if (chaselev_size_approx(vdq) == 0) continue;
+
+            // Steal up to half (capped at STEAL_BATCH) from this level.
+            uint32_t take = chaselev_size_approx(vdq) / 2;
+            if (take == 0) take = 1;
+            if (take > STEAL_BATCH) take = STEAL_BATCH;
+
+            for (uint32_t i = 0; i < take; i++) {
+                void* v = chaselev_steal(vdq);
+                if (v == CHASELEV_ABORT) {        // CAS lost
+                    cpu_relax();
+                    continue;
+                }
+                if (!v) break;                     // empty
+                task_t* t = (task_t*)v;
+                __atomic_fetch_sub(&victim->rq.nr_running, 1,
+                                     __ATOMIC_RELAXED);
+
+                // Push onto our own deque at the same MLFQ level.
+                // We're the owner here — chaselev_push is lock-free
+                // from our side and doesn't contend with thieves on
+                // OUR queue (there shouldn't be any at this moment
+                // since we just woke from idle).
+                if (!chaselev_push(&self->rq.levels[lvl], t)) {
+                    // Our own queue full — give the task back.
+                    // Pushing to victim again isn't easy from this
+                    // side (we're a thief w.r.t them), so enqueue
+                    // locally once space clears.  For now, re-try by
+                    // popping oldest and re-pushing victim — but at
+                    // 512 slots this is pathological.  Panic for now.
+                    extern void kprintf(const char*, ...);
+                    kprintf("[sched] PANIC: steal-side rq overflow\n");
+                    for (;;) __asm__ volatile("cli; hlt");
+                }
+                __atomic_fetch_add(&self->rq.nr_running, 1,
+                                     __ATOMIC_RELAXED);
+                took_any = 1;
+            }
+            if (took_any) break;      // stop at first productive level
+        }
+        if (took_any) return 1;       // one productive victim is enough
+    }
+    return took_any;
+}
+
 // Idle loop — runs on each CPU's private idle task_t + kstack when the
 // scheduler has nothing else to give it.  Spins between sti/hlt and
 // sched_yield so:
@@ -497,9 +594,24 @@ extern void proc_trampoline(void);  // kernel/arch/x86_64/process_ctx_switch.asm
 //     while we're idle
 //
 // preempt_depth stays 0 the entire time; timer IRQs freely preempt us.
+//
+// Work-stealing (phase 3): before halting, try to steal from a few
+// random remote CPUs.  If successful, the stolen task is enqueued
+// locally and sched_yield below picks it up naturally.  If no steal
+// succeeds, we fall through to sti;hlt and wait for an IPI/IRQ.
 static void cpu_idle_loop(void) {
     for (;;) {
         rcu_note_qs();
+
+        // Only attempt to steal if our own rq is empty — otherwise we
+        // have work and sched_yield below will find it.
+        cpu_t* c = this_cpu();
+        if (__atomic_load_n(&c->rq.nr_running, __ATOMIC_RELAXED) == 0) {
+            // Returns true if something was enqueued locally.
+            extern uint8_t sched_try_steal(cpu_t* self);
+            (void)sched_try_steal(c);
+        }
+
         __asm__ volatile("sti\nhlt");
         sched_yield();
     }
