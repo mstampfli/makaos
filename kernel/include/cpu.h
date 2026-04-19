@@ -102,6 +102,10 @@ typedef struct cpu_t {
                                         // context switch should happen as
                                         // soon as preempt_depth hits zero
 
+    // Work-stealing random-victim PRNG (xorshift64).  Per-CPU so no
+    // contention; seeded lazily from TSC+id on first use.
+    uint64_t        steal_rng;
+
     // Per-CPU allocator magazines (Phase 4).
     slab_magazine_t slab;
     pmm_pcp_t       pcp;
