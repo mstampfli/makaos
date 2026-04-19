@@ -182,11 +182,19 @@ typedef struct __attribute__((aligned(16))) task_t {
     // a non-running task can't be preempted.
 
     // Home CPU: which CPU's run queue / sleep list / zombie list this
-    // task belongs to.  Assigned at sched_add time, immutable until
-    // explicit migration (Phase 9 work stealing).  On single CPU this
-    // is always 0.  Readers never synchronize — the value is only
-    // written once during task creation before sched_add.
+    // task was initially placed on.  Assigned at sched_add time and
+    // stays constant — used as a cold-start hint only.  Work stealing
+    // may migrate the task elsewhere; the SOURCE of truth for "where
+    // is this task now" is last_ran_cpu below.
     uint32_t      home_cpu;
+
+    // Where the task most recently ran (updated by context_switch).
+    // sched_wake routes into this CPU's runqueue to preserve cache
+    // affinity across sleep/wake.  Written only by the owning CPU at
+    // context-switch time; read cross-CPU by sched_wake with a plain
+    // atomic_load (races are benign — worst case, we enqueue on a
+    // cold CPU, which work stealing will fix on its next idle).
+    volatile uint32_t last_ran_cpu;
 
     char*         cwd;          // current working directory (absolute path, heap-allocated KPATH_MAX)
     char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
