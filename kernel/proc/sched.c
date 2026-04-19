@@ -1431,7 +1431,55 @@ void sched_wake(task_t* proc) {
     while (*pp && *pp != proc) pp = &(*pp)->next;
     if (*pp) *pp = proc->next;
     proc->next = NULL;
-    enqueue_on(&home->rq, proc);
+
+    // Power-of-two-choices load balancing at wake time: if home is
+    // loaded, pick one random alternate CPU and compare.  If the alt
+    // is clearly less loaded, migrate the wake there.  This keeps
+    // tasks flowing to idle CPUs proactively (sched_wake) rather than
+    // only reactively (steal-on-idle), which matters for workloads
+    // where one CPU is persistently busier (BSP runs init/svcmgr/net/
+    // pcache etc) and its sleepers would otherwise accumulate.
+    //
+    // Only O(1) per wake — two nr_running loads, one random index.
+    // Migration requires switching rq_locks so we keep home's lock
+    // held only across the sleep-list unlink, then either enqueue
+    // locally or drop the lock and re-acquire target's.
+    cpu_t* target = home;
+    unsigned n = num_cpus();
+    if (n >= 2) {
+        uint32_t home_load = __atomic_load_n(&home->rq.nr_running,
+                                               __ATOMIC_RELAXED);
+        // Two migration triggers:
+        //   (a) home is loaded AND the random alt is STRICTLY less
+        //       loaded — classic power-of-2-choices balancing
+        //   (b) the random alt is completely idle (nr_running==0)
+        //       even if home has just this one task — because a
+        //       persistently-busy CPU with load==1 can still be 5x
+        //       slower than an idle CPU on another core (BSP vs AP,
+        //       shared MSI-X target, ISR-heavy CPU, etc).  An idle
+        //       CPU is always a win: the task runs immediately there.
+        uint32_t r = steal_rng_next(this_cpu()) % n;
+        cpu_t* alt = &g_cpus[r];
+        if (alt != home) {
+            uint32_t alt_load = __atomic_load_n(&alt->rq.nr_running,
+                                                 __ATOMIC_RELAXED);
+            if (alt_load == 0 ||
+                (home_load >= 2 && alt_load + 1 < home_load))
+                target = alt;
+        }
+    }
+
+    if (target != home) {
+        // Migrate: drop home's lock, take target's, enqueue there.
+        spin_unlock_irqrestore(&home->rq_lock, flags);
+        __atomic_store_n(&proc->last_ran_cpu, target->id,
+                           __ATOMIC_RELAXED);
+        flags = spin_lock_irqsave(&target->rq_lock);
+        enqueue_on(&target->rq, proc);
+        home = target;  // reuse variable for the rest of the function
+    } else {
+        enqueue_on(&home->rq, proc);
+    }
 
     // Decide whether to ask the target CPU to reschedule immediately.
     //   - If it's running idle, we MUST request a switch: otherwise the
