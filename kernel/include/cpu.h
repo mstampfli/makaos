@@ -46,14 +46,19 @@
 
 struct task_t;
 
-// Per-CPU run queue: MLFQ with SCHED_MLFQ_LEVELS priority levels.
-// Each level is a doubly-linked list of tasks chained via task_t.next.
-// Protected by cpu_t.rq_lock.
+// Per-CPU run queue: MLFQ with SCHED_MLFQ_LEVELS priority levels,
+// each level a Chase-Lev work-stealing deque.  The owner pushes/pops
+// lock-free on its own `bottom`; remote thieves CAS `top` to steal
+// load-balancing work without touching the owner's hot cache line.
+// sleep_head and zombie_head remain linked lists protected by
+// cpu_t.rq_lock — they're cold paths (one op per sleep/wake) and
+// don't justify the deque complexity.
+#include "chaselev.h"
 typedef struct cpu_rq_t {
-    struct task_t* heads[SCHED_MLFQ_LEVELS];
-    struct task_t* tails[SCHED_MLFQ_LEVELS];
+    chaselev_deque_t levels[SCHED_MLFQ_LEVELS];
     struct task_t* sleep_head;   // tasks in TASK_SLEEPING owned by this CPU
     struct task_t* zombie_head;  // zombies owned by this CPU
+    volatile uint32_t nr_running;  // advisory: ready-task count (for steal)
 } cpu_rq_t;
 
 // Per-CPU slab magazine — a freelist of recently-freed objects for each

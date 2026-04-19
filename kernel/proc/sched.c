@@ -597,7 +597,9 @@ static volatile uint32_t s_tick_count  = 0;
 // so the same code works for any CPU.  Callers must hold that CPU's
 // rq_lock.
 
-// Enqueue at the task's current mlfq_level.  Caller holds target's rq_lock.
+// Enqueue at the task's current mlfq_level.  Still called under
+// rq_lock for the sleep_head/zombie_head fields, but the runqueue
+// itself no longer needs it — chaselev_push is lock-free.
 static void enqueue_on(cpu_rq_t* rq, task_t* p) {
     p->state = TASK_READY;
     p->next  = NULL;
@@ -605,23 +607,28 @@ static void enqueue_on(cpu_rq_t* rq, task_t* p) {
         p->mlfq_ticks_left = s_quanta[p->mlfq_level];
 
     uint8_t lvl = p->mlfq_level;
-    if (!rq->tails[lvl]) {
-        rq->heads[lvl] = rq->tails[lvl] = p;
-    } else {
-        rq->tails[lvl]->next = p;
-        rq->tails[lvl] = p;
+    if (UNLIKELY(!chaselev_push(&rq->levels[lvl], p))) {
+        // 512 slots per level per CPU exhausted.  At Linux scale this
+        // means the caller is leaking runnable tasks; panic with
+        // enough context rather than silently drop.
+        extern void kprintf(const char*, ...);
+        kprintf("[sched] PANIC: rq level %u overflow on cpu %u\n",
+                (uint32_t)lvl, (uint32_t)((rq - &g_cpus[0].rq) ? 0 : 0));
+        for (;;) __asm__ volatile("cli; hlt");
     }
+    __atomic_fetch_add(&rq->nr_running, 1, __ATOMIC_RELAXED);
 }
 
-// Dequeue from the highest non-empty level.  Caller holds this CPU's rq_lock.
+// Dequeue from the highest-priority non-empty level.  Owner-only —
+// chaselev_pop is the LIFO side; preserves the "run recent tasks first"
+// semantics of the old linked-list version.
 static task_t* dequeue_local(cpu_rq_t* rq) {
     for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
-        if (!rq->heads[i]) continue;
-        task_t* p = rq->heads[i];
-        rq->heads[i] = p->next;
-        if (!rq->heads[i]) rq->tails[i] = NULL;
-        p->next = NULL;
-        return p;
+        task_t* p = (task_t*)chaselev_pop(&rq->levels[i]);
+        if (p) {
+            __atomic_fetch_sub(&rq->nr_running, 1, __ATOMIC_RELAXED);
+            return p;
+        }
     }
     return NULL;
 }
@@ -1002,20 +1009,28 @@ void sched_tick(void) {
         }
     }
 
-    // Priority boost: move every task in levels 1-3 back to level 0.
+    // Priority boost: move every task in levels 1-N back to level 0.
+    // With Chase-Lev deques we drain each lower level by popping (which
+    // may race with thieves on other CPUs — harmless, the thief gets
+    // the task before we boost it, but then it'll re-enter at its
+    // level on the thief's CPU and be boosted on a later tick there).
     if (s_tick_count % BOOST_INTERVAL == 0) {
         for (uint8_t i = 1; i < MLFQ_LEVELS; i++) {
-            task_t* t = rq->heads[i];
-            while (t) {
-                task_t* nxt = t->next;
-                t->mlfq_level     = 0;
+            for (;;) {
+                task_t* t = (task_t*)chaselev_pop(&rq->levels[i]);
+                if (!t) break;
+                t->mlfq_level      = 0;
                 t->mlfq_ticks_left = s_quanta[0];
-                t->next = NULL;
-                if (!rq->tails[0]) { rq->heads[0] = rq->tails[0] = t; }
-                else               { rq->tails[0]->next = t; rq->tails[0] = t; }
-                t = nxt;
+                // Re-push into level 0.  We decremented nr_running in
+                // the pop, the push below bumps it again — net zero.
+                if (UNLIKELY(!chaselev_push(&rq->levels[0], t))) {
+                    extern void kprintf(const char*, ...);
+                    kprintf("[sched] PANIC: boost overflow\n");
+                    for (;;) __asm__ volatile("cli; hlt");
+                }
+                __atomic_fetch_add(&rq->nr_running, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_sub(&rq->nr_running, 1, __ATOMIC_RELAXED);
             }
-            rq->heads[i] = rq->tails[i] = NULL;
         }
         // Boost the currently running task too (local state, but done
         // here so the boost semantics are visible in one place).
@@ -1415,9 +1430,19 @@ void sched_for_each(void (*cb)(task_t*, void*), void* data) {
             cb(c->current, data);
 
         uint64_t flags = spin_lock_irqsave(&c->rq_lock);
+        // Walk Chase-Lev slots [top, bottom) directly.  rq_lock
+        // excludes the owner, but thieves on remote CPUs may CAS top
+        // concurrently — which at worst hides a task that just got
+        // stolen (still alive on the thief's CPU, just not listed
+        // here this pass).  Acceptable for debug enumeration.
         for (uint8_t i = 0; i < MLFQ_LEVELS; i++) {
-            task_t* t = c->rq.heads[i];
-            while (t) { cb(t, data); t = t->next; }
+            chaselev_deque_t* dq = &c->rq.levels[i];
+            uint64_t top = __atomic_load_n(&dq->top, __ATOMIC_ACQUIRE);
+            uint64_t bot = __atomic_load_n(&dq->bottom, __ATOMIC_ACQUIRE);
+            for (uint64_t j = top; (int64_t)(j - bot) < 0; j++) {
+                task_t* p = (task_t*)dq->slots[j & CHASELEV_MASK];
+                if (p) cb(p, data);
+            }
         }
         task_t* t = c->rq.sleep_head;
         while (t) { cb(t, data); t = t->next; }
