@@ -4,6 +4,7 @@
 #include "wait.h"
 #include "cpu.h"
 #include "smp.h"
+#include "preempt.h"
 
 // ── Per-IRQ waiter queues — lock-free MPSC ──────────────────────────────
 //
@@ -83,8 +84,16 @@ void irq_drain(uint8_t irq) {
 }
 
 void irq_notify(uint8_t irq) {
+    // preempt_disable around wake_all: this is called from ISR context
+    // (keyboard/mouse/hda/ac97/virtio-net/...).  Without this, wake_all's
+    // rcu_read_unlock → preempt_enable → sched_preempt → do_switch → `sti`
+    // re-enables IRQs inside the ISR and lets a fresh interrupt of the
+    // same vector nest, racing on per-driver state.  Direct dec at the
+    // end — preempt_enable() would itself re-trigger that path.
     if (atomic_load_acq(&s_wq[irq].head)) {
+        preempt_disable();
         wait_queue_wake_all(&s_wq[irq]);
+        this_cpu()->preempt_depth--;
     } else {
         if (s_pending[irq] < 255) s_pending[irq]++;
     }

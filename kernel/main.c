@@ -241,6 +241,94 @@ static void stress_nvme_launch(void) {
     }
 }
 
+// ── stress_ahci — raw ahci_read() stress, mirrors the NVMe harness ──────
+//
+// Verifies the AHCI completion path under SMP load: same pattern as
+// stress_nvme, but through the single-port NCQ interface.  The device
+// is the OVMF boot disk (build/disk.img) which is the same one ext2
+// reads from, so the reference is reproducible.
+
+#define AHCI_STRESS_REF_PAGES 256
+#define AHCI_STRESS_ITERS     5000
+#define AHCI_STRESS_WORKERS   4
+
+static uint8_t* g_ahci_ref  = NULL;
+static uint64_t g_ahci_pages = 0;
+static uint8_t* g_ahci_tmp_bufs[16] = {0};
+static volatile uint32_t g_ahci_tmp_ix = 0;
+
+static void stress_ahci_worker(void) {
+    uint32_t my_ix = __atomic_fetch_add(&g_ahci_tmp_ix, 1, __ATOMIC_RELAXED);
+    uint8_t* tmp = g_ahci_tmp_bufs[my_ix];
+    uint64_t seed = 0xBEEFCAFEDEADA5A5ULL ^ ((uint64_t)g_current->pid << 16);
+    uint64_t fails = 0, errs = 0;
+
+    kprintf("[ahci-stress] pid=%u START pages=%lu\n",
+            g_current->pid, g_ahci_pages);
+
+    for (uint64_t i = 0; i < AHCI_STRESS_ITERS; i++) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        uint64_t pg  = (seed >> 16) % g_ahci_pages;
+        uint64_t lba = pg * 8;  // 4K page = 8 × 512B LBAs
+
+        if (!ahci_read(lba, tmp, 8)) {
+            errs++;
+            kprintf("[ahci-stress] pid=%u i=%lu READ FAILED lba=%lx\n",
+                    g_current->pid, i, lba);
+            continue;
+        }
+        uint8_t* ref = g_ahci_ref + pg * 4096;
+        uint64_t first = (uint64_t)-1;
+        for (uint64_t j = 0; j < 4096; j++)
+            if (tmp[j] != ref[j]) { first = j; break; }
+        if (first != (uint64_t)-1) {
+            fails++;
+            kprintf("[ahci-stress] pid=%u i=%lu MISMATCH lba=%lx "
+                    "first_diff=+%lu got=%x want=%x\n",
+                    g_current->pid, i, lba, first,
+                    (uint32_t)tmp[first], (uint32_t)ref[first]);
+        }
+    }
+
+    kprintf("[ahci-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu\n",
+            g_current->pid, (uint32_t)AHCI_STRESS_ITERS, fails, errs);
+
+    g_current->state = TASK_DEAD; sched_yield();
+    for (;;) __asm__ volatile("hlt");
+}
+
+static void stress_ahci_launch(void) {
+    uint64_t ref_bytes = (uint64_t)AHCI_STRESS_REF_PAGES * 4096;
+    uint8_t* ref = (uint8_t*)kmalloc(ref_bytes);
+    if (!ref) { kprintf("[ahci-stress] OOM ref\n"); return; }
+
+    kprintf("[ahci-stress] building reference (%lu pages, %lu bytes)\n",
+            (uint64_t)AHCI_STRESS_REF_PAGES, ref_bytes);
+    for (uint64_t pg = 0; pg < AHCI_STRESS_REF_PAGES; pg++) {
+        if (!ahci_read(pg * 8, ref + pg * 4096, 8)) {
+            kprintf("[ahci-stress] ref read failed at page %lu\n", pg);
+            kfree(ref);
+            return;
+        }
+    }
+    g_ahci_ref = ref;
+    g_ahci_pages = AHCI_STRESS_REF_PAGES;
+
+    for (int i = 0; i < AHCI_STRESS_WORKERS; i++) {
+        phys_addr_t p = pmm_buddy_alloc(0);
+        g_ahci_tmp_bufs[i] = (uint8_t*)(p + HHDM_OFFSET);
+    }
+    g_ahci_tmp_ix = 0;
+
+    kprintf("[ahci-stress] reference built; launching %u workers x %u iters\n",
+            (uint32_t)AHCI_STRESS_WORKERS, (uint32_t)AHCI_STRESS_ITERS);
+
+    for (int i = 0; i < AHCI_STRESS_WORKERS; i++) {
+        task_t* t = task_create_kthread(stress_ahci_worker, pid_alloc());
+        if (t) sched_add(t);
+    }
+}
+
 // ── init_kthread ──────────────────────────────────────────────────────────
 // Runs in process context after the scheduler and timer are live.
 // Calls do_initcalls_subsys() then spawns login and svcmgr.
@@ -285,6 +373,7 @@ static void init_kthread(void) {
 
     // NVMe stress: 4 kthreads × 10000 random 4 KiB reads vs reference.
     stress_nvme_launch();
+    stress_ahci_launch();
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's
