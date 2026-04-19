@@ -20,6 +20,8 @@
 #include "sched.h"
 #include "smp.h"
 #include "preempt.h"
+#include "cpu.h"
+#include "acpi.h"
 
 // ── PCI class codes ─────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE    0x01
@@ -124,53 +126,69 @@ static uint8_t         s_acq_phase = 1;   // phase bit flips each wrap; initial
 // I/O queue pair #1.  One per step 2; step 4 scales to per-CPU.
 //
 // 4 KiB SQ holds 64 entries of 64 B; 4 KiB CQ holds 256 entries of 16 B.
-// We use 64 entries for both — matches admin depth, plenty for a smoke
-// test.
+// We use 64 entries for both — plenty for realistic depth-per-CPU.
 #define NVME_IOQ_DEPTH    64
-#define NVME_IOQ_ID       1u
-
-static nvme_sqe_t*     s_iosq = NULL;
-static nvme_cqe_t*     s_iocq = NULL;
-static phys_addr_t     s_iosq_phys = 0;
-static phys_addr_t     s_iocq_phys = 0;
-static uint32_t        s_iosq_tail = 0;
-static uint32_t        s_iocq_head = 0;
-static uint8_t         s_iocq_phase = 1;
+// QID 0 is admin.  I/O queues start at QID 1 and map 1:1 to CPUs:
+// queue i belongs to CPU (i-1).  Sized by ACPI cpu_count at init.
+#define NVME_IOQ_QID(cpu)  (uint16_t)((cpu) + 1)
 
 static uint32_t        s_ns_nsid = 0;      // first namespace id
 static uint32_t        s_ns_lba_size = 512;
+static uint32_t        s_nr_ioq = 0;       // number of per-CPU I/O queues
 
 // PCI location — saved so MSI-X setup can write PCI config.
 static pci_device_t    s_pci;
 static volatile uint32_t* s_msix_table = NULL;  // 16 B per entry × N entries
 
-// Per-request state.  Submitter stack-allocates one.  The persistent
-// sleep_we in task_t (used by WAIT_EVENT) protects us from stack-UAF
-// if a late wake arrives after our frame pops — req->wq is only held
-// for the duration of WAIT_EVENT, which blocks until req->done=1.
+// Per-request state — the SUBMITTER's wait object.  wait_queue_init is
+// called for every new submit, so across CID reuse there is no stale
+// state.  A late wake from a drained entry is harmless (sleep_we is
+// task-persistent).
 typedef struct nvme_request {
     wait_queue_t      wq;
     volatile uint8_t  done;
     volatile uint16_t status;
 } nvme_request_t;
 
-// Persistent per-CID request slots.  NOT stack-allocated — a late
-// wake from the ISR (after the submitter's frame has popped via
-// wake_pending-driven early return) would otherwise clobber freed
-// stack memory.  CID-indexed so the ISR finds the slot directly from
-// the CQE's CID field.
-static nvme_request_t    s_req[NVME_IOQ_DEPTH] __attribute__((aligned(64)));
+// ── Per-CPU I/O queue pair ──────────────────────────────────────────────
+//
+// Every online CPU gets its own SQ+CQ, its own CID bitmap, and its own
+// MSI-X vector that fires ONLY on that CPU.  Submissions and completions
+// run entirely on the same CPU: no cross-CPU state, no lock.  The
+// `sq_lock` below is still taken because a task CAN be preempted inside
+// io_submit_async by its own timer tick — a second task on the same
+// queue's CPU would then race on sq_tail if we didn't serialise.  IRQs
+// are disabled during the critical section (spin_lock_irqsave), so the
+// ISR on the owning CPU can't nest here either.
+//
+// Aligned to cache line so two CPUs' queues don't share one line.
+typedef struct nvme_ioq {
+    uint16_t            qid;           // 1..s_nr_ioq
+    uint16_t            cpu;           // owning cpu_id (0..MAX_CPUS-1)
+    uint8_t             msix_vec;      // IDT vector (VEC_NVME_IO_BASE + cpu)
 
-// CID allocator: 64-bit free bitmap, one bit per CID.  Pop = find lowest
-// set bit + CAS it off.  Push = atomic_fetch_or.  Lock-free; immune to
-// ABA because we never write the backing store ahead of the commit.
-static volatile uint64_t s_cid_free_bitmap;
+    // Submission queue
+    nvme_sqe_t*         sq;            // HHDM ptr
+    phys_addr_t         sq_phys;
+    uint32_t            sq_tail;
+    spinlock_t          sq_lock;
 
-// Tail-advance lock.  Multiple submitters can race to write the SQE
-// and advance the tail; serialize that little slice so the SQE at
-// sq_tail is ours and the doorbell write matches.  Held for a handful
-// of stores — no contention cost under normal load.
-static spinlock_t               s_iosq_lock;
+    // Completion queue
+    nvme_cqe_t*         cq;            // HHDM ptr
+    phys_addr_t         cq_phys;
+    uint32_t            cq_head;
+    uint8_t             cq_phase;
+
+    // Per-CID request slots (persistent — ISR writes into req[cqe.cid])
+    nvme_request_t      req[NVME_IOQ_DEPTH];
+
+    // Lock-free CID bitmap, per-queue.  Bit N set = CID N is free.
+    volatile uint64_t   cid_free_bitmap;
+
+    uint8_t             _pad[16];      // cache-line isolation
+} __attribute__((aligned(64))) nvme_ioq_t;
+
+static nvme_ioq_t s_ioq[MAX_CPUS];
 
 // ── Register helpers ────────────────────────────────────────────────────
 static inline uint32_t reg_rd32(uint32_t off) {
@@ -360,34 +378,46 @@ static uint8_t create_iosq(uint16_t qid, uint16_t qsize, phys_addr_t sq_phys,
     return admin_submit_sync(&cmd, &cqe);
 }
 
-// ── Free-CID allocator — lock-free bitmap ───────────────────────────────
-// 64-bit bitmap, bit N=1 means CID N is free.  Pop finds the lowest set
-// bit and CAS-clears it.  Push atomically OR-sets the bit.  No backing
-// store updated ahead of the commit, so no race window.
-static uint16_t cid_pop(void) {
+// ── Free-CID allocator — per-queue lock-free bitmap ─────────────────────
+// 64-bit bitmap per queue.  Bit N=1 means CID N is free.  Pop finds the
+// lowest set bit and CAS-clears it.  Push atomically OR-sets.  Per-queue
+// so two CPUs' allocators don't touch the same cache line.
+static uint16_t cid_pop(nvme_ioq_t* q) {
     while (1) {
-        uint64_t old = __atomic_load_n(&s_cid_free_bitmap, __ATOMIC_ACQUIRE);
+        uint64_t old = __atomic_load_n(&q->cid_free_bitmap, __ATOMIC_ACQUIRE);
         if (!old) {
-            // Pool exhausted.  Shouldn't happen at step-3 scale; spin
-            // briefly and retry.  (Later: wait on a slot-available wq.)
+            // Pool exhausted — only possible with >64 outstanding commands
+            // on this one CPU, which means the caller is submitting faster
+            // than the device completes.  Spin briefly and retry.
             for (volatile int i = 0; i < 100; i++) { }
             continue;
         }
         int bit = __builtin_ctzll(old);
         uint64_t new_val = old & ~(1ULL << bit);
-        if (__atomic_compare_exchange_n(&s_cid_free_bitmap, &old, new_val, 0,
+        if (__atomic_compare_exchange_n(&q->cid_free_bitmap, &old, new_val, 0,
                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return (uint16_t)bit;
     }
 }
-static void cid_push(uint16_t cid) {
-    __atomic_fetch_or(&s_cid_free_bitmap, 1ULL << cid, __ATOMIC_RELEASE);
+static void cid_push(nvme_ioq_t* q, uint16_t cid) {
+    __atomic_fetch_or(&q->cid_free_bitmap, 1ULL << cid, __ATOMIC_RELEASE);
 }
 
-// ── Async I/O submit — wakeup via MSI-X ISR ─────────────────────────────
+// ── Async I/O submit — per-CPU queue, wakeup via that CPU's MSI-X ────
 static uint8_t io_submit_async(nvme_sqe_t* cmd) {
-    uint16_t cid = cid_pop();
-    nvme_request_t* req = &s_req[cid];
+    // Pin to the current CPU for the duration of queue selection +
+    // submission.  Our scheduler has no work stealing so tasks already
+    // stay on their home_cpu, but preempt_disable defends against the
+    // (legal) case of a voluntary yield migrating us between picking
+    // q and writing the doorbell, which would land the SQE in the
+    // wrong queue's ring.
+    preempt_disable();
+    uint32_t cpu = this_cpu()->id;
+    if (cpu >= s_nr_ioq) cpu = 0;   // fallback — shouldn't happen post-init
+    nvme_ioq_t* q = &s_ioq[cpu];
+
+    uint16_t cid = cid_pop(q);
+    nvme_request_t* req = &q->req[cid];
     wait_queue_init(&req->wq);
     __atomic_store_n(&req->done, 0u, __ATOMIC_RELEASE);
     req->status = 0;
@@ -395,75 +425,74 @@ static uint8_t io_submit_async(nvme_sqe_t* cmd) {
     cmd->opc_fuse_psdt_cid =
         (cmd->opc_fuse_psdt_cid & 0xFFFFu) | ((uint32_t)cid << 16);
 
-    // Serialize the SQE store + tail advance + doorbell write.
-    uint64_t flags = spin_lock_irqsave(&s_iosq_lock);
-    uint32_t tail = s_iosq_tail;
-    s_iosq[tail] = *cmd;
+    // sq_lock defends against same-CPU preemption between two submitters
+    // on the same queue.  It's taken with IRQs disabled so the owning
+    // CPU's ISR can't deadlock on it while waiting for us to release.
+    uint64_t flags = spin_lock_irqsave(&q->sq_lock);
+    uint32_t tail = q->sq_tail;
+    q->sq[tail] = *cmd;
     uint32_t new_tail = (tail + 1) % NVME_IOQ_DEPTH;
-    s_iosq_tail = new_tail;
+    q->sq_tail = new_tail;
     // SFENCE drains the store buffer so the device's DMA-read of the
     // SQE observes the full 64 bytes before it sees the new tail via
-    // the doorbell.  The plain compiler barrier was insufficient under
-    // heavy SMP contention — QEMU occasionally pulled a stale SQE field
-    // and returned success with an un-DMA'd buffer (observed as single-
-    // byte mismatches under 4-worker stress).
+    // the doorbell MMIO write.
     __asm__ volatile("sfence" ::: "memory");
-    *sq_doorbell(NVME_IOQ_ID) = new_tail;  // MMIO: serializing write
-    spin_unlock_irqrestore(&s_iosq_lock, flags);
+    *sq_doorbell(q->qid) = new_tail;
+    spin_unlock_irqrestore(&q->sq_lock, flags);
+
+    // Re-enable preemption before WAIT_EVENT — sched_sleep requires
+    // preempt_depth==0 (asserts otherwise).  preempt_enable() is safe
+    // here: we're in task context, not an ISR, so a trailing
+    // sched_preempt → do_switch → sti is just a normal voluntary yield.
+    preempt_enable();
 
     WAIT_EVENT(&req->wq, __atomic_load_n(&req->done, __ATOMIC_ACQUIRE));
     __asm__ volatile("mfence" ::: "memory");
     uint16_t status = req->status;
-    cid_push(cid);
+    cid_push(q, cid);
     return (status >> 1) == 0;
 }
 
 // ── I/O completion IRQ handler ──────────────────────────────────────────
-// Drains the CQ: for each new entry, look up the request via CID and
-// wake it with the reported status.  Per-request wait queue means at
-// most one waiter ever — wake_all is O(1).
+// Drains THIS CPU's completion queue.  MSI-X steers vector
+// VEC_NVME_IO_BASE + cpu_id only to cpu_id, so this handler runs on
+// the CPU that owns q->cpu == this_cpu()->id — no cross-CPU state is
+// touched and no serialisation is needed for cq_head / cq_phase.
+//
+// preempt_disable is still required because the body calls
+// wait_queue_wake_all → rcu_read_unlock → preempt_enable, which at
+// depth==0 with reschedule_pending set would do_switch → trailing `sti`,
+// re-enabling IRQs inside this handler and letting the next MSI-X
+// nest on top.  Staying at depth>=1 short-circuits that path; any
+// pending reschedule is picked up after iretq.
 void nvme_irq_handler(void) {
-    if (!s_iocq) return;
-    // CRITICAL: the ISR body below calls wait_queue_wake_all → task_wake_func
-    // → sched_wake (which sets reschedule_pending) and wait_queue_wake_all
-    // also calls rcu_read_lock/unlock.  rcu_read_unlock's preempt_enable
-    // hits zero here (IRQ fired outside a preempt-disabled section) and,
-    // seeing reschedule_pending set by our own sched_wake, would call
-    // sched_preempt → do_switch → trailing `sti`.  That `sti` re-enables
-    // IRQs INSIDE this handler.  A fresh NVMe MSI-X then nests on top of
-    // us, races on s_iocq_head, double-consumes the same CQE slot, and
-    // wakes a worker whose DMA never landed — the "prev-iter buffer"
-    // data-mismatch bug.  Bump preempt_depth for the entire handler so
-    // rcu_read_unlock can never drop to zero here, and manually decrement
-    // at exit (NOT preempt_enable, which would re-trigger the same path).
+    uint32_t cpu = this_cpu()->id;
+    if (cpu >= s_nr_ioq) return;        // IRQ before per-CPU queues ready
+    nvme_ioq_t* q = &s_ioq[cpu];
+    if (!q->cq) return;
+
     preempt_disable();
     while (1) {
         volatile uint16_t* sp_ptr =
-            (volatile uint16_t*)&s_iocq[s_iocq_head].status_phase;
+            (volatile uint16_t*)&q->cq[q->cq_head].status_phase;
         uint16_t sp = *sp_ptr;
-        if ((sp & 1) != s_iocq_phase) break;
-        nvme_cqe_t cqe = s_iocq[s_iocq_head];
-        s_iocq_head = (s_iocq_head + 1) % NVME_IOQ_DEPTH;
-        if (s_iocq_head == 0) s_iocq_phase ^= 1;
+        if ((sp & 1) != q->cq_phase) break;
+        nvme_cqe_t cqe = q->cq[q->cq_head];
+        q->cq_head = (q->cq_head + 1) % NVME_IOQ_DEPTH;
+        if (q->cq_head == 0) q->cq_phase ^= 1;
 
-        // Persistent per-CID slot — no lookup, no xchg, no UAF risk.
-        nvme_request_t* req = &s_req[cqe.cid];
+        nvme_request_t* req = &q->req[cqe.cid];
         req->status = cqe.status_phase;
-        // Full fence so the device's preceding DMA to the command buffer
-        // is globally ordered before the waker observes done=1.  MSI-X
-        // delivery already orders the device's DMA ahead of the interrupt
-        // itself on x86, but a waiter CPU that observed an early done=1
-        // from a stale cache line before MSI-X propagated would read
-        // stale buffer bytes — seen as a single-byte mismatch at i/o
-        // load under 4-worker stress.
+        // Full fence so the device's preceding DMA to the caller buffer
+        // is globally ordered before the waker observes done=1.
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         __atomic_store_n(&req->done, 1u, __ATOMIC_RELEASE);
         wait_queue_wake_all(&req->wq);
     }
-    // Acknowledge consumed CQEs — ring the CQ head doorbell.
-    *cq_doorbell(NVME_IOQ_ID) = s_iocq_head;
-    // Manual decrement — calling preempt_enable() would itself re-open
-    // the same bug (checks reschedule_pending → sched_preempt → `sti`).
+    *cq_doorbell(q->qid) = q->cq_head;
+    // Manual decrement — calling preempt_enable() here would itself
+    // re-open the sched_preempt → do_switch → `sti` path that would
+    // let the next MSI-X nest inside this handler.
     this_cpu()->preempt_depth--;
 }
 
@@ -522,12 +551,14 @@ uint8_t nvme_write(uint64_t lba, const void* buf, uint32_t nlb) {
     return nvme_rw(lba, (void*)buf, nlb, 1);
 }
 
-// ── MSI-X setup — program vector 0 to deliver VEC_NVME_IO to BSP ────────
-// Follows the same pattern as ahci.c: find the MSI-X capability, map
-// the MSI-X table BAR, program entry 0 with our LAPIC MSI address/data,
-// then unmask MSI-X in PCI config.  Fixed-delivery to BSP works in both
-// xAPIC and x2APIC modes.  Per-CPU steering lands in step 4.
-static uint8_t nvme_msix_enable(void) {
+// ── MSI-X setup — one entry per CPU, each steered to its LAPIC ──────────
+// Locate the MSI-X capability, map as many table entries as we need,
+// program each entry `cpu` with (MSI addr = LAPIC-of-cpu, data = vector
+// VEC_NVME_IO_BASE + cpu), then enable MSI-X.  Every per-CPU I/O queue
+// uses its own IV (== cpu), so completions fire on that CPU only.
+// Returns 0 on failure; on success, `*out_tbl_size` gets the usable
+// entry count (for the caller to cap s_nr_ioq).
+static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
     uint8_t cap = (uint8_t)(pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn,
                                               0x34u) & 0xFCu);
     uint8_t msix_cap = 0;
@@ -540,6 +571,14 @@ static uint8_t nvme_msix_enable(void) {
         kprintf("[nvme] no MSI-X capability\n");
         return 0;
     }
+    uint32_t mc0 = pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn, msix_cap);
+    uint32_t tbl_size = ((mc0 >> 16) & 0x7FFu) + 1u;   // bits 26:16 (0-based)
+    if (tbl_size < nr_wanted) {
+        kprintf("[nvme] MSI-X table has %u entries, wanted %u — capping\n",
+                tbl_size, nr_wanted);
+        nr_wanted = tbl_size;
+    }
+
     uint32_t tbl_dw = pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn,
                                        msix_cap + 4u);
     uint32_t bir     = tbl_dw & 0x7u;
@@ -548,23 +587,42 @@ static uint8_t nvme_msix_enable(void) {
                                       (uint8_t)bir);
     if (!bar_phys) { kprintf("[nvme] MSI-X BAR%u is zero\n", bir); return 0; }
 
-    // Map 16 B × 1 entry (we only use vector 0 at step 3).
+    // Map enough space for all entries we intend to program.
+    uint32_t map_bytes = 16u * tbl_size;
+    // Round up to page so vmm_map_mmio is happy.
+    map_bytes = (map_bytes + 0xFFFu) & ~0xFFFu;
     s_msix_table = (volatile uint32_t*)
-                   vmm_map_mmio(bar_phys + tbl_off, 16u);
+                   vmm_map_mmio(bar_phys + tbl_off, map_bytes);
 
-    uint32_t msi_addr = (uint32_t)lapic_msi_addr();
-    uint32_t msi_data = lapic_msi_data(VEC_NVME_IO);
-    s_msix_table[0] = msi_addr;      // addr_lo
-    s_msix_table[1] = 0;              // addr_hi
-    s_msix_table[2] = msi_data;       // data
-    s_msix_table[3] = 0;              // vector_ctrl: unmask
+    // Program one entry per CPU we actually want to service.
+    for (uint32_t cpu = 0; cpu < nr_wanted; cpu++) {
+        uint8_t vec = (uint8_t)(VEC_NVME_IO_BASE + cpu);
+        // MSI address format for physical-mode fixed delivery:
+        //   0xFEE00000 | (dest_apic_id << 12)
+        // lapic_msi_addr() returns it for the *current* CPU; we need
+        // it per-destination, so build it inline.
+        uint32_t apic_id = g_acpi.ok
+                            ? (g_acpi.cpus[cpu].apic_id & 0xFFu)
+                            : (uint32_t)cpu;
+        uint32_t msi_addr = 0xFEE00000u | (apic_id << 12);
+        s_msix_table[cpu * 4 + 0] = msi_addr;    // addr_lo
+        s_msix_table[cpu * 4 + 1] = 0;            // addr_hi
+        s_msix_table[cpu * 4 + 2] = (uint32_t)vec; // data = vector
+        s_msix_table[cpu * 4 + 3] = 0;            // vector_ctrl: unmask
 
-    // Enable MSI-X in message control (bit 31), clear Function Mask (bit 30).
+        idt_irq_register(vec, (uint64_t)nvme_irq_entry);
+    }
+    // Mask any remaining table entries (device may have > nr_wanted).
+    for (uint32_t i = nr_wanted; i < tbl_size; i++) {
+        s_msix_table[i * 4 + 3] = 1u;   // masked
+    }
+
+    // Enable MSI-X (bit 31), clear Function Mask (bit 30).
     uint32_t mc = pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn, msix_cap);
     mc = (mc | (1u << 31)) & ~(1u << 30);
     pci_cfg_write32(s_pci.bus, s_pci.dev, s_pci.fn, msix_cap, mc);
 
-    idt_irq_register(VEC_NVME_IO, (uint64_t)nvme_irq_entry);
+    if (out_tbl_size) *out_tbl_size = tbl_size;
     return 1;
 }
 
@@ -677,43 +735,65 @@ uint8_t nvme_init(void) {
     kprintf("[nvme] NS%u: nsze=%lu lba_size=%u bytes\n",
             first_nsid, nsze, s_ns_lba_size);
 
-    // 9. Create one I/O queue pair (step-2 scope — single queue, polling).
-    s_iosq_phys = pmm_buddy_alloc(0);
-    s_iocq_phys = pmm_buddy_alloc(0);
-    if (s_iosq_phys == PMM_INVALID_ADDR || s_iocq_phys == PMM_INVALID_ADDR) {
-        kprintf("[nvme] OOM allocating I/O queue pages\n");
-        return 0;
+    // 9. Create one I/O queue pair per CPU.  ACPI gives us the CPU count
+    //    even before APs are brought up (g_num_cpus still == 1 at this
+    //    point in the init chain).  Each queue i owns CPU i, its MSI-X
+    //    vector is VEC_NVME_IO_BASE+i, and its MSI destination is that
+    //    CPU's LAPIC ID — so completions fire only on the owning CPU.
+    uint32_t nr_cpus = (g_acpi.ok && g_acpi.cpu_count)
+                        ? g_acpi.cpu_count : 1u;
+    if (nr_cpus > MAX_CPUS) nr_cpus = MAX_CPUS;
+
+    // 9a. Program MSI-X for all N vectors BEFORE any Create-CQ admin
+    //     command (which arms interrupts with the given IV).  The helper
+    //     reads back the device's MSI-X table size and may cap nr_cpus.
+    uint32_t msix_tbl_size = 0;
+    if (!nvme_msix_enable(nr_cpus, &msix_tbl_size)) return 0;
+    uint32_t nr_queues = nr_cpus < msix_tbl_size ? nr_cpus : msix_tbl_size;
+
+    // 9b. Build per-CPU queue state and issue Create-IOCQ / Create-IOSQ
+    //     admin commands for each.
+    for (uint32_t cpu = 0; cpu < nr_queues; cpu++) {
+        nvme_ioq_t* q = &s_ioq[cpu];
+        phys_addr_t sq_phys = pmm_buddy_alloc(0);
+        phys_addr_t cq_phys = pmm_buddy_alloc(0);
+        if (sq_phys == PMM_INVALID_ADDR || cq_phys == PMM_INVALID_ADDR) {
+            kprintf("[nvme] OOM allocating I/O queue %u\n", cpu);
+            return 0;
+        }
+        __builtin_memset((void*)(sq_phys + HHDM_OFFSET), 0, 4096);
+        __builtin_memset((void*)(cq_phys + HHDM_OFFSET), 0, 4096);
+
+        q->qid       = NVME_IOQ_QID(cpu);
+        q->cpu       = (uint16_t)cpu;
+        q->msix_vec  = (uint8_t)(VEC_NVME_IO_BASE + cpu);
+        q->sq        = (nvme_sqe_t*)(sq_phys + HHDM_OFFSET);
+        q->sq_phys   = sq_phys;
+        q->sq_tail   = 0;
+        q->cq        = (nvme_cqe_t*)(cq_phys + HHDM_OFFSET);
+        q->cq_phys   = cq_phys;
+        q->cq_head   = 0;
+        q->cq_phase  = 1;
+        q->cid_free_bitmap = (NVME_IOQ_DEPTH == 64)
+                               ? (uint64_t)-1
+                               : ((1ULL << NVME_IOQ_DEPTH) - 1ULL);
+        spin_lock_init(&q->sq_lock);
+
+        // CQ first (with IV=cpu), then SQ.
+        if (!create_iocq(q->qid, NVME_IOQ_DEPTH, cq_phys, (uint16_t)cpu)) {
+            kprintf("[nvme] Create I/O CQ #%u failed\n", q->qid);
+            return 0;
+        }
+        if (!create_iosq(q->qid, NVME_IOQ_DEPTH, sq_phys, q->qid)) {
+            kprintf("[nvme] Create I/O SQ #%u failed\n", q->qid);
+            return 0;
+        }
     }
-    s_iosq = (nvme_sqe_t*)(s_iosq_phys + HHDM_OFFSET);
-    s_iocq = (nvme_cqe_t*)(s_iocq_phys + HHDM_OFFSET);
-    __builtin_memset(s_iosq, 0, 4096);
-    __builtin_memset(s_iocq, 0, 4096);
+    s_nr_ioq = nr_queues;
+    kprintf("[nvme] %u I/O queue pairs created (one per CPU, depth=%u)\n",
+            s_nr_ioq, (uint32_t)NVME_IOQ_DEPTH);
 
-    // 9a. MSI-X must be programmed BEFORE Create I/O CQ, because CQ
-    //     creation arms interrupts with the given IV.
-    if (!nvme_msix_enable()) return 0;
-
-    // 9b. Initialize per-request plumbing.
-    spin_lock_init(&s_iosq_lock);
-    // Mark CIDs 0..NVME_IOQ_DEPTH-1 as free (bits 0..depth-1 set).
-    s_cid_free_bitmap = (NVME_IOQ_DEPTH == 64)
-                         ? (uint64_t)-1
-                         : ((1ULL << NVME_IOQ_DEPTH) - 1ULL);
-
-    // 9c. Create CQ (IEN=1, IV=0), then SQ.
-    if (!create_iocq(NVME_IOQ_ID, NVME_IOQ_DEPTH, s_iocq_phys, 0)) {
-        kprintf("[nvme] Create I/O CQ failed\n");
-        return 0;
-    }
-    if (!create_iosq(NVME_IOQ_ID, NVME_IOQ_DEPTH, s_iosq_phys, NVME_IOQ_ID)) {
-        kprintf("[nvme] Create I/O SQ failed\n");
-        return 0;
-    }
-    kprintf("[nvme] I/O queue pair #%u created (depth=%u, IEN=1 IV=0)\n",
-            (uint32_t)NVME_IOQ_ID, (uint32_t)NVME_IOQ_DEPTH);
-
-    // 10. Smoke test: read LBA 0 into a fresh 4 KiB page and dump the
-    //     first 32 bytes.  This proves the full submit→complete path.
+    // 10. Smoke test from the BSP (only CPU online at this point).
     phys_addr_t t_phys = pmm_buddy_alloc(0);
     if (t_phys != PMM_INVALID_ADDR) {
         uint8_t* t = (uint8_t*)(t_phys + HHDM_OFFSET);
@@ -728,6 +808,6 @@ uint8_t nvme_init(void) {
         }
     }
 
-    kprintf("[nvme] step 2 complete — I/O queue live\n");
+    kprintf("[nvme] init complete — per-CPU I/O queues live\n");
     return 1;
 }

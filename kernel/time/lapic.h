@@ -35,7 +35,14 @@
 #define VEC_AHCI_MSI         0x32   // AHCI MSI
 #define VEC_HDA_MSI          0x33   // HDA MSI
 #define VEC_VIRTIO_NET       0x34   // virtio-net MSI (RX+TX shared)
-#define VEC_NVME_IO          0x35   // NVMe I/O completion (single-queue, step 3)
+// NVMe I/O completion — one vector per CPU (per-CPU I/O queue pair).
+// VEC_NVME_IO_BASE + cpu_id is programmed into MSI-X entry `cpu_id`
+// with the MSI destination set to that CPU's LAPIC ID.  A completion
+// only fires on the submitting CPU, so the ISR touches only per-CPU
+// state and needs no cross-CPU serialisation.  Range reserved
+// 0x50..0x8F (up to MAX_CPUS=64 vectors).  Picked away from the IPI
+// vectors (0x40..0x42) and existing device vectors (0x30..0x34).
+#define VEC_NVME_IO_BASE     0x50
 
 // IPI vectors — reserved for SMP work (Phase 9-5 and onwards).
 #define VEC_IPI_RESCHEDULE   0x40   // wake an idle CPU so it picks up a task
