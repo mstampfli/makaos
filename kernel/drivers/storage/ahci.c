@@ -9,6 +9,8 @@
 #include "process.h"
 #include "wait.h"
 #include "smp.h"
+#include "preempt.h"
+#include "cpu.h"
 
 // ── PCI class codes ────────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
@@ -287,6 +289,16 @@ void ahci_irq_handler(void) {
     s_port->is = port_is;   // W1C
     s_hba->is  = hba_is;    // W1C
 
+    // Bump preempt_depth for the whole body.  The wait_queue_wake_all
+    // calls below run rcu_read_lock/unlock; at depth 0 with
+    // reschedule_pending set, preempt_enable would call sched_preempt →
+    // do_switch → trailing `sti`, re-enabling IRQs inside the ISR and
+    // letting a fresh AHCI MSI nest on top of us.  Staying at depth>=1
+    // short-circuits that; any pending reschedule is picked up after
+    // iretq.  Manual dec at exit (not preempt_enable, which would re-
+    // open the same path).
+    preempt_disable();
+
     if (port_is & PORT_IS_TFES) {
         // Task file error: fail all active slots.  The port is now dirty;
         // leaving it is safe for a restart (next submit re-issues).
@@ -301,6 +313,7 @@ void ahci_irq_handler(void) {
         }
         __atomic_fetch_or(&s_free_mask, active, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
+        this_cpu()->preempt_depth--;
         return;
     }
 
@@ -350,6 +363,7 @@ void ahci_irq_handler(void) {
         __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
     }
+    this_cpu()->preempt_depth--;
 }
 
 // ── Slot allocation ───────────────────────────────────────────────────────
@@ -515,6 +529,14 @@ static void issue_cmd(uint32_t slot, uint64_t lba, uint32_t nsectors,
 // slot, overwrites the PRDT, and DMA writes data to the wrong buffer.
 static void ahci_rescan_completions(void) {
     if (!s_port) return;
+    // Same preempt-disable rationale as ahci_irq_handler: this runs from
+    // sched_tick (timer IRQ) AND from slot_wait (process context).  Either
+    // way, wait_queue_wake_all → rcu_read_unlock → preempt_enable could
+    // otherwise call sched_preempt → do_switch → `sti` inside an ISR and
+    // let another IRQ nest.  Works for the process-context caller too:
+    // bump and dec is cheap, and the caller's own preempt_enable (if
+    // any) still reaches zero eventually.
+    preempt_disable();
     for (;;) {
         // irqsave: callable from IRQ context (sched_tick path) AND
         // process context (slot_wait hook).  The lock is also taken by
@@ -522,9 +544,17 @@ static void ahci_rescan_completions(void) {
         // that holds it would self-deadlock without disabling IRQs.
         uint64_t flags = spin_lock_irqsave(&s_ci_lock);
         uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
-        if (!active) { spin_unlock_irqrestore(&s_ci_lock, flags); return; }
+        if (!active) {
+            spin_unlock_irqrestore(&s_ci_lock, flags);
+            this_cpu()->preempt_depth--;
+            return;
+        }
         uint32_t done = s_ncq ? (active & ~s_port->sact) : (active & ~s_port->ci);
-        if (!done)   { spin_unlock_irqrestore(&s_ci_lock, flags); return; }
+        if (!done) {
+            spin_unlock_irqrestore(&s_ci_lock, flags);
+            this_cpu()->preempt_depth--;
+            return;
+        }
         __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
         spin_unlock_irqrestore(&s_ci_lock, flags);
 

@@ -112,6 +112,20 @@ void wait_queue_wake_all(wait_queue_t* wq) {
         // silently do nothing — fine, we've already committed to
         // calling func for this entry.
         if (!atomic_load_acq(&chain->dead)) {
+            // Sanity check: corrupt func pointers mean the wake_entry
+            // memory has been clobbered.  Catch the bug HERE — with
+            // full context — rather than the cryptic downstream #UD.
+            extern int task_wake_func(wake_entry_t* we);
+            extern int epoll_wake_func(wake_entry_t* we);
+            if (chain->func != task_wake_func &&
+                chain->func != epoll_wake_func) {
+                extern void kprintf(const char*, ...);
+                kprintf("\n=== WAKE UAF === wq=%p chain=%p func=%p "
+                        "dead=%x next=%p\n",
+                        wq, chain, chain->func,
+                        chain->dead, chain->next);
+                for (;;) __asm__ volatile("cli; hlt");
+            }
             int keep = chain->func(chain);
             if (keep == WQ_KEEP) {
                 // Re-push onto the queue for the next round.
