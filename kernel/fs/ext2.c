@@ -199,8 +199,24 @@ static void bcache_fill_way(uint32_t set, uint32_t way, uint32_t blk,
 // Top-level fill: pick an unpinned LRU way in `blk`'s set and publish
 // there.  If no way is unpinned (4 readers on 4 different blocks, rare)
 // the update is dropped — no correctness impact.
+//
+// Coherence rule: at most ONE way per set may hold a given blk.  Before
+// picking a victim, invalidate any existing way that holds this blk —
+// otherwise a fresh disk-write update can land in a second way while the
+// old way keeps serving stale reads.  Invalidating even a pinned way is
+// safe: the reader has already captured its data pointer and will finish
+// its read against the (still-addressable) bytes; future lookups see
+// tag=INVALID, miss, and re-fill from disk (which holds the fresh data).
 static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
     uint32_t set = bcache_set_of(blk);
+
+    // Evict any way currently tagged with `blk` so the new data isn't
+    // shadowed by a stale copy in another way.
+    for (uint32_t w = 0; w < BCACHE_WAYS; w++) {
+        bcache_way_t* m = &s_bcache_meta[set][w];
+        if (__atomic_load_n(&m->tag, __ATOMIC_ACQUIRE) == blk)
+            __atomic_store_n(&m->tag, BCACHE_INVALID, __ATOMIC_RELEASE);
+    }
 
     // Prefer an empty/invalid way first — no eviction cost.
     uint32_t victim = BCACHE_WAYS;

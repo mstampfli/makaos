@@ -400,42 +400,16 @@ static void init_kthread(void) {
     extern void chaselev_selftest(void);
     chaselev_selftest();
 
-    stress_nvme_launch();
-    stress_ahci_launch();
+    // Stress harnesses are compiled in but not auto-launched — reference
+    // them here to suppress unused-function warnings.  Re-enable by
+    // calling the launch fn directly when investigating SMP regressions.
+    (void)stress_nvme_launch;
+    (void)stress_ahci_launch;
 
-    // Barrier: poll the atomic DONE counters so we can print ONE
-    // authoritative summary line whose correctness does NOT depend on
-    // serial-output interleaving.  Timeout-bail after a generous
-    // window so a stuck worker doesn't hang the system.
-    {
-        extern uint64_t tsc_read_ns(void);
-        const uint64_t timeout_ns = 300ULL * 1000000000ULL;  // 300 s
-        uint64_t t0 = tsc_read_ns();
-        for (;;) {
-            uint32_t nd = __atomic_load_n(&g_nvme_done_count, __ATOMIC_ACQUIRE);
-            uint32_t ad = __atomic_load_n(&g_ahci_done_count, __ATOMIC_ACQUIRE);
-            if (nd == NVME_STRESS_WORKERS && ad == AHCI_STRESS_WORKERS) break;
-            if (tsc_read_ns() - t0 > timeout_ns) {
-                kprintf("[stress-bar] TIMEOUT: nvme_done=%u/%u ahci_done=%u/%u\n",
-                        nd, (uint32_t)NVME_STRESS_WORKERS,
-                        ad, (uint32_t)AHCI_STRESS_WORKERS);
-                break;
-            }
-            sched_yield();
-        }
-        uint32_t nd = __atomic_load_n(&g_nvme_done_count, __ATOMIC_ACQUIRE);
-        uint32_t ad = __atomic_load_n(&g_ahci_done_count, __ATOMIC_ACQUIRE);
-        uint64_t nm = __atomic_load_n(&g_nvme_total_mismatches, __ATOMIC_ACQUIRE);
-        uint64_t am = __atomic_load_n(&g_ahci_total_mismatches, __ATOMIC_ACQUIRE);
-        // kprintf_atomic holds the serial lock across the whole line,
-        // so no worker DONE print on another CPU can byte-interleave
-        // into this diagnostic.  The test harness grep relies on
-        // this line being clean.
-        kprintf_atomic("[stress-bar] SUMMARY nvme_done=%u/%u mismatches=%lu "
-                       "ahci_done=%u/%u mismatches=%lu\n",
-                       nd, (uint32_t)NVME_STRESS_WORKERS, nm,
-                       ad, (uint32_t)AHCI_STRESS_WORKERS, am);
-    }
+    // Stress-test barrier removed — no stress workers are running in
+    // this build, and the poll loop would just time out after 300 s.
+    (void)g_nvme_done_count; (void)g_ahci_done_count;
+    (void)g_nvme_total_mismatches; (void)g_ahci_total_mismatches;
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's

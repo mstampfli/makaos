@@ -127,7 +127,7 @@ static void cache_insert(uint32_t ip_be, const uint8_t* mac) {
 
 static void arp_send(uint16_t oper, const uint8_t* tha,
                      uint32_t tpa_be, const uint8_t* dst_mac) {
-    skbuff_t* skb = skb_alloc(sizeof(arp_pkt_t));
+    skbuff_t* skb = skb_alloc(sizeof(arp_pkt_t) + ETH_HDR_LEN);
     if (!skb) return;
     skb_reserve(skb, ETH_HDR_LEN);  // reserve room for Ethernet header
 

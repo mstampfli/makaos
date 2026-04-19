@@ -1778,8 +1778,15 @@ static uint64_t sys_sigreturn(void) {
 
 // ── sys_mmap ──────────────────────────────────────────────────────────────
 // mmap(addr, len, prot, flags, fd, off) → mapped address or -errno.
-// Supports MAP_PRIVATE | MAP_ANONYMOUS, MAP_SHARED | MAP_ANONYMOUS,
-// and MAP_SHARED with fd (shmem fd from shm_open).  MAP_FIXED is supported.
+// Supports:
+//   MAP_PRIVATE | MAP_ANONYMOUS — zero-fill private pages
+//   MAP_SHARED  | MAP_ANONYMOUS — anonymous shared (fork-inherited)
+//   MAP_SHARED  with shmem fd   — named shmem (shm_open fd)
+//   MAP_PRIVATE with regular fd — file-backed, demand-paged from pcache;
+//                                 writes trigger eager COW (same path ELF
+//                                 data segments use).  Writes never reach
+//                                 disk — it's the caller's private view.
+// MAP_FIXED is supported for all of the above.
 static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t off) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
@@ -1790,13 +1797,13 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     int has_fd    = ((int64_t)fd != -1);
 
     // Validate flag combinations.
-    // MAP_SHARED | MAP_ANONYMOUS → anonymous shared (for fork-inherited shm)
-    // MAP_SHARED with fd         → named shmem (shm_open fd)
-    // MAP_PRIVATE | MAP_ANONYMOUS → private anonymous (existing behavior)
-    // MAP_PRIVATE with fd        → not supported yet (file-backed mmap)
     if (!is_anon && !has_fd) return (uint64_t)-EINVAL;
-    if (!is_shared && has_fd) return (uint64_t)-ENOSYS; // MAP_PRIVATE + fd: TODO
     if (is_anon && has_fd) return (uint64_t)-EINVAL;    // anon + fd: nonsensical
+    if (off & PAGE_MASK) return (uint64_t)-EINVAL;      // offset must be page-aligned
+    // MAP_SHARED + regular fd (non-shmem) not yet supported — would need
+    // dirty-page tracking + writeback to the underlying file.  Callers that
+    // really want shared file-backed memory should shm_open + write.
+    // We distinguish "shmem fd" vs "regular fd" below after fdget.
 
     mm_t* mm = g_current->mm_shared->mm;
 
@@ -1849,6 +1856,48 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (prot & PROT_WRITE) vma_flags |= VMA_W;
     if (prot & PROT_EXEC)  vma_flags |= VMA_X;
     if (is_shared) vma_flags |= VMA_SHARED;
+
+    // ── File-backed private mmap (MAP_PRIVATE + regular fd) ───────────────
+    // Route through the same file-VMA infrastructure the lazy ELF loader
+    // uses: the page-fault handler in vmm.c consults pcache, demand-reads
+    // from ext2 on miss, offers the frame back to pcache (ref-counted),
+    // and for VMA_W eagerly COWs into a private frame.  Read-ahead of the
+    // next 7 pages happens automatically on each disk miss.  Nothing here
+    // to re-invent — just build the right VMA and return.
+    if (has_fd && !is_shared) {
+        vfs_file_t* f = fdget(fd);
+        if (!f) return (uint64_t)-EBADF;
+        // Must be a regular ext2 file (has a stored path we can stat).
+        // Shmem, ttys, sockets, pipes have no inode — reject.
+        if (!f->path[0]) { fdput(f); return (uint64_t)-EACCES; }
+        if (prot & PROT_READ &&
+            f->rights != 0 && !rights_check(f->rights, RIGHT_READ)) {
+            fdput(f); return (uint64_t)-EACCES;
+        }
+        // Snapshot file size at mmap time — standard POSIX semantics.
+        // Pages within [off, off+file_sz-off) get demand-paged from ext2;
+        // pages past EOF are zero-filled (BSS-like).
+        uint32_t inum = ext2_lookup_path_raw(f->path);
+        uint64_t file_sz = 0;
+        if (inum) {
+            ext2_inode_t inode;
+            if (ext2_read_inode(inum, &inode)) file_sz = inode.i_size;
+        }
+        if (off > file_sz) { fdput(f); return (uint64_t)-EINVAL; }
+        uint64_t file_len = file_sz - off;
+        if (file_len > len) file_len = len;
+
+        // mm_vma_add_file vfs_dup's the file; the VMA holds its own ref
+        // for the lifetime of the mapping (closed in mm_destroy path).
+        if (!mm_vma_add_file(mm, vaddr, vaddr + len,
+                              vma_flags & ~VMA_ANON,
+                              f, off, file_len)) {
+            fdput(f);
+            return (uint64_t)-ENOMEM;
+        }
+        fdput(f);
+        return vaddr;
+    }
 
     if (!mm_vma_add(mm, vaddr, vaddr + len, vma_flags))
         return (uint64_t)-ENOMEM;

@@ -462,17 +462,35 @@ void tcp_timer_tick(void) {
         // Retransmit timeout.
         if (pcb->rto_deadline && now >= pcb->rto_deadline &&
             SEQ_GT(pcb->snd_nxt, pcb->snd_una)) {
-            // Simple retransmit: resend from snd_una.
-            uint32_t rlen = pcb->snd_nxt - pcb->snd_una;
-            if (rlen > TCP_MSS) rlen = TCP_MSS;
+            // SYN_SENT / SYN_RCVD: the outstanding "byte" is the SYN itself,
+            // which must be retransmitted as a SYN (with ACK in SYN_RCVD),
+            // never as a plain ACK.  Blindly sending TCP_ACK here wedged the
+            // handshake whenever the first SYN's ipv4_send_ex failed on an
+            // ARP miss — the retry looked like an ACK-only segment, peer
+            // dropped it, and connect() hit the caller's timeout.
+            uint8_t flags;
+            uint32_t rlen = 0;
+            const void* rdata = NULL;
             uint32_t old_nxt = pcb->snd_nxt;
-            pcb->snd_nxt = pcb->snd_una;  // rewind
-            uint8_t flags = TCP_ACK;
-            if (pcb->fin_sent && rlen == 0) flags |= TCP_FIN;
-            tcp_send_segment(pcb, flags,
-                              pcb->txbuf + (pcb->txbuf_head & TCP_TXBUF_MASK),
-                              (uint16_t)rlen);
-            if (!rlen && !pcb->fin_sent) pcb->snd_nxt = old_nxt;
+            if (pcb->state == TCP_SYN_SENT) {
+                flags = TCP_SYN;
+                pcb->snd_nxt = pcb->snd_una;  // rewind over SYN
+            } else if (pcb->state == TCP_SYN_RCVD) {
+                flags = TCP_SYN | TCP_ACK;
+                pcb->snd_nxt = pcb->snd_una;
+            } else {
+                // ESTABLISHED / FIN_WAIT / CLOSE_WAIT / ...: resend data.
+                rlen = pcb->snd_nxt - pcb->snd_una;
+                if (rlen > TCP_MSS) rlen = TCP_MSS;
+                pcb->snd_nxt = pcb->snd_una;
+                flags = TCP_ACK;
+                if (pcb->fin_sent && rlen == 0) flags |= TCP_FIN;
+                rdata = pcb->txbuf + (pcb->txbuf_head & TCP_TXBUF_MASK);
+            }
+            tcp_send_segment(pcb, flags, rdata, (uint16_t)rlen);
+            if (!rlen && !pcb->fin_sent && pcb->state != TCP_SYN_SENT &&
+                pcb->state != TCP_SYN_RCVD)
+                pcb->snd_nxt = old_nxt;
             pcb->rto_deadline = now + TCP_RTO_NS;
         }
 
@@ -567,7 +585,13 @@ int tcp_connect(tcp_pcb_t* pcb, uint32_t dst_ip_be, uint16_t dst_port) {
     pcb->snd_wnd     = TCP_WINDOW;
     pcb->reset       = 0;
     pcb->state       = TCP_SYN_SENT;
-    if (tcp_send_segment(pcb, TCP_SYN, NULL, 0) < 0) {
+    int r = tcp_send_segment(pcb, TCP_SYN, NULL, 0);
+    // r < 0 usually means ARP miss on the first try (ipv4_send_ex returns -1
+    // while the ARP request is still outstanding).  The segment was still
+    // logically queued — snd_nxt advanced and rto_deadline is armed — so the
+    // retransmit tick will resend once ARP resolves.  Hard-fail only if we
+    // couldn't even build the segment (rto_deadline stays 0).
+    if (r < 0 && pcb->rto_deadline == 0) {
         pcb->state = TCP_CLOSED;
         return -ENOBUFS;
     }

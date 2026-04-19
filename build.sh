@@ -444,7 +444,7 @@ uid=0
 gid=0
 stdio=null
 pledge=net stdio cpath wpath
-unveil=/etc rw
+unveil=/etc rwc
 restart=on-failure
 SVC_EOF
 
@@ -611,11 +611,12 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display none \
-  -audiodev pa,id=snd0,server=/run/user/1000/pulse/native \
+  -audiodev pa,id=snd0,server=/mnt/wslg/PulseServer \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \
   -device virtio-net-pci,netdev=net0 \
+  -object filter-dump,id=f1,netdev=net0,file=build/net.pcap \
   -serial file:build/serial.txt \
   -monitor none \
   -gdb tcp::1234 \

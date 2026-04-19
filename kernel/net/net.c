@@ -8,6 +8,7 @@
 #include "sched.h"
 #include "irq_wait.h"
 #include "common.h"
+#include "tsc.h"
 
 extern void sched_yield(void);
 
@@ -108,6 +109,16 @@ void net_set_dns(const uint32_t* servers, uint32_t count) {
 // Also fires tcp_timer_tick() every ~10 wakeups (loose timer, ±200 ms is fine
 // since TCP RTO minimum is 1 s).
 
+// TCP timer thread: fires tcp_timer_tick() roughly every 200 ms so
+// retransmits and TIME_WAIT expiry don't depend on incoming traffic.
+static void net_tcp_timer_thread(void) {
+    for (;;) {
+        uint64_t until = tsc_read_ns() + 200ull * 1000ull * 1000ull;
+        while (tsc_read_ns() < until) sched_yield();
+        tcp_timer_tick();
+    }
+}
+
 static void net_rx_thread(void) {
     uint32_t tick = 0;
 
@@ -173,6 +184,13 @@ int net_init(void) {
         return 0;
     }
     sched_add(t);
+
+    // Spawn a dedicated TCP timer thread.  net_rx_thread only ticks when
+    // packets arrive; that's a problem for retransmits — if the initial
+    // SYN fails or its SYN-ACK never comes back, there's no RX traffic to
+    // drive the tick, and the handshake wedges forever.
+    task_t* tt = task_create_kthread(net_tcp_timer_thread, pid_alloc());
+    if (tt) sched_add(tt);
 
     s_ready = 1;
     ser_puts("[net] ready\n");
