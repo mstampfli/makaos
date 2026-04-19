@@ -171,10 +171,14 @@ static void stress_nvme_worker(void) {
     uint64_t seed = 0xA5A5DEADBEEFCAFEULL ^ ((uint64_t)g_current->pid << 16);
     uint64_t fails = 0, errs = 0;
 
-    kprintf("[nvme-stress] pid=%u START pages=%lu\n",
-            g_current->pid, g_nvme_pages);
+    kprintf("[nvme-stress] pid=%u START pages=%lu start_cpu=%u\n",
+            g_current->pid, g_nvme_pages, this_cpu()->id);
 
+    uint64_t t_start = tsc_read_ns();
+    uint32_t cpu_hist[4] = {0};  // residence counter per CPU
     for (uint64_t i = 0; i < NVME_STRESS_ITERS; i++) {
+        uint32_t cur_cpu = this_cpu()->id;
+        if (cur_cpu < 4) cpu_hist[cur_cpu]++;
         seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
         uint64_t pg  = (seed >> 16) % g_nvme_pages;
         uint64_t lba = pg * 8;  // 4K page = 8 × 512 B LBAs
@@ -198,8 +202,12 @@ static void stress_nvme_worker(void) {
         }
     }
 
-    kprintf("[nvme-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu\n",
-            g_current->pid, (uint32_t)NVME_STRESS_ITERS, fails, errs);
+    uint64_t t_end = tsc_read_ns();
+    uint64_t elapsed_ms = (t_end - t_start) / 1000000ULL;
+    kprintf("[nvme-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu "
+            "elapsed_ms=%lu cpu_hist=[%u,%u,%u,%u]\n",
+            g_current->pid, (uint32_t)NVME_STRESS_ITERS, fails, errs,
+            elapsed_ms, cpu_hist[0], cpu_hist[1], cpu_hist[2], cpu_hist[3]);
 
     // tmp is from g_nvme_tmp_bufs[] — freed by launch harness.
     g_current->state = TASK_DEAD; sched_yield();
