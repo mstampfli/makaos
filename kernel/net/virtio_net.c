@@ -114,9 +114,20 @@ typedef struct __attribute__((packed)) {
     uint16_t num_buffers; // only present when VIRTIO_NET_F_MRG_RXBUF negotiated
 } virtio_net_hdr_t;
 
-// We don't negotiate MRG_RXBUF so num_buffers is NOT present.
-// Use the shorter 10-byte header.
-#define VIRTIO_NET_HDR_LEN  10u
+// Header length.  Per virtio 1.0 §5.1.6.1: when VIRTIO_F_VERSION_1 is
+// negotiated (which we do in DRIVER_FEATURES) the `num_buffers` field
+// is ALWAYS present — set to 1 by the device if MRG_RXBUF isn't
+// negotiated, but still there as part of the header — so the header
+// is 12 bytes even without MRG_RXBUF.  Only pre-1.0 (legacy) devices
+// omit `num_buffers` when MRG_RXBUF isn't negotiated.
+//
+// Using the wrong length silently shifts every Ethernet frame by 2
+// bytes at the wire: QEMU strips 12 bytes of header, leaving the
+// first 2 bytes of our Ethernet dst MAC in the tail of the header.
+// Outgoing frames arrive at the NAT with a mangled dst MAC → silently
+// dropped.  Symptom: DHCP DISCOVER retransmits forever, no OFFER
+// comes back.
+#define VIRTIO_NET_HDR_LEN  12u
 
 // ── Per-virtqueue state ───────────────────────────────────────────────────
 typedef struct {
@@ -582,32 +593,91 @@ int virtio_net_init(void) {
     // 7. Pre-populate RX ring.
     rxq_refill();
 
-    // 8. Enable MSI and register ISR.
+    // 8. Enable MSI-X and register ISR.
+    //
+    // QEMU's modern virtio-net-pci ONLY exposes MSI-X (cap 0x11), no
+    // legacy MSI (cap 0x05).  Previously we searched only for 0x05, so
+    // no IRQ was ever wired up and RX silently stalled — the device
+    // had plenty of incoming packets but no notification reached us.
+    //
+    // Steps:
+    //   - Locate MSI-X capability
+    //   - Map the MSI-X table BAR
+    //   - Program entry 0: (LAPIC addr, VEC_VIRTIO_NET)
+    //   - Unmask entry 0
+    //   - Enable MSI-X in the capability control word
+    //   - Tell virtio which MSI-X vector serves queue 0 (and queue 1)
+    //     via queue_select / queue_msix_vector
     {
         uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
                                                0x34u) & 0xFCu);
-        while (cap) {
-            uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-            if ((dw & 0xFFu) == 0x05u) {  // MSI capability
-                uint32_t mc = dw;
-                uint64_t msi_addr = lapic_msi_addr();
-                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
-                int is_64 = (int)((mc >> 23) & 1u);
-                if (is_64) {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, (uint32_t)(msi_addr >> 32));
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 12u, lapic_msi_data(VEC_VIRTIO_NET));
-                } else {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, lapic_msi_data(VEC_VIRTIO_NET));
-                }
-                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                (mc & ~(0x7u << 20)) | (1u << 16));
-                break;
+        uint8_t msix_cap = 0;
+        {
+            uint8_t c = cap;
+            while (c) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, c);
+                if ((dw & 0xFFu) == 0x11u) { msix_cap = c; break; }
+                c = (uint8_t)((dw >> 8) & 0xFCu);
             }
-            cap = (uint8_t)((dw >> 8) & 0xFCu);
+        }
+        if (!msix_cap) {
+            // Fall back to legacy MSI if MSI-X is absent (very old QEMU).
+            cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
+                                           0x34u) & 0xFCu);
+            while (cap) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
+                if ((dw & 0xFFu) == 0x05u) {
+                    uint32_t mc = dw;
+                    uint64_t msi_addr = lapic_msi_addr();
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 4u,
+                                    (uint32_t)(msi_addr & 0xFFFFFFFFu));
+                    int is_64 = (int)((mc >> 23) & 1u);
+                    if (is_64) {
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                        (uint32_t)(msi_addr >> 32));
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 12u,
+                                        lapic_msi_data(VEC_VIRTIO_NET));
+                    } else {
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                        lapic_msi_data(VEC_VIRTIO_NET));
+                    }
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                                    (mc & ~(0x7u << 20)) | (1u << 16));
+                    break;
+                }
+                cap = (uint8_t)((dw >> 8) & 0xFCu);
+            }
+        } else {
+            // MSI-X path.
+            uint32_t tbl_dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn,
+                                               msix_cap + 4u);
+            uint32_t bir     = tbl_dw & 0x7u;
+            uint32_t tbl_off = tbl_dw & ~0x7u;
+            uint64_t bar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn,
+                                              (uint8_t)bir);
+            volatile uint32_t* msix_table = (volatile uint32_t*)
+                vmm_map_mmio(bar_phys + tbl_off, 0x1000u);
+
+            uint32_t msi_addr = (uint32_t)lapic_msi_addr();
+            uint32_t msi_data = lapic_msi_data(VEC_VIRTIO_NET);
+            msix_table[0] = msi_addr;       // addr_lo
+            msix_table[1] = 0;               // addr_hi
+            msix_table[2] = msi_data;        // data
+            msix_table[3] = 0;               // vector_ctrl: unmask
+
+            // Enable MSI-X (bit 31 of message control word); clear
+            // function mask (bit 30).
+            uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
+            mc = (mc | (1u << 31)) & ~(1u << 30);
+            pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
+
+            // Bind MSI-X vector 0 to RX queue (index 0) and TX queue
+            // (index 1).  Virtio spec §4.1.4.3: select queue, write
+            // queue_msix_vector.  0xFFFF = "no vector" (default).
+            s_common->queue_select       = 0;   // rxq
+            s_common->queue_msix_vector  = 0;
+            s_common->queue_select       = 1;   // txq
+            s_common->queue_msix_vector  = 0;   // share same vector
         }
 
         g_virtio_net_irq = 4u;  // logical irq_wait slot (free slot)

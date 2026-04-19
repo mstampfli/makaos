@@ -45,10 +45,18 @@ static void ser_put_hex8(uint8_t v) {
 #define IP4_BE(a,b,c,d)  ((uint32_t)(a) | ((uint32_t)(b)<<8) | \
                            ((uint32_t)(c)<<16) | ((uint32_t)(d)<<24))
 
-static uint32_t s_our_ip = IP4_BE(10, 0, 2, 15);
-static uint32_t s_gw_ip  = IP4_BE(10, 0, 2,  2);
-static uint32_t s_mask   = IP4_BE(255,255,255, 0);
-static uint32_t s_bcast  = IP4_BE(10, 0, 2, 255);
+// Start UNCONFIGURED.  The userspace /bin/net DHCP client runs during
+// boot and calls net_ifconfig() with the lease assignment from the
+// server.  Pre-DHCP, any sendto() on a SOCK_DGRAM inherits src_ip = 0
+// (= 0.0.0.0) which is exactly what RFC 2131 requires for DISCOVER /
+// REQUEST before a lease exists.  Previously we hardcoded 10.0.2.15
+// (the QEMU SLIRP default) which broke DHCP: the server silently
+// dropped our DISCOVER because the src IP claimed an address we don't
+// yet own.
+static uint32_t s_our_ip = 0;
+static uint32_t s_gw_ip  = 0;
+static uint32_t s_mask   = 0;
+static uint32_t s_bcast  = IP4_BE(255, 255, 255, 255);   // limited broadcast
 static int      s_ready  = 0;
 
 #define NET_MAX_DNS 4
