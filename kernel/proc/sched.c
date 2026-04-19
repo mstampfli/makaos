@@ -1470,11 +1470,26 @@ void sched_wake(task_t* proc) {
     }
 
     if (target != home) {
-        // Migrate: drop home's lock, take target's, enqueue there.
-        spin_unlock_irqrestore(&home->rq_lock, flags);
+        // Migrate.  Race hazard: between releasing home's lock and
+        // taking target's, a second sched_wake for the same proc from
+        // another CPU would see last_ran_cpu=target, take target's
+        // lock, observe state==TASK_SLEEPING, silently fail to remove
+        // proc from target's sleep_head (proc isn't there), and
+        // enqueue proc — then we enqueue again on target's rq.
+        // Double-enqueue → corrupted Chase-Lev slots → crash.
+        //
+        // Fix: transition state OUT of SLEEPING *before* releasing
+        // home's lock.  A racing sched_wake on the second CPU then
+        // sees state != TASK_SLEEPING and takes the wake_pending
+        // fast-return path instead of trying to re-enqueue.
+        proc->state = TASK_READY;
         __atomic_store_n(&proc->last_ran_cpu, target->id,
                            __ATOMIC_RELAXED);
+        spin_unlock_irqrestore(&home->rq_lock, flags);
+
         flags = spin_lock_irqsave(&target->rq_lock);
+        // enqueue_on re-sets state=TASK_READY (idempotent) and also
+        // does mlfq_ticks_left housekeeping + push + nr_running bump.
         enqueue_on(&target->rq, proc);
         home = target;  // reuse variable for the rest of the function
     } else {
