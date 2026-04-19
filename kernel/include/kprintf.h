@@ -23,3 +23,11 @@
 
 __attribute__((format(printf, 1, 2)))
 void kprintf(const char* fmt, ...);
+
+// Like kprintf but holds the serial lock across the entire format+emit.
+// The output line cannot byte-interleave with concurrent kprintfs on
+// other CPUs — use for lines that must be machine-parseable (test
+// harness summaries, crash reports).  Blocks concurrent kprintf on
+// other CPUs for the duration of the call; use sparingly.
+__attribute__((format(printf, 1, 2)))
+void kprintf_atomic(const char* fmt, ...);

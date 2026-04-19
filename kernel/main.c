@@ -165,6 +165,14 @@ static uint64_t g_nvme_pages = 0;
 static uint8_t* g_nvme_tmp_bufs[16] = {0};  // pre-allocated, one per worker
 static volatile uint32_t g_nvme_tmp_ix = 0;
 
+// Cross-worker tallies — written by workers on DONE, read by the
+// launcher-side barrier thread.  No serial output involved, so
+// interleaved kprintf lines can't confuse the completion accounting.
+static volatile uint32_t g_nvme_done_count = 0;
+static volatile uint64_t g_nvme_total_mismatches = 0;
+static volatile uint32_t g_ahci_done_count = 0;
+static volatile uint64_t g_ahci_total_mismatches = 0;
+
 static void stress_nvme_worker(void) {
     uint32_t my_ix = __atomic_fetch_add(&g_nvme_tmp_ix, 1, __ATOMIC_RELAXED);
     uint8_t* tmp = g_nvme_tmp_bufs[my_ix];
@@ -204,6 +212,9 @@ static void stress_nvme_worker(void) {
 
     uint64_t t_end = tsc_read_ns();
     uint64_t elapsed_ms = (t_end - t_start) / 1000000ULL;
+    // Aggregate under atomic RMW — cannot be corrupted by interleaving.
+    __atomic_fetch_add(&g_nvme_total_mismatches, fails, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_nvme_done_count, 1, __ATOMIC_RELEASE);
     kprintf("[nvme-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu "
             "elapsed_ms=%lu cpu_hist=[%u,%u,%u,%u]\n",
             g_current->pid, (uint32_t)NVME_STRESS_ITERS, fails, errs,
@@ -298,6 +309,8 @@ static void stress_ahci_worker(void) {
         }
     }
 
+    __atomic_fetch_add(&g_ahci_total_mismatches, fails, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_ahci_done_count, 1, __ATOMIC_RELEASE);
     kprintf("[ahci-stress] pid=%u DONE iters=%u mismatches=%lu errs=%lu\n",
             g_current->pid, (uint32_t)AHCI_STRESS_ITERS, fails, errs);
 
@@ -389,6 +402,40 @@ static void init_kthread(void) {
 
     stress_nvme_launch();
     stress_ahci_launch();
+
+    // Barrier: poll the atomic DONE counters so we can print ONE
+    // authoritative summary line whose correctness does NOT depend on
+    // serial-output interleaving.  Timeout-bail after a generous
+    // window so a stuck worker doesn't hang the system.
+    {
+        extern uint64_t tsc_read_ns(void);
+        const uint64_t timeout_ns = 300ULL * 1000000000ULL;  // 300 s
+        uint64_t t0 = tsc_read_ns();
+        for (;;) {
+            uint32_t nd = __atomic_load_n(&g_nvme_done_count, __ATOMIC_ACQUIRE);
+            uint32_t ad = __atomic_load_n(&g_ahci_done_count, __ATOMIC_ACQUIRE);
+            if (nd == NVME_STRESS_WORKERS && ad == AHCI_STRESS_WORKERS) break;
+            if (tsc_read_ns() - t0 > timeout_ns) {
+                kprintf("[stress-bar] TIMEOUT: nvme_done=%u/%u ahci_done=%u/%u\n",
+                        nd, (uint32_t)NVME_STRESS_WORKERS,
+                        ad, (uint32_t)AHCI_STRESS_WORKERS);
+                break;
+            }
+            sched_yield();
+        }
+        uint32_t nd = __atomic_load_n(&g_nvme_done_count, __ATOMIC_ACQUIRE);
+        uint32_t ad = __atomic_load_n(&g_ahci_done_count, __ATOMIC_ACQUIRE);
+        uint64_t nm = __atomic_load_n(&g_nvme_total_mismatches, __ATOMIC_ACQUIRE);
+        uint64_t am = __atomic_load_n(&g_ahci_total_mismatches, __ATOMIC_ACQUIRE);
+        // kprintf_atomic holds the serial lock across the whole line,
+        // so no worker DONE print on another CPU can byte-interleave
+        // into this diagnostic.  The test harness grep relies on
+        // this line being clean.
+        kprintf_atomic("[stress-bar] SUMMARY nvme_done=%u/%u mismatches=%lu "
+                       "ahci_done=%u/%u mismatches=%lu\n",
+                       nd, (uint32_t)NVME_STRESS_WORKERS, nm,
+                       ad, (uint32_t)AHCI_STRESS_WORKERS, am);
+    }
 
     // init_kthread has finished its work (subsystem init, AP boot, userland
     // launch).  Previously, falling off the end landed in proc_trampoline's
