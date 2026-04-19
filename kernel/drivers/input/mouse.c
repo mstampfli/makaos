@@ -4,6 +4,8 @@
 #include "irq_wait.h"
 #include "sched.h"
 #include "process.h"
+#include "preempt.h"
+#include "cpu.h"
 
 // Global wait queue — woken after each decoded mouse packet so poll/epoll
 // on /dev/mouse wakes immediately when events are available.
@@ -150,8 +152,13 @@ void mouse_irq_handler(void) {
     if (s_packet_idx == PACKET_BYTES) {
         packet_decode();
         s_packet_idx = 0;
-        // Wake poll/epoll waiters on /dev/mouse.
+        // Wake poll/epoll waiters on /dev/mouse.  preempt_disable
+        // around the wake — rcu_read_unlock inside wait_queue_wake_all
+        // otherwise trips sched_preempt → do_switch → `sti`, re-enabling
+        // IRQs and allowing nested ISR delivery on the same vector.
+        preempt_disable();
         wait_queue_wake_all(&g_mouse_waitq);
+        this_cpu()->preempt_depth--;
     }
 
     irq_notify(12);
