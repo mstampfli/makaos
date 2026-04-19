@@ -716,6 +716,58 @@ static void test_sigprocmask(void) {
 
 // ── Entry ─────────────────────────────────────────────────────────────────
 
+// ── file-backed mmap ──────────────────────────────────────────────────────
+// MAP_PRIVATE on a regular file demand-pages content from ext2 via pcache.
+// PROT_WRITE eagerly COWs into a private frame on fault (same mechanism
+// ELF data segments use) — writes must never leak back to the file.
+static void test_mmap_file(void) {
+    printf("-- file-backed mmap\n");
+
+    const char* path = "/tmp_mmap_test";
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    check("create test file", fd >= 0);
+    if (fd < 0) return;
+
+    // 3 pages so the fault handler exercises more than a single page.
+    char pat[4096];
+    for (int i = 0; i < 4096; i++) pat[i] = (char)(i & 0xFF);
+    for (int p = 0; p < 3; p++) check("write page", write(fd, pat, 4096) == 4096);
+    close(fd);
+
+    fd = open(path, O_RDONLY);
+    void* m = mmap(0, 3 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    check("mmap PROT_READ", m != (void*)-1);
+    if (m != (void*)-1) {
+        int ok = 1;
+        for (int i = 0; i < 3 * 4096 && ok; i++)
+            if (((unsigned char*)m)[i] != (i & 0xFF)) ok = 0;
+        check("mapped bytes match file on disk", ok);
+        munmap(m, 3 * 4096);
+    }
+    close(fd);
+
+    fd = open(path, O_RDONLY);
+    void* w = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    check("mmap RW MAP_PRIVATE", w != (void*)-1);
+    if (w != (void*)-1) {
+        ((char*)w)[0] = 'X';          // eager COW in PF handler
+        ((char*)w)[4095] = 'Y';
+        check("COW write does not SIGSEGV", 1);
+        munmap(w, 4096);
+    }
+    close(fd);
+
+    // File on disk must be untouched (MAP_PRIVATE writes are process-local).
+    fd = open(path, O_RDONLY);
+    char verify[1] = {0};
+    int n = (int)read(fd, verify, 1);
+    check("MAP_PRIVATE write did not reach disk",
+          n == 1 && verify[0] == 0);
+    close(fd);
+
+    unlink(path);
+}
+
 int main(void) {
     printf("========= POSIX-1 test suite =========\n");
 
@@ -735,6 +787,7 @@ int main(void) {
     test_waitpid_getppid();
     test_libc_str();
     test_dup();
+    test_mmap_file();
     test_pipe();
     test_sigaction();
     test_sigprocmask();

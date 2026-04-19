@@ -3,5 +3,5 @@ uid=0
 gid=0
 stdio=null
 pledge=net stdio cpath wpath
-unveil=/etc rw
+unveil=/etc rwc
 restart=on-failure

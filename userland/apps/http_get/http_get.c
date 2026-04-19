@@ -90,8 +90,11 @@ static int send_all(int fd, const void* buf, size_t len) {
 }
 
 // Read until we've seen "\r\n\r\n" (end of response headers).
-// Returns index into buf where headers end (i.e. start of body), or -1.
-static ssize_t recv_headers(int fd, char* buf, size_t max) {
+// Returns the *total* number of bytes in buf on success (which may exceed
+// the header block if the server packed header+body into one segment), and
+// writes the header-end position (first byte of body) to *header_end_out.
+// Returns -1 on error.
+static ssize_t recv_headers(int fd, char* buf, size_t max, size_t* header_end_out) {
     size_t total = 0;
     while (total < max - 1) {
         ssize_t n = recv(fd, buf + total, max - 1 - total, 0);
@@ -103,7 +106,8 @@ static ssize_t recv_headers(int fd, char* buf, size_t max) {
         for (size_t i = 3; i < total; i++) {
             if (buf[i-3] == '\r' && buf[i-2] == '\n' &&
                 buf[i-1] == '\r' && buf[i]   == '\n') {
-                return (ssize_t)(i + 1);
+                if (header_end_out) *header_end_out = i + 1;
+                return (ssize_t)total;
             }
         }
     }
@@ -307,7 +311,7 @@ typedef struct {
     char location[1024];
 } http_result_t;
 
-static int http_get_one(const url_t* url, int verbose, int out_fd,
+static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
                          http_result_t* r) {
     if (verbose) {
         char line[512];
@@ -372,28 +376,20 @@ static int http_get_one(const url_t* url, int verbose, int out_fd,
         return -1;
     }
 
-    // Receive response headers
+    // Receive response headers (recv_headers returns total bytes read,
+    // which may include peeked body bytes; header_end points at body start).
     static char hdr[MAX_HEADER_SIZE];
-    ssize_t total = recv_headers(sock, hdr, sizeof(hdr));
-    if (total < 0) {
+    size_t header_end = 0;
+    ssize_t total = recv_headers(sock, hdr, sizeof(hdr), &header_end);
+    if (total < 0 || header_end == 0) {
         write(2, "* failed to read headers\n", 25);
         close(sock);
         return -1;
     }
 
-    // Find end of headers (\r\n\r\n) — recv_headers returned index of last
-    // byte of the terminator; so the body begins at total+1... but we actually
-    // read beyond the headers, and the bytes past header_end are the start of
-    // the body.  Recompute header_end precisely from the terminator.
-    size_t header_end = 0;
-    for (ssize_t i = 3; i < total; i++) {
-        if (hdr[i-3] == '\r' && hdr[i-2] == '\n' &&
-            hdr[i-1] == '\r' && hdr[i]   == '\n') {
-            header_end = (size_t)(i + 1);
-            break;
-        }
-    }
-    if (header_end == 0) { close(sock); return -1; }
+    // Sidecar log: append raw response bytes (headers + any peeked body) so
+    // callers get to see every hop even if the redirect chain aborts later.
+    if (raw_fd >= 0 && total > 0) (void)write(raw_fd, hdr, (size_t)total);
 
     // Parse status line
     int status = parse_status(hdr);
@@ -411,6 +407,19 @@ static int http_get_one(const url_t* url, int verbose, int out_fd,
     if (status == 301 || status == 302 || status == 303 ||
         status == 307 || status == 308) {
         find_header(hdr, header_end, "Location", r->location, sizeof(r->location));
+        // Tee any body already read past the header block, then drain a
+        // bit more into the sidecar so callers can see the redirect page.
+        if (raw_fd >= 0) {
+            size_t initial_len = (size_t)total - header_end;
+            if (initial_len > 0)
+                (void)write(raw_fd, hdr + header_end, initial_len);
+            uint8_t buf[RECV_BUF_SIZE];
+            for (int i = 0; i < 16; i++) {
+                ssize_t n = recv(sock, buf, sizeof(buf), 0);
+                if (n <= 0) break;
+                (void)write(raw_fd, buf, (size_t)n);
+            }
+        }
         close(sock);
         return 0;
     }
@@ -477,18 +486,30 @@ static void usage(void) {
 int main(int argc, char** argv) {
     int verbose = 0;
     const char* out_path = NULL;
+    const char* err_path = NULL;
+    const char* raw_path = NULL;
     const char* url_arg  = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
+            err_path = argv[++i];
+        } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+            raw_path = argv[++i];
         } else if (argv[i][0] != '-' && !url_arg) {
             url_arg = argv[i];
         } else {
             usage();
             return 1;
         }
+    }
+
+    // Redirect stderr to err_path so the kernel can tail diagnostics.
+    if (err_path) {
+        int efd = open(err_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (efd >= 0 && efd != 2) { dup2(efd, 2); close(efd); }
     }
     if (!url_arg) { usage(); return 1; }
 
@@ -501,6 +522,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Sidecar raw-response log (append-only).  Every hop's full response
+    // header block + any body bytes peeked in the same recv() land here
+    // — a read-only witness of what the server actually said, preserved
+    // across redirect follow-ups.
+    int raw_fd = -1;
+    if (raw_path) {
+        raw_fd = open(raw_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    }
+
     url_t url;
     if (parse_url(url_arg, &url) < 0) {
         write(2, "* malformed URL (or https not supported)\n", 41);
@@ -511,7 +541,7 @@ int main(int argc, char** argv) {
     for (int hop = 0; hop < MAX_REDIRECTS; hop++) {
         http_result_t r;
         memset(&r, 0, sizeof(r));
-        if (http_get_one(&url, verbose, out_fd, &r) < 0) {
+        if (http_get_one(&url, verbose, out_fd, raw_fd, &r) < 0) {
             if (out_fd > 2) close(out_fd);
             return 1;
         }

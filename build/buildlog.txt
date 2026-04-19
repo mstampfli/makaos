@@ -1,0 +1,177 @@
+[+] Building user binaries
+[+] Building kernel (clang + ld.lld)
+kernel/main/subsys_init.c:30:13: warning: initializer overrides prior initialization of this subobject [-Winitializer-overrides]
+   28 | DEFINE_INITCALL(evdev, INITCALL_LEVEL_EARLY,
+      | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   29 |     .fn   = _evdev_init,
+      |     ~~~~~~~~~~~~~~~~~~~~
+   30 |     .deps = INITCALL_DEPS("tty"),
+      |     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~
+   31 | );
+      | ~
+kernel/include/initcall.h:78:29: note: expanded from macro 'INITCALL_DEPS'
+   78 | #define INITCALL_DEPS(...)  { __VA_ARGS__, NULL }
+      |                             ^
+kernel/include/initcall.h:106:9: note: expanded from macro 'DEFINE_INITCALL'
+  106 |         __VA_ARGS__                                                         \
+      |         ^~~~~~~~~~~
+kernel/main/subsys_init.c:28:1: note: previous initialization is here
+   28 | DEFINE_INITCALL(evdev, INITCALL_LEVEL_EARLY,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   29 |     .fn   = _evdev_init,
+      |     ~~~~~~~~~~~~~~~~~~~~
+   30 |     .deps = INITCALL_DEPS("tty"),
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   31 | );
+      | ~
+kernel/include/initcall.h:105:18: note: expanded from macro 'DEFINE_INITCALL'
+  105 |         .deps  = { NULL },                                                  \
+      |                  ^~~~~~~~
+kernel/main/subsys_init.c:41:13: warning: initializer overrides prior initialization of this subobject [-Winitializer-overrides]
+   39 | DEFINE_INITCALL(nvme, INITCALL_LEVEL_EARLY,
+      | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   40 |     .fn   = _nvme_init,
+      |     ~~~~~~~~~~~~~~~~~~~
+   41 |     .deps = INITCALL_DEPS("ahci"),
+      |     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+   42 | );
+      | ~
+kernel/include/initcall.h:78:29: note: expanded from macro 'INITCALL_DEPS'
+   78 | #define INITCALL_DEPS(...)  { __VA_ARGS__, NULL }
+      |                             ^
+kernel/include/initcall.h:106:9: note: expanded from macro 'DEFINE_INITCALL'
+  106 |         __VA_ARGS__                                                         \
+      |         ^~~~~~~~~~~
+kernel/main/subsys_init.c:39:1: note: previous initialization is here
+   39 | DEFINE_INITCALL(nvme, INITCALL_LEVEL_EARLY,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   40 |     .fn   = _nvme_init,
+      |     ~~~~~~~~~~~~~~~~~~~
+   41 |     .deps = INITCALL_DEPS("ahci"),
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   42 | );
+      | ~
+kernel/include/initcall.h:105:18: note: expanded from macro 'DEFINE_INITCALL'
+  105 |         .deps  = { NULL },                                                  \
+      |                  ^~~~~~~~
+kernel/main/subsys_init.c:47:13: warning: initializer overrides prior initialization of this subobject [-Winitializer-overrides]
+   45 | DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
+      | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   46 |     .fn   = _ext2_init,
+      |     ~~~~~~~~~~~~~~~~~~~
+   47 |     .deps = INITCALL_DEPS("ahci"),
+      |     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~
+   48 | );
+      | ~
+kernel/include/initcall.h:78:29: note: expanded from macro 'INITCALL_DEPS'
+   78 | #define INITCALL_DEPS(...)  { __VA_ARGS__, NULL }
+      |                             ^
+kernel/include/initcall.h:106:9: note: expanded from macro 'DEFINE_INITCALL'
+  106 |         __VA_ARGS__                                                         \
+      |         ^~~~~~~~~~~
+kernel/main/subsys_init.c:45:1: note: previous initialization is here
+   45 | DEFINE_INITCALL(ext2, INITCALL_LEVEL_EARLY,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   46 |     .fn   = _ext2_init,
+      |     ~~~~~~~~~~~~~~~~~~~
+   47 |     .deps = INITCALL_DEPS("ahci"),
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   48 | );
+      | ~
+kernel/include/initcall.h:105:18: note: expanded from macro 'DEFINE_INITCALL'
+  105 |         .deps  = { NULL },                                                  \
+      |                  ^~~~~~~~
+kernel/main/subsys_init.c:73:13: warning: initializer overrides prior initialization of this subobject [-Winitializer-overrides]
+   71 | DEFINE_INITCALL(input, INITCALL_LEVEL_SUBSYS,
+      | ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |     .fn   = _input_init,
+      |     ~~~~~~~~~~~~~~~~~~~~
+   73 |     .deps = INITCALL_DEPS("tty", "evdev"),
+      |     ~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   74 | );
+      | ~
+kernel/include/initcall.h:78:29: note: expanded from macro 'INITCALL_DEPS'
+   78 | #define INITCALL_DEPS(...)  { __VA_ARGS__, NULL }
+      |                             ^
+kernel/include/initcall.h:106:9: note: expanded from macro 'DEFINE_INITCALL'
+  106 |         __VA_ARGS__                                                         \
+      |         ^~~~~~~~~~~
+kernel/main/subsys_init.c:71:1: note: previous initialization is here
+   71 | DEFINE_INITCALL(input, INITCALL_LEVEL_SUBSYS,
+      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   72 |     .fn   = _input_init,
+      |     ~~~~~~~~~~~~~~~~~~~~
+   73 |     .deps = INITCALL_DEPS("tty", "evdev"),
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   74 | );
+      | ~
+kernel/include/initcall.h:105:18: note: expanded from macro 'DEFINE_INITCALL'
+  105 |         .deps  = { NULL },                                                  \
+      |                  ^~~~~~~~
+4 warnings generated.
+    [skip] fat32.c
+    [skip] ac97.c
+    [skip] ata_driver_irq.c
+    [skip] ata_poll.c
+kernel/drivers/storage/nvme.c:200:24: warning: unused function 'reg_rd64' [-Wunused-function]
+  200 | static inline uint64_t reg_rd64(uint32_t off) {
+      |                        ^~~~~~~~
+1 warning generated.
+kernel/drivers/tty/pty.c:31:9: warning: 'PTY_TRACE' macro redefined [-Wmacro-redefined]
+   31 | #define PTY_TRACE 1
+      |         ^
+kernel/drivers/tty/tty.h:10:9: note: previous definition is here
+   10 | #define PTY_TRACE 0
+      |         ^
+1 warning generated.
+kernel/time/lapic.c:66:15: warning: duplicate 'static' declaration specifier [-Wduplicate-decl-specifier]
+   66 | ALWAYS_INLINE static void wrmsr_u32(uint32_t msr, uint32_t val) {
+      |               ^~~~~~
+kernel/time/lapic.c:73:15: warning: duplicate 'static' declaration specifier [-Wduplicate-decl-specifier]
+   73 | ALWAYS_INLINE static void wrmsr_u64(uint32_t msr, uint64_t val) {
+      |               ^~~~~~
+kernel/time/lapic.c:82:15: warning: duplicate 'static' declaration specifier [-Wduplicate-decl-specifier]
+   82 | ALWAYS_INLINE static uint32_t rdmsr_u32(uint32_t msr) {
+      |               ^~~~~~
+kernel/time/lapic.c:89:15: warning: duplicate 'static' declaration specifier [-Wduplicate-decl-specifier]
+   89 | ALWAYS_INLINE static uint64_t rdmsr_u64(uint32_t msr) {
+      |               ^~~~~~
+kernel/time/lapic.c:97:15: warning: duplicate 'static' declaration specifier [-Wduplicate-decl-specifier]
+   97 | ALWAYS_INLINE static void cpuid(uint32_t leaf,
+      |               ^~~~~~
+5 warnings generated.
+    [skip] asm_offsets.c
+[+] Building UEFI bootloader (clang → PE32+)
+[+] Checking sizes
+build/kernel.bin 308475
+build/BOOTX64.EFI 8192
+[+] Creating disk image (GPT + ESP + ext2)
+[+] Building ext2 filesystem
+[+] /etc/passwd and /etc/shadow installed
+[+] /etc/services/net.svc installed
+[+] smp_test ELF installed at bin/smp_test (root:root 0755)
+[+] shell ELF installed at bin/shell (root:root 0755)
+[+] ps ELF installed at bin/ps (root:root 0755)
+[+] net ELF installed at bin/net (root:root 0755)
+[+] svcmgr ELF installed at bin/svcmgr (root:root 0755)
+[+] restrict ELF installed at bin/restrict (root:root 0755)
+[+] http_get ELF installed at bin/http_get (root:root 0755)
+[+] ksec ELF installed at bin/ksec (root:root 0755)
+[+] login ELF installed at bin/login (root:root 0755)
+[+] ls ELF installed at bin/ls (root:root 0755)
+[+] doom ELF installed at bin/doom (root:root 0755)
+[+] bash ELF installed at bin/bash (root:root 0755)
+[+] cat ELF installed at bin/cat (root:root 0755)
+[+] echo ELF installed at bin/echo (root:root 0755)
+[+] mkdir ELF installed at bin/mkdir (root:root 0755)
+[+] rm ELF installed at bin/rm (root:root 0755)
+[+] mv ELF installed at bin/mv (root:root 0755)
+[+] clear ELF installed at bin/clear (root:root 0755)
+[+] reboot ELF installed at bin/reboot (root:root 0755)
+[+] makadisplay ELF installed at bin/makadisplay (root:root 0755)
+[+] demo_client ELF installed at bin/demo_client (root:root 0755)
+[+] makaterm ELF installed at bin/makaterm (root:root 0755)
+[+] WAD installed: userland/apps/doom/doom1.wad → /bin/doom1.wad (root:root 0644)
+build/disk.img 36700160
+[+] Running QEMU (UEFI/OVMF)
+./build.sh: line 623: 35074 Killed                  qemu-system-x86_64 -accel kvm -cpu host -smp 4 -m 256M -nodefaults -no-user-config -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$OVMF_VARS" -drive format=raw,file="$BUILD_DIR/disk.img",if=none,id=hd0 -device ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 -vga std -display none -audiodev pa,id=snd0,server=/mnt/wslg/PulseServer -device intel-hda -device hda-duplex,audiodev=snd0 -netdev user,id=net0,hostfwd=tcp::18080-:80 -device virtio-net-pci,netdev=net0 -object filter-dump,id=f1,netdev=net0,file=build/net.pcap -serial file:build/serial.txt -monitor none -gdb tcp::1234 -no-reboot -no-shutdown

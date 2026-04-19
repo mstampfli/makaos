@@ -1,11 +1,11 @@
-	.file	"asm_offsets.c"
 	.text
+	.file	"asm_offsets.c"
 	.globl	asm_offsets                     # -- Begin function asm_offsets
-	.p2align	4
+	.p2align	4, 0x90
 	.type	asm_offsets,@function
 asm_offsets:                            # @asm_offsets
 .Lfunc_begin0:
-	.file	0 "/home/kali/Documents/dev/MakaOS/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
+	.file	0 "/home/maka/dev/MakaOS/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
 	.loc	0 28 0                          # kernel/arch/x86_64/asm_offsets.c:28:0
 	.cfi_sections .debug_frame
 	.cfi_startproc
@@ -18,79 +18,79 @@ asm_offsets:                            # @asm_offsets
 .Ltmp0:
 	.loc	0 29 5 prologue_end             # kernel/arch/x86_64/asm_offsets.c:29:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_TSS_RSP0 796"
+	.ascii	"@@@ASMDEF CPU_TSS_RSP0 17716"
 	#NO_APP
 	.loc	0 34 5                          # kernel/arch/x86_64/asm_offsets.c:34:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RSP 896"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RSP 17816"
 	#NO_APP
 	.loc	0 35 5                          # kernel/arch/x86_64/asm_offsets.c:35:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RIP 904"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RIP 17824"
 	#NO_APP
 	.loc	0 36 5                          # kernel/arch/x86_64/asm_offsets.c:36:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RFLAGS 912"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RFLAGS 17832"
 	#NO_APP
 	.loc	0 37 5                          # kernel/arch/x86_64/asm_offsets.c:37:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RBP 920"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RBP 17840"
 	#NO_APP
 	.loc	0 38 5                          # kernel/arch/x86_64/asm_offsets.c:38:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RBX 928"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RBX 17848"
 	#NO_APP
 	.loc	0 39 5                          # kernel/arch/x86_64/asm_offsets.c:39:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R12 936"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R12 17856"
 	#NO_APP
 	.loc	0 40 5                          # kernel/arch/x86_64/asm_offsets.c:40:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R13 944"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R13 17864"
 	#NO_APP
 	.loc	0 41 5                          # kernel/arch/x86_64/asm_offsets.c:41:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R14 952"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R14 17872"
 	#NO_APP
 	.loc	0 42 5                          # kernel/arch/x86_64/asm_offsets.c:42:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R15 960"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R15 17880"
 	#NO_APP
 	.loc	0 43 5                          # kernel/arch/x86_64/asm_offsets.c:43:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_ARG5 968"
+	.ascii	"@@@ASMDEF CPU_SC_ARG5 17888"
 	#NO_APP
 	.loc	0 44 5                          # kernel/arch/x86_64/asm_offsets.c:44:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_ARG6 976"
+	.ascii	"@@@ASMDEF CPU_SC_ARG6 17896"
 	#NO_APP
 	.loc	0 45 5                          # kernel/arch/x86_64/asm_offsets.c:45:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_DELIVER 984"
+	.ascii	"@@@ASMDEF CPU_SIG_DELIVER 17904"
 	#NO_APP
 	.loc	0 46 5                          # kernel/arch/x86_64/asm_offsets.c:46:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_IN_SYSCALL 985"
+	.ascii	"@@@ASMDEF CPU_SIG_IN_SYSCALL 17905"
 	#NO_APP
 	.loc	0 47 5                          # kernel/arch/x86_64/asm_offsets.c:47:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_RDI 992"
+	.ascii	"@@@ASMDEF CPU_SIG_RDI 17912"
 	#NO_APP
 	.loc	0 48 5                          # kernel/arch/x86_64/asm_offsets.c:48:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_REQUESTED 1000"
+	.ascii	"@@@ASMDEF CPU_EXEC_REQUESTED 17920"
 	#NO_APP
 	.loc	0 49 5                          # kernel/arch/x86_64/asm_offsets.c:49:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_ENTRY 1008"
+	.ascii	"@@@ASMDEF CPU_EXEC_ENTRY 17928"
 	#NO_APP
 	.loc	0 50 5                          # kernel/arch/x86_64/asm_offsets.c:50:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_RSP 1016"
+	.ascii	"@@@ASMDEF CPU_EXEC_RSP 17936"
 	#NO_APP
 	.loc	0 51 5                          # kernel/arch/x86_64/asm_offsets.c:51:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_PML4 1024"
+	.ascii	"@@@ASMDEF CPU_EXEC_PML4 17944"
 	#NO_APP
 	.loc	0 52 1 epilogue_begin           # kernel/arch/x86_64/asm_offsets.c:52:1
 	popq	%rbp
@@ -187,13 +187,13 @@ asm_offsets:                            # @asm_offsets
 .Lstr_offsets_base0:
 	.section	.debug_str,"MS",@progbits,1
 .Linfo_string0:
-	.asciz	"Debian clang version 21.1.8 (3+b1)" # string offset=0
+	.asciz	"Ubuntu clang version 18.1.3 (1ubuntu1)" # string offset=0
 .Linfo_string1:
-	.asciz	"kernel/arch/x86_64/asm_offsets.c" # string offset=35
+	.asciz	"kernel/arch/x86_64/asm_offsets.c" # string offset=39
 .Linfo_string2:
-	.asciz	"/home/kali/Documents/dev/MakaOS/bootloader-kernel-in-NASM" # string offset=68
+	.asciz	"/home/maka/dev/MakaOS/bootloader-kernel-in-NASM" # string offset=72
 .Linfo_string3:
-	.asciz	"asm_offsets"                   # string offset=126
+	.asciz	"asm_offsets"                   # string offset=120
 	.section	.debug_str_offsets,"",@progbits
 	.long	.Linfo_string0
 	.long	.Linfo_string1
@@ -208,7 +208,7 @@ asm_offsets:                            # @asm_offsets
 .Laddr_table_base0:
 	.quad	.Lfunc_begin0
 .Ldebug_addr_end0:
-	.ident	"Debian clang version 21.1.8 (3+b1)"
+	.ident	"Ubuntu clang version 18.1.3 (1ubuntu1)"
 	.section	".note.GNU-stack","",@progbits
 	.addrsig
 	.section	.debug_line,"",@progbits

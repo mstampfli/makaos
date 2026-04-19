@@ -444,6 +444,8 @@ int socket_connect(vfs_file_t* f, uint32_t dst_ip_be, uint16_t dst_port) {
 
 // ── socket_send ───────────────────────────────────────────────────────────
 
+static int udp_auto_bind(socket_t* s);
+
 int socket_send(vfs_file_t* f, const void* buf, uint32_t len) {
     if (!f) return -EBADF;
     if (!buf || !len) return -EINVAL;
@@ -459,6 +461,8 @@ int socket_send(vfs_file_t* f, const void* buf, uint32_t len) {
 
     // UDP: requires a peer set via connect() or sendto().
     if (s->udp_peer_ip == 0 || s->udp_peer_port == 0) return -EDESTADDRREQ;
+    int ar = udp_auto_bind(s);
+    if (ar < 0) return ar;
     int r = udp_send(s->udp_peer_ip, s->local_port, s->udp_peer_port,
                       buf, (uint16_t)len);
     return (r < 0) ? -EIO : (int)len;
@@ -506,6 +510,25 @@ static int is_broadcast_dst(uint32_t dst_ip_be) {
     return 0;
 }
 
+// Auto-allocate and register an ephemeral UDP port if the socket hasn't
+// been explicitly bound.  Required so datagram replies can be demuxed back
+// to this socket.  Starts at 49152; retries on collision.
+static int udp_auto_bind(socket_t* s) {
+    if (s->bound && s->local_port) return 0;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        uint16_t p = tcp_ephemeral_port();           // shared 49152-65535 pool
+        if (p < 1024) continue;
+        int r = udp_table_register(p, s);
+        if (r == 0) {
+            s->local_port = p;
+            s->bound      = 1;
+            return 0;
+        }
+        if (r != -EADDRINUSE) return r;
+    }
+    return -EADDRINUSE;
+}
+
 int socket_sendto(vfs_file_t* f, const void* buf, uint32_t len,
                    uint32_t dst_ip_be, uint16_t dst_port) {
     if (!f) return -EBADF;
@@ -516,6 +539,10 @@ int socket_sendto(vfs_file_t* f, const void* buf, uint32_t len,
 
     // POSIX: sending to a broadcast address requires SO_BROADCAST.
     if (is_broadcast_dst(dst_ip_be) && !s->broadcast) return -EACCES;
+
+    // Auto-bind to an ephemeral port so the reply can be demuxed back.
+    int ar = udp_auto_bind(s);
+    if (ar < 0) return ar;
 
     // Remember peer for subsequent send() calls.
     s->udp_peer_ip   = dst_ip_be;
