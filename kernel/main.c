@@ -372,6 +372,13 @@ static void init_kthread(void) {
     (void)stress_pread_launch;
 
     // NVMe stress: 4 kthreads × 10000 random 4 KiB reads vs reference.
+    // Phase 1 of the work-stealing scheduler refactor: verify the
+    // Chase-Lev deque primitive under live SMP before any scheduler
+    // code consumes it.  Must run AFTER smp_boot_aps() so thieves
+    // actually land on remote CPUs.
+    extern void chaselev_selftest(void);
+    chaselev_selftest();
+
     stress_nvme_launch();
     stress_ahci_launch();
 
