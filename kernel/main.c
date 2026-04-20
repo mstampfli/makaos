@@ -425,6 +425,11 @@ static void init_kthread(void) {
     extern void slab_typesafe_selftest(void);
     slab_typesafe_selftest();
 
+    // Phase 7F: dcache acceptance — negative-dentry invalidation
+    // semantics + warm-cache path-walk speedup.
+    extern void dcache_selftest(void);
+    dcache_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.

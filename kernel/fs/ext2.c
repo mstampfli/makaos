@@ -5,6 +5,8 @@
 #include "smp.h"
 #include "seqlock.h"
 #include "rcu.h"
+#include "dcache.h"    // Phase 7: cached path-component lookups +
+                       // invalidation hooks at every mutation site
 
 // ── Multi-task / SMP-safe scratch buffers ───────────────────────────────
 // Function-local 4 KiB scratch buffers cannot live in BSS (would race
@@ -323,11 +325,24 @@ static void bcache_put(bcache_ref_t* r) {
 #define IRTREE_SIZE  (1u << IRTREE_BITS)   // 256
 #define IRTREE_MASK  (IRTREE_SIZE - 1u)
 
-typedef struct {
+typedef struct irtree_leaf_t {
     seqlock_t    seq;             // per-inode seqlock; readers never block
     ext2_inode_t inode;
     uint32_t     ino;
     uint8_t      valid;
+
+    // Phase 7E: refcount + activity timestamp for eviction.  Bumped
+    // by inode_lock (writer) and by the implicit hold during
+    // irtree_get's rcu_read_lock section.  last_used_ns is updated
+    // on every access (relaxed store — pure hint for the shrinker).
+    volatile uint32_t refcount;
+    volatile uint64_t last_used_ns;
+
+    // Phase 7E: RCU callback head for async free under
+    // SLAB_TYPESAFE_BY_RCU semantics.  Memory stays irtree_leaf_t-
+    // typed during the grace period so concurrent irtree_get
+    // readers are safe to dereference.
+    rcu_head_t   rcu_head;
 } irtree_leaf_t;
 
 typedef struct {
@@ -335,9 +350,19 @@ typedef struct {
 } irtree_l1_t;
 
 static irtree_l1_t* s_irtree[IRTREE_SIZE];  // L0: 256 pointers
-// Single allocation lock — only taken the first time a given inode is
-// touched.  Two CPUs racing to add the same leaf both end up sharing one.
+// Allocation + eviction lock.  Taken briefly on first-touch alloc
+// and by the shrinker when evicting.
 static spinlock_t   s_irtree_alloc_lock = SPINLOCK_INIT;
+
+// Phase 7E: dedicated SLAB_TYPESAFE_BY_RCU cache for leaves.  After
+// an eviction, the page memory remains irtree_leaf_t-typed for an
+// RCU grace period so readers mid-irtree_get stay safe even if they
+// already loaded the pointer.  The seqlock + ino check detects
+// instance reuse (fresh alloc in the same slot).
+static slab_cache_t s_irtree_leaf_cache;
+static uint8_t       s_irtree_cache_inited = 0;
+
+extern uint64_t tsc_read_ns(void);
 
 // Lookup: plain acquire-loads down the L0 / L1 chain.  No lock needed
 // because every store in irtree_alloc is publish-once with release
@@ -354,11 +379,23 @@ static irtree_leaf_t* irtree_lookup(uint32_t ino) {
 
 // Allocate a fresh leaf if none exists yet.  Idempotent.  Returns NULL
 // on OOM.
-static irtree_leaf_t* irtree_alloc(uint32_t ino) {
+// Lazy-init the typesafe leaf cache on first use.  Called under
+// s_irtree_alloc_lock so we don't race two CPUs initialising the
+// same cache struct.
+static void irtree_cache_init_once_locked(void) {
+    if (s_irtree_cache_inited) return;
+    pmm_slab_cache_init(&s_irtree_leaf_cache, sizeof(irtree_leaf_t),
+                        SLAB_TYPESAFE_BY_RCU);
+    s_irtree_cache_inited = 1;
+}
+
+static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
     uint32_t l0 = (ino >> IRTREE_BITS) & IRTREE_MASK;
     uint32_t l1 = ino & IRTREE_MASK;
 
     spin_lock(&s_irtree_alloc_lock);
+    irtree_cache_init_once_locked();
+
     irtree_l1_t* l1tab = s_irtree[l0];
     if (!l1tab) {
         l1tab = kmalloc(sizeof(irtree_l1_t));
@@ -367,14 +404,27 @@ static irtree_leaf_t* irtree_alloc(uint32_t ino) {
         __atomic_store_n(&s_irtree[l0], l1tab, __ATOMIC_RELEASE);
     }
     irtree_leaf_t* leaf = l1tab->leaves[l1];
-    if (!leaf) {
-        leaf = kmalloc(sizeof(irtree_leaf_t));
-        if (!leaf) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
-        seqlock_init(&leaf->seq);
-        leaf->ino   = ino;
-        leaf->valid = 0;
-        __atomic_store_n(&l1tab->leaves[l1], leaf, __ATOMIC_RELEASE);
+    if (leaf) {
+        // Already present (another CPU raced us here).  Bump its
+        // refcount and return — the caller's rcu_read_lock kept it
+        // alive against any concurrent eviction that might have
+        // been in flight before we grabbed s_irtree_alloc_lock.
+        __atomic_fetch_add(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&leaf->last_used_ns, tsc_read_ns(), __ATOMIC_RELAXED);
+        spin_unlock(&s_irtree_alloc_lock);
+        return leaf;
     }
+
+    // Fresh allocation from the typesafe slab.
+    leaf = (irtree_leaf_t*)pmm_slab_alloc(&s_irtree_leaf_cache);
+    if (!leaf) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
+    seqlock_init(&leaf->seq);
+    leaf->ino          = ino;
+    leaf->valid        = 0;
+    leaf->refcount     = 1;     // caller gets one reference
+    leaf->last_used_ns = tsc_read_ns();
+    __atomic_store_n(&l1tab->leaves[l1], leaf, __ATOMIC_RELEASE);
+
     spin_unlock(&s_irtree_alloc_lock);
     return leaf;
 }
@@ -395,13 +445,29 @@ static uint8_t inode_load_into(uint32_t ino, ext2_inode_t* out);
 // Benign race: two CPUs may load the same inode concurrently; both
 // publish identical bytes.  Last-writer-wins is correct.
 static irtree_leaf_t* inode_lock(uint32_t ino) {
+    // Phase 7E: lookup + refcount bump atomic w.r.t. eviction.
+    // rcu_read_lock pins any leaf we find against concurrent reclaim.
+    // On hit, we bump refcount before dropping rcu.  On miss, we
+    // fall through to irtree_alloc_with_ref which takes the
+    // alloc-lock and installs a new leaf (also refcounted).
+    rcu_read_lock();
     irtree_leaf_t* leaf = irtree_lookup(ino);
-    if (!leaf) leaf = irtree_alloc(ino);
-    if (!leaf) return NULL;
+    if (leaf && leaf->ino == ino) {
+        __atomic_fetch_add(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&leaf->last_used_ns, tsc_read_ns(), __ATOMIC_RELAXED);
+        rcu_read_unlock();
+    } else {
+        rcu_read_unlock();
+        leaf = irtree_alloc_with_ref(ino);
+        if (!leaf) return NULL;
+    }
 
     if (!leaf->valid) {
         ext2_inode_t tmp;
-        if (!inode_load_into(ino, &tmp)) return NULL;
+        if (!inode_load_into(ino, &tmp)) {
+            __atomic_fetch_sub(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
+            return NULL;
+        }
         seq_write_begin(&leaf->seq);
         if (!leaf->valid) {              // re-check under write lock
             leaf->inode = tmp;
@@ -416,15 +482,23 @@ static irtree_leaf_t* inode_lock(uint32_t ino) {
 }
 
 static void inode_unlock(irtree_leaf_t* leaf) {
-    if (leaf) seq_write_end(&leaf->seq);
+    if (!leaf) return;
+    seq_write_end(&leaf->seq);
+    __atomic_fetch_sub(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
 }
 
 // Brief-section reader: copy the cached inode out under a seqlock retry
 // loop.  No atomics on a consistent read.  Loops on the rare collision
 // where a writer is mid-update.
+//
+// Phase 7E: wrapped in rcu_read_lock so the leaf memory stays
+// irtree_leaf_t-typed even if a concurrent shrinker evicts the slot.
+// The leaf->ino check inside the retry loop detects slab slot reuse
+// across a grace period.
 static uint8_t irtree_get(uint32_t ino, ext2_inode_t* out) {
+    rcu_read_lock();
     irtree_leaf_t* leaf = irtree_lookup(ino);
-    if (!leaf) return 0;
+    if (!leaf) { rcu_read_unlock(); return 0; }
     uint32_t s;
     uint8_t valid;
     do {
@@ -432,7 +506,84 @@ static uint8_t irtree_get(uint32_t ino, ext2_inode_t* out) {
         valid = leaf->valid && leaf->ino == ino;
         if (valid) *out = leaf->inode;
     } while (seq_retry(&leaf->seq, s));
+    // Bump last_used_ns even on a hit — keeps the leaf out of the
+    // shrinker's "cold" set as long as something's reading it.
+    // Relaxed store; pure hint.
+    if (valid) __atomic_store_n(&leaf->last_used_ns, tsc_read_ns(),
+                                  __ATOMIC_RELAXED);
+    rcu_read_unlock();
     return valid;
+}
+
+// ── Phase 7E: inode cache shrinker ─────────────────────────────────────
+//
+// Walks every (l0, l1) slot, evicts leaves with refcount == 0 older
+// than `idle_ns_cutoff`, up to `max` evictions per call.
+//
+// Eviction sequence:
+//   1. Under s_irtree_alloc_lock, re-check refcount == 0.
+//   2. atomic_store NULL into l1tab->leaves[l1] — future lookups miss.
+//   3. call_rcu_head(&leaf->rcu_head, irtree_leaf_free_cb, leaf) —
+//      defer the slab free until every concurrent irtree_get reader
+//      has passed through an RCU quiescent state.
+//
+// Readers mid-irtree_get who already loaded the leaf pointer stay
+// safe because:
+//   - They're inside rcu_read_lock; the callback can't fire until
+//     they rcu_read_unlock.
+//   - SLAB_TYPESAFE_BY_RCU keeps the memory irtree_leaf_t-typed for
+//     the grace period, so struct-field access doesn't UAF.
+//   - The leaf->ino check inside the seqlock loop catches instance
+//     reuse if the slab slot gets recycled by another inode.
+
+static void irtree_leaf_free_cb(void* p) {
+    pmm_slab_free(p);
+}
+
+// Returns number of leaves evicted.  `idle_ns_cutoff` = "if
+// last_used_ns < now - cutoff, candidate for eviction".  `max`
+// caps the scan to bounded work per call.
+uint32_t irtree_shrink(uint32_t max, uint64_t idle_ns_cutoff) {
+    if (!s_irtree_cache_inited || max == 0) return 0;
+    uint64_t now = tsc_read_ns();
+    uint32_t evicted = 0;
+
+    for (uint32_t l0 = 0; l0 < IRTREE_SIZE && evicted < max; l0++) {
+        irtree_l1_t* l1tab = __atomic_load_n(&s_irtree[l0], __ATOMIC_ACQUIRE);
+        if (!l1tab) continue;
+        for (uint32_t l1 = 0; l1 < IRTREE_SIZE && evicted < max; l1++) {
+            irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1],
+                                                    __ATOMIC_ACQUIRE);
+            if (!leaf) continue;
+
+            // Quick unlocked check — spares the lock acquire when
+            // the leaf is hot.  A racy race (leaf gets touched between
+            // the check and the lock) just means we bail inside the
+            // locked block.
+            if (__atomic_load_n(&leaf->refcount, __ATOMIC_ACQUIRE) != 0)
+                continue;
+            uint64_t last = __atomic_load_n(&leaf->last_used_ns,
+                                              __ATOMIC_RELAXED);
+            if (now - last < idle_ns_cutoff) continue;
+
+            // Evict under the alloc lock (serialises vs concurrent
+            // irtree_alloc_with_ref on the same slot).
+            spin_lock(&s_irtree_alloc_lock);
+            // Re-check: refcount could have been bumped, leaf could
+            // have been evicted by another shrinker, etc.
+            if (__atomic_load_n(&l1tab->leaves[l1], __ATOMIC_RELAXED) != leaf
+                || __atomic_load_n(&leaf->refcount, __ATOMIC_ACQUIRE) != 0) {
+                spin_unlock(&s_irtree_alloc_lock);
+                continue;
+            }
+            // Unpublish: future irtree_lookup returns NULL for this ino.
+            __atomic_store_n(&l1tab->leaves[l1], NULL, __ATOMIC_RELEASE);
+            spin_unlock(&s_irtree_alloc_lock);
+            call_rcu_head(&leaf->rcu_head, irtree_leaf_free_cb, leaf);
+            evicted++;
+        }
+    }
+    return evicted;
 }
 
 
@@ -644,14 +795,6 @@ static uint32_t str_len(const char* s) {
     return n;
 }
 
-static int str_cmp_n(const char* a, const char* b, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) {
-        if (a[i] != b[i]) return (int)(unsigned char)a[i] - (int)(unsigned char)b[i];
-        if (a[i] == '\0') return 0;
-    }
-    return 0;
-}
-
 // ── Block address resolution (direct + single indirect) ───────────────────
 
 // Return the block number for the Nth logical block of an inode.
@@ -848,7 +991,7 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
             if (de->rec_len == 0) break;
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
-                str_cmp_n(de->name, name, name_len) == 0) {
+                kmemeq(de->name, name, name_len)) {
                 found = de->inode;
                 break;
             }
@@ -1753,7 +1896,7 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
 
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
-                str_cmp_n(de->name, name, name_len) == 0) {
+                kmemeq(de->name, name, name_len)) {
                 de->inode = 0;
                 write_block(blk, dre_buf);
                 ok = 1;
@@ -1924,6 +2067,10 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
         return 0;
     }
 
+    // Phase 7C: create-via-write path — invalidate any negative
+    // dentry that cached ENOENT for this file.
+    dcache_invalidate(parent_ino, basename, str_len(basename));
+
     return 1;
 }
 
@@ -1941,7 +2088,12 @@ int ext2_create(const char* path) {
     // Fail if already exists.
     if (dir_lookup(&parent_inode, basename, str_len(basename))) return 0;
     // Create empty file via ext2_write_file.
-    return ext2_write_file(path, (const uint8_t*)"", 0);
+    int r = ext2_write_file(path, (const uint8_t*)"", 0);
+    // Phase 7C: invalidate any negative dentry that cached ENOENT
+    // at this path.  After create, the path exists — future lookups
+    // should re-resolve and install a positive dentry.
+    if (r) dcache_invalidate(parent_ino, basename, str_len(basename));
+    return r;
 }
 
 // ── ext2_truncate ─────────────────────────────────────────────────────────
@@ -2012,6 +2164,21 @@ int ext2_truncate_to(const char* path, uint64_t length) {
 #include "cred.h"
 #include "errno.h"
 
+// Phase 7B: dcache-accelerated path walk.
+//
+// For each path component:
+//   1. Compute name hash.
+//   2. rcu-protected dcache lookup for (cur_ino, name, hash).
+//   3. On hit: use cached child_ino (or fail for DCACHE_NEGATIVE).
+//      Still read the parent inode to check the EXEC bit against the
+//      caller's creds — cached perms per-cred would be another layer
+//      and inode read is already cheap (seqlock reader on irtree).
+//   4. On miss: do the original O(N) dir_lookup + install a positive
+//      or negative dentry for next time.
+//
+// Net effect: repeated walks of the same path skip the per-component
+// directory-block scan entirely (dir_lookup is the single biggest
+// cost in path walk).
 uint32_t ext2_lookup_path(const char* path, const void* cred, int* err_out) {
     if (err_out) *err_out = 0;
     if (!s_mounted || !path || path[0] != '/') {
@@ -2032,7 +2199,11 @@ uint32_t ext2_lookup_path(const char* path, const void* cred, int* err_out) {
             break;
         }
 
-        // Check execute (search) permission on the current directory.
+        const char* name      = path + start;
+        uint32_t    name_hash = dcache_name_hash(name, comp_len);
+
+        // Read parent inode for dir-type + EXEC-perm check.  Fast:
+        // irtree hit is a seqlock read (zero atomics).
         ext2_inode_t cur_inode;
         if (!read_inode(cur_ino, &cur_inode)) {
             if (err_out) *err_out = -ENOENT;
@@ -2058,10 +2229,33 @@ uint32_t ext2_lookup_path(const char* path, const void* cred, int* err_out) {
             }
         }
 
-        cur_ino = dir_lookup(&cur_inode, path + start, comp_len);
-        if (!cur_ino) {
-            if (err_out) *err_out = -ENOENT;
-            return 0;
+        // Try the dcache.
+        dentry_t* d = dcache_lookup(cur_ino, name, comp_len, name_hash);
+        if (d) {
+            uint32_t child = d->child_ino;
+            dcache_put(d);
+            if (child == DCACHE_NEGATIVE) {
+                if (err_out) *err_out = -ENOENT;
+                return 0;
+            }
+            cur_ino = child;
+        } else {
+            // Miss — fall through to on-disk directory scan.
+            uint32_t next_ino = dir_lookup(&cur_inode, name, comp_len);
+            if (!next_ino) {
+                // Install negative dentry so future lookups of the
+                // same path skip the scan.
+                dentry_t* neg = dcache_install(NULL, cur_ino, name, comp_len,
+                                                name_hash, DCACHE_NEGATIVE);
+                if (neg) dcache_put(neg);
+                if (err_out) *err_out = -ENOENT;
+                return 0;
+            }
+            // Install positive dentry.
+            dentry_t* pos = dcache_install(NULL, cur_ino, name, comp_len,
+                                            name_hash, next_ino);
+            if (pos) dcache_put(pos);
+            cur_ino = next_ino;
         }
 
         if (path[i] == '/') i++;
@@ -2182,6 +2376,11 @@ int ext2_mkdir(const char* path) {
         spin_unlock(&s_group_locks[g]);
     }
 
+    // Phase 7C: any negative dentry at (parent, basename) is now stale
+    // — the directory exists.  Invalidating lets the next lookup
+    // install a fresh positive dentry pointing at new_ino.
+    dcache_invalidate(parent_ino, basename, str_len(basename));
+
     return 1;
 }
 
@@ -2231,6 +2430,12 @@ int ext2_unlink(const char* path) {
         inode_writeback(leaf);
         inode_unlock(leaf);
     }
+
+    // Phase 7C: invalidate the dentry that cached this path component.
+    // Future lookups for (parent_ino, basename) will miss dcache and
+    // either find a new entry (if another inode got reinstalled under
+    // the same name) or install a negative dentry.
+    dcache_invalidate(parent_ino, basename, str_len(basename));
 
     return 1;
 }
@@ -2306,6 +2511,13 @@ int ext2_rename(const char* src, const char* dst) {
 
     // Remove old directory entry.
     dir_remove_entry(src_parent_ino, src_base);
+
+    // Phase 7C: invalidate both the src dentry (moved away) and any
+    // cached negative dentry at the dst (which may previously have
+    // cached ENOENT).  If dst_ino was set we also killed an old
+    // positive dentry for that path.
+    dcache_invalidate(src_parent_ino, src_base, str_len(src_base));
+    dcache_invalidate(dst_parent_ino, dst_base, str_len(dst_base));
 
     spin_unlock(&s_rename_lock);
     return 1;
