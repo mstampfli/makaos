@@ -30,6 +30,7 @@
 #include "common.h"
 #include "process.h"
 #include "sched.h"
+#include "../fs/dcache.h"      // Phase 7D: dcache LRU reclaim hook
 
 #define SHRINK_IDLE_INTERVAL_NS     (5000000000ULL)  // 5 s  — plenty free
 #define SHRINK_MODERATE_INTERVAL_NS (1000000000ULL)  // 1 s  — moderate
@@ -63,6 +64,10 @@ static void slab_shrinker_kthread_entry(void) {
             pmm_pcp_lock(&f);
             pmm_slab_shrink_bounded_locked(4);
             pmm_pcp_unlock(f);
+            dcache_shrink(32);      // Phase 7D: light dcache trim
+            // Phase 7E: trim inode cache leaves idle >= 60s.
+            extern uint32_t irtree_shrink(uint32_t, uint64_t);
+            irtree_shrink(32, 60ULL * 1000 * 1000 * 1000);
             sleep_ns = SHRINK_MODERATE_INTERVAL_NS;
         } else if (ratio_bp >= 2500) {
             // Notable pressure — drain half the empty list per cache
@@ -72,6 +77,10 @@ static void slab_shrinker_kthread_entry(void) {
             pmm_slab_shrink_bounded_locked(32);
             pmm_pcp_unlock(f);
             pcp_drain_all();
+            dcache_shrink(256);     // Phase 7D: moderate dcache trim
+            // Phase 7E: trim inode cache leaves idle >= 10s.
+            extern uint32_t irtree_shrink(uint32_t, uint64_t);
+            irtree_shrink(256, 10ULL * 1000 * 1000 * 1000);
             sleep_ns = SHRINK_PRESSURE_INTERVAL_NS;
         } else {
             // Starving — reclaim everything reclaimable, tight loop.
@@ -80,6 +89,11 @@ static void slab_shrinker_kthread_entry(void) {
             pmm_slab_shrink_all_locked();
             pmm_pcp_unlock(f);
             pcp_drain_all();
+            dcache_shrink(UINT32_MAX);   // Phase 7D: reclaim all
+                                         // refcount-0 dentries.
+            // Phase 7E: reclaim ALL refcount-0 leaves regardless of age.
+            extern uint32_t irtree_shrink(uint32_t, uint64_t);
+            irtree_shrink(UINT32_MAX, 0);
             sleep_ns = SHRINK_EMERGENCY_INTERVAL_NS;
         }
 

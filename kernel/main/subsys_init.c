@@ -19,7 +19,13 @@
 static int _tty_init(void)   { tty_init();        return 0; }
 static int _evdev_init(void) { evdev_init();       return 0; }
 static int _ahci_init(void)  { ahci_init();        return 0; }
-static int _ext2_init(void)  { ext2_init(4096);    return 0; }
+static int _ext2_init(void)  {
+    extern void dcache_init(void);
+    dcache_init();           // Phase 7A: dentry cache must exist
+                             // before first path walk.
+    ext2_init(4096);
+    return 0;
+}
 
 // tty: no kernel deps at this level (tty_init only needs the heap)
 DEFINE_INITCALL(tty, INITCALL_LEVEL_EARLY, .fn = _tty_init);
