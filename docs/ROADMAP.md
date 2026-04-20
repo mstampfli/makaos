@@ -35,22 +35,58 @@ All installed into `$SYSROOT/usr/{lib,include}` via a `scripts/port-FOO.sh`.
 - **harfbuzz** — complex-script shaping (needs freetype)
 - **fontconfig** — font discovery (needs freetype + expat)
 
-## Tier 2.5 — kernel DRM/KMS subsystem
+## Tier 2.5 — kernel DRM/KMS subsystem on virtio-gpu
 
-The real cost of Hyprland.  Not portable, must be written for MakaOS.
+**Strategy:** implement a **virtio-gpu** driver as the kernel's first
+real DRM device, then expose the Linux-compatible DRM/KMS uAPI on top
+of it.  virtio-gpu is a standard PCI virtio device emulated by QEMU
+(`-device virtio-gpu-pci`), has a clean, fully-public spec, supports
+real modesetting + cursor + page-flip + hardware scanout via host-
+resident resources, and optionally 3D/virgl for GL acceleration.  It
+replaces the flat GOP framebuffer we currently scanout to — the GOP
+path stays as a fallback for pre-virtio-gpu consoles.
 
-- `/dev/dri/card0` character device
-- Core ioctls: `GET_CAP`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR`,
-  `MODE_GETCRTC`, `MODE_GETENCODER`, `MODE_SETCRTC`, `MODE_ADDFB2`,
-  `MODE_RMFB`, `MODE_PAGE_FLIP`, `MODE_CREATE_DUMB`, `MODE_MAP_DUMB`,
-  `MODE_DESTROY_DUMB`, `SET_MASTER`, `DROP_MASTER`, `MODE_GETGAMMA`
-- One CRTC, one connector, one encoder — the GOP framebuffer.  No
-  real modesetting; report boot mode and keep it.
-- Dumb buffers back onto anonymous pages.  Page-flip swaps which
-  buffer the GOP FB samples from, vsync fake-synchronised to a
-  timer (we have no true vblank IRQ yet).
+### Tier 2.5a — virtio-gpu driver
+`kernel/drivers/video/virtio_gpu.c`
+- PCI enumeration + virtio common (virtqueue setup, feature negotiation,
+  MSI-X or legacy IRQ).
+- Control queue: `RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`,
+  `SET_SCANOUT`, `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`,
+  `GET_DISPLAY_INFO`, `RESOURCE_UNREF`, `UPDATE_CURSOR`, `MOVE_CURSOR`.
+- Cursor queue (secondary virtqueue, same format as control).
+- Multi-scanout support (virtio-gpu reports N displays — one per
+  connector in the DRM wrapper).
+- 3D: defer virgl / TRANSFER_TO_HOST_3D until after Hyprland lands
+  on the 2D path; wlroots-pixman renderer doesn't need GL.
 
-Budget: ~2 KLOC kernel, 1–2 weeks focused.
+### Tier 2.5b — DRM/KMS uAPI layer
+`kernel/drivers/video/drm.c` + `/dev/dri/card0` chardev
+- Implements the Linux DRM ioctl surface libdrm expects:
+  `GET_CAP`, `MODE_GETRESOURCES`, `MODE_GETCONNECTOR`, `MODE_GETCRTC`,
+  `MODE_GETENCODER`, `MODE_SETCRTC`, `MODE_ADDFB2`, `MODE_RMFB`,
+  `MODE_PAGE_FLIP`, `MODE_CREATE_DUMB`, `MODE_MAP_DUMB`,
+  `MODE_DESTROY_DUMB`, `SET_MASTER`, `DROP_MASTER`, `MODE_GETGAMMA`,
+  `PRIME_HANDLE_TO_FD`, `PRIME_FD_TO_HANDLE`.
+- Translates DRM concepts → virtio-gpu resources:
+  - dumb buffer = `RESOURCE_CREATE_2D` + anonymous host-backing pages
+  - ADDFB2 = handle wrapper (no upload until a SETCRTC references it)
+  - SETCRTC / PAGE_FLIP = `SET_SCANOUT` + `TRANSFER_TO_HOST_2D` +
+    `RESOURCE_FLUSH`
+- PRIME fd pair connects dumb-buffer handles to dmabuf fds for
+  wayland's `wl_shm` / `linux-dmabuf-v1` protocols.
+- Real vblank IRQ: virtio-gpu signals resource-flush completion on
+  the control queue — we use that as the vsync source instead of a
+  timer hack.
+
+### Why virtio-gpu first, not a bare-metal GPU
+- We're a VM-first kernel; QEMU + virtio-gpu is the deployment
+  target.  A physical-GPU driver is orders of magnitude more code
+  and hardware-specific.
+- The DRM uAPI surface is identical either way — Hyprland can't tell
+  the difference between virtio-gpu and a real Intel iGPU as long
+  as the ioctls return sane data.
+- virtio-gpu gets us real page-flip, real vblank, real multi-monitor,
+  and 3D-on-the-host (later) without any hardware reverse-engineering.
 
 ## Tier 3 — DRM userland + input
 
