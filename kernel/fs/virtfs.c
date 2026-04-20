@@ -28,6 +28,8 @@ static const dev_node_t s_dev_nodes[] = {
     { "urandom", 0, 0, 0444, FS_TYPE_CHAR },  // read-only
     { "input",         0, 0, 0755, FS_TYPE_DIR  },
     { "input/event0",  0, 0, 0660, FS_TYPE_CHAR },
+    { "dri",           0, 0, 0755, FS_TYPE_DIR  },
+    { "dri/card0",     0, 0, 0660, FS_TYPE_CHAR },
     { NULL, 0, 0, 0, 0 }
 };
 

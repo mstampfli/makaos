@@ -11,6 +11,8 @@
 
 #include "common.h"
 
+#define VIRTIO_GPU_MAX_SCANOUTS_CAP 16  // matches VIRTIO_GPU_MAX_SCANOUTS in .c
+
 // Initialise the virtio-gpu device.  Returns 1 if a device was found
 // and initialised, 0 otherwise (system then falls back to the GOP
 // framebuffer for scanout).  Calls GET_DISPLAY_INFO once at init and
