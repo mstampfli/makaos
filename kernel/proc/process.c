@@ -185,6 +185,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sigstate.pending = 0;
     t->sigstate.blocked = 0;
     t->sigstate.sigframe_rsp = 0;
+    t->signalfd_head    = NULL;  // no signalfd subscribers until signalfd_new
     // Zero the whole handlers[] array.  task_t comes out of kmalloc
     // uninitialised, so handlers[].sa_handler could hold slab garbage.
     // On first signal delivery the kernel would treat that garbage as
@@ -431,6 +432,11 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     __builtin_memcpy(t->sigstate.handlers,
                      parent->sigstate.handlers,
                      sizeof(t->sigstate.handlers));
+    // signalfd subscribers are per-task; child starts with none (parent's
+    // signalfds stay on the parent).  Linux fork() does the same — fds
+    // are duplicated in the fd table but each signalfd's wait_queue list
+    // is its owner-specific subscriber membership.
+    t->signalfd_head    = NULL;
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) __builtin_memcpy(t->cwd, parent->cwd, KPATH_MAX);
     for (int _i = 0; _i < 16;  _i++) t->comm[_i] = parent->comm[_i];

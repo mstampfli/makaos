@@ -39,6 +39,11 @@ void signal_send(task_t* t, int sig) {
     // Set the pending bit atomically.  Coalesces repeat sends (classic POSIX).
     atomic_or(&t->sigstate.pending, bit);
 
+    // Wake any signalfd subscribed to this signal on the target task.
+    // signalfd_notify walks t->signalfd_head; no-op if the list is empty.
+    extern void signalfd_notify(task_t* t, int sig);
+    signalfd_notify(t, sig);
+
     // Always go through sched_wake.  The previous "if (t->state ==
     // TASK_SLEEPING) sched_wake(t)" optimisation is a lost-wakeup bug
     // under SMP: between the sender's racy state read and the sleeper

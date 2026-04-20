@@ -132,6 +132,13 @@ typedef struct __attribute__((aligned(16))) task_t {
 
     sigstate_t    sigstate;
 
+    // Head of per-task signalfd subscriber list.  signal_send walks
+    // this list and wakes any signalfd whose mask covers the signal.
+    // Accessed under the task's sigstate update path — single-writer
+    // (the owning thread modifies, signal_send reads under the pending
+    // atomic-or).  See kernel/io/signalfd.c.
+    void*         signalfd_head;
+
     int32_t       exit_code;    // set by sys_exit, readable via wait()
 
     uint64_t      sleep_until_ns; // wake time for nanosleep (TSC nanoseconds)

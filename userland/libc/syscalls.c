@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <sys/signalfd.h>
 
 // ── I/O ───────────────────────────────────────────────────────────────
 
@@ -160,6 +161,15 @@ ssize_t sendmsg(int fd, const struct msghdr* msg, int flags) {
 ssize_t recvmsg(int fd, struct msghdr* msg, int flags) {
     return (ssize_t)__syscall_ret(
         syscall3(SYS_RECVMSG, (uint64_t)fd, (uint64_t)msg, (uint64_t)flags));
+}
+
+// ── signalfd (POSIX / Linux-compatible) ───────────────────────────────
+int signalfd(int fd, const sigset_t* mask, int flags) {
+    return (int)__syscall_ret(
+        syscall3(SYS_SIGNALFD,
+                 (uint64_t)(int64_t)fd,
+                 (uint64_t)mask,
+                 (uint64_t)(unsigned int)flags));
 }
 
 // ── Sockets + time(NULL)/nanosleep — provided by libc.c's extern

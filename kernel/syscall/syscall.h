@@ -126,6 +126,11 @@
 #define SYS_SOCKETPAIR        109 // socketpair(domain, type, protocol, fds[2]) → 0 or -errno
 #define SYS_SENDMSG           110 // sendmsg(fd, msghdr*, flags) → count or -errno
 #define SYS_RECVMSG           111 // recvmsg(fd, msghdr*, flags) → count or -errno
+#define SYS_SIGNALFD          112 // signalfd(fd, mask_ptr, flags) → fd or -errno
+
+// signalfd flags (Linux-compatible).
+#define SFD_CLOEXEC  0x0002
+#define SFD_NONBLOCK 0x0004
 
 // eventfd flags
 #define EFD_SEMAPHORE 0x0001
