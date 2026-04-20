@@ -1081,6 +1081,12 @@ void sched_tick(void) {
     }
 #endif
 
+    // ── Per-CPU timerfd drain ───────────────────────────────────────────
+    // Atomic fast-path in timerfd_tick — returns O(1) if no expired
+    // timers on this CPU.  Drain path only runs when needed.
+    extern void timerfd_tick(void);
+    timerfd_tick();
+
     // ── Local-only work (no lock) ───────────────────────────────────────
     // Tick down the running task's quantum.
     if (c->current && c->current != c->idle) {
