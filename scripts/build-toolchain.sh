@@ -26,8 +26,8 @@ PREFIX="$REPO_ROOT/toolchain"
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
 JOBS="$(nproc)"
 
-BINUTILS_URL="https://ftpmirror.gnu.org/binutils/binutils-${BINUTILS_VERSION}.tar.xz"
-GCC_URL="https://ftpmirror.gnu.org/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz"
+BINUTILS_URL="https://ftp.gnu.org/gnu/binutils/binutils-${BINUTILS_VERSION}.tar.xz"
+GCC_URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz"
 
 BINUTILS_SRC="$THIRD_PARTY/binutils-${BINUTILS_VERSION}"
 GCC_SRC="$THIRD_PARTY/gcc-${GCC_VERSION}"

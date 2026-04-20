@@ -37,13 +37,14 @@ diff --git a/bfd/config.bfd b/bfd/config.bfd
 diff --git a/gas/configure.tgt b/gas/configure.tgt
 --- a/gas/configure.tgt
 +++ b/gas/configure.tgt
-@@ -259,6 +259,7 @@ case ${generic_target} in
+@@ -251,6 +251,7 @@ case ${generic_target} in
    i386-*-gnu*)				fmt=elf em=gnu ;;
-   i386-*-msdosdjgpp* \
-   | i386-*-go32*)			fmt=coff em=go32 ;;
+   i386-*-msdos*)			fmt=aout ;;
+   i386-*-moss*)				fmt=elf ;;
 +  i386-*-makaos* | x86_64-*-makaos*)	fmt=elf em=gnu ;;
-   i386-*-rdos*)				fmt=elf ;;
-   i386-*-darwin*)			fmt=macho ;;
+   i386-*-pe)				fmt=coff em=pe ;;
+   i386-*-cygwin*)
+    case ${cpu} in
 
 diff --git a/ld/configure.tgt b/ld/configure.tgt
 --- a/ld/configure.tgt
