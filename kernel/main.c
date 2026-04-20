@@ -570,6 +570,12 @@ void kmain(void) {
     cpu_init_bsp();
     irq_wait_init();          // per-IRQ wait queues (Phase 3 SMP)
 
+    // Phase 9A: kernel CSPRNG — multi-source entropy pool + ChaCha20
+    // DRBG.  Mixes RDRAND/RDSEED, TSC jitter, boot-time DRAM, and
+    // every IRQ's tsc_read_ns into a SHA-256 pool.  Seeds /dev/urandom.
+    extern void kcsprng_init(void);
+    kcsprng_init();
+
     // ── Scheduler + timer — sched_init must precede timer_init ───────────
     sched_init();
     timer_init(1000);

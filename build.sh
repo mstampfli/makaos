@@ -36,6 +36,7 @@ KERNEL_INCLUDES=(
   -I "$KERNEL_DIR/security"
   -I "$KERNEL_DIR/net"
   -I "$KERNEL_DIR/io"
+  -I "$KERNEL_DIR/crypto"
   -I "$KERNEL_DIR/arch/x86_64"
   -I "$BUILD_DIR"
 )
@@ -63,6 +64,7 @@ KERNEL_CFLAGS=(
   -O2
   -g
   -fno-strict-aliasing          # kernel casts through pointers all the time
+  -D__KERNEL__                  # distinguishes kernel-compiled crypto from userland
   -Wall -Wextra
   -Wno-unused-parameter
   -Wno-missing-field-initializers
@@ -255,6 +257,7 @@ KERNEL_SUBDIRS=(
     "$KERNEL_DIR/arch/x86_64"
     "$KERNEL_DIR/net"
     "$KERNEL_DIR/io"
+    "$KERNEL_DIR/crypto"
 )
 
 for dir in "${KERNEL_SUBDIRS[@]}"; do

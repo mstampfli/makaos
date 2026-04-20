@@ -197,28 +197,22 @@ vfs_file_t* vfs_zero_open(void) {
     return f;
 }
 
-// ── /dev/urandom ──────────────────────────────────────────────────────────
-
-static uint64_t s_urandom_state = 0x123456789abcdef0ULL;
+// ── /dev/urandom — routed through the kernel CSPRNG (Phase 9A) ─────
+//
+// Previously a TSC-seeded xorshift64 — NOT cryptographic.  Now reads
+// from the multi-source entropy pool + ChaCha20 DRBG in
+// kernel/crypto/random.c.  Mix sources include RDRAND (not trusted
+// alone), TSC jitter on every IRQ, boot-DRAM noise, and periodic
+// per-CPU fast-mix flushes.
+#include "random.h"
 
 static int64_t urandom_read(vfs_file_t* self, void* buf, uint64_t len) {
     (void)self;
-    uint8_t* p = (uint8_t*)buf;
-    for (uint64_t i = 0; i < len; i++) {
-        s_urandom_state ^= s_urandom_state << 13;
-        s_urandom_state ^= s_urandom_state >> 7;
-        s_urandom_state ^= s_urandom_state << 17;
-        p[i] = (uint8_t)s_urandom_state;
-    }
+    kcsprng_read(buf, len);
     return (int64_t)len;
 }
 
 vfs_file_t* vfs_urandom_open(void) {
-    if (s_urandom_state == 0x123456789abcdef0ULL) {
-        uint32_t lo, hi;
-        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-        s_urandom_state ^= ((uint64_t)hi << 32) | lo;
-    }
     vfs_file_t* f = vfs_alloc_file();
     if (!f) return NULL;
     f->read  = urandom_read;
