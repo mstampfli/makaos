@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# ── MakaOS mbedTLS port (sysroot-based) ────────────────────────────────
+# ── MakaOS mbedTLS port (cross-gcc + sysroot) ──────────────────────────
 #
-# Fetches a pinned mbedTLS release and compiles it against the MakaOS
-# sysroot built by build.sh.  Produces:
-#   $SYSROOT/usr/include/mbedtls/*.h   (public headers)
-#   $SYSROOT/usr/include/psa/*.h
-#   $SYSROOT/usr/lib/libmbedtls.a      (static archive)
+# Fetches pinned mbedTLS, compiles it with x86_64-pc-makaos-gcc, and
+# installs libmbedtls.a + headers into the sysroot.  Zero per-port
+# shim headers, zero bespoke include-path soup — the cross-gcc knows
+# its own target triple and sysroot.
 #
-# No per-library shim dir, no source in the repo.  Upstream tarball is
-# cached in build/third_party/.  Re-run with FORCE=1 to rebuild.
+# No mbedTLS sources are committed to this repo.
 
 set -euo pipefail
 
@@ -24,19 +22,24 @@ MBEDTLS_TARBALL="$THIRD_PARTY/mbedtls-${MBEDTLS_VERSION}.tar.gz"
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
 CONFIG_HEADER="$REPO_ROOT/scripts/configs/mbedtls_config.h"
 
-CC="${CC:-gcc}"
-AR="${AR:-ar}"
+# Cross-compiler.  Falls back to host gcc with a loud warning if the
+# toolchain isn't built — only useful during very early dev.
+CROSS_CC="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-gcc"
+CROSS_AR="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-ar"
+if [ ! -x "$CROSS_CC" ]; then
+    echo "[port-mbedtls] WARNING: cross-toolchain missing — run scripts/build-toolchain.sh" >&2
+    echo "[port-mbedtls] falling back to host gcc (legacy path, not production)" >&2
+    CROSS_CC="${CC:-gcc}"
+    CROSS_AR="${AR:-ar}"
+fi
 
-# Must match USER_CFLAGS in build.sh — sysroot-based freestanding userland.
-USER_CFLAGS=(
-    -ffreestanding -m64 -mno-red-zone
-    -fno-pie -fno-pic -fno-plt
-    -fno-stack-protector -fno-builtin
-    -fno-asynchronous-unwind-tables -fno-unwind-tables
-    --sysroot="$SYSROOT"
-    -nostdinc
-    -isystem "$SYSROOT/usr/include"
+# With the cross-gcc, the target triple carries:
+#   --sysroot, -nostdinc-equivalent, ELF64, static-by-default,
+#   freestanding defaults, __makaos__ + __unix__ + __ELF__ predefines.
+# So our flag list is just "tell it about the config header + -O2".
+CFLAGS=(
     -O2
+    -fPIC        # needed by a few PSA tests; harmless for static archives
     -Wall -Wextra
     -Wno-unused-parameter
     -Wno-unused-function
@@ -81,20 +84,20 @@ build_lib() {
         srcs+=("$f")
     done < <(find "$MBEDTLS_SRC/library" -maxdepth 1 -name '*.c' -print0)
 
-    log "compiling ${#srcs[@]} mbedtls sources"
+    log "compiling ${#srcs[@]} mbedtls sources with $CROSS_CC"
     local objs=()
     for src in "${srcs[@]}"; do
         local base; base="$(basename "$src" .c)"
         local obj="$build_objs/${base}.o"
         objs+=("$obj")
         if [ "$src" -nt "$obj" ] || [ "$CONFIG_HEADER" -nt "$obj" ]; then
-            "$CC" "${USER_CFLAGS[@]}" -c "$src" -o "$obj"
+            "$CROSS_CC" "${CFLAGS[@]}" -c "$src" -o "$obj"
         fi
     done
 
     local lib="$SYSROOT/usr/lib/libmbedtls.a"
     rm -f "$lib"
-    "$AR" rcs "$lib" "${objs[@]}"
+    "$CROSS_AR" rcs "$lib" "${objs[@]}"
     log "done — $(stat -c%s "$lib") bytes → $lib"
 }
 
