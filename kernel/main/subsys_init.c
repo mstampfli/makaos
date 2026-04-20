@@ -12,6 +12,7 @@
 #include "net/net.h"
 #include "fb.h"
 #include "ioapic.h"
+#include "drivers/video/virtio_gpu.h"
 
 // ── INITCALL_LEVEL_EARLY registrations ───────────────────────────────────
 // No sleeping.  Strict dependency order declared explicitly.
@@ -88,3 +89,11 @@ DEFINE_INITCALL(hda, INITCALL_LEVEL_SUBSYS, .fn = _hda_init);
 static int _net_init(void) { net_init(); return 0; }
 
 DEFINE_INITCALL(net, INITCALL_LEVEL_SUBSYS, .fn = _net_init);
+
+// virtio-gpu: PCI-based 2D scanout device.  Silently no-ops if the
+// device isn't present (hardware boot, QEMU without -device virtio-gpu).
+// Runs in subsys level because feature negotiation + GET_DISPLAY_INFO
+// may involve delays — the probe polls the control-queue used ring.
+static int _virtio_gpu_init(void) { (void)virtio_gpu_init(); return 0; }
+
+DEFINE_INITCALL(virtio_gpu, INITCALL_LEVEL_SUBSYS, .fn = _virtio_gpu_init);

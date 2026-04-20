@@ -22,6 +22,7 @@ qemu-system-x86_64 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
+  -device virtio-gpu-pci \
   -display sdl \
   -audiodev pa,id=snd0 \
   -device intel-hda \
