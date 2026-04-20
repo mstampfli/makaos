@@ -18,7 +18,12 @@
 // userland/libc/libc.c and pulled in via the shim headers during the
 // library build.
 
-#include "libc.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/socket.h>
 #include <mbedtls/entropy.h>
 
 // ── 1. Hardware entropy poll ──────────────────────────────────────────

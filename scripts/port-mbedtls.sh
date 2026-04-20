@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
-# ── MakaOS mbedTLS port tool ──────────────────────────────────────────
+# ── MakaOS mbedTLS port (sysroot-based) ────────────────────────────────
 #
-# Fetches a pinned mbedTLS release, applies the MakaOS build config, and
-# compiles the library against the userland freestanding toolchain.  The
-# output is a static archive linked into any userland binary that asks
-# for TLS (initially just /bin/http_get, later anything else that wants
-# HTTPS / TLS 1.3).
+# Fetches a pinned mbedTLS release and compiles it against the MakaOS
+# sysroot built by build.sh.  Produces:
+#   $SYSROOT/usr/include/mbedtls/*.h   (public headers)
+#   $SYSROOT/usr/include/psa/*.h
+#   $SYSROOT/usr/lib/libmbedtls.a      (static archive)
 #
-# First invocation downloads + extracts + compiles (~2-3 minutes).  Later
-# invocations reuse the extracted tree and only recompile if the library
-# is missing.  Pass FORCE=1 to rebuild from scratch.
-#
-# No mbedTLS sources are committed to this repo — only the config header
-# and glue layer.  Upstream code is cached in build/third_party/mbedtls.
+# No per-library shim dir, no source in the repo.  Upstream tarball is
+# cached in build/third_party/.  Re-run with FORCE=1 to rebuild.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MBEDTLS_VERSION="3.6.2"                       # LTS branch, has stable TLS 1.3
-MBEDTLS_SHA256="8b660f28d92fff5ae3f7f8c3d1d301d4fe68cb5b8a3a4a10b35a0c90af8f7f7e"
+MBEDTLS_VERSION="3.6.2"
 MBEDTLS_URL="https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/mbedtls-${MBEDTLS_VERSION}.tar.gz"
 
 BUILD_DIR="$REPO_ROOT/build"
@@ -26,25 +21,22 @@ THIRD_PARTY="$BUILD_DIR/third_party"
 MBEDTLS_SRC="$THIRD_PARTY/mbedtls-${MBEDTLS_VERSION}"
 MBEDTLS_TARBALL="$THIRD_PARTY/mbedtls-${MBEDTLS_VERSION}.tar.gz"
 
-LIBS_DIR="$REPO_ROOT/userland/libs/mbedtls"
-INCLUDE_DIR="$LIBS_DIR/include"
-LIB_OUT="$LIBS_DIR/libmbedtls.a"
-
-CONFIG_HEADER="$LIBS_DIR/mbedtls_config.h"    # MakaOS-specific config
+SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
+CONFIG_HEADER="$REPO_ROOT/scripts/configs/mbedtls_config.h"
 
 CC="${CC:-gcc}"
 AR="${AR:-ar}"
 
-# Must match USER_CFLAGS in build.sh — freestanding userland.  We add
-# -nostdinc to keep the host's /usr/include (glibc) away from mbedTLS:
-# it fights our libc.h over fd_set, pselect, imaxdiv, etc.
+# Must match USER_CFLAGS in build.sh — sysroot-based freestanding userland.
 USER_CFLAGS=(
     -ffreestanding -m64 -mno-red-zone
     -fno-pie -fno-pic -fno-plt
     -fno-stack-protector -fno-builtin
     -fno-asynchronous-unwind-tables -fno-unwind-tables
+    --sysroot="$SYSROOT"
     -nostdinc
-    -O2                                       # TLS is hot — let the compiler optimise
+    -isystem "$SYSROOT/usr/include"
+    -O2
     -Wall -Wextra
     -Wno-unused-parameter
     -Wno-unused-function
@@ -52,25 +44,13 @@ USER_CFLAGS=(
     -Wno-sign-compare
     -Wno-unused-but-set-variable
     -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>'
-)
-
-# All standard-header lookups resolve inside shim/ — which forwards
-# everything to our libc.h.  No glibc leakage, no gcc-builtin stddef.h
-# (its `typedef long int size_t` fights libc.h's `typedef uint64_t
-# size_t`, even though both are 64-bit on x86_64, per C's strict-type
-# rule).
-USER_INCLUDES=(
-    -I "$LIBS_DIR/shim"
-    -I "$REPO_ROOT/userland/libc"
-    -I "$REPO_ROOT/userland/include"
-    -I "$LIBS_DIR"                            # mbedtls_config.h
+    -I "$(dirname "$CONFIG_HEADER")"
     -I "$MBEDTLS_SRC/include"
     -I "$MBEDTLS_SRC/library"
 )
 
 log() { printf '[port-mbedtls] %s\n' "$*" >&2; }
 
-# ── 1. Fetch & extract the upstream tarball ─────────────────────────
 fetch_mbedtls() {
     mkdir -p "$THIRD_PARTY"
     if [ ! -f "$MBEDTLS_TARBALL" ]; then
@@ -80,22 +60,22 @@ fetch_mbedtls() {
     if [ ! -d "$MBEDTLS_SRC" ]; then
         log "extracting mbedtls"
         tar -xzf "$MBEDTLS_TARBALL" -C "$THIRD_PARTY"
-        # Upstream uses "mbedtls-mbedtls-<ver>" as the top-level dir.
         if [ -d "$THIRD_PARTY/mbedtls-mbedtls-${MBEDTLS_VERSION}" ]; then
             mv "$THIRD_PARTY/mbedtls-mbedtls-${MBEDTLS_VERSION}" "$MBEDTLS_SRC"
         fi
     fi
 }
 
-# ── 2. Compile library .c files into libmbedtls.a ───────────────────
-build_mbedtls() {
-    local build_objs="$BUILD_DIR/mbedtls_objs"
-    mkdir -p "$build_objs" "$LIBS_DIR"
+install_headers() {
+    log "installing headers into $SYSROOT/usr/include"
+    mkdir -p "$SYSROOT/usr/include"
+    cp -rT "$MBEDTLS_SRC/include" "$SYSROOT/usr/include"
+}
 
-    # mbedTLS lives in library/*.c — ~130 source files (full build).
-    # We compile everything including psa_*.c — TLS 1.3 in mbedTLS 3.x
-    # routes through the PSA Crypto subsystem and won't compile without
-    # those sources.
+build_lib() {
+    local build_objs="$BUILD_DIR/mbedtls_objs"
+    mkdir -p "$build_objs"
+
     local srcs=()
     while IFS= read -r -d '' f; do
         srcs+=("$f")
@@ -107,41 +87,35 @@ build_mbedtls() {
         local base; base="$(basename "$src" .c)"
         local obj="$build_objs/${base}.o"
         objs+=("$obj")
-        # Only recompile if stale.
         if [ "$src" -nt "$obj" ] || [ "$CONFIG_HEADER" -nt "$obj" ]; then
-            "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
-                -c "$src" -o "$obj"
+            "$CC" "${USER_CFLAGS[@]}" -c "$src" -o "$obj"
         fi
     done
 
-    log "archiving → $LIB_OUT"
-    rm -f "$LIB_OUT"
-    "$AR" rcs "$LIB_OUT" "${objs[@]}"
-    log "done — $(stat -c%s "$LIB_OUT") bytes"
-}
-
-# ── 3. Expose headers under userland/libs/mbedtls/include/mbedtls/ ──
-export_headers() {
-    rm -rf "$INCLUDE_DIR"
-    mkdir -p "$INCLUDE_DIR"
-    cp -R "$MBEDTLS_SRC/include/"* "$INCLUDE_DIR/"
-    log "headers exported → $INCLUDE_DIR"
+    local lib="$SYSROOT/usr/lib/libmbedtls.a"
+    rm -f "$lib"
+    "$AR" rcs "$lib" "${objs[@]}"
+    log "done — $(stat -c%s "$lib") bytes → $lib"
 }
 
 main() {
     if [ "${FORCE:-0}" = "1" ]; then
         log "FORCE=1 — wiping prior build"
-        rm -rf "$BUILD_DIR/mbedtls_objs" "$LIB_OUT" "$INCLUDE_DIR"
+        rm -rf "$BUILD_DIR/mbedtls_objs" "$SYSROOT/usr/lib/libmbedtls.a"
     fi
-
     if [ ! -f "$CONFIG_HEADER" ]; then
-        log "ERROR: $CONFIG_HEADER not found — write it before running this script"
+        log "ERROR: $CONFIG_HEADER not found"
+        exit 1
+    fi
+    if [ ! -d "$SYSROOT/usr/include" ]; then
+        log "ERROR: sysroot not populated ($SYSROOT/usr/include missing)"
+        log "       Run build.sh first — it builds the sysroot before ports."
         exit 1
     fi
 
     fetch_mbedtls
-    export_headers
-    build_mbedtls
+    install_headers
+    build_lib
 }
 
 main "$@"

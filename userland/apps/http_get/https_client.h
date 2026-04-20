@@ -5,7 +5,9 @@
 // conn_close and don't care which protocol is underneath.  Lets the
 // bulk of http_get.c stay protocol-agnostic.
 
-#include "libc.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
 
 typedef struct conn_t conn_t;
 
