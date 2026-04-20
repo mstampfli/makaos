@@ -137,6 +137,21 @@
 #define TFD_NONBLOCK      0x0004
 #define TFD_TIMER_ABSTIME 0x0001
 
+// POSIX clockids accepted by timerfd_create / clock_gettime.
+#define K_CLOCK_REALTIME  0
+#define K_CLOCK_MONOTONIC 1
+
+// kernel-side timespec/itimerspec.  Layout matches the userland
+// struct timespec { time_t; long; } where time_t and long are both
+// 64-bit on x86_64.  The canonical stat layout (line ~465) reuses
+// this typedef, so it lives up here.
+typedef struct k_timespec { int64_t tv_sec; int64_t tv_nsec; } k_timespec_t;
+
+typedef struct k_itimerspec {
+    k_timespec_t it_interval;   // period for repeating timer (0 = one-shot)
+    k_timespec_t it_value;      // next expiration (relative unless ABSTIME)
+} k_itimerspec_t;
+
 // sendmsg/recvmsg control-message types
 #define SCM_RIGHTS      0x01
 #define MSG_CMSG_CLOEXEC 0x40000000
@@ -457,8 +472,7 @@ typedef struct {
 // ── stat_t / struct stat (POSIX, for SYS_STAT / SYS_FSTAT) ──────────────
 // Filled by sys_stat / sys_fstat and written to userspace.
 // Layout must match stat_t / struct stat in userland/libc/libc.h exactly.
-// Matches userland struct stat exactly (st_atim etc. are struct { int64 sec; int64 nsec }).
-typedef struct k_timespec { int64_t tv_sec; int64_t tv_nsec; } k_timespec_t;
+// k_timespec_t is defined above (needed by k_itimerspec_t).
 typedef struct stat {
     uint64_t     st_ino;
     uint64_t     st_nlink;

@@ -4569,6 +4569,56 @@ static uint64_t w_sys_io_uring_register(uint64_t a, uint64_t b, uint64_t c, uint
     return sys_io_uring_register(a, b, c, d);
 }
 
+// ── sys_timerfd_{create,settime,gettime} ────────────────────────────
+// timerfd_create(clockid, flags) → fd; settime/gettime mirror POSIX
+// semantics (relative or ABSTIME).  Per-CPU timer list; drain happens
+// on the home CPU's scheduler tick.  No cross-CPU lock in hot path.
+extern vfs_file_t* timerfd_new(int clockid, uint32_t flags);
+extern int timerfd_settime(vfs_file_t* f, int flags,
+                             const k_itimerspec_t* new_val,
+                             k_itimerspec_t* old_val);
+extern int timerfd_gettime(vfs_file_t* f, k_itimerspec_t* out);
+extern int timerfd_is(vfs_file_t* f);
+
+static uint64_t w_sys_timerfd_create(uint64_t clockid, uint64_t flags,
+                                      uint64_t c, uint64_t d) {
+    (void)c; (void)d;
+    vfs_file_t* f = timerfd_new((int)clockid, (uint32_t)flags);
+    if (!f) return (uint64_t)-EINVAL;
+    int64_t fd = fd_install(f);
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }
+    return (uint64_t)fd;
+}
+
+static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
+                                       uint64_t new_ptr, uint64_t old_ptr) {
+    if (!new_ptr) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    k_itimerspec_t kn, ko;
+    if (copy_from_user(&kn, (void*)new_ptr, sizeof(kn)) != 0)
+        return (uint64_t)-EFAULT;
+    int rc = timerfd_settime(f, (int)flags, &kn, old_ptr ? &ko : NULL);
+    if (rc != 0) return (uint64_t)rc;
+    if (old_ptr && copy_to_user((void*)old_ptr, &ko, sizeof(ko)) != 0)
+        return (uint64_t)-EFAULT;
+    return 0;
+}
+
+static uint64_t w_sys_timerfd_gettime(uint64_t fd, uint64_t out_ptr,
+                                       uint64_t c, uint64_t d) {
+    (void)c; (void)d;
+    if (!out_ptr) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fd_to_file(fd);
+    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    k_itimerspec_t ks;
+    int rc = timerfd_gettime(f, &ks);
+    if (rc != 0) return (uint64_t)rc;
+    if (copy_to_user((void*)out_ptr, &ks, sizeof(ks)) != 0)
+        return (uint64_t)-EFAULT;
+    return 0;
+}
+
 // 4-arg handlers that already match the uniform signature — used directly.
 // sys_read(a,b,c,d), sys_readdir(a,b,c,d), sys_rename(a,b,c,d)
 
@@ -4684,6 +4734,9 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_IO_URING_REGISTER]   = w_sys_io_uring_register,
     [SYS_SCHED_YIELD]         = w_sys_sched_yield,
     [SYS_EVENTFD]             = w_sys_eventfd,
+    [SYS_TIMERFD_CREATE]      = w_sys_timerfd_create,
+    [SYS_TIMERFD_SETTIME]     = w_sys_timerfd_settime,
+    [SYS_TIMERFD_GETTIME]     = w_sys_timerfd_gettime,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

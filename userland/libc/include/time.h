@@ -10,6 +10,11 @@ struct timespec {
     long   tv_nsec;
 };
 
+struct itimerspec {
+    struct timespec it_interval;
+    struct timespec it_value;
+};
+
 struct tm {
     int tm_sec;
     int tm_min;
