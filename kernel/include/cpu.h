@@ -172,6 +172,14 @@ typedef struct cpu_t {
     // period detection by one cycle).
     volatile uint64_t rcu_qs_count;
 
+    // Per-CPU async-RCU pending list (Phase 5B).  call_rcu_head
+    // lock-free pushes an rcu_head_t here; the rcu_gp_kthread
+    // periodically atomic_exchanges the list, waits for a grace
+    // period, and invokes each callback.  Treated as an opaque
+    // void* here to avoid pulling rcu.h into cpu.h's include chain;
+    // rcu.c casts to rcu_head_t* at use.
+    void* volatile    rcu_pending_head;
+
     // Statistics — non-atomic, owner-only.
     uint64_t        sched_ticks;
     uint64_t        context_switches;

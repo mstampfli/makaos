@@ -33,6 +33,7 @@ typedef struct {
 typedef struct unix_ns_table {
     uint32_t         cap;     // power of two
     uint32_t         cnt;
+    rcu_head_t       rcu_head; // Phase 5B: embedded for call_rcu_head
     unix_ns_entry_t  slots[]; // flexible
 } unix_ns_table_t;
 
@@ -130,7 +131,7 @@ static int ns_insert(const char* path, unix_sock_t* sock) {
 
     rcu_assign_pointer(s_unix_ns, neu);
     spin_unlock_irqrestore(&s_unix_ns_wlock, flags);
-    if (old) call_rcu(ns_table_free_rcu, old);
+    if (old) call_rcu_head(&old->rcu_head, ns_table_free_rcu, old);
     return 0;
 }
 
@@ -153,7 +154,7 @@ static void ns_remove(const char* path) {
 
     rcu_assign_pointer(s_unix_ns, neu);
     spin_unlock_irqrestore(&s_unix_ns_wlock, flags);
-    call_rcu(ns_table_free_rcu, old);
+    call_rcu_head(&old->rcu_head, ns_table_free_rcu, old);
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────

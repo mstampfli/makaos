@@ -18,79 +18,79 @@ asm_offsets:                            # @asm_offsets
 .Ltmp0:
 	.loc	0 29 5 prologue_end             # kernel/arch/x86_64/asm_offsets.c:29:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_TSS_RSP0 18580"
+	.ascii	"@@@ASMDEF CPU_TSS_RSP0 18588"
 	#NO_APP
 	.loc	0 34 5                          # kernel/arch/x86_64/asm_offsets.c:34:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RSP 18680"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RSP 18688"
 	#NO_APP
 	.loc	0 35 5                          # kernel/arch/x86_64/asm_offsets.c:35:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RIP 18688"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RIP 18696"
 	#NO_APP
 	.loc	0 36 5                          # kernel/arch/x86_64/asm_offsets.c:36:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RFLAGS 18696"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RFLAGS 18704"
 	#NO_APP
 	.loc	0 37 5                          # kernel/arch/x86_64/asm_offsets.c:37:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RBP 18704"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RBP 18712"
 	#NO_APP
 	.loc	0 38 5                          # kernel/arch/x86_64/asm_offsets.c:38:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_RBX 18712"
+	.ascii	"@@@ASMDEF CPU_SC_USER_RBX 18720"
 	#NO_APP
 	.loc	0 39 5                          # kernel/arch/x86_64/asm_offsets.c:39:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R12 18720"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R12 18728"
 	#NO_APP
 	.loc	0 40 5                          # kernel/arch/x86_64/asm_offsets.c:40:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R13 18728"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R13 18736"
 	#NO_APP
 	.loc	0 41 5                          # kernel/arch/x86_64/asm_offsets.c:41:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R14 18736"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R14 18744"
 	#NO_APP
 	.loc	0 42 5                          # kernel/arch/x86_64/asm_offsets.c:42:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_USER_R15 18744"
+	.ascii	"@@@ASMDEF CPU_SC_USER_R15 18752"
 	#NO_APP
 	.loc	0 43 5                          # kernel/arch/x86_64/asm_offsets.c:43:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_ARG5 18752"
+	.ascii	"@@@ASMDEF CPU_SC_ARG5 18760"
 	#NO_APP
 	.loc	0 44 5                          # kernel/arch/x86_64/asm_offsets.c:44:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SC_ARG6 18760"
+	.ascii	"@@@ASMDEF CPU_SC_ARG6 18768"
 	#NO_APP
 	.loc	0 45 5                          # kernel/arch/x86_64/asm_offsets.c:45:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_DELIVER 18768"
+	.ascii	"@@@ASMDEF CPU_SIG_DELIVER 18776"
 	#NO_APP
 	.loc	0 46 5                          # kernel/arch/x86_64/asm_offsets.c:46:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_IN_SYSCALL 18769"
+	.ascii	"@@@ASMDEF CPU_SIG_IN_SYSCALL 18777"
 	#NO_APP
 	.loc	0 47 5                          # kernel/arch/x86_64/asm_offsets.c:47:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_SIG_RDI 18776"
+	.ascii	"@@@ASMDEF CPU_SIG_RDI 18784"
 	#NO_APP
 	.loc	0 48 5                          # kernel/arch/x86_64/asm_offsets.c:48:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_REQUESTED 18784"
+	.ascii	"@@@ASMDEF CPU_EXEC_REQUESTED 18792"
 	#NO_APP
 	.loc	0 49 5                          # kernel/arch/x86_64/asm_offsets.c:49:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_ENTRY 18792"
+	.ascii	"@@@ASMDEF CPU_EXEC_ENTRY 18800"
 	#NO_APP
 	.loc	0 50 5                          # kernel/arch/x86_64/asm_offsets.c:50:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_RSP 18800"
+	.ascii	"@@@ASMDEF CPU_EXEC_RSP 18808"
 	#NO_APP
 	.loc	0 51 5                          # kernel/arch/x86_64/asm_offsets.c:51:5
 	#APP
-	.ascii	"@@@ASMDEF CPU_EXEC_PML4 18808"
+	.ascii	"@@@ASMDEF CPU_EXEC_PML4 18816"
 	#NO_APP
 	.loc	0 52 1 epilogue_begin           # kernel/arch/x86_64/asm_offsets.c:52:1
 	popq	%rbp

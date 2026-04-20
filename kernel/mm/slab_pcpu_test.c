@@ -147,3 +147,83 @@ void slab_pcpu_selftest(void) {
                 (uint64_t)slab_pct);
     }
 }
+
+// ── Phase 5B acceptance: SLAB_TYPESAFE_BY_RCU ──────────────────────────
+//
+// Verifies that a typesafe cache's empty-list pages are NOT returned
+// to the buddy until a grace period elapses.
+//
+// Test flow:
+//   1. Create a typesafe cache (slot_size 256) and register it.
+//   2. Allocate N objects; record the slab_phys of the first one.
+//   3. Free all of them via pmm_slab_free → page goes to cache->empty.
+//   4. Call pmm_slab_shrink_all_locked() — typesafe path defers via
+//      call_rcu instead of freeing immediately.  g_slab_trackers
+//      for those frames must STILL point at our cache.
+//   5. synchronize_rcu() — blocks until the callback runs.
+//   6. After the grace period, g_slab_trackers must be NULL (page
+//      returned to buddy).
+
+#include "rcu.h"
+
+void slab_typesafe_selftest(void) {
+    kprintf("[typesafe_test] starting\n");
+
+    static slab_cache_t tc;
+    pmm_slab_cache_init(&tc, 256, SLAB_TYPESAFE_BY_RCU);
+
+    // Allocate 4 objects so we at least fill one slot on a fresh page.
+    void* objs[4];
+    for (int i = 0; i < 4; i++) {
+        objs[i] = pmm_slab_alloc(&tc);
+        if (!objs[i]) {
+            kprintf("[typesafe_test] FAILED: alloc returned NULL at i=%d\n", i);
+            return;
+        }
+    }
+    // Which frame does obj[0] live in?  We poll pmm_is_slab_ptr.
+    uint8_t before_shrink = pmm_is_slab_ptr(objs[0]);
+    if (!before_shrink) {
+        kprintf("[typesafe_test] FAILED: is_slab_ptr=0 before free\n");
+        return;
+    }
+
+    for (int i = 0; i < 4; i++) pmm_slab_free(objs[i]);
+
+    // Shrink.  On a typesafe cache, pages on cache->empty get their
+    // return to buddy deferred via call_rcu.
+    extern void pmm_slab_shrink_all_locked(void);
+    {
+        uint64_t f;
+        pmm_pcp_lock(&f);
+        pmm_slab_shrink_all_locked();
+        pmm_pcp_unlock(f);
+    }
+
+    // Before the grace period, the page is still typed as a slab of
+    // our cache — pmm_is_slab_ptr must still return true for objs[0].
+    uint8_t mid_shrink = pmm_is_slab_ptr(objs[0]);
+    if (!mid_shrink) {
+        kprintf("[typesafe_test] FAILED: is_slab_ptr=0 before synchronize_rcu "
+                "(typesafe guarantee violated)\n");
+        return;
+    }
+
+    // Wait for the RCU callback to actually fire.  synchronize_rcu()
+    // alone isn't enough — it waits for a grace period, but async
+    // call_rcu_head fires on the GP kthread's own schedule.
+    // rcu_barrier() blocks until every currently-queued callback
+    // (including our pmm_slab_rcu_free_cb) has completed.
+    rcu_barrier();
+
+    // After the callback runs, the page is back in the buddy and
+    // g_slab_trackers for its frames is NULL.
+    uint8_t after_gp = pmm_is_slab_ptr(objs[0]);
+    if (after_gp) {
+        kprintf("[typesafe_test] FAILED: is_slab_ptr=1 after rcu_barrier "
+                "(RCU callback didn't run?)\n");
+        return;
+    }
+
+    kprintf("[typesafe_test] SELF-TEST PASSED (defer → grace → reclaim)\n");
+}

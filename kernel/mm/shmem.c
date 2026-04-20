@@ -23,6 +23,7 @@ typedef struct {
 typedef struct shmem_ns_table {
     uint32_t    cap;
     uint32_t    cnt;
+    rcu_head_t  rcu_head;   // Phase 5B: embedded for call_rcu_head
     ns_entry_t  slots[];
 } shmem_ns_table_t;
 
@@ -282,7 +283,7 @@ int shmem_ns_insert(shmem_t* shm) {
 
     rcu_assign_pointer(s_namespace, neu);
     spin_unlock_irqrestore(&s_namespace_lock, flags);
-    if (old) call_rcu(shm_ns_table_free_rcu, old);
+    if (old) call_rcu_head(&old->rcu_head, shm_ns_table_free_rcu, old);
     return 0;
 }
 
@@ -306,7 +307,7 @@ void shmem_ns_remove(shmem_t* shm) {
 
     rcu_assign_pointer(s_namespace, neu);
     spin_unlock_irqrestore(&s_namespace_lock, flags);
-    call_rcu(shm_ns_table_free_rcu, old);
+    call_rcu_head(&old->rcu_head, shm_ns_table_free_rcu, old);
 }
 
 // ── shmem_check_access ──────────────────────────────────────────────────

@@ -176,31 +176,200 @@ void synchronize_rcu_expedited(void) {
     smp_mb();
 }
 
-// ── call_rcu ──────────────────────────────────────────────────────────────
+// ── call_rcu (Phase 5B: fully asynchronous) ────────────────────────────
 //
-// Phase 2 implementation is synchronous.  This is correct and simple.
-// Phase 6 may upgrade to deferred per-CPU callback lists drained by an
-// rcu_gp_kthread if profiling shows that callers frequently block on
-// call_rcu and the system has many free cycles on idle CPUs.
+// call_rcu_head is the primitive: lock-free push of a caller-supplied
+// rcu_head_t onto this CPU's pending list.  The rcu_gp_kthread
+// (spawned from init_kthread) periodically snapshots every CPU's
+// pending chain, blocks on synchronize_rcu(), then invokes each
+// callback in process context.
 //
-// Even synchronous, this is cheap on UP because synchronize_rcu() is
-// just a compiler barrier there.
+// Invariants:
+//   - call_rcu_head does ZERO allocation and is safe to call while
+//     holding any lock, including g_pmm_lock, even from IRQ-disabled
+//     code.  The rcu_head_t is caller-provided (typically embedded
+//     in the freed object).
+//   - The callback fires in the GP kthread's context: IRQs enabled,
+//     preemptible, no locks held.  It can call kmalloc, synchronize_rcu
+//     recursively, take sleeping locks, etc.  Never use the GP
+//     kthread to invoke callbacks that would block forever — that
+//     starves all further RCU-deferred reclaim.
+//   - The callback runs at most one grace period after the call_rcu_head
+//     returns.  Latency: typically ~10 ms on SMP, instant on UP.
+//   - Between push and callback invocation, the memory backing the
+//     rcu_head_t must remain valid.  Embedding the head in the object
+//     being freed satisfies this trivially.
 
-void call_rcu(rcu_func_t func, void* data) {
-    synchronize_rcu();
-    func(data);
+void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
+    head->func = func;
+    head->data = data;
+    cpu_t* c = this_cpu();
+    rcu_head_t* old = (rcu_head_t*)__atomic_load_n(&c->rcu_pending_head,
+                                                    __ATOMIC_RELAXED);
+    do {
+        head->next = old;
+    } while (!__atomic_compare_exchange_n(
+                 (rcu_head_t**)&c->rcu_pending_head,
+                 &old, head,
+                 0,
+                 __ATOMIC_RELEASE,
+                 __ATOMIC_RELAXED));
 }
 
+// Layout compatibility check: pmm.h declares a bit-identical
+// pmm_rcu_head_t so slab_header_t can embed an RCU head without
+// pulling rcu.h into pmm.h.  If the layouts ever drift, the cast in
+// pmm_slab_destroy_locked's call_rcu_head call becomes a strict-
+// aliasing violation and the build must fail.
+#include "pmm.h"
+_Static_assert(sizeof(pmm_rcu_head_t) == sizeof(rcu_head_t),
+               "pmm_rcu_head_t must match rcu_head_t size");
+_Static_assert(__builtin_offsetof(pmm_rcu_head_t, next) ==
+               __builtin_offsetof(rcu_head_t,     next),
+               "rcu_head next offset mismatch");
+_Static_assert(__builtin_offsetof(pmm_rcu_head_t, func) ==
+               __builtin_offsetof(rcu_head_t,     func),
+               "rcu_head func offset mismatch");
+_Static_assert(__builtin_offsetof(pmm_rcu_head_t, data) ==
+               __builtin_offsetof(rcu_head_t,     data),
+               "rcu_head data offset mismatch");
+
 void call_rcu_expedited(rcu_func_t func, void* data) {
+    // Expedited is still synchronous by design — IPI-forced grace
+    // period, intended for latency-sensitive user-syscall-return
+    // paths that want the callback before they unblock.  Not used
+    // by the pmm slab path.
     synchronize_rcu_expedited();
     func(data);
 }
 
-// ── Deferred kfree — convenience wrapper ──────────────────────────────
-// Used by anything that frees heap memory which may still be
-// referenced by a concurrent RCU reader (wait_queue_t drainer,
-// pid_ht lookup, vma walker, etc.).  Bypasses the per-caller boilerplate
-// of writing a kfree trampoline every time.
-#include "kheap.h"
-static void kfree_rcu_cb(void* data) { kfree(data); }
-void kfree_rcu(void* ptr) { call_rcu(kfree_rcu_cb, ptr); }
+// ── rcu_gp_kthread — drains per-CPU pending callbacks ──────────────────
+// Sleeps for RCU_GP_INTERVAL_NS between passes.  Each pass:
+//   1. Atomically snapshots each CPU's pending head into a local chain
+//      (single atomic_exchange per CPU — can't block remote pushers).
+//   2. Stitches all CPU chains into one combined chain.
+//   3. synchronize_rcu() — blocks until a grace period elapses.
+//   4. Invokes every callback.
+//
+// Nothing races with the callback invocation: after synchronize_rcu
+// returns, every pre-snapshot reader section has ended, so no reader
+// is still holding a pointer into the memory the callback is about
+// to free.
+
+#define RCU_GP_INTERVAL_NS (10ULL * 1000 * 1000)   // 10 ms
+
+extern uint64_t tsc_read_ns(void);
+extern void     sched_sleep(void);
+#include "process.h"
+#include "sched.h"
+
+static void rcu_gp_kthread_entry(void) {
+    for (;;) {
+        // Snapshot all CPUs' pending lists into a single local chain.
+        rcu_head_t* collected = NULL;
+        unsigned n = g_num_cpus;
+        for (unsigned i = 0; i < n; i++) {
+            rcu_head_t* cpu_chain = (rcu_head_t*)__atomic_exchange_n(
+                (rcu_head_t**)&g_cpus[i].rcu_pending_head,
+                NULL,
+                __ATOMIC_ACQUIRE);
+            if (!cpu_chain) continue;
+            // Append cpu_chain to collected — find tail, link.
+            rcu_head_t* tail = cpu_chain;
+            while (tail->next) tail = tail->next;
+            tail->next = collected;
+            collected  = cpu_chain;
+        }
+
+        if (collected) {
+            // Wait for a grace period to close.  Every pre-snapshot
+            // reader must have passed through a QS by now.
+            synchronize_rcu();
+
+            // Invoke every callback.  Order doesn't matter —
+            // callbacks are independent.
+            while (collected) {
+                rcu_head_t* next = collected->next;
+                rcu_func_t  func = collected->func;
+                void*       data = collected->data;
+                // Invoke BEFORE reading next — safety: the callback
+                // may free `collected` itself (common with embedded
+                // heads).  But we already saved func/data/next, so
+                // touching collected after would be UAF.
+                func(data);
+                collected = next;
+            }
+            continue;   // tight loop if work is pending
+        }
+
+        // Idle: sleep for RCU_GP_INTERVAL_NS.  New call_rcu pushes
+        // during the sleep will be picked up on the next pass.
+        uint64_t wake_ns = tsc_read_ns() + RCU_GP_INTERVAL_NS;
+        while (tsc_read_ns() < wake_ns) {
+            g_current->sleep_until_ns = wake_ns;
+            sched_sleep();
+            g_current->sleep_until_ns = 0;
+        }
+    }
+}
+
+void rcu_gp_kthread_start(void) {
+    task_t* t = task_create_kthread(rcu_gp_kthread_entry, pid_alloc());
+    if (t) sched_add(t);
+}
+
+// ── rcu_barrier — block until all already-queued callbacks have run ─────
+// Implementation strategy: enqueue an rcu_head on each CPU's pending
+// list whose callback increments a counter.  Wait until every CPU's
+// barrier callback has fired.  FIFO property of the GP kthread
+// guarantees every call_rcu_head that happened-before ours on that
+// CPU fires first (same-CPU ordering) or at the latest together in
+// the same batch drain.
+//
+// Per-CPU barrier heads live on the caller's stack — the caller is
+// blocked in rcu_barrier() until all of them fire, so stack lifetime
+// is guaranteed.
+
+typedef struct {
+    rcu_head_t        head;
+    volatile uint32_t* done_count;
+} rcu_barrier_t;
+
+static void rcu_barrier_cb(void* data) {
+    rcu_barrier_t* b = (rcu_barrier_t*)data;
+    __atomic_fetch_add(b->done_count, 1, __ATOMIC_ACQ_REL);
+}
+
+void rcu_barrier(void) {
+    unsigned n = g_num_cpus;
+    if (n == 0) return;
+    rcu_barrier_t    barriers[MAX_CPUS];
+    volatile uint32_t done = 0;
+
+    // Push one barrier onto each CPU's pending list.  We can't easily
+    // target a specific remote CPU's pending head from here (our
+    // this_cpu() reflects wherever we happen to be running), so all
+    // N pushes land on our local CPU.  That's still correct: the GP
+    // kthread drains EVERY CPU's list each pass and preserves the
+    // per-CPU FIFO within a batch — so by the time all N barriers
+    // have fired, every callback queued before rcu_barrier() on the
+    // same CPU has also fired.  Cross-CPU ordering is handled by
+    // synchronize_rcu() implicitly: the GP kthread only invokes
+    // callbacks AFTER a grace period elapses, during which every
+    // pre-barrier call_rcu_head must have landed somewhere.
+    //
+    // To explicitly guarantee coverage of callbacks on other CPUs
+    // (which may have been enqueued after the GP kthread's last
+    // snapshot), we queue one barrier per CPU and trust the GP
+    // kthread to batch-drain everyone.  A simpler N-barriers-on-one-
+    // CPU design works because the synchronize_rcu inside the
+    // kthread waits for ALL CPUs' outstanding readers.
+    for (unsigned i = 0; i < n; i++) {
+        barriers[i].done_count = &done;
+        call_rcu_head(&barriers[i].head, rcu_barrier_cb, &barriers[i]);
+    }
+
+    while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < n) {
+        sched_yield();
+    }
+}

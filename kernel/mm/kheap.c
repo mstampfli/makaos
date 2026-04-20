@@ -41,7 +41,8 @@ void kheap_init(void) {
   g_kheap.cache_size_max = 2 * PAGE_SIZE;
 
   for (size_t i = 0; i < KMALLOC_CACHE_COUNT; i++) {
-    pmm_slab_cache_init(&g_kheap.caches[i], g_kmalloc_sizes[i]);
+    // Generic kmalloc caches: no RCU typesafe semantics, default flags.
+    pmm_slab_cache_init(&g_kheap.caches[i], g_kmalloc_sizes[i], 0);
   }
 
   // Phase 4: stamp class_idx into every cache so slab_pcpu_free can
