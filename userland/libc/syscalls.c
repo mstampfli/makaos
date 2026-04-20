@@ -143,6 +143,14 @@ int timerfd_gettime(int fd, struct itimerspec* curr_value) {
         syscall2(SYS_TIMERFD_GETTIME, (uint64_t)fd, (uint64_t)curr_value));
 }
 
+// ── socketpair (POSIX) ────────────────────────────────────────────────
+int socketpair(int domain, int type, int protocol, int fds[2]) {
+    return (int)__syscall_ret(
+        syscall4(SYS_SOCKETPAIR,
+                 (uint64_t)domain, (uint64_t)type,
+                 (uint64_t)protocol, (uint64_t)fds));
+}
+
 // ── Sockets + time(NULL)/nanosleep — provided by libc.c's extern
 //    wrappers, not here. ─────────────────────────────────────────────
 

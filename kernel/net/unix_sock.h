@@ -146,6 +146,10 @@ typedef struct unix_sock {
 // Create a unix socket and wrap in vfs_file_t.  type = SOCK_STREAM or SOCK_DGRAM.
 vfs_file_t* unix_sock_open(int type);
 
+// Create a pre-connected pair.  Returns 0 + fills out[0]/out[1], or -errno.
+// Neither end is bound to a path; both are fully connected and peer-linked.
+int unix_sock_pair(int type, vfs_file_t** out);
+
 // Bind to a filesystem path.  Returns 0 or -errno.
 int unix_sock_bind(vfs_file_t* f, const char* path);
 

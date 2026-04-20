@@ -335,6 +335,85 @@ vfs_file_t* unix_sock_open(int type) {
     return f;
 }
 
+// ── unix_sock_pair ───────────────────────────────────────────────────────
+// Creates two connected sockets — the POSIX socketpair() primitive.
+// Linux-compatible: both ends are unbound (no filesystem path), fully
+// peer-linked, and immediately in UNIX_STATE_CONNECTED.  No listen/accept
+// dance, no backlog.  Used heavily by wayland/pthread for fd passing.
+int unix_sock_pair(int type, vfs_file_t** out) {
+    if (!out) return -EINVAL;
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return -EINVAL;
+
+    vfs_file_t* a = unix_sock_open(type);
+    if (!a) return -ENOMEM;
+    vfs_file_t* b = unix_sock_open(type);
+    if (!b) { unix_sock_close(a); kfree(a); return -ENOMEM; }
+
+    unix_sock_t* sa = (unix_sock_t*)a->ctx;
+    unix_sock_t* sb = (unix_sock_t*)b->ctx;
+
+    sa->peer  = sb;
+    sb->peer  = sa;
+    sa->state = UNIX_STATE_CONNECTED;
+    sb->state = UNIX_STATE_CONNECTED;
+    // Both ends are in the same process — peer_pid is self on each side.
+    sa->peer_pid = g_current ? g_current->pid : 0;
+    sb->peer_pid = sa->peer_pid;
+
+    out[0] = a;
+    out[1] = b;
+    return 0;
+}
+
+// ── socketpair selftest ──────────────────────────────────────────────
+// Uses unix_sock_pair + the peer linkage directly (bypassing fd_install
+// since init_kthread doesn't have a regular user fd table).  Exercises
+// bidirectional send/recv over the pair — the most common wayland path.
+extern void kprintf_atomic(const char* fmt, ...);
+void socketpair_selftest(void) {
+    vfs_file_t* pair[2];
+    if (unix_sock_pair(SOCK_STREAM, pair) != 0) {
+        kprintf_atomic("[socketpair-selftest] FAIL pair alloc\n");
+        return;
+    }
+    const char msg_ab[] = "ping";
+    const char msg_ba[] = "pong";
+    char rx[8] = {0};
+
+    // A → B
+    int r = unix_sock_send(pair[0], msg_ab, 4);
+    if (r != 4) {
+        kprintf_atomic("[socketpair-selftest] FAIL send A->B = %d\n", r);
+        goto fail;
+    }
+    r = unix_sock_recv(pair[1], rx, 4);
+    if (r != 4 || rx[0]!='p' || rx[1]!='i' || rx[2]!='n' || rx[3]!='g') {
+        kprintf_atomic("[socketpair-selftest] FAIL recv A->B r=%d\n", r);
+        goto fail;
+    }
+
+    // B → A
+    __builtin_memset(rx, 0, sizeof(rx));
+    r = unix_sock_send(pair[1], msg_ba, 4);
+    if (r != 4) {
+        kprintf_atomic("[socketpair-selftest] FAIL send B->A = %d\n", r);
+        goto fail;
+    }
+    r = unix_sock_recv(pair[0], rx, 4);
+    if (r != 4 || rx[0]!='p' || rx[1]!='o' || rx[2]!='n' || rx[3]!='g') {
+        kprintf_atomic("[socketpair-selftest] FAIL recv B->A r=%d\n", r);
+        goto fail;
+    }
+
+    unix_sock_close(pair[0]); kfree(pair[0]);
+    unix_sock_close(pair[1]); kfree(pair[1]);
+    kprintf_atomic("[socketpair-selftest] PASS (bidirectional stream)\n");
+    return;
+fail:
+    unix_sock_close(pair[0]); kfree(pair[0]);
+    unix_sock_close(pair[1]); kfree(pair[1]);
+}
+
 // ── unix_sock_bind ───────────────────────────────────────────────────────
 
 int unix_sock_bind(vfs_file_t* f, const char* path) {
