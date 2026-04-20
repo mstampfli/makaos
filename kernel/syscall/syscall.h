@@ -118,6 +118,7 @@
 #define SYS_IO_URING_SETUP    101 // setup(entries, io_uring_params*) → ring fd
 #define SYS_IO_URING_ENTER    102 // enter(fd, to_submit, min_complete, flags) → submitted
 #define SYS_IO_URING_REGISTER 103 // register(fd, op, arg*, nr_args) → 0 or -errno
+#define SYS_SCHED_YIELD       104 // yield remaining timeslice; reschedules → 0
 
 // ── epoll types ───────────────────────────────────────────────────────────
 #define EPOLLIN      0x00000001u

@@ -107,6 +107,7 @@
 #define SYS_IO_URING_SETUP    101
 #define SYS_IO_URING_ENTER    102
 #define SYS_IO_URING_REGISTER 103
+#define SYS_SCHED_YIELD       104
 
 // SYS_READ nonblock hint — encoded in the 4th syscall arg to SYS_READ.
 #define SYS_READ_NONBLOCK 1
