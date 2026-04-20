@@ -7,8 +7,15 @@
 
 typedef unsigned long       size_t;
 typedef   signed long       ptrdiff_t;
-typedef   signed long       ssize_t;
 typedef int                 wchar_t;
+
+// ssize_t is technically a POSIX type but libgcc pulls it via stdio.h
+// in freestanding compiles, so expose it here too with the shared
+// guard to keep a single source of truth.
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED 1
+typedef long ssize_t;
+#endif
 
 typedef struct { long long __ll; long double __ld; } max_align_t;
 

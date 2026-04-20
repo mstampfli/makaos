@@ -3,7 +3,19 @@
 
 #include <stddef.h>
 #include <stdarg.h>
-#include <sys/types.h>
+
+// Self-contained ssize_t / off_t — libgcc's freestanding compile path
+// pulls in <stdio.h> without being able to reach <sys/types.h>, so we
+// can't rely on it transitively.  Guards prevent redefinition when the
+// caller already pulled in <sys/types.h>.
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED 1
+typedef long ssize_t;
+#endif
+#ifndef _OFF_T_DEFINED
+#define _OFF_T_DEFINED 1
+typedef long long off_t;
+#endif
 
 #define EOF   (-1)
 #define BUFSIZ 4096
