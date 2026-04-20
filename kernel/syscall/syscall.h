@@ -119,6 +119,27 @@
 #define SYS_IO_URING_ENTER    102 // enter(fd, to_submit, min_complete, flags) → submitted
 #define SYS_IO_URING_REGISTER 103 // register(fd, op, arg*, nr_args) → 0 or -errno
 #define SYS_SCHED_YIELD       104 // yield remaining timeslice; reschedules → 0
+#define SYS_EVENTFD           105 // eventfd(init_val, flags) → fd or -errno
+#define SYS_TIMERFD_CREATE    106 // timerfd_create(clockid, flags) → fd or -errno
+#define SYS_TIMERFD_SETTIME   107 // timerfd_settime(fd, flags, new_spec*, old_spec*) → 0 or -errno
+#define SYS_TIMERFD_GETTIME   108 // timerfd_gettime(fd, out_spec*) → 0 or -errno
+#define SYS_SOCKETPAIR        109 // socketpair(domain, type, protocol, fds[2]) → 0 or -errno
+#define SYS_SENDMSG           110 // sendmsg(fd, msghdr*, flags) → count or -errno
+#define SYS_RECVMSG           111 // recvmsg(fd, msghdr*, flags) → count or -errno
+
+// eventfd flags
+#define EFD_SEMAPHORE 0x0001
+#define EFD_CLOEXEC   0x0002
+#define EFD_NONBLOCK  0x0004
+
+// timerfd flags
+#define TFD_CLOEXEC       0x0002
+#define TFD_NONBLOCK      0x0004
+#define TFD_TIMER_ABSTIME 0x0001
+
+// sendmsg/recvmsg control-message types
+#define SCM_RIGHTS      0x01
+#define MSG_CMSG_CLOEXEC 0x40000000
 
 // ── epoll types ───────────────────────────────────────────────────────────
 #define EPOLLIN      0x00000001u

@@ -4550,6 +4550,21 @@ static uint64_t w_sys_sched_yield(uint64_t a, uint64_t b, uint64_t c, uint64_t d
     return 0;
 }
 
+// ── sys_eventfd ─────────────────────────────────────────────────────
+// eventfd2(init_val, flags) → fd.  Linux-compatible semantics: read
+// drains (or, in EFD_SEMAPHORE mode, decrements by 1); write adds to
+// the counter; poll POLLIN when counter > 0, POLLOUT when < max.
+extern vfs_file_t* eventfd_new(uint32_t init_val, uint32_t flags);
+static uint64_t w_sys_eventfd(uint64_t init_val, uint64_t flags,
+                                uint64_t c, uint64_t d) {
+    (void)c; (void)d;
+    vfs_file_t* f = eventfd_new((uint32_t)init_val, (uint32_t)flags);
+    if (!f) return (uint64_t)-ENOMEM;
+    int64_t fd = fd_install(f);
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }
+    return (uint64_t)fd;
+}
+
 static uint64_t w_sys_io_uring_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return sys_io_uring_register(a, b, c, d);
 }
@@ -4668,6 +4683,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_IO_URING_ENTER]      = w_sys_io_uring_enter,
     [SYS_IO_URING_REGISTER]   = w_sys_io_uring_register,
     [SYS_SCHED_YIELD]         = w_sys_sched_yield,
+    [SYS_EVENTFD]             = w_sys_eventfd,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

@@ -436,6 +436,10 @@ static void init_kthread(void) {
     extern void io_uring_selftest(void);
     io_uring_selftest();
 
+    // Tier 1 #2 (eventfd): counter + semaphore + nonblocking semantics.
+    extern void eventfd_selftest(void);
+    eventfd_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.
