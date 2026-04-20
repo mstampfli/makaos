@@ -130,6 +130,7 @@ SYSROOT_CFLAGS=(
 # ── Common user object files ───────────────────────────────────────────────
 "$NASM" -f elf64 "$USERLAND_DIR/entry/entry.asm"    -o "$BUILD_DIR/user_entry.o"
 "$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
+"$NASM" -f elf64 "$USERLAND_DIR/libc/pthread_trampoline.asm" -o "$BUILD_DIR/user_pthread_tramp.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
@@ -140,11 +141,17 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/syscalls.c" -o "$BUILD_DIR/user_syscalls.o"
 
+# pthread: POSIX threading on top of sys_thread + sched_yield.  Spins
+# on contention until we add a kernel futex.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/pthread.c" -o "$BUILD_DIR/user_pthread.o"
+
 # libc archive — anything linking sysroot-style pulls this in as -lc.
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_stdio.o" \
    "$BUILD_DIR/user_dns.o" "$BUILD_DIR/user_math.o" \
-   "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o"
+   "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o" \
+   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still

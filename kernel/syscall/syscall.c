@@ -4540,6 +4540,16 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t op,
     return (uint64_t)(int64_t)r;
 }
 
+// ── sys_sched_yield ───────────────────────────────────────────────────
+// POSIX sched_yield(void).  Drops the remaining timeslice; picks up
+// whatever the scheduler decides is next.  pthread uses this when it
+// can't grab a contended mutex — spins a few times, then yields.
+static uint64_t w_sys_sched_yield(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    sched_yield();
+    return 0;
+}
+
 static uint64_t w_sys_io_uring_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return sys_io_uring_register(a, b, c, d);
 }
@@ -4657,6 +4667,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_IO_URING_SETUP]      = w_sys_io_uring_setup,
     [SYS_IO_URING_ENTER]      = w_sys_io_uring_enter,
     [SYS_IO_URING_REGISTER]   = w_sys_io_uring_register,
+    [SYS_SCHED_YIELD]         = w_sys_sched_yield,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────
