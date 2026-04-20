@@ -107,6 +107,34 @@ echo "[+] Building user binaries"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
+# ── mbedTLS (userspace library) ────────────────────────────────────────────
+# Ports upstream mbedtls-3.6.x into userland/libs/mbedtls/libmbedtls.a.
+# The port script is idempotent and skips work when already built; pass
+# FORCE=1 to rebuild from scratch.  See scripts/port-mbedtls.sh.
+MBEDTLS_LIB="$USERLAND_DIR/libs/mbedtls/libmbedtls.a"
+if [ ! -f "$MBEDTLS_LIB" ] || [ "${REBUILD_MBEDTLS:-0}" = "1" ]; then
+  echo "[+] Building mbedTLS (first-time port can take ~2 minutes)"
+  bash scripts/port-mbedtls.sh
+fi
+
+# Glue layer — same shim-based include strategy as the library itself so
+# the symbols link cleanly.  mbedtls_glue.c provides hardware_poll,
+# ms_time, and BIO callbacks for any userland program that wants TLS.
+MBEDTLS_CFLAGS=(
+  -nostdinc
+  -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>'
+)
+MBEDTLS_INCLUDES=(
+  -I "$USERLAND_DIR/libs/mbedtls/shim"
+  -I "$USERLAND_DIR/libc"
+  -I "$USERLAND_DIR/include"
+  -I "$USERLAND_DIR/libs/mbedtls"
+  -I "$USERLAND_DIR/libs/mbedtls/include"
+)
+"$CC" "${USER_CFLAGS[@]}" "${MBEDTLS_CFLAGS[@]}" "${MBEDTLS_INCLUDES[@]}" \
+  -c "$USERLAND_DIR/libs/mbedtls/mbedtls_glue.c" \
+  -o "$BUILD_DIR/user_mbedtls_glue.o"
+
 USER_INCLUDES=(
   -I "$USERLAND_DIR/libc"
   -I "$USERLAND_DIR/include"
