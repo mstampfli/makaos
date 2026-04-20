@@ -103,7 +103,19 @@ build_gcc() {
     log "fetching gcc prerequisites (gmp/mpfr/mpc/isl)"
     (cd "$GCC_SRC" && ./contrib/download_prerequisites)
 
-    log "configuring gcc"
+    log "configuring gcc (C + C++)"
+    # Sysroot must already contain a built libc.a + split headers; the
+    # top-level ./build.sh produces those.  libstdc++ autoconf needs
+    # them to link its probe test cases during configure.
+    if [ ! -f "$SYSROOT/usr/lib/libc.a" ]; then
+        log "FATAL: $SYSROOT/usr/lib/libc.a missing — run ./build.sh first"
+        exit 1
+    fi
+    if [ ! -f "$SYSROOT/usr/include/pthread.h" ]; then
+        log "FATAL: $SYSROOT/usr/include/pthread.h missing — run ./build.sh first"
+        exit 1
+    fi
+
     rm -rf "$build"
     mkdir -p "$build"
     # Put the newly-built x86_64-pc-makaos-{as,ld,ar} on PATH so gcc's
@@ -114,22 +126,38 @@ build_gcc() {
             --target="$TARGET" \
             --prefix="$PREFIX" \
             --with-sysroot="$SYSROOT" \
+            --with-native-system-header-dir=/usr/include \
             --disable-nls \
-            --enable-languages=c \
+            --enable-languages=c,c++ \
             --disable-shared \
-            --disable-threads \
+            --enable-threads=posix \
             --disable-libssp \
             --disable-libmudflap \
             --disable-libgomp \
             --disable-libquadmath \
             --disable-libatomic \
             --disable-multilib \
-            --without-headers)
-    log "building gcc + libgcc (this takes ~30–45 min)"
+            --disable-hosted-libstdcxx \
+            --disable-wchar_t \
+            --disable-libstdcxx-pch \
+            --disable-libstdcxx-filesystem-ts \
+            --disable-libstdcxx-backtrace \
+            --disable-libstdcxx-verbose)
+    log "building gcc"
     make -C "$build" -j"$JOBS" all-gcc
+    log "building libgcc"
     make -C "$build" -j"$JOBS" all-target-libgcc
-    log "installing gcc"
+    log "installing gcc + libgcc (needed before libstdc++ can probe)"
     make -C "$build" install-gcc install-target-libgcc
+    log "building libstdc++"
+    # Freestanding libstdc++: headers + type traits + <atomic> + exceptions,
+    # no <iostream>/<fstream>/<regex>/<random> (those need full hosted libc
+    # features we don't all ship).  Ladybird and most C++ libs compile
+    # against the hosted bits they actually use; the unused headers simply
+    # aren't present.  If a port fails on a missing header we add a shim.
+    make -C "$build" -j"$JOBS" all-target-libstdc++-v3
+    log "installing libstdc++"
+    make -C "$build" install-target-libstdc++-v3
 }
 
 main() {
