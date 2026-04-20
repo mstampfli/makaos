@@ -1,0 +1,47 @@
+Add x86_64-pc-makaos target support to libstdc++-v3.
+
+libstdc++-v3/crossconfig.m4 has an explicit OS list; unknown targets
+hit the catch-all *) at the bottom and get AC_MSG_ERROR("No support
+for this host/target combination").  Add a minimal *-makaos* entry —
+same shape as *-fuchsia* (freestanding, no hosted libc probes), with
+section-splitting flags so the linker can GC unused bits.
+
+We patch both crossconfig.m4 (the source) AND the generated configure
+script — the build script doesn't run autoreconf, so configure needs
+to be edited directly.
+
+Signed-off-by: MakaOS <noreply@makaos>
+
+diff --git a/libstdc++-v3/crossconfig.m4 b/libstdc++-v3/crossconfig.m4
+--- a/libstdc++-v3/crossconfig.m4
++++ b/libstdc++-v3/crossconfig.m4
+@@ -141,6 +141,14 @@ case "${host}" in
+     AC_SUBST(SECTION_FLAGS)
+     ;;
+
++  *-makaos*)
++    # Freestanding-ish MakaOS — relies on host-libc probes for hosted
++    # features via --with-sysroot.  Section flags give the linker room
++    # to garbage-collect unused bits.
++    SECTION_FLAGS='-ffunction-sections -fdata-sections'
++    AC_SUBST(SECTION_FLAGS)
++    ;;
++
+   *-hpux*)
+     SECTION_FLAGS='-ffunction-sections -fdata-sections'
+     AC_SUBST(SECTION_FLAGS)
+diff --git a/libstdc++-v3/configure b/libstdc++-v3/configure
+--- a/libstdc++-v3/configure
++++ b/libstdc++-v3/configure
+@@ -38409,6 +38409,11 @@ fi
+
+     ;;
+
++  *-makaos*)
++    SECTION_FLAGS='-ffunction-sections -fdata-sections'
++
++    ;;
++
+   *-hpux*)
+     SECTION_FLAGS='-ffunction-sections -fdata-sections'
+
