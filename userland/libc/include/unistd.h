@@ -4,6 +4,13 @@
 #include <sys/types.h>
 #include <stddef.h>
 
+// POSIX feature marker — we provide the .2001 subset that matters to
+// portable code (clock_gettime, nanosleep, pthread types not included).
+#define _POSIX_VERSION      200112L
+#define _POSIX2_VERSION     200112L
+#define _POSIX_TIMERS       1
+#define _POSIX_MONOTONIC_CLOCK 1
+
 // whence
 #define SEEK_SET 0
 #define SEEK_CUR 1

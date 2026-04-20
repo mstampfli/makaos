@@ -83,6 +83,11 @@ int  puts(const char* s);
 
 // Error messages
 void perror(const char* prefix);
+void setbuf(FILE* f, char* buf);
+int  setvbuf(FILE* f, char* buf, int mode, size_t size);
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
 
 // Temp files / rename / remove
 int   remove(const char* path);

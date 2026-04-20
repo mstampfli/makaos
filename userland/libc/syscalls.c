@@ -12,12 +12,14 @@
 #include <makaos/syscall.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
+#include <stdio.h>
 #include <stdarg.h>
 
 // ── I/O ───────────────────────────────────────────────────────────────
@@ -77,7 +79,33 @@ uid_t geteuid(void)  { return (uid_t)syscall0(SYS_GETEUID); }
 gid_t getgid(void)   { return (gid_t)syscall0(SYS_GETGID); }
 gid_t getegid(void)  { return (gid_t)syscall0(SYS_GETEGID); }
 
-// ── Sockets + time — provided by libc.c's extern wrappers; not here. ──
+// ── clock_gettime / clock_getres (POSIX) ──────────────────────────────
+// MakaOS has a single monotonic nanosecond clock exposed via SYS_CLOCK_NS.
+// Every clock id maps to it — we don't separate wall vs. monotonic yet.
+int clock_gettime(clockid_t id, struct timespec* ts) {
+    (void)id;
+    if (!ts) { errno = EINVAL; return -1; }
+    uint64_t ns = syscall0(SYS_CLOCK_NS);
+    ts->tv_sec  = (time_t)(ns / 1000000000ull);
+    ts->tv_nsec = (long)  (ns % 1000000000ull);
+    return 0;
+}
+
+int clock_getres(clockid_t id, struct timespec* res) {
+    (void)id;
+    if (!res) { errno = EINVAL; return -1; }
+    res->tv_sec  = 0;
+    res->tv_nsec = 1;                      // nanosecond resolution
+    return 0;
+}
+
+// ── setbuf — thin wrapper over setvbuf (which libc.c provides). ───────
+void setbuf(FILE* f, char* buf) {
+    setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+// ── Sockets + time(NULL)/nanosleep — provided by libc.c's extern
+//    wrappers, not here. ─────────────────────────────────────────────
 
 // ── net byte order (libc.h has them static-inline — sysroot consumers
 //    need real symbols) ───────────────────────────────────────────────
