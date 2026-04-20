@@ -7,11 +7,22 @@
 
 #include "https_client.h"
 
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
 #include <mbedtls/ssl.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/error.h>
-#include <mbedtls/net_sockets.h>   // harmless even with MBEDTLS_NET_C off
+#include <mbedtls/net_sockets.h>
 
 // Glue symbols implemented in userland/libs/mbedtls/mbedtls_glue.c.
 extern int mbedtls_hardware_poll(void* data, unsigned char* output,
@@ -68,11 +79,11 @@ static int tcp_connect(const char* host, uint16_t port, int verbose) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { write_err("* socket() failed\n"); return -1; }
 
-    sockaddr_in_t dst;
+    struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
     dst.sin_port   = htons(port);
-    dst.sin_addr   = ip_be;
+    dst.sin_addr   = ip_be;    // netinet/in.h flattens this to raw in_addr_t
     if (connect(fd, (struct sockaddr*)&dst, sizeof(dst)) < 0) {
         write_err("* connect() failed\n");
         close(fd);

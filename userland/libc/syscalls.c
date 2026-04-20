@@ -1,0 +1,103 @@
+// ── libc syscall wrappers — extern symbols for sysroot consumers ──────
+//
+// userland/libc/libc.h declares the basic syscall wrappers as `static
+// inline` so legacy apps that include libc.h get them inlined.  Any TU
+// that uses the new split headers (<unistd.h>, <fcntl.h>, <sys/socket.h>,
+// etc.) expects external linkage — this file provides those symbols.
+//
+// Each wrapper routes through syscall* defined in <makaos/syscall.h>
+// and translates the negative-kernel-return convention into POSIX
+// errno via __syscall_ret.
+
+#include <makaos/syscall.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
+#include <stdarg.h>
+
+// ── I/O ───────────────────────────────────────────────────────────────
+
+ssize_t read(int fd, void* buf, size_t n) {
+    return (ssize_t)__syscall_ret(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)buf, n));
+}
+ssize_t write(int fd, const void* buf, size_t n) {
+    return (ssize_t)__syscall_ret(syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, n));
+}
+int close(int fd) {
+    return (int)__syscall_ret(syscall1(SYS_CLOSE, (uint64_t)fd));
+}
+off_t lseek(int fd, off_t off, int whence) {
+    return (off_t)__syscall_ret(syscall3(SYS_LSEEK, (uint64_t)fd, (uint64_t)off, (uint64_t)whence));
+}
+int dup(int fd) {
+    return (int)__syscall_ret(syscall1(SYS_DUP, (uint64_t)fd));
+}
+int dup2(int oldfd, int newfd) {
+    return (int)__syscall_ret(syscall2(SYS_DUP2, (uint64_t)oldfd, (uint64_t)newfd));
+}
+int pipe(int fds[2]) {
+    return (int)__syscall_ret(syscall1(SYS_PIPE, (uint64_t)fds));
+}
+
+int open(const char* path, int flags, ...) {
+    uint64_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (uint64_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return (int)__syscall_ret(syscall3(SYS_OPEN, (uint64_t)path, (uint64_t)flags, mode));
+}
+
+int fcntl(int fd, int cmd, ...) {
+    va_list ap;
+    va_start(ap, cmd);
+    uint64_t arg = (uint64_t)va_arg(ap, long);
+    va_end(ap);
+    return (int)__syscall_ret(syscall3(SYS_FCNTL, (uint64_t)fd, (uint64_t)cmd, arg));
+}
+
+int access(const char* path, int mode) {
+    return (int)__syscall_ret(syscall2(SYS_ACCESS, (uint64_t)path, (uint64_t)mode));
+}
+
+// ── Process ───────────────────────────────────────────────────────────
+
+pid_t fork(void)     { return (pid_t)__syscall_ret(syscall0(SYS_FORK)); }
+pid_t getpid(void)   { return (pid_t)syscall0(SYS_GETPID); }
+pid_t getppid(void)  { return (pid_t)syscall0(SYS_GETPPID); }
+uid_t getuid(void)   { return (uid_t)syscall0(SYS_GETUID); }
+uid_t geteuid(void)  { return (uid_t)syscall0(SYS_GETEUID); }
+gid_t getgid(void)   { return (gid_t)syscall0(SYS_GETGID); }
+gid_t getegid(void)  { return (gid_t)syscall0(SYS_GETEGID); }
+
+// ── Sockets + time — provided by libc.c's extern wrappers; not here. ──
+
+// ── net byte order (libc.h has them static-inline — sysroot consumers
+//    need real symbols) ───────────────────────────────────────────────
+
+uint16_t htons(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
+uint16_t ntohs(uint16_t v) { return htons(v); }
+uint32_t htonl(uint32_t v) {
+    return ((v >> 24) & 0xFF) | (((v >> 16) & 0xFF) << 8)
+         | (((v >> 8) & 0xFF) << 16) | ((v & 0xFF) << 24);
+}
+uint32_t ntohl(uint32_t v) { return htonl(v); }
+
+// ── memchr (used by http_get) — not a syscall, simple loop ────────────
+
+void* memchr(const void* s, int c, size_t n) {
+    const unsigned char* p = (const unsigned char*)s;
+    unsigned char target = (unsigned char)c;
+    while (n--) {
+        if (*p == target) return (void*)p;
+        p++;
+    }
+    return (void*)0;
+}

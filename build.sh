@@ -99,6 +99,23 @@ KERNEL_EXCLUDE="ata_poll.c ata_driver_irq.c fat32.c ac97.c asm_offsets.c"
 
 echo "[+] Building user binaries"
 
+# ── Sysroot (Phase B) ──────────────────────────────────────────────────────
+# Every ported library and every future external build targets this tree.
+# The only thing the repo owns inside is headers under userland/libc/include
+# and the libc .c sources — everything else is rebuilt on every run.
+SYSROOT="$BUILD_DIR/sysroot"
+rm -rf "$SYSROOT"
+mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib"
+cp -rT "$USERLAND_DIR/libc/include" "$SYSROOT/usr/include"
+
+# Shared cross-compile flags any sysroot consumer uses.  -nostdinc forces
+# the sysroot include path so host glibc headers never leak in.
+SYSROOT_CFLAGS=(
+  --sysroot="$SYSROOT"
+  -nostdinc
+  -isystem "$SYSROOT/usr/include"
+)
+
 # ── Common user object files ───────────────────────────────────────────────
 "$NASM" -f elf64 "$USERLAND_DIR/entry/entry.asm"    -o "$BUILD_DIR/user_entry.o"
 "$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
@@ -107,32 +124,41 @@ echo "[+] Building user binaries"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
-# ── mbedTLS (userspace library) ────────────────────────────────────────────
-# Ports upstream mbedtls-3.6.x into userland/libs/mbedtls/libmbedtls.a.
-# The port script is idempotent and skips work when already built; pass
-# FORCE=1 to rebuild from scratch.  See scripts/port-mbedtls.sh.
-MBEDTLS_LIB="$USERLAND_DIR/libs/mbedtls/libmbedtls.a"
+# syscalls.c: extern-linkage wrappers around the raw syscall* ops for
+# sysroot consumers that can't see libc.h's static-inline copies.
+"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/syscalls.c" -o "$BUILD_DIR/user_syscalls.o"
+
+# libc archive — anything linking sysroot-style pulls this in as -lc.
+ar rcs "$SYSROOT/usr/lib/libc.a" \
+   "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_stdio.o" \
+   "$BUILD_DIR/user_dns.o" "$BUILD_DIR/user_math.o" \
+   "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o"
+
+# crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
+# the real cross-gcc is in place.  For the current host-gcc path we still
+# list user_entry.o explicitly in each link line.
+cp "$BUILD_DIR/user_entry.o" "$SYSROOT/usr/lib/crt0.o"
+
+# Default link script for sysroot users.
+cp "$USERLAND_DIR/link.ld" "$SYSROOT/usr/lib/makaos-link.ld"
+
+# ── mbedTLS (userspace port, sysroot-based) ────────────────────────────────
+# port-mbedtls.sh fetches the upstream tarball into build/third_party/,
+# compiles it against $SYSROOT, and installs libmbedtls.a + headers into
+# the sysroot.  Nothing about this port lives inside the MakaOS repo.
+MBEDTLS_LIB="$SYSROOT/usr/lib/libmbedtls.a"
 if [ ! -f "$MBEDTLS_LIB" ] || [ "${REBUILD_MBEDTLS:-0}" = "1" ]; then
   echo "[+] Building mbedTLS (first-time port can take ~2 minutes)"
-  bash scripts/port-mbedtls.sh
+  SYSROOT="$SYSROOT" bash scripts/port-mbedtls.sh
 fi
 
-# Glue layer — same shim-based include strategy as the library itself so
-# the symbols link cleanly.  mbedtls_glue.c provides hardware_poll,
-# ms_time, and BIO callbacks for any userland program that wants TLS.
-MBEDTLS_CFLAGS=(
-  -nostdinc
-  -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>'
-)
-MBEDTLS_INCLUDES=(
-  -I "$USERLAND_DIR/libs/mbedtls/shim"
-  -I "$USERLAND_DIR/libc"
-  -I "$USERLAND_DIR/include"
-  -I "$USERLAND_DIR/libs/mbedtls"
-  -I "$USERLAND_DIR/libs/mbedtls/include"
-)
-"$CC" "${USER_CFLAGS[@]}" "${MBEDTLS_CFLAGS[@]}" "${MBEDTLS_INCLUDES[@]}" \
-  -c "$USERLAND_DIR/libs/mbedtls/mbedtls_glue.c" \
+# Glue — hardware_poll / ms_time / BIO shims.  Compiles sysroot-style:
+# the same include topology as any external client of mbedTLS.
+"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>' \
+  -I scripts/configs \
+  -c scripts/glue/mbedtls_glue.c \
   -o "$BUILD_DIR/user_mbedtls_glue.o"
 
 USER_INCLUDES=(
@@ -222,10 +248,12 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_svcmgr.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_restrict.o" \
    -o "$BUILD_DIR/user_restrict.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
-# https_client.c includes mbedtls headers — needs the same shim/include
-# topology as the library itself.
-"$CC" "${USER_CFLAGS[@]}" "${MBEDTLS_CFLAGS[@]}" "${MBEDTLS_INCLUDES[@]}" \
+"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
+# https_client.c pulls mbedtls headers from the sysroot — no per-app
+# shim dirs, just -isystem $SYSROOT/usr/include.
+"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>' \
+  -I scripts/configs \
   -c "$USERLAND_DIR/apps/http_get/https_client.c" \
   -o "$BUILD_DIR/user_http_get_tls.o"
 LIBGCC="$("$CC" -print-libgcc-file-name)"
@@ -233,7 +261,8 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" \
    "$BUILD_DIR/user_http_get.o" \
    "$BUILD_DIR/user_http_get_tls.o" \
    "$BUILD_DIR/user_mbedtls_glue.o" \
-   "$USERLAND_DIR/libs/mbedtls/libmbedtls.a" \
+   "$BUILD_DIR/user_syscalls.o" \
+   "$SYSROOT/usr/lib/libmbedtls.a" \
    "$LIBGCC" \
    -o "$BUILD_DIR/user_http_get.elf"
 

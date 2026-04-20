@@ -14,7 +14,13 @@
 //   • Redirect chain: 301/302/303/307/308, max 10 hops
 //   • Writes body to stdout (or -o file)
 
-#include "libc.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "https_client.h"
 
 #define HTTP_PORT_DEFAULT  80
