@@ -436,6 +436,12 @@ static void init_kthread(void) {
     extern void io_uring_selftest(void);
     io_uring_selftest();
 
+    // Phase 9A/9B: crypto KATs.  Fails the boot loudly if any
+    // primitive produces wrong output — TLS silently corrupts
+    // everything downstream if the primitives are broken.
+    extern void crypto_selftest(void);
+    crypto_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.
