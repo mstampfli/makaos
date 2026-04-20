@@ -84,6 +84,15 @@ void irq_drain(uint8_t irq) {
 }
 
 void irq_notify(uint8_t irq) {
+    // Phase 9A: mix TSC-at-IRQ into the kernel entropy pool.  Each
+    // IRQ's exact arrival time carries jitter from interrupt
+    // controllers + DRAM + bus contention — a real entropy source.
+    // Lockless (per-CPU fast-mix slot); zero overhead on the IRQ
+    // hot path beyond one tsc_read_ns() + a few XORs.
+    extern uint64_t tsc_read_ns(void);
+    extern void kcsprng_mix_irq(uint8_t, uint64_t);
+    kcsprng_mix_irq(irq, tsc_read_ns());
+
     // preempt_disable around wake_all: this is called from ISR context
     // (keyboard/mouse/hda/ac97/virtio-net/...).  Without this, wake_all's
     // rcu_read_unlock → preempt_enable → sched_preempt → do_switch → `sti`
