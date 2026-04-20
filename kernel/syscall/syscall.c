@@ -197,7 +197,8 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
 // open(path_ptr, flags, mode) → fd or -errno
 // flags: O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NONBLOCK/O_CLOEXEC
 // mode: used for umask masking on O_CREAT.
-static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
+// Non-static — exposed for io_uring opcode dispatch.
+uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
     // Copy null-terminated path from user space (max 511 to leave room for cwd prefix).
@@ -372,7 +373,9 @@ got_file:
 
 // ── sys_close ─────────────────────────────────────────────────────────────
 // close(fd) → 0 or -1
-static uint64_t sys_close(uint64_t fd) {
+// Non-static so other subsystems (io_uring, etc.) can invoke the
+// canonical close semantics without duplicating the fd-table walk.
+uint64_t sys_close(uint64_t fd) {
     if (!g_current || !g_current->files_shared) return (uint64_t)-EBADF;
     task_files_t* tf = g_current->files_shared;
     spin_lock(&tf->lock);
@@ -1295,8 +1298,8 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
 }
 
 // Forward declarations for copy helpers (defined later in this file).
-static int copy_to_user(void* dst_u, const void* src, uint64_t len);
-static int copy_from_user(void* dst, const void* src_u, uint64_t len);
+int copy_to_user(void* dst_u, const void* src, uint64_t len);
+int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 // ── sys_stat ──────────────────────────────────────────────────────────────
 // stat(path_ptr, pathlen, stat_ptr) → 0 or -errno
@@ -2471,7 +2474,7 @@ static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
 }
 
 // accept(fd, sockaddr*, addrlen*) → new fd or -errno
-static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
+uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)addrlen_ptr;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
@@ -2501,7 +2504,7 @@ static uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr)
 }
 
 // connect(fd, sockaddr*, addrlen) → 0 or -errno
-static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
+uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
     if (!f) return (uint64_t)-EBADF;
@@ -2523,7 +2526,7 @@ static uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
 }
 
 // sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
-static uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
+uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                              uint64_t flags, uint64_t addr_ptr, uint64_t addrlen) {
     (void)flags; (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
@@ -2553,7 +2556,7 @@ static uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
 }
 
 // recvfrom(fd, buf, len, flags, addr, addrlen*) → bytes or -errno
-static uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
+uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                                uint64_t flags, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)flags; (void)addrlen_ptr;
     vfs_file_t* f = fd_to_file(fd);
@@ -2664,14 +2667,14 @@ static inline int _access_ok(uint64_t addr, uint64_t len) {
 
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
 // Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
-static int copy_from_user(void* dst, const void* src_u, uint64_t len) {
+int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)src_u, len);
     __builtin_memcpy(dst, src_u, len);
     return 0;
 }
 
-static int copy_to_user(void* dst_u, const void* src, uint64_t len) {
+int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
     user_buf_prefault((virt_addr_t)dst_u, len);
     __builtin_memcpy(dst_u, src, len);
@@ -4457,6 +4460,90 @@ static uint64_t w_sys_slabinfo(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return sys_slabinfo(a);
 }
 
+// ── sys_io_uring_setup (Phase 8B) ─────────────────────────────────────
+// entries   (a): requested SQ size; clamped to power of two, max 4096
+// params*   (b): user pointer to io_uring_params_t — filled on return
+// Returns the ring fd on success, -errno otherwise.
+#include "io_uring.h"
+static uint64_t sys_io_uring_setup(uint64_t entries, uint64_t params_uptr) {
+    if (!params_uptr) return (uint64_t)-EINVAL;
+    io_uring_params_t kparams;
+    // Read user params (flags, sq_thread_cpu, etc.)
+    if (copy_from_user(&kparams, (const void*)params_uptr, sizeof(kparams)) != 0)
+        return (uint64_t)-EFAULT;
+    // Zero output fields — kernel owns everything below the input triplet.
+    kparams.sq_entries  = 0;
+    kparams.cq_entries  = 0;
+    kparams.features    = 0;
+    kparams.sq_ring_ptr = kparams.cq_ring_ptr = 0;
+    kparams.sqes_ptr    = kparams.cqes_ptr    = 0;
+
+    vfs_file_t* f = io_uring_create((uint32_t)entries, &kparams);
+    if (!f) return (uint64_t)-ENOMEM;
+
+    int64_t fd = fd_install(f);
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }
+
+    if (copy_to_user((void*)params_uptr, &kparams, sizeof(kparams)) != 0) {
+        sys_close((uint64_t)fd);
+        return (uint64_t)-EFAULT;
+    }
+    return (uint64_t)fd;
+}
+
+static uint64_t w_sys_io_uring_setup(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d;
+    return sys_io_uring_setup(a, b);
+}
+
+// ── sys_io_uring_enter (Phase 8B) ─────────────────────────────────────
+// fd            (a): ring fd
+// to_submit     (b): max SQEs to consume
+// min_complete  (c): min CQEs to wait for if GETEVENTS flag set
+// flags         (d): IORING_ENTER_*
+// Returns number submitted (≤ to_submit) or -errno.
+static uint64_t sys_io_uring_enter(uint64_t fd, uint64_t to_submit,
+                                     uint64_t min_complete, uint64_t flags) {
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    // Validate: must be a ring fd (close == io_uring_close_file).
+    extern void io_uring_close_file(struct vfs_file_t*);
+    if (f->close != io_uring_close_file) { fdput(f); return (uint64_t)-EINVAL; }
+    io_uring_t* uring = (io_uring_t*)f->ctx;
+    int submitted = io_uring_enter_impl(uring, (uint32_t)to_submit,
+                                          (uint32_t)min_complete,
+                                          (uint32_t)flags);
+    fdput(f);
+    if (submitted < 0) return (uint64_t)(int64_t)submitted;
+    return (uint64_t)submitted;
+}
+
+static uint64_t w_sys_io_uring_enter(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_io_uring_enter(a, b, c, d);
+}
+
+// ── sys_io_uring_register (Phase 8G) ─────────────────────────────────
+// fd       (a): ring fd
+// op       (b): IORING_REGISTER_* / _UNREGISTER_*
+// arg_uptr (c): user ptr (type depends on op)
+// nr_args  (d): count
+static uint64_t sys_io_uring_register(uint64_t fd, uint64_t op,
+                                        uint64_t arg_uptr, uint64_t nr_args) {
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    extern void io_uring_close_file(struct vfs_file_t*);
+    if (f->close != io_uring_close_file) { fdput(f); return (uint64_t)-EINVAL; }
+    io_uring_t* uring = (io_uring_t*)f->ctx;
+    int r = io_uring_register_impl(uring, (uint32_t)op, arg_uptr,
+                                     (uint32_t)nr_args);
+    fdput(f);
+    return (uint64_t)(int64_t)r;
+}
+
+static uint64_t w_sys_io_uring_register(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return sys_io_uring_register(a, b, c, d);
+}
+
 // 4-arg handlers that already match the uniform signature — used directly.
 // sys_read(a,b,c,d), sys_readdir(a,b,c,d), sys_rename(a,b,c,d)
 
@@ -4567,6 +4654,9 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_EPOLL_CTL]           = w_sys_epoll_ctl,
     [SYS_EPOLL_WAIT]          = w_sys_epoll_wait,
     [SYS_SLABINFO]            = w_sys_slabinfo,
+    [SYS_IO_URING_SETUP]      = w_sys_io_uring_setup,
+    [SYS_IO_URING_ENTER]      = w_sys_io_uring_enter,
+    [SYS_IO_URING_REGISTER]   = w_sys_io_uring_register,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

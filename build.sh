@@ -35,6 +35,7 @@ KERNEL_INCLUDES=(
   -I "$KERNEL_DIR/syscall"
   -I "$KERNEL_DIR/security"
   -I "$KERNEL_DIR/net"
+  -I "$KERNEL_DIR/io"
   -I "$KERNEL_DIR/arch/x86_64"
   -I "$BUILD_DIR"
 )
@@ -143,6 +144,10 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
+"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_io_uring/test_io_uring.c" -o "$BUILD_DIR/user_test_io_uring.o"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_io_uring.o" \
+   -o "$BUILD_DIR/user_test_io_uring.elf"
+
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/smp_test/smp_test.c" -o "$BUILD_DIR/user_smp_test.o"
 ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_smp_test.o" \
    -o "$BUILD_DIR/user_smp_test.elf"
@@ -249,6 +254,7 @@ KERNEL_SUBDIRS=(
     "$KERNEL_DIR/security"
     "$KERNEL_DIR/arch/x86_64"
     "$KERNEL_DIR/net"
+    "$KERNEL_DIR/io"
 )
 
 for dir in "${KERNEL_SUBDIRS[@]}"; do
@@ -476,6 +482,9 @@ if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
 fi
 if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_posix1.elf" bin/test_posix1
+fi
+if [ -f "$BUILD_DIR/user_test_io_uring.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_io_uring.elf" bin/test_io_uring
 fi
 if [ -f "$BUILD_DIR/user_smp_test.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_smp_test.elf" bin/smp_test

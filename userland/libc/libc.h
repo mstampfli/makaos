@@ -882,6 +882,87 @@ int getaddrinfo_ipv4(const char* host, uint16_t port,
 #define SYS_EPOLL_CTL    98
 #define SYS_EPOLL_WAIT   99
 #define SYS_SLABINFO     100   // Phase 4H: dump per-CPU slab/pcp stats
+#define SYS_IO_URING_SETUP    101 // Phase 8B: io_uring_setup
+#define SYS_IO_URING_ENTER    102 // Phase 8B: io_uring_enter
+#define SYS_IO_URING_REGISTER 103 // Phase 8G: io_uring_register
+
+// ── io_uring user-space API ────────────────────────────────────────────
+//
+// Layouts MUST match kernel/io/io_uring.h exactly.  Static asserts in
+// the kernel side validate sizeof correctness.
+
+typedef struct {
+    uint8_t  opcode;
+    uint8_t  flags;
+    uint16_t ioprio;
+    int32_t  fd;
+    uint64_t off;
+    uint64_t addr;
+    uint32_t len;
+    uint32_t op_flags;
+    uint64_t user_data;
+    uint64_t _reserved[3];
+} __attribute__((packed)) io_sqe_t;
+
+typedef struct {
+    uint64_t user_data;
+    int32_t  res;
+    uint32_t flags;
+} __attribute__((packed)) io_cqe_t;
+
+typedef struct {
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    uint32_t          ring_mask;
+    uint32_t          ring_entries;
+    volatile uint32_t flags;
+    volatile uint32_t dropped;
+} io_sq_ring_hdr_t;
+
+typedef struct {
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    uint32_t          ring_mask;
+    uint32_t          ring_entries;
+    volatile uint32_t overflow;
+    volatile uint32_t flags;
+} io_cq_ring_hdr_t;
+
+typedef struct io_uring_params {
+    uint32_t sq_entries;
+    uint32_t cq_entries;
+    uint32_t flags;
+    uint32_t sq_thread_cpu;
+    uint32_t sq_thread_idle;
+    uint32_t features;
+    uint32_t _resv[2];
+    uint64_t sq_ring_ptr;
+    uint64_t cq_ring_ptr;
+    uint64_t sqes_ptr;
+    uint64_t cqes_ptr;
+    uint64_t _resv2;
+} io_uring_params_t;
+
+// Opcodes
+#define IORING_OP_NOP      0
+#define IORING_OP_READ     1
+#define IORING_OP_WRITE    2
+#define IORING_OP_CLOSE    3
+
+// Enter flags
+#define IORING_ENTER_GETEVENTS (1u << 0)
+
+static inline int io_uring_setup(uint32_t entries, io_uring_params_t* p) {
+    return (int)syscall2(SYS_IO_URING_SETUP, (uint64_t)entries, (uint64_t)p);
+}
+
+static inline int io_uring_enter(int fd, uint32_t to_submit,
+                                   uint32_t min_complete, uint32_t flags) {
+    return (int)syscall4(SYS_IO_URING_ENTER, (uint64_t)fd,
+                          (uint64_t)to_submit,
+                          (uint64_t)min_complete,
+                          (uint64_t)flags);
+}
 
 // Phase 4H: per-CPU slab allocator counters.  The kernel fills a
 // fixed-size array indexed by (cpu, cls) plus per-cpu pcp totals.

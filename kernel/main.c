@@ -430,6 +430,12 @@ static void init_kthread(void) {
     extern void dcache_selftest(void);
     dcache_selftest();
 
+    // Phase 8D: io_uring kernel-side acceptance — NOP pipeline +
+    // ns/op steady-state measurement.  Userland test binary lives
+    // at /bin/test_io_uring for interactive testing.
+    extern void io_uring_selftest(void);
+    io_uring_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.
