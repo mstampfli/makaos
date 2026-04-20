@@ -56,36 +56,48 @@ of CPUs fork simultaneously, which is not a real workload.
 
 ---
 
-## `g_pmm_lock` — `kernel/mm/pmm.c`
+## `g_pmm_lock` — `kernel/mm/pmm.c` (Phase 4 — depot/slow-path lock)
 
-**Guards:** all buddy free lists, slab cache heads (partial/full),
-per-frame refcount array, per-frame pincount array, slab tracker
-array. Essentially the entire PMM state.
+**Phase 4 status: landed.**  `g_pmm_lock` is now the **depot lock**
+behind the per-CPU allocator fast paths.  Hot-path `kmalloc/kfree`
+and order-0 `pmm_buddy_alloc/free` no longer touch it — they hit
+the lockless `cpu_slot[cls]` (slab) or `pcp_hdr` (pageset) via
+`cmpxchg16b` on `%gs:offset`-relative per-CPU memory.  Only the
+slow paths (refill / overflow / demote / shrinker / order ≥ 1
+buddy / refcount / pin) still acquire the lock.
+
+Acceptance measurement (Phase 4H self-test, `slab_pcpu_selftest`,
+4-CPU × 50k mixed-size alloc/free pairs): slab fast-path hit rate
+9999/10000 (99.99 %), pcp hit rate 100 %.
+
+**Guards:** all buddy free lists, slab cache heads
+(partial / full / empty), per-frame refcount array, per-frame
+pincount array, slab tracker array, slab page-state (`on_list`).
+Under SMP the fast paths **never** see contention on this lock;
+only the batched refill (~1 in 16–32 allocs after warmup), the
+state-transition helpers (`pmm_slab_demote_or_keep`, `park_full`,
+`grab_partial`, etc.), the refcount/pin APIs, and order ≥ 1 buddy.
 
 **Readers (lock-free):**
 - `pmm_ref_get`, `pmm_pin_get`, `pmm_is_slab_ptr` — single aligned
-  loads. May race with a concurrent mutation but each individual read
-  is intact (uint32_t/pointer loads are atomic on x86). Callers
-  needing a stable read must hold a higher-level lock.
+  loads.  Callers needing a stable read must hold a higher-level lock.
 
-**Writers:** `pmm_buddy_alloc/free`, `pmm_slab_alloc/free`,
-`pmm_ref_inc/dec`, `pmm_pin/unpin`. Called from every `kmalloc`,
-`kfree`, `pmm_buddy_alloc(0)` path, fork (CoW ref bump), page fault
-(CoW break), DMA setup (pin).
+**Writers (slow-path only):**
+- `pmm_buddy_alloc/free` for order ≥ 1
+- `pmm_slab_grab_partial/empty/grow`, `pmm_slab_park_partial/full/empty`,
+  `pmm_slab_demote_or_keep`
+- `pmm_ref_inc/dec`, `pmm_pin/unpin`
+- `pmm_slab_shrink_all_locked` (shrinker and pressure hook)
+- `pmm_buddy_alloc_locked_for_pcp` / `pmm_buddy_free_locked_for_pcp`
+  (called under `pmm_pcp_lock / _unlock` from `pcp.c` to batch a
+  whole refill or drain in one lock acquire)
 
-**Why a single global lock here, temporarily:**
-- Phase 4 (per-CPU allocators) was attempted, tried, and reverted
-  after a design flaw made the common path SLOWER than the single-
-  lock version.  See `docs/PHASE4_REDESIGN.md` for the post-mortem
-  and the redesigned plan.
-- Until Phase 4 lands properly, correctness trumps speed: one global
-  lock makes every allocation SMP-safe.
-- Uncontended cost: one `lock cmpxchg` + `pushfq`/`popfq` pair,
-  ~30 cycles of overhead per alloc.  Measurable only at
-  microbenchmark scale.
-- On a single CPU (today), the lock is always uncontended.  When APs
-  boot in Phase 9, all CPUs serialize here — unacceptable long-term
-  but safe short-term.
+**Hot path (Phase 4 takes no lock here):**
+- `kmalloc` → `slab_pcpu_alloc` → cmpxchg16b on `%gs:cpu_slot[cls]`
+- `kfree` → `slab_pcpu_free` → cmpxchg16b on `%gs:cpu_slot[cls]` OR
+  (cross-CPU) `pmm_slab_free` (which does take `g_pmm_lock`)
+- `pmm_buddy_alloc(0)` → `pcp_alloc` → cmpxchg16b on `%gs:pcp_hdr`
+- `pmm_buddy_free(addr, 0)` → `pcp_free` → cmpxchg16b on `%gs:pcp_hdr`
 
 **IRQ-safety:** MUST use `spin_lock_irqsave` / `spin_unlock_irqrestore`.
 `pmm_ref_dec` is reachable from the page fault handler which may run
@@ -98,12 +110,12 @@ array updates. No sleeps, no cross-call retention. The one costly op
 is buddy split/merge which touches multiple free lists — still
 bounded O(MAX_ORDER=32) and does no I/O.
 
-**SMP-readiness:** correct as-is but a serialization bottleneck. Phase 4
-proper replaces this with per-CPU magazines + per-CPU pagesets, at
-which point `g_pmm_lock` becomes only the depot lock hit on magazine
-refill (~1 in 16 allocs after warmup).
+**SMP-readiness:** Phase 4 landed — this is the depot lock behind
+per-CPU allocator magazines (slab) + pcp (buddy order-0).  Fast
+paths never touch it; refill/drain hit it ~1 in 16–32 allocs after
+warmup.  Measured cross-CPU hit rate: 99.99 % (Phase 4H self-test).
 
-**Future work:** see `docs/PHASE4_REDESIGN.md` for the full plan.
+**History:** see `docs/PHASE4_REDESIGN.md` for the full design.
 
 ---
 

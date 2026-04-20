@@ -61,22 +61,42 @@ typedef struct cpu_rq_t {
     volatile uint32_t nr_running;  // advisory: ready-task count (for steal)
 } cpu_rq_t;
 
-// Per-CPU slab magazine — a freelist of recently-freed objects for each
-// kmalloc size class.  Placeholder for Phase 4; declared now so cpu_t has
-// a stable layout.
-#define SLAB_MAGAZINE_CLASSES 10
-typedef struct {
-    void*    free_head[SLAB_MAGAZINE_CLASSES];
-    uint32_t free_count[SLAB_MAGAZINE_CLASSES];
-} slab_magazine_t;
+// ── Per-CPU SLUB-style slab fast path (Phase 4) ─────────────────────────
+//
+// One `slab_cpu_slot_t` per kmalloc size class, 16-byte aligned so the
+// lockless cmpxchg16b fast path is legal.  The owning CPU's slow path
+// also keeps the `cpu_slab[cls]` page (the slab page being carved into
+// `freelist`), per-CPU partial-list head/count, and per-class counters.
+//
+// Layout matches kheap.h's KMALLOC_CACHE_COUNT (10).  We don't include
+// kheap.h here to avoid pulling pmm.h into every translation unit; the
+// _Static_assert in slab_pcpu.c verifies the count matches.
 
-// Per-CPU pageset — freelist of recently-freed order-0 pages.  Placeholder
-// for Phase 4.
-#define PCP_BATCH_SIZE 32
-typedef struct {
-    uint64_t pages[PCP_BATCH_SIZE];  // physical addresses
-    uint32_t count;
-} pmm_pcp_t;
+#define SLAB_PCPU_CLASSES   10           // == KMALLOC_CACHE_COUNT
+#define SLAB_PCPU_PARTIAL_DEPTH 16       // CPU-local partial pages cap
+
+// 16-byte payload that the lockless fast path operates on via
+// cmpxchg16b.  Field order matters: cmpxchg16b reads 16 bytes as
+// {RDX:RAX} = {hi:lo}, with `lo` the low 8 bytes (offset 0) and `hi`
+// the high 8 bytes (offset 8).  We put the freelist pointer at lo so
+// the popped pointer is naturally returned in RAX after the load.
+typedef struct __attribute__((aligned(16))) {
+    void*    freelist;   // head of the per-CPU singly-linked free list
+    uint64_t tid;        // monotonic transaction id, bumped on every op
+} slab_cpu_slot_t;
+
+// Per-CPU PCP for buddy order-0 (Phase 4).  Same {lo,hi} idiom, but the
+// "lo" word holds {count, _pad} and "hi" word holds the tid.  The
+// physical-address backing array is a separate per-CPU buffer indexed
+// by `count`.
+#define SLAB_PCPU_PCP_DEPTH    64
+#define SLAB_PCPU_PCP_REFILL   32
+
+typedef struct __attribute__((aligned(16))) {
+    uint32_t count;      // number of valid entries in pcp_pages[]
+    uint32_t _pad;
+    uint64_t tid;        // monotonic transaction id
+} pcp_hdr_t;
 
 typedef struct cpu_t {
     // ── Self-pointer at offset 0 (load-bearing) ─────────────────────────
@@ -106,9 +126,37 @@ typedef struct cpu_t {
     // contention; seeded lazily from TSC+id on first use.
     uint64_t        steal_rng;
 
-    // Per-CPU allocator magazines (Phase 4).
-    slab_magazine_t slab;
-    pmm_pcp_t       pcp;
+    // ── Per-CPU SLUB fast path (Phase 4) ────────────────────────────
+    // cpu_slot[cls] is the lockless fast-path slot — one cmpxchg16b
+    // pop/push per kmalloc.  cpu_slab[cls] points at the slab page
+    // currently bound to this CPU for that size class (its freelist
+    // is *cpu_slot[cls].freelist); only the slow paths read it.
+    // partial_head / partial_count are the per-CPU partial-page list
+    // (Linux SLUB equivalent).  Counters are owner-only writes.
+    //
+    // The slot array MUST be 16-byte aligned for cmpxchg16b — the
+    // slab_cpu_slot_t struct already carries aligned(16), and the
+    // surrounding cpu_t is itself naturally aligned (BSS, page-aligned
+    // by the linker), so each slot starts on a 16-byte boundary
+    // automatically (sizeof(slab_cpu_slot_t) == 16).
+    slab_cpu_slot_t cpu_slot[SLAB_PCPU_CLASSES];
+    void*           cpu_slab[SLAB_PCPU_CLASSES];          // slab_header_t* (opaque here)
+    void*           partial_head[SLAB_PCPU_CLASSES];      // slab_header_t*
+    uint32_t        partial_count[SLAB_PCPU_CLASSES];
+
+    // Per-CPU PCP for pmm_buddy_alloc(0) — see pcp_hdr_t commentary.
+    // pcp_hdr is the 16-byte cmpxchg16b slot; pcp_pages is the storage.
+    pcp_hdr_t       pcp_hdr;
+    phys_addr_t     pcp_pages[SLAB_PCPU_PCP_DEPTH];
+
+    // Per-CPU allocator counters (non-atomic, owner-only).
+    uint64_t        slab_mag_hits[SLAB_PCPU_CLASSES];
+    uint64_t        slab_mag_misses[SLAB_PCPU_CLASSES];
+    uint64_t        slab_mag_drains[SLAB_PCPU_CLASSES];
+    uint64_t        slab_remote_frees[SLAB_PCPU_CLASSES];
+    uint64_t        pcp_hits;
+    uint64_t        pcp_misses;
+    uint64_t        pcp_drains;
 
     // IRQ bookkeeping.  Pending counts for IRQ lines this CPU services.
     // The IRQ waiter lists themselves are per-IRQ (in irq_wait.c) and the
@@ -288,6 +336,115 @@ ALWAYS_INLINE cpu_t* this_cpu(void) {
         : "i"(__builtin_offsetof(cpu_t, field))                            \
         : "memory", "cc");                                                 \
     __nz;                                                                  \
+})
+
+// ── 16-byte lockless compare-and-swap on per-CPU memory (Phase 4) ────────
+//
+// `cmpxchg16b %gs:offset` is the SLUB fast path: a single 16-byte CAS
+// against per-CPU memory.  No LOCK prefix is required because the memory
+// is per-CPU (only the owning CPU writes it) and on x86 a non-locked
+// cmpxchg16b is atomic against interrupts on the same core — which is
+// the only race we care about for per-CPU state.
+//
+// USAGE (see slab_pcpu.c):
+//
+//   slab_cpu_slot_t old, new;
+//   do {
+//       old.lo_freelist = this_cpu_read_ptr(cpu_slot[cls].lo_freelist);
+//       old.hi_tid      = this_cpu_read_u64(cpu_slot[cls].hi_tid);
+//       new.lo_freelist = *(void**)old.lo_freelist;
+//       new.hi_tid      = old.hi_tid + 1;
+//   } while (!this_cpu_cmpxchg16b_field(cpu_slot[cls], &old, &new));
+//
+// MIGRATION SAFETY: %gs is resolved at instruction execution time, so a
+// preemption/migration between the loads and the cmpxchg16b will execute
+// against the NEW CPU's slot.  The CAS will then almost certainly fail
+// (different tid) and the caller retries on the new CPU.  Correct by
+// construction; no preempt_disable needed.
+//
+// The macro takes a *byte offset* — typically `offsetof(cpu_t, field)`
+// computed at the call site so it resolves to a compile-time immediate.
+// Returns 1 on success, 0 on failure (so the caller can spin).
+//
+// `old` is updated in place with the observed memory value on failure
+// (standard cmpxchg semantics) — the caller's retry loop uses the
+// updated `old` as the next attempt's expected value.
+#define this_cpu_cmpxchg16b_off(byte_off, old_lo_p, old_hi_p, new_lo, new_hi) ({ \
+    uint8_t __ok;                                                                 \
+    uint64_t __old_lo = *(old_lo_p);                                              \
+    uint64_t __old_hi = *(old_hi_p);                                              \
+    __asm__ volatile("cmpxchg16b %%gs:%c5\n\tsetz %0"                             \
+        : "=q"(__ok), "+a"(__old_lo), "+d"(__old_hi)                              \
+        : "b"((uint64_t)(new_lo)), "c"((uint64_t)(new_hi)),                       \
+          "i"((long)(byte_off))                                                   \
+        : "memory", "cc");                                                        \
+    *(old_lo_p) = __old_lo;                                                       \
+    *(old_hi_p) = __old_hi;                                                       \
+    __ok;                                                                         \
+})
+
+// Convenience: pass a cpu_t field name; the offset is computed for you.
+// `field` must be a 16-byte-aligned member whose first 8 bytes are the
+// "lo" word and second 8 bytes are the "hi" word.
+#define this_cpu_cmpxchg16b_field(field, old_lo_p, old_hi_p, new_lo, new_hi) \
+    this_cpu_cmpxchg16b_off(__builtin_offsetof(cpu_t, field),                \
+                            old_lo_p, old_hi_p, new_lo, new_hi)
+
+// 16-byte atomic load of per-CPU memory.  Implemented via a
+// cmpxchg16b that compares against {0,0} and writes back {0,0} on
+// match — on mismatch it just returns the observed value, which is
+// what we want.  Both branches give us the live 16-byte snapshot
+// atomically.  No LOCK prefix needed (per-CPU memory).
+#define this_cpu_load16b_off(byte_off, out_lo_p, out_hi_p) do {                  \
+    uint64_t __exp_lo = 0, __exp_hi = 0;                                          \
+    __asm__ volatile("cmpxchg16b %%gs:%c4"                                        \
+        : "+a"(__exp_lo), "+d"(__exp_hi)                                          \
+        : "b"(__exp_lo), "c"(__exp_hi),                                           \
+          "i"((long)(byte_off))                                                   \
+        : "memory", "cc");                                                        \
+    *(out_lo_p) = __exp_lo;                                                       \
+    *(out_hi_p) = __exp_hi;                                                       \
+} while (0)
+
+#define this_cpu_load16b_field(field, out_lo_p, out_hi_p) \
+    this_cpu_load16b_off(__builtin_offsetof(cpu_t, field), out_lo_p, out_hi_p)
+
+// Runtime-offset variants — when the offset isn't a compile-time
+// constant (e.g. cpu_slot[cls] for runtime cls).  Compute the byte
+// offset into a register and use `%gs:(%reg)` addressing.
+#define this_cpu_cmpxchg16b_at(byte_off_var, old_lo_p, old_hi_p, new_lo, new_hi) ({ \
+    uint8_t __ok;                                                                    \
+    uint64_t __old_lo = *(old_lo_p);                                                 \
+    uint64_t __old_hi = *(old_hi_p);                                                 \
+    uint64_t __off    = (uint64_t)(byte_off_var);                                    \
+    __asm__ volatile("cmpxchg16b %%gs:(%5)\n\tsetz %0"                               \
+        : "=q"(__ok), "+a"(__old_lo), "+d"(__old_hi)                                 \
+        : "b"((uint64_t)(new_lo)), "c"((uint64_t)(new_hi)),                          \
+          "r"(__off)                                                                 \
+        : "memory", "cc");                                                           \
+    *(old_lo_p) = __old_lo;                                                          \
+    *(old_hi_p) = __old_hi;                                                          \
+    __ok;                                                                            \
+})
+
+#define this_cpu_load16b_at(byte_off_var, out_lo_p, out_hi_p) do {                   \
+    uint64_t __exp_lo = 0, __exp_hi = 0;                                              \
+    uint64_t __off    = (uint64_t)(byte_off_var);                                     \
+    __asm__ volatile("cmpxchg16b %%gs:(%4)"                                           \
+        : "+a"(__exp_lo), "+d"(__exp_hi)                                              \
+        : "b"(__exp_lo), "c"(__exp_hi),                                               \
+          "r"(__off)                                                                  \
+        : "memory", "cc");                                                            \
+    *(out_lo_p) = __exp_lo;                                                           \
+    *(out_hi_p) = __exp_hi;                                                           \
+} while (0)
+
+// Read a per-CPU pointer at a runtime offset.
+#define this_cpu_read_ptr_at(byte_off_var) ({                                        \
+    void* __v;                                                                       \
+    uint64_t __off = (uint64_t)(byte_off_var);                                       \
+    __asm__ volatile("mov %%gs:(%1), %0" : "=r"(__v) : "r"(__off));                  \
+    __v;                                                                             \
 })
 
 // Initialise cpu0's slot AND program GS_BASE so this_cpu() works.

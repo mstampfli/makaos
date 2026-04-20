@@ -61,7 +61,11 @@ static void cpu_slot_init(uint32_t id, uint32_t apic_id) {
     c->reschedule_pending = 0;
     c->sched_ticks        = 0;
     c->context_switches   = 0;
-    // slab, pcp, irq_pending: zeroed by BSS.
+    // cpu_slot/cpu_slab/partial_*, pcp_hdr/pcp_pages, all SLUB
+    // counters, and irq_pending all start zero from BSS — that's a
+    // valid initial state for the SLUB fast paths (empty freelist,
+    // tid 0).
+
 }
 
 void cpu_init_bsp(void) {

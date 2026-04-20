@@ -597,6 +597,17 @@ OVMF_VARS="$BUILD_DIR/OVMF_VARS.fd"
 
 cp "$OVMF_VARS_SRC" "$OVMF_VARS"
 
+# ── Free up any port lingering from a prior aborted run ──────────────────
+# build.sh is meant to be re-runnable; a previous QEMU instance still
+# holding the host-port forward (or the gdbstub on :1234) would block
+# the new bind.  pkill is targeted by command line so we don't touch
+# unrelated qemus the user might have running.
+pkill -f "qemu-system-x86_64.*disk\.img" 2>/dev/null || true
+for _i in 1 2 3 4 5; do
+    if ! ss -tln 2>/dev/null | grep -qE ":(18080|1234)\b"; then break; fi
+    sleep 0.2
+done
+
 qemu-system-x86_64 \
   -accel kvm \
   -cpu host \
@@ -611,7 +622,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display none \
-  -audiodev pa,id=snd0,server=/mnt/wslg/PulseServer \
+  -audiodev pa,id=snd0 \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \

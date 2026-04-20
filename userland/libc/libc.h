@@ -881,6 +881,30 @@ int getaddrinfo_ipv4(const char* host, uint16_t port,
 #define SYS_EPOLL_CREATE 97
 #define SYS_EPOLL_CTL    98
 #define SYS_EPOLL_WAIT   99
+#define SYS_SLABINFO     100   // Phase 4H: dump per-CPU slab/pcp stats
+
+// Phase 4H: per-CPU slab allocator counters.  The kernel fills a
+// fixed-size array indexed by (cpu, cls) plus per-cpu pcp totals.
+// SLABINFO_MAX_CPUS / SLABINFO_CLASSES must match kernel MAX_CPUS
+// and SLAB_PCPU_CLASSES respectively.
+#define SLABINFO_MAX_CPUS  64
+#define SLABINFO_CLASSES   10
+
+typedef struct {
+    // Flattened [cpu][cls] rows: 64 rows × (4 u64) = 2048 bytes per array.
+    uint64_t slab_hits        [SLABINFO_MAX_CPUS * SLABINFO_CLASSES];
+    uint64_t slab_misses      [SLABINFO_MAX_CPUS * SLABINFO_CLASSES];
+    uint64_t slab_drains      [SLABINFO_MAX_CPUS * SLABINFO_CLASSES];
+    uint64_t slab_remote_frees[SLABINFO_MAX_CPUS * SLABINFO_CLASSES];
+    uint64_t pcp_hits   [SLABINFO_MAX_CPUS];
+    uint64_t pcp_misses [SLABINFO_MAX_CPUS];
+    uint64_t pcp_drains [SLABINFO_MAX_CPUS];
+    uint32_t num_cpus;     // actually-online CPU count
+} slabinfo_t;
+
+static inline long sys_slabinfo(slabinfo_t* info) {
+    return syscall1(SYS_SLABINFO, (uint64_t)info);
+}
 
 // ── Extra errno values ────────────────────────────────────────────────────
 #define EILSEQ      84

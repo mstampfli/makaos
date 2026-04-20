@@ -1,8 +1,60 @@
-# Phase 4 — Per-CPU allocators (deferred)
+# Phase 4 — Per-CPU allocators
 
 ## Status
 
-**Deferred until after Phase 9 (AP boot).**
+**LANDED.**  All eight sub-phases (4A–4H) are committed and the
+acceptance self-test passes at 99.99 % slab fast-path hit rate on
+4-CPU × 50k mixed-size alloc/free stress.  See
+`kernel/mm/slab_pcpu.{h,c}`, `kernel/mm/pcp.{h,c}`,
+`kernel/mm/slab_shrinker.c`, and `kernel/mm/slab_pcpu_test.c`.
+
+### What shipped
+
+- **4A** cmpxchg16b primitives in `cpu.h` (`this_cpu_cmpxchg16b_*`,
+  `this_cpu_load16b_*`); page-state field on `slab_header_t` and the
+  SLAB_LIST_* enum (`NONE / PARTIAL / FULL / EMPTY / CPU_ACTIVE`);
+  cache registry `g_slab_cache_head` in `pmm.c`.
+- **4B** empty-list recycling path + `pmm_slab_shrink_all_locked`
+  pressure hook called from `pmm_buddy_alloc` on OOM.
+- **4C / 4D** Per-CPU `cpu_slot[cls]` (16-byte aligned, cmpxchg16b
+  target) + `cpu_slab[cls]` + per-CPU partial list + counters, all
+  in `cpu_t`.  Lockless fast paths: `slab_pcpu_alloc` /
+  `slab_pcpu_free` routed from `kmalloc` / `kfree`.
+- **4E** Per-CPU pcp (`pcp_hdr` 16-byte + `pcp_pages[64]`) wired into
+  `pmm_buddy_alloc(0)` / `pmm_buddy_free(0)`.  Order ≥ 1 keeps
+  `g_pmm_lock`.
+- **4F** Shrinker kthread (`kernel/mm/slab_shrinker.c`) drains cache
+  empty-lists and per-CPU pcps once per second.
+- **4G** Cross-CPU correctness via `pmm_slab_demote_or_keep` —
+  frees to non-THIS-CPU's cpu_slab page route through the locked
+  `pmm_slab_free` which pushes onto `page->freelist`; the owning
+  CPU's next refill atomically snapshots that chain under
+  `g_pmm_lock` and republishes it into `cpu_slot`.
+- **4H** `sys_slabinfo(100)` syscall + per-CPU counters (`slab_mag_hits
+  / _misses / _drains / _remote_frees`, `pcp_hits / _misses / _drains`)
+  in `cpu_t`.  Kernel-side acceptance self-test `slab_pcpu_selftest`
+  runs from `init_kthread` after chaselev.
+
+### Acceptance result (from `slab_pcpu_selftest`, 4-CPU × 50k iters)
+
+```
+[slab_test] allocs=200000 slab_hits=400028 slab_misses=10 hit_rate=9999/10000
+[slab_test] pcp_hits=12    pcp_misses=0   hit_rate=10000/10000
+[slab_test] SELF-TEST PASSED (slab hit rate >= 95%)
+```
+
+Cold-cache overhead bounded: 10 slow-path refills total across all
+(cpu, cls) pairs in 200000 allocs.  Every subsequent alloc/free is
+a cmpxchg16b on per-CPU memory with no lock acquire.
+
+### Historical content (design discussion)
+
+The remainder of this document captures the design iteration that
+led to the implementation and is preserved as reference.
+
+---
+
+## Historical — deferred plan (superseded by the landed implementation)
 
 Two redesigns exist in this file:
 

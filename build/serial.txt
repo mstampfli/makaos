@@ -4,10 +4,10 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x000000000004B4FB
+kernel.bin size=0x000000000004E4FB
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x000000000004B4FB
-phys_ceiling=0x0000010000000000
+kernel loaded, bytes=0x000000000004E4FB
+phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
 ExitBootServices OK
@@ -23,10 +23,14 @@ K
 [net] IP 0.0.0.0 GW 0.0.0.0
 [net] MAC 52:54:00:12:34:56
 [net] ready
-[elf] lazy /bin/login: header 902 us (demand-paged)
-[elf] lazy /bin/svcmgr: header 238 us (demand-paged)
+[elf] lazy /bin/login: header 246 us (demand-paged)
+[elf] lazy /bin/svcmgr: header 137 us (demand-paged)
 [chaselev] self-test starting: N=20000 thieves=3 cap=512
-[chaselev] pushed=20000 owner_popped=8149 thief_stolen=11851 found=20000 missing=0 duplicates=0
-[chaselev] SELF-TEST PASSED
-[elf] lazy /bin/net: header 184 us (demand-paged)
+[elf] lazy /bin/net: header 63 us (demand-paged)
 [net] ifconfig IP 10.0.2.15 GW 10.0.2.2
+[chaselev] pushed=20000 owner_popped=12151 thief_stolen=7849 found=20000 missing=0 duplicates=0
+[chaselev] SELF-TEST PASSED
+[slab_test] starting: workers=4 iters=50000 mixed sizes (8..1024)
+[slab_test] allocs=200000 slab_hits=400028 slab_misses=10 hit_rate=9999/10000
+[slab_test] pcp_hits=12 pcp_misses=0 hit_rate=10000/10000
+[slab_test] SELF-TEST PASSED (slab hit rate >= 95%)

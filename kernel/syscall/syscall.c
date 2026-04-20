@@ -4399,6 +4399,64 @@ static uint64_t w_sys_epoll_wait(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
     return sys_epoll_wait(a, b, c, d);
 }
 
+// ── sys_slabinfo (Phase 4H) ───────────────────────────────────────────────
+// Fills a slabinfo_t struct with per-CPU slab fast-path counters and
+// per-CPU pcp counters.  Used by test_vmalloc -s and for acceptance
+// testing (hit-rate > 99 % under workload).  Intentionally
+// unprivileged — it leaks nothing but allocator telemetry.
+#include "slab_pcpu.h"
+#include "pcp.h"
+#define SLABINFO_MAX_CPUS_K   64
+#define SLABINFO_CLASSES_K    10
+typedef struct {
+    uint64_t slab_hits        [SLABINFO_MAX_CPUS_K * SLABINFO_CLASSES_K];
+    uint64_t slab_misses      [SLABINFO_MAX_CPUS_K * SLABINFO_CLASSES_K];
+    uint64_t slab_drains      [SLABINFO_MAX_CPUS_K * SLABINFO_CLASSES_K];
+    uint64_t slab_remote_frees[SLABINFO_MAX_CPUS_K * SLABINFO_CLASSES_K];
+    uint64_t pcp_hits   [SLABINFO_MAX_CPUS_K];
+    uint64_t pcp_misses [SLABINFO_MAX_CPUS_K];
+    uint64_t pcp_drains [SLABINFO_MAX_CPUS_K];
+    uint32_t num_cpus;
+} k_slabinfo_t;
+
+static uint64_t sys_slabinfo(uint64_t out_ptr) {
+    if (!out_ptr) return (uint64_t)-EINVAL;
+    // Build on kstack — ~10 KiB, fits comfortably.
+    static k_slabinfo_t k;   // static: too big for task kstack, single
+                             // writer guaranteed by the snapshot
+                             // being a one-shot read of shared counters.
+                             // Under concurrent slabinfo callers, the
+                             // resulting values are a valid snapshot of
+                             // the allocator state at some point during
+                             // the race window — monotonic counters
+                             // can't tear into an invalid value.
+    for (uint32_t cpu = 0; cpu < SLABINFO_MAX_CPUS_K; cpu++) {
+        for (uint32_t cls = 0; cls < SLABINFO_CLASSES_K; cls++) {
+            slab_pcpu_stats_t s;
+            slab_pcpu_stats_get(cpu, cls, &s);
+            uint32_t idx = cpu * SLABINFO_CLASSES_K + cls;
+            k.slab_hits[idx]         = s.hits;
+            k.slab_misses[idx]       = s.misses;
+            k.slab_drains[idx]       = s.drains;
+            k.slab_remote_frees[idx] = s.remote_frees;
+        }
+        pcp_stats_t ps;
+        pcp_stats_get(cpu, &ps);
+        k.pcp_hits[cpu]   = ps.hits;
+        k.pcp_misses[cpu] = ps.misses;
+        k.pcp_drains[cpu] = ps.drains;
+    }
+    extern unsigned g_num_cpus;
+    k.num_cpus = g_num_cpus;
+    return (copy_to_user((void*)out_ptr, &k, sizeof(k)) == 0)
+           ? 0 : (uint64_t)-EFAULT;
+}
+
+static uint64_t w_sys_slabinfo(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d;
+    return sys_slabinfo(a);
+}
+
 // 4-arg handlers that already match the uniform signature — used directly.
 // sys_read(a,b,c,d), sys_readdir(a,b,c,d), sys_rename(a,b,c,d)
 
@@ -4407,7 +4465,7 @@ static uint64_t w_sys_epoll_wait(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 // initializers mean any unused slot is implicitly NULL and reordering the
 // array is safe.
 
-static const sys_handler_t s_syscall_table[100] = {
+static const sys_handler_t s_syscall_table[128] = {
     [SYS_WRITE]               = w_sys_write,
     [SYS_EXIT]                = w_sys_exit,
     [SYS_READ]                = sys_read,
@@ -4508,6 +4566,7 @@ static const sys_handler_t s_syscall_table[100] = {
     [SYS_EPOLL_CREATE]        = w_sys_epoll_create,
     [SYS_EPOLL_CTL]           = w_sys_epoll_ctl,
     [SYS_EPOLL_WAIT]          = w_sys_epoll_wait,
+    [SYS_SLABINFO]            = w_sys_slabinfo,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

@@ -30,6 +30,7 @@ static spinlock_t g_pmm_lock = SPINLOCK_INIT;
 static phys_addr_t pmm_buddy_alloc_locked(uint8_t order);
 static void        pmm_buddy_free_locked(phys_addr_t addr, uint8_t order);
 static void        pmm_count_free_pages(void);
+static void        pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h);
 
 static phys_addr_t g_phys_ceiling = 0;
 static uint64_t    g_total_frames = 0;
@@ -63,6 +64,12 @@ static uint16_t* g_frame_pincount;   // [frame_index] → pin count
 // Slab trackers
 static slab_cache_t** g_slab_trackers;   // [frame_index] -> owning cache or NULL
 static void** g_slab_heads;      // [frame_index] -> (void*)head_frame_index
+
+// ── Singly-linked list of registered caches (Phase 4) ─────────────────
+// Linked at pmm_slab_cache_init() time.  The shrinker (4F) and stats
+// dump (4H) walk this.  Mutated only at boot when caches are
+// registered, then read-only — no synchronisation needed.
+static slab_cache_t* g_slab_cache_head = NULL;
 
 static inline uint64_t align_down(uint64_t addr) {
   return (addr & ~(PAGE_SIZE - 1));
@@ -559,9 +566,63 @@ static void pmm_count_free_pages(void) {
 // dominated by the actual DRAM write bandwidth, not the loop.
 #define PMM_DEBUG_ALWAYS_ZERO 0
 
+// Phase 4: synchronous drain of every cache's empty-list.  Called
+// from pmm_buddy_alloc() when the buddy is out of free blocks,
+// before declaring OOM, and from the Phase 4F shrinker kthread.
+// Caller holds g_pmm_lock.
+void pmm_slab_shrink_all_locked(void) {
+  for (slab_cache_t* c = g_slab_cache_head; c; c = c->cache_next) {
+    while (c->empty) {
+      slab_header_t* h = (slab_header_t*)c->empty;
+      pmm_slab_destroy_locked(c, h);  // unlinks + frees to buddy
+    }
+  }
+}
+
+// ── Phase 4E hooks used by pcp.c ─────────────────────────────────────
+// The PCP needs to take/release g_pmm_lock around batched refills and
+// drains so it doesn't re-acquire once per page.  These wrappers
+// expose the lock as a pair and the _locked buddy paths by name.
+void pmm_pcp_lock(uint64_t* flags_out) {
+    *flags_out = spin_lock_irqsave(&g_pmm_lock);
+}
+void pmm_pcp_unlock(uint64_t flags) {
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+phys_addr_t pmm_buddy_alloc_locked_for_pcp(uint8_t order) {
+    return pmm_buddy_alloc_locked(order);
+}
+void pmm_buddy_free_locked_for_pcp(phys_addr_t addr, uint8_t order) {
+    pmm_buddy_free_locked(addr, order);
+    __atomic_fetch_add(&g_free_pages, order_to_pages(order), __ATOMIC_RELAXED);
+}
+
 phys_addr_t pmm_buddy_alloc(uint8_t order) {
+  // Phase 4E: order-0 goes through the per-CPU pcp fast path.  Only
+  // order ≥ 1 takes g_pmm_lock on every call (rare in practice —
+  // only VMM large mappings, DMA buffers, and the slab_order=1/2
+  // slabs during refill).
+  if (order == 0) {
+    extern phys_addr_t pcp_alloc(void);
+    phys_addr_t r = pcp_alloc();
+    if (r != PMM_INVALID_ADDR) {
+#if PMM_DEBUG_ALWAYS_ZERO
+      __builtin_memset((void*)(r + HHDM_OFFSET), 0, PAGE_SIZE);
+#endif
+      return r;
+    }
+    // pcp refill failed → try direct buddy with shrink-on-pressure.
+  }
+
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
   phys_addr_t r = pmm_buddy_alloc_locked(order);
+  if (r == PMM_INVALID_ADDR) {
+    // Hard pressure: reclaim every empty slab page we're sitting on
+    // and retry once.  Guarantees we never fail an allocation while
+    // holding reclaimable slab pages.
+    pmm_slab_shrink_all_locked();
+    r = pmm_buddy_alloc_locked(order);
+  }
   spin_unlock_irqrestore(&g_pmm_lock, flags);
 #if PMM_DEBUG_ALWAYS_ZERO
   if (r != PMM_INVALID_ADDR) {
@@ -573,6 +634,12 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
 }
 
 void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
+  // Phase 4E: order-0 hits the per-CPU pcp push.
+  if (order == 0) {
+    extern void pcp_free(phys_addr_t);
+    pcp_free(addr);
+    return;
+  }
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
   pmm_buddy_free_locked(addr, order);
   __atomic_fetch_add(&g_free_pages, order_to_pages(order), __ATOMIC_RELAXED);
@@ -638,7 +705,8 @@ static slab_header_t* pmm_slab_grow_locked(slab_cache_t* cache) {
   h->slab_phys = slab_phys;
   h->freelist = NULL;
   h->inuse = 0;
-  h->in_full_list = 0;
+  h->on_list = SLAB_LIST_NONE;
+  h->remote_free = NULL;
 
   // update trackers and g_slab_heads for every page in the slab
   for (uint64_t page_offset = 0; page_offset < pages_in_slab; page_offset++) {
@@ -680,7 +748,22 @@ static slab_header_t* pmm_slab_grow_locked(slab_cache_t* cache) {
   h->freelist = freelist;
 
   slab_list_push((slab_header_t**)&cache->partial, h);
+  h->on_list = SLAB_LIST_PARTIAL;
   return h;
+}
+
+// Phase 4: pop a fully-empty page from cache->empty for reuse before
+// hitting the buddy allocator.  Returns the page repurposed onto
+// cache->partial (freelist already populated by an earlier
+// initialisation), or NULL if empty list is dry.  Caller holds
+// g_pmm_lock.
+static slab_header_t* pmm_slab_recycle_empty_locked(slab_cache_t* cache) {
+    slab_header_t* h = (slab_header_t*)cache->empty;
+    if (!h) return NULL;
+    slab_list_remove((slab_header_t**)&cache->empty, h);
+    slab_list_push((slab_header_t**)&cache->partial, h);
+    h->on_list = SLAB_LIST_PARTIAL;
+    return h;
 }
 
 // Internal — caller holds g_pmm_lock.
@@ -688,8 +771,13 @@ static void* pmm_slab_alloc_locked(slab_cache_t* cache) {
   slab_header_t* h = (slab_header_t*)cache->partial;
 
   if (!h) {
-    h = pmm_slab_grow_locked(cache);
-    if (!h) return NULL;
+    // Try recycling a fully-empty page before going to buddy.  Cheap
+    // and avoids buddy churn when allocator pressure oscillates.
+    h = pmm_slab_recycle_empty_locked(cache);
+    if (!h) {
+      h = pmm_slab_grow_locked(cache);
+      if (!h) return NULL;
+    }
   }
 
   void* slot = h->freelist;
@@ -701,7 +789,7 @@ static void* pmm_slab_alloc_locked(slab_cache_t* cache) {
   if (!h->freelist) {
     slab_list_remove((slab_header_t**)&cache->partial, h);
     slab_list_push((slab_header_t**)&cache->full, h);
-    h->in_full_list = 1;
+    h->on_list = SLAB_LIST_FULL;
   }
 
   return slot;
@@ -716,9 +804,17 @@ void* pmm_slab_alloc(slab_cache_t* cache) {
 }
 
 // Internal — caller holds g_pmm_lock.
+// Unlinks `h` from whichever cache list it lives on, clears the slab
+// trackers for every frame in the slab, and returns the underlying
+// pages to the buddy allocator.  After this call `h` is invalid.
 static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
-  if (h->in_full_list) slab_list_remove((slab_header_t**)&cache->full, h);
-  else slab_list_remove((slab_header_t**)&cache->partial, h);
+  switch (h->on_list) {
+    case SLAB_LIST_PARTIAL: slab_list_remove((slab_header_t**)&cache->partial, h); break;
+    case SLAB_LIST_FULL:    slab_list_remove((slab_header_t**)&cache->full,    h); break;
+    case SLAB_LIST_EMPTY:   slab_list_remove((slab_header_t**)&cache->empty,   h); break;
+    default: break;  // SLAB_LIST_NONE: not on a list (caller already unlinked)
+  }
+  h->on_list = SLAB_LIST_NONE;
 
   uint64_t head_frame_index = (h->slab_phys >> PAGE_SHIFT);
   uint64_t pages_in_slab = (1ULL << cache->slab_order);
@@ -732,9 +828,19 @@ static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
   }
 
   pmm_buddy_free_locked(h->slab_phys, cache->slab_order);
+  __atomic_fetch_add(&g_free_pages, order_to_pages(cache->slab_order), __ATOMIC_RELAXED);
 }
 
 // Internal — caller holds g_pmm_lock.
+//
+// Phase 4 page state machine on free:
+//   - was on FULL  → move to PARTIAL
+//   - was on PARTIAL or EMPTY → stay (PARTIAL after this push has a
+//     valid freelist again, so it remains on PARTIAL — EMPTY shouldn't
+//     happen here because EMPTY pages have inuse==0 and no live ptrs).
+//   - inuse drops to 0 → move to EMPTY (the shrinker (Phase 4F) will
+//     reclaim it; until then it's a recycle candidate via
+//     pmm_slab_recycle_empty_locked, avoiding buddy churn).
 static void pmm_slab_free_locked(void* ptr) {
   if (!ptr) return;
 
@@ -748,21 +854,27 @@ static void pmm_slab_free_locked(void* ptr) {
   uint64_t head_idx = (uint64_t)g_slab_heads[frame_index];
   slab_header_t* h = (slab_header_t*)phys_to_virt((phys_addr_t)(head_idx << PAGE_SHIFT));
 
-  int was_full = (h->freelist == NULL);
+  uint8_t was_on = h->on_list;
 
   *(void**)ptr = h->freelist;
   h->freelist = ptr;
 
   if (h->inuse) h->inuse--;
 
-  if (was_full) {
+  // FULL → PARTIAL transition (we just gave the page a free slot).
+  if (was_on == SLAB_LIST_FULL) {
     slab_list_remove((slab_header_t**)&cache->full, h);
     slab_list_push((slab_header_t**)&cache->partial, h);
-    h->in_full_list = 0;
+    h->on_list = SLAB_LIST_PARTIAL;
   }
 
-  if (h->inuse == 0) {
-    pmm_slab_destroy_locked(cache, h);
+  // inuse hit 0 → move from PARTIAL to EMPTY for shrinker reclaim.
+  // The page sits on cache->empty until either the shrinker drains
+  // it or pmm_slab_recycle_empty_locked promotes it back to PARTIAL.
+  if (h->inuse == 0 && h->on_list == SLAB_LIST_PARTIAL) {
+    slab_list_remove((slab_header_t**)&cache->partial, h);
+    slab_list_push((slab_header_t**)&cache->empty, h);
+    h->on_list = SLAB_LIST_EMPTY;
   }
 }
 
@@ -790,7 +902,157 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size) {
   cache->slot_size = slot_size;
   cache->partial = NULL;
   cache->full = NULL;
+  cache->empty = NULL;
   cache->slab_order = calculate_slab_order(slot_size);
+  cache->class_idx = (uint8_t)0xFF;   // kheap sets this for managed caches
+
+  // Pre-compute objects per slab page for slab_pcpu promote/demote.
+  // Mirrors the layout pmm_slab_grow_locked uses: header at offset 0,
+  // first slot at align_up(sizeof(header), slot_size), slots packed.
+  size_t   slab_bytes     = (size_t)PAGE_SIZE << cache->slab_order;
+  uint64_t first_slot_off = align_up_to((uint64_t)sizeof(slab_header_t),
+                                         (uint64_t)slot_size);
+  if (first_slot_off >= slab_bytes) {
+      cache->obj_per_slab = 0;
+  } else {
+      size_t num_slots = (slab_bytes - first_slot_off) / slot_size;
+      cache->obj_per_slab = (num_slots > 0xFFFF) ? 0xFFFF : (uint16_t)num_slots;
+  }
+
+  // Register on the global cache list so the Phase 4F shrinker and
+  // Phase 4H stats walker can find every cache.  Boot-time only;
+  // no synchronisation needed (single-threaded init).
+  cache->cache_next = g_slab_cache_head;
+  g_slab_cache_head = cache;
+}
+
+// ── Phase 4 grab/park helpers for slab_pcpu.c ─────────────────────────
+
+slab_header_t* pmm_slab_grab_partial(slab_cache_t* cache) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_header_t* h = (slab_header_t*)cache->partial;
+  if (h) {
+    slab_list_remove((slab_header_t**)&cache->partial, h);
+    h->on_list = SLAB_LIST_NONE;
+  }
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return h;
+}
+
+slab_header_t* pmm_slab_grab_empty(slab_cache_t* cache) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_header_t* h = (slab_header_t*)cache->empty;
+  if (h) {
+    slab_list_remove((slab_header_t**)&cache->empty, h);
+    h->on_list = SLAB_LIST_NONE;
+  }
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return h;
+}
+
+slab_header_t* pmm_slab_grow(slab_cache_t* cache) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_header_t* h = pmm_slab_grow_locked(cache);
+  if (h) {
+    // grow puts it on partial; unlink so the caller takes ownership.
+    slab_list_remove((slab_header_t**)&cache->partial, h);
+    h->on_list = SLAB_LIST_NONE;
+  }
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return h;
+}
+
+void pmm_slab_park_partial(slab_cache_t* cache, slab_header_t* h) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_list_push((slab_header_t**)&cache->partial, h);
+  h->on_list = SLAB_LIST_PARTIAL;
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
+void pmm_slab_park_full(slab_cache_t* cache, slab_header_t* h) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_list_push((slab_header_t**)&cache->full, h);
+  h->on_list = SLAB_LIST_FULL;
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
+void pmm_slab_park_empty(slab_cache_t* cache, slab_header_t* h) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  slab_list_push((slab_header_t**)&cache->empty, h);
+  h->on_list = SLAB_LIST_EMPTY;
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
+// Phase 4G: demote a CPU_ACTIVE page, or keep it active if cross-CPU
+// frees populated its freelist.  Takes g_pmm_lock so the check of
+// h->freelist is consistent with any concurrent pmm_slab_free_locked
+// pushes.  See pmm.h for semantics.
+int pmm_slab_demote_or_keep(slab_cache_t* cache, slab_header_t* h, void** out_fl) {
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  void* fl = h->freelist;
+  if (fl) {
+    // Cross-CPU frees populated the page's freelist while we were
+    // CPU_ACTIVE.  Transfer ownership back to the caller's cpu_slot;
+    // keep the page CPU_ACTIVE.
+    h->freelist = NULL;
+    *out_fl = fl;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+    return 1;
+  }
+  *out_fl = NULL;
+  // No frees to rescue — park as FULL.  Page has no free slots from
+  // anyone's view; future frees (via pmm_slab_free_locked) will
+  // transition FULL→PARTIAL naturally.
+  slab_list_push((slab_header_t**)&cache->full, h);
+  h->on_list = SLAB_LIST_FULL;
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return 0;
+}
+
+slab_cache_t* pmm_slab_cache_first(void) {
+  return g_slab_cache_head;
+}
+
+// ── Phase 4 accessors used by the per-CPU slab fast path ──────────────
+//
+// pmm_slab_state_get: returns the SLAB_LIST_* enum for the page that
+// backs `phys`, or SLAB_LIST_NONE if the frame is not a slab page.
+// The state is read directly from the slab_header_t — no separate
+// state byte array — because the header already lives in the slab
+// page itself (cache-hot if you've just allocated/freed an object on
+// that page).
+//
+// pmm_slab_header_of: returns the slab_header_t* for the slab page
+// that contains `ptr`.  NULL if `ptr` is not in a slab page.
+//
+// pmm_slab_cache_of: returns the slab_cache_t* that owns `ptr`'s
+// slab page.  NULL if `ptr` is not in a slab page.
+
+slab_header_t* pmm_slab_header_of(void* ptr) {
+  if (!ptr) return NULL;
+  phys_addr_t phys = virt_to_phys((virt_addr_t)ptr);
+  uint64_t fi = (phys >> PAGE_SHIFT);
+  if (fi >= g_total_frames) return NULL;
+  if (!g_slab_trackers[fi]) return NULL;
+  uint64_t head_idx = (uint64_t)g_slab_heads[fi];
+  return (slab_header_t*)phys_to_virt((phys_addr_t)(head_idx << PAGE_SHIFT));
+}
+
+slab_cache_t* pmm_slab_cache_of(void* ptr) {
+  if (!ptr) return NULL;
+  phys_addr_t phys = virt_to_phys((virt_addr_t)ptr);
+  uint64_t fi = (phys >> PAGE_SHIFT);
+  if (fi >= g_total_frames) return NULL;
+  return g_slab_trackers[fi];
+}
+
+uint8_t pmm_slab_state_get(phys_addr_t phys) {
+  uint64_t fi = (phys >> PAGE_SHIFT);
+  if (fi >= g_total_frames) return SLAB_LIST_NONE;
+  if (!g_slab_trackers[fi]) return SLAB_LIST_NONE;
+  uint64_t head_idx = (uint64_t)g_slab_heads[fi];
+  slab_header_t* h = (slab_header_t*)phys_to_virt((phys_addr_t)(head_idx << PAGE_SHIFT));
+  return h->on_list;
 }
 
 uint64_t pmm_total_frames_get(void) { return g_total_frames; }
