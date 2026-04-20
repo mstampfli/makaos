@@ -372,6 +372,13 @@ static void init_kthread(void) {
     extern void slab_shrinker_start(void);
     slab_shrinker_start();
 
+    // Phase 5B: start the RCU GP kthread.  Drains each CPU's
+    // rcu_pending_head (pushed lock-free by call_rcu_head) once per
+    // grace period.  Must start before any call_rcu_head site fires,
+    // which in practice means before userspace launches.
+    extern void rcu_gp_kthread_start(void);
+    rcu_gp_kthread_start();
+
     // Phase 9-4b/c: wake every AP discovered by ACPI now that the
     // scheduler, timers, LAPIC, VMM, and PMM are fully live.  APs
     // land in cpu_init_ap and drop into an idle-hlt loop until
@@ -411,6 +418,12 @@ static void init_kthread(void) {
     // slab fast-path hit rate and pcp hit rate; asserts >= 95%.
     extern void slab_pcpu_selftest(void);
     slab_pcpu_selftest();
+
+    // Phase 5B: SLAB_TYPESAFE_BY_RCU — validates that a typesafe
+    // cache's empty-list pages defer to call_rcu and only return
+    // to the buddy after a grace period.
+    extern void slab_typesafe_selftest(void);
+    slab_typesafe_selftest();
 
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by

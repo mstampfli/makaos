@@ -32,6 +32,7 @@ typedef struct {
 typedef struct udp_table {
     uint32_t         cap;
     uint32_t         cnt;
+    rcu_head_t       rcu_head;   // Phase 5B: embedded for call_rcu_head
     udp_sock_entry_t slots[];
 } udp_table_t;
 
@@ -97,7 +98,7 @@ static int udp_table_register(uint16_t port, socket_t* s) {
 
     rcu_assign_pointer(s_udp, neu);
     spin_unlock_irqrestore(&s_udp_wlock, flags);
-    if (old) call_rcu(udp_table_free_rcu, old);
+    if (old) call_rcu_head(&old->rcu_head, udp_table_free_rcu, old);
     return 0;
 }
 
@@ -117,7 +118,7 @@ static void udp_table_remove(uint16_t port) {
 
     rcu_assign_pointer(s_udp, neu);
     spin_unlock_irqrestore(&s_udp_wlock, flags);
-    call_rcu(udp_table_free_rcu, old);
+    call_rcu_head(&old->rcu_head, udp_table_free_rcu, old);
 }
 
 // Reader — must be inside rcu_read_lock().

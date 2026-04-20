@@ -1,22 +1,26 @@
-// ── Slab / pcp shrinker kthread (Phase 4F) ─────────────────────────────
+// ── Slab / pcp shrinker kthread (Phase 4F + 5D pressure-aware) ─────────
 //
 // Two trigger points for reclaim:
 //
-//  1) Periodic: a kthread wakes every SHRINK_INTERVAL_NS, walks every
-//     registered slab cache, and returns every page on cache->empty
-//     to the buddy allocator.  Also drains each CPU's pcp back half.
-//     This keeps unused slab pages from parking indefinitely while
-//     the buddy is still able to satisfy large allocs.
+//  1) Periodic kthread:
+//       - Reads pmm_free_ratio_bp() (free pages / total, basis points).
+//       - Maps ratio → scan policy:
+//           >= 7500 (>=75% free)  skip entirely, long sleep
+//           5000..7499 (50-74%)   drain oldest 10% per cache, medium sleep
+//           2500..4999 (25-49%)   drain 50% per cache, short sleep
+//           <  2500 (< 25%)       drain everything, tight loop
+//       - pcp_drain_all only runs when ratio < 5000; at high free
+//         levels the per-CPU pagesets aren't costing us buddy
+//         fragmentation, and draining wastes refill churn.
 //
-//  2) Pressure (synchronous): pmm_buddy_alloc() on failure calls
-//     pmm_slab_shrink_all_locked() (see pmm.c) and also needs a pcp
-//     drain path that runs with g_pmm_lock already held.  The
-//     locked-variant drain is expected to cross-CPU and is guarded
-//     by the invariant that the caller is inside g_pmm_lock — no
-//     per-CPU fast path can make progress while the lock is held,
-//     since the slow paths and refills also take it (refill via
-//     pmm_buddy_alloc_locked_for_pcp).  That means a consistent
-//     snapshot of each cpu's pcp is readable.
+//  2) Pressure (synchronous): pmm_buddy_alloc() failure path still
+//     calls pmm_slab_shrink_all_locked() unconditionally — reclaim
+//     everything before declaring OOM.  That path is unchanged.
+//
+// Sleep intervals are picked so idle kernels don't spin the shrinker
+// unnecessarily (saves CPU in a data-center setting where memory
+// pressure is rare), while memory-starved systems get immediate,
+// tight-loop reclaim.
 
 #include "slab_pcpu.h"
 #include "pcp.h"
@@ -27,39 +31,59 @@
 #include "process.h"
 #include "sched.h"
 
-#define SHRINK_INTERVAL_NS (1000000000ULL)  // 1 second
+#define SHRINK_IDLE_INTERVAL_NS     (5000000000ULL)  // 5 s  — plenty free
+#define SHRINK_MODERATE_INTERVAL_NS (1000000000ULL)  // 1 s  — moderate
+#define SHRINK_PRESSURE_INTERVAL_NS ( 250000000ULL)  // 250ms — tight
+#define SHRINK_EMERGENCY_INTERVAL_NS (50000000ULL)   //  50ms — starving
 
 extern uint64_t tsc_read_ns(void);
 
+static void shrinker_sleep_ns(uint64_t ns) {
+    uint64_t wake_ns = tsc_read_ns() + ns;
+    while (tsc_read_ns() < wake_ns) {
+        g_current->sleep_until_ns = wake_ns;
+        sched_sleep();
+        g_current->sleep_until_ns = 0;
+    }
+}
+
 static void slab_shrinker_kthread_entry(void) {
     for (;;) {
-        // Drain every cache's empty_list.  pmm_slab_shrink_all_locked
-        // expects g_pmm_lock held; we wrap briefly via the same helpers
-        // the pcp uses so we don't need a public drain API.
-        {
+        uint32_t ratio_bp = pmm_free_ratio_bp();
+        uint64_t sleep_ns;
+
+        if (ratio_bp >= 7500) {
+            // Plenty free — don't reclaim, sleep long.
+            sleep_ns = SHRINK_IDLE_INTERVAL_NS;
+        } else if (ratio_bp >= 5000) {
+            // Moderate — drain a few oldest pages per cache.  Keeps
+            // empty-lists from growing unbounded while preserving
+            // recently-used pages for re-promotion.
+            uint64_t f;
+            pmm_pcp_lock(&f);
+            pmm_slab_shrink_bounded_locked(4);
+            pmm_pcp_unlock(f);
+            sleep_ns = SHRINK_MODERATE_INTERVAL_NS;
+        } else if (ratio_bp >= 2500) {
+            // Notable pressure — drain half the empty list per cache
+            // plus drain pcps (free pages currently parked per-CPU).
+            uint64_t f;
+            pmm_pcp_lock(&f);
+            pmm_slab_shrink_bounded_locked(32);
+            pmm_pcp_unlock(f);
+            pcp_drain_all();
+            sleep_ns = SHRINK_PRESSURE_INTERVAL_NS;
+        } else {
+            // Starving — reclaim everything reclaimable, tight loop.
             uint64_t f;
             pmm_pcp_lock(&f);
             pmm_slab_shrink_all_locked();
             pmm_pcp_unlock(f);
+            pcp_drain_all();
+            sleep_ns = SHRINK_EMERGENCY_INTERVAL_NS;
         }
 
-        // Drain per-CPU pcp's.  We're a kthread running on one CPU at
-        // a time; to touch other CPUs' pcps we rely on the same
-        // cross-CPU contract pcp_drain_all() documents.  For the
-        // current design (scheduler doesn't migrate kthreads off
-        // their last CPU mid-call), a full pass each second catches
-        // all CPUs as the shrinker migrates naturally.  We don't
-        // need a hard barrier because stale pages in pcp only delay
-        // reclaim, not corrupt.
-        pcp_drain_all();
-
-        // Sleep for SHRINK_INTERVAL_NS.  Same pattern as sys_nanosleep.
-        uint64_t wake_ns = tsc_read_ns() + SHRINK_INTERVAL_NS;
-        while (tsc_read_ns() < wake_ns) {
-            g_current->sleep_until_ns = wake_ns;
-            sched_sleep();
-            g_current->sleep_until_ns = 0;
-        }
+        shrinker_sleep_ns(sleep_ns);
     }
 }
 

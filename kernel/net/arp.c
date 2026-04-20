@@ -49,6 +49,9 @@ typedef struct {
 typedef struct {
     uint32_t    cap;      // power of two
     uint32_t    cnt;
+    rcu_head_t  rcu_head; // Phase 5B: embedded RCU callback record
+                          // used to defer free via call_rcu_head —
+                          // lock-free push, no allocation.
     arp_entry_t slots[];  // flexible
 } arp_table_t;
 
@@ -113,7 +116,7 @@ static void cache_insert_locked(uint32_t ip_be, const uint8_t* mac) {
     arp_table_raw_insert(neu, ip_be, mac);
 
     rcu_assign_pointer(s_arp, neu);
-    if (old) call_rcu(arp_table_free_rcu, old);
+    if (old) call_rcu_head(&old->rcu_head, arp_table_free_rcu, old);
 }
 
 static void cache_insert(uint32_t ip_be, const uint8_t* mac) {

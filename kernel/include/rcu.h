@@ -115,13 +115,49 @@ void synchronize_rcu(void);
 // Hot paths should prefer call_rcu() which is asynchronous entirely.
 void synchronize_rcu_expedited(void);
 
-// Asynchronous reclamation: after a grace period elapses, call
-// func(data).  Phase 2 implementation is synchronous (equivalent to
-// synchronize_rcu(); func(data);), which is correct but blocks the
-// caller.  Phase 6 can upgrade to truly deferred per-CPU callback lists
-// if profiling shows a hot call_rcu site.
 typedef void (*rcu_func_t)(void* data);
-void call_rcu(rcu_func_t func, void* data);
+
+// ── rcu_head_t — embed-able callback record ─────────────────────────────
+// Include one of these in any struct you plan to free via RCU.  The
+// head is lock-free pushed onto a per-CPU pending list by
+// call_rcu_head; an RCU GP kthread periodically snapshots each CPU's
+// list, waits for a grace period, then invokes every head's callback.
+//
+// Because the head is caller-supplied, call_rcu_head performs ZERO
+// allocation and is safe to call from any context including inside
+// g_pmm_lock or from IRQ disable.  Use this wherever the allocator
+// path itself might defer (pmm slab destroy, fd close, etc.).
+typedef struct rcu_head {
+    struct rcu_head* next;
+    rcu_func_t       func;
+    void*            data;
+} rcu_head_t;
+
+// Asynchronous reclamation — caller-provided head.  After a grace
+// period elapses, `func(data)` runs in the GP kthread's context
+// (process context, IRQs enabled, preemptible — safe to kmalloc,
+// take sleeping locks, etc.).
+//
+// The head must remain valid from the call until the callback fires.
+// Typical use: embed the head in the object being freed; the object
+// is alive until the callback runs, so the head is too.
+//
+// This is the ONLY asynchronous call_rcu path — no allocating
+// wrapper.  Every async RCU site in the kernel embeds an rcu_head_t
+// in the object being freed, matching Linux's call_rcu semantics.
+void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data);
+
+// Block until every call_rcu_head that happened-before this call has
+// had its callback invoked.  Does NOT wait for callbacks enqueued
+// after this call.  Implementation: enqueues a known callback on
+// each CPU, waits for all of them to fire — by the time ours fires,
+// everything queued before it on the same CPU has already fired.
+// Mirrors Linux's rcu_barrier().
+void rcu_barrier(void);
+
+// Spawn the RCU GP kthread.  Called once from init_kthread after
+// the scheduler is live.
+void rcu_gp_kthread_start(void);
 
 // Expedited variant of call_rcu — use only on user-syscall-return
 // latency paths (munmap, brk-shrink, close of the last fd for a
@@ -131,16 +167,6 @@ void call_rcu(rcu_func_t func, void* data);
 // IPIs add per-remote-CPU cost that classic RCU's tick-piggyback
 // avoids.  See rcu.c for the full trade-off.
 void call_rcu_expedited(rcu_func_t func, void* data);
-
-// ── Deferred kfree helper ────────────────────────────────────────────────
-// Defer a kfree of `ptr` until every concurrent RCU reader has
-// completed its critical section.  Required for any heap-allocated
-// object that might still be referenced by a reader (typically a
-// wait_queue_t drainer in wait.c) at the moment of free.
-//
-// Implementation is one line of glue; the owning caller wants a
-// readable name at the call site.
-void kfree_rcu(void* ptr);
 
 // ── Internal — called by the scheduler ───────────────────────────────────
 // Not part of the public API, but exposed so sched.c can bump the QS

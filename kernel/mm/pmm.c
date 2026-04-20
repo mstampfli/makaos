@@ -1,6 +1,8 @@
 #include "pmm.h"
 #include "common.h"
 #include "smp.h"
+#include "rcu.h"      // Phase 5B: call_rcu for SLAB_TYPESAFE_BY_RCU
+#include "cpu.h"      // Phase 5C: SLAB_PCPU_PARTIAL_DEPTH cap
 
 // ── SMP correctness — global PMM lock ───────────────────────────────────
 //
@@ -31,6 +33,7 @@ static phys_addr_t pmm_buddy_alloc_locked(uint8_t order);
 static void        pmm_buddy_free_locked(phys_addr_t addr, uint8_t order);
 static void        pmm_count_free_pages(void);
 static void        pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h);
+static inline void drain_remote_into_freelist_locked(slab_header_t* h);
 
 static phys_addr_t g_phys_ceiling = 0;
 static uint64_t    g_total_frames = 0;
@@ -579,6 +582,35 @@ void pmm_slab_shrink_all_locked(void) {
   }
 }
 
+// Phase 5D: bounded shrink.  Walks each cache's empty list to find
+// its TAIL (oldest — head-push means tail is LRU), then drains up
+// to `max_per_cache` pages tail-first.  Caller holds g_pmm_lock.
+//
+// The per-call O(n) walk to tail is acceptable: shrinker runs at
+// most every 10s under low pressure, empty lists are bounded by
+// working set.
+void pmm_slab_shrink_bounded_locked(uint32_t max_per_cache) {
+  if (max_per_cache == 0) return;
+  for (slab_cache_t* c = g_slab_cache_head; c; c = c->cache_next) {
+    uint32_t remaining = max_per_cache;
+    while (remaining && c->empty) {
+      // Find tail of c->empty (doubly-linked via prev/next).
+      slab_header_t* tail = (slab_header_t*)c->empty;
+      while (tail->next) tail = (slab_header_t*)tail->next;
+      pmm_slab_destroy_locked(c, tail);  // unlinks + frees to buddy
+      remaining--;
+    }
+  }
+}
+
+uint32_t pmm_free_ratio_bp(void) {
+  if (g_total_frames == 0) return 10000;
+  uint64_t free = __atomic_load_n(&g_free_pages, __ATOMIC_RELAXED);
+  if (free >= g_total_frames) return 10000;
+  uint64_t bp = (free * 10000u) / g_total_frames;
+  return (uint32_t)bp;
+}
+
 // ── Phase 4E hooks used by pcp.c ─────────────────────────────────────
 // The PCP needs to take/release g_pmm_lock around batched refills and
 // drains so it doesn't re-acquire once per page.  These wrappers
@@ -766,6 +798,35 @@ static slab_header_t* pmm_slab_recycle_empty_locked(slab_cache_t* cache) {
     return h;
 }
 
+// Phase 5A: drain the per-page remote_free Treiber stack into
+// h->freelist and decrement h->inuse by the count of drained items.
+// Called at the head of every slow-path function that touches
+// h->freelist or h->inuse so that cross-CPU frees (which push to
+// remote_free lockless from slab_pcpu_free) are reflected before any
+// state check.
+//
+// Caller must hold g_pmm_lock.  The atomic_exchange grabs the
+// entire chain in one step; remote freers continue pushing to a
+// fresh (post-exchange) NULL head without blocking.
+//
+// Chain length is typically small (few items between slow-path
+// transitions) so the O(n) tail walk isn't a concern.
+static inline void drain_remote_into_freelist_locked(slab_header_t* h) {
+    void* chain = __atomic_exchange_n(&h->remote_free, NULL, __ATOMIC_ACQUIRE);
+    if (!chain) return;
+    // Walk to tail; count items.
+    void*    tail = chain;
+    uint32_t n    = 1;
+    while (*(void**)tail) {
+        tail = *(void**)tail;
+        n++;
+    }
+    *(void**)tail = h->freelist;
+    h->freelist   = chain;
+    if (h->inuse >= n) h->inuse -= n;
+    else               h->inuse = 0;  // defensive — should be unreachable
+}
+
 // Internal — caller holds g_pmm_lock.
 static void* pmm_slab_alloc_locked(slab_cache_t* cache) {
   slab_header_t* h = (slab_header_t*)cache->partial;
@@ -780,8 +841,20 @@ static void* pmm_slab_alloc_locked(slab_cache_t* cache) {
     }
   }
 
+  // Phase 5A: absorb any cross-CPU frees that landed on this page
+  // while it was waiting on cache->partial.  Keeps inuse and
+  // freelist consistent before we touch them.
+  drain_remote_into_freelist_locked(h);
+
   void* slot = h->freelist;
-  if (!slot) return NULL;
+  if (!slot) {
+    // After draining, still nothing.  Means remote_free was empty
+    // and the page was on cache->partial with NULL freelist — that
+    // should never happen (partial invariant: freelist != NULL)
+    // unless a concurrent allocator already took the object.
+    // Return NULL; caller will try again or report OOM.
+    return NULL;
+  }
 
   h->freelist = *(void**)slot;
   h->inuse++;
@@ -807,15 +880,12 @@ void* pmm_slab_alloc(slab_cache_t* cache) {
 // Unlinks `h` from whichever cache list it lives on, clears the slab
 // trackers for every frame in the slab, and returns the underlying
 // pages to the buddy allocator.  After this call `h` is invalid.
-static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
-  switch (h->on_list) {
-    case SLAB_LIST_PARTIAL: slab_list_remove((slab_header_t**)&cache->partial, h); break;
-    case SLAB_LIST_FULL:    slab_list_remove((slab_header_t**)&cache->full,    h); break;
-    case SLAB_LIST_EMPTY:   slab_list_remove((slab_header_t**)&cache->empty,   h); break;
-    default: break;  // SLAB_LIST_NONE: not on a list (caller already unlinked)
-  }
-  h->on_list = SLAB_LIST_NONE;
-
+// Helper: actually return a slab page to the buddy allocator.
+// Clears per-frame trackers for every frame in the slab, frees the
+// physical pages, and accounts for g_free_pages.  Caller MUST hold
+// g_pmm_lock.  Shared between the immediate destroy path and the
+// RCU-deferred destroy callback (Phase 5B).
+static void pmm_slab_release_to_buddy_locked(slab_cache_t* cache, slab_header_t* h) {
   uint64_t head_frame_index = (h->slab_phys >> PAGE_SHIFT);
   uint64_t pages_in_slab = (1ULL << cache->slab_order);
 
@@ -829,6 +899,60 @@ static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
 
   pmm_buddy_free_locked(h->slab_phys, cache->slab_order);
   __atomic_fetch_add(&g_free_pages, order_to_pages(cache->slab_order), __ATOMIC_RELAXED);
+}
+
+// Phase 5B: RCU callback — runs after a grace period has elapsed so
+// every CPU that might have been dereferencing a pointer into this
+// slab page has reached a quiescent state.  Clears trackers (making
+// pmm_is_slab_ptr return false for these frames) and returns the
+// pages to buddy.
+//
+// Runs in kthread context (rcu_gp_kthread), not IRQ — safe to take
+// g_pmm_lock with irqsave.  The `cache` pointer is recovered from
+// h->cache; the h itself is a valid slab_header_t because the page's
+// underlying memory hasn't been freed yet (that's the whole point).
+static void pmm_slab_rcu_free_cb(void* data) {
+  slab_header_t* h     = (slab_header_t*)data;
+  slab_cache_t*  cache = h->cache;
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  pmm_slab_release_to_buddy_locked(cache, h);
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
+static void pmm_slab_destroy_locked(slab_cache_t* cache, slab_header_t* h) {
+  // Phase 5A: drain any pending cross-CPU frees before returning the
+  // page to buddy.  Items left on remote_free would be lost — the
+  // memory's about to be reused for something else.
+  drain_remote_into_freelist_locked(h);
+
+  switch (h->on_list) {
+    case SLAB_LIST_PARTIAL: slab_list_remove((slab_header_t**)&cache->partial, h); break;
+    case SLAB_LIST_FULL:    slab_list_remove((slab_header_t**)&cache->full,    h); break;
+    case SLAB_LIST_EMPTY:   slab_list_remove((slab_header_t**)&cache->empty,   h); break;
+    default: break;  // SLAB_LIST_NONE: not on a list (caller already unlinked)
+  }
+
+  // Phase 5B: for typesafe caches, defer the actual buddy return via
+  // call_rcu.  The page memory stays slab-typed (g_slab_trackers
+  // still points at `cache`) for the duration of the grace period,
+  // so any rcu_read_lock'd reader still dereferencing a pointer
+  // into this page sees a valid object of the same type.  A new
+  // alloc in the same cache may return a pointer into a different
+  // (not-yet-reclaimed) page — the typesafe guarantee is per-type,
+  // not per-instance, so instance identity is up to the user (seqlock
+  // / version counter).
+  if (cache->flags & SLAB_TYPESAFE_BY_RCU) {
+    h->on_list = SLAB_LIST_RCU_DEFER;
+    // call_rcu_head: zero-allocation, lock-free push.  Safe to call
+    // while holding g_pmm_lock — the head is embedded in h, no
+    // recursion into the allocator, no synchronize_rcu wait.  The
+    // rcu_gp_kthread fires pmm_slab_rcu_free_cb after a grace period.
+    call_rcu_head((rcu_head_t*)&h->rcu_head, pmm_slab_rcu_free_cb, h);
+    return;
+  }
+
+  h->on_list = SLAB_LIST_NONE;
+  pmm_slab_release_to_buddy_locked(cache, h);
 }
 
 // Internal — caller holds g_pmm_lock.
@@ -853,6 +977,11 @@ static void pmm_slab_free_locked(void* ptr) {
 
   uint64_t head_idx = (uint64_t)g_slab_heads[frame_index];
   slab_header_t* h = (slab_header_t*)phys_to_virt((phys_addr_t)(head_idx << PAGE_SHIFT));
+
+  // Phase 5A: absorb cross-CPU frees into freelist/inuse BEFORE we
+  // inspect/update them, so the page state transitions below see a
+  // consistent view.
+  drain_remote_into_freelist_locked(h);
 
   uint8_t was_on = h->on_list;
 
@@ -898,13 +1027,14 @@ phys_addr_t pmm_highest_address_get(void) {
   return g_phys_ceiling;
 }
 
-void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size) {
+void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size, uint8_t flags) {
   cache->slot_size = slot_size;
   cache->partial = NULL;
   cache->full = NULL;
   cache->empty = NULL;
   cache->slab_order = calculate_slab_order(slot_size);
   cache->class_idx = (uint8_t)0xFF;   // kheap sets this for managed caches
+  cache->flags = flags;
 
   // Pre-compute objects per slab page for slab_pcpu promote/demote.
   // Mirrors the layout pmm_slab_grow_locked uses: header at offset 0,
@@ -918,6 +1048,18 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size) {
       size_t num_slots = (slab_bytes - first_slot_off) / slot_size;
       cache->obj_per_slab = (num_slots > 0xFFFF) ? 0xFFFF : (uint16_t)num_slots;
   }
+
+  // Phase 5C: adaptive CPU partial list cap.  Linux SLUB's heuristic
+  // (mm/slub.c get_order_size_cpu_partial): scale inversely with
+  // obj_per_slab so small-object caches accumulate more partial
+  // pages per CPU.  Capped at SLAB_PCPU_PARTIAL_DEPTH (compile-time
+  // upper bound of the on-CPU list).
+  uint16_t cap;
+  if      (cache->obj_per_slab >= 256) cap = 13;
+  else if (cache->obj_per_slab >= 32)  cap = 6;
+  else                                 cap = 2;
+  if (cap > SLAB_PCPU_PARTIAL_DEPTH) cap = SLAB_PCPU_PARTIAL_DEPTH;
+  cache->cpu_partial_cap = cap;
 
   // Register on the global cache list so the Phase 4F shrinker and
   // Phase 4H stats walker can find every cache.  Boot-time only;
@@ -934,6 +1076,9 @@ slab_header_t* pmm_slab_grab_partial(slab_cache_t* cache) {
   if (h) {
     slab_list_remove((slab_header_t**)&cache->partial, h);
     h->on_list = SLAB_LIST_NONE;
+    // Phase 5A: absorb cross-CPU frees that landed while on the
+    // partial list.  Caller gets a fully-merged page.
+    drain_remote_into_freelist_locked(h);
   }
   spin_unlock_irqrestore(&g_pmm_lock, flags);
   return h;
@@ -945,6 +1090,7 @@ slab_header_t* pmm_slab_grab_empty(slab_cache_t* cache) {
   if (h) {
     slab_list_remove((slab_header_t**)&cache->empty, h);
     h->on_list = SLAB_LIST_NONE;
+    drain_remote_into_freelist_locked(h);
   }
   spin_unlock_irqrestore(&g_pmm_lock, flags);
   return h;
@@ -957,6 +1103,10 @@ slab_header_t* pmm_slab_grow(slab_cache_t* cache) {
     // grow puts it on partial; unlink so the caller takes ownership.
     slab_list_remove((slab_header_t**)&cache->partial, h);
     h->on_list = SLAB_LIST_NONE;
+    // Fresh page, remote_free is NULL from grow_locked's init — but
+    // drain anyway in case future code paths share this helper from
+    // a non-init state.
+    drain_remote_into_freelist_locked(h);
   }
   spin_unlock_irqrestore(&g_pmm_lock, flags);
   return h;
@@ -983,12 +1133,53 @@ void pmm_slab_park_empty(slab_cache_t* cache, slab_header_t* h) {
   spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
+// ── Phase 5C: batched grab/park for per-CPU partial list ───────────────
+// Both helpers do ONE g_pmm_lock acquire for up to `want`/`count`
+// pages.  Amortises lock cost across many pages under bursty
+// allocation (fork storms, mass-close, bulk network RX).
+
+uint32_t pmm_slab_grab_partial_batch(slab_cache_t* cache,
+                                      slab_header_t** out, uint32_t want) {
+  if (want == 0) return 0;
+  uint32_t got = 0;
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  while (got < want) {
+    slab_header_t* h = (slab_header_t*)cache->partial;
+    if (!h) break;
+    slab_list_remove((slab_header_t**)&cache->partial, h);
+    h->on_list = SLAB_LIST_NONE;
+    // Drain remote frees into h->freelist while we still hold the
+    // lock — caller gets a consistent page.
+    drain_remote_into_freelist_locked(h);
+    out[got++] = h;
+  }
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+  return got;
+}
+
+void pmm_slab_park_partial_batch(slab_cache_t* cache,
+                                  slab_header_t** pages, uint32_t count) {
+  if (count == 0) return;
+  uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  for (uint32_t i = 0; i < count; i++) {
+    slab_header_t* h = pages[i];
+    slab_list_push((slab_header_t**)&cache->partial, h);
+    h->on_list = SLAB_LIST_PARTIAL;
+  }
+  spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
 // Phase 4G: demote a CPU_ACTIVE page, or keep it active if cross-CPU
 // frees populated its freelist.  Takes g_pmm_lock so the check of
 // h->freelist is consistent with any concurrent pmm_slab_free_locked
 // pushes.  See pmm.h for semantics.
 int pmm_slab_demote_or_keep(slab_cache_t* cache, slab_header_t* h, void** out_fl) {
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+  // Phase 5A: drain cross-CPU frees into h->freelist before the
+  // rescue check.  Any lockless push to h->remote_free that landed
+  // while we owned the page is now materialised; the "kept active"
+  // fast-exit republishes the merged chain via cpu_slot.
+  drain_remote_into_freelist_locked(h);
   void* fl = h->freelist;
   if (fl) {
     // Cross-CPU frees populated the page's freelist while we were
