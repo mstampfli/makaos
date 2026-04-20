@@ -10,6 +10,7 @@
 // configuration block and the command payload differ.
 
 #include "virtio_gpu.h"
+#include "drm_backend.h"
 #include "pci.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -681,4 +682,59 @@ int virtio_gpu_present_test(void) {
     kprintf("[virtio-gpu] present OK (%ux%u, resource %u, %u bytes)\n",
             w, h, s_fb_res_id, s_fb_bytes);
     return 1;
+}
+
+// ── drm_backend_ops adapters ─────────────────────────────────────────
+// Thin wrappers that match the backend vtable signatures.  The DRM
+// core calls these; legacy virtio_gpu_* functions are preserved as
+// the adapter targets and for the present_test.
+
+static uint32_t vgpu_be_scanout_count(void) { return virtio_gpu_num_scanouts(); }
+static void     vgpu_be_scanout_mode(uint32_t idx, uint32_t* w, uint32_t* h) {
+    virtio_gpu_get_mode(idx, w, h);
+}
+static int vgpu_be_resource_create(uint32_t id, uint32_t fmt, uint32_t w, uint32_t h) {
+    return virtio_gpu_resource_create_2d(id, fmt, w, h) ? 0 : -1;
+}
+static int vgpu_be_resource_destroy(uint32_t id) {
+    return virtio_gpu_resource_unref(id) ? 0 : -1;
+}
+static int vgpu_be_resource_attach(uint32_t id, phys_addr_t phys, uint32_t bytes) {
+    return virtio_gpu_resource_attach_backing_single(id, phys, bytes) ? 0 : -1;
+}
+static int vgpu_be_scanout_set(uint32_t sc, uint32_t res, uint32_t w, uint32_t h) {
+    return virtio_gpu_set_scanout(sc, res, w, h) ? 0 : -1;
+}
+static int vgpu_be_transfer(uint32_t id, uint32_t w, uint32_t h) {
+    return virtio_gpu_transfer_to_host_2d(id, w, h) ? 0 : -1;
+}
+static int vgpu_be_flush(uint32_t id, uint32_t w, uint32_t h) {
+    return virtio_gpu_resource_flush(id, w, h) ? 0 : -1;
+}
+
+static const drm_backend_ops_t vgpu_backend_ops = {
+    .scanout_count           = vgpu_be_scanout_count,
+    .scanout_mode            = vgpu_be_scanout_mode,
+    .resource_create         = vgpu_be_resource_create,
+    .resource_destroy        = vgpu_be_resource_destroy,
+    .resource_attach_backing = vgpu_be_resource_attach,
+    .scanout_set             = vgpu_be_scanout_set,
+    .resource_transfer       = vgpu_be_transfer,
+    .resource_flush          = vgpu_be_flush,
+};
+
+// drm_backend global pointer + registration — defined here so the
+// backend owns its own storage.  drm.c reads it through __atomic_load
+// (effectively one-time init; a future multi-backend world would use
+// proper RCU).
+const drm_backend_ops_t* drm_backend = NULL;
+
+void drm_backend_register(const drm_backend_ops_t* ops) {
+    __atomic_store_n(&drm_backend, ops, __ATOMIC_RELEASE);
+}
+
+// Hook: at init, after s_ok = 1 means the device is live, register
+// ourselves as the backend.  Must be called AFTER virtio_gpu_init.
+void virtio_gpu_register_backend(void) {
+    if (s_ok) drm_backend_register(&vgpu_backend_ops);
 }

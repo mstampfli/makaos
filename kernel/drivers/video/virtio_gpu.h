@@ -51,3 +51,7 @@ int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
                             uint32_t w, uint32_t h);
 int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h);
 int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h);
+
+// Called at subsys init after virtio_gpu_init succeeds.  Registers
+// this device as the DRM core's active backend via drm_backend_register.
+void virtio_gpu_register_backend(void);

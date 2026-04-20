@@ -94,6 +94,11 @@ DEFINE_INITCALL(net, INITCALL_LEVEL_SUBSYS, .fn = _net_init);
 // device isn't present (hardware boot, QEMU without -device virtio-gpu).
 // Runs in subsys level because feature negotiation + GET_DISPLAY_INFO
 // may involve delays — the probe polls the control-queue used ring.
-static int _virtio_gpu_init(void) { (void)virtio_gpu_init(); return 0; }
+// After init, register as the DRM core's backend so /dev/dri/card0
+// ioctls route here.
+static int _virtio_gpu_init(void) {
+    if (virtio_gpu_init()) virtio_gpu_register_backend();
+    return 0;
+}
 
 DEFINE_INITCALL(virtio_gpu, INITCALL_LEVEL_SUBSYS, .fn = _virtio_gpu_init);

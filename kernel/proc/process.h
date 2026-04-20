@@ -139,6 +139,11 @@ typedef struct __attribute__((aligned(16))) task_t {
     // atomic-or).  See kernel/io/signalfd.c.
     void*         signalfd_head;
 
+    // Total DRM dumb-buffer bytes charged to this task.  Incremented
+    // on CREATE_DUMB, decremented on DESTROY_DUMB or drm_close.  Hard
+    // cap enforced in drm.c; future OOM kill reads this to prioritise.
+    uint64_t      drm_bytes_charged;
+
     int32_t       exit_code;    // set by sys_exit, readable via wait()
 
     uint64_t      sleep_until_ns; // wake time for nanosleep (TSC nanoseconds)

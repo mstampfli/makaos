@@ -10,6 +10,7 @@
 #define EINTR        4   // Interrupted system call
 #define EIO          5   // I/O error
 #define ENOEXEC      8   // Exec format error
+#define ENODEV       19  // No such device
 #define EBADF        9   // Bad file descriptor
 #define ECHILD      10   // No child processes
 #define EAGAIN      11   // Try again
