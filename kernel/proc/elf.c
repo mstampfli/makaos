@@ -445,9 +445,10 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->files_shared     = files;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
-    t->sigstate.pending = 0;
-    t->sigstate.blocked = 0;
-    t->signalfd_head    = NULL;
+    t->sigstate.pending   = 0;
+    t->sigstate.blocked   = 0;
+    t->signalfd_head      = NULL;
+    t->drm_bytes_charged  = 0;
     t->umask            = 0022u;
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
@@ -545,9 +546,10 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->files_shared     = files;
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
-    t->sigstate.pending = 0;
-    t->sigstate.blocked = 0;
-    t->signalfd_head    = NULL;
+    t->sigstate.pending   = 0;
+    t->sigstate.blocked   = 0;
+    t->signalfd_head      = NULL;
+    t->drm_bytes_charged  = 0;
     t->umask            = 0022u;
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;

@@ -15,6 +15,7 @@
 // Dumb buffers / ADDFB2 / SETCRTC / PAGE_FLIP come next.
 
 #include "drm.h"
+#include "drm_backend.h"
 #include "virtio_gpu.h"
 #include "kheap.h"
 #include "kprintf.h"
@@ -23,10 +24,68 @@
 #include "vmm.h"
 #include "process.h"
 #include "smp.h"
+#include "sched.h"      // g_current
 #include "syscall.h"   // copy_from_user / copy_to_user
 
 extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+
+// ── Global modeset state ─────────────────────────────────────────────
+// Protected by s_state_lock during a commit.  Readers (ioctls that
+// consult current state like GETCRTC) take the lock briefly, copy out.
+// The atomic commit apply path is the only writer.  Future: seqlock
+// once we measure reader contention under wlroots.
+#define DRM_MAX_SCANOUTS  VIRTIO_GPU_MAX_SCANOUTS_CAP
+
+typedef struct drm_scanout_state {
+    uint32_t active;          // 1 if a resource is currently scanning out
+    uint32_t resource_id;     // backend resource; 0 means disabled
+    uint32_t fb_id;           // per-client fb_id used to bind; 0 if none
+    uint32_t w, h;
+    uint64_t generation;      // bumps on every successful apply
+} drm_scanout_state_t;
+
+static spinlock_t         s_state_lock;
+static drm_scanout_state_t s_scanouts[DRM_MAX_SCANOUTS];
+static int                s_state_init_done = 0;
+
+static void drm_state_init_once(void) {
+    if (__atomic_load_n(&s_state_init_done, __ATOMIC_ACQUIRE)) return;
+    int expect = 0;
+    if (__atomic_compare_exchange_n(&s_state_init_done, &expect, 2,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        spin_lock_init(&s_state_lock);
+        for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
+            s_scanouts[i] = (drm_scanout_state_t){0};
+        __atomic_store_n(&s_state_init_done, 1, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&s_state_init_done, __ATOMIC_ACQUIRE) != 1)
+            __builtin_ia32_pause();
+    }
+}
+
+// ── Memory accounting ────────────────────────────────────────────────
+// Every DRM dumb buffer charges its backing allocation to the owning
+// task's drm_bytes_charged counter.  Hard cap enforced on create;
+// OOM path (kernel/mm/oom.c, future) will consult this to pick
+// kill victims.
+#define DRM_PER_TASK_LIMIT  (256ull * 1024 * 1024)  // 256 MiB
+
+static int drm_charge(task_t* t, uint64_t bytes) {
+    if (!t) return 0;
+    uint64_t cur = __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (cur + bytes > DRM_PER_TASK_LIMIT) return -ENOMEM;
+        if (__atomic_compare_exchange_n(&t->drm_bytes_charged, &cur, cur + bytes,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 0;
+    }
+}
+
+static void drm_uncharge(task_t* t, uint64_t bytes) {
+    if (!t) return;
+    __atomic_fetch_sub(&t->drm_bytes_charged, bytes, __ATOMIC_ACQ_REL);
+}
 
 // ── Linux DRM ioctl numbers (subset) ─────────────────────────────────
 // Encoded via _IOC in Linux; we hardcode the exact request values
@@ -47,6 +106,7 @@ extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
 #define DRM_IOCTL_MODE_CREATE_DUMB    0xC02064B2
 #define DRM_IOCTL_MODE_MAP_DUMB       0xC01064B3
 #define DRM_IOCTL_MODE_DESTROY_DUMB   0xC00464B4
+#define DRM_IOCTL_MODE_ATOMIC         0xC03864BC
 
 // ── DRM capability IDs ──────────────────────────────────────────────
 #define DRM_CAP_DUMB_BUFFER          0x1
@@ -206,48 +266,55 @@ typedef struct {
 } drm_mode_create_dumb_t;
 
 static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b) return -ENODEV;
+
     drm_mode_create_dumb_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (!a.width || !a.height) return -EINVAL;
-    if (a.bpp != 32) return -EINVAL;     // we only support 32-bpp
+    if (a.bpp != 32) return -EINVAL;     // 32-bpp only
 
     uint32_t pitch = a.width * 4;
     uint64_t size  = (uint64_t)pitch * a.height;
-    // Round allocation up to a power-of-two page count so virtio-gpu
-    // can attach it as a single contiguous range.
     uint64_t pages = (size + 4095) / 4096;
     uint8_t  order = 0;
     while (((uint64_t)1 << order) < pages) order++;
-    phys_addr_t phys = pmm_buddy_alloc(order);
-    if (!phys) return -ENOMEM;
     uint32_t bytes_alloc = (uint32_t)((uint64_t)1 << order) * 4096u;
 
-    // Zero backing pages (prevents info leak).  HHDM mapping.
+    // Memory-accounting check BEFORE the buddy alloc — reject early
+    // if this client is over quota.  Applies to both real userland
+    // tasks and kthreads; kthreads have drm_bytes_charged=0 by default.
+    int rc = drm_charge(g_current, bytes_alloc);
+    if (rc < 0) return rc;
+
+    phys_addr_t phys = pmm_buddy_alloc(order);
+    if (!phys) { drm_uncharge(g_current, bytes_alloc); return -ENOMEM; }
+
     uint8_t* virt = (uint8_t*)((uintptr_t)phys + HHDM_OFFSET);
     __builtin_memset(virt, 0, bytes_alloc);
 
-    // Ref-count each backing page so our own user VA maps don't free
-    // pages from under us if the process exits before DESTROY_DUMB.
     for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
         pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
 
     uint32_t res_id = alloc_res_id();
-    if (!virtio_gpu_resource_create_2d(res_id,
-                                        VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
-                                        a.width, a.height)) {
+    if (b->resource_create(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+                             a.width, a.height) != 0) {
         pmm_buddy_free(phys, order);
+        drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
-    if (!virtio_gpu_resource_attach_backing_single(res_id, phys, bytes_alloc)) {
-        virtio_gpu_resource_unref(res_id);
+    if (b->resource_attach_backing(res_id, phys, bytes_alloc) != 0) {
+        b->resource_destroy(res_id);
         pmm_buddy_free(phys, order);
+        drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
 
     drm_dumb_t* d = (drm_dumb_t*)kmalloc(sizeof(*d));
     if (!d) {
-        virtio_gpu_resource_unref(res_id);
+        b->resource_destroy(res_id);
         pmm_buddy_free(phys, order);
+        drm_uncharge(g_current, bytes_alloc);
         return -ENOMEM;
     }
     drm_client_t* c = client_of(f);
@@ -297,18 +364,13 @@ typedef struct {
     uint32_t handle;
 } drm_mode_destroy_dumb_t;
 
-static void dumb_free(drm_dumb_t* d) {
-    virtio_gpu_resource_unref(d->vgpu_res_id);
-    // Drop our extra ref; if user unmapped, this was the last ref and
-    // pmm_ref_dec frees the pages.  If not unmapped, the unmap path
-    // will take them down.
+static void dumb_free(drm_dumb_t* d, task_t* owner) {
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (b) b->resource_destroy(d->vgpu_res_id);
     for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
         pmm_ref_dec(d->phys + (phys_addr_t)i * 4096u);
-    // Also release the buddy allocation back.  pmm_ref_dec freed the
-    // individual pages but the buddy bookkeeping still owns them —
-    // this returns them to the free list.  Safe because we held a
-    // ref for every page above.
     pmm_buddy_free(d->phys, d->order);
+    drm_uncharge(owner, d->bytes_alloc);
     kfree(d);
 }
 
@@ -332,7 +394,7 @@ static int drm_ioctl_destroy_dumb(vfs_file_t* f, uint64_t arg) {
                 }
             }
             *pp = d->next;
-            dumb_free(d);
+            dumb_free(d, g_current);
             return 0;
         }
         pp = &(*pp)->next;
@@ -395,9 +457,82 @@ static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
     return -ENOENT;
 }
 
-// ── SETCRTC / PAGE_FLIP ──────────────────────────────────────────────
-// SETCRTC binds fb_id to crtc_id and forces an initial upload+flush.
-// Linux drm_mode_crtc layout:
+// ── Atomic commit — the single state-changing primitive ─────────────
+//
+// Every modeset (SETCRTC, PAGE_FLIP, MODE_ATOMIC) goes through this
+// function.  Legacy sync ioctls are thin wrappers that build a
+// one-scanout commit and call drm_commit_apply().  Linux carries
+// parallel sync + atomic code paths forever; we only have one.
+//
+// Snapshot + rollback semantics: we snapshot s_scanouts BEFORE
+// touching the backend.  Any backend call failing rolls every prior
+// change back with the backend's own primitives (SET_SCANOUT + old
+// resource_id).  Either the full commit applies, or nothing did.
+
+typedef struct drm_commit_entry {
+    uint32_t scanout;          // 0..n-1
+    uint32_t resource_id;      // backend id; 0 disables
+    uint32_t fb_id;            // tracked for observability
+    uint32_t w, h;
+} drm_commit_entry_t;
+
+typedef struct drm_commit {
+    uint32_t n;
+    drm_commit_entry_t entries[DRM_MAX_SCANOUTS];
+} drm_commit_t;
+
+static int drm_commit_apply(const drm_commit_t* commit) {
+    drm_state_init_once();
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b) return -ENODEV;
+
+    uint64_t flags = spin_lock_irqsave(&s_state_lock);
+
+    // Snapshot prior state of every touched scanout for rollback.
+    drm_scanout_state_t prior[DRM_MAX_SCANOUTS];
+    for (uint32_t i = 0; i < commit->n; i++) {
+        uint32_t sc = commit->entries[i].scanout;
+        if (sc >= DRM_MAX_SCANOUTS) { spin_unlock_irqrestore(&s_state_lock, flags); return -EINVAL; }
+        prior[i] = s_scanouts[sc];
+    }
+
+    // Apply each entry.  On failure, roll back every succeeded entry.
+    for (uint32_t i = 0; i < commit->n; i++) {
+        const drm_commit_entry_t* e = &commit->entries[i];
+        if (b->scanout_set(e->scanout, e->resource_id, e->w, e->h) != 0) goto rollback;
+        if (e->resource_id) {
+            if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) goto rollback;
+            if (b->resource_flush   (e->resource_id, e->w, e->h) != 0) goto rollback;
+        }
+        s_scanouts[e->scanout] = (drm_scanout_state_t){
+            .active      = (e->resource_id != 0),
+            .resource_id = e->resource_id,
+            .fb_id       = e->fb_id,
+            .w = e->w, .h = e->h,
+            .generation  = s_scanouts[e->scanout].generation + 1,
+        };
+    }
+
+    spin_unlock_irqrestore(&s_state_lock, flags);
+    return 0;
+
+rollback:
+    // Walk the prefix of entries that we applied and restore each
+    // one.  Best-effort; a backend refusing rollback is a bug we
+    // log but can't prevent.
+    for (uint32_t j = 0; j < commit->n; j++) {
+        const drm_commit_entry_t* e = &commit->entries[j];
+        if (s_scanouts[e->scanout].generation != prior[j].generation) {
+            b->scanout_set(e->scanout, prior[j].resource_id, prior[j].w, prior[j].h);
+            s_scanouts[e->scanout] = prior[j];
+        }
+    }
+    spin_unlock_irqrestore(&s_state_lock, flags);
+    return -EIO;
+}
+
+// ── Legacy sync ioctls — one-entry commits on top of atomic ─────────
+
 typedef struct {
     uint64_t set_connectors_ptr;
     uint32_t count_connectors;
@@ -409,36 +544,40 @@ typedef struct {
     drm_mode_modeinfo_t mode;
 } drm_mode_crtc_t;
 
-static int drm_ioctl_setcrtc(vfs_file_t* f, uint64_t arg) {
-    drm_mode_crtc_t a;
-    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    uint32_t n_sc = virtio_gpu_num_scanouts();
-    if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
-    uint32_t scanout = a.crtc_id - CRTC_BASE;
-
-    if (a.fb_id == 0) {
-        // Disable — zero the scanout by pointing to resource 0.
-        virtio_gpu_set_scanout(scanout, 0, 0, 0);
-        return 0;
-    }
-    drm_client_t* c = client_of(f);
-    drm_fb_t* fb = find_fb(c, a.fb_id);
+// Resolve a (client, fb_id) pair to the backend data the commit needs.
+// Returns 0 on success, -errno on failure.
+static int resolve_fb(drm_client_t* c, uint32_t fb_id,
+                       uint32_t* out_res, uint32_t* out_w, uint32_t* out_h) {
+    if (fb_id == 0) { *out_res = 0; *out_w = 0; *out_h = 0; return 0; }
+    drm_fb_t* fb = find_fb(c, fb_id);
     if (!fb) return -ENOENT;
     drm_dumb_t* d = find_dumb(c, fb->handle);
     if (!d) return -ENOENT;
-
-    if (!virtio_gpu_set_scanout(scanout, d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
-    if (!virtio_gpu_transfer_to_host_2d(d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
-    if (!virtio_gpu_resource_flush(d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
+    *out_res = d->vgpu_res_id;
+    *out_w   = fb->width;
+    *out_h   = fb->height;
     return 0;
 }
 
-// PAGE_FLIP: same shape as SETCRTC for the fb swap, minus mode info.
-// We transfer + flush synchronously; the Linux async event isn't
-// emitted yet (wlroots handles missing event via timeout).
+static int drm_ioctl_setcrtc(vfs_file_t* f, uint64_t arg) {
+    drm_mode_crtc_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b) return -ENODEV;
+    uint32_t n_sc = b->scanout_count();
+    if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
+
+    drm_commit_t commit = { .n = 1 };
+    commit.entries[0].scanout = a.crtc_id - CRTC_BASE;
+    commit.entries[0].fb_id   = a.fb_id;
+    int rc = resolve_fb(client_of(f), a.fb_id,
+                         &commit.entries[0].resource_id,
+                         &commit.entries[0].w,
+                         &commit.entries[0].h);
+    if (rc != 0) return rc;
+    return drm_commit_apply(&commit);
+}
+
 typedef struct {
     uint32_t crtc_id, fb_id, flags, reserved;
     uint64_t user_data;
@@ -447,23 +586,92 @@ typedef struct {
 static int drm_ioctl_page_flip(vfs_file_t* f, uint64_t arg) {
     drm_mode_page_flip_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    uint32_t n_sc = virtio_gpu_num_scanouts();
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b) return -ENODEV;
+    uint32_t n_sc = b->scanout_count();
     if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
-    uint32_t scanout = a.crtc_id - CRTC_BASE;
 
+    drm_commit_t commit = { .n = 1 };
+    commit.entries[0].scanout = a.crtc_id - CRTC_BASE;
+    commit.entries[0].fb_id   = a.fb_id;
+    int rc = resolve_fb(client_of(f), a.fb_id,
+                         &commit.entries[0].resource_id,
+                         &commit.entries[0].w,
+                         &commit.entries[0].h);
+    if (rc != 0) return rc;
+    return drm_commit_apply(&commit);
+}
+
+// ── MODE_ATOMIC ioctl — the first-class path ────────────────────────
+// Linux struct drm_mode_atomic.  For this initial drop we accept the
+// struct but only parse enough to build a drm_commit_t: objects array
+// mapping (crtc_id → fb_id).  Full property graph parsing comes when
+// wlroots actually exercises it.
+typedef struct {
+    uint32_t flags;
+    uint32_t count_objs;
+    uint64_t objs_ptr;         // array of u32 object ids
+    uint64_t count_props_ptr;  // array of u32 per object
+    uint64_t props_ptr;        // flat array of u32 property ids
+    uint64_t prop_values_ptr;  // flat array of u64 property values
+    uint64_t reserved;
+    uint64_t user_data;
+} drm_mode_atomic_t;
+
+#define DRM_MODE_PROP_CRTC_FB   1
+#define DRM_MODE_PROP_CRTC_MODE 2
+
+static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
+    drm_mode_atomic_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (a.count_objs == 0) return 0;
+    if (a.count_objs > DRM_MAX_SCANOUTS) return -EINVAL;
+
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    if (!b) return -ENODEV;
+    uint32_t n_sc = b->scanout_count();
+
+    // Pull the objs array into a kernel buffer.
+    uint32_t objs[DRM_MAX_SCANOUTS];
+    if (copy_from_user(objs, (void*)a.objs_ptr,
+                        a.count_objs * sizeof(uint32_t)) != 0) return -EFAULT;
+    // count_props_ptr: per-object u32 property count.
+    uint32_t counts[DRM_MAX_SCANOUTS];
+    if (copy_from_user(counts, (void*)a.count_props_ptr,
+                        a.count_objs * sizeof(uint32_t)) != 0) return -EFAULT;
+
+    // For each CRTC object, pull its properties and extract the fb id.
+    drm_commit_t commit = { .n = 0 };
     drm_client_t* c = client_of(f);
-    drm_fb_t* fb = find_fb(c, a.fb_id);
-    if (!fb) return -ENOENT;
-    drm_dumb_t* d = find_dumb(c, fb->handle);
-    if (!d) return -ENOENT;
-
-    if (!virtio_gpu_set_scanout(scanout, d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
-    if (!virtio_gpu_transfer_to_host_2d(d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
-    if (!virtio_gpu_resource_flush(d->vgpu_res_id, fb->width, fb->height))
-        return -EIO;
-    return 0;
+    uint64_t props_off   = 0;
+    uint64_t values_off  = 0;
+    for (uint32_t i = 0; i < a.count_objs; i++) {
+        uint32_t obj_id = objs[i];
+        if (obj_id < CRTC_BASE || obj_id >= CRTC_BASE + n_sc) {
+            // Not a CRTC — skip its props (we don't yet model planes).
+            props_off  += counts[i] * sizeof(uint32_t);
+            values_off += counts[i] * sizeof(uint64_t);
+            continue;
+        }
+        uint32_t fb_id = 0;
+        for (uint32_t j = 0; j < counts[i]; j++) {
+            uint32_t prop_id;
+            uint64_t prop_val;
+            if (copy_from_user(&prop_id, (void*)(a.props_ptr + props_off),
+                                sizeof(prop_id)) != 0) return -EFAULT;
+            if (copy_from_user(&prop_val, (void*)(a.prop_values_ptr + values_off),
+                                sizeof(prop_val)) != 0) return -EFAULT;
+            props_off  += sizeof(uint32_t);
+            values_off += sizeof(uint64_t);
+            if (prop_id == DRM_MODE_PROP_CRTC_FB) fb_id = (uint32_t)prop_val;
+        }
+        drm_commit_entry_t* e = &commit.entries[commit.n++];
+        e->scanout = obj_id - CRTC_BASE;
+        e->fb_id   = fb_id;
+        int rc = resolve_fb(c, fb_id, &e->resource_id, &e->w, &e->h);
+        if (rc != 0) return rc;
+    }
+    return drm_commit_apply(&commit);
 }
 
 // ── mmap resolver (called from sys_mmap) ─────────────────────────────
@@ -565,7 +773,8 @@ static int drm_ioctl_mode_getresources(uint64_t arg) {
     drm_mode_card_res_t r;
     if (copy_from_user(&r, (void*)arg, sizeof(r)) != 0) return -EFAULT;
 
-    uint32_t n_sc = virtio_gpu_num_scanouts();
+    const drm_backend_ops_t* b_vtbl = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b_vtbl ? b_vtbl->scanout_count() : 0;
     if (n_sc == 0) {
         // No virtio-gpu display: report an empty resource set so
         // libdrm doesn't crash.  min/max stays 0 which means "no
@@ -593,7 +802,7 @@ static int drm_ioctl_mode_getresources(uint64_t arg) {
     // bounds in virtio-gpu practice — but we conservatively take the
     // enumerated mode as both min and max).
     uint32_t w0 = 0, h0 = 0;
-    virtio_gpu_get_mode(0, &w0, &h0);
+    if (b_vtbl) b_vtbl->scanout_mode(0, &w0, &h0);
     r.min_width  = 1;
     r.max_width  = w0 ? w0 : 8192;
     r.min_height = 1;
@@ -616,13 +825,14 @@ static int drm_ioctl_mode_getconnector(uint64_t arg) {
     drm_mode_get_connector_t c;
     if (copy_from_user(&c, (void*)arg, sizeof(c)) != 0) return -EFAULT;
 
-    uint32_t n_sc = virtio_gpu_num_scanouts();
+    const drm_backend_ops_t* b_vtbl = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b_vtbl ? b_vtbl->scanout_count() : 0;
     if (c.connector_id < CONN_BASE || c.connector_id >= CONN_BASE + n_sc)
         return -ENOENT;
     uint32_t idx = c.connector_id - CONN_BASE;
 
     uint32_t w = 0, h = 0;
-    virtio_gpu_get_mode(idx, &w, &h);
+    if (b_vtbl) b_vtbl->scanout_mode(idx, &w, &h);
 
     c.encoder_id        = ENC_BASE + idx;
     c.connector_type    = 11;             // DRM_MODE_CONNECTOR_VIRTUAL
@@ -690,7 +900,8 @@ static int drm_ioctl_mode_getencoder(uint64_t arg) {
     } e;
     if (copy_from_user(&e, (void*)arg, sizeof(e)) != 0) return -EFAULT;
 
-    uint32_t n_sc = virtio_gpu_num_scanouts();
+    const drm_backend_ops_t* b_vtbl = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b_vtbl ? b_vtbl->scanout_count() : 0;
     if (e.encoder_id < ENC_BASE || e.encoder_id >= ENC_BASE + n_sc)
         return -ENOENT;
     uint32_t idx = e.encoder_id - ENC_BASE;
@@ -717,15 +928,29 @@ static int drm_ioctl_mode_getcrtc(uint64_t arg) {
     } c;
     if (copy_from_user(&c, (void*)arg, sizeof(c)) != 0) return -EFAULT;
 
-    uint32_t n_sc = virtio_gpu_num_scanouts();
-    if (c.crtc_id < CRTC_BASE || c.crtc_id >= CRTC_BASE + n_sc)
-        return -ENOENT;
+    const drm_backend_ops_t* b_vtbl = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b_vtbl ? b_vtbl->scanout_count() : 0;
+    if (c.crtc_id < CRTC_BASE || c.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
+    uint32_t scanout = c.crtc_id - CRTC_BASE;
 
-    c.fb_id       = 0;       // no framebuffer bound yet (part 1)
-    c.x = c.y     = 0;
-    c.gamma_size  = 0;       // no gamma in virtio-gpu
-    c.mode_valid  = 0;
+    // Report the actual currently-bound fb_id from the state machine.
+    // Read under the state lock for a consistent snapshot.
+    drm_state_init_once();
+    uint64_t flags = spin_lock_irqsave(&s_state_lock);
+    drm_scanout_state_t cur = s_scanouts[scanout];
+    spin_unlock_irqrestore(&s_state_lock, flags);
+
+    c.fb_id        = cur.fb_id;
+    c.x = c.y      = 0;
+    c.gamma_size   = 0;
+    c.mode_valid   = cur.active ? 1 : 0;
     __builtin_memset(&c.mode, 0, sizeof(c.mode));
+    if (cur.active) {
+        c.mode.hdisplay = (uint16_t)cur.w;
+        c.mode.vdisplay = (uint16_t)cur.h;
+        c.mode.vrefresh = 60;
+        c.mode.type     = 0x40;   // DRM_MODE_TYPE_PREFERRED
+    }
     c.count_connectors = 0;
 
     if (copy_to_user((void*)arg, &c, sizeof(c)) != 0) return -EFAULT;
@@ -743,6 +968,7 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_GETCRTC:      return drm_ioctl_mode_getcrtc(arg);
     case DRM_IOCTL_MODE_SETCRTC:      return drm_ioctl_setcrtc(self, arg);
     case DRM_IOCTL_MODE_PAGE_FLIP:    return drm_ioctl_page_flip(self, arg);
+    case DRM_IOCTL_MODE_ATOMIC:       return drm_ioctl_atomic(self, arg);
     case DRM_IOCTL_MODE_ADDFB2:       return drm_ioctl_addfb2(self, arg);
     case DRM_IOCTL_MODE_RMFB:         return drm_ioctl_rmfb(self, arg);
     case DRM_IOCTL_MODE_CREATE_DUMB:  return drm_ioctl_create_dumb(self, arg);
@@ -765,7 +991,7 @@ static void drm_close(vfs_file_t* self) {
         drm_fb_t* fb = c->fbs;
         while (fb) { drm_fb_t* n = fb->next; kfree(fb); fb = n; }
         drm_dumb_t* d = c->dumbs;
-        while (d)  { drm_dumb_t* n = d->next; dumb_free(d); d = n; }
+        while (d)  { drm_dumb_t* n = d->next; dumb_free(d, g_current); d = n; }
         kfree(c);
         self->ctx = NULL;
     }
