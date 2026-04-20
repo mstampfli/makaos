@@ -366,6 +366,12 @@ static void init_kthread(void) {
     // Start the page cache reclaim kthread (CLOCK eviction).
     pcache_start_reclaim_thread();
 
+    // Phase 4F: start the slab / pcp shrinker kthread.  Periodically
+    // drains each cache's empty_list and each CPU's pcp back to the
+    // buddy allocator so reclaimable pages don't park indefinitely.
+    extern void slab_shrinker_start(void);
+    slab_shrinker_start();
+
     // Phase 9-4b/c: wake every AP discovered by ACPI now that the
     // scheduler, timers, LAPIC, VMM, and PMM are fully live.  APs
     // land in cpu_init_ap and drop into an idle-hlt loop until
@@ -399,6 +405,12 @@ static void init_kthread(void) {
     // actually land on remote CPUs.
     extern void chaselev_selftest(void);
     chaselev_selftest();
+
+    // Phase 4H: slab / pcp acceptance self-test.  One kthread per
+    // online CPU × 50k alloc/free pairs of mixed sizes.  Reports
+    // slab fast-path hit rate and pcp hit rate; asserts >= 95%.
+    extern void slab_pcpu_selftest(void);
+    slab_pcpu_selftest();
 
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by

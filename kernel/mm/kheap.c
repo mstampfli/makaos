@@ -1,5 +1,13 @@
 #include "kheap.h"
+#include "slab_pcpu.h"
 static kheap_t g_kheap;
+
+// Exposed to slab_pcpu.c — the only consumer that needs the cache
+// pointer for a kmalloc class index.  Bounds-checked.
+slab_cache_t* kheap_cache_get(uint8_t cls) {
+    if (cls >= KMALLOC_CACHE_COUNT) return NULL;
+    return &g_kheap.caches[cls];
+}
 
 static const size_t g_kmalloc_sizes[KMALLOC_CACHE_COUNT] = {
     8, 16, 32, 64,
@@ -35,13 +43,21 @@ void kheap_init(void) {
   for (size_t i = 0; i < KMALLOC_CACHE_COUNT; i++) {
     pmm_slab_cache_init(&g_kheap.caches[i], g_kmalloc_sizes[i]);
   }
+
+  // Phase 4: stamp class_idx into every cache so slab_pcpu_free can
+  // derive cls in O(1), and seed any further per-class state.
+  // Per-CPU slots themselves are BSS-zeroed and self-seed on first
+  // alloc via the slow refill path.
+  slab_pcpu_init();
 }
 
 void* kmalloc(size_t size) {
   size_t idx = pick_cache_idx(size);
-  
+
   if (idx != UINT64_MAX) {
-    return pmm_slab_alloc(&g_kheap.caches[idx]);
+    // Phase 4 fast path: lockless cmpxchg16b pop on this CPU's
+    // cpu_slot[idx].  Falls through to slab_refill on cold cache.
+    return slab_pcpu_alloc(idx);
   }
 
   uint8_t order = size_to_order(size + 8);
@@ -57,7 +73,10 @@ void kfree(void* addr) {
   if (!addr) return;
 
   if (pmm_is_slab_ptr(addr)) {
-    pmm_slab_free(addr);
+    // Phase 4: route through the per-CPU layer.  Fast path is a
+    // cmpxchg16b push on this CPU's cpu_slot[cls]; cross-CPU frees
+    // hit the page's remote_free Treiber stack.
+    slab_pcpu_free(addr);
   } else {
     uint8_t* raw = (uint8_t*)addr - 16;
     uint8_t order = *raw;

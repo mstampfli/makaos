@@ -2,8 +2,8 @@
 
 Start here. Read `CLAUDE.md` for project rules (non-negotiable), then this
 file for current state. Architecture reference is `SMP_ARCHITECTURE.md`;
-lock inventory is `LOCKS.md`; the deferred per-CPU allocator is
-`PHASE4_REDESIGN.md`.
+lock inventory is `LOCKS.md`; the per-CPU allocator implementation
+notes are in `PHASE4_REDESIGN.md` (Phase 4 is landed).
 
 ## What MakaOS is
 
@@ -166,10 +166,14 @@ Current `poll` is O(n_fds) per call. epoll with a ready-list (O(1)
 dispatch) is what lets a server handle 10k connections. Prereq for any
 serious network service.
 
-### 6. Phase-4 per-CPU allocators
-Long-deferred — see `PHASE4_REDESIGN.md`. Global PMM lock is hit on
-every `kmalloc`; a lockless `cmpxchg16b` per-CPU magazine would remove
-it from the hot path. Large surface area; ~week of careful work.
+### 6. ~~Phase-4 per-CPU allocators~~ — LANDED
+See `PHASE4_REDESIGN.md` for full design.  `kmalloc` / `kfree` and
+order-0 `pmm_buddy_alloc` / `_free` now take no locks on the hot
+path; every alloc/free is a single `cmpxchg16b` on `%gs:cpu_slot`
+(slab) or `%gs:pcp_hdr` (pcp).  `g_pmm_lock` demoted to depot-lock
+duty (refill / drain / order ≥ 1 / refcount).  Acceptance:
+99.99 % slab hit rate on 4-CPU × 50k stress (`slab_pcpu_selftest`
+runs at boot — grep `[slab_test]` in `build/serial.txt`).
 
 ## Debugging cookbook
 
@@ -240,7 +244,7 @@ docs/                  this folder
   HANDOFF.md           you are here
   SMP_ARCHITECTURE.md  design reference (lock-minimized)
   LOCKS.md             every lock + its justification
-  PHASE4_REDESIGN.md   deferred per-CPU allocator redesign
+  PHASE4_REDESIGN.md   per-CPU allocator (landed)
 CLAUDE.md              project rules (scalable / performant / correct)
 KSEC.md                security policy daemon protocol
 ```

@@ -23,7 +23,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga std \
   -display sdl \
-  -audiodev pa,id=snd0,server=/mnt/wslg/PulseServer \
+  -audiodev pa,id=snd0 \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \

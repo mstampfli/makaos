@@ -114,6 +114,7 @@
 #define SYS_EPOLL_CREATE 97 // epoll_create(flags)                  → fd or -errno
 #define SYS_EPOLL_CTL    98 // epoll_ctl(epfd,op,fd,event*)         → 0 or -errno
 #define SYS_EPOLL_WAIT   99 // epoll_wait(epfd,events,maxev,timeout)→ count or -errno
+#define SYS_SLABINFO     100 // slabinfo(slabinfo_t*) → fills per-CPU slab/pcp counters
 
 // ── epoll types ───────────────────────────────────────────────────────────
 #define EPOLLIN      0x00000001u
