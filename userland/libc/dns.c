@@ -53,7 +53,11 @@ static int parse_dotted(const char* s, uint32_t* out_be) {
 }
 
 static void load_resolv_conf(void) {
-    if (s_loaded) return;
+    // Re-read if we've never loaded successfully (count==0).  On a cold
+    // boot the DHCP client races with DNS-using processes; without this,
+    // a process that calls us before dhcpcd writes /etc/resolv.conf
+    // caches "no nameservers" forever and never recovers.
+    if (s_loaded && s_ns_count > 0) return;
     s_loaded = 1;
     s_ns_count = 0;
 
