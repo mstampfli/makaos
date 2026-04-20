@@ -11,11 +11,22 @@ DOOM_DIR="$USERLAND_DIR/apps/doom"
 mkdir -p "$BUILD_DIR"
 
 # ── Toolchain ──────────────────────────────────────────────────────────────
-CC="gcc"
+CC="gcc"                                      # host gcc: compiles kernel
 CLANG="clang"
 LD="ld.lld"
 NASM="nasm"
 OBJCOPY="objcopy"
+
+# Cross-compiler for userland — target-aware, sysroot baked in, knows
+# about crt0 + link script + libc without any command-line flag soup.
+# Built by scripts/build-toolchain.sh; falls back to host gcc if absent
+# (early-development convenience only — production path is the cross).
+USER_CC="$(pwd)/toolchain/bin/x86_64-pc-makaos-gcc"
+if [ ! -x "$USER_CC" ]; then
+  echo "[!] cross-toolchain missing — run scripts/build-toolchain.sh"
+  echo "    falling back to host gcc for userland (legacy path)"
+  USER_CC="$CC"
+fi
 
 # ── Kernel compile flags (clang, ELF64, freestanding) ─────────────────────
 KERNEL_INCLUDES=(
@@ -119,14 +130,14 @@ SYSROOT_CFLAGS=(
 # ── Common user object files ───────────────────────────────────────────────
 "$NASM" -f elf64 "$USERLAND_DIR/entry/entry.asm"    -o "$BUILD_DIR/user_entry.o"
 "$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
 # syscalls.c: extern-linkage wrappers around the raw syscall* ops for
 # sysroot consumers that can't see libc.h's static-inline copies.
-"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/syscalls.c" -o "$BUILD_DIR/user_syscalls.o"
 
 # libc archive — anything linking sysroot-style pulls this in as -lc.
@@ -155,7 +166,7 @@ fi
 
 # Glue — hardware_poll / ms_time / BIO shims.  Compiles sysroot-style:
 # the same include topology as any external client of mbedTLS.
-"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>' \
   -I scripts/configs \
   -c scripts/glue/mbedtls_glue.c \
@@ -177,43 +188,43 @@ USER_RT=(
 
 USER_LINK="$USERLAND_DIR/link.ld"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/home" -c "$USERLAND_DIR/apps/home/home.c" -o "$BUILD_DIR/user_home.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_home.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/home" -c "$USERLAND_DIR/apps/home/home.c" -o "$BUILD_DIR/user_home.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_home.o" \
    -o "$BUILD_DIR/user_home.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_vmalloc/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_vmalloc.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_vmalloc/test_vmalloc.c" -o "$BUILD_DIR/user_test_vmalloc.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_vmalloc.o" \
    -o "$BUILD_DIR/user_test_vmalloc.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_test_vmalloc.elf" "$BUILD_DIR/user_test_vmalloc.bin"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/hello/hello.c" -o "$BUILD_DIR/user_hello.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_hello.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/hello/hello.c" -o "$BUILD_DIR/user_hello.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_hello.o" \
    -o "$BUILD_DIR/user_hello.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
 ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_helloraw.elf" "$BUILD_DIR/user_helloraw.bin"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_posix1/test_posix1.c" -o "$BUILD_DIR/user_test_posix1.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_posix1.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_posix1/test_posix1.c" -o "$BUILD_DIR/user_test_posix1.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_io_uring/test_io_uring.c" -o "$BUILD_DIR/user_test_io_uring.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_test_io_uring.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_io_uring/test_io_uring.c" -o "$BUILD_DIR/user_test_io_uring.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_io_uring.o" \
    -o "$BUILD_DIR/user_test_io_uring.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/smp_test/smp_test.c" -o "$BUILD_DIR/user_smp_test.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_smp_test.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/smp_test/smp_test.c" -o "$BUILD_DIR/user_smp_test.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_smp_test.o" \
    -o "$BUILD_DIR/user_smp_test.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_tone.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_shell.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
 
 # ── Bash 5.2 (optional — requires /tmp/bash-5.2 source tree) ──────────────
@@ -228,51 +239,48 @@ if [ -d "$BASH_SRC" ]; then
     fi
 fi
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ksec/ksec.c" -o "$BUILD_DIR/user_ksec.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ksec.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ksec/ksec.c" -o "$BUILD_DIR/user_ksec.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_ksec.o" \
    -o "$BUILD_DIR/user_ksec.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ps/ps.c" -o "$BUILD_DIR/user_ps.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ps.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/ps/ps.c" -o "$BUILD_DIR/user_ps.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_ps.o" \
    -o "$BUILD_DIR/user_ps.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/net/net.c" -o "$BUILD_DIR/user_net.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_net.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/net/net.c" -o "$BUILD_DIR/user_net.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_net.o" \
    -o "$BUILD_DIR/user_net.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/svcmgr/svcmgr.c" -o "$BUILD_DIR/user_svcmgr.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_svcmgr.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/svcmgr/svcmgr.c" -o "$BUILD_DIR/user_svcmgr.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_svcmgr.o" \
    -o "$BUILD_DIR/user_svcmgr.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/restrict/restrict.c" -o "$BUILD_DIR/user_restrict.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_restrict.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/restrict/restrict.c" -o "$BUILD_DIR/user_restrict.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_restrict.o" \
    -o "$BUILD_DIR/user_restrict.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
 # https_client.c pulls mbedtls headers from the sysroot — no per-app
 # shim dirs, just -isystem $SYSROOT/usr/include.
-"$CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>' \
   -I scripts/configs \
   -c "$USERLAND_DIR/apps/http_get/https_client.c" \
   -o "$BUILD_DIR/user_http_get_tls.o"
-LIBGCC="$("$CC" -print-libgcc-file-name)"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" \
+"$USER_CC" "${USER_CFLAGS[@]}" \
    "$BUILD_DIR/user_http_get.o" \
    "$BUILD_DIR/user_http_get_tls.o" \
    "$BUILD_DIR/user_mbedtls_glue.o" \
-   "$BUILD_DIR/user_syscalls.o" \
    "$SYSROOT/usr/lib/libmbedtls.a" \
-   "$LIBGCC" \
    -o "$BUILD_DIR/user_http_get.elf"
 
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/login/login.c" -o "$BUILD_DIR/user_login.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_login.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/login/login.c" -o "$BUILD_DIR/user_login.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_login.o" \
    -o "$BUILD_DIR/user_login.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/ls" -c "$USERLAND_DIR/apps/ls/ls.c" -o "$BUILD_DIR/user_ls.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_ls.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/ls" -c "$USERLAND_DIR/apps/ls/ls.c" -o "$BUILD_DIR/user_ls.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_ls.o" \
    -o "$BUILD_DIR/user_ls.elf"
 
 # ── Coreutils (cat, echo, mkdir, rm, mv, clear, reboot) ─────────────────
@@ -287,18 +295,18 @@ done
 DISPLAY_DIR="$USERLAND_DIR/apps/display"
 DISPLAY_INCLUDES=("${USER_INCLUDES[@]}" -I"$DISPLAY_DIR")
 
-"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/libdisplay.c" -o "$BUILD_DIR/user_libdisplay.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/libdisplay.c" -o "$BUILD_DIR/user_libdisplay.o"
 
-"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/compositor.c" -o "$BUILD_DIR/user_compositor.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_compositor.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/compositor.c" -o "$BUILD_DIR/user_compositor.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_compositor.o" \
    -o "$BUILD_DIR/user_compositor.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/demo_client.c" -o "$BUILD_DIR/user_demo_client.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_demo_client.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/demo_client.c" -o "$BUILD_DIR/user_demo_client.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_demo_client.o" \
    -o "$BUILD_DIR/user_demo_client.elf"
 
-"$CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/terminal.c" -o "$BUILD_DIR/user_terminal.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_terminal.o" \
+"$USER_CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/terminal.c" -o "$BUILD_DIR/user_terminal.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_terminal.o" \
    -o "$BUILD_DIR/user_terminal.elf"
 
 echo "[+] Building kernel (clang + ld.lld)"

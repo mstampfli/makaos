@@ -1,9 +1,9 @@
 Add x86_64-pc-makaos target to GCC 14.2.0.
 
-Registers "makaos" in config.sub + config.gcc + libgcc/config.host, adds
-a gcc/config/makaos.h with CPP predefines (__makaos__, __unix__), and
-routes the x86_64-*-makaos* case to reuse the glibc-style ELF64 bits
-with a MakaOS-specific LINK_SPEC / STARTFILE_SPEC / ENDFILE_SPEC.
+Registers "makaos" in config.sub + config.gcc + libgcc/config.host,
+adds gcc/config/makaos.h with CPP predefines (__makaos__, __unix__),
+and routes x86_64-*-makaos* to reuse glibc-style ELF64 bits with a
+MakaOS-specific LINK_SPEC / STARTFILE_SPEC / ENDFILE_SPEC.
 
 Signed-off-by: MakaOS <noreply@makaos>
 
@@ -22,9 +22,9 @@ diff --git a/config.sub b/config.sub
 diff --git a/gcc/config.gcc b/gcc/config.gcc
 --- a/gcc/config.gcc
 +++ b/gcc/config.gcc
-@@ -900,6 +900,14 @@ case ${target} in
- *-*-haiku*)
-   tmake_file="${tmake_file} t-haiku"
+@@ -1165,6 +1165,14 @@ case ${target} in
+       ;;
+   esac
    ;;
 +*-*-makaos*)
 +  gas=yes
@@ -37,10 +37,10 @@ diff --git a/gcc/config.gcc b/gcc/config.gcc
  *-*-elf|arc*-*-elf*)
    # Assume that newlib is being used and so __cxa_atexit is provided.
    default_use_cxa_atexit=yes
-@@ -2035,6 +2043,12 @@ x86_64-*-linux* | x86_64-*-kfreebsd*-gnu | x86_64-*-gnu*)
- 		done
- 		TM_MULTILIB_CONFIG=`echo $TM_MULTILIB_CONFIG | sed 's/^,//'`
- 		;;
+@@ -2080,6 +2088,12 @@ x86_64-*-linux* | x86_64-*-kfreebsd*-gnu | x86_64-*-gnu*)
+ 	done
+ 	TM_MULTILIB_CONFIG=`echo $TM_MULTILIB_CONFIG | sed 's/^,//'`
+ 	;;
 +x86_64-*-makaos*)
 +	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h \
 +		 i386/i386elf.h i386/x86-64.h makaos.h"
@@ -49,7 +49,7 @@ diff --git a/gcc/config.gcc b/gcc/config.gcc
 +	;;
  i[34567]86-pc-msdosdjgpp*)
  	xm_file=i386/xm-djgpp.h
- 	tm_file="dbxcoff.h ${tm_file} i386/unix.h i386/bsd.h i386/gas.h i386/djgpp.h i386/djgpp-stdint.h"
+ 	tm_file="${tm_file} i386/unix.h i386/bsd.h i386/gas.h i386/djgpp.h i386/djgpp-stdint.h"
 diff --git a/gcc/config/makaos.h b/gcc/config/makaos.h
 new file mode 100644
 --- /dev/null
@@ -108,7 +108,7 @@ diff --git a/libgcc/config.host b/libgcc/config.host
  	;;
 +x86_64-*-makaos*)
 +	extra_parts="crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o"
-+	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic t-eh-dw2-dip"
++	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
 +	tmake_file="$tmake_file t-slibgcc i386/t-linux"
 +	;;
  x86_64-*-freebsd*)
