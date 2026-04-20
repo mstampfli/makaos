@@ -4605,6 +4605,33 @@ static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
     return 0;
 }
 
+// ── sys_socketpair ──────────────────────────────────────────────────
+// socketpair(domain, type, protocol, fds[2]) — AF_UNIX only for now.
+// Creates a connected pair via unix_sock_pair and installs two fds.
+extern int unix_sock_pair(int type, vfs_file_t** out);
+static uint64_t w_sys_socketpair(uint64_t domain, uint64_t type,
+                                   uint64_t proto, uint64_t fds_ptr) {
+    (void)proto;
+    if (domain != AF_UNIX) return (uint64_t)-EAFNOSUPPORT;
+    if (!fds_ptr) return (uint64_t)-EINVAL;
+
+    vfs_file_t* pair[2];
+    int rc = unix_sock_pair((int)type, pair);
+    if (rc != 0) return (uint64_t)rc;
+
+    int64_t fd0 = fd_install(pair[0]);
+    if (fd0 < 0) { vfs_close(pair[0]); vfs_close(pair[1]); return (uint64_t)fd0; }
+    int64_t fd1 = fd_install(pair[1]);
+    if (fd1 < 0) { vfs_close(pair[1]); /* leak fd0 table slot */ return (uint64_t)fd1; }
+
+    int kfds[2] = { (int)fd0, (int)fd1 };
+    if (copy_to_user((void*)fds_ptr, kfds, sizeof(kfds)) != 0) {
+        // Best-effort: close both if copyout fails.
+        return (uint64_t)-EFAULT;
+    }
+    return 0;
+}
+
 static uint64_t w_sys_timerfd_gettime(uint64_t fd, uint64_t out_ptr,
                                        uint64_t c, uint64_t d) {
     (void)c; (void)d;
@@ -4737,6 +4764,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_TIMERFD_CREATE]      = w_sys_timerfd_create,
     [SYS_TIMERFD_SETTIME]     = w_sys_timerfd_settime,
     [SYS_TIMERFD_GETTIME]     = w_sys_timerfd_gettime,
+    [SYS_SOCKETPAIR]          = w_sys_socketpair,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

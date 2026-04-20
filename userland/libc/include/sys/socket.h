@@ -82,5 +82,6 @@ ssize_t recvfrom(int fd, void* buf, size_t len, int flags,
 int     setsockopt(int fd, int level, int opt, const void* val, socklen_t n);
 int     getsockopt(int fd, int level, int opt, void* val, socklen_t* n);
 int     shutdown(int fd, int how);
+int     socketpair(int domain, int type, int protocol, int fds[2]);
 
 #endif
