@@ -269,10 +269,14 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
                              && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
                              && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
                              && dev[12]=='\0');
+        uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
+                             && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
+                             && dev[8]=='0' && dev[9]=='\0');
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_event0) f = evdev_open();
+        else if (match_dri0)   { extern vfs_file_t* vfs_drm_open(void); f = vfs_drm_open(); }
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
         else if (match_mouse)  f = vfs_mouse_open();
