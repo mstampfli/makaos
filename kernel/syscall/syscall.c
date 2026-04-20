@@ -1914,10 +1914,36 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         shmem_t* shm = NULL;
 
         if (has_fd) {
-            // MAP_SHARED with fd: the fd must be a shmem fd.  fdget takes
-            // a reference so we can inspect f->ctx without racing close.
+            // MAP_SHARED with fd: check for the supported fd types.
             vfs_file_t* f = fdget(fd);
             if (!f) goto fail_unmap;
+
+            // DRM dumb-buffer mmap: resolve offset → contiguous backing,
+            // install PTEs eagerly.  No VMA accounting for free/rcu —
+            // the buffer's phys is owned by drm.c's per-fd dumb list
+            // and freed via DESTROY_DUMB / drm_close.
+            extern int64_t drm_resolve_dumb_mmap(vfs_file_t*, uint64_t,
+                                                   uint64_t, phys_addr_t*,
+                                                   uint64_t*);
+            extern int drm_is_drm_file(vfs_file_t*);
+            if (drm_is_drm_file(f)) {
+                phys_addr_t dphys = 0;
+                uint64_t    dlen  = 0;
+                int64_t rc = drm_resolve_dumb_mmap(f, off, len, &dphys, &dlen);
+                if (rc != 0) { fdput(f); goto fail_unmap; }
+                uint64_t pte = mm_vma_pte_flags(vma_flags);
+                phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+                for (uint64_t i = 0; i < npages; i++) {
+                    if (!vmm_page_map(pml4, vaddr + i * 4096u,
+                                       dphys + i * 4096u, pte)) {
+                        fdput(f); goto fail_unmap;
+                    }
+                    pmm_ref_inc(dphys + i * 4096u);
+                }
+                fdput(f);
+                return vaddr;
+            }
+
             extern void shmem_fd_close(vfs_file_t*);
             if (f->close != shmem_fd_close) { fdput(f); goto fail_unmap; }
             shm = (shmem_t*)f->ctx;

@@ -13,3 +13,13 @@
 #include "vfs.h"
 
 vfs_file_t* vfs_drm_open(void);
+
+// Predicate used by sys_mmap to recognise a DRM fd before calling
+// drm_resolve_dumb_mmap.  Compares the close op under the hood.
+int drm_is_drm_file(vfs_file_t* f);
+
+// Resolve a MAP_DUMB "magic offset" → backing physical address + size.
+// Callers: sys_mmap.  Returns 0 on success, -errno on failure.
+int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
+                                uint64_t len, phys_addr_t* out_phys,
+                                uint64_t* out_bytes);
