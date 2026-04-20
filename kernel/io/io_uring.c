@@ -875,6 +875,18 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
         // they'd land in a follow-up phase.  Return -EINVAL for now
         // so a caller that uses them sees a clear error code.
 
+        case IORING_OP_DRM_COMMIT: {
+            // Zero-syscall DRM atomic commit.  sqe->fd resolves to the
+            // DRM chardev fd; sqe->addr is the user ptr to
+            // drm_mode_atomic_t.  Reuses the same commit primitive as
+            // the legacy DRM_IOCTL_MODE_ATOMIC ioctl.
+            vfs_file_t* f = sqe_fdget(uring, sqe);
+            if (!f) { res = -EBADF; break; }
+            extern int drm_ring_atomic(vfs_file_t*, uint64_t);
+            res = drm_ring_atomic(f, sqe->addr);
+            break;
+        }
+
         default:
             res = -EINVAL;
             break;
