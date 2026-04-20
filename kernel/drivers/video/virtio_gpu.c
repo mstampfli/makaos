@@ -474,6 +474,12 @@ void virtio_gpu_get_mode(uint32_t idx, uint32_t* out_w, uint32_t* out_h) {
 typedef struct __attribute__((packed)) {
     virtio_gpu_ctrl_hdr_t hdr;
     uint32_t resource_id;
+    uint32_t padding;
+} vgpu_resource_unref_t;
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t hdr;
+    uint32_t resource_id;
     uint32_t format;
     uint32_t width, height;
 } vgpu_resource_create_2d_t;
@@ -513,8 +519,8 @@ typedef struct __attribute__((packed)) {
     uint32_t padding;
 } vgpu_resource_flush_t;
 
-static int vgpu_resource_create_2d(uint32_t res_id, uint32_t fmt,
-                                     uint32_t w, uint32_t h) {
+int virtio_gpu_resource_create_2d(uint32_t res_id, uint32_t fmt,
+                                    uint32_t w, uint32_t h) {
     vgpu_resource_create_2d_t req = {0};
     req.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
     req.resource_id = res_id;
@@ -526,8 +532,17 @@ static int vgpu_resource_create_2d(uint32_t res_id, uint32_t fmt,
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
-static int vgpu_attach_single_backing(uint32_t res_id,
-                                        phys_addr_t phys, uint32_t len) {
+int virtio_gpu_resource_unref(uint32_t res_id) {
+    vgpu_resource_unref_t req = {0};
+    req.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    req.resource_id = res_id;
+    virtio_gpu_ctrl_hdr_t resp = {0};
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
+    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+int virtio_gpu_resource_attach_backing_single(uint32_t res_id,
+                                               phys_addr_t phys, uint32_t len) {
     // Single mem_entry — attach one physically contiguous range.  The
     // common case for our driver-allocated buffers.  For more complex
     // SG lists (user-mapped dumb buffers later), walk the PTE tree and
@@ -546,8 +561,8 @@ static int vgpu_attach_single_backing(uint32_t res_id,
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
-static int vgpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
-                              uint32_t w, uint32_t h) {
+int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
+                             uint32_t w, uint32_t h) {
     vgpu_set_scanout_t req = {0};
     req.hdr.type    = VIRTIO_GPU_CMD_SET_SCANOUT;
     req.r.width     = w;
@@ -559,7 +574,7 @@ static int vgpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
-static int vgpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h) {
+int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h) {
     vgpu_xfer_to_host_2d_t req = {0};
     req.hdr.type    = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     req.r.width     = w;
@@ -571,7 +586,7 @@ static int vgpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h) {
     return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
 }
 
-static int vgpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h) {
+int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h) {
     vgpu_resource_flush_t req = {0};
     req.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     req.r.width     = w;
@@ -608,16 +623,16 @@ static int vgpu_setup_scanout_buffer(uint32_t w, uint32_t h) {
     // Use resource_id = 1 (zero is reserved).
     const uint32_t res_id = 1;
 
-    if (!vgpu_resource_create_2d(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8, w, h)) {
+    if (!virtio_gpu_resource_create_2d(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8, w, h)) {
         kprintf("[virtio-gpu] RESOURCE_CREATE_2D failed\n");
         pmm_buddy_free(phys, order); return 0;
     }
-    if (!vgpu_attach_single_backing(res_id, phys,
+    if (!virtio_gpu_resource_attach_backing_single(res_id, phys,
                                      (uint32_t)((uint64_t)1 << order) * 4096u)) {
         kprintf("[virtio-gpu] ATTACH_BACKING failed\n");
         pmm_buddy_free(phys, order); return 0;
     }
-    if (!vgpu_set_scanout(0, res_id, w, h)) {
+    if (!virtio_gpu_set_scanout(0, res_id, w, h)) {
         kprintf("[virtio-gpu] SET_SCANOUT failed\n");
         pmm_buddy_free(phys, order); return 0;
     }
@@ -657,10 +672,10 @@ int virtio_gpu_present_test(void) {
         }
     }
 
-    if (!vgpu_transfer_to_host_2d(s_fb_res_id, w, h)) {
+    if (!virtio_gpu_transfer_to_host_2d(s_fb_res_id, w, h)) {
         kprintf("[virtio-gpu] TRANSFER_TO_HOST_2D failed\n"); return 0;
     }
-    if (!vgpu_resource_flush(s_fb_res_id, w, h)) {
+    if (!virtio_gpu_resource_flush(s_fb_res_id, w, h)) {
         kprintf("[virtio-gpu] RESOURCE_FLUSH failed\n"); return 0;
     }
     kprintf("[virtio-gpu] present OK (%ux%u, resource %u, %u bytes)\n",

@@ -19,6 +19,10 @@
 #include "kheap.h"
 #include "kprintf.h"
 #include "errno.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "process.h"
+#include "smp.h"
 #include "syscall.h"   // copy_from_user / copy_to_user
 
 extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
@@ -34,8 +38,15 @@ extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
 #define DRM_IOCTL_DROP_MASTER         0x0000641F
 #define DRM_IOCTL_MODE_GETRESOURCES   0xC04064A0
 #define DRM_IOCTL_MODE_GETCRTC        0xC06864A1
+#define DRM_IOCTL_MODE_SETCRTC        0xC06864A2
 #define DRM_IOCTL_MODE_GETENCODER     0xC01464A6
 #define DRM_IOCTL_MODE_GETCONNECTOR   0xC05064A7
+#define DRM_IOCTL_MODE_ADDFB2         0xC06864B8
+#define DRM_IOCTL_MODE_RMFB           0xC00464AF
+#define DRM_IOCTL_MODE_PAGE_FLIP      0xC01864B0
+#define DRM_IOCTL_MODE_CREATE_DUMB    0xC02064B2
+#define DRM_IOCTL_MODE_MAP_DUMB       0xC01064B3
+#define DRM_IOCTL_MODE_DESTROY_DUMB   0xC00464B4
 
 // ── DRM capability IDs ──────────────────────────────────────────────
 #define DRM_CAP_DUMB_BUFFER          0x1
@@ -126,6 +137,361 @@ typedef struct {
 #define CONN_BASE  100u
 #define ENC_BASE   200u
 #define CRTC_BASE  300u
+
+// ── Per-fd state: dumb buffers + framebuffers ────────────────────────
+// Each open of /dev/dri/card0 gets a private drm_client_t in f->ctx.
+// Dumb buffer handles + fb ids are scoped to the fd (Linux semantics).
+// Resource IDs (virtio-gpu-global) are allocated from a separate
+// monotonically-increasing counter — the hardware shares them across
+// all clients but we enforce per-client handle isolation.
+
+typedef struct drm_dumb {
+    uint32_t           handle;         // per-fd ID (1..)
+    uint32_t           width, height;
+    uint32_t           pitch;          // bytes per row
+    uint64_t           size;           // total bytes
+    uint32_t           vgpu_res_id;    // device-global resource id
+    phys_addr_t        phys;           // backing pages (contiguous)
+    uint32_t           bytes_alloc;    // pow-2 page-rounded allocation
+    uint8_t            order;          // buddy order actually used
+    struct drm_dumb*   next;
+} drm_dumb_t;
+
+typedef struct drm_fb {
+    uint32_t           fb_id;          // per-fd ID (1..)
+    uint32_t           handle;         // matching drm_dumb_t.handle
+    uint32_t           width, height;
+    uint32_t           pitch;
+    uint32_t           format;         // DRM_FORMAT_*
+    struct drm_fb*     next;
+} drm_fb_t;
+
+typedef struct drm_client {
+    drm_dumb_t* dumbs;
+    drm_fb_t*   fbs;
+    uint32_t    next_dumb_handle;      // starts at 1
+    uint32_t    next_fb_id;            // starts at 1
+} drm_client_t;
+
+// Device-global resource id allocator.  Never returns 0 (reserved).
+static uint32_t s_next_res_id = 1;
+static uint32_t alloc_res_id(void) {
+    uint32_t r;
+    do { r = __atomic_fetch_add(&s_next_res_id, 1, __ATOMIC_RELAXED); }
+    while (r == 0);
+    return r;
+}
+
+static drm_client_t* client_of(vfs_file_t* f) { return (drm_client_t*)f->ctx; }
+
+static drm_dumb_t* find_dumb(drm_client_t* c, uint32_t handle) {
+    for (drm_dumb_t* d = c->dumbs; d; d = d->next)
+        if (d->handle == handle) return d;
+    return NULL;
+}
+
+static drm_fb_t* find_fb(drm_client_t* c, uint32_t fb_id) {
+    for (drm_fb_t* fb = c->fbs; fb; fb = fb->next)
+        if (fb->fb_id == fb_id) return fb;
+    return NULL;
+}
+
+// ── CREATE_DUMB ──────────────────────────────────────────────────────
+// Linux uses: u32 height, u32 width, u32 bpp, u32 flags, u32 handle,
+// u32 pitch, u64 size.  Driver fills handle/pitch/size.
+typedef struct {
+    uint32_t height, width, bpp, flags;
+    uint32_t handle, pitch;
+    uint64_t size;
+} drm_mode_create_dumb_t;
+
+static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
+    drm_mode_create_dumb_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!a.width || !a.height) return -EINVAL;
+    if (a.bpp != 32) return -EINVAL;     // we only support 32-bpp
+
+    uint32_t pitch = a.width * 4;
+    uint64_t size  = (uint64_t)pitch * a.height;
+    // Round allocation up to a power-of-two page count so virtio-gpu
+    // can attach it as a single contiguous range.
+    uint64_t pages = (size + 4095) / 4096;
+    uint8_t  order = 0;
+    while (((uint64_t)1 << order) < pages) order++;
+    phys_addr_t phys = pmm_buddy_alloc(order);
+    if (!phys) return -ENOMEM;
+    uint32_t bytes_alloc = (uint32_t)((uint64_t)1 << order) * 4096u;
+
+    // Zero backing pages (prevents info leak).  HHDM mapping.
+    uint8_t* virt = (uint8_t*)((uintptr_t)phys + HHDM_OFFSET);
+    __builtin_memset(virt, 0, bytes_alloc);
+
+    // Ref-count each backing page so our own user VA maps don't free
+    // pages from under us if the process exits before DESTROY_DUMB.
+    for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
+        pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
+
+    uint32_t res_id = alloc_res_id();
+    if (!virtio_gpu_resource_create_2d(res_id,
+                                        VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+                                        a.width, a.height)) {
+        pmm_buddy_free(phys, order);
+        return -EIO;
+    }
+    if (!virtio_gpu_resource_attach_backing_single(res_id, phys, bytes_alloc)) {
+        virtio_gpu_resource_unref(res_id);
+        pmm_buddy_free(phys, order);
+        return -EIO;
+    }
+
+    drm_dumb_t* d = (drm_dumb_t*)kmalloc(sizeof(*d));
+    if (!d) {
+        virtio_gpu_resource_unref(res_id);
+        pmm_buddy_free(phys, order);
+        return -ENOMEM;
+    }
+    drm_client_t* c = client_of(f);
+    d->handle      = c->next_dumb_handle++;
+    d->width       = a.width;
+    d->height      = a.height;
+    d->pitch       = pitch;
+    d->size        = size;
+    d->vgpu_res_id = res_id;
+    d->phys        = phys;
+    d->bytes_alloc = bytes_alloc;
+    d->order       = order;
+    d->next        = c->dumbs;
+    c->dumbs       = d;
+
+    a.handle = d->handle;
+    a.pitch  = pitch;
+    a.size   = size;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+typedef struct {
+    uint32_t handle, pad;
+    uint64_t offset;
+} drm_mode_map_dumb_t;
+
+// MAP_DUMB returns a magic offset that encodes the handle.  Userland
+// mmaps the DRM fd at that offset; sys_mmap detects a DRM fd and calls
+// drm_resolve_dumb_mmap to translate offset → backing pages.
+#define DRM_DUMB_OFFSET_SHIFT 32
+#define DRM_DUMB_OFFSET_MARK  0xDD00000000000000ull
+
+static int drm_ioctl_map_dumb(vfs_file_t* f, uint64_t arg) {
+    drm_mode_map_dumb_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_client_t* c = client_of(f);
+    drm_dumb_t* d = find_dumb(c, a.handle);
+    if (!d) return -ENOENT;
+    a.offset = DRM_DUMB_OFFSET_MARK
+             | ((uint64_t)a.handle << DRM_DUMB_OFFSET_SHIFT);
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+typedef struct {
+    uint32_t handle;
+} drm_mode_destroy_dumb_t;
+
+static void dumb_free(drm_dumb_t* d) {
+    virtio_gpu_resource_unref(d->vgpu_res_id);
+    // Drop our extra ref; if user unmapped, this was the last ref and
+    // pmm_ref_dec frees the pages.  If not unmapped, the unmap path
+    // will take them down.
+    for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
+        pmm_ref_dec(d->phys + (phys_addr_t)i * 4096u);
+    // Also release the buddy allocation back.  pmm_ref_dec freed the
+    // individual pages but the buddy bookkeeping still owns them —
+    // this returns them to the free list.  Safe because we held a
+    // ref for every page above.
+    pmm_buddy_free(d->phys, d->order);
+    kfree(d);
+}
+
+static int drm_ioctl_destroy_dumb(vfs_file_t* f, uint64_t arg) {
+    drm_mode_destroy_dumb_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_client_t* c = client_of(f);
+    drm_dumb_t** pp = &c->dumbs;
+    while (*pp) {
+        if ((*pp)->handle == a.handle) {
+            drm_dumb_t* d = *pp;
+            // Remove any fbs that reference this dumb handle.
+            drm_fb_t** fpp = &c->fbs;
+            while (*fpp) {
+                if ((*fpp)->handle == a.handle) {
+                    drm_fb_t* fb = *fpp;
+                    *fpp = fb->next;
+                    kfree(fb);
+                } else {
+                    fpp = &(*fpp)->next;
+                }
+            }
+            *pp = d->next;
+            dumb_free(d);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    return -ENOENT;
+}
+
+// ── ADDFB2 / RMFB ────────────────────────────────────────────────────
+// Linux layout (drm_mode_fb_cmd2):
+typedef struct {
+    uint32_t fb_id, width, height, pixel_format;
+    uint32_t flags;
+    uint32_t handles[4];
+    uint32_t pitches[4];
+    uint32_t offsets[4];
+    uint64_t modifier[4];
+} drm_mode_fb_cmd2_t;
+
+static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
+    drm_mode_fb_cmd2_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!a.handles[0]) return -EINVAL;
+    drm_client_t* c = client_of(f);
+    drm_dumb_t* d = find_dumb(c, a.handles[0]);
+    if (!d) return -ENOENT;
+    if (a.width > d->width || a.height > d->height) return -EINVAL;
+
+    drm_fb_t* fb = (drm_fb_t*)kmalloc(sizeof(*fb));
+    if (!fb) return -ENOMEM;
+    fb->fb_id  = c->next_fb_id++;
+    fb->handle = a.handles[0];
+    fb->width  = a.width;
+    fb->height = a.height;
+    fb->pitch  = a.pitches[0] ? a.pitches[0] : d->pitch;
+    fb->format = a.pixel_format;
+    fb->next   = c->fbs;
+    c->fbs     = fb;
+
+    a.fb_id = fb->fb_id;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+typedef struct { uint32_t fb_id; } drm_mode_rmfb_t;
+
+static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
+    drm_mode_rmfb_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_client_t* c = client_of(f);
+    drm_fb_t** pp = &c->fbs;
+    while (*pp) {
+        if ((*pp)->fb_id == a.fb_id) {
+            drm_fb_t* fb = *pp;
+            *pp = fb->next;
+            kfree(fb);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    return -ENOENT;
+}
+
+// ── SETCRTC / PAGE_FLIP ──────────────────────────────────────────────
+// SETCRTC binds fb_id to crtc_id and forces an initial upload+flush.
+// Linux drm_mode_crtc layout:
+typedef struct {
+    uint64_t set_connectors_ptr;
+    uint32_t count_connectors;
+    uint32_t crtc_id;
+    uint32_t fb_id;
+    uint32_t x, y;
+    uint32_t gamma_size;
+    uint32_t mode_valid;
+    drm_mode_modeinfo_t mode;
+} drm_mode_crtc_t;
+
+static int drm_ioctl_setcrtc(vfs_file_t* f, uint64_t arg) {
+    drm_mode_crtc_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    uint32_t n_sc = virtio_gpu_num_scanouts();
+    if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
+    uint32_t scanout = a.crtc_id - CRTC_BASE;
+
+    if (a.fb_id == 0) {
+        // Disable — zero the scanout by pointing to resource 0.
+        virtio_gpu_set_scanout(scanout, 0, 0, 0);
+        return 0;
+    }
+    drm_client_t* c = client_of(f);
+    drm_fb_t* fb = find_fb(c, a.fb_id);
+    if (!fb) return -ENOENT;
+    drm_dumb_t* d = find_dumb(c, fb->handle);
+    if (!d) return -ENOENT;
+
+    if (!virtio_gpu_set_scanout(scanout, d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    if (!virtio_gpu_transfer_to_host_2d(d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    if (!virtio_gpu_resource_flush(d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    return 0;
+}
+
+// PAGE_FLIP: same shape as SETCRTC for the fb swap, minus mode info.
+// We transfer + flush synchronously; the Linux async event isn't
+// emitted yet (wlroots handles missing event via timeout).
+typedef struct {
+    uint32_t crtc_id, fb_id, flags, reserved;
+    uint64_t user_data;
+} drm_mode_page_flip_t;
+
+static int drm_ioctl_page_flip(vfs_file_t* f, uint64_t arg) {
+    drm_mode_page_flip_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    uint32_t n_sc = virtio_gpu_num_scanouts();
+    if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
+    uint32_t scanout = a.crtc_id - CRTC_BASE;
+
+    drm_client_t* c = client_of(f);
+    drm_fb_t* fb = find_fb(c, a.fb_id);
+    if (!fb) return -ENOENT;
+    drm_dumb_t* d = find_dumb(c, fb->handle);
+    if (!d) return -ENOENT;
+
+    if (!virtio_gpu_set_scanout(scanout, d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    if (!virtio_gpu_transfer_to_host_2d(d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    if (!virtio_gpu_resource_flush(d->vgpu_res_id, fb->width, fb->height))
+        return -EIO;
+    return 0;
+}
+
+// ── mmap resolver (called from sys_mmap) ─────────────────────────────
+// Given a DRM fd and the offset from MAP_DUMB, return the backing
+// physical address + byte count.  Returns 0 on success, -errno on
+// failure.  The caller's sys_mmap installs the PTEs.
+int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
+                                uint64_t len, phys_addr_t* out_phys,
+                                uint64_t* out_bytes) {
+    if ((offset & 0xFF00000000000000ull) != DRM_DUMB_OFFSET_MARK)
+        return -EINVAL;
+    uint32_t handle = (uint32_t)(offset >> DRM_DUMB_OFFSET_SHIFT) & 0xFFFFFF;
+    drm_client_t* c = client_of(f);
+    drm_dumb_t* d = find_dumb(c, handle);
+    if (!d) return -ENOENT;
+    if (len > d->bytes_alloc) return -EINVAL;
+    *out_phys  = d->phys;
+    *out_bytes = d->bytes_alloc;
+    return 0;
+}
+
+// Predicate used by sys_mmap to detect a DRM fd without exposing
+// drm_close externally.  static-in-.c comparison is reliable: every
+// vfs_file_t we return from vfs_drm_open has this specific pointer.
+static void drm_close(vfs_file_t* self);
+int drm_is_drm_file(vfs_file_t* f) {
+    return f && f->close == drm_close;
+}
 
 static int drm_ioctl_version(uint64_t arg) {
     drm_version_t v;
@@ -368,7 +734,6 @@ static int drm_ioctl_mode_getcrtc(uint64_t arg) {
 
 // ── ioctl dispatch ──────────────────────────────────────────────────
 static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
-    (void)self;
     switch (req) {
     case DRM_IOCTL_VERSION:           return drm_ioctl_version(arg);
     case DRM_IOCTL_GET_CAP:           return drm_ioctl_get_cap(arg);
@@ -376,6 +741,13 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_GETCONNECTOR: return drm_ioctl_mode_getconnector(arg);
     case DRM_IOCTL_MODE_GETENCODER:   return drm_ioctl_mode_getencoder(arg);
     case DRM_IOCTL_MODE_GETCRTC:      return drm_ioctl_mode_getcrtc(arg);
+    case DRM_IOCTL_MODE_SETCRTC:      return drm_ioctl_setcrtc(self, arg);
+    case DRM_IOCTL_MODE_PAGE_FLIP:    return drm_ioctl_page_flip(self, arg);
+    case DRM_IOCTL_MODE_ADDFB2:       return drm_ioctl_addfb2(self, arg);
+    case DRM_IOCTL_MODE_RMFB:         return drm_ioctl_rmfb(self, arg);
+    case DRM_IOCTL_MODE_CREATE_DUMB:  return drm_ioctl_create_dumb(self, arg);
+    case DRM_IOCTL_MODE_MAP_DUMB:     return drm_ioctl_map_dumb(self, arg);
+    case DRM_IOCTL_MODE_DESTROY_DUMB: return drm_ioctl_destroy_dumb(self, arg);
     case DRM_IOCTL_SET_MASTER:        return 0;  // single-client for now
     case DRM_IOCTL_DROP_MASTER:       return 0;
     default:
@@ -387,17 +759,33 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
 }
 
 static void drm_close(vfs_file_t* self) {
-    // Nothing stateful yet; part 2 will track per-fd dumb buffers + fbs.
+    // Tear down every dumb buffer + fb this client still holds.
+    drm_client_t* c = client_of(self);
+    if (c) {
+        drm_fb_t* fb = c->fbs;
+        while (fb) { drm_fb_t* n = fb->next; kfree(fb); fb = n; }
+        drm_dumb_t* d = c->dumbs;
+        while (d)  { drm_dumb_t* n = d->next; dumb_free(d); d = n; }
+        kfree(c);
+        self->ctx = NULL;
+    }
     kfree(self);
 }
 
 vfs_file_t* vfs_drm_open(void) {
+    drm_client_t* c = (drm_client_t*)kmalloc(sizeof(*c));
+    if (!c) return NULL;
+    __builtin_memset(c, 0, sizeof(*c));
+    c->next_dumb_handle = 1;
+    c->next_fb_id       = 1;
+
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
-    if (!f) return NULL;
+    if (!f) { kfree(c); return NULL; }
     __builtin_memset(f, 0, sizeof(*f));
     f->ioctl    = drm_ioctl;
     f->close    = drm_close;
+    f->ctx      = c;
     f->refcount = 1;
-    f->rights   = 0xFFFFFFFFu;   // full rights; access-controlled by file mode
+    f->rights   = 0xFFFFFFFFu;
     return f;
 }

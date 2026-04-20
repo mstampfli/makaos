@@ -33,3 +33,21 @@ void virtio_gpu_get_mode(uint32_t idx, uint32_t* out_w, uint32_t* out_h);
 // up on the QEMU window.  Returns 1 on success.  Runs from
 // init_kthread so it exercises the happy path at every boot.
 int virtio_gpu_present_test(void);
+
+// ── Resource lifecycle API (used by the DRM/KMS uAPI layer) ─────────
+// All five calls return 1 on success, 0 on failure.  Caller is
+// responsible for assigning a nonzero resource_id (conventionally
+// monotonically increasing); 0 is reserved by the spec.
+
+#define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM  2
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM  1
+
+int virtio_gpu_resource_create_2d(uint32_t res_id, uint32_t format,
+                                   uint32_t w, uint32_t h);
+int virtio_gpu_resource_unref(uint32_t res_id);
+int virtio_gpu_resource_attach_backing_single(uint32_t res_id,
+                                               phys_addr_t phys, uint32_t len);
+int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
+                            uint32_t w, uint32_t h);
+int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h);
+int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h);
