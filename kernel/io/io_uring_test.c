@@ -60,6 +60,12 @@ static io_uring_t* test_ring_create(uint32_t entries) {
     u->sqp_task = NULL;
     u->sqp_stop = 0;
     u->sqp_idle_ms = 1000;
+    u->fixed_files = NULL;
+    u->fixed_files_nr = 0;
+    spin_lock_init(&u->fixed_files_lock);
+    u->overflow_head = NULL;
+    u->overflow_tail = NULL;
+    spin_lock_init(&u->overflow_lock);
 
     uint8_t* kbase = (uint8_t*)(phys + HHDM_OFFSET);
     u->sq_hdr = (io_sq_ring_hdr_t*)(kbase);

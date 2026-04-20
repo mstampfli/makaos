@@ -35,8 +35,11 @@ extern uint64_t tsc_read_ns(void);
 #define IO_URING_MAX_ENTRIES 4096u
 
 // Forward declarations for helpers used across phases.
-static int io_sqp_spawn(io_uring_t* uring);
-static int io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe);
+static int     io_sqp_spawn(io_uring_t* uring);
+static int     io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe);
+static int     io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+                                     uint32_t user_tail, uint32_t mask);
+static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe);
 
 // Round up to next power of two, minimum 1.
 static uint32_t round_pow2_u32(uint32_t v) {
@@ -163,6 +166,9 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
     uring->fixed_files    = NULL;
     uring->fixed_files_nr = 0;
     spin_lock_init(&uring->fixed_files_lock);
+    uring->overflow_head = NULL;
+    uring->overflow_tail = NULL;
+    spin_lock_init(&uring->overflow_lock);
 
     // Kernel-side HHDM aliases — read/write these directly, no fault.
     uint8_t* kbase = (uint8_t*)(phys + HHDM_OFFSET);
@@ -236,20 +242,74 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
 }
 
 // Post a CQE at the tail.  cq_lock serialises concurrent posters
-// (multiple io_wq workers in 8E).  Single poster (8C) still takes
-// the lock — cheap and keeps the code path uniform.
+// (multiple io_wq workers in 8E).
+//
+// Overflow handling: if the CQ is full, the CQE is stashed on a
+// kernel-side overflow list instead of being dropped.  The next
+// post_cqe call that finds CQ space drains the overflow list
+// head-first BEFORE publishing its own CQE — guaranteeing FIFO
+// delivery.  Matches Linux io_uring's overflow semantics.
+//
+// Drain-on-post is cheap: one atomic_load of the head, one
+// kmalloc'd node free per drained entry, and the overflow list
+// is short under normal load (only fills during burst overflow).
 void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
                         int32_t res, uint32_t cqe_flags) {
     uint64_t f = spin_lock_irqsave(&uring->cq_lock);
-    uint32_t tail = uring->cq_hdr->tail;
-    uint32_t head = __atomic_load_n(&uring->cq_hdr->head, __ATOMIC_ACQUIRE);
     uint32_t mask = uring->cq_hdr->ring_mask;
 
+    // Drain any pending overflow entries that now fit.
+    if (uring->overflow_head) {
+        uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
+        while (uring->overflow_head) {
+            uint32_t tail = uring->cq_hdr->tail;
+            uint32_t head = __atomic_load_n(&uring->cq_hdr->head,
+                                              __ATOMIC_ACQUIRE);
+            if ((tail - head) >= uring->cq_entries) break;
+
+            struct io_overflow_cqe* n = uring->overflow_head;
+            io_cqe_t* slot = &uring->cqes[tail & mask];
+            *slot = n->cqe;
+            __atomic_store_n(&uring->cq_hdr->tail, tail + 1,
+                              __ATOMIC_RELEASE);
+
+            uring->overflow_head = n->next;
+            if (!uring->overflow_head) uring->overflow_tail = NULL;
+            kfree(n);
+        }
+        spin_unlock_irqrestore(&uring->overflow_lock, of);
+    }
+
+    uint32_t tail = uring->cq_hdr->tail;
+    uint32_t head = __atomic_load_n(&uring->cq_hdr->head, __ATOMIC_ACQUIRE);
+
     if ((tail - head) >= uring->cq_entries) {
-        // CQ full — drop and bump overflow counter.  Userspace can
-        // observe the overflow field and throttle.
+        // CQ still full — push onto overflow list instead of
+        // dropping.  Bump the user-visible overflow counter as a
+        // hint (userspace can monitor it to throttle submissions).
+        struct io_overflow_cqe* n = (struct io_overflow_cqe*)
+            kmalloc(sizeof(*n));
+        if (!n) {
+            // OOM during overflow — last resort: drop and count.
+            uring->cq_hdr->overflow++;
+            spin_unlock_irqrestore(&uring->cq_lock, f);
+            wait_queue_wake_all(&uring->waitq);
+            return;
+        }
+        n->next          = NULL;
+        n->cqe.user_data = user_data;
+        n->cqe.res       = res;
+        n->cqe.flags     = cqe_flags;
+
+        uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
+        if (uring->overflow_tail) uring->overflow_tail->next = n;
+        else                      uring->overflow_head = n;
+        uring->overflow_tail = n;
+        spin_unlock_irqrestore(&uring->overflow_lock, of);
+
         uring->cq_hdr->overflow++;
         spin_unlock_irqrestore(&uring->cq_lock, f);
+        wait_queue_wake_all(&uring->waitq);
         return;
     }
 
@@ -258,12 +318,9 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
     slot->res       = res;
     slot->flags     = cqe_flags;
 
-    // Release-store on tail ensures the CQE body is visible before
-    // the user sees the updated tail.
     __atomic_store_n(&uring->cq_hdr->tail, tail + 1, __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&uring->cq_lock, f);
 
-    // Wake any waiter blocked in io_uring_enter with GETEVENTS.
     wait_queue_wake_all(&uring->waitq);
 }
 
@@ -568,13 +625,35 @@ static void io_wq_worker_entry(void) {
             continue;
         }
 
-        // Walk the chain.  Treiber push reverses order; LIFO dispatch
-        // is fine (user_data correlates completions, not order).
+        // Walk the Treiber chain (LIFO between distinct submissions
+        // is fine).  For each work item, walk its chain_next list
+        // (linked chain within a single submission) sequentially —
+        // cancel the chain tail on IO_LINK failure.
         while (chain) {
-            io_wq_work_t* w = chain;
+            io_wq_work_t* head_w = chain;
             chain = chain->next;
-            dispatch_one(uring, &w->sqe);
-            wq_work_free(w);
+
+            // Walk one linked chain (one SQE or a sequence linked
+            // via IOSQE_IO_LINK / IOSQE_IO_HARDLINK).
+            io_wq_work_t* w = head_w;
+            int cancelled = 0;
+            while (w) {
+                io_wq_work_t* nxt = w->chain_next;
+                int32_t res;
+                if (cancelled) {
+                    res = -ECANCELED;
+                } else {
+                    res = dispatch_exec(uring, &w->sqe);
+                }
+                io_uring_post_cqe(uring, w->sqe.user_data, res, 0);
+                // If this op had IO_LINK set and failed, cancel the
+                // rest of the chain.  IO_HARDLINK ignores the failure
+                // and keeps running.
+                if (!cancelled && (w->sqe.flags & IOSQE_IO_LINK) && res < 0)
+                    cancelled = 1;
+                wq_work_free(w);
+                w = nxt;
+            }
         }
     }
 }
@@ -610,16 +689,16 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     return 0;
 }
 
-// Enqueue an SQE onto the worker's pending chain.  Allocates a
-// io_wq_work_t, single-CAS push.
+// Enqueue a single SQE (no linked chain).  Single-CAS push.
 static int io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe) {
     int r = io_wq_ensure_worker(uring);
     if (r < 0) return r;
 
     io_wq_work_t* w = wq_work_alloc();
     if (!w) return -ENOMEM;
-    w->sqe   = *sqe;        // full SQE snapshot — user can reuse the slot
-    w->uring = uring;
+    w->sqe        = *sqe;
+    w->uring      = uring;
+    w->chain_next = NULL;
 
     io_wq_work_t* old = (io_wq_work_t*)__atomic_load_n(
         &uring->wq_head, __ATOMIC_RELAXED);
@@ -628,12 +707,69 @@ static int io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe) {
     } while (!__atomic_compare_exchange_n(&uring->wq_head, &old, w,
                                             0, __ATOMIC_RELEASE,
                                             __ATOMIC_RELAXED));
-    // Wake the worker if it's parked.
     wait_queue_wake_all(&uring->wq_waitq);
     return 0;
 }
 
-static void dispatch_one(io_uring_t* uring, const io_sqe_t* sqe) {
+// Enqueue an SQE and any following IO_LINK/IO_HARDLINK SQEs as one
+// chained work item.  *phead is advanced past the whole chain.
+// The worker walks chain_next sequentially with IO_LINK cancel
+// semantics (see worker loop).
+static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+                                 uint32_t user_tail, uint32_t mask) {
+    int r = io_wq_ensure_worker(uring);
+    if (r < 0) return r;
+
+    // Build the chain by following IO_LINK / IO_HARDLINK flags.
+    io_wq_work_t* first = NULL;
+    io_wq_work_t* tail  = NULL;
+
+    for (;;) {
+        if (*phead == user_tail) break;
+        const io_sqe_t* sqe = &uring->sqes[*phead & mask];
+
+        io_wq_work_t* w = wq_work_alloc();
+        if (!w) {
+            // Partial-failure cleanup: free what we've built.
+            while (first) {
+                io_wq_work_t* n = first->chain_next;
+                wq_work_free(first);
+                first = n;
+            }
+            return -ENOMEM;
+        }
+        w->sqe        = *sqe;
+        w->uring      = uring;
+        w->chain_next = NULL;
+        if (!first) first = w;
+        if (tail)   tail->chain_next = w;
+        tail = w;
+
+        uint8_t flags = sqe->flags;
+        (*phead)++;
+        // End of chain when this SQE has neither IO_LINK nor IO_HARDLINK.
+        if (!(flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) break;
+    }
+
+    if (!first) return 0;
+
+    // Push the head onto the worker's Treiber stack.  The chain_next
+    // links the rest; worker walks both dimensions.
+    io_wq_work_t* old = (io_wq_work_t*)__atomic_load_n(
+        &uring->wq_head, __ATOMIC_RELAXED);
+    do {
+        first->next = old;
+    } while (!__atomic_compare_exchange_n(&uring->wq_head, &old, first,
+                                            0, __ATOMIC_RELEASE,
+                                            __ATOMIC_RELAXED));
+    wait_queue_wake_all(&uring->wq_waitq);
+    return 0;
+}
+
+// Returns the op result; does NOT post a CQE (caller does).
+// Split from dispatch_one so linked-chain logic can decide whether
+// to cancel the rest of the chain based on res < 0 + IO_LINK flag.
+static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
     int32_t res = -EINVAL;
     switch (sqe->opcode) {
         case IORING_OP_NOP:
@@ -743,7 +879,31 @@ static void dispatch_one(io_uring_t* uring, const io_sqe_t* sqe) {
             res = -EINVAL;
             break;
     }
+    return res;
+}
+
+// Thin wrapper: exec + post CQE.  Used by code paths that don't
+// care about linked-chain behaviour (inline NOP batches etc.).
+static void dispatch_one(io_uring_t* uring, const io_sqe_t* sqe) {
+    int32_t res = dispatch_exec(uring, sqe);
     io_uring_post_cqe(uring, sqe->user_data, res, 0);
+}
+
+// Returns 1 if the opcode is known to potentially block waiting for
+// I/O (disk read completion, socket accept, recv-with-no-data,
+// connect handshake).  Used by the auto-async policy: these
+// opcodes auto-route to io_wq unless IOSQE_FORCE_SYNC is set.
+// Sync ops (NOP, CLOSE, OPENAT, FSYNC, WRITE, SEND) run inline.
+static inline int opcode_may_block(uint8_t op) {
+    switch (op) {
+        case IORING_OP_READ:
+        case IORING_OP_ACCEPT:
+        case IORING_OP_RECV:
+        case IORING_OP_CONNECT:
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
@@ -770,21 +930,60 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
 
     while (submitted < to_submit && head != user_tail) {
         const io_sqe_t* sqe = &uring->sqes[head & mask];
-        if (sqe->flags & IOSQE_ASYNC) {
-            // Offload to io_wq worker — enter returns immediately
-            // after enqueue, caller keeps running.  CQE is posted
-            // later by the worker.
-            int r = io_wq_enqueue(uring, sqe);
+
+        // Auto-async policy: ops that may block go through io_wq
+        // unless the user explicitly requested sync.  Covers the
+        // real "async" value-add — the caller doesn't block on
+        // disk I/O / network accept/recv.
+        int go_async = (sqe->flags & IOSQE_ASYNC)
+                    || (opcode_may_block(sqe->opcode)
+                        && !(sqe->flags & IOSQE_FORCE_SYNC));
+
+        if (go_async) {
+            // Offload the SQE — and any linked followers — as a
+            // single chain work item.  The worker walks the chain
+            // sequentially; IO_LINK failure cancels the tail.
+            int r = io_wq_enqueue_chain(uring, &head, user_tail, mask);
             if (r < 0) {
-                // Enqueue failed — surface -errno immediately so
-                // the caller doesn't wait forever.
                 io_uring_post_cqe(uring, sqe->user_data, r, 0);
+                head++;
             }
-        } else {
-            dispatch_one(uring, sqe);
+            submitted++;
+            // io_wq_enqueue_chain advances `head` past the whole
+            // chain; we count the whole chain as one submission
+            // here for the to_submit budget (matching Linux's
+            // submitted-count semantics on linked ops).
+            continue;
         }
+
+        // Sync dispatch with IO_LINK / IO_HARDLINK semantics.
+        int32_t res = dispatch_exec(uring, sqe);
+        io_uring_post_cqe(uring, sqe->user_data, res, 0);
+        uint8_t this_flags = sqe->flags;
         head++;
         submitted++;
+
+        // IO_LINK + failure → cancel the rest of the chain by
+        // posting -ECANCELED for each remaining linked SQE.
+        // Stop at the first SQE without IO_LINK OR IO_HARDLINK
+        // set (that's the end of this chain).  IO_HARDLINK is
+        // special: we still post -ECANCELED for the linked SQEs
+        // AFTER the hardlink boundary (Linux's exact rule) since
+        // hardlink means "this runs regardless but subsequent
+        // links depend on this one".
+        if ((this_flags & IOSQE_IO_LINK) && res < 0) {
+            while (submitted < to_submit && head != user_tail) {
+                const io_sqe_t* nxt = &uring->sqes[head & mask];
+                io_uring_post_cqe(uring, nxt->user_data, -ECANCELED, 0);
+                uint8_t nxt_flags = nxt->flags;
+                head++;
+                submitted++;
+                // Stop when we fall off the chain: neither this
+                // SQE nor its predecessor had LINK/HARDLINK set.
+                if (!(nxt_flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)))
+                    break;
+            }
+        }
     }
     // Publish new sq_head to user.
     __atomic_store_n(&uring->sq_hdr->head, head, __ATOMIC_RELEASE);
