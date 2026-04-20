@@ -144,6 +144,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     // cap enforced in drm.c; future OOM kill reads this to prioritise.
     uint64_t      drm_bytes_charged;
 
+    // DRM context priority (#5 of design-hardening).  Higher numbers
+    // submit commits with higher priority than lower numbers.  Default
+    // 0 (normal); compositors bump themselves to 10+.  Currently
+    // informational — a future drm_sched integration will use this to
+    // order pending commits from multiple clients.
+    uint8_t       drm_priority;
+
     int32_t       exit_code;    // set by sys_exit, readable via wait()
 
     uint64_t      sleep_until_ns; // wake time for nanosleep (TSC nanoseconds)

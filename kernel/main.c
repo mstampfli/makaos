@@ -464,6 +464,12 @@ static void init_kthread(void) {
     extern int virtio_gpu_present_test(void);
     (void)virtio_gpu_present_test();
 
+    // Tier 2.5b (#8): DRM mock backend exerciser — exercises the
+    // clean drm_backend_ops_t vtable without touching real hardware.
+    // Happy path + two error-path probes.
+    extern void drm_mock_selftest(void);
+    drm_mock_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.

@@ -67,7 +67,10 @@ enum {
     IORING_OP_SEND     = 8,
     IORING_OP_RECV     = 9,
     IORING_OP_TIMEOUT  = 10,
-    IORING_OP_POLL_ADD = 11,
+    IORING_OP_POLL_ADD  = 11,
+    IORING_OP_DRM_COMMIT = 12,   // atomic DRM modeset commit
+                                  // sqe->fd = /dev/dri/card0 fd
+                                  // sqe->addr = user ptr to drm_mode_atomic_t
     IORING_OP_LAST,
 };
 

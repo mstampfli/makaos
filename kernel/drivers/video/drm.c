@@ -25,16 +25,22 @@
 #include "process.h"
 #include "smp.h"
 #include "sched.h"      // g_current
+#include "seqlock.h"
 #include "syscall.h"   // copy_from_user / copy_to_user
 
 extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
 
 // ── Global modeset state ─────────────────────────────────────────────
-// Protected by s_state_lock during a commit.  Readers (ioctls that
-// consult current state like GETCRTC) take the lock briefly, copy out.
-// The atomic commit apply path is the only writer.  Future: seqlock
-// once we measure reader contention under wlroots.
+// Protected by a seqlock: readers (GETCRTC + atomic-commit readers in
+// future multi-client paths) spin on a sequence counter rather than
+// taking a lock.  Writers (drm_commit_apply) take the seqlock's
+// internal spinlock so multiple concurrent commits serialize.
+//
+// This is #2 of the DRM design improvements — Linux's DRM core uses
+// drm_modeset_lock_all + per-CRTC locks with a documented acquisition
+// order; we use one seqlock for the entire modeset state and get
+// wait-free reads for free.
 #define DRM_MAX_SCANOUTS  VIRTIO_GPU_MAX_SCANOUTS_CAP
 
 typedef struct drm_scanout_state {
@@ -45,7 +51,7 @@ typedef struct drm_scanout_state {
     uint64_t generation;      // bumps on every successful apply
 } drm_scanout_state_t;
 
-static spinlock_t         s_state_lock;
+static seqlock_t          s_state_sl;
 static drm_scanout_state_t s_scanouts[DRM_MAX_SCANOUTS];
 static int                s_state_init_done = 0;
 
@@ -54,7 +60,7 @@ static void drm_state_init_once(void) {
     int expect = 0;
     if (__atomic_compare_exchange_n(&s_state_init_done, &expect, 2,
                                      0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        spin_lock_init(&s_state_lock);
+        seqlock_init(&s_state_sl);
         for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
             s_scanouts[i] = (drm_scanout_state_t){0};
         __atomic_store_n(&s_state_init_done, 1, __ATOMIC_RELEASE);
@@ -62,6 +68,19 @@ static void drm_state_init_once(void) {
         while (__atomic_load_n(&s_state_init_done, __ATOMIC_ACQUIRE) != 1)
             __builtin_ia32_pause();
     }
+}
+
+// Wait-free snapshot of one scanout's state.  Call pattern for
+// read-mostly paths (GETCRTC, page-flip event builders).
+static drm_scanout_state_t drm_scanout_snapshot(uint32_t sc) {
+    drm_scanout_state_t s;
+    uint32_t seq;
+    do {
+        seq = seq_begin(&s_state_sl);
+        if (sc < DRM_MAX_SCANOUTS) s = s_scanouts[sc];
+        else { __builtin_memset(&s, 0, sizeof(s)); }
+    } while (seq_retry(&s_state_sl, seq));
+    return s;
 }
 
 // ── Memory accounting ────────────────────────────────────────────────
@@ -486,17 +505,19 @@ static int drm_commit_apply(const drm_commit_t* commit) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     if (!b) return -ENODEV;
 
-    uint64_t flags = spin_lock_irqsave(&s_state_lock);
+    // Writer: takes the seqlock's internal spinlock.  During
+    // seq_write_begin..seq_write_end the seq counter is odd; readers
+    // spin-retry until we finish.  Every bumped field is visible on
+    // seq_write_end via the built-in release fence.
+    seq_write_begin(&s_state_sl);
 
-    // Snapshot prior state of every touched scanout for rollback.
     drm_scanout_state_t prior[DRM_MAX_SCANOUTS];
     for (uint32_t i = 0; i < commit->n; i++) {
         uint32_t sc = commit->entries[i].scanout;
-        if (sc >= DRM_MAX_SCANOUTS) { spin_unlock_irqrestore(&s_state_lock, flags); return -EINVAL; }
+        if (sc >= DRM_MAX_SCANOUTS) { seq_write_end(&s_state_sl); return -EINVAL; }
         prior[i] = s_scanouts[sc];
     }
 
-    // Apply each entry.  On failure, roll back every succeeded entry.
     for (uint32_t i = 0; i < commit->n; i++) {
         const drm_commit_entry_t* e = &commit->entries[i];
         if (b->scanout_set(e->scanout, e->resource_id, e->w, e->h) != 0) goto rollback;
@@ -513,13 +534,10 @@ static int drm_commit_apply(const drm_commit_t* commit) {
         };
     }
 
-    spin_unlock_irqrestore(&s_state_lock, flags);
+    seq_write_end(&s_state_sl);
     return 0;
 
 rollback:
-    // Walk the prefix of entries that we applied and restore each
-    // one.  Best-effort; a backend refusing rollback is a bug we
-    // log but can't prevent.
     for (uint32_t j = 0; j < commit->n; j++) {
         const drm_commit_entry_t* e = &commit->entries[j];
         if (s_scanouts[e->scanout].generation != prior[j].generation) {
@@ -527,7 +545,7 @@ rollback:
             s_scanouts[e->scanout] = prior[j];
         }
     }
-    spin_unlock_irqrestore(&s_state_lock, flags);
+    seq_write_end(&s_state_sl);
     return -EIO;
 }
 
@@ -933,12 +951,10 @@ static int drm_ioctl_mode_getcrtc(uint64_t arg) {
     if (c.crtc_id < CRTC_BASE || c.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
     uint32_t scanout = c.crtc_id - CRTC_BASE;
 
-    // Report the actual currently-bound fb_id from the state machine.
-    // Read under the state lock for a consistent snapshot.
+    // Wait-free seqlock read.  No writers are delayed by us; if a
+    // commit is in flight, we spin-retry inside drm_scanout_snapshot.
     drm_state_init_once();
-    uint64_t flags = spin_lock_irqsave(&s_state_lock);
-    drm_scanout_state_t cur = s_scanouts[scanout];
-    spin_unlock_irqrestore(&s_state_lock, flags);
+    drm_scanout_state_t cur = drm_scanout_snapshot(scanout);
 
     c.fb_id        = cur.fb_id;
     c.x = c.y      = 0;
@@ -1014,4 +1030,25 @@ vfs_file_t* vfs_drm_open(void) {
     f->refcount = 1;
     f->rights   = 0xFFFFFFFFu;
     return f;
+}
+
+// ── io_uring DRM commit op (#4) ──────────────────────────────────────
+// Clients submit a drm_mode_atomic-shaped request via an io_uring
+// SQE with opcode IORING_OP_DRM_COMMIT.  sqe->fd is the DRM fd,
+// sqe->addr is the user pointer to drm_mode_atomic_t.  This function
+// reuses the ioctl path below the parse layer — atomic-first design
+// means there's exactly one commit primitive no matter how it was
+// submitted.  Returns 0 or -errno; caller (io_uring dispatcher)
+// writes the value into the CQE's res field.
+int drm_ring_atomic(vfs_file_t* drm_fd_file, uint64_t atomic_ptr) {
+    if (!drm_fd_file || !drm_is_drm_file(drm_fd_file)) return -EBADF;
+    if (!atomic_ptr) return -EFAULT;
+    // Re-enter the ioctl parser; same struct shape, same commit path.
+    return drm_ioctl_atomic(drm_fd_file, atomic_ptr);
+}
+
+// ── OOM query (#6) ───────────────────────────────────────────────────
+uint64_t drm_get_charged_bytes(struct task_t* t) {
+    if (!t) return 0;
+    return __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
 }

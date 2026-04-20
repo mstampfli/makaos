@@ -187,6 +187,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sigstate.sigframe_rsp = 0;
     t->signalfd_head    = NULL;  // no signalfd subscribers until signalfd_new
     t->drm_bytes_charged = 0;
+    t->drm_priority      = 0;
     // Zero the whole handlers[] array.  task_t comes out of kmalloc
     // uninitialised, so handlers[].sa_handler could hold slab garbage.
     // On first signal delivery the kernel would treat that garbage as
@@ -439,6 +440,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     // is its owner-specific subscriber membership.
     t->signalfd_head     = NULL;
     t->drm_bytes_charged = 0;   // fresh tasks start with no DRM charges
+    t->drm_priority      = parent->drm_priority;   // inherit priority
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) __builtin_memcpy(t->cwd, parent->cwd, KPATH_MAX);
     for (int _i = 0; _i < 16;  _i++) t->comm[_i] = parent->comm[_i];
