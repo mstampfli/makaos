@@ -41,7 +41,18 @@ static void write_mbedtls_err(const char* pfx, int rc) {
 
 static int tcp_connect(const char* host, uint16_t port, int verbose) {
     uint32_t ip_be;
-    if (gethostbyname_ipv4(host, &ip_be) < 0) {
+    // Retry DNS with a short backoff: on a cold boot, the DHCP client
+    // (/bin/net) races with our launch and may not have installed the
+    // DNS servers yet.  30 attempts × 1s = 30s budget, plenty for a
+    // VM DHCP lease.
+    int resolved = 0;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        if (gethostbyname_ipv4(host, &ip_be) == 0) { resolved = 1; break; }
+        if (attempt == 0 && verbose) write_err("* DNS not ready, retrying...\n");
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+    }
+    if (!resolved) {
         write_err("* DNS resolution failed\n");
         return -1;
     }
