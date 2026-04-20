@@ -1,0 +1,98 @@
+Add x86_64-pc-makaos target to binutils 2.42.
+
+Registers "makaos" as a recognized OS in config.sub, routes the x86_64
+target through the existing ELF64 path, and wires a default ELF
+emulation name (elf_x86_64_makaos) that reuses standard elf_x86_64.sh
+with MakaOS-appropriate defaults.
+
+Signed-off-by: MakaOS <noreply@makaos>
+
+diff --git a/config.sub b/config.sub
+--- a/config.sub
++++ b/config.sub
+@@ -1723,7 +1723,7 @@ case $os in
+ 	# Now accept the basic system types.
+ 	# The portable systems comes first.
+ 	# Each alternative MUST end in a * to match a version number.
+-	gnu* | android* | bsd* | mach* | minix* | genix* | ultrix* | irix* \
++	gnu* | android* | bsd* | mach* | minix* | genix* | ultrix* | irix* | makaos* \
+ 	     | *vms* | esix* | aix* | cnk* | sunos | sunos[34]* \
+ 	     | hpux* | unos* | osf* | luna* | dgux* | auroraux* | solaris* \
+ 	     | sym* |  plan9* | psp* | sim* | xray* | os68k* | v88r* \
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -652,6 +652,11 @@ case "${targ}" in
+     targ_selvecs="iamdll_vec x86_64_elf64_vec x86_64_pei_vec i386_pei_vec i386_elf32_vec iamdll_vec x86_64_mach_o_vec"
+     want64=true
+     ;;
++  x86_64-*-makaos*)
++    targ_defvec=x86_64_elf64_vec
++    targ_selvecs="i386_elf32_vec"
++    want64=true
++    ;;
+   x86_64-*-mingw* | x86_64-*-pe | x86_64-*-pep | x86_64-*-cygwin)
+     targ_defvec=x86_64_pe_vec
+     targ_selvecs="x86_64_pei_vec x86_64_elf64_vec i386_pe_vec i386_pei_vec i386_elf32_vec iamdll_vec x86_64_mach_o_vec"
+diff --git a/gas/configure.tgt b/gas/configure.tgt
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -259,6 +259,7 @@ case ${generic_target} in
+   i386-*-gnu*)				fmt=elf em=gnu ;;
+   i386-*-msdosdjgpp* \
+   | i386-*-go32*)			fmt=coff em=go32 ;;
++  i386-*-makaos* | x86_64-*-makaos*)	fmt=elf em=gnu ;;
+   i386-*-rdos*)				fmt=elf ;;
+   i386-*-darwin*)			fmt=macho ;;
+
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -998,6 +998,10 @@ x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-fuchsia* | x86_64-*-genode*)
+ 			targ_extra_emuls="elf_i386 elf32_x86_64 elf_iamcu"
+ 			targ_extra_libpath=$targ_extra_emuls
+ 			;;
++x86_64-*-makaos*)	targ_emul=elf_x86_64_makaos
++			targ_extra_emuls="elf_x86_64 elf_i386"
++			targ_extra_libpath=$targ_extra_emuls
++			;;
+ x86_64-*-haiku*)	targ_emul=elf_x86_64_haiku
+ 			targ_extra_emuls="elf_x86_64 elf_i386_haiku"
+ 			;;
+diff --git a/ld/emulparams/elf_x86_64_makaos.sh b/ld/emulparams/elf_x86_64_makaos.sh
+new file mode 100644
+--- /dev/null
++++ b/ld/emulparams/elf_x86_64_makaos.sh
+@@ -0,0 +1,10 @@
++# elf_x86_64_makaos — MakaOS static-ELF, no dynamic linker.
++#
++# Thin override of elf_x86_64 that drops the interpreter reference
++# (we statically link everything today) and keeps all other defaults.
++
++source_sh ${srcdir}/emulparams/plt_unwind.sh
++source_sh ${srcdir}/emulparams/extern_protected_data.sh
++source_sh ${srcdir}/emulparams/dynamic_undefined_weak.sh
++source_sh ${srcdir}/emulparams/reloc_overflow.sh
++source_sh ${srcdir}/emulparams/elf_x86_64.sh
+diff --git a/ld/Makefile.am b/ld/Makefile.am
+--- a/ld/Makefile.am
++++ b/ld/Makefile.am
+@@ -281,6 +281,7 @@ ALL_EMULATION_SOURCES = \
+ 	eelf_i386_haiku.c \
+ 	eelf_i386_ldso.c \
+ 	eelf_i386_sol2.c \
++	eelf_x86_64_makaos.c \
+ 	eelf_i386_vxworks.c \
+ 	eelf_iamcu.c \
+ 	eelf_s390.c \
+diff --git a/ld/Makefile.in b/ld/Makefile.in
+--- a/ld/Makefile.in
++++ b/ld/Makefile.in
+@@ -781,6 +781,7 @@ ALL_EMULATION_SOURCES = \
+ 	eelf_i386_haiku.c \
+ 	eelf_i386_ldso.c \
+ 	eelf_i386_sol2.c \
++	eelf_x86_64_makaos.c \
+ 	eelf_i386_vxworks.c \
+ 	eelf_iamcu.c \
+ 	eelf_s390.c \

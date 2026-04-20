@@ -1,0 +1,116 @@
+Add x86_64-pc-makaos target to GCC 14.2.0.
+
+Registers "makaos" in config.sub + config.gcc + libgcc/config.host, adds
+a gcc/config/makaos.h with CPP predefines (__makaos__, __unix__), and
+routes the x86_64-*-makaos* case to reuse the glibc-style ELF64 bits
+with a MakaOS-specific LINK_SPEC / STARTFILE_SPEC / ENDFILE_SPEC.
+
+Signed-off-by: MakaOS <noreply@makaos>
+
+diff --git a/config.sub b/config.sub
+--- a/config.sub
++++ b/config.sub
+@@ -1725,7 +1725,7 @@ case $os in
+ 	# Now accept the basic system types.
+ 	# The portable systems comes first.
+ 	# Each alternative MUST end in a * to match a version number.
+-	gnu* | android* | bsd* | mach* | minix* | genix* | ultrix* | irix* \
++	gnu* | android* | bsd* | mach* | minix* | genix* | ultrix* | irix* | makaos* \
+ 	     | *vms* | esix* | aix* | cnk* | sunos | sunos[34]* \
+ 	     | hpux* | unos* | osf* | luna* | dgux* | auroraux* | solaris* \
+ 	     | sym* |  plan9* | psp* | sim* | xray* | os68k* | v88r* \
+diff --git a/gcc/config.gcc b/gcc/config.gcc
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -900,6 +900,14 @@ case ${target} in
+ *-*-haiku*)
+   tmake_file="${tmake_file} t-haiku"
+   ;;
++*-*-makaos*)
++  gas=yes
++  gnu_ld=yes
++  default_use_cxa_atexit=yes
++  use_gcc_stdint=provide
++  tmake_file="t-slibgcc"
++  extra_options="${extra_options} gnu-user.opt"
++  ;;
+ *-*-elf|arc*-*-elf*)
+   # Assume that newlib is being used and so __cxa_atexit is provided.
+   default_use_cxa_atexit=yes
+@@ -2035,6 +2043,12 @@ x86_64-*-linux* | x86_64-*-kfreebsd*-gnu | x86_64-*-gnu*)
+ 		done
+ 		TM_MULTILIB_CONFIG=`echo $TM_MULTILIB_CONFIG | sed 's/^,//'`
+ 		;;
++x86_64-*-makaos*)
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h \
++		 i386/i386elf.h i386/x86-64.h makaos.h"
++	tmake_file="${tmake_file} i386/t-x86_64-elf"
++	use_gcc_stdint=provide
++	;;
+ i[34567]86-pc-msdosdjgpp*)
+ 	xm_file=i386/xm-djgpp.h
+ 	tm_file="dbxcoff.h ${tm_file} i386/unix.h i386/bsd.h i386/gas.h i386/djgpp.h i386/djgpp-stdint.h"
+diff --git a/gcc/config/makaos.h b/gcc/config/makaos.h
+new file mode 100644
+--- /dev/null
++++ b/gcc/config/makaos.h
+@@ -0,0 +1,44 @@
++/* Target configuration for MakaOS — x86_64-pc-makaos.
++
++   Defines CPP predefines and the spec strings the driver uses to
++   invoke cc1 / as / ld.  We ship static binaries, no dynamic linker,
++   so DYNAMIC_LINKER is left unset and LINK_SPEC forces -static by
++   default (users can still override with -shared, but that's off the
++   happy path for MakaOS).  */
++
++#undef TARGET_OS_CPP_BUILTINS
++#define TARGET_OS_CPP_BUILTINS()            \
++  do {                                      \
++    builtin_define ("__makaos__");          \
++    builtin_define ("__unix__");            \
++    builtin_define ("__ELF__");             \
++    builtin_assert ("system=unix");         \
++    builtin_assert ("system=posix");        \
++    builtin_assert ("system=makaos");       \
++  } while (0)
++
++/* Use libc.a from the sysroot; no dynamic linker.  */
++#undef LIB_SPEC
++#define LIB_SPEC "%{!shared: -lc }"
++
++/* crt0.o provided by the sysroot.  */
++#undef STARTFILE_SPEC
++#define STARTFILE_SPEC "crt0.o%s"
++
++/* No crtn.o yet.  */
++#undef ENDFILE_SPEC
++#define ENDFILE_SPEC ""
++
++/* Static-by-default, sysroot-aware link.  */
++#undef LINK_SPEC
++#define LINK_SPEC "-static -nostdlib %{shared:-shared} %{!T*:-T %R/usr/lib/makaos-link.ld}"
++
++/* We don't use the Linux/glibc dynamic linker path.  */
++#undef GNU_USER_DYNAMIC_LINKER
++#define GNU_USER_DYNAMIC_LINKER ""
++
++#undef TARGET_UNWIND_TABLES_DEFAULT
++#define TARGET_UNWIND_TABLES_DEFAULT false
++
++#undef TARGET_LIBC_PROVIDES_SSP
++#define TARGET_LIBC_PROVIDES_SSP 0
+diff --git a/libgcc/config.host b/libgcc/config.host
+--- a/libgcc/config.host
++++ b/libgcc/config.host
+@@ -783,6 +783,11 @@ x86_64-*-linux*)
+ 	tmake_file="${tmake_file} i386/t-linux t-slibgcc-libgcc"
+ 	md_unwind_header=i386/linux-unwind.h
+ 	;;
++x86_64-*-makaos*)
++	extra_parts="crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o"
++	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic t-eh-dw2-dip"
++	tmake_file="$tmake_file t-slibgcc i386/t-linux"
++	;;
+ x86_64-*-freebsd*)
+ 	extra_parts="crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o"
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
