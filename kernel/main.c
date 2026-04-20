@@ -453,6 +453,10 @@ static void init_kthread(void) {
     extern void scm_rights_selftest(void);
     scm_rights_selftest();
 
+    // Tier 1 #6 (signalfd): block sig, send, drain via signalfd read.
+    extern void signalfd_selftest(void);
+    signalfd_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.

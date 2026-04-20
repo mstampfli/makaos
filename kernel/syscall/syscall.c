@@ -4605,6 +4605,38 @@ static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
     return 0;
 }
 
+// ── sys_signalfd ─────────────────────────────────────────────────────
+// signalfd(fd, &sigset, flags).  fd==-1 creates a new signalfd; fd>=0
+// updates the mask on an existing signalfd.  We only take the low 32
+// bits of the user sigset (NSIG=32 on MakaOS).  The mask is passed as
+// a pointer to a uint64_t on Linux; we accept either size via a
+// 4-byte-minimum copy.
+extern vfs_file_t* signalfd_new(uint32_t mask, uint32_t flags);
+extern int         signalfd_update(vfs_file_t* f, uint32_t mask);
+extern int         signalfd_is(vfs_file_t* f);
+
+static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
+                                 uint64_t flags, uint64_t d) {
+    (void)d;
+    if (!mask_ptr) return (uint64_t)-EFAULT;
+    uint64_t mask64 = 0;
+    if (copy_from_user(&mask64, (void*)mask_ptr, sizeof(mask64)) != 0)
+        return (uint64_t)-EFAULT;
+    uint32_t mask = (uint32_t)(mask64 & 0xFFFFFFFFu);
+
+    if ((int64_t)fd_u >= 0) {
+        vfs_file_t* f = fd_to_file(fd_u);
+        if (!f || !signalfd_is(f)) return (uint64_t)-EBADF;
+        int rc = signalfd_update(f, mask);
+        return rc < 0 ? (uint64_t)rc : (uint64_t)fd_u;
+    }
+    vfs_file_t* f = signalfd_new(mask, (uint32_t)flags);
+    if (!f) return (uint64_t)-ENOMEM;
+    int64_t nfd = fd_install(f);
+    if (nfd < 0) { vfs_close(f); return (uint64_t)nfd; }
+    return (uint64_t)nfd;
+}
+
 // ── sys_sendmsg / sys_recvmsg (with SCM_RIGHTS) ─────────────────────
 // Linux-compatible: parse msghdr + iovec + cmsghdr, scatter-gather
 // over unix_sock_send/recv, marshal fd-passing via unix_sock_sendfd /
@@ -4969,6 +5001,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SOCKETPAIR]          = w_sys_socketpair,
     [SYS_SENDMSG]             = w_sys_sendmsg,
     [SYS_RECVMSG]             = w_sys_recvmsg,
+    [SYS_SIGNALFD]            = w_sys_signalfd,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────
