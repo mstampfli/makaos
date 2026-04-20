@@ -24,11 +24,22 @@
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 
-// Glue symbols implemented in userland/libs/mbedtls/mbedtls_glue.c.
-extern int mbedtls_hardware_poll(void* data, unsigned char* output,
-                                 size_t len, size_t* olen);
-extern int mbedtls_bio_send(void* ctx, const unsigned char* buf, size_t len);
-extern int mbedtls_bio_recv(void* ctx, unsigned char* buf, size_t len);
+// BIO callbacks — wrap a TCP socket fd for mbedTLS.  Caller passes
+// &fd as the ctx pointer via mbedtls_ssl_set_bio.  Tiny and local —
+// every TLS client wires its own socket differently.
+static int bio_send(void* ctx, const unsigned char* buf, size_t len) {
+    int fd = *(int*)ctx;
+    ssize_t n = send(fd, buf, len, 0);
+    if (n < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    return (int)n;
+}
+static int bio_recv(void* ctx, unsigned char* buf, size_t len) {
+    int fd = *(int*)ctx;
+    ssize_t n = recv(fd, buf, len, 0);
+    if (n == 0) return MBEDTLS_ERR_SSL_CONN_EOF;
+    if (n < 0)  return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    return (int)n;
+}
 
 struct conn_t {
     int fd;
@@ -98,8 +109,8 @@ static int tls_handshake(conn_t* c, const char* host, int insecure, int verbose)
     mbedtls_entropy_init(&c->entropy);
     mbedtls_ctr_drbg_init(&c->ctr_drbg);
 
-    // DRBG seeded from our hardware_poll hook (entropy framework calls
-    // mbedtls_hardware_poll via ENTROPY_HARDWARE_ALT).
+    // DRBG seeded from mbedTLS's stock platform entropy, which reads
+    // /dev/urandom (→ kernel CSPRNG).
     int rc = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
                                     &c->entropy,
                                     (const unsigned char*)"MakaOS-https", 12);
@@ -127,8 +138,7 @@ static int tls_handshake(conn_t* c, const char* host, int insecure, int verbose)
     // BIO bound to our socket fd.  The third argument is the opaque
     // ctx passed back to our send/recv callbacks; point it at fd so
     // the callback can do send(fd, ...) / recv(fd, ...).
-    mbedtls_ssl_set_bio(&c->ssl, &c->fd,
-                        mbedtls_bio_send, mbedtls_bio_recv, NULL);
+    mbedtls_ssl_set_bio(&c->ssl, &c->fd, bio_send, bio_recv, NULL);
 
     if (verbose) write_err("* TLS handshake...\n");
 

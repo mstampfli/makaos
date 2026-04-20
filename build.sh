@@ -164,14 +164,6 @@ if [ ! -f "$MBEDTLS_LIB" ] || [ "${REBUILD_MBEDTLS:-0}" = "1" ]; then
   SYSROOT="$SYSROOT" bash scripts/port-mbedtls.sh
 fi
 
-# Glue — hardware_poll / ms_time / BIO shims.  Compiles sysroot-style:
-# the same include topology as any external client of mbedTLS.
-"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
-  -DMBEDTLS_CONFIG_FILE='<mbedtls_config.h>' \
-  -I scripts/configs \
-  -c scripts/glue/mbedtls_glue.c \
-  -o "$BUILD_DIR/user_mbedtls_glue.o"
-
 USER_INCLUDES=(
   -I "$USERLAND_DIR/libc"
   -I "$USERLAND_DIR/include"
@@ -270,7 +262,6 @@ fi
 "$USER_CC" "${USER_CFLAGS[@]}" \
    "$BUILD_DIR/user_http_get.o" \
    "$BUILD_DIR/user_http_get_tls.o" \
-   "$BUILD_DIR/user_mbedtls_glue.o" \
    "$SYSROOT/usr/lib/libmbedtls.a" \
    -o "$BUILD_DIR/user_http_get.elf"
 

@@ -1,10 +1,11 @@
 // ── MakaOS mbedTLS build config ───────────────────────────────────────
 //
 // Enables TLS 1.3 (+ 1.2 fallback), modern AEADs, and both RSA- and
-// ECDSA-signed X.509 chains.  Disables features that depend on a hosted
-// POSIX environment (file I/O, BSD sockets, platform entropy sources)
-// since MakaOS provides its own glue via mbedtls_hardware_poll + custom
-// BIO callbacks.
+// ECDSA-signed X.509 chains.  Everything else is the stock mbedTLS
+// build — MakaOS libc provides enough POSIX (open/read/close on
+// /dev/urandom, clock_gettime, malloc, send/recv) that mbedTLS's
+// default platform shims work without any MakaOS-specific overrides.
+// No glue file; apps own their own BIO callbacks.
 //
 // Trim goals:
 //   * No DTLS (we only do TCP).
@@ -26,36 +27,19 @@
 
 // ── Platform abstraction ──────────────────────────────────────────────
 
-#define MBEDTLS_PLATFORM_C              // required by MS_TIME_ALT, etc.
+#define MBEDTLS_PLATFORM_C
+#define MBEDTLS_HAVE_TIME            // cert validity checks use time()
+// Skip MBEDTLS_HAVE_TIME_DATE — that needs gmtime_r which libc lacks.
+#define MBEDTLS_HAVE_ASM             // inline asm optimisations OK on x86_64
 
-// We have a real malloc/free in userland/libc/libc.c — let mbedtls
-// call them directly (the default).  No MBEDTLS_PLATFORM_MEMORY needed.
-
-// No stdio-backed fprintf/exit hooks — keep the defaults.
-// (mbedtls uses printf only in debug paths we don't compile in.)
-
-// We have time() in libc.  Certificate validity checks need it.
-#define MBEDTLS_HAVE_TIME
-// Skip MBEDTLS_HAVE_TIME_DATE — that needs gmtime_r which our libc lacks.
-// mbedTLS falls back to a simpler epoch-seconds comparison without it.
-
-// We provide our own millisecond clock in mbedtls_glue.c (libc lacks
-// clock_gettime; just multiply time() by 1000 there).
-#define MBEDTLS_PLATFORM_MS_TIME_ALT
-
-// Let strstr etc. be the libc ones.  They're correct.
-#define MBEDTLS_HAVE_ASM            // allow inline asm optimisations
-
-// ── Entropy: MakaOS-provided only ─────────────────────────────────────
-// Kernel CSPRNG (RDRAND + RDSEED + TSC jitter + per-IRQ timing + DRAM
-// noise, SHA-256 pool, ChaCha20 DRBG) is exposed via /dev/urandom.
-// The glue layer reads from there inside mbedtls_hardware_poll.
-
-#define MBEDTLS_NO_PLATFORM_ENTROPY     // don't try /dev/urandom directly
-#define MBEDTLS_ENTROPY_HARDWARE_ALT    // use our mbedtls_hardware_poll
+// ── Entropy ───────────────────────────────────────────────────────────
+// mbedTLS's default platform entropy reads /dev/urandom, which MakaOS
+// exposes via the kernel CSPRNG (RDRAND + RDSEED + TSC jitter + per-IRQ
+// timing + DRAM noise, SHA-256 pool, ChaCha20 DRBG).  No override: stock
+// mbedtls_platform_entropy_poll() just works.
 #define MBEDTLS_ENTROPY_C
-#define MBEDTLS_CTR_DRBG_C              // counter-mode DRBG on top of entropy
-#define MBEDTLS_HMAC_DRBG_C             // alt DRBG for EC key gen etc.
+#define MBEDTLS_CTR_DRBG_C           // counter-mode DRBG on top of entropy
+#define MBEDTLS_HMAC_DRBG_C          // alt DRBG for EC key gen etc.
 
 // ── PSA Crypto (required for TLS 1.3 in mbedTLS 3.x) ──────────────────
 // TLS 1.3 in 3.x routes everything through PSA.  Enabling this + not
