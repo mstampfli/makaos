@@ -1,22 +1,24 @@
-// http_get — MakaOS HTTP/1.1 client
+// http_get — MakaOS HTTP/1.1 client (now with HTTPS via mbedTLS)
 //
 // Usage:
-//   http_get [-v] [-o outfile] <url>
+//   http_get [-v] [-k] [-o outfile] <url>
 //
 // Supports:
-//   • Absolute URLs: http://host[:port][/path]
-//   • gethostbyname_ipv4() via libc DNS resolver
+//   • Absolute URLs: http://host[:port][/path]  AND  https://...
+//   • TLS via mbedTLS 3.6 (TLS 1.3 + 1.2 fallback, X25519 / P-256 /
+//     P-384 / RSA, AES-GCM / ChaCha20-Poly1305).  -k to skip cert
+//     verification (we don't ship a CA bundle yet).
 //   • HTTP/1.1 GET with Host / User-Agent / Connection: close
 //   • Chunked transfer encoding (RFC 7230 §4.1)
 //   • Content-Length framing
 //   • Redirect chain: 301/302/303/307/308, max 10 hops
 //   • Writes body to stdout (or -o file)
-//
-// Non-goals: HTTPS (no TLS), HTTP/2, compression, cookies.
 
 #include "libc.h"
+#include "https_client.h"
 
 #define HTTP_PORT_DEFAULT  80
+#define HTTPS_PORT_DEFAULT 443
 #define RECV_BUF_SIZE      4096
 #define MAX_HEADER_SIZE    8192
 #define MAX_REDIRECTS      10
@@ -26,6 +28,7 @@
 typedef struct {
     char     host[256];
     uint16_t port;
+    int      is_https;          // 1 → TLS, 0 → plain HTTP
     char     path[1024];
 } url_t;
 
@@ -34,11 +37,13 @@ static int parse_url(const char* url, url_t* out) {
     out->port = HTTP_PORT_DEFAULT;
 
     const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
-    else if (strncmp(p, "https://", 8) == 0) {
-        // We don't support TLS — but accept the scheme so redirect handling
-        // can surface a meaningful error.
-        return -2;
+    if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+        out->is_https = 0;
+    } else if (strncmp(p, "https://", 8) == 0) {
+        p += 8;
+        out->is_https = 1;
+        out->port     = HTTPS_PORT_DEFAULT;
     }
 
     // Host[:port]
@@ -75,13 +80,13 @@ static int parse_url(const char* url, url_t* out) {
     return 0;
 }
 
-// ── Socket I/O helpers ────────────────────────────────────────────────────
+// ── conn_t I/O helpers (transparent over HTTP / HTTPS) ───────────────────
 
-static int send_all(int fd, const void* buf, size_t len) {
+static int send_all(conn_t* c, const void* buf, size_t len) {
     const uint8_t* p = (const uint8_t*)buf;
     size_t remaining = len;
     while (remaining > 0) {
-        ssize_t n = send(fd, p, remaining, 0);
+        ssize_t n = conn_send(c, p, remaining);
         if (n <= 0) return -1;
         p += n;
         remaining -= (size_t)n;
@@ -94,10 +99,10 @@ static int send_all(int fd, const void* buf, size_t len) {
 // the header block if the server packed header+body into one segment), and
 // writes the header-end position (first byte of body) to *header_end_out.
 // Returns -1 on error.
-static ssize_t recv_headers(int fd, char* buf, size_t max, size_t* header_end_out) {
+static ssize_t recv_headers(conn_t* c, char* buf, size_t max, size_t* header_end_out) {
     size_t total = 0;
     while (total < max - 1) {
-        ssize_t n = recv(fd, buf + total, max - 1 - total, 0);
+        ssize_t n = conn_recv(c, buf + total, max - 1 - total);
         if (n <= 0) return -1;
         total += (size_t)n;
         buf[total] = '\0';
@@ -174,9 +179,9 @@ static int parse_status(const char* headers) {
 
 // ── Body readers ──────────────────────────────────────────────────────────
 
-// Read exactly `n` bytes from fd into `out_fd`, using `initial` bytes already
+// Read exactly `n` bytes from `c` into `out_fd`, using `initial` bytes already
 // buffered (from the header read).
-static int drain_content_length(int sock, int out_fd, const uint8_t* initial,
+static int drain_content_length(conn_t* c, int out_fd, const uint8_t* initial,
                                   size_t initial_len, uint64_t content_len) {
     uint64_t remaining = content_len;
 
@@ -190,7 +195,7 @@ static int drain_content_length(int sock, int out_fd, const uint8_t* initial,
     uint8_t buf[RECV_BUF_SIZE];
     while (remaining > 0) {
         size_t want = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
-        ssize_t n = recv(sock, buf, want, 0);
+        ssize_t n = conn_recv(c, buf, want);
         if (n <= 0) return -1;
         if (write(out_fd, buf, (size_t)n) != n) return -1;
         remaining -= (size_t)n;
@@ -199,9 +204,9 @@ static int drain_content_length(int sock, int out_fd, const uint8_t* initial,
 }
 
 // Read HTTP chunked body. `initial` contains bytes that were read past the
-// end of the header block; we continue reading from `sock` as needed.
+// end of the header block; we continue reading from `c` as needed.
 typedef struct {
-    int sock;
+    conn_t* c;
     uint8_t buf[RECV_BUF_SIZE];
     size_t  pos;
     size_t  len;
@@ -209,7 +214,7 @@ typedef struct {
 
 static int cr_fill(chunked_reader_t* cr) {
     if (cr->pos < cr->len) return 0;
-    ssize_t n = recv(cr->sock, cr->buf, sizeof(cr->buf), 0);
+    ssize_t n = conn_recv(cr->c, cr->buf, sizeof(cr->buf));
     if (n <= 0) return -1;
     cr->pos = 0;
     cr->len = (size_t)n;
@@ -255,10 +260,10 @@ static int cr_readn(chunked_reader_t* cr, int out_fd, uint64_t n) {
     return 0;
 }
 
-static int drain_chunked(int sock, int out_fd,
+static int drain_chunked(conn_t* c, int out_fd,
                           const uint8_t* initial, size_t initial_len) {
     chunked_reader_t cr;
-    cr.sock = sock;
+    cr.c   = c;
     cr.pos = 0;
     cr.len = 0;
     if (initial_len > sizeof(cr.buf)) return -1;
@@ -288,7 +293,7 @@ static int drain_chunked(int sock, int out_fd,
 }
 
 // Read body until the server closes the connection (no C-L, no chunked).
-static int drain_until_close(int sock, int out_fd,
+static int drain_until_close(conn_t* c, int out_fd,
                               const uint8_t* initial, size_t initial_len) {
     if (initial_len > 0) {
         if (write(out_fd, initial, initial_len) != (ssize_t)initial_len)
@@ -296,7 +301,7 @@ static int drain_until_close(int sock, int out_fd,
     }
     uint8_t buf[RECV_BUF_SIZE];
     for (;;) {
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        ssize_t n = conn_recv(c, buf, sizeof(buf));
         if (n == 0) return 0;
         if (n < 0)  return -1;
         if (write(out_fd, buf, (size_t)n) != n) return -1;
@@ -311,8 +316,8 @@ typedef struct {
     char location[1024];
 } http_result_t;
 
-static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
-                         http_result_t* r) {
+static int http_get_one(const url_t* url, int verbose, int insecure,
+                         int out_fd, int raw_fd, http_result_t* r) {
     if (verbose) {
         char line[512];
         int n = snprintf(line, sizeof(line),
@@ -320,35 +325,8 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
         if (n > 0) write(2, line, (size_t)n);
     }
 
-    uint32_t ip_be;
-    if (gethostbyname_ipv4(url->host, &ip_be) < 0) {
-        write(2, "* DNS resolution failed\n", 24);
-        return -1;
-    }
-
-    if (verbose) {
-        char ipstr[16];
-        inet_ntop(AF_INET, &ip_be, ipstr, sizeof(ipstr));
-        char line[128];
-        int n = snprintf(line, sizeof(line),
-                         "* connecting to %s:%u\n", ipstr, (unsigned)url->port);
-        if (n > 0) write(2, line, (size_t)n);
-    }
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { write(2, "* socket() failed\n", 18); return -1; }
-
-    sockaddr_in_t dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(url->port);
-    dst.sin_addr   = ip_be;
-
-    if (connect(sock, (struct sockaddr*)&dst, sizeof(dst)) < 0) {
-        write(2, "* connect() failed\n", 19);
-        close(sock);
-        return -1;
-    }
+    conn_t* c = conn_open(url->host, url->port, url->is_https, insecure, verbose);
+    if (!c) return -1;
 
     // Build request
     char req[2048];
@@ -361,7 +339,7 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
         "\r\n",
         url->path, url->host);
     if (rlen < 0 || rlen >= (int)sizeof(req)) {
-        close(sock);
+        conn_close(c);
         return -1;
     }
 
@@ -370,9 +348,9 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
         write(2, req, (size_t)rlen);
     }
 
-    if (send_all(sock, req, (size_t)rlen) < 0) {
-        write(2, "* send() failed\n", 16);
-        close(sock);
+    if (send_all(c, req, (size_t)rlen) < 0) {
+        write(2, "* send failed\n", 14);
+        conn_close(c);
         return -1;
     }
 
@@ -380,10 +358,10 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
     // which may include peeked body bytes; header_end points at body start).
     static char hdr[MAX_HEADER_SIZE];
     size_t header_end = 0;
-    ssize_t total = recv_headers(sock, hdr, sizeof(hdr), &header_end);
+    ssize_t total = recv_headers(c, hdr, sizeof(hdr), &header_end);
     if (total < 0 || header_end == 0) {
         write(2, "* failed to read headers\n", 25);
-        close(sock);
+        conn_close(c);
         return -1;
     }
 
@@ -393,7 +371,7 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
 
     // Parse status line
     int status = parse_status(hdr);
-    if (status < 0) { close(sock); return -1; }
+    if (status < 0) { conn_close(c); return -1; }
     r->status = status;
     r->location[0] = '\0';
 
@@ -415,12 +393,12 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
                 (void)write(raw_fd, hdr + header_end, initial_len);
             uint8_t buf[RECV_BUF_SIZE];
             for (int i = 0; i < 16; i++) {
-                ssize_t n = recv(sock, buf, sizeof(buf), 0);
+                ssize_t n = conn_recv(c, buf, sizeof(buf));
                 if (n <= 0) break;
                 (void)write(raw_fd, buf, (size_t)n);
             }
         }
-        close(sock);
+        conn_close(c);
         return 0;
     }
 
@@ -440,15 +418,15 @@ static int http_get_one(const url_t* url, int verbose, int out_fd, int raw_fd,
 
     int drain_rc;
     if (have_chunked) {
-        drain_rc = drain_chunked(sock, out_fd, initial, initial_len);
+        drain_rc = drain_chunked(c, out_fd, initial, initial_len);
     } else if (have_cl) {
         uint64_t len = strtoul(cl, NULL, 10);
-        drain_rc = drain_content_length(sock, out_fd, initial, initial_len, len);
+        drain_rc = drain_content_length(c, out_fd, initial, initial_len, len);
     } else {
-        drain_rc = drain_until_close(sock, out_fd, initial, initial_len);
+        drain_rc = drain_until_close(c, out_fd, initial, initial_len);
     }
 
-    close(sock);
+    conn_close(c);
     return drain_rc < 0 ? -1 : 0;
 }
 
@@ -479,12 +457,14 @@ static int resolve_redirect(const url_t* base, const char* loc, url_t* out) {
 
 static void usage(void) {
     const char* msg =
-        "usage: http_get [-v] [-o outfile] <url>\n";
+        "usage: http_get [-v] [-k] [-o outfile] [-e errfile] [-r rawfile] <url>\n"
+        "  -k   skip TLS certificate verification (no CA bundle yet)\n";
     write(2, msg, strlen(msg));
 }
 
 int main(int argc, char** argv) {
     int verbose = 0;
+    int insecure = 0;
     const char* out_path = NULL;
     const char* err_path = NULL;
     const char* raw_path = NULL;
@@ -492,6 +472,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) verbose = 1;
+        else if (strcmp(argv[i], "-k") == 0) insecure = 1;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             out_path = argv[++i];
         } else if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) {
@@ -541,7 +522,7 @@ int main(int argc, char** argv) {
     for (int hop = 0; hop < MAX_REDIRECTS; hop++) {
         http_result_t r;
         memset(&r, 0, sizeof(r));
-        if (http_get_one(&url, verbose, out_fd, raw_fd, &r) < 0) {
+        if (http_get_one(&url, verbose, insecure, out_fd, raw_fd, &r) < 0) {
             if (out_fd > 2) close(out_fd);
             return 1;
         }

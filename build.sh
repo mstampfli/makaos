@@ -223,7 +223,18 @@ ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_restrict.o" \
    -o "$BUILD_DIR/user_restrict.elf"
 
 "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/http_get/http_get.c" -o "$BUILD_DIR/user_http_get.o"
-ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_http_get.o" \
+# https_client.c includes mbedtls headers — needs the same shim/include
+# topology as the library itself.
+"$CC" "${USER_CFLAGS[@]}" "${MBEDTLS_CFLAGS[@]}" "${MBEDTLS_INCLUDES[@]}" \
+  -c "$USERLAND_DIR/apps/http_get/https_client.c" \
+  -o "$BUILD_DIR/user_http_get_tls.o"
+LIBGCC="$("$CC" -print-libgcc-file-name)"
+ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" \
+   "$BUILD_DIR/user_http_get.o" \
+   "$BUILD_DIR/user_http_get_tls.o" \
+   "$BUILD_DIR/user_mbedtls_glue.o" \
+   "$USERLAND_DIR/libs/mbedtls/libmbedtls.a" \
+   "$LIBGCC" \
    -o "$BUILD_DIR/user_http_get.elf"
 
 
