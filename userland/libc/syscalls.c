@@ -21,6 +21,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <sys/eventfd.h>
 
 // ── I/O ───────────────────────────────────────────────────────────────
 
@@ -102,6 +103,23 @@ int clock_getres(clockid_t id, struct timespec* res) {
 // ── setbuf — thin wrapper over setvbuf (which libc.c provides). ───────
 void setbuf(FILE* f, char* buf) {
     setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+// ── eventfd (Linux-compatible 64-bit counter fd) ──────────────────────
+// Thin kernel wrapper; read/write go through the normal fd read/write
+// path because kernel/io/eventfd.c installs its own vfs ops.
+int eventfd(unsigned int initval, int flags) {
+    return (int)__syscall_ret(
+        syscall2(SYS_EVENTFD, (uint64_t)initval, (uint64_t)(unsigned int)flags));
+}
+
+int eventfd_read(int fd, eventfd_t* value) {
+    if (!value) { errno = EINVAL; return -1; }
+    return read(fd, value, sizeof(*value)) == (ssize_t)sizeof(*value) ? 0 : -1;
+}
+
+int eventfd_write(int fd, eventfd_t value) {
+    return write(fd, &value, sizeof(value)) == (ssize_t)sizeof(value) ? 0 : -1;
 }
 
 // ── Sockets + time(NULL)/nanosleep — provided by libc.c's extern
