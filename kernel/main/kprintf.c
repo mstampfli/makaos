@@ -47,13 +47,44 @@ static void kp_s32(kp_out_t out, int32_t v) {
     else       {           kp_u64(out, (uint64_t)v, 10, 0); }
 }
 
+// Emit a number with optional zero-padded minimum width.
+static void kp_u64_padded(kp_out_t out, uint64_t v, uint8_t base, int upper,
+                            int width, int zero_pad) {
+    // Render into a local buffer so we know the natural length.
+    char tmp[24];
+    int n = 0;
+    if (v == 0) { tmp[n++] = '0'; }
+    else {
+        while (v) {
+            uint8_t d = (uint8_t)(v % base);
+            tmp[n++] = (char)(d < 10 ? '0' + d
+                                      : (upper ? 'A' : 'a') + (d - 10));
+            v /= base;
+        }
+    }
+    for (int i = n; i < width; i++) out(zero_pad ? '0' : ' ');
+    while (n--) out(tmp[n]);
+}
+
 // Core formatter — parameterized on the output sink so the same body
 // serves both kprintf (per-char-locked) and kprintf_atomic (outer-lock).
+// Supports %c, %s, %d, %u, %x/%X, %p, %% — with optional '0' flag and
+// decimal minimum width on the integer conversions.  `l` length modifier
+// promotes to 64-bit; nothing else is parsed.
 static void kp_format(kp_out_t out, const char* fmt, va_list ap) {
     for (; *fmt; fmt++) {
         if (*fmt != '%') { out(*fmt); continue; }
         fmt++;
         if (!*fmt) break;
+
+        int zero_pad = 0;
+        int width    = 0;
+        if (*fmt == '0') { zero_pad = 1; fmt++; if (!*fmt) break; }
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+            if (!*fmt) return;
+        }
 
         int is_long = 0;
         if (*fmt == 'l') { is_long = 1; fmt++; if (!*fmt) break; }
@@ -62,18 +93,24 @@ static void kp_format(kp_out_t out, const char* fmt, va_list ap) {
         case 'c': out((char)va_arg(ap, int)); break;
         case 's': kp_puts(out, va_arg(ap, const char*)); break;
         case 'd': kp_s32(out, va_arg(ap, int32_t)); break;
-        case 'u':
-            if (is_long) kp_u64(out, va_arg(ap, uint64_t), 10, 0);
-            else         kp_u64(out, (uint64_t)va_arg(ap, uint32_t), 10, 0);
+        case 'u': {
+            uint64_t v = is_long ? va_arg(ap, uint64_t)
+                                 : (uint64_t)va_arg(ap, uint32_t);
+            kp_u64_padded(out, v, 10, 0, width, zero_pad);
             break;
-        case 'x':
-            if (is_long) kp_u64(out, va_arg(ap, uint64_t), 16, 0);
-            else         kp_u64(out, (uint64_t)va_arg(ap, uint32_t), 16, 0);
+        }
+        case 'x': {
+            uint64_t v = is_long ? va_arg(ap, uint64_t)
+                                 : (uint64_t)va_arg(ap, uint32_t);
+            kp_u64_padded(out, v, 16, 0, width, zero_pad);
             break;
-        case 'X':
-            if (is_long) kp_u64(out, va_arg(ap, uint64_t), 16, 1);
-            else         kp_u64(out, (uint64_t)va_arg(ap, uint32_t), 16, 1);
+        }
+        case 'X': {
+            uint64_t v = is_long ? va_arg(ap, uint64_t)
+                                 : (uint64_t)va_arg(ap, uint32_t);
+            kp_u64_padded(out, v, 16, 1, width, zero_pad);
             break;
+        }
         case 'p': {
             uint64_t p = (uint64_t)va_arg(ap, void*);
             out('0'); out('x');
