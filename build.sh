@@ -177,6 +177,15 @@ if [ ! -f "$MBEDTLS_LIB" ] || [ "${REBUILD_MBEDTLS:-0}" = "1" ]; then
   SYSROOT="$SYSROOT" bash scripts/port-mbedtls.sh
 fi
 
+# ── Tier 2 foundation libraries (fast idempotent ports) ────────────────
+# Each port script is a no-op when its target sits newer than its
+# sources, so re-running build.sh is cheap.  Sysroot is always self-
+# consistent because build.sh wipes + re-populates it every run.
+for port in zlib expat; do
+  echo "[+] Building Tier 2 lib: $port"
+  SYSROOT="$SYSROOT" bash "scripts/port-$port.sh"
+done
+
 USER_INCLUDES=(
   -I "$USERLAND_DIR/libc"
   -I "$USERLAND_DIR/include"

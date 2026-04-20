@@ -14,6 +14,22 @@
 #define INFINITY   __builtin_inff()
 #define NAN        __builtin_nanf("")
 
+// C99 classification macros — compiler builtins, no libm call needed.
+#define isnan(x)      __builtin_isnan(x)
+#define isinf(x)      __builtin_isinf(x)
+#define isfinite(x)   __builtin_isfinite(x)
+#define isnormal(x)   __builtin_isnormal(x)
+#define signbit(x)    __builtin_signbit(x)
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, \
+                                             FP_NORMAL, FP_SUBNORMAL, \
+                                             FP_ZERO, (x))
+
+#define FP_NAN        0
+#define FP_INFINITE   1
+#define FP_NORMAL     2
+#define FP_SUBNORMAL  3
+#define FP_ZERO       4
+
 double floor(double);
 double ceil(double);
 double round(double);

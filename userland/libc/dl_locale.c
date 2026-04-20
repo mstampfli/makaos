@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <locale.h>
 #include <langinfo.h>
+#include <makaos/syscall.h>
 
 // ── dlfcn ────────────────────────────────────────────────────────────
 // All operations fail predictably: dlopen returns NULL and dlerror
@@ -137,4 +138,70 @@ char* nl_langinfo(nl_item item) {
     case T_FMT_AMPM: return (char*)s_t_fmt_ampm;
     default:         return (char*)s_empty;
     }
+}
+
+// ── getenv (real external symbol) ────────────────────────────────────
+// libc.h has a static inline that works for in-tree apps; ported
+// libraries via the split headers need a linkable symbol.  Shares
+// the same `environ` table the loader populates.
+extern char** environ;
+
+char* getenv(const char* name) {
+    if (!environ || !name) return (char*)0;
+    size_t nlen = 0; while (name[nlen]) nlen++;
+    for (char** e = environ; *e; e++) {
+        size_t klen = 0;
+        while ((*e)[klen] && (*e)[klen] != '=') klen++;
+        if ((*e)[klen] != '=') continue;
+        if (klen != nlen) continue;
+        int eq = 1;
+        for (size_t i = 0; i < nlen; i++)
+            if ((*e)[i] != name[i]) { eq = 0; break; }
+        if (eq) return (*e) + nlen + 1;
+    }
+    return (char*)0;
+}
+
+// ── gettimeofday ─────────────────────────────────────────────────────
+// POSIX.  expat, libffi, curl, many others call it.  MakaOS has only
+// a monotonic nanosecond clock via SYS_CLOCK_NS; we return that as
+// both sec + usec.  Matches enough of POSIX semantics for these
+// libraries (none depend on wall-clock accuracy).
+struct __k_timeval { long tv_sec; long tv_usec; };
+
+int gettimeofday(struct __k_timeval* tv, void* tz) {
+    (void)tz;
+    if (!tv) { errno = EINVAL; return -1; }
+    uint64_t ns = syscall0(SYS_CLOCK_NS);
+    tv->tv_sec  = (long)(ns / 1000000000ull);
+    tv->tv_usec = (long)((ns % 1000000000ull) / 1000ull);
+    return 0;
+}
+
+// ── __assert_fail (glibc-style assert stub) ──────────────────────────
+// expat + many others call this when compiled with NDEBUG undefined.
+// We print via write(2) to stderr + exit — matches glibc behaviour.
+extern ssize_t write(int fd, const void* buf, size_t n);
+
+void __assert_fail(const char* expr, const char* file,
+                     unsigned int line, const char* func) {
+    (void)line; (void)func;
+    const char prefix[] = "assert failed: ";
+    const char nl[]     = "\n";
+    write(2, prefix, sizeof(prefix) - 1);
+    if (expr) { size_t n = 0; while (expr[n]) n++; write(2, expr, n); }
+    write(2, " at ", 4);
+    if (file) { size_t n = 0; while (file[n]) n++; write(2, file, n); }
+    write(2, nl, 1);
+    // Direct SYS_EXIT — libc.h's static-inline exit isn't visible here.
+    syscall1(SYS_EXIT, 134);
+    __builtin_unreachable();
+}
+
+// Real extern exit() for sysroot consumers.  abort() and _exit()
+// already exist elsewhere in libc.c — don't redefine here.
+__attribute__((noreturn))
+void exit(int status) {
+    syscall1(SYS_EXIT, (uint64_t)status);
+    __builtin_unreachable();
 }
