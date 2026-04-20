@@ -146,12 +146,18 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/pthread.c" -o "$BUILD_DIR/user_pthread.o"
 
+# dl_locale: real extern symbols for <dlfcn.h>/<locale.h>/<langinfo.h>
+# so sysroot-linked C++ ports (harfbuzz, ICU, fontconfig, curl) resolve.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/dl_locale.c" -o "$BUILD_DIR/user_dl_locale.o"
+
 # libc archive — anything linking sysroot-style pulls this in as -lc.
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_stdio.o" \
    "$BUILD_DIR/user_dns.o" "$BUILD_DIR/user_math.o" \
    "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o" \
-   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o"
+   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o" \
+   "$BUILD_DIR/user_dl_locale.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still
