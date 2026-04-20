@@ -457,6 +457,13 @@ static void init_kthread(void) {
     extern void signalfd_selftest(void);
     signalfd_selftest();
 
+    // Tier 2.5a (virtio-gpu): full pipeline exerciser — creates a 2D
+    // resource sized to scanout 0, attaches backing, SET_SCANOUT,
+    // paints a 4-quadrant test pattern, TRANSFER + FLUSH so it's
+    // actually on screen.  Silently no-ops if no virtio-gpu device.
+    extern int virtio_gpu_present_test(void);
+    (void)virtio_gpu_present_test();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.
