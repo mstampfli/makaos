@@ -47,6 +47,13 @@ typedef struct {
 
 _Static_assert(sizeof(io_cqe_t) == 16, "io_cqe_t must be 16 bytes");
 
+// Overflow CQE storage (forward-declared in io_uring_t above).
+// Small — one cqe + one next-pointer per node.
+struct io_overflow_cqe {
+    struct io_overflow_cqe* next;
+    io_cqe_t                cqe;
+};
+
 // ── Opcodes (subset; more added in Phase 8H) ────────────────────────
 enum {
     IORING_OP_NOP      = 0,
@@ -78,7 +85,10 @@ enum {
 
 // ── SQE flags ──────────────────────────────────────────────────────
 #define IOSQE_FIXED_FILE         (1u << 0)    // SQE's fd is an index into fixed files (Phase 8G)
-#define IOSQE_ASYNC              (1u << 1)    // Phase 8E: route through io_wq worker kthread
+#define IOSQE_ASYNC              (1u << 1)    // Phase 8E: force io_wq worker dispatch
+#define IOSQE_IO_LINK            (1u << 2)    // next SQE depends on this one; fail → cancel rest
+#define IOSQE_IO_HARDLINK        (1u << 3)    // next SQE runs regardless of this one's result
+#define IOSQE_FORCE_SYNC         (1u << 4)    // override the auto-async-for-blocking-ops policy
 
 // ── io_uring_params (kernel ↔ user) ─────────────────────────────────
 // Filled by io_uring_setup.  sq_entries / cq_entries are requested in;
@@ -134,12 +144,19 @@ struct mm_t;
 struct task_t;
 struct vfs_file_t;
 
-// ── io_wq work item (Phase 8E) ─────────────────────────────────────
+// ── io_wq work item (Phase 8E + 8I linked chains) ──────────────────
 // Queued onto the ring's per-worker pending list (Treiber stack).
 // Allocated from a dedicated slab cache so enqueue is a single CAS.
+//
+// Linked ops (IOSQE_IO_LINK / IOSQE_IO_HARDLINK) are represented as
+// a chain: `chain_next` points to the next link, NULL at the end.
+// The worker walks the chain sequentially; on IO_LINK failure it
+// cancels the tail by posting -ECANCELED for each remaining item
+// (stopping at the first HARDLINK boundary).
 struct io_wq_work;
 typedef struct io_wq_work {
-    struct io_wq_work* next;        // lockless Treiber stack next
+    struct io_wq_work* next;        // Treiber stack link (queue side)
+    struct io_wq_work* chain_next;  // linked-chain next (NULL = chain end)
     io_sqe_t           sqe;         // SQE snapshot (SQ slot is reused)
     struct io_uring*   uring;       // back-pointer for CQE post
 } io_wq_work_t;
@@ -185,6 +202,16 @@ typedef struct io_uring {
     struct vfs_file_t** fixed_files;    // NULL = no registration
     uint32_t            fixed_files_nr;
     spinlock_t          fixed_files_lock;
+
+    // ── CQ overflow list (Phase 8 follow-up) ───────────────────
+    // When the CQ is full, CQEs would be dropped — instead they
+    // go onto a kernel-side singly-linked list.  Next post_cqe
+    // that finds CQ space drains the list head-first before
+    // publishing new CQEs.  Matches Linux io_uring's overflow
+    // handling.
+    struct io_overflow_cqe* overflow_head;
+    struct io_overflow_cqe* overflow_tail;
+    spinlock_t              overflow_lock;
 
     // Kernel-side aliases (HHDM) into the backing memory — lets the
     // kernel read/write ring fields without going through the user

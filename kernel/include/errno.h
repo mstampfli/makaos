@@ -54,3 +54,4 @@
 #define EHOSTUNREACH 113 // No route to host
 #define EINPROGRESS  115 // Operation now in progress (nonblocking connect)
 #define EALREADY     114 // Operation already in progress
+#define ECANCELED    125 // Operation canceled (io_uring IO_LINK cascade)
