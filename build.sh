@@ -64,7 +64,7 @@ KERNEL_CFLAGS=(
   -O2
   -g
   -fno-strict-aliasing          # kernel casts through pointers all the time
-  -D__KERNEL__                  # distinguishes kernel-compiled crypto from userland
+  -D__KERNEL__                  # kernel code uses common.h; userland uses libc.h
   -Wall -Wextra
   -Wno-unused-parameter
   -Wno-missing-field-initializers
