@@ -4,9 +4,9 @@ MakaOS UEFI bootloader starting
 GOP fb=0x0000000080000000
     w=0x0000000000000500
     h=0x0000000000000320
-kernel.bin size=0x00000000000504FB
+kernel.bin size=0x00000000000524FB
 kernel_phys=0x000000000C000000
-kernel loaded, bytes=0x00000000000504FB
+kernel loaded, bytes=0x00000000000524FB
 phys_ceiling=0x0000000100000000
 pml4_phys=0x000000000DFFA000
 Calling ExitBootServices...
@@ -23,21 +23,25 @@ K
 [net] IP 0.0.0.0 GW 0.0.0.0
 [net] MAC 52:54:00:12:34:56
 [net] ready
-[elf] lazy /bin/login: header 562 us (demand-paged)
-[elf] lazy /bin/svcmgr: header 670 us (demand-paged)
+[elf] lazy /bin/login: header 39 us (demand-paged)
+[elf] lazy /bin/svcmgr: header 239 us (demand-paged)
 [chaselev] self-test starting: N=20000 thieves=3 cap=512
-[elf] lazy /bin/net: header 218 us (demand-paged)
+[elf] lazy /bin/net: header 1001 us (demand-paged)
 [net] ifconfig IP 10.0.2.15 GW 10.0.2.2
-[chaselev] pushed=20000 owner_popped=8044 thief_stolen=11956 found=20000 missing=0 duplicates=0
+[chaselev] pushed=20000 owner_popped=11953 thief_stolen=8047 found=20000 missing=0 duplicates=0
 [chaselev] SELF-TEST PASSED
 [slab_test] starting: workers=4 iters=50000 mixed sizes (8..1024)
-[slab_test] allocs=200000 slab_hits=400028 slab_misses=13 hit_rate=9999/10000
+[slab_test] allocs=200000 slab_hits=400028 slab_misses=12 hit_rate=9999/10000
 [slab_test] pcp_hits=11 pcp_misses=1 hit_rate=9166/10000
 [slab_test] SELF-TEST PASSED (slab hit rate >= 95%)
 [typesafe_test] starting
 [typesafe_test] SELF-TEST PASSED (defer → grace → reclaim)
 [dcache_test] starting
 [dcache_test] hits=19015 misses=4 hit_rate=9997/10000
-[dcache_test] cold=738 ns/lookup warm=263 ns/lookup speedup=2x
+[dcache_test] cold=2397 ns/lookup warm=1096 ns/lookup speedup=2x
 [dcache_test] live=14 table_cap=256 installs=4 evictions=0
 [dcache_test] SELF-TEST PASSED
+[io_uring_test] starting
+[io_uring_test] NOP batch: 32 ops in 5114 ns (159 ns/op)
+[io_uring_test] steady-state: 100 rounds × 32 ops, 165 ns/op avg
+[io_uring_test] SELF-TEST PASSED

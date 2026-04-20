@@ -199,6 +199,12 @@ typedef struct __attribute__((aligned(16))) task_t {
     char*         cwd;          // current working directory (absolute path, heap-allocated KPATH_MAX)
     char          comm[16];     // short process name (basename of argv[0], NUL-terminated)
 
+    // ── kthread-private handoff ──────────────────────────────────────────
+    // Opaque pointer used by kthread entry functions to locate their
+    // context (e.g. io_wq worker finds its io_uring_t here).  Set by
+    // the spawner before sched_add; unused by regular user tasks.
+    void*         kthread_ctx;
+
     // ── Security ──────────────────────────────────────────────────────────
     cred_t        cred;         // uid/gid/euid/egid/suid/sgid + supplemental groups
     uint32_t      pledge_mask;  // PLEDGE_* bitmask; starts as PLEDGE_ALL (no restriction)

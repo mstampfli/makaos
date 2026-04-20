@@ -115,6 +115,9 @@
 #define SYS_EPOLL_CTL    98 // epoll_ctl(epfd,op,fd,event*)         → 0 or -errno
 #define SYS_EPOLL_WAIT   99 // epoll_wait(epfd,events,maxev,timeout)→ count or -errno
 #define SYS_SLABINFO     100 // slabinfo(slabinfo_t*) → fills per-CPU slab/pcp counters
+#define SYS_IO_URING_SETUP    101 // setup(entries, io_uring_params*) → ring fd
+#define SYS_IO_URING_ENTER    102 // enter(fd, to_submit, min_complete, flags) → submitted
+#define SYS_IO_URING_REGISTER 103 // register(fd, op, arg*, nr_args) → 0 or -errno
 
 // ── epoll types ───────────────────────────────────────────────────────────
 #define EPOLLIN      0x00000001u
