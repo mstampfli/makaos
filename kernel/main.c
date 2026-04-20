@@ -448,6 +448,11 @@ static void init_kthread(void) {
     extern void socketpair_selftest(void);
     socketpair_selftest();
 
+    // Tier 1 #5 (SCM_RIGHTS): fd round-trip over unix_sock_sendfd/recvfd.
+    // Userland sendmsg/recvmsg marshals cmsg into these primitives.
+    extern void scm_rights_selftest(void);
+    scm_rights_selftest();
+
     // Stress harnesses are compiled in but not auto-launched — reference
     // them here to suppress unused-function warnings.  Re-enable by
     // calling the launch fn directly when investigating SMP regressions.

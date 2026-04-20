@@ -4605,6 +4605,208 @@ static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
     return 0;
 }
 
+// ── sys_sendmsg / sys_recvmsg (with SCM_RIGHTS) ─────────────────────
+// Linux-compatible: parse msghdr + iovec + cmsghdr, scatter-gather
+// over unix_sock_send/recv, marshal fd-passing via unix_sock_sendfd /
+// unix_sock_recvfd.  Works on any vfs_file_t (unix_sock does real fd
+// transfer; other socket types ignore the cmsg block).
+//
+// User-space layouts must match <sys/socket.h>.  We re-declare them
+// here as `k_*` types to avoid pulling userland headers into kernel.
+
+typedef struct k_iovec { uint64_t iov_base; uint64_t iov_len; } k_iovec_t;
+
+typedef struct k_msghdr {
+    uint64_t msg_name;          // void*
+    uint32_t msg_namelen;
+    uint32_t _pad0;
+    uint64_t msg_iov;           // k_iovec_t*
+    uint64_t msg_iovlen;
+    uint64_t msg_control;       // void*
+    uint64_t msg_controllen;
+    int32_t  msg_flags;
+    uint32_t _pad1;
+} k_msghdr_t;
+
+typedef struct k_cmsghdr {
+    uint64_t cmsg_len;
+    int32_t  cmsg_level;
+    int32_t  cmsg_type;
+    // data follows, aligned to sizeof(size_t)==8
+} k_cmsghdr_t;
+
+#define K_CMSG_ALIGN(n) (((n) + 7u) & ~7u)
+
+// Maximum fds in a single SCM_RIGHTS cmsg.  Matches Linux SCM_MAX_FD.
+#define SCM_MAX_FD 253
+
+extern int         unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
+extern int         unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
+extern int         unix_sock_sendfd(vfs_file_t* s, vfs_file_t* f, uint32_t r);
+extern vfs_file_t* unix_sock_recvfd(vfs_file_t* s);
+extern int         is_unix_sock(vfs_file_t* f);
+
+static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
+                                uint64_t flags, uint64_t d) {
+    (void)flags; (void)d;
+    if (!mhdr_ptr) return (uint64_t)-EFAULT;
+    vfs_file_t* sock = fd_to_file(fd_u);
+    if (!sock) return (uint64_t)-EBADF;
+
+    k_msghdr_t mh;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
+        return (uint64_t)-EFAULT;
+
+    // ── Pass fds in any SCM_RIGHTS cmsg before sending payload so the
+    //    receiver sees them in correct order (Linux semantics). ─────
+    if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)) {
+        if (!is_unix_sock(sock)) return (uint64_t)-EINVAL;
+        uint64_t off = 0;
+        while (off + sizeof(k_cmsghdr_t) <= mh.msg_controllen) {
+            k_cmsghdr_t ch;
+            if (copy_from_user(&ch, (void*)(mh.msg_control + off),
+                                sizeof(ch)) != 0)
+                return (uint64_t)-EFAULT;
+            if (ch.cmsg_len < sizeof(k_cmsghdr_t) ||
+                off + ch.cmsg_len > mh.msg_controllen)
+                return (uint64_t)-EINVAL;
+            if (ch.cmsg_level == SOL_SOCKET && ch.cmsg_type == SCM_RIGHTS) {
+                uint64_t data_off  = off + K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
+                uint64_t data_len  = ch.cmsg_len - K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
+                uint64_t n_fds     = data_len / sizeof(int32_t);
+                if (n_fds > SCM_MAX_FD) return (uint64_t)-EINVAL;
+                // Pull all fds out atomically — if any lookup fails we
+                // abort before queuing any.
+                int32_t fds_buf[SCM_MAX_FD];
+                if (copy_from_user(fds_buf, (void*)(mh.msg_control + data_off),
+                                    n_fds * sizeof(int32_t)) != 0)
+                    return (uint64_t)-EFAULT;
+                for (uint64_t i = 0; i < n_fds; i++) {
+                    vfs_file_t* tf = fd_to_file(fds_buf[i]);
+                    if (!tf) return (uint64_t)-EBADF;
+                    int r = unix_sock_sendfd(sock, tf, tf->rights);
+                    if (r < 0) return (uint64_t)(int64_t)r;
+                }
+            }
+            off += K_CMSG_ALIGN(ch.cmsg_len);
+        }
+    }
+
+    // ── Scatter-gather payload over msg_iov ────────────────────────
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
+        k_iovec_t iv;
+        if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
+                            sizeof(iv)) != 0)
+            return (uint64_t)-EFAULT;
+        if (!iv.iov_len) continue;
+        // Bounce via a small stack buffer — avoids pinning the user page
+        // and avoids any kmalloc in the hot path for typical wayland
+        // message sizes (<4 KiB).
+        uint8_t bounce[4096];
+        uint64_t done = 0;
+        while (done < iv.iov_len) {
+            uint64_t chunk = iv.iov_len - done;
+            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
+            if (copy_from_user(bounce, (void*)(iv.iov_base + done),
+                                chunk) != 0)
+                return (uint64_t)-EFAULT;
+            int w = unix_sock_send(sock, bounce, (uint32_t)chunk);
+            if (w < 0) return (uint64_t)(int64_t)w;
+            if (w == 0) break;
+            done  += (uint64_t)w;
+            total += (uint64_t)w;
+            if ((uint64_t)w < chunk) break;
+        }
+    }
+    return total;
+}
+
+static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
+                                uint64_t flags, uint64_t d) {
+    (void)flags; (void)d;
+    if (!mhdr_ptr) return (uint64_t)-EFAULT;
+    vfs_file_t* sock = fd_to_file(fd_u);
+    if (!sock) return (uint64_t)-EBADF;
+
+    k_msghdr_t mh;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
+        return (uint64_t)-EFAULT;
+
+    // ── Drain any pending fds into a single SCM_RIGHTS cmsg ────────
+    // We dequeue up to the userland-sized control buffer.  Any fd
+    // installed here must be closed if we later fault on copyout.
+    uint64_t cmsg_written = 0;
+    int32_t  inst_fds[SCM_MAX_FD];
+    uint64_t n_inst = 0;
+    if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
+        && is_unix_sock(sock)) {
+        uint64_t hdr_pad = K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
+        uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
+        if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
+        while (n_inst < max_fds) {
+            vfs_file_t* rf = unix_sock_recvfd(sock);
+            if (!rf) break;
+            int64_t new_fd = fd_install(rf);
+            if (new_fd < 0) { vfs_close(rf); break; }
+            inst_fds[n_inst++] = (int32_t)new_fd;
+        }
+        if (n_inst) {
+            k_cmsghdr_t ch;
+            ch.cmsg_len   = hdr_pad + n_inst * sizeof(int32_t);
+            ch.cmsg_level = SOL_SOCKET;
+            ch.cmsg_type  = SCM_RIGHTS;
+            if (copy_to_user((void*)mh.msg_control, &ch, sizeof(ch)) != 0
+                || copy_to_user((void*)(mh.msg_control + hdr_pad),
+                                 inst_fds, n_inst * sizeof(int32_t)) != 0) {
+                // Faulted mid-write → close everything we installed
+                // so the fd table isn't leaked.
+                for (uint64_t i = 0; i < n_inst; i++)
+                    (void)sys_close((uint64_t)(int)inst_fds[i]);
+                return (uint64_t)-EFAULT;
+            }
+            cmsg_written = ch.cmsg_len;
+        }
+    }
+
+    // ── Gather payload into msg_iov ────────────────────────────────
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
+        k_iovec_t iv;
+        if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
+                            sizeof(iv)) != 0)
+            return (uint64_t)-EFAULT;
+        if (!iv.iov_len) continue;
+        uint8_t bounce[4096];
+        uint64_t done = 0;
+        while (done < iv.iov_len) {
+            uint64_t chunk = iv.iov_len - done;
+            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
+            int r = sock->read(sock, bounce, chunk);
+            if (r < 0) {
+                // First read returning an error propagates; a later
+                // partial read returns bytes already gathered.
+                if (total == 0) return (uint64_t)(int64_t)r;
+                goto done_gather;
+            }
+            if (r == 0) goto done_gather;
+            if (copy_to_user((void*)(iv.iov_base + done), bounce,
+                              (uint64_t)r) != 0)
+                return (uint64_t)-EFAULT;
+            done  += (uint64_t)r;
+            total += (uint64_t)r;
+            if ((uint64_t)r < chunk) goto done_gather;
+        }
+    }
+done_gather:
+    // Write back msg_controllen so caller knows how much we used.
+    mh.msg_controllen = cmsg_written;
+    mh.msg_flags      = 0;
+    if (copy_to_user((void*)mhdr_ptr, &mh, sizeof(mh)) != 0)
+        return (uint64_t)-EFAULT;
+    return total;
+}
+
 // ── sys_socketpair ──────────────────────────────────────────────────
 // socketpair(domain, type, protocol, fds[2]) — AF_UNIX only for now.
 // Creates a connected pair via unix_sock_pair and installs two fds.
@@ -4765,6 +4967,8 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_TIMERFD_SETTIME]     = w_sys_timerfd_settime,
     [SYS_TIMERFD_GETTIME]     = w_sys_timerfd_gettime,
     [SYS_SOCKETPAIR]          = w_sys_socketpair,
+    [SYS_SENDMSG]             = w_sys_sendmsg,
+    [SYS_RECVMSG]             = w_sys_recvmsg,
 };
 
 // ── native_syscall_dispatch ───────────────────────────────────────────────

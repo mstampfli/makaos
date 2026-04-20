@@ -151,6 +151,17 @@ int socketpair(int domain, int type, int protocol, int fds[2]) {
                  (uint64_t)protocol, (uint64_t)fds));
 }
 
+// ── sendmsg / recvmsg with SCM_RIGHTS (POSIX) ─────────────────────────
+ssize_t sendmsg(int fd, const struct msghdr* msg, int flags) {
+    return (ssize_t)__syscall_ret(
+        syscall3(SYS_SENDMSG, (uint64_t)fd, (uint64_t)msg, (uint64_t)flags));
+}
+
+ssize_t recvmsg(int fd, struct msghdr* msg, int flags) {
+    return (ssize_t)__syscall_ret(
+        syscall3(SYS_RECVMSG, (uint64_t)fd, (uint64_t)msg, (uint64_t)flags));
+}
+
 // ── Sockets + time(NULL)/nanosleep — provided by libc.c's extern
 //    wrappers, not here. ─────────────────────────────────────────────
 

@@ -405,13 +405,66 @@ void socketpair_selftest(void) {
         goto fail;
     }
 
-    unix_sock_close(pair[0]); kfree(pair[0]);
-    unix_sock_close(pair[1]); kfree(pair[1]);
+    unix_sock_close(pair[0]);
+    unix_sock_close(pair[1]);
     kprintf_atomic("[socketpair-selftest] PASS (bidirectional stream)\n");
     return;
 fail:
-    unix_sock_close(pair[0]); kfree(pair[0]);
-    unix_sock_close(pair[1]); kfree(pair[1]);
+    unix_sock_close(pair[0]);
+    unix_sock_close(pair[1]);
+}
+
+// ── SCM_RIGHTS ancillary selftest ────────────────────────────────────
+// Exercises unix_sock_sendfd → unix_sock_recvfd round-trip on a pair.
+// This is the kernel half of what sendmsg(SCM_RIGHTS)/recvmsg parse
+// into — userland msghdr marshalling is validated once a userland
+// test app runs (wayland handshake, etc).
+//
+// Uses a SEPARATE standalone unix_sock as the payload — passing one
+// end of the transport pair would alias the free path on cleanup.
+void scm_rights_selftest(void) {
+    vfs_file_t* pair[2];
+    if (unix_sock_pair(SOCK_STREAM, pair) != 0) {
+        kprintf_atomic("[scm_rights-selftest] FAIL pair alloc\n");
+        return;
+    }
+    vfs_file_t* payload = unix_sock_open(SOCK_DGRAM);
+    if (!payload) {
+        kprintf_atomic("[scm_rights-selftest] FAIL payload alloc\n");
+        unix_sock_close(pair[0]);
+        unix_sock_close(pair[1]);
+        return;
+    }
+    // Hand payload to the sender.  unix_sock_sendfd does not bump
+    // refcount — it transfers ownership into the ancillary queue.
+    // We must NOT close `payload` directly; the receiver's close
+    // is authoritative.
+    int r = unix_sock_sendfd(pair[0], payload, payload->rights);
+    if (r < 0) {
+        kprintf_atomic("[scm_rights-selftest] FAIL sendfd = %d\n", r);
+        unix_sock_close(payload);
+        goto fail;
+    }
+    vfs_file_t* got = unix_sock_recvfd(pair[1]);
+    if (!got) {
+        kprintf_atomic("[scm_rights-selftest] FAIL recvfd NULL\n");
+        goto fail;
+    }
+    if (got != payload) {
+        kprintf_atomic("[scm_rights-selftest] FAIL recvfd != payload\n");
+        got->close(got);
+        goto fail;
+    }
+    // Close the received file — this is the only reference now.
+    got->close(got);
+
+    unix_sock_close(pair[0]);
+    unix_sock_close(pair[1]);
+    kprintf_atomic("[scm_rights-selftest] PASS (fd round-trip over pair)\n");
+    return;
+fail:
+    unix_sock_close(pair[0]);
+    unix_sock_close(pair[1]);
 }
 
 // ── unix_sock_bind ───────────────────────────────────────────────────────

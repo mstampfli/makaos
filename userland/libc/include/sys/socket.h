@@ -68,6 +68,38 @@ struct msghdr {
     int           msg_flags;
 };
 
+struct cmsghdr {
+    size_t cmsg_len;    // full header + data length
+    int    cmsg_level;  // SOL_SOCKET
+    int    cmsg_type;   // SCM_RIGHTS, SCM_CREDENTIALS, ...
+    // followed by data, aligned to sizeof(size_t)
+};
+
+// SCM_RIGHTS: pass file descriptors over AF_UNIX sockets.
+#define SCM_RIGHTS 0x01
+
+// MSG_CMSG_CLOEXEC: received fds are created with O_CLOEXEC.
+#define MSG_CMSG_CLOEXEC 0x40000000
+
+// cmsg iteration macros (Linux-compatible layout).  size_t alignment.
+#define __CMSG_ALIGN(n) (((n) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_ALIGN(n)   __CMSG_ALIGN(n)
+#define CMSG_LEN(n)     (__CMSG_ALIGN(sizeof(struct cmsghdr)) + (n))
+#define CMSG_SPACE(n)   (__CMSG_ALIGN(sizeof(struct cmsghdr)) + __CMSG_ALIGN(n))
+#define CMSG_DATA(cmsg) ((unsigned char*)(cmsg) + __CMSG_ALIGN(sizeof(struct cmsghdr)))
+
+#define CMSG_FIRSTHDR(mhdr) \
+    ((mhdr)->msg_controllen >= sizeof(struct cmsghdr) \
+        ? (struct cmsghdr*)(mhdr)->msg_control : (struct cmsghdr*)0)
+
+#define CMSG_NXTHDR(mhdr, cmsg) \
+    ((cmsg)->cmsg_len < sizeof(struct cmsghdr) ? (struct cmsghdr*)0 : \
+     ((unsigned char*)(cmsg) + __CMSG_ALIGN((cmsg)->cmsg_len) \
+      + sizeof(struct cmsghdr) > \
+      (unsigned char*)(mhdr)->msg_control + (mhdr)->msg_controllen) \
+        ? (struct cmsghdr*)0 \
+        : (struct cmsghdr*)((unsigned char*)(cmsg) + __CMSG_ALIGN((cmsg)->cmsg_len)))
+
 int     socket(int domain, int type, int protocol);
 int     bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
 int     listen(int fd, int backlog);
@@ -83,5 +115,7 @@ int     setsockopt(int fd, int level, int opt, const void* val, socklen_t n);
 int     getsockopt(int fd, int level, int opt, void* val, socklen_t* n);
 int     shutdown(int fd, int how);
 int     socketpair(int domain, int type, int protocol, int fds[2]);
+ssize_t sendmsg(int fd, const struct msghdr* msg, int flags);
+ssize_t recvmsg(int fd, struct msghdr* msg, int flags);
 
 #endif
