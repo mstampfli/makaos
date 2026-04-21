@@ -14,9 +14,15 @@ extern "C" {
 #define M_PI_2     1.57079632679489661923
 #define M_SQRT2    1.41421356237309504880
 
+#ifndef HUGE_VAL
 #define HUGE_VAL   __builtin_huge_val()
+#endif
+#ifndef INFINITY
 #define INFINITY   __builtin_inff()
+#endif
+#ifndef NAN
 #define NAN        __builtin_nanf("")
+#endif
 
 // C99 classification macros — compiler builtins, no libm call needed.
 #define isnan(x)      __builtin_isnan(x)
