@@ -69,6 +69,31 @@ double ldexp(double, int);
 double frexp(double, int*);
 double modf(double, double*);
 
+// long double variants — alias to double on MakaOS (no 80-bit x87).
+long double sqrtl(long double);
+long double fabsl(long double);
+long double floorl(long double);
+long double ceill(long double);
+long double truncl(long double);
+long double roundl(long double);
+long double fmodl(long double, long double);
+long double frexpl(long double, int*);
+long double ldexpl(long double, int);
+long double modfl(long double, long double*);
+long double logl(long double);
+long double log2l(long double);
+long double log10l(long double);
+long double expl(long double);
+long double powl(long double, long double);
+long double sinl(long double);
+long double cosl(long double);
+long double tanl(long double);
+long double asinl(long double);
+long double acosl(long double);
+long double atanl(long double);
+long double atan2l(long double, long double);
+long double copysignl(long double, long double);
+
 float  floorf(float);
 float  ceilf(float);
 float  fabsf(float);

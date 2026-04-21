@@ -94,7 +94,7 @@ static int tcp_connect(const char* host, uint16_t port, int verbose) {
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
     dst.sin_port   = htons(port);
-    dst.sin_addr   = ip_be;    // netinet/in.h flattens this to raw in_addr_t
+    dst.sin_addr.s_addr = ip_be;  // POSIX struct in_addr has s_addr member
     if (connect(fd, (struct sockaddr*)&dst, sizeof(dst)) < 0) {
         write_err("* connect() failed\n");
         close(fd);

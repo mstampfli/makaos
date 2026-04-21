@@ -18,14 +18,14 @@ typedef uint16_t in_port_t;
 typedef uint32_t in_addr_t;
 
 struct in_addr {
-    in_addr_t s_addr;   // big-endian
+    in_addr_t s_addr;
 };
 
 struct sockaddr_in {
-    uint16_t        sin_family;
-    in_port_t       sin_port;      // big-endian
-    in_addr_t       sin_addr;      // big-endian (flattened, no nested struct)
-    unsigned char   sin_zero[8];
+    uint16_t       sin_family;
+    in_port_t      sin_port;
+    struct in_addr sin_addr;
+    uint8_t        sin_zero[8];
 };
 
 struct in6_addr {
@@ -39,5 +39,11 @@ struct sockaddr_in6 {
     struct in6_addr sin6_addr;
     uint32_t       sin6_scope_id;
 };
+
+// Byte-order conversions — POSIX mandates these via <netinet/in.h> too.
+uint16_t htons(uint16_t v);
+uint16_t ntohs(uint16_t v);
+uint32_t htonl(uint32_t v);
+uint32_t ntohl(uint32_t v);
 
 #endif
