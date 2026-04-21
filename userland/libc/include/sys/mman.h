@@ -22,10 +22,16 @@
 #define MADV_WILLNEED   3
 #define MADV_DONTNEED   4
 
+// msync flags — wayland-shm uses MS_SYNC for deterministic flush.
+#define MS_ASYNC       1
+#define MS_INVALIDATE  2
+#define MS_SYNC        4
+
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off);
 int   munmap(void* addr, size_t len);
 int   mprotect(void* addr, size_t len, int prot);
 int   madvise(void* addr, size_t len, int advice);
+int   msync(void* addr, size_t len, int flags);
 
 // POSIX shared memory
 int shm_open(const char* name, int flags, mode_t mode);

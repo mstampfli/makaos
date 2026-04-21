@@ -6,12 +6,24 @@
 // Address families
 #define AF_UNSPEC  0
 #define AF_UNIX    1
+#define AF_LOCAL   AF_UNIX   // POSIX alias
 #define AF_INET    2
 #define AF_INET6   10
 #define PF_UNSPEC  AF_UNSPEC
 #define PF_UNIX    AF_UNIX
+#define PF_LOCAL   AF_UNIX
 #define PF_INET    AF_INET
 #define PF_INET6   AF_INET6
+
+// SO_PEERCRED — Linux socket option to retrieve peer credentials on
+// an AF_UNIX stream socket.  Used by wayland-server to authenticate
+// compositor clients.  See getsockopt(fd, SOL_SOCKET, SO_PEERCRED).
+#define SO_PEERCRED 17
+struct ucred {
+    int32_t  pid;
+    uint32_t uid;
+    uint32_t gid;
+};
 
 // Socket types
 #define SOCK_STREAM    1
@@ -53,10 +65,10 @@ struct sockaddr_storage {
     char     __pad[128 - 2];
 };
 
-struct iovec {
-    void*  iov_base;
-    size_t iov_len;
-};
+// struct iovec is the canonical POSIX scatter-gather descriptor; real
+// home is <sys/uio.h>.  Include it here so socket code that only pulls
+// in <sys/socket.h> still gets the type without duplicating it.
+#include <sys/uio.h>
 
 struct msghdr {
     void*         msg_name;

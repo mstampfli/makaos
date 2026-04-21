@@ -333,3 +333,59 @@ double tanh(double x) {
     double e2 = exp(2.0 * x);
     return (e2 - 1.0) / (e2 + 1.0);
 }
+
+// ── Basic math (extern — merged from former libm_extern.c) ────────────────
+// Compiler lowers each __builtin_* to a single SSE2 scalar instruction:
+//   sqrt/sqrtf   → sqrtsd/sqrtss
+//   fabs/fabsf   → andpd/andps
+//   floor/ceil/round/trunc → roundsd/roundss (with the right imm8)
+// Long-double variants alias to double — MakaOS doesn't use 80-bit x87.
+
+double fabs(double x)        { return __builtin_fabs(x); }
+float  fabsf(float x)        { return __builtin_fabsf(x); }
+double sqrt(double x)        { return __builtin_sqrt(x); }
+float  sqrtf(float x)        { return __builtin_sqrtf(x); }
+double floor(double x)       { return __builtin_floor(x); }
+float  floorf(float x)       { return __builtin_floorf(x); }
+double ceil(double x)        { return __builtin_ceil(x); }
+float  ceilf(float x)        { return __builtin_ceilf(x); }
+double round(double x)       { return __builtin_round(x); }
+float  roundf(float x)       { return __builtin_roundf(x); }
+double trunc(double x)       { return __builtin_trunc(x); }
+float  truncf(float x)       { return __builtin_truncf(x); }
+double fmin(double a, double b) { return a < b ? a : b; }
+double fmax(double a, double b) { return a > b ? a : b; }
+float  fminf(float a, float b)  { return a < b ? a : b; }
+float  fmaxf(float a, float b)  { return a > b ? a : b; }
+double copysign(double x, double y) { return __builtin_copysign(x, y); }
+float  copysignf(float x, float y)  { return __builtin_copysignf(x, y); }
+double fmod(double x, double y)     { return __builtin_fmod(x, y); }
+float  fmodf(float x, float y)      { return __builtin_fmodf(x, y); }
+
+// ── hypot / cbrt (real impls) ─────────────────────────────────────────────
+double hypot(double x, double y) { return sqrt(x * x + y * y); }
+double cbrt(double x) {
+    return x < 0.0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0);
+}
+float hypotf(float x, float y) { return (float)hypot((double)x, (double)y); }
+float cbrtf(float x)           { return (float)cbrt((double)x); }
+
+// ── Single-precision wrappers over the double impls above ────────────────
+float atanf(float x)  { return (float)atan((double)x); }
+float asinf(float x)  { return (float)asin((double)x); }
+float acosf(float x)  { return (float)acos((double)x); }
+float log2f(float x)  { return (float)log2((double)x); }
+float log10f(float x) { return (float)log10((double)x); }
+float sinhf(float x)  { return (float)sinh((double)x); }
+float coshf(float x)  { return (float)cosh((double)x); }
+float tanhf(float x)  { return (float)tanh((double)x); }
+
+// ── Long-double variants (alias to double) ────────────────────────────────
+long double sqrtl(long double x)  { return (long double)__builtin_sqrt((double)x); }
+long double fabsl(long double x)  { return (long double)__builtin_fabs((double)x); }
+long double floorl(long double x) { return (long double)__builtin_floor((double)x); }
+long double ceill(long double x)  { return (long double)__builtin_ceil((double)x); }
+long double fmodl(long double x, long double y) {
+    return (long double)__builtin_fmod((double)x, (double)y);
+}
+

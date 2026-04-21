@@ -82,7 +82,6 @@ int    vprintf(const char* fmt, va_list ap);
 #endif
 
 // ── fileno ────────────────────────────────────────────────────────────────
-static inline int fileno(FILE* f) {
-    if (!f) { extern int errno; errno = 9 /*EBADF*/; return -1; }
-    return f->fd;
-}
+// Implemented as an extern in stdio.c so sysroot and in-tree builds share
+// one definition.
+int fileno(FILE* f);

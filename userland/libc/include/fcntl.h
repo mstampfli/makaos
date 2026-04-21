@@ -34,6 +34,22 @@
 // fcntl fd flags
 #define FD_CLOEXEC 1
 
+// POSIX record locking — fcntl(fd, F_SETLK/F_SETLKW/F_GETLK, &struct flock).
+// Fontconfig / sqlite / gdbm use this for cache coherency across
+// processes.  MakaOS is single-process in practice so the lock request
+// always succeeds (advisory + uncontended).
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+
+struct flock {
+    short   l_type;     // F_RDLCK / F_WRLCK / F_UNLCK
+    short   l_whence;   // SEEK_SET / SEEK_CUR / SEEK_END
+    off_t   l_start;
+    off_t   l_len;
+    pid_t   l_pid;
+};
+
 int open(const char* path, int flags, ...);
 int openat(int dirfd, const char* path, int flags, ...);
 int creat(const char* path, mode_t mode);

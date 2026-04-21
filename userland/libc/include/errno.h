@@ -55,6 +55,22 @@ extern "C" {
 #define ENOTCONN    107
 #define ETIMEDOUT   110
 #define ECANCELED   125
+#define EOVERFLOW    75    // value too large for defined data type
+#define EPROTO       71    // protocol error
+#define EPROTONOSUPPORT 93
+#define EMSGSIZE     90
+#define EADDRNOTAVAIL 99
+#define ENETDOWN    100
+#define ENETUNREACH 101
+#define ECONNABORTED 103
+#define EDESTADDRREQ 89
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
+#define EALREADY    114
+#define EINPROGRESS 115
+#define ENOPROTOOPT  92
+#define ESOCKTNOSUPPORT 94
+#define ENOTUNIQ    76
 
 extern int errno;
 
