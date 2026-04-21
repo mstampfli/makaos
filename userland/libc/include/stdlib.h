@@ -75,6 +75,10 @@ char* realpath(const char* path, char* resolved_path);
 // POSIX memalign — allocates aligned memory for ports that check for it.
 int posix_memalign(void** memptr, size_t alignment, size_t size);
 
+// POSIX mkstemp / mkostemp — unique-temp-file creation.
+int mkstemp(char* template_);
+int mkostemp(char* template_, int flags);
+
 #ifdef __cplusplus
 }
 #endif

@@ -72,6 +72,23 @@ extern "C" {
 #define ESOCKTNOSUPPORT 94
 #define ENOTUNIQ    76
 #define ETIME       62    // timer expired
+#define EROFS       30
+#define EMLINK      31
+#define EDOM        33
+#define EDQUOT     122
+#define ESTALE     116
+#define EMULTIHOP  72
+#define EREMOTE    66
+#define EBADMSG    74
+#define EIDRM      43
+#define ENOLCK     37
+#define ENOLINK    67
+#define ENODATA    61
+#define ENOSTR     60
+#define ENOSR      63
+#define ENOMSG     42
+#define ETXTBSY    26
+#define ENOTBLK    15
 
 extern int errno;
 

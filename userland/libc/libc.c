@@ -1518,6 +1518,10 @@ char* mktemp(char* tmpl) {
     if (mkdtemp_r(tmpl) < 0) return NULL;
     return tmpl;
 }
+int mkostemp(char* tmpl, int flags) {
+    if (mkdtemp_r(tmpl) < 0) return -1;
+    return open(tmpl, O_RDWR | O_CREAT | O_EXCL | flags, 0600);
+}
 char* mkdtemp(char* tmpl) {
     if (mkdtemp_r(tmpl) < 0) return NULL;
     if (mkdir(tmpl, 0700) < 0) return NULL;
