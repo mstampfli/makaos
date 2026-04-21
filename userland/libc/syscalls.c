@@ -144,6 +144,45 @@ int timerfd_gettime(int fd, struct itimerspec* curr_value) {
         syscall2(SYS_TIMERFD_GETTIME, (uint64_t)fd, (uint64_t)curr_value));
 }
 
+// ── stat / lstat / fstat / access (externs for sysroot consumers) ─────
+// libc.h has these as static inline so in-tree apps inline them; ported
+// libraries linked via the sysroot need link-resolvable symbols.
+int stat(const char* path, struct stat* st) {
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(syscall3(SYS_STAT, (uint64_t)path, n, (uint64_t)st));
+}
+
+int lstat(const char* path, struct stat* st) {
+    // No symlink support yet — lstat behaves like stat.
+    return stat(path, st);
+}
+
+int fstat(int fd, struct stat* st) {
+    return (int)__syscall_ret(syscall2(SYS_FSTAT, (uint64_t)fd, (uint64_t)st));
+}
+
+int mkdir(const char* path, mode_t mode) {
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(syscall3(SYS_MKDIR, (uint64_t)path, n, (uint64_t)mode));
+}
+
+int unlink(const char* path) {
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(syscall2(SYS_UNLINK, (uint64_t)path, n));
+}
+
+// ioctl — central for drm, evdev, tty control.  Variadic but all real
+// users pass one trailing pointer.  Marshal that as a single arg.
+#include <stdarg.h>
+int ioctl(int fd, unsigned long req, ...) {
+    va_list ap; va_start(ap, req);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    return (int)__syscall_ret(syscall3(SYS_IOCTL, (uint64_t)fd, (uint64_t)req, (uint64_t)arg));
+}
+
+// access lives earlier in this file — don't redefine.
+
 // ── socketpair (POSIX) ────────────────────────────────────────────────
 int socketpair(int domain, int type, int protocol, int fds[2]) {
     return (int)__syscall_ret(

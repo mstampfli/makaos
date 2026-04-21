@@ -22,6 +22,8 @@
 #define HAVE_STRDUP              1
 #define HAVE_STRCASECMP          1
 #define HAVE_STRNCASECMP         1
+#define HAVE_ASPRINTF            1
+#define HAVE_VASPRINTF           1
 // Features we DON'T have — left undefined because xkb uses
 // `#if defined(HAVE_X)` which is true regardless of value:
 //   HAVE_VASPRINTF, HAVE_ASPRINTF, HAVE_OPEN_MEMSTREAM, HAVE_MKSTEMP,

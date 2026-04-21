@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_MATH_H
 #define _MAKAOS_MATH_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define M_E        2.7182818284590452354
 #define M_LOG2E    1.4426950408889634074
 #define M_LOG10E   0.43429448190325182765
@@ -96,5 +100,9 @@ long double fabsl(long double);
 long double floorl(long double);
 long double ceill(long double);
 long double fmodl(long double, long double);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
