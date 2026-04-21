@@ -257,7 +257,9 @@ static int64_t sock_seek(vfs_file_t* self, int64_t offset, int whence) {
 
 vfs_file_t* socket_open(int domain, int type) {
     if (domain != AF_INET) return 0;
-    if (type != SOCK_STREAM && type != SOCK_DGRAM) return 0;
+    // Strip SOCK_CLOEXEC / SOCK_NONBLOCK (Linux-style OR flags).
+    int sock_type = type & ~(0x80000 | 0x00800);
+    if (sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM) return 0;
 
     socket_t* s = (socket_t*)kmalloc(sizeof(socket_t));
     if (!s) return 0;
@@ -265,9 +267,9 @@ vfs_file_t* socket_open(int domain, int type) {
     __builtin_memset(s, 0, sizeof(socket_t));
     wait_queue_init(&s->waitq);
 
-    s->type = (uint8_t)type;
+    s->type = (uint8_t)sock_type;
 
-    if (type == SOCK_STREAM) {
+    if (sock_type == SOCK_STREAM) {
         // Allocate an ephemeral local port for the PCB now; bind() can
         // override it later.
         uint16_t lport = tcp_ephemeral_port();
@@ -282,6 +284,7 @@ vfs_file_t* socket_open(int domain, int type) {
         kfree(s);
         return 0;
     }
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read        = sock_read;
     f->write       = sock_write;
@@ -380,6 +383,7 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
 
     vfs_file_t* cf = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!cf) { kfree(cs); tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
+    __builtin_memset(cf, 0, sizeof(*cf));
     cf->read        = sock_read;
     cf->write       = sock_write;
     cf->close       = sock_close;

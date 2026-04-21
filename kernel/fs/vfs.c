@@ -31,20 +31,10 @@ char g_cwd[256] = "/";
 static vfs_file_t* vfs_alloc_file(void) {
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) return NULL;
-    f->read            = NULL;
-    f->write           = NULL;
-    f->close           = NULL;
-    f->seek            = NULL;
-    f->poll            = NULL;
-    f->ioctl           = NULL;
-    f->ctx             = NULL;
-    f->waitq           = &f->_waitq;
+    __builtin_memset(f, 0, sizeof(*f));
+    f->waitq = &f->_waitq;
     wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags           = 0;
-    f->refcount        = 1;
-    f->rights          = 0;
-    f->path[0]         = '\0';
+    f->refcount = 1;
     return f;
 }
 

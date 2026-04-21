@@ -53,6 +53,10 @@ typedef struct vfs_file_t {
     uint32_t refcount; // reference count; 0 = static object (never freed)
     uint32_t rights;   // RIGHT_* bitmask; checked before every operation
     uint32_t ino;      // ext2 inode number (0 for non-file fds); page cache key
+    uint32_t rdev;     // st_rdev for character devices (Linux-style MKDEV(major, minor)).
+                       // Populated by device open paths (evdev, DRM, mouse, tty…); 0 for
+                       // everything else.  Consumers like libinput's fstat-then-lookup
+                       // flow depend on this matching udev's advertised devnum.
     char     path[256]; // absolute path for ext2 files (empty for devices/pipes)
 } vfs_file_t;
 

@@ -419,6 +419,24 @@ static void init_kthread(void) {
     extern void slab_pcpu_selftest(void);
     slab_pcpu_selftest();
 
+    // Buddy high-order uniqueness test: DRM dumb buffers land at
+    // order=10 (4MB each), so a duplicate-address bug there silently
+    // corrupts compositor framebuffers.  Allocate 8 blocks without
+    // freeing, require all distinct addresses, then free them all.
+    {
+        phys_addr_t got[8];
+        int dup = 0;
+        for (int i = 0; i < 8; i++) {
+            got[i] = pmm_buddy_alloc(10);
+            kprintf("[pmm10-test] alloc %d = 0x%lx\n", i, (unsigned long)got[i]);
+            if (!got[i]) { kprintf("[pmm10-test] FAIL: OOM at %d\n", i); break; }
+            for (int j = 0; j < i; j++)
+                if (got[j] == got[i]) { dup = 1; kprintf("[pmm10-test] FAIL: dup alloc[%d]==alloc[%d]==0x%lx\n", j, i, (unsigned long)got[i]); }
+        }
+        for (int i = 0; i < 8; i++) if (got[i]) pmm_buddy_free(got[i], 10);
+        kprintf("[pmm10-test] %s\n", dup ? "FAILED" : "PASSED (all 8 order=10 allocs distinct)");
+    }
+
     // Phase 5B: SLAB_TYPESAFE_BY_RCU — validates that a typesafe
     // cache's empty-list pages defer to call_rcu and only return
     // to the buddy after a grace period.
@@ -457,12 +475,13 @@ static void init_kthread(void) {
     extern void signalfd_selftest(void);
     signalfd_selftest();
 
-    // Tier 2.5a (virtio-gpu): full pipeline exerciser — creates a 2D
-    // resource sized to scanout 0, attaches backing, SET_SCANOUT,
-    // paints a 4-quadrant test pattern, TRANSFER + FLUSH so it's
-    // actually on screen.  Silently no-ops if no virtio-gpu device.
-    extern int virtio_gpu_present_test(void);
-    (void)virtio_gpu_present_test();
+    // Tier 2.5a (virtio-gpu): pipeline exerciser was overriding the
+    // UEFI GOP framebuffer with a self-test banner, hiding the TTY
+    // from the SDL window under `-vga none -device virtio-vga`.  The
+    // scanout is left in VGA-compat mode until the first userland
+    // DRM client (dwl) actually calls SET_SCANOUT — TTY stays visible
+    // throughout boot + login that way.  The full pipeline is still
+    // exercised by drm-mock-selftest and the runtime DRM path.
 
     // Tier 2.5b (#8): DRM mock backend exerciser — exercises the
     // clean drm_backend_ops_t vtable without touching real hardware.

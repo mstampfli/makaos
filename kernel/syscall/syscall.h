@@ -181,7 +181,11 @@ typedef union epoll_data {
     uint64_t u64;
 } epoll_data_t;
 
-typedef struct {
+// Must stay packed (total 12 bytes, data at offset 4) to match the
+// Linux-compat layout libc exposes.  Without packing, the natural u64
+// alignment of epoll_data_t inserts 4 bytes of pad, shifting data to
+// offset 8 and breaking wayland / libuv / every epoll consumer.
+typedef struct __attribute__((packed)) {
     uint32_t     events;  // EPOLLIN | EPOLLOUT | ...
     epoll_data_t data;
 } epoll_event_t;

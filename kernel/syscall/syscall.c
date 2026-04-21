@@ -239,8 +239,16 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
     if (fsr == 0 && (flags & O_CREAT) && (flags & O_EXCL))
         return (uint64_t)-EEXIST;
-    if (fsr != 0 && fsr != -ENOENT) return (uint64_t)(int64_t)fsr;
-    if (fsr == -ENOENT && !(flags & O_CREAT)) return (uint64_t)-ENOENT;
+    if (fsr != 0 && fsr != -ENOENT) {
+        if (path[0]=='/' && path[1]=='t' && path[2]=='m' && path[3]=='p')
+            kprintf("[open-dbg] %s flags=0x%x -> %d\n", path, (uint32_t)flags, fsr);
+        return (uint64_t)(int64_t)fsr;
+    }
+    if (fsr == -ENOENT && !(flags & O_CREAT)) {
+        if (path[0]=='/' && path[1]=='t' && path[2]=='m' && path[3]=='p')
+            kprintf("[open-dbg] %s ENOENT flags=0x%x\n", path, (uint32_t)flags);
+        return (uint64_t)-ENOENT;
+    }
 
     // Virtual path — dispatch to backend; permission already checked by fs_lookup.
     if (fsr == 0 && fsn.is_virtual) {
@@ -265,17 +273,23 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
         uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
                              && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
-        uint8_t match_event0 = (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
-                             && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
-                             && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11]=='0'
-                             && dev[12]=='\0');
+        // /dev/input/event<N>: parse the decimal number so every
+        // registered input_device_t gets its own node, not just event0.
+        int match_eventn = -1;
+        if (dev[0]=='i' && dev[1]=='n' && dev[2]=='p' && dev[3]=='u'
+            && dev[4]=='t' && dev[5]=='/' && dev[6]=='e' && dev[7]=='v'
+            && dev[8]=='e' && dev[9]=='n' && dev[10]=='t' && dev[11] >= '0' && dev[11] <= '9') {
+            int n = 0; int i = 11;
+            while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
+            if (dev[i] == '\0') match_eventn = n;
+        }
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
-        else if (match_event0) f = evdev_open();
+        else if (match_eventn >= 0) { extern vfs_file_t* evdev_open_device(uint32_t); f = evdev_open_device((uint32_t)match_eventn); }
         else if (match_dri0)   { extern vfs_file_t* vfs_drm_open(void); f = vfs_drm_open(); }
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
@@ -1336,7 +1350,12 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     // stat needs no permission on the file itself — only parent dir traversal,
     // which ext2_lookup_path already checks on every component.
     int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);
-    if (fsr != 0) return (uint64_t)(int64_t)fsr;
+    if (fsr != 0) {
+        // TEMP: trace xkb lookup failures so we can see why dwl's keymap init fails.
+        if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r')
+            kprintf("[stat-dbg] %s -> %d\n", path, fsr);
+        return (uint64_t)(int64_t)fsr;
+    }
 
     if (fsn.is_virtual) {
         // All virtual nodes (both /dev and /proc) now have per-node
@@ -1864,14 +1883,37 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (prot & PROT_EXEC)  vma_flags |= VMA_X;
     if (is_shared) vma_flags |= VMA_SHARED;
 
-    // ── File-backed private mmap (MAP_PRIVATE + regular fd) ───────────────
-    // Route through the same file-VMA infrastructure the lazy ELF loader
-    // uses: the page-fault handler in vmm.c consults pcache, demand-reads
-    // from ext2 on miss, offers the frame back to pcache (ref-counted),
-    // and for VMA_W eagerly COWs into a private frame.  Read-ahead of the
-    // next 7 pages happens automatically on each disk miss.  Nothing here
-    // to re-invent — just build the right VMA and return.
-    if (has_fd && !is_shared) {
+    // ── File-backed mmap on a regular ext2 fd ─────────────────────────────
+    // MAP_PRIVATE is fully supported: pages demand-paged from pcache, writes
+    // COW into a private frame.  MAP_SHARED + PROT_READ is accepted too —
+    // shared read-only is identical to the private path on the read side,
+    // no dirty tracking needed.  Shared+writable on a regular file fd is
+    // routed here for the read-only case (PROT_WRITE off); writable shared
+    // on a regular fd is still -EINVAL pending msync/munmap writeback
+    // (TODO).  Shmem-backed fds (shm_open / MAP_SHARED anonymous) fall
+    // through to the explicit shmem branch below — do NOT redirect them
+    // here, since their f->path is empty and the ext2 lookup below rejects.
+    // This relaxation removes per-library MAP_SHARED patches for
+    // xkbcommon, fontconfig, freetype, etc. reading read-only keymap/font
+    // data.
+    int route_file_backed = 0;
+    if (has_fd) {
+        vfs_file_t* probe = fdget(fd);
+        if (!probe) return (uint64_t)-EBADF;
+        int is_regular_file = probe->path[0] != 0;
+        fdput(probe);
+        if (is_regular_file) {
+            if (is_shared && (prot & PROT_WRITE))
+                return (uint64_t)-EINVAL;  // TODO: writable MAP_SHARED
+            route_file_backed = 1;
+        } else if (!is_shared) {
+            // MAP_PRIVATE on a non-regular fd (shmem/tty/socket/pipe) —
+            // the old code returned EACCES here.  Preserve that, since
+            // those fds don't expose a readable inode to demand-page from.
+            return (uint64_t)-EACCES;
+        }
+    }
+    if (route_file_backed) {
         vfs_file_t* f = fdget(fd);
         if (!f) return (uint64_t)-EBADF;
         // Must be a regular ext2 file (has a stored path we can stat).
@@ -2438,7 +2480,14 @@ static vfs_file_t* fd_to_file(uint64_t fd) {
 }
 
 // socket(domain, type, proto) → fd or -errno
+static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto);
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
+    uint64_t r = sys_socket_inner(domain, type, proto);
+    kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
+            (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
+    return r;
+}
+static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto) {
     (void)proto;
     serial_puts_dbg("[socket] domain="); serial_hex_dbg(domain);
     vfs_file_t* f;
@@ -2810,9 +2859,12 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t stat_ptr) {
         }
     } else {
         // Device/pipe/socket/tty: fill minimal stat (char device, rw).
+        // rdev matters for consumers like libinput that cross-check
+        // fstat(fd).st_rdev against libudev's advertised devnum.
         kst.st_mode    = 0020666; // S_IFCHR | 0666
         kst.st_nlink   = 1;
         kst.st_blksize = 4096;
+        kst.st_rdev    = (int32_t)f->rdev;
     }
 
     fdput(f);
@@ -3676,6 +3728,7 @@ static uint64_t sys_epoll_create(uint64_t flags) {
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(state->slots); kfree(state); return (uint64_t)-ENOMEM; }
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read           = epoll_read;
     f->write          = epoll_write;

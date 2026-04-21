@@ -245,6 +245,7 @@ vfs_file_t* fat32_open(const char* name83) {
                 fd->bytes_read    = 0;
 
                 vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+                if (f) __builtin_memset(f, 0, sizeof(*f));
                 f->read     = fat32_read;
                 f->write    = NULL;
                 f->close    = fat32_close;
