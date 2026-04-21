@@ -745,6 +745,36 @@ if [ -d "$BUILD_DIR/fs" ]; then
     done
 fi
 
+# ── Install xkeyboard-config data tree (/usr/share/X11/xkb) ──────────
+# xkbcommon's xkb_keymap_new_from_names() walks this tree to compile
+# the default keymap.  Without it, dwl/tinywl crash in xkb_context_ref
+# after xkb_context_include_path_append_default silently fails.
+# Stage the host's copy in one debugfs run (a `mkdir` + `write` per
+# file would cost ~2000 subprocess spawns).
+if [ -d /usr/share/X11/xkb ]; then
+    XKB_SCRIPT="$BUILD_DIR/xkb_install.debugfs"
+    : > "$XKB_SCRIPT"
+    # Create /usr, /usr/share, /usr/share/X11, /usr/share/X11/xkb and
+    # every subdirectory under it.  debugfs's `mkdir` fails if the
+    # parent is missing, so emit in depth order.
+    seen_dirs=""
+    for d in usr usr/share usr/share/X11 usr/share/X11/xkb \
+             $(cd /usr/share/X11/xkb && find . -type d | sed 's|^\./||' | sed 's|^|usr/share/X11/xkb/|' | grep -v '^usr/share/X11/xkb/\.$'); do
+        echo "mkdir /$d" >> "$XKB_SCRIPT"
+    done
+    (cd /usr/share/X11/xkb && find . -type f) | while read -r rel; do
+        rel="${rel#./}"
+        echo "write /usr/share/X11/xkb/$rel /usr/share/X11/xkb/$rel"
+    done >> "$XKB_SCRIPT"
+    debugfs -w "$BUILD_DIR/ext2.img" -f "$XKB_SCRIPT" > /dev/null 2>&1 || true
+    # Set perms on the root dir (files inherit 0644 default from debugfs write).
+    ext2_setperm "$BUILD_DIR/ext2.img" /usr              0040755 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /usr/share        0040755 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/X11    0040755 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/X11/xkb 0040755 0 0
+    echo "[+] xkeyboard-config installed at /usr/share/X11/xkb"
+fi
+
 dd if="$BUILD_DIR/ext2.img" of="$BUILD_DIR/disk.img" bs=512 seek=$EXT2_LBA conv=notrunc status=none
 
 stat -c "%n %s" "$BUILD_DIR/disk.img"
