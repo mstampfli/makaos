@@ -1,0 +1,142 @@
+ninja: Entering directory `/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/glib_build'
+[1/566] Generating glib/glib-visibility.h with a custom command
+[2/566] Generating glib/gversionmacros.h with a custom command
+[3/566] Generating gio/gio-visibility.h with a custom command
+[4/566] Generating gobject/gobject-visibility.h with a custom command
+[5/566] Copying file gio/gdbus-2.0/codegen/__init__.py
+[6/566] Generating gmodule/gmodule-visibility.h with a custom command
+[7/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimealias.c.o
+[8/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeicon.c.o
+[9/566] Copying file gio/gdbus-2.0/codegen/codegen_main.py
+[10/566] Copying file gio/gdbus-2.0/codegen/codegen.py
+[11/566] Copying file gio/gdbus-2.0/codegen/codegen_docbook.py
+[12/566] Compiling C object glib/libcharset/libcharset.a.p/localcharset.c.o
+[13/566] Copying file gio/gdbus-2.0/codegen/dbustypes.py
+[14/566] Copying file gio/gdbus-2.0/codegen/parser.py
+[15/566] Generating girepository/gi-visibility.h with a custom command
+[16/566] Copying file gio/gdbus-2.0/codegen/codegen_rst.py
+[17/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeint.c.o
+[18/566] Copying file gio/gdbus-2.0/codegen/codegen_md.py
+[19/566] Copying file gio/gdbus-2.0/codegen/utils.py
+[20/566] Compiling C object subprojects/proxy-libintl/libintl.a.p/libintl.c.o
+[21/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexp.c.o
+[22/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexpl.c.o
+[23/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gallocator.c.o
+[24/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeparent.c.o
+[25/566] Compiling C object glib/gnulib/libgnulib.a.p/asnprintf.c.o
+[26/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gcache.c.o
+[27/566] Compiling C object glib/libglib-2.0.a.p/garcbox.c.o
+[28/566] Compiling C object glib/gnulib/libgnulib.a.p/xsize.c.o
+[29/566] Compiling C object glib/libglib-2.0.a.p/gatomic.c.o
+[30/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-args.c.o
+[31/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gcompletion.c.o
+[32/566] Compiling C object glib/gnulib/libgnulib.a.p/printf.c.o
+[33/566] Generating gio/gdbus-daemon-generated with a custom command
+[34/566] Generating gio/xdp-dbus with a custom command
+[35/566] Compiling C object glib/libglib-2.0.a.p/gasyncqueue.c.o
+[36/566] Compiling C object glib/libglib-2.0.a.p/gbytes.c.o
+[37/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeglob.c.o
+[38/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimemagic.c.o
+[39/566] Compiling C object glib/libglib-2.0.a.p/gbacktrace.c.o
+[40/566] Generating gobject/glib_enumtypes_h with a custom command (wrapped by meson to capture output)
+[41/566] Compiling C object glib/libglib-2.0.a.p/gbitlock.c.o
+[42/566] Compiling C object glib/libglib-2.0.a.p/gbase64.c.o
+[43/566] Compiling C object glib/libglib-2.0.a.p/deprecated_grel.c.o
+[44/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gthread-deprecated.c.o
+[45/566] Compiling C object glib/libglib-2.0.a.p/genviron.c.o
+[46/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmime.c.o
+[47/566] Compiling C object glib/libglib-2.0.a.p/gdir.c.o
+[48/566] Compiling C object glib/libglib-2.0.a.p/gdatetime-private.c.o
+[49/566] Compiling C object glib/libglib-2.0.a.p/gcharset.c.o
+[50/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-parse.c.o
+[51/566] Compiling C object glib/libglib-2.0.a.p/gerror.c.o
+[52/566] Generating gio/gioenumtypes_h with a custom command (wrapped by meson to capture output)
+[53/566] Compiling C object glib/libglib-2.0.a.p/glib-private.c.o
+[54/566] Compiling C object glib/libglib-2.0.a.p/ghmac.c.o
+[55/566] Compiling C object glib/libglib-2.0.a.p/ggettext.c.o
+[56/566] Generating gobject/glib_enumtypes_c with a custom command (wrapped by meson to capture output)
+[57/566] Compiling C object glib/libglib-2.0.a.p/gmappedfile.c.o
+[58/566] Compiling C object glib/libglib-2.0.a.p/glib-init.c.o
+[59/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimecache.c.o
+[60/566] Compiling C object glib/libglib-2.0.a.p/gmain.c.o
+FAILED: glib/libglib-2.0.a.p/gmain.c.o 
+/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc -Iglib/libglib-2.0.a.p -Iglib -I../third_party/glib-2.82.2/glib -I. -I../third_party/glib-2.82.2 -Isubprojects/proxy-libintl -I../third_party/glib-2.82.2/subprojects/proxy-libintl -I/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include -I/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/include -fvisibility=hidden -fdiagnostics-color=always -D_FILE_OFFSET_BITS=64 -Wall -Winvalid-pch -Wextra -Wpedantic -std=gnu99 -O2 -g -D_GNU_SOURCE -fno-strict-aliasing -DG_DISABLE_CAST_CHECKS -DG_DISABLE_ASSERT -DG_DISABLE_CHECKS -Wduplicated-branches -Wimplicit-fallthrough -Wmisleading-indentation -Wmissing-field-initializers -Wnonnull -Wnull-dereference -Wunused -Wno-unused-parameter -Wno-cast-function-type -Wno-pedantic -Wno-format-zero-length -Wno-variadic-macros -Werror=format=2 -Werror=init-self -Werror=missing-include-dirs -Werror=pointer-arith -Werror=unused-result -Wstrict-prototypes -Wno-bad-function-cast -Werror=implicit-function-declaration -Werror=missing-prototypes -Werror=pointer-sign --sysroot=/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot -nostdinc -fPIC -pthread -DPCRE2_CODE_UNIT_WIDTH=8 -DG_INTL_STATIC_COMPILATION '-DG_LOG_DOMAIN="GLib"' -DGLIB_COMPILATION -MD -MQ glib/libglib-2.0.a.p/gmain.c.o -MF glib/libglib-2.0.a.p/gmain.c.o.d -o glib/libglib-2.0.a.p/gmain.c.o -c ../third_party/glib-2.82.2/glib/gmain.c
+../third_party/glib-2.82.2/glib/gmain.c: In function 'g_main_context_ref':
+../third_party/glib-2.82.2/glib/gmain.c:472:7: warning: variable 'old_ref_count' set but not used [-Wunused-but-set-variable]
+  472 |   int old_ref_count;
+      |       ^~~~~~~~~~~~~
+../third_party/glib-2.82.2/glib/gmain.c: In function 'g_main_context_push_thread_default':
+../third_party/glib-2.82.2/glib/gmain.c:785:12: warning: variable 'acquired_context' set but not used [-Wunused-but-set-variable]
+  785 |   gboolean acquired_context;
+      |            ^~~~~~~~~~~~~~~~
+../third_party/glib-2.82.2/glib/gmain.c: In function 'g_get_worker_context':
+../third_party/glib-2.82.2/glib/gmain.c:6561:7: error: implicit declaration of function 'pthread_sigmask'; did you mean 'pthread_spin_lock'? [-Wimplicit-function-declaration]
+ 6561 |       pthread_sigmask (SIG_SETMASK, &all, &prev_mask);
+      |       ^~~~~~~~~~~~~~~
+      |       pthread_spin_lock
+[61/566] Compiling C object glib/libglib-2.0.a.p/ghook.c.o
+[62/566] Compiling C object glib/libglib-2.0.a.p/gdataset.c.o
+[63/566] Compiling C object glib/libglib-2.0.a.p/gprimes.c.o
+[64/566] Compiling C object glib/libglib-2.0.a.p/gpoll.c.o
+[65/566] Compiling C object glib/libglib-2.0.a.p/gmem.c.o
+[66/566] Compiling C object glib/libglib-2.0.a.p/gconvert.c.o
+[67/566] Compiling C object glib/libglib-2.0.a.p/gpathbuf.c.o
+[68/566] Compiling C object glib/libglib-2.0.a.p/glist.c.o
+[69/566] Compiling C object glib/libglib-2.0.a.p/gdate.c.o
+[70/566] Compiling C object glib/libglib-2.0.a.p/ghostutils.c.o
+[71/566] Compiling C object glib/libglib-2.0.a.p/gpattern.c.o
+[72/566] Compiling C object glib/libglib-2.0.a.p/gfileutils.c.o
+../third_party/glib-2.82.2/glib/gfileutils.c: In function 'g_get_current_dir':
+../third_party/glib-2.82.2/glib/gfileutils.c:2995:17: warning: potential null pointer dereference [-Wnull-dereference]
+ 2995 |       buffer[1] = 0;
+      |       ~~~~~~~~~~^~~
+../third_party/glib-2.82.2/glib/gfileutils.c:2994:17: warning: potential null pointer dereference [-Wnull-dereference]
+ 2994 |       buffer[0] = G_DIR_SEPARATOR;
+[73/566] Compiling C object glib/libglib-2.0.a.p/garray.c.o
+[74/566] Compiling C object glib/libglib-2.0.a.p/gnode.c.o
+[75/566] Generating gio/gioenumtypes_c with a custom command (wrapped by meson to capture output)
+[76/566] Compiling C object glib/libglib-2.0.a.p/giochannel.c.o
+[77/566] Compiling C object glib/libglib-2.0.a.p/gmessages.c.o
+[78/566] Compiling C object glib/libglib-2.0.a.p/ghash.c.o
+[79/566] Compiling C object glib/libglib-2.0.a.p/gdatetime.c.o
+[80/566] Compiling C object glib/libglib-2.0.a.p/gmarkup.c.o
+[81/566] Compiling C object glib/libglib-2.0.a.p/gchecksum.c.o
+[82/566] Compiling C object glib/libglib-2.0.a.p/goption.c.o
+[83/566] Compiling C object glib/libglib-2.0.a.p/gkeyfile.c.o
+../third_party/glib-2.82.2/glib/gkeyfile.c: In function 'g_key_file_set_group_comment':
+../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
+ 3401 |   group = group_node->next->data;
+      |           ~~~~~~~~~~^~~~~~
+../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
+In function 'g_key_file_get_group_comment',
+    inlined from 'g_key_file_get_comment' at ../third_party/glib-2.82.2/glib/gkeyfile.c:3684:12:
+../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
+ 3630 |   group_node = group_node->next;
+      |   ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
+[84/566] Compiling C object glib/libglib-2.0.a.p/gbookmarkfile.c.o
+[85/566] Compiling C object glib/gnulib/libgnulib.a.p/vasnprintf.c.o
+../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c: In function '_g_gnulib_vasnprintf':
+../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:5335:31: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+ 5335 |                     if (count >= tmp_length)
+      |                               ^~
+../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:5426:31: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+ 5426 |                     if (count > allocated - length)
+      |                               ^
+In file included from ../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:60:
+In function 'convert_to_decimal',
+    inlined from 'scale10_round_decimal_decoded' at ../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:1296:12:
+../third_party/glib-2.82.2/glib/gnulib/g-gnulib.h:33:17: warning: argument 1 value '18446744073709551615' exceeds maximum object size 9223372036854775807 [-Walloc-size-larger-than=]
+   33 | #define malloc  g_malloc
+../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:867:26: note: in expansion of macro 'malloc'
+  867 |   char *c_ptr = (char *) malloc (xsum (xsum (extra_zeroes, c_len), 1));
+      |                          ^~~~~~
+In file included from ../third_party/glib-2.82.2/glib/glist.h:34,
+                 from ../third_party/glib-2.82.2/glib/ghash.h:36,
+                 from ../third_party/glib-2.82.2/glib/glib.h:52,
+                 from ../third_party/glib-2.82.2/glib/gnulib/g-gnulib.h:21:
+../third_party/glib-2.82.2/glib/gmem.h: In function 'scale10_round_decimal_decoded':
+../third_party/glib-2.82.2/glib/gmem.h:84:10: note: in a call to allocation function 'g_malloc' declared here
+   84 | gpointer g_malloc         (gsize         n_bytes) G_GNUC_MALLOC G_GNUC_ALLOC_SIZE(1);
+      |          ^~~~~~~~
+ninja: build stopped: subcommand failed.
