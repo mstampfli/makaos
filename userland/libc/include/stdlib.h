@@ -79,6 +79,15 @@ int posix_memalign(void** memptr, size_t alignment, size_t size);
 int mkstemp(char* template_);
 int mkostemp(char* template_, int flags);
 
+// Wide-char conversion — POSIX puts these in BOTH <stdlib.h> and
+// <wchar.h>.  wchar_t comes from <stddef.h> (compiler builtin); we
+// already include it at the top of this header.
+int    mbtowc(wchar_t* pwc, const char* s, size_t n);
+int    wctomb(char* s, wchar_t wc);
+size_t mbstowcs(wchar_t* dst, const char* src, size_t n);
+size_t wcstombs(char* dst, const wchar_t* src, size_t n);
+int    mblen(const char* s, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <signal.h>
 
 // Declared by pthread_trampoline.asm.
 extern void pthread_trampoline(void);
@@ -518,5 +519,27 @@ int pthread_setname_np(pthread_t tid, const char* name) {
 int pthread_getname_np(pthread_t tid, char* name, size_t n) {
     (void)tid;
     if (name && n) name[0] = '\0';
+    return 0;
+}
+
+// pthread_sigmask — per-thread signal mask.  MakaOS has no per-thread
+// mask yet; forward to process-level sigprocmask.
+// TODO(scalability-debt-ledger): real per-thread sigmask when the
+// kernel gains per-task pending-signal tables.
+extern int sigprocmask(int how, const sigset_t* set, sigset_t* old);
+int pthread_sigmask(int how, const sigset_t* set, sigset_t* old) {
+    return sigprocmask(how, set, old);
+}
+
+int pthread_setcancelstate(int state, int* oldstate) {
+    (void)state; if (oldstate) *oldstate = 0; return 0;
+}
+int pthread_setcanceltype(int type, int* oldtype) {
+    (void)type; if (oldtype) *oldtype = 0; return 0;
+}
+void pthread_testcancel(void) { }
+
+int pthread_atfork(void (*prep)(void), void (*parent)(void), void (*child)(void)) {
+    (void)prep; (void)parent; (void)child;
     return 0;
 }

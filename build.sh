@@ -145,7 +145,7 @@ SYSROOT_CFLAGS=(
 # in-tree apps that include it directly.
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
            sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
-           time arpa_inet string ctype makaos_input poll signal; do
+           time arpa_inet string ctype makaos_input poll signal resolv; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
     -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
 done
@@ -185,7 +185,8 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_sys_epoll.o" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
-   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o"
+   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
+   "$BUILD_DIR/user_resolv.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still
