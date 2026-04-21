@@ -128,6 +128,16 @@ static void packet_decode(void) {
     if (flags & PKT_BTN_MIDDLE) ev.buttons |= MOUSE_BTN_MIDDLE;
 
     evt_push(ev);
+
+    // Bridge to the evdev layer so /dev/input/event1 (mouse) fires
+    // EV_REL / EV_KEY / SYN_REPORT for libinput consumers.  The native
+    // /dev/mouse ring above feeds the legacy compositor path unchanged.
+    extern void evdev_on_mouse_packet(int32_t dx, int32_t dy, uint8_t buttons);
+    uint8_t evdev_buttons = 0;
+    if (flags & PKT_BTN_LEFT)   evdev_buttons |= 0x1;
+    if (flags & PKT_BTN_MIDDLE) evdev_buttons |= 0x2;
+    if (flags & PKT_BTN_RIGHT)  evdev_buttons |= 0x4;
+    evdev_on_mouse_packet((int32_t)dx, (int32_t)dy, evdev_buttons);
 }
 
 // ── IRQ12 handler — runs in interrupt context ─────────────────────────────
