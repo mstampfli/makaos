@@ -32,6 +32,27 @@ if [ ! -d "$WLR_SRC" ]; then
     exit 1
 fi
 
+# ── MakaOS native backend patch ───────────────────────────────────
+# Copy our native backend source into the wlroots tree and patch
+# backend/meson.build to include it.  Idempotent: re-copies every
+# invocation so upstream tarball re-extract doesn't lose our patch.
+NATIVE_SRC="$REPO_ROOT/userland/wlroots-backend-native"
+if [ -d "$NATIVE_SRC" ]; then
+    mkdir -p "$WLR_SRC/backend/native" "$WLR_SRC/include/wlr/backend"
+    cp "$NATIVE_SRC/backend.c"               "$WLR_SRC/backend/native/"
+    cp "$NATIVE_SRC/keyboard.c"              "$WLR_SRC/backend/native/"
+    cp "$NATIVE_SRC/pointer.c"               "$WLR_SRC/backend/native/"
+    cp "$NATIVE_SRC/native.h"                "$WLR_SRC/backend/native/"
+    cp "$NATIVE_SRC/meson.build"             "$WLR_SRC/backend/native/"
+    cp "$NATIVE_SRC/wlr_backend_native.h"    "$WLR_SRC/include/wlr/backend/native.h"
+
+    # Patch backend/meson.build to include the native subdir — idempotent.
+    if ! grep -q "^subdir('native')" "$WLR_SRC/backend/meson.build"; then
+        printf "\nsubdir('native')\n" >> "$WLR_SRC/backend/meson.build"
+    fi
+    log "native backend source + header installed"
+fi
+
 # ── Sysroot scaffolding required before meson can configure wlroots.
 #    Each item here is idempotent; safe to re-run.  Moving them into
 #    port-wlroots.sh means a fresh sysroot self-bootstraps.
