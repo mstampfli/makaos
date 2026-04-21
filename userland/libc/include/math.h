@@ -69,5 +69,32 @@ float  logf(float);
 float  sinf(float);
 float  cosf(float);
 float  tanf(float);
+float  roundf(float);
+float  truncf(float);
+float  fmodf(float, float);
+float  copysignf(float, float);
+float  fminf(float, float);
+float  fmaxf(float, float);
+float  hypotf(float, float);
+float  atanf(float);
+float  atan2f(float, float);
+float  asinf(float);
+float  acosf(float);
+float  log2f(float);
+float  log10f(float);
+float  cbrtf(float);
+float  sinhf(float);
+float  coshf(float);
+float  tanhf(float);
+
+double fmin(double, double);
+double fmax(double, double);
+
+// long double variants (alias to double internally)
+long double sqrtl(long double);
+long double fabsl(long double);
+long double floorl(long double);
+long double ceill(long double);
+long double fmodl(long double, long double);
 
 #endif

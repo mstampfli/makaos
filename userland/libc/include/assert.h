@@ -9,7 +9,10 @@
   #define assert(x) ((x) ? (void)0 : __assert_fail(#x, __FILE__, __LINE__, __func__))
 #endif
 
-// C11 static_assert alias.
+// C11 static_assert alias.  C++ already has static_assert as a keyword
+// so this macro must not clobber it in C++ translation units.
+#ifndef __cplusplus
 #define static_assert _Static_assert
+#endif
 
 #endif
