@@ -44,6 +44,21 @@ const char*         udev_device_get_sysattr_value(struct udev_device* d, const c
 dev_t               udev_device_get_devnum(struct udev_device* d);
 struct udev_device* udev_device_get_parent_with_subsystem_devtype(
     struct udev_device* d, const char* subsystem, const char* devtype);
+// libinput walks device->parent chains for property inheritance
+// (quirks, NAME, etc).  We store no parent for most devices → NULL.
+struct udev_device* udev_device_get_parent(struct udev_device* d);
+// libinput reaches back to the owning udev context to rehydrate
+// devices after kernel hot-plug; return the back-reference we cache
+// at creation time.
+struct udev*        udev_device_get_udev(struct udev_device* d);
+// libinput's path-seat + udev-seat paths check whether the kernel
+// has finished initializing a device before opening it.  Our
+// synthetic devices are always fully populated at construction, so
+// this always returns 1.
+int                 udev_device_get_is_initialized(struct udev_device* d);
+// libinput-record iterates all UDEV properties on a device to
+// archive them.  Return the head of the property list.
+struct udev_list_entry* udev_device_get_properties_list_entry(struct udev_device* d);
 
 struct udev_monitor* udev_monitor_new_from_netlink(struct udev* u, const char* name);
 struct udev_monitor* udev_monitor_unref(struct udev_monitor* m);

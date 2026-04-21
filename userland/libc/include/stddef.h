@@ -7,7 +7,11 @@
 
 typedef unsigned long       size_t;
 typedef   signed long       ptrdiff_t;
+// wchar_t is a built-in type in C++, not typedefable; only declare
+// in C.  (Cross-language headers must wrap this.)
+#ifndef __cplusplus
 typedef int                 wchar_t;
+#endif
 
 // ssize_t is technically a POSIX type but libgcc pulls it via stdio.h
 // in freestanding compiles, so expose it here too with the shared

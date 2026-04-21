@@ -92,6 +92,11 @@ extern "C" {
 
 extern int errno;
 
+// glibc extensions a handful of ports (libinput, systemd, elfutils)
+// log messages through.  We populate both from argv[0] when crt0 runs.
+extern char* program_invocation_name;
+extern char* program_invocation_short_name;
+
 #ifdef __cplusplus
 }
 #endif

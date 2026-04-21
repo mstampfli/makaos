@@ -4,6 +4,13 @@
 
 #pragma once
 #include <stdint.h>
+
+// __BITS_PER_LONG steers linux/input.h's struct input_event layout
+// selection (timeval vs 64-bit counter).  x86_64 has 64-bit long.
+#ifndef __BITS_PER_LONG
+#define __BITS_PER_LONG 64
+#endif
+
 typedef int8_t   __s8;
 typedef uint8_t  __u8;
 typedef int16_t  __s16;

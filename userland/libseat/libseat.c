@@ -71,8 +71,14 @@ int libseat_close_seat(struct libseat* seat) {
 
 int libseat_open_device(struct libseat* seat, const char* path, int* fd) {
     if (!seat || !path || !fd) { errno = EINVAL; return -1; }
-    int real = open(path, O_RDWR | O_CLOEXEC);
-    if (real < 0) real = open(path, O_RDONLY | O_CLOEXEC);
+    // Always open non-blocking.  libinput + wlroots both assume the
+    // seat hands back an O_NONBLOCK fd (on Linux, systemd-logind/seatd
+    // pass it that way over the FD-passing socket), and wlroots'
+    // libinput_open_restricted discards the caller's flags argument
+    // rather than applying it.  On DRM this only affects the page-flip
+    // event loop, which compositors drive via poll() anyway.
+    int real = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (real < 0) real = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (real < 0) return -1;
     int id;
     // Search for a free slot; grow if none.

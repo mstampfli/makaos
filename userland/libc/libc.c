@@ -3,6 +3,14 @@
 // ── errno ─────────────────────────────────────────────────────────────────
 int errno = 0;
 
+// glibc-ism: argv[0] split into "/path/to/prog" and "prog".  Several
+// upstream ports (systemd, libinput, elfutils, util-linux) log
+// through these.  Populated from crt0 when available; default to an
+// empty string so printf("%s", program_invocation_short_name) is safe.
+char  _prog_name_default[]       = "";
+char* program_invocation_name       = _prog_name_default;
+char* program_invocation_short_name = _prog_name_default;
+
 // ── environ ───────────────────────────────────────────────────────────────
 // Null-terminated array of "KEY=VALUE" strings, set by ELF loader.
 // If the loader doesn't set it, default to an empty environment.
@@ -909,6 +917,17 @@ int nanosleep(const struct timespec* req, struct timespec* rem) {
         syscall2(SYS_NANOSLEEP, (uint64_t)req, (uint64_t)rem));
 }
 
+// ── usleep — POSIX.1-2001 variant taking microseconds. ───────────────────
+// useconds_t max is 1e6.  Split into whole seconds + nanoseconds before
+// handing off to SYS_NANOSLEEP.  Returns 0 / -1, sets errno on failure.
+int usleep(unsigned us) {
+    struct timespec ts = {
+        .tv_sec  = (long)(us / 1000000u),
+        .tv_nsec = (long)((us % 1000000u) * 1000u),
+    };
+    return nanosleep(&ts, 0);
+}
+
 // ── mmap / munmap ─────────────────────────────────────────────────────────
 void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
     uint64_t ret;
@@ -1367,6 +1386,133 @@ void rewinddir(DIR* dirp) {
     if (dirp) dirp->pos = 0;
 }
 
+// ── libgen.h — basename / dirname ────────────────────────────────────────
+// POSIX basename/dirname MAY modify the path buffer and return a
+// pointer into it (or a static ".") — libinput's quirks.c relies on
+// that contract.  Empty path -> ".".  Trailing slashes are stripped.
+static char s_dot[] = ".";
+static char s_slash[] = "/";
+
+char* basename(char* path) {
+    if (!path || !*path) return s_dot;
+    // Strip trailing slashes (but not the root "/" itself).
+    size_t n = 0; while (path[n]) n++;
+    while (n > 1 && path[n - 1] == '/') { path[n - 1] = '\0'; n--; }
+    const char* last = path;
+    for (size_t i = 0; i < n; i++) if (path[i] == '/') last = path + i + 1;
+    return (char*)last;
+}
+
+char* dirname(char* path) {
+    if (!path || !*path) return s_dot;
+    size_t n = 0; while (path[n]) n++;
+    // Trailing slashes (keep "/" as "/").
+    while (n > 1 && path[n - 1] == '/') { path[n - 1] = '\0'; n--; }
+    // Find last slash.
+    ssize_t last = -1;
+    for (size_t i = 0; i < n; i++) if (path[i] == '/') last = (ssize_t)i;
+    if (last < 0) return s_dot;
+    if (last == 0) return s_slash;
+    path[last] = '\0';
+    // Strip again if inner slashes (/a//b → /a).
+    while (last > 1 && path[last - 1] == '/') path[--last] = '\0';
+    return path;
+}
+
+// ── rindex — BSD alias for strrchr, still used by libinput. ───────────────
+char* rindex(const char* s, int c) { return strrchr(s, c); }
+char* index (const char* s, int c) { return strchr (s, c); }
+
+
+// locale_t forward-declared here; <locale.h> defines it as a
+// pointer to an opaque __locale_struct.  libc.h doesn't include
+// <locale.h> since most of the kernel/TUs have no locale concept,
+// so introduce the typedef locally.
+typedef struct __locale_struct* locale_t;
+
+// ── _l locale-aware parsers — ignore locale, MakaOS is C-only. ───────────
+double strtod_l(const char* s, char** endptr, locale_t loc) {
+    (void)loc; return strtod(s, endptr);
+}
+long strtol_l(const char* s, char** endptr, int base, locale_t loc) {
+    (void)loc; return strtol(s, endptr, base);
+}
+unsigned long strtoul_l(const char* s, char** endptr, int base, locale_t loc) {
+    (void)loc; return strtoul(s, endptr, base);
+}
+
+// ── scandir / alphasort — POSIX directory listing helpers ─────────────────
+// libinput scans /dev/input/ for eventN nodes via scandir.  We keep the
+// layout POSIX-standard (namelist is an array of malloc'd struct dirent
+// pointers — caller frees each + the array).
+int alphasort(const struct dirent** a, const struct dirent** b) {
+    const char* sa = (*a)->d_name;
+    const char* sb = (*b)->d_name;
+    while (*sa && *sa == *sb) { sa++; sb++; }
+    return (unsigned char)*sa - (unsigned char)*sb;
+}
+
+// versionsort: compare filenames with embedded decimal numbers treated
+// as integers (event2 < event10).  Matches glibc/musl semantics.
+int versionsort(const struct dirent** a, const struct dirent** b) {
+    const char* sa = (*a)->d_name;
+    const char* sb = (*b)->d_name;
+    while (*sa && *sb) {
+        if (*sa >= '0' && *sa <= '9' && *sb >= '0' && *sb <= '9') {
+            unsigned long na = 0, nb = 0;
+            while (*sa >= '0' && *sa <= '9') { na = na * 10 + (*sa - '0'); sa++; }
+            while (*sb >= '0' && *sb <= '9') { nb = nb * 10 + (*sb - '0'); sb++; }
+            if (na != nb) return na < nb ? -1 : 1;
+        } else {
+            if (*sa != *sb) return (unsigned char)*sa - (unsigned char)*sb;
+            sa++; sb++;
+        }
+    }
+    return (unsigned char)*sa - (unsigned char)*sb;
+}
+
+int scandir(const char* path, struct dirent*** namelist,
+            int (*filter)(const struct dirent*),
+            int (*compar)(const struct dirent**, const struct dirent**)) {
+    if (!path || !namelist) { errno = EINVAL; return -1; }
+    DIR* d = opendir(path);
+    if (!d) return -1;
+
+    struct dirent** arr = NULL;
+    size_t cap = 0, n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        if (filter && !filter(e)) continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            struct dirent** na = realloc(arr, cap * sizeof(*arr));
+            if (!na) { closedir(d); for (size_t i = 0; i < n; i++) free(arr[i]); free(arr); return -1; }
+            arr = na;
+        }
+        struct dirent* copy = malloc(sizeof(*copy));
+        if (!copy) { closedir(d); for (size_t i = 0; i < n; i++) free(arr[i]); free(arr); return -1; }
+        *copy = *e;
+        arr[n++] = copy;
+    }
+    closedir(d);
+
+    if (compar && n > 1) {
+        // Simple insertion sort — N is tiny for /dev/input.
+        for (size_t i = 1; i < n; i++) {
+            struct dirent* key = arr[i];
+            size_t j = i;
+            while (j > 0 && compar((const struct dirent**)&arr[j-1],
+                                    (const struct dirent**)&key) > 0) {
+                arr[j] = arr[j-1]; j--;
+            }
+            arr[j] = key;
+        }
+    }
+
+    *namelist = arr;
+    return (int)n;
+}
+
 // ── passwd database ───────────────────────────────────────────────────────
 // Parse /etc/passwd: username:x:uid:gid:gecos:home:shell
 
@@ -1628,18 +1774,20 @@ char* strsignal(int sig) {
 }
 
 // ── strftime / localtime ──────────────────────────────────────────────────
-static struct tm s_tm;
+//
+// localtime()/gmtime() return a pointer to a shared static buffer per
+// POSIX — not thread-safe by design.  New code should prefer the _r
+// variants which take a caller-owned tm.  MakaOS is UTC-only; no DST.
 
-struct tm* localtime(const time_t* t) {
-    // Simple Gregorian calendar decomposition (UTC, no timezone).
-    long long ts = t ? (long long)*t : 0;
+static void tm_decompose(time_t t, struct tm* out) {
+    long long ts = (long long)t;
     long long day = ts / 86400;
     long long sec = ts % 86400;
-    s_tm.tm_sec  = (int)(sec % 60);
-    s_tm.tm_min  = (int)((sec / 60) % 60);
-    s_tm.tm_hour = (int)(sec / 3600);
+    out->tm_sec  = (int)(sec % 60);
+    out->tm_min  = (int)((sec / 60) % 60);
+    out->tm_hour = (int)(sec / 3600);
     // Days since epoch (Jan 1 1970 = Thursday, wday=4)
-    s_tm.tm_wday = (int)((day + 4) % 7);
+    out->tm_wday = (int)((day + 4) % 7);
     // Year/month/day from day count
     long long y = 1970; long long d = day;
     while (1) {
@@ -1647,8 +1795,8 @@ struct tm* localtime(const time_t* t) {
         if (d < yd) break;
         d -= yd; y++;
     }
-    s_tm.tm_year = (int)(y - 1900);
-    s_tm.tm_yday = (int)d;
+    out->tm_year = (int)(y - 1900);
+    out->tm_yday = (int)d;
     int is_leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
     static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
     int m = 0;
@@ -1657,9 +1805,24 @@ struct tm* localtime(const time_t* t) {
         if (d < dm) break;
         d -= dm; m++;
     }
-    s_tm.tm_mon  = m;
-    s_tm.tm_mday = (int)d + 1;
-    s_tm.tm_isdst = 0;
+    out->tm_mon   = m;
+    out->tm_mday  = (int)d + 1;
+    out->tm_isdst = 0;
+}
+
+struct tm* localtime_r(const time_t* t, struct tm* tm) {
+    if (!t || !tm) return 0;
+    tm_decompose(*t, tm);
+    return tm;
+}
+struct tm* gmtime_r(const time_t* t, struct tm* tm) {
+    return localtime_r(t, tm);  // MakaOS is UTC-only
+}
+
+static struct tm s_tm;
+struct tm* localtime(const time_t* t) {
+    if (!t) return 0;
+    tm_decompose(*t, &s_tm);
     return &s_tm;
 }
 
@@ -2385,6 +2548,123 @@ int tputs(const char* str, int affcnt, int (*putc_fn)(int)) {
     while (*str)
         putc_fn((unsigned char)*str++);
     return 0;
+}
+
+
+
+// ── Forward declarations for the new libinput-port libc surface.
+// libc.h doesn't pull in <sys/utsname.h> / <stdio.h> directly, and
+// dragging the sysroot copies in here triggers a type conflict on
+// clock_t / ssize_t.  Minimal local forward-decls suffice.
+FILE* fdopen(int fd, const char* mode);
+int   unlink(const char* path);
+
+// ── atof ─────────────────────────────────────────────────────────────────
+// Thin wrapper around strtod: discard the end-pointer.
+double atof(const char* s) { return strtod(s, 0); }
+
+
+// ── tmpfile / mkstemp fallback ───────────────────────────────────────────
+// Opens /tmp/mkosXXXXXX, O_CREAT|O_EXCL|O_RDWR|O_CLOEXEC.  The file is
+// unlinked before fdopen so it self-cleans on close.  Uses srand-seeded
+// 6-char suffix — good enough for libinput-record tempfiles.
+FILE* tmpfile(void) {
+    char path[32];
+    for (int tries = 0; tries < 64; tries++) {
+        unsigned r = (unsigned)rand();
+        snprintf(path, sizeof(path), "/tmp/mko%06u", r % 1000000u);
+        int fd = open(path, O_CREAT|O_EXCL|O_RDWR, 0600);
+        if (fd < 0) continue;
+        unlink(path);
+        FILE* fp = fdopen(fd, "w+");
+        if (!fp) { close(fd); return 0; }
+        return fp;
+    }
+    return 0;
+}
+
+// ── scanf family — minimal %d/%s/%u/%x/%lx/%ld — satisfies libinput. ─────
+// libinput-record parses trivially-formatted event dumps with scanf.
+// We don't need fancy conversion; only the primitives below.
+static int scanf_core(const char** bufp, const char* fmt, va_list ap);
+int vsscanf(const char* buf, const char* fmt, va_list ap) {
+    const char* b = buf;
+    return scanf_core(&b, fmt, ap);
+}
+static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
+    int matched = 0;
+    const char* b = *bufp;
+    while (*fmt) {
+        if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
+            while (*b == ' ' || *b == '\t' || *b == '\n') b++;
+            fmt++;
+            continue;
+        }
+        if (*fmt != '%') {
+            if (*b != *fmt) break;
+            b++; fmt++;
+            continue;
+        }
+        fmt++;
+        int longflag = 0, llflag = 0;
+        while (*fmt == 'l') { longflag++; if (longflag == 2) llflag = 1; fmt++; }
+        while (*b == ' ' || *b == '\t' || *b == '\n') b++;
+        switch (*fmt) {
+        case 'd': {
+            int neg = 0;
+            if (*b == '-') { neg = 1; b++; } else if (*b == '+') b++;
+            if (*b < '0' || *b > '9') return matched;
+            long long v = 0;
+            while (*b >= '0' && *b <= '9') { v = v*10 + (*b - '0'); b++; }
+            if (neg) v = -v;
+            if (llflag)      *va_arg(ap, long long*) = v;
+            else if (longflag) *va_arg(ap, long*)    = (long)v;
+            else               *va_arg(ap, int*)     = (int)v;
+            matched++;
+            break;
+        }
+        case 'u': case 'x': {
+            int base = (*fmt == 'x') ? 16 : 10;
+            if (base == 16 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) b += 2;
+            unsigned long long v = 0; int consumed = 0;
+            while (*b) {
+                int d;
+                if (*b >= '0' && *b <= '9') d = *b - '0';
+                else if (base == 16 && *b >= 'a' && *b <= 'f') d = *b - 'a' + 10;
+                else if (base == 16 && *b >= 'A' && *b <= 'F') d = *b - 'A' + 10;
+                else break;
+                v = v * base + d; b++; consumed++;
+            }
+            if (!consumed) return matched;
+            if (llflag)      *va_arg(ap, unsigned long long*) = v;
+            else if (longflag) *va_arg(ap, unsigned long*)    = (unsigned long)v;
+            else               *va_arg(ap, unsigned int*)     = (unsigned int)v;
+            matched++;
+            break;
+        }
+        case 's': {
+            char* out = va_arg(ap, char*);
+            int i = 0;
+            while (*b && *b != ' ' && *b != '\t' && *b != '\n') { out[i++] = *b++; }
+            out[i] = 0;
+            if (!i) return matched;
+            matched++;
+            break;
+        }
+        case 'c': {
+            char* out = va_arg(ap, char*);
+            if (!*b) return matched;
+            *out = *b++;
+            matched++;
+            break;
+        }
+        case '%': if (*b++ != '%') return matched; break;
+        default: return matched;
+        }
+        fmt++;
+    }
+    *bufp = b;
+    return matched;
 }
 
 // ── setvbuf ───────────────────────────────────────────────────────────────

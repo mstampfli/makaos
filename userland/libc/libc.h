@@ -1784,6 +1784,8 @@ struct tm {
 };
 struct tm* localtime(const time_t* t);
 struct tm* gmtime(const time_t* t);
+struct tm* localtime_r(const time_t* t, struct tm* tm);
+struct tm* gmtime_r   (const time_t* t, struct tm* tm);
 size_t     strftime(char* s, size_t max, const char* fmt, const struct tm* tm);
 static inline void tzset(void) {}
 

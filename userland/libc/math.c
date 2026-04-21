@@ -334,33 +334,114 @@ double tanh(double x) {
     return (e2 - 1.0) / (e2 + 1.0);
 }
 
-// ── Basic math (extern — merged from former libm_extern.c) ────────────────
-// Compiler lowers each __builtin_* to a single SSE2 scalar instruction:
-//   sqrt/sqrtf   → sqrtsd/sqrtss
-//   fabs/fabsf   → andpd/andps
-//   floor/ceil/round/trunc → roundsd/roundss (with the right imm8)
-// Long-double variants alias to double — MakaOS doesn't use 80-bit x87.
+// ── Basic math: SSE2 via inline asm ──────────────────────────────────
+// We can NOT use __builtin_X here: at -O0 (our userland flag) gcc lowers
+// __builtin_sqrt / __builtin_fabs / etc. to `call sqrt` / `call fabs` /
+// etc. — a call into ourselves, stack-overflows at first invocation.
+// Same for __builtin_fmod which even at -O2 emits a libm call.  Hand-
+// write them with inline asm so no amount of optimization level change
+// can re-introduce the recursion trap.
+//
+// References:
+//  - sqrtsd xmm, xmm         — scalar double square root (SSE2)
+//  - sqrtss xmm, xmm         — scalar float square root (SSE2)
+//  - andpd / andps           — with a sign-mask constant → fabs
+//  - cvttsd2si / cvttss2si   — truncate-to-int for trunc()
+//
+// floor/ceil need roundsd (SSE4.1).  On CPUs without SSE4.1 we fall
+// back to a software path built from trunc + comparison.
 
-double fabs(double x)        { return __builtin_fabs(x); }
-float  fabsf(float x)        { return __builtin_fabsf(x); }
-double sqrt(double x)        { return __builtin_sqrt(x); }
-float  sqrtf(float x)        { return __builtin_sqrtf(x); }
-double floor(double x)       { return __builtin_floor(x); }
-float  floorf(float x)       { return __builtin_floorf(x); }
-double ceil(double x)        { return __builtin_ceil(x); }
-float  ceilf(float x)        { return __builtin_ceilf(x); }
-double round(double x)       { return __builtin_round(x); }
-float  roundf(float x)       { return __builtin_roundf(x); }
-double trunc(double x)       { return __builtin_trunc(x); }
-float  truncf(float x)       { return __builtin_truncf(x); }
+double fabs(double x) {
+    double r;
+    asm("andpd %1, %0" : "=x"(r) : "x"((double)((union { uint64_t u; double d; }){.u=0x7FFFFFFFFFFFFFFFULL}.d)), "0"(x));
+    return r;
+}
+float fabsf(float x) {
+    float r;
+    asm("andps %1, %0" : "=x"(r) : "x"((float)((union { uint32_t u; float f; }){.u=0x7FFFFFFFu}.f)), "0"(x));
+    return r;
+}
+double sqrt(double x) {
+    double r;
+    asm("sqrtsd %1, %0" : "=x"(r) : "x"(x));
+    return r;
+}
+float sqrtf(float x) {
+    float r;
+    asm("sqrtss %1, %0" : "=x"(r) : "x"(x));
+    return r;
+}
+double copysign(double x, double y) {
+    // Mask x's sign bit off, OR in y's sign bit.
+    union { uint64_t u; double d; } ax = {.d = x}, ay = {.d = y};
+    ax.u = (ax.u & 0x7FFFFFFFFFFFFFFFULL) | (ay.u & 0x8000000000000000ULL);
+    return ax.d;
+}
+float copysignf(float x, float y) {
+    union { uint32_t u; float f; } ax = {.f = x}, ay = {.f = y};
+    ax.u = (ax.u & 0x7FFFFFFFu) | (ay.u & 0x80000000u);
+    return ax.f;
+}
+
+// trunc via cvttsd2si for values that fit in int64; otherwise value is
+// already an integer.  Handles the full double range safely.
+double trunc(double x) {
+    union { uint64_t u; double d; } ux = {.d = x};
+    int exp = (int)((ux.u >> 52) & 0x7FF) - 1023;
+    if (exp < 0) return copysign(0.0, x);
+    if (exp >= 52) return x;                 // already integer
+    uint64_t mask = ~((uint64_t)0) >> (12 + exp);
+    ux.u &= ~mask;
+    return ux.d;
+}
+float truncf(float x) { return (float)trunc((double)x); }
+
+// floor: trunc toward -inf.  If x<0 and has fractional part, step down by 1.
+double floor(double x) {
+    double t = trunc(x);
+    if (t == x) return t;
+    if (x < 0.0) return t - 1.0;
+    return t;
+}
+float floorf(float x) { return (float)floor((double)x); }
+
+// ceil: trunc toward +inf.
+double ceil(double x) {
+    double t = trunc(x);
+    if (t == x) return t;
+    if (x > 0.0) return t + 1.0;
+    return t;
+}
+float ceilf(float x) { return (float)ceil((double)x); }
+
+// round: round half-away-from-zero.
+double round(double x) {
+    if (x >= 0.0) return floor(x + 0.5);
+    return       ceil (x - 0.5);
+}
+float roundf(float x) {
+    if (x >= 0.0f) return (float)floor((double)x + 0.5);
+    return               (float)ceil ((double)x - 0.5);
+}
+
 double fmin(double a, double b) { return a < b ? a : b; }
 double fmax(double a, double b) { return a > b ? a : b; }
 float  fminf(float a, float b)  { return a < b ? a : b; }
 float  fmaxf(float a, float b)  { return a > b ? a : b; }
-double copysign(double x, double y) { return __builtin_copysign(x, y); }
-float  copysignf(float x, float y)  { return __builtin_copysignf(x, y); }
-double fmod(double x, double y)     { return __builtin_fmod(x, y); }
-float  fmodf(float x, float y)      { return __builtin_fmodf(x, y); }
+
+// fmod: x - trunc(x/y)*y.  Native-SSE2 friendly, no x87, no libm call.
+double fmod(double x, double y) {
+    if (y == 0.0) return 0.0 / 0.0;           // NaN
+    union { uint64_t u; double d; } ux = {.d = x}, uy = {.d = y};
+    int ex = (int)((ux.u >> 52) & 0x7FF);
+    int ey = (int)((uy.u >> 52) & 0x7FF);
+    if (ex == 0x7FF || ey == 0x7FF) return 0.0 / 0.0; // inf/nan
+    double q = x / y;
+    return x - trunc(q) * y;
+}
+float fmodf(float x, float y) {
+    return (float)fmod((double)x, (double)y);
+}
 
 // ── hypot / cbrt (real impls) ─────────────────────────────────────────────
 double hypot(double x, double y) { return sqrt(x * x + y * y); }
@@ -386,7 +467,7 @@ long double fabsl(long double x)  { return (long double)__builtin_fabs((double)x
 long double floorl(long double x) { return (long double)__builtin_floor((double)x); }
 long double ceill(long double x)  { return (long double)__builtin_ceil((double)x); }
 long double fmodl(long double x, long double y) {
-    return (long double)__builtin_fmod((double)x, (double)y);
+    return (long double)fmod((double)x, (double)y);
 }
 long double frexpl(long double x, int* ep) {
     return (long double)frexp((double)x, ep);
