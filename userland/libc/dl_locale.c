@@ -259,10 +259,88 @@ FILE* fmemopen(void* buf, size_t size, const char* mode) {
     return (FILE*)0;
 }
 
-// asprintf stub — returns -1, leaves *strp unset.  Real impl would
-// need a pre-probe vsnprintf(NULL) pass.  Not needed by our current
-// ports' happy paths.
-int asprintf(char** strp, const char* fmt, ...) {
-    (void)strp; (void)fmt;
+// asprintf lives in libc.c — do not duplicate here.
+
+// readlink stub — MakaOS has no symlinks in its filesystem, so the
+// canonical answer is always "not a symlink".  Return -1 + ENOENT.
+// libdrm uses readlink to walk /sys/class/drm/*/device symlinks;
+// seeing -1 makes it fall through to alternate discovery paths.
+#include <unistd.h>
+typedef long ssize_t;
+
+ssize_t readlink(const char* path, char* buf, size_t n) {
+    (void)path; (void)buf; (void)n;
+    errno = ENOENT;
     return -1;
+}
+
+// getline stub — reads a line from a FILE* into *lineptr (malloc'd
+// on demand).  Used by libdrm for uevent parsing; returns -1 when no
+// more data.  Minimal implementation: fgetc-based loop, grows buffer
+// by 128 at a time.
+#include <stdio.h>
+extern int fgetc(FILE*);
+extern void* realloc(void*, size_t);
+
+// fscanf stub — always returns 0 matches.  libdrm uses it for
+// /sys PCI-ID parsing which can safely fail (callers check count).
+extern int vfscanf(FILE* f, const char* fmt, __builtin_va_list ap);
+int fscanf(FILE* f, const char* fmt, ...) {
+    (void)f; (void)fmt;
+    return 0;
+}
+
+// fileno — extract underlying fd from a FILE*.  Our FILE* is a thin
+// wrapper where the fd is stored at a fixed offset (first field).
+// libxkbcommon uses it for mmap-the-file-by-fd paths.
+int fileno(FILE* f) {
+    // FILE layout in libc is { int fd; ... }.  Safe to cast.
+    return f ? *(int*)f : -1;
+}
+
+// chown stub — no filesystem ownership changes supported.  libdrm
+// calls this during a mknod-style setup path that already fails on
+// our mknod stub.  Return 0 (success-ish) so libdrm doesn't abort.
+int chown(const char* path, unsigned uid, unsigned gid) {
+    (void)path; (void)uid; (void)gid;
+    return 0;
+}
+
+int fchown(int fd, unsigned uid, unsigned gid) {
+    (void)fd; (void)uid; (void)gid;
+    return 0;
+}
+
+// chmod/remove stubs — used by libdrm's drmOpenDevice creation path
+// (creates /dev/dri/cardN as root, chmod 0660, chown root:video).
+// Our /dev/dri/card0 is virtfs-provided, drmOpenDevice's creation
+// path is only hit if open() fails first — succeed silently so the
+// error message isn't misleading.
+int chmod(const char* path, unsigned mode) {
+    (void)path; (void)mode;
+    return 0;
+}
+
+extern int unlink(const char*);
+int remove(const char* path) { return unlink(path); }
+
+ssize_t getline(char** lineptr, size_t* n, FILE* f) {
+    if (!lineptr || !n || !f) { errno = EINVAL; return -1; }
+    if (!*lineptr || *n < 2) { *n = 128; *lineptr = (char*)malloc(128); }
+    if (!*lineptr) { errno = ENOMEM; return -1; }
+    ssize_t used = 0;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == -1) { if (used == 0) return -1; break; }
+        if (used + 2 > (ssize_t)*n) {
+            *n *= 2;
+            char* nb = (char*)realloc(*lineptr, *n);
+            if (!nb) { errno = ENOMEM; return -1; }
+            *lineptr = nb;
+        }
+        (*lineptr)[used++] = (char)c;
+        if (c == '\n') break;
+    }
+    (*lineptr)[used] = '\0';
+    return used;
 }

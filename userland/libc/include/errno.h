@@ -1,5 +1,9 @@
 #ifndef _MAKAOS_ERRNO_H
 #define _MAKAOS_ERRNO_H 1
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // POSIX / Linux-compatible errno values.  The numeric codes must stay in
 // sync with kernel/include/errno.h — the kernel returns these verbatim
 // via syscall return values (negative = error).
@@ -53,5 +57,9 @@
 #define ECANCELED   125
 
 extern int errno;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

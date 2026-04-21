@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_DLFCN_H
 #define _MAKAOS_DLFCN_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // MakaOS statically links everything — dlopen/dlsym cannot load a new
 // library at runtime.  These symbols exist only so code compiled
 // against glibc's <dlfcn.h> resolves.  dlopen() always returns NULL,
@@ -28,5 +32,9 @@ void* dlsym(void* handle, const char* name);
 int   dlclose(void* handle);
 char* dlerror(void);
 int   dladdr(const void* addr, Dl_info* info);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

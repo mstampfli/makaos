@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_UNISTD_H
 #define _MAKAOS_UNISTD_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <stddef.h>
 
@@ -110,5 +114,9 @@ int getpagesize(void);
 // Device-node creation — stub, returns -ENOSYS.  libdrm calls it for
 // /dev/dri node setup but we pre-populate in virtfs.
 int mknod(const char* path, unsigned mode, unsigned dev);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

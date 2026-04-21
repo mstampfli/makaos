@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_STDLIB_H
 #define _MAKAOS_STDLIB_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 #define EXIT_SUCCESS 0
@@ -70,5 +74,9 @@ char* realpath(const char* path, char* resolved_path);
 
 // POSIX memalign — allocates aligned memory for ports that check for it.
 int posix_memalign(void** memptr, size_t alignment, size_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

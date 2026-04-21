@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_STDIO_H
 #define _MAKAOS_STDIO_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdarg.h>
 
@@ -103,5 +107,9 @@ ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* f);
 FILE* open_memstream(char** bufp, size_t* sizep);
 FILE* fmemopen(void* buf, size_t size, const char* mode);
 int   asprintf(char** strp, const char* fmt, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

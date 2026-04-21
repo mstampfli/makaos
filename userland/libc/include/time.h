@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_TIME_H
 #define _MAKAOS_TIME_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 #define CLOCKS_PER_SEC 1000000L
@@ -54,5 +58,9 @@ size_t     strftime(char* s, size_t max, const char* fmt, const struct tm* tm);
 char*      ctime(const time_t* t);
 char*      asctime(const struct tm* tm);
 double     difftime(time_t a, time_t b);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

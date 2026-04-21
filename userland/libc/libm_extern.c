@@ -57,15 +57,24 @@ extern double asin(double x);
 extern double acos(double x);
 extern double log2(double x);
 extern double log10(double x);
-extern double cbrt(double x);
 extern double sinh(double x);
 extern double cosh(double x);
 extern double tanh(double x);
-extern double hypot(double x, double y);
+
+// hypot + cbrt live in libc/math.h as externs but nothing implements
+// them — ship one-liner implementations here.  hypot uses sqrt; cbrt
+// uses pow.  Accurate enough for text shaping / general port use.
+extern double sqrt(double);
+extern double pow(double, double);
+
+double hypot(double x, double y) { return sqrt(x * x + y * y); }
+double cbrt(double x) {
+    return x < 0.0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0);
+}
 
 float hypotf(float x, float y) { return (float)hypot((double)x, (double)y); }
 float atanf(float x)           { return (float)atan((double)x); }
-float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
+// atan2f lives in math.c (has the same wrapper there already).
 float asinf(float x)           { return (float)asin((double)x); }
 float acosf(float x)           { return (float)acos((double)x); }
 float log2f(float x)           { return (float)log2((double)x); }

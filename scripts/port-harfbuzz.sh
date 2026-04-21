@@ -66,13 +66,12 @@ fetch_hb() {
 install_headers() {
     log "installing public headers into $SYSROOT/usr/include/harfbuzz"
     mkdir -p "$SYSROOT/usr/include/harfbuzz"
-    # All hb-*.h in src/ that don't start with underscore are public.
+    # hb.h is the umbrella header; hb-*.h are specific.
+    [ -f "$HB_SRC/src/hb.h" ] && cp "$HB_SRC/src/hb.h" "$SYSROOT/usr/include/harfbuzz/"
     for h in "$HB_SRC/src/"hb-*.h; do
         [ -f "$h" ] || continue
         cp "$h" "$SYSROOT/usr/include/harfbuzz/"
     done
-    # hb-ft.h for freetype integration (harfbuzz ↔ freetype glue)
-    [ -f "$HB_SRC/src/hb-ft.h" ] && cp "$HB_SRC/src/hb-ft.h" "$SYSROOT/usr/include/harfbuzz/"
 }
 
 build_lib() {
