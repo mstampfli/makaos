@@ -40,6 +40,7 @@ CFLAGS=(
     -Wno-sign-compare
     -Wno-pointer-sign
     -DHAVE_CONFIG_H
+    -DFC_GPERF_SIZE_T=size_t
     -I "$SYSROOT/usr/include/freetype2"
 )
 
@@ -87,18 +88,65 @@ build_lib() {
     : > "$FC_SRC/src/fcftalias.h"
     : > "$FC_SRC/src/fcftaliastail.h"
 
+    # fcobjshash.h is normally gperf-generated.  We don't ship gperf, so
+    # synthesize a replacement that maps object-name strings → enum IDs
+    # via linear scan of a compile-time table (driven by fcobjs.h).
+    # Lookup is O(n=55) on the non-hot config-parse path; unknown names
+    # fall through to fontconfig's "other types" path that allocates
+    # on demand.  When we ship gperf, swap back to the perfect hash.
+    if [ ! -f "$FC_SRC/src/fcobjshash.h" ]; then
+        log "generating fcobjshash.h (linear scan, derived from fcobjs.h)"
+        {
+            cat <<'HEADER'
+/* MakaOS port: linear-scan replacement for the gperf-generated
+ * fcobjshash.h.  Source of truth: fcobjs.h's FC_OBJECT entries.
+ * Matches fontconfig.h's property-string convention (strip
+ * underscores, lowercase) — rare exceptions (FC_DESKTOP_NAME →
+ * "desktop") degrade to the "other type" path, still correct. */
+#include <string.h>
+struct FcObjectTypeInfo { const char* name; int id; };
+static const struct FcObjectTypeInfo fc_object_table[] = {
+HEADER
+            awk '
+                /^FC_OBJECT[[:space:]]*\(/ {
+                    s = $0
+                    sub(/^FC_OBJECT[[:space:]]*\([[:space:]]*/, "", s)
+                    n = s
+                    sub(/[[:space:]]*,.*$/, "", n)
+                    lower = tolower(n)
+                    gsub(/_/, "", lower)
+                    printf "    { \"%s\", FC_%s_OBJECT },\n", lower, n
+                }' "$FC_SRC/src/fcobjs.h"
+            cat <<'FOOTER'
+};
+static unsigned int
+FcObjectTypeHash(register const char* str, register FC_GPERF_SIZE_T len)
+{ (void)str; (void)len; return 0; }
+static const struct FcObjectTypeInfo*
+FcObjectTypeLookup(register const char* str, register FC_GPERF_SIZE_T len) {
+    size_t n = sizeof(fc_object_table) / sizeof(fc_object_table[0]);
+    for (size_t i = 0; i < n; i++) {
+        const char* name = fc_object_table[i].name;
+        if (strncmp(str, name, len) == 0 && name[len] == 0)
+            return &fc_object_table[i];
+    }
+    return 0;
+}
+FOOTER
+        } > "$FC_SRC/src/fcobjshash.h"
+    fi
+
     local includes=(
         -I "$FC_SRC"
         -I "$FC_SRC/src"
         -I "$FC_SRC/fontconfig"
     )
 
-    # Fontconfig sources — single flat directory under src/
-    # fccache.c + fcatomic.c pull in `utimes`, `struct flock`, `timercmp`
-    # that our libc doesn't yet ship.  Skip — fontconfig without the
-    # on-disk cache still functions (scans fonts on each init, slower
-    # startup but correct).  Revisit when libc gains these.
+    # Fontconfig sources — full set including fccache + fcatomic, which
+    # use utimes/flock/timercmp (now supplied by libc).
     local srcs=(
+        "src/fccache.c"
+        "src/fcatomic.c"
         "src/fccfg.c"
         "src/fccharset.c"
         "src/fccompat.c"
