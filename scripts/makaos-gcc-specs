@@ -1,0 +1,16 @@
+# MakaOS gcc specs override.
+#
+# The cross-toolchain ships default specs that are wrong for shared
+# library builds:
+#   *startfile: crt0.o%s            (unconditional — breaks .so)
+#   *lib:       %{!shared: -lc }    (no libc for shared — breaks .so)
+#
+# For .so builds: skip crt0 (no _entry is needed) but still link libc
+# so that strlen/malloc/etc. resolve.  For executables: unchanged.
+
+*startfile:
+%{!shared: crt0.o%s}
+
+*lib:
+-lc
+

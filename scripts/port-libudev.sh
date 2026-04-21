@@ -66,6 +66,21 @@ const char*         udev_device_get_sysattr_value(struct udev_device* d, const c
 dev_t               udev_device_get_devnum(struct udev_device* d);
 struct udev_device* udev_device_get_parent_with_subsystem_devtype(
     struct udev_device* d, const char* subsystem, const char* devtype);
+// libinput walks device->parent chains for property inheritance
+// (quirks, NAME, etc).  We store no parent for most devices → NULL.
+struct udev_device* udev_device_get_parent(struct udev_device* d);
+// libinput reaches back to the owning udev context to rehydrate
+// devices after kernel hot-plug; return the back-reference we cache
+// at creation time.
+struct udev*        udev_device_get_udev(struct udev_device* d);
+// libinput's path-seat + udev-seat paths check whether the kernel
+// has finished initializing a device before opening it.  Our
+// synthetic devices are always fully populated at construction, so
+// this always returns 1.
+int                 udev_device_get_is_initialized(struct udev_device* d);
+// libinput-record iterates all UDEV properties on a device to
+// archive them.  Return the head of the property list.
+struct udev_list_entry* udev_device_get_properties_list_entry(struct udev_device* d);
 
 struct udev_monitor* udev_monitor_new_from_netlink(struct udev* u, const char* name);
 struct udev_monitor* udev_monitor_unref(struct udev_monitor* m);
@@ -119,6 +134,7 @@ struct udev_enumerate {
 
 struct udev_device {
     int    refcnt;
+    struct udev* owner;      // back-ref for udev_device_get_udev
     char*  syspath;
     char*  sysname;
     char*  subsystem;
@@ -151,11 +167,17 @@ typedef struct {
     unsigned    minor;
     const char* seat;
     const char* boot_vga;     // NULL for non-DRM
+    // libinput classifies input devices by udev properties; attach the
+    // right combo for each event node.  NULL for non-input devices.
+    const char* id_input;         // "1" on every input device
+    const char* id_input_kind;    // "ID_INPUT_KEYBOARD" or "ID_INPUT_MOUSE" etc.
+    const char* name;             // udev NAME= prop (used by libinput quirks)
 } devdesc_t;
 
 static const devdesc_t s_devices[] = {
-    { "/sys/class/drm/card0",       "card0",   "drm",   "/dev/dri/card0",   226,   0, "seat0", "1"   },
-    { "/sys/class/input/event0",    "event0",  "input", "/dev/input/event0", 13,  64, "seat0", NULL },
+    { "/sys/class/drm/card0",       "card0",   "drm",   "/dev/dri/card0",   226,   0, "seat0", "1",  NULL, NULL, NULL },
+    { "/sys/class/input/event0",    "event0",  "input", "/dev/input/event0", 13,  64, "seat0", NULL, "1", "ID_INPUT_KEYBOARD", "MakaOS PS/2 Keyboard" },
+    { "/sys/class/input/event1",    "event1",  "input", "/dev/input/event1", 13,  65, "seat0", NULL, "1", "ID_INPUT_MOUSE",    "MakaOS PS/2 Mouse"    },
 };
 static const int s_device_count = (int)(sizeof(s_devices) / sizeof(s_devices[0]));
 
@@ -309,20 +331,23 @@ static void entry_list_add(struct udev_list_entry** head, const char* name, cons
 }
 
 struct udev_device* udev_device_new_from_syspath(struct udev* u, const char* syspath) {
-    (void)u;
     const devdesc_t* d = find_desc_by_syspath(syspath);
     if (!d) { errno = ENODEV; return 0; }
     struct udev_device* dev = (struct udev_device*)calloc(1, sizeof(*dev));
     if (!dev) return 0;
     dev->refcnt    = 1;
+    dev->owner     = u ? udev_ref(u) : 0;
     dev->syspath   = xstrdup(d->syspath);
     dev->sysname   = xstrdup(d->sysname);
     dev->subsystem = xstrdup(d->subsystem);
     dev->devnode   = xstrdup(d->devnode);
     dev->action    = 0;
     dev->devnum    = ((dev_t)d->major << 8) | (d->minor & 0xFF);
-    if (d->seat)     entry_list_add(&dev->props, "ID_SEAT", d->seat);
-    if (d->boot_vga) entry_list_add(&dev->attrs, "boot_vga", d->boot_vga);
+    if (d->seat)          entry_list_add(&dev->props, "ID_SEAT",     d->seat);
+    if (d->boot_vga)      entry_list_add(&dev->attrs, "boot_vga",    d->boot_vga);
+    if (d->id_input)      entry_list_add(&dev->props, "ID_INPUT",    d->id_input);
+    if (d->id_input_kind) entry_list_add(&dev->props, d->id_input_kind, "1");
+    if (d->name)          entry_list_add(&dev->props, "NAME",        d->name);
     return dev;
 }
 
@@ -346,6 +371,7 @@ struct udev_device* udev_device_unref(struct udev_device* d) {
     entry_free(d->props);
     entry_free(d->attrs);
     if (d->parent) udev_device_unref(d->parent);
+    if (d->owner)  udev_unref(d->owner);
     free(d);
     return 0;
 }
@@ -377,6 +403,7 @@ struct udev_device* udev_device_get_parent_with_subsystem_devtype(
         struct udev_device* p = (struct udev_device*)calloc(1, sizeof(*p));
         if (!p) return 0;
         p->refcnt    = 1;
+        p->owner     = d->owner ? udev_ref(d->owner) : 0;
         p->syspath   = xstrdup("/sys/bus/pci/devices/0000:00:02.0");
         p->sysname   = xstrdup("0000:00:02.0");
         p->subsystem = xstrdup("pci");
@@ -385,6 +412,27 @@ struct udev_device* udev_device_get_parent_with_subsystem_devtype(
         return p;
     }
     return 0;
+}
+
+// libinput walks the bus-hierarchy via get_parent during quirk
+// matching.  We only synthesize one PCI parent (above); plain
+// get_parent returns the cached chain or NULL at the root.
+struct udev_device* udev_device_get_parent(struct udev_device* d) {
+    return d ? d->parent : 0;
+}
+
+struct udev* udev_device_get_udev(struct udev_device* d) {
+    return d ? d->owner : 0;
+}
+
+int udev_device_get_is_initialized(struct udev_device* d) {
+    // All our synthesized devices spring to life fully populated;
+    // there's no "waiting on kernel coldplug" state to report.
+    return d ? 1 : 0;
+}
+
+struct udev_list_entry* udev_device_get_properties_list_entry(struct udev_device* d) {
+    return d ? d->props : 0;
 }
 
 // ── monitor — stub ──────────────────────────────────────────────

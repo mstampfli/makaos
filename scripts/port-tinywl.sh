@@ -54,6 +54,7 @@ log "cross-compiling tinywl.c"
     -Wl,--start-group \
     -lwlroots-0.18 -lwayland-server -lwayland-client \
     -lxkbcommon -lpixman-1 -ldrm -ludev -lseat -lffi -ldisplay-info \
+    -linput -levdev -lmtdev \
     -lc -lm -lrt -lpthread -ldl \
     -Wl,--end-group \
     -o "$BUILD_DIR/tinywl.elf"

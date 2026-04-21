@@ -1,164 +1,123 @@
 #!/usr/bin/env bash
-# ── MakaOS native libevdev replacement ─────────────────────────────────
+# ── MakaOS libevdev port (upstream) ───────────────────────────────────
 #
-# sway calls only two libevdev functions:
-#   libevdev_event_code_from_name(type, name)  — string → keycode
-#   libevdev_event_code_get_name(type, code)   — keycode → string
-# Both only used for EV_KEY config-string translation (bindsym BTN_LEFT).
-#
-# Rather than port the full libevdev (needs <linux/input.h> shim we
-# rejected), hand-roll a ~150 LOC native implementation with hardcoded
-# KEY_* / BTN_* name tables sourced from <makaos/input.h>.
+# libinput depends on libevdev for struct libevdev device handling,
+# event parsing via EVIOCG* ioctls, and slot tracking.  Prior to this
+# commit we shipped a 2-function stub that only satisfied sway's
+# libevdev_event_code_from_name() path; libinput exercises the full
+# surface (libevdev_new_from_fd, libevdev_next_event, libevdev_has_
+# event_code, slot management).  Ship upstream 1.13.1 cross-compiled
+# against our sysroot — the kernel's EVIOCG* ioctls now match what
+# libevdev expects byte-for-byte.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EVDEV_VERSION="1.13.1"
+# Upstream tags are prefixed with the project name.
+EVDEV_URL="https://gitlab.freedesktop.org/libevdev/libevdev/-/archive/libevdev-${EVDEV_VERSION}/libevdev-libevdev-${EVDEV_VERSION}.tar.gz"
+
 BUILD_DIR="$REPO_ROOT/build"
+THIRD_PARTY="$BUILD_DIR/third_party"
+SRC_DIR="$THIRD_PARTY/libevdev-libevdev-${EVDEV_VERSION}"
+TARBALL="$THIRD_PARTY/libevdev-libevdev-${EVDEV_VERSION}.tar.gz"
+OUT_DIR="$BUILD_DIR/libevdev_build"
+
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
-CROSS_CC="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-gcc"
-CROSS_AR="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-ar"
+PATH="$REPO_ROOT/build/host-tools/bin:$PATH"
+export PATH
+export PKG_CONFIG_PATH="$SYSROOT/usr/lib/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+export PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig"
 
 log() { printf '[port-libevdev] %s\n' "$*" >&2; }
 
-SRC_DIR="$REPO_ROOT/userland/libevdev"
-mkdir -p "$SRC_DIR"
-
-# ── libevdev.h — minimal API surface ───────────────────────────────
-cat > "$SRC_DIR/libevdev.h" << 'EOF'
-#ifndef _MAKAOS_LIBEVDEV_H
-#define _MAKAOS_LIBEVDEV_H
-
-// Minimum subset of libevdev used by sway's config parser.
-
-// Event types — match Linux evdev numbering so config-string parsing
-// interchanges with Linux tools.
-#define EV_SYN   0
-#define EV_KEY   1
-#define EV_REL   2
-#define EV_ABS   3
-
-// name → event code.  Returns -1 if unknown.
-int libevdev_event_code_from_name(unsigned int type, const char* name);
-
-// event code → name.  Returns NULL if unknown.
-const char* libevdev_event_code_get_name(unsigned int type, unsigned int code);
-
-#endif
-EOF
-
-# ── libevdev.c — hardcoded KEY_/BTN_ tables ────────────────────────
-cat > "$SRC_DIR/libevdev.c" << 'EOF'
-// MakaOS minimal libevdev.  Lookup tables for the KEY_* and BTN_*
-// names sway's config parser accepts.  Linear scan (~120 entries);
-// called once per config-line binding, not a hot path.
-//
-// TODO(scalability-debt-ledger-#3): when kernel grows a device-caps
-// query ioctl, swap this static table for a dynamic capability scan.
-
-#include "libevdev.h"
-#include <makaos/input.h>
-#include <string.h>
-
-struct name_entry { const char* name; unsigned int code; };
-
-// Keep alphabetized within groups; linear scan on ~120 items is fine
-// for config-parse, which happens once at compositor start.
-static const struct name_entry s_key_names[] = {
-    // Alphanumerics
-    {"KEY_0", KEY_0}, {"KEY_1", KEY_1}, {"KEY_2", KEY_2}, {"KEY_3", KEY_3},
-    {"KEY_4", KEY_4}, {"KEY_5", KEY_5}, {"KEY_6", KEY_6}, {"KEY_7", KEY_7},
-    {"KEY_8", KEY_8}, {"KEY_9", KEY_9},
-    {"KEY_A", KEY_A}, {"KEY_B", KEY_B}, {"KEY_C", KEY_C}, {"KEY_D", KEY_D},
-    {"KEY_E", KEY_E}, {"KEY_F", KEY_F}, {"KEY_G", KEY_G}, {"KEY_H", KEY_H},
-    {"KEY_I", KEY_I}, {"KEY_J", KEY_J}, {"KEY_K", KEY_K}, {"KEY_L", KEY_L},
-    {"KEY_M", KEY_M}, {"KEY_N", KEY_N}, {"KEY_O", KEY_O}, {"KEY_P", KEY_P},
-    {"KEY_Q", KEY_Q}, {"KEY_R", KEY_R}, {"KEY_S", KEY_S}, {"KEY_T", KEY_T},
-    {"KEY_U", KEY_U}, {"KEY_V", KEY_V}, {"KEY_W", KEY_W}, {"KEY_X", KEY_X},
-    {"KEY_Y", KEY_Y}, {"KEY_Z", KEY_Z},
-    // Function keys
-    {"KEY_F1", KEY_F1}, {"KEY_F2", KEY_F2}, {"KEY_F3", KEY_F3}, {"KEY_F4", KEY_F4},
-    {"KEY_F5", KEY_F5}, {"KEY_F6", KEY_F6}, {"KEY_F7", KEY_F7}, {"KEY_F8", KEY_F8},
-    {"KEY_F9", KEY_F9}, {"KEY_F10", KEY_F10},{"KEY_F11", KEY_F11},{"KEY_F12", KEY_F12},
-    // Navigation
-    {"KEY_ESC", KEY_ESC}, {"KEY_TAB", KEY_TAB},
-    {"KEY_ENTER", KEY_ENTER}, {"KEY_SPACE", KEY_SPACE},
-    {"KEY_BACKSPACE", KEY_BACKSPACE},
-    {"KEY_HOME", KEY_HOME}, {"KEY_END", KEY_END},
-    {"KEY_PAGEUP", KEY_PAGEUP}, {"KEY_PAGEDOWN", KEY_PAGEDOWN},
-    {"KEY_INSERT", KEY_INSERT}, {"KEY_DELETE", KEY_DELETE},
-    {"KEY_UP", KEY_UP}, {"KEY_DOWN", KEY_DOWN},
-    {"KEY_LEFT", KEY_LEFT}, {"KEY_RIGHT", KEY_RIGHT},
-    // Punctuation
-    {"KEY_MINUS", KEY_MINUS}, {"KEY_EQUAL", KEY_EQUAL},
-    {"KEY_LEFTBRACE", KEY_LEFTBRACE}, {"KEY_RIGHTBRACE", KEY_RIGHTBRACE},
-    {"KEY_SEMICOLON", KEY_SEMICOLON}, {"KEY_APOSTROPHE", KEY_APOSTROPHE},
-    {"KEY_GRAVE", KEY_GRAVE}, {"KEY_BACKSLASH", KEY_BACKSLASH},
-    {"KEY_COMMA", KEY_COMMA}, {"KEY_DOT", KEY_DOT}, {"KEY_SLASH", KEY_SLASH},
-    // Modifiers
-    {"KEY_LEFTSHIFT", KEY_LEFTSHIFT}, {"KEY_RIGHTSHIFT", KEY_RIGHTSHIFT},
-    {"KEY_LEFTCTRL", KEY_LEFTCTRL},   {"KEY_RIGHTCTRL", KEY_RIGHTCTRL},
-    {"KEY_LEFTALT", KEY_LEFTALT},     {"KEY_RIGHTALT", KEY_RIGHTALT},
-    {"KEY_CAPSLOCK", KEY_CAPSLOCK},
-    // Locks
-    {"KEY_NUMLOCK", KEY_NUMLOCK}, {"KEY_SCROLLLOCK", KEY_SCROLLLOCK},
-    // Keypad
-    {"KEY_KP0", KEY_KP0}, {"KEY_KP1", KEY_KP1}, {"KEY_KP2", KEY_KP2},
-    {"KEY_KP3", KEY_KP3}, {"KEY_KP4", KEY_KP4}, {"KEY_KP5", KEY_KP5},
-    {"KEY_KP6", KEY_KP6}, {"KEY_KP7", KEY_KP7}, {"KEY_KP8", KEY_KP8},
-    {"KEY_KP9", KEY_KP9}, {"KEY_KPDOT", KEY_KPDOT},
-    {"KEY_KPPLUS", KEY_KPPLUS}, {"KEY_KPMINUS", KEY_KPMINUS},
-    {"KEY_KPASTERISK", KEY_KPASTERISK},
-    {"KEY_102ND", KEY_102ND},
-    // Mouse buttons (evdev puts them in the KEY event-type namespace).
-    {"BTN_LEFT",   BTN_LEFT},
-    {"BTN_RIGHT",  BTN_RIGHT},
-    {"BTN_MIDDLE", BTN_MIDDLE},
-    {"BTN_MOUSE",  BTN_MOUSE},
-};
-static const int s_key_count = (int)(sizeof(s_key_names) / sizeof(s_key_names[0]));
-
-int libevdev_event_code_from_name(unsigned int type, const char* name) {
-    if (type != EV_KEY || !name) return -1;
-    for (int i = 0; i < s_key_count; i++) {
-        if (strcmp(s_key_names[i].name, name) == 0)
-            return (int)s_key_names[i].code;
-    }
-    return -1;
+fetch() {
+    mkdir -p "$THIRD_PARTY"
+    [ -f "$TARBALL" ] || curl -fsSL -o "$TARBALL" "$EVDEV_URL"
+    [ -d "$SRC_DIR" ] || tar -xzf "$TARBALL" -C "$THIRD_PARTY"
 }
 
-const char* libevdev_event_code_get_name(unsigned int type, unsigned int code) {
-    if (type != EV_KEY) return 0;
-    for (int i = 0; i < s_key_count; i++) {
-        if (s_key_names[i].code == code) return s_key_names[i].name;
-    }
-    return 0;
+configure() {
+    if [ "${FORCE:-0}" = "1" ]; then
+        log "FORCE=1 wiping build dir"
+        rm -rf "$OUT_DIR"
+    fi
+    [ -d "$OUT_DIR" ] && return 0
+    # libevdev's meson looks up input.h / input-event-codes.h under
+    # include/linux/<host_machine.system()>/.  Our cross-file sets
+    # system=makaos; point that at the bundled linux copies (same
+    # codes, Linux is the ABI we implement byte-for-byte).
+    mkdir -p "$SRC_DIR/include/linux/makaos"
+    cp "$SRC_DIR/include/linux/linux/input.h" "$SRC_DIR/include/linux/makaos/input.h"
+    cp "$SRC_DIR/include/linux/linux/input-event-codes.h" "$SRC_DIR/include/linux/makaos/input-event-codes.h"
+    cp "$SRC_DIR/include/linux/linux/uinput.h" "$SRC_DIR/include/linux/makaos/uinput.h"
+    # Wrapper picks bundled kernel header via __linux__ / __FreeBSD__
+    # macros.  Our cross-gcc defines neither; teach it __makaos__.
+    for h in input.h input-event-codes.h uinput.h; do
+        w="$SRC_DIR/include/linux/$h"
+        if [ -f "$w" ] && ! grep -q "__makaos__" "$w"; then
+            sed -i 's|#elif __FreeBSD__|#elif defined(__makaos__)\n#include "makaos/'"$h"'"\n#elif __FreeBSD__|' "$w"
+        fi
+    done
+    log "meson setup"
+    meson setup "$OUT_DIR" "$SRC_DIR" \
+        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --prefix=/usr \
+        --libdir=lib \
+        -Ddefault_library=static \
+        -Dtests=disabled \
+        -Ddocumentation=disabled \
+        -Dcoverity=false \
+        2>&1 | tee "$BUILD_DIR/libevdev_meson.log"
+
+    # Strip libevdev's tools/ CLI programs — they pull in libgen.h and
+    # assume Linux-namespaced <linux/input.h>.  We only need the
+    # library for libinput to link against.  Delete the `# tools`
+    # executable block + its install_man line.  Idempotent.
+    if ! grep -q "MAKAOS_NO_TOOLS" "$SRC_DIR/meson.build"; then
+        python3 <<PYEOF
+p = '$SRC_DIR/meson.build'
+with open(p) as f: s = f.read()
+marker = '\n# MAKAOS_NO_TOOLS — tools block removed\n'
+import re
+# Remove the '# tools\n<executable blocks>\ninstall_man(...)' chunk.
+new = re.sub(
+    r"\n# tools\n.*?install_man\(\s*'tools/[^)]*\)\n",
+    marker, s, count=1, flags=re.DOTALL)
+if new != s:
+    with open(p, 'w') as f: f.write(new)
+    print('stripped tools block')
+else:
+    print('no match — tools block not found')
+PYEOF
+        rm -rf "$OUT_DIR"
+        meson setup "$OUT_DIR" "$SRC_DIR" \
+            --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+            --prefix=/usr --libdir=lib \
+            -Ddefault_library=static \
+            -Dtests=disabled -Ddocumentation=disabled -Dcoverity=false \
+            2>&1 | tee -a "$BUILD_DIR/libevdev_meson.log"
+    fi
 }
-EOF
 
-# ── Build + install ────────────────────────────────────────────────
-objdir="$BUILD_DIR/libevdev_objs"
-mkdir -p "$objdir"
-"$CROSS_CC" -O2 -fPIC -Wall \
-    --sysroot="$SYSROOT" -nostdinc -isystem "$SYSROOT/usr/include" \
-    -c "$SRC_DIR/libevdev.c" -o "$objdir/libevdev.o"
-rm -f "$SYSROOT/usr/lib/libevdev.a"
-"$CROSS_AR" rcs "$SYSROOT/usr/lib/libevdev.a" "$objdir/libevdev.o"
+build_install() {
+    log "ninja build"
+    ninja -C "$OUT_DIR" 2>&1 | tee "$BUILD_DIR/libevdev_ninja.log"
+    DESTDIR="$SYSROOT" ninja -C "$OUT_DIR" install \
+        2>&1 | tee "$BUILD_DIR/libevdev_install.log"
+}
 
-mkdir -p "$SYSROOT/usr/include/libevdev"
-cp "$SRC_DIR/libevdev.h" "$SYSROOT/usr/include/libevdev/libevdev.h"
-
-mkdir -p "$SYSROOT/usr/lib/pkgconfig"
-cat > "$SYSROOT/usr/lib/pkgconfig/libevdev.pc" <<EOF
-prefix=/usr
-libdir=\${prefix}/lib
-includedir=\${prefix}/include
-
-Name: libevdev
-Description: MakaOS native libevdev (name ↔ keycode only)
-Version: 1.13.3
-Libs: -L\${libdir} -levdev
-Cflags: -I\${includedir}
-EOF
-
-log "libevdev.a: $(stat -c%s "$SYSROOT/usr/lib/libevdev.a") bytes"
-log "done"
+main() {
+    # Remove the hand-rolled stub if it's still in the sysroot — we
+    # want pkg-config + linker to pick up the new one unambiguously.
+    rm -f "$SYSROOT/usr/lib/libevdev.a" \
+          "$SYSROOT/usr/include/libevdev/libevdev.h" \
+          "$SYSROOT/usr/lib/pkgconfig/libevdev.pc"
+    fetch
+    configure
+    build_install
+    log "done"
+    ls -la "$SYSROOT/usr/lib/libevdev"* 2>/dev/null
+}
+main "$@"

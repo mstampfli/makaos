@@ -82,6 +82,47 @@ s = s.replace('#if defined(__linux__)',   '#if defined(__linux__) || defined(__m
 with open(p, 'w') as f: f.write(s)
 "
     done
+    # Patch xf86drm.c's drmGetDeviceNameFromFd2 — on Linux it walks
+    # /sys/dev/char/<maj>:<min> which we don't have.  Force a simple
+    # "return /dev/dri/card0" for our single-GPU setup.
+    python3 -c "
+p='$DRM_SRC/xf86drm.c'
+with open(p) as f: s = f.read()
+marker = 'drm_public char *drmGetDeviceNameFromFd2(int fd)\n{'
+if marker in s and 'MAKAOS_DRM_FIXED_DEVNAME' not in s:
+    replacement = marker + '\n    /* MAKAOS_DRM_FIXED_DEVNAME: single-GPU system; no sysfs. */\n    (void)fd;\n    return strdup(\"/dev/dri/card0\");'
+    s = s.replace(marker, replacement, 1)
+    with open(p, 'w') as f: f.write(s)
+    print('patched drmGetDeviceNameFromFd2')
+"
+    # Patch drmGetNodeTypeFromFd — on Linux it stats the fd and checks
+    # the character major/minor against the DRM device allocation
+    # (226:0..127).  Our fstat surface doesn't reproduce those numbers,
+    # so force DRM_NODE_PRIMARY (0) for any valid DRM fd.  wlroots'
+    # dumb-buffer allocator explicitly rejects non-primary nodes.
+    python3 -c "
+p='$DRM_SRC/xf86drm.c'
+with open(p) as f: s = f.read()
+marker = 'drm_public int drmGetNodeTypeFromFd(int fd)\n{'
+if marker in s and 'MAKAOS_FIXED_NODE_TYPE' not in s:
+    replacement = marker + '\n    /* MAKAOS_FIXED_NODE_TYPE: single card, always primary. */\n    (void)fd;\n    return 0; /* DRM_NODE_PRIMARY */'
+    s = s.replace(marker, replacement, 1)
+    with open(p, 'w') as f: f.write(s)
+    print('patched drmGetNodeTypeFromFd')
+"
+    # Patch drmGetRenderDeviceNameFromFd — same sysfs walk; we don't
+    # have a render node, so return NULL and let callers fall back to
+    # drmGetDeviceNameFromFd2.
+    python3 -c "
+p='$DRM_SRC/xf86drm.c'
+with open(p) as f: s = f.read()
+marker = 'drm_public char *drmGetRenderDeviceNameFromFd(int fd)\n{'
+if marker in s and 'MAKAOS_NO_RENDER_NODE' not in s:
+    replacement = marker + '\n    /* MAKAOS_NO_RENDER_NODE: no separate render node. */\n    (void)fd;\n    return (char*)0;'
+    s = s.replace(marker, replacement, 1)
+    with open(p, 'w') as f: f.write(s)
+    print('patched drmGetRenderDeviceNameFromFd')
+"
 }
 
 build_lib() {

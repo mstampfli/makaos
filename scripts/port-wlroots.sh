@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
 # ── MakaOS wlroots port ────────────────────────────────────────────────
 #
-# First attempt: minimal config — no optional backends (no drm, no
-# libinput, no x11), pixman-only renderer, session support via our
-# native libseat+libudev, no xwayland, no gbm.
+# Upstream-clean wlroots 0.18.1 build.  Input comes from libinput
+# (ported separately); no custom backend shim.  Backends: drm +
+# libinput; renderer is pixman-only (GL/Vulkan not ported yet);
+# session via our native libseat+libudev.
 #
-# This validates:
-#   * meson cross-compile setup lands
-#   * pkg-config sysroot resolution works for our libs
-#   * wlroots core + wayland + headless + multi backends build
-#   * generated-protocol dispatch links correctly
-#
-# Outputs sysroot/usr/lib/libwlroots-0.18.so.* (and static if meson can).
+# Outputs sysroot/usr/lib/libwlroots-0.18.{a,so.*} and headers.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WLR_VERSION="0.18.1"
 BUILD_DIR="$REPO_ROOT/build"
-WLR_SRC="$BUILD_DIR/third_party/wlroots-${WLR_VERSION}"
+THIRD_PARTY="$BUILD_DIR/third_party"
+WLR_SRC="$THIRD_PARTY/wlroots-${WLR_VERSION}"
+WLR_TARBALL="$THIRD_PARTY/wlroots-${WLR_VERSION}.tar.gz"
 WLR_BUILD="$BUILD_DIR/wlroots_build"
 
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
@@ -27,35 +24,29 @@ export PATH
 
 log() { printf '[port-wlroots] %s\n' "$*" >&2; }
 
-if [ ! -d "$WLR_SRC" ]; then
-    log "FATAL: source tree missing at $WLR_SRC — extract the tarball first"
-    exit 1
-fi
-
-# ── MakaOS native backend patch ───────────────────────────────────
-# Copy our native backend source into the wlroots tree and patch
-# backend/meson.build to include it.  Idempotent: re-copies every
-# invocation so upstream tarball re-extract doesn't lose our patch.
-NATIVE_SRC="$REPO_ROOT/userland/wlroots-backend-native"
-if [ -d "$NATIVE_SRC" ]; then
-    mkdir -p "$WLR_SRC/backend/native" "$WLR_SRC/include/wlr/backend"
-    cp "$NATIVE_SRC/backend.c"               "$WLR_SRC/backend/native/"
-    cp "$NATIVE_SRC/keyboard.c"              "$WLR_SRC/backend/native/"
-    cp "$NATIVE_SRC/pointer.c"               "$WLR_SRC/backend/native/"
-    cp "$NATIVE_SRC/native.h"                "$WLR_SRC/backend/native/"
-    cp "$NATIVE_SRC/meson.build"             "$WLR_SRC/backend/native/"
-    cp "$NATIVE_SRC/wlr_backend_native.h"    "$WLR_SRC/include/wlr/backend/native.h"
-
-    # Patch backend/meson.build to include the native subdir — idempotent.
-    if ! grep -q "^subdir('native')" "$WLR_SRC/backend/meson.build"; then
-        printf "\nsubdir('native')\n" >> "$WLR_SRC/backend/meson.build"
+# ── Source (re-)extraction ────────────────────────────────────────
+# Earlier iterations patched a custom native/ backend into the tree.
+# If that's still present, it's stale — wipe and re-extract so the
+# build is upstream-clean.  Also wipes if the tarball exists but the
+# dir doesn't (first run after a `rm -rf` clean).
+fetch() {
+    [ -f "$WLR_TARBALL" ] || {
+        log "FATAL: tarball missing at $WLR_TARBALL — populate third_party/ first"
+        exit 1
+    }
+    if [ -d "$WLR_SRC/backend/native" ]; then
+        log "stale native/ backend detected — re-extracting source"
+        rm -rf "$WLR_SRC"
     fi
-    log "native backend source + header installed"
-fi
+    [ -d "$WLR_SRC" ] || {
+        log "extracting wlroots-${WLR_VERSION}"
+        tar -xzf "$WLR_TARBALL" -C "$THIRD_PARTY"
+    }
+}
+fetch
 
 # ── Sysroot scaffolding required before meson can configure wlroots.
-#    Each item here is idempotent; safe to re-run.  Moving them into
-#    port-wlroots.sh means a fresh sysroot self-bootstraps.
+# Each item here is idempotent; safe to re-run.
 #
 # 1) Link-time placeholder archives for -lm / -lrt / -lpthread / -ldl.
 #    Math/time/pthread/dl symbols all live in libc.a on MakaOS; these
@@ -111,6 +102,9 @@ if [ "${FORCE:-0}" = "1" ]; then
 fi
 
 # ── meson configure (only re-runs if $WLR_BUILD is fresh) ─────────
+# Backends: drm (native KMS) + libinput (input via libinput port).
+# Renderer: pixman only — GL/Vulkan require libgbm + mesa we haven't
+# ported.  Session support uses our native libseat equivalent.
 if [ ! -d "$WLR_BUILD" ]; then
     log "meson setup ${WLR_BUILD}"
     meson setup "$WLR_BUILD" "$WLR_SRC" \
@@ -118,7 +112,7 @@ if [ ! -d "$WLR_BUILD" ]; then
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \
-        -Dbackends=drm \
+        -Dbackends=drm,libinput \
         -Drenderers= \
         -Dallocators= \
         -Dsession=enabled \
