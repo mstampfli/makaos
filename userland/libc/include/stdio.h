@@ -99,4 +99,9 @@ char* tmpnam(char* buf);
 ssize_t getline(char** lineptr, size_t* n, FILE* f);
 ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* f);
 
+// GNU extensions — stubs for port compat.
+FILE* open_memstream(char** bufp, size_t* sizep);
+FILE* fmemopen(void* buf, size_t size, const char* mode);
+int   asprintf(char** strp, const char* fmt, ...);
+
 #endif

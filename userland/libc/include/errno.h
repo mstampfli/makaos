@@ -11,6 +11,9 @@
 #define EIO           5
 #define E2BIG         7
 #define ENOEXEC       8
+#define ENODEV       19
+#define EXDEV        18
+#define ENXIO         6
 #define EBADF         9
 #define ECHILD       10
 #define EAGAIN       11
@@ -39,6 +42,7 @@
 #define EILSEQ       84
 #define ENOTSOCK     88
 #define EOPNOTSUPP   95
+#define ENOTSUP      EOPNOTSUPP    // Linux alias
 #define EAFNOSUPPORT 97
 #define EADDRINUSE   98
 #define ECONNRESET  104

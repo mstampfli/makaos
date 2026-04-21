@@ -104,4 +104,11 @@ int      usleep(unsigned us);
 // fork-safe entropy snapshot
 void alarm(unsigned seconds);
 
+// Page size (fixed 4 KiB on x86_64).
+int getpagesize(void);
+
+// Device-node creation — stub, returns -ENOSYS.  libdrm calls it for
+// /dev/dri node setup but we pre-populate in virtfs.
+int mknod(const char* path, unsigned mode, unsigned dev);
+
 #endif

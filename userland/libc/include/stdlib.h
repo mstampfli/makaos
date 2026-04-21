@@ -64,4 +64,11 @@ ldiv_t    ldiv(long n, long d);
 lldiv_t   lldiv(long long n, long long d);
 imaxdiv_t imaxdiv(long long n, long long d);
 
+// realpath — stub that copies input to resolved_path.  We don't have
+// symlinks; the "canonical" path is the path itself.
+char* realpath(const char* path, char* resolved_path);
+
+// POSIX memalign — allocates aligned memory for ports that check for it.
+int posix_memalign(void** memptr, size_t alignment, size_t size);
+
 #endif
