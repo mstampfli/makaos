@@ -59,6 +59,22 @@ char* realpath(const char* path, char* resolved_path) {
     return out;
 }
 
+// ── bsearch — binary search over a sorted array ──────────────────────
+void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+              int (*cmp)(const void*, const void*)) {
+    const unsigned char* a = (const unsigned char*)base;
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const void* elt = a + mid * size;
+        int c = cmp(key, elt);
+        if (c < 0)       hi = mid;
+        else if (c > 0)  lo = mid + 1;
+        else             return (void*)elt;
+    }
+    return (void*)0;
+}
+
 // ── posix_memalign ───────────────────────────────────────────────────
 // libc's malloc returns 16-byte-aligned blocks.  Callers requesting
 // alignment ≤ 16 get correct behaviour; > 16 is not supported yet.

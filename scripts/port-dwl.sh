@@ -127,7 +127,7 @@ build() {
         dwl.c util.c \
         -Wl,--start-group \
         -lwlroots-0.18 -lwayland-server -lwayland-client \
-        -lxkbcommon -lpixman-1 -ldrm -ludev -lseat -lffi \
+        -lxkbcommon -lpixman-1 -ldrm -ludev -lseat -lffi -ldisplay-info \
         -lc -lm -lrt -lpthread -ldl \
         -Wl,--end-group \
         -o dwl.elf)
