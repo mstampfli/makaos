@@ -48,7 +48,7 @@ typedef uint64_t pte_t;
 // Just a convention — nothing enforces these at hardware level.
 #define VMM_USER_CODE_BASE   0x0000000000400000ULL   // code/text at 4MiB
 #define VMM_USER_STACK_TOP   0x00007FFFFFFFE000ULL   // stack grows DOWN from here
-#define VMM_USER_STACK_PAGES 512ULL                  // 512 × 4KiB = 2MiB stack
+#define VMM_USER_STACK_PAGES 2048ULL                 // 2048 × 4KiB = 8MiB stack (matches Linux default — dwl/wlroots overflowed 2MiB)
 // Anonymous mmap region: sits between heap and stack.
 // mmap allocations grow downward from this hint.
 #define VMM_MMAP_BASE        0x00007FF000000000ULL   // top of mmap region

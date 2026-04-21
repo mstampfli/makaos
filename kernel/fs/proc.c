@@ -104,6 +104,7 @@ static vfs_file_t* membuf_open(uint8_t* buf, uint64_t size) {
 
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(ctx); return NULL; }
+    __builtin_memset(f, 0, sizeof(*f));
     f->read     = membuf_read;
     f->write    = NULL;  // read-only
     f->close    = membuf_close;

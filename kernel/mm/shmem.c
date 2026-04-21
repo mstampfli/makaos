@@ -367,6 +367,7 @@ vfs_file_t* shmem_fd_create(shmem_t* shm) {
     if (!shm) return NULL;
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) return NULL;
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read     = shmem_fd_read;
     f->write    = shmem_fd_write;

@@ -1363,6 +1363,7 @@ static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(fd); return NULL; }
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read            = ext2_vfs_read;
     f->write           = ext2_vfs_write;

@@ -168,6 +168,8 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
         kfree(p);
         return -ENOMEM;
     }
+    __builtin_memset(r, 0, sizeof(*r));
+    __builtin_memset(w, 0, sizeof(*w));
 
     r->read        = pipe_read;
     r->write       = NULL;

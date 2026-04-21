@@ -303,18 +303,24 @@ void unix_sock_close(vfs_file_t* self) {
 // ── unix_sock_open ───────────────────────────────────────────────────────
 
 vfs_file_t* unix_sock_open(int type) {
-    if (type != SOCK_STREAM && type != SOCK_DGRAM) return NULL;
+    // Strip SOCK_CLOEXEC / SOCK_NONBLOCK (Linux-style OR flags) before
+    // matching the core type.  wl_display_add_socket_auto passes
+    // SOCK_STREAM | SOCK_CLOEXEC; without this mask, it failed with
+    // -ENOMEM (propagated from our NULL return below).
+    int sock_type = type & ~(0x80000 | 0x00800);  // SOCK_CLOEXEC | SOCK_NONBLOCK
+    if (sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM) return NULL;
 
     unix_sock_t* s = kmalloc(sizeof(unix_sock_t));
     if (!s) return NULL;
     zero_mem(s, sizeof(unix_sock_t));
     wait_queue_init(&s->waitq);
 
-    s->type  = (uint8_t)type;
+    s->type  = (uint8_t)sock_type;
     s->state = UNIX_STATE_UNCONNECTED;
 
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(s); return NULL; }
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read        = unix_vfs_read;
     f->write       = unix_vfs_write;

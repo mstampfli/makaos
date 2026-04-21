@@ -581,6 +581,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     vfs_file_t* master = kmalloc(sizeof(vfs_file_t));
     if (!master) { kfree(mctx); pty_free_locked(pty); return -12; }
+    __builtin_memset(master, 0, sizeof(*master));
 
     master->read        = pty_master_read;
     master->write       = pty_master_write;
@@ -607,6 +608,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     vfs_file_t* slave = kmalloc(sizeof(vfs_file_t));
     if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_locked(pty); return -12; }
+    __builtin_memset(slave, 0, sizeof(*slave));
 
     slave->read     = pty_slave_read;
     slave->write    = pty_slave_write;

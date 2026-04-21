@@ -309,6 +309,7 @@ vfs_file_t* tty_open(int idx) {
 
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(ctx); return NULL; }
+    __builtin_memset(f, 0, sizeof(*f));
 
     f->read     = tty_vfs_read;
     f->write    = tty_vfs_write;
