@@ -388,4 +388,37 @@ long double ceill(long double x)  { return (long double)__builtin_ceil((double)x
 long double fmodl(long double x, long double y) {
     return (long double)__builtin_fmod((double)x, (double)y);
 }
+long double frexpl(long double x, int* ep) {
+    return (long double)frexp((double)x, ep);
+}
+long double ldexpl(long double x, int e) {
+    return (long double)ldexp((double)x, e);
+}
+long double modfl(long double x, long double* iptr) {
+    double di;
+    double rv = modf((double)x, &di);
+    *iptr = (long double)di;
+    return (long double)rv;
+}
+long double logl(long double x)     { return (long double)log((double)x); }
+long double log2l(long double x)    { return (long double)log2((double)x); }
+long double log10l(long double x)   { return (long double)log10((double)x); }
+long double expl(long double x)     { return (long double)exp((double)x); }
+long double powl(long double x, long double y) {
+    return (long double)pow((double)x, (double)y);
+}
+long double sinl(long double x)     { return (long double)sin((double)x); }
+long double cosl(long double x)     { return (long double)cos((double)x); }
+long double tanl(long double x)     { return (long double)tan((double)x); }
+long double asinl(long double x)    { return (long double)asin((double)x); }
+long double acosl(long double x)    { return (long double)acos((double)x); }
+long double atanl(long double x)    { return (long double)atan((double)x); }
+long double atan2l(long double y, long double x) {
+    return (long double)atan2((double)y, (double)x);
+}
+long double truncl(long double x)   { return (long double)__builtin_trunc((double)x); }
+long double roundl(long double x)   { return (long double)__builtin_round((double)x); }
+long double copysignl(long double x, long double y) {
+    return (long double)__builtin_copysign((double)x, (double)y);
+}
 
