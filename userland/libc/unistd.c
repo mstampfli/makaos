@@ -174,6 +174,13 @@ int link(const char* oldpath, const char* newpath) {
         syscall2(SYS_LINK, (uint64_t)oldpath, (uint64_t)newpath));
 }
 
+// ── waitpid / wait — extern wrappers for sysroot consumers ──────────
+pid_t waitpid(pid_t pid, int* status, int options) {
+    return (pid_t)__syscall_ret(
+        syscall3(SYS_WAIT, (uint64_t)(int64_t)pid, (uint64_t)status, (uint64_t)options));
+}
+pid_t wait(int* status) { return waitpid(-1, status, 0); }
+
 // ── rename(old, new) ────────────────────────────────────────────────
 int rename(const char* old, const char* nwp) {
     size_t olen = 0, nlen = 0;
@@ -214,10 +221,69 @@ int execlp(const char* path, const char* arg0, ...) {
     return execl(path, arg0);
 }
 
+// execvp — as-close-as-we-get to POSIX until kernel SYS_EXEC grows
+// argv support.  argv dropped, arg[0] lost.  Same caveat as execl.
+int execvp(const char* path, char* const argv[]) {
+    (void)argv;
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, n));
+}
+
+int execv(const char* path, char* const argv[]) {
+    return execvp(path, argv);
+}
+
+int execvpe(const char* path, char* const argv[], char* const envp[]) {
+    (void)envp; return execvp(path, argv);
+}
+
+// setsid — new session/process group.  MakaOS has no multi-session
+// model; report the current pid as the "new session id."
+pid_t setsid(void) { return getpid(); }
+
+int setpgid(pid_t pid, pid_t pgid) {
+    (void)pid; (void)pgid; return 0;
+}
+pid_t getpgid(pid_t pid) { (void)pid; return getpid(); }
+pid_t getpgrp(void)      { return getpid(); }
+pid_t getsid(pid_t pid)  { (void)pid; return getpid(); }
+
+// kill — signal a pid.  SYS_KILL backs this.
+int kill(pid_t pid, int sig) {
+    return (int)__syscall_ret(
+        syscall2(SYS_KILL, (uint64_t)(int64_t)pid, (uint64_t)(unsigned)sig));
+}
+
 // ffs — find first set bit (1-based).  Compiler builtin.
 int ffs(int i)          { return __builtin_ffs(i); }
 int ffsl(long i)        { return __builtin_ffsl(i); }
 int ffsll(long long i)  { return __builtin_ffsll(i); }
+
+// waitid — POSIX.1-2008 extended wait.  MakaOS kernel only has
+// SYS_WAIT (waitpid semantics); fill siginfo_t from the waitpid
+// status.  Supports P_PID and P_ALL; P_PGID falls back to P_ALL
+// since we don't track pgid sets kernel-side yet.
+// TODO(scalability-debt-ledger): SYS_WAITID with true si_code
+// distinctions (CLD_STOPPED vs CLD_TRAPPED needs ptrace-like infra).
+#include <sys/wait.h>
+#include <signal.h>
+int waitid(idtype_t idtype, id_t id, siginfo_t* info, int options) {
+    int status = 0;
+    pid_t target = (idtype == P_PID) ? (pid_t)id : -1;
+    pid_t r = waitpid(target, &status, options);
+    if (r < 0) return -1;
+    if (info) {
+        info->si_signo = SIGCHLD;
+        info->si_pid   = r;
+        info->si_status= status;
+        if (WIFEXITED(status))         info->si_code = CLD_EXITED;
+        else if (WIFSIGNALED(status))  info->si_code = (WTERMSIG(status) == 6) ? CLD_DUMPED : CLD_KILLED;
+        else if (WIFSTOPPED(status))   info->si_code = CLD_STOPPED;
+        else if (WIFCONTINUED(status)) info->si_code = CLD_CONTINUED;
+        else                           info->si_code = 0;
+    }
+    return 0;
+}
 
 // isatty — we don't yet track whether an fd is a tty in userland.
 // Report fds 0/1/2 as ttys (stdio) and everything else as non-tty.
