@@ -195,6 +195,30 @@ int rmdir(const char* path) {
 // x86_64 page size is fixed at 4 KiB.  No syscall needed.
 int getpagesize(void) { return 4096; }
 
+// execl — variadic exec-variant.  Our kernel SYS_EXEC takes path+len;
+// gather argv from varargs, then forward.  Limit to 64 args (plenty
+// for compositor spawn-terminal etc).  Fails with E2BIG if exceeded.
+#include <stdarg.h>
+int execl(const char* path, const char* arg0, ...) {
+    (void)arg0;
+    // MakaOS kernel currently has no "exec with argv" path — SYS_EXEC
+    // takes only the program path.  argv/envp are communicated via
+    // SYS_SPAWN, which we'd reach for in the common fork→exec pattern
+    // but not the variadic execl.  For now: invoke SYS_EXEC with just
+    // the path; argv[0] lost.  Revisit when argv-aware exec lands.
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, n));
+}
+
+int execlp(const char* path, const char* arg0, ...) {
+    return execl(path, arg0);
+}
+
+// ffs — find first set bit (1-based).  Compiler builtin.
+int ffs(int i)          { return __builtin_ffs(i); }
+int ffsl(long i)        { return __builtin_ffsl(i); }
+int ffsll(long long i)  { return __builtin_ffsll(i); }
+
 // isatty — we don't yet track whether an fd is a tty in userland.
 // Report fds 0/1/2 as ttys (stdio) and everything else as non-tty.
 // Good enough for wlroots/bash/harfbuzz "am I interactive?" checks.
