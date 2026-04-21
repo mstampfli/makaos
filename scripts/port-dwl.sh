@@ -42,30 +42,46 @@ fetch() {
 }
 
 patch_dwl() {
-    local f="$DWL_SRC/dwl.c"
-    if grep -q "MAKAOS_PATCHED" "$f"; then
-        log "dwl.c already patched"; return 0
+    if grep -q "MAKAOS_PATCHED" "$DWL_SRC/dwl.c" 2>/dev/null; then
+        log "dwl already patched"; return 0
     fi
-    log "patching dwl.c: strip libinput-only code"
+    log "patching dwl: strip libinput-only code, stub wlr_session_change_vt"
+
+    # config.h is derived from config.def.h; make sure it exists AND
+    # pulls in our libinput-shim (enums only) for the config variables.
+    if [ ! -f "$DWL_SRC/config.h" ]; then
+        cp "$DWL_SRC/config.def.h" "$DWL_SRC/config.h"
+    fi
+    # Prepend <libinput.h> include to config.h so the enum type decls
+    # on static-file-scope variables resolve.
+    if ! head -5 "$DWL_SRC/config.h" | grep -q "libinput.h"; then
+        { printf '#include <libinput.h>\n'; cat "$DWL_SRC/config.h"; } > "$DWL_SRC/config.h.new"
+        mv "$DWL_SRC/config.h.new" "$DWL_SRC/config.h"
+    fi
 
     python3 - <<PY
-import re
-path = "$f"
+import re, sys
+path = "$DWL_SRC/dwl.c"
 with open(path) as h: s = h.read()
-# 1. Drop libinput includes.
+# 1. Drop libinput backend include (keep config.h's <libinput.h> enum
+#    shim; the wlr/backend/libinput.h one is a real runtime dep we
+#    don't have).
 s = re.sub(r'^#include <libinput.h>\n',            '', s, flags=re.M)
 s = re.sub(r'^#include <wlr/backend/libinput.h>\n', '', s, flags=re.M)
-# 2. Replace the entire per-pointer libinput-config block with the no-op
-#    skeleton.  The block starts at "struct libinput_device *device;" and
-#    runs through the closing brace of the enclosing if.  Match it by
-#    locating the marker comment dwl uses just before it.
+# 2. Remove the per-pointer libinput-config block.  The block starts
+#    at "struct libinput_device *device;" and runs through the closing
+#    brace of the enclosing if.
 old = re.search(
     r'\tstruct libinput_device \*device;\n'
     r'\tif \(wlr_input_device_is_libinput\(&pointer->base\).*?\n\t\}\n',
     s, flags=re.DOTALL)
-assert old, "libinput block not located — source layout changed"
+assert old, "libinput block not located"
 s = s[:old.start()] + '\t/* MakaOS: libinput-config block removed (native input backend). */\n' + s[old.end():]
-# 3. First-line marker so subsequent runs are idempotent.
+# 3. Replace wlr_session_change_vt calls with a no-op — session backend
+#    is disabled in our wlroots build; VT switching doesn't exist on
+#    MakaOS anyway.
+s = s.replace('wlr_session_change_vt(session,', '(void)(0 &&')
+# 4. First-line marker.
 s = "/* MAKAOS_PATCHED — see scripts/port-dwl.sh */\n" + s
 with open(path, 'w') as h: h.write(s)
 print("patched")
@@ -81,6 +97,7 @@ build() {
         -Wno-unused-but-set-variable
         -Wno-missing-field-initializers
         -DWLR_USE_UNSTABLE
+        '-DVERSION="'"${DWL_VERSION}"'"'
         --sysroot="$SYSROOT"
         -nostdinc
         -isystem "$SYSROOT/usr/include"
