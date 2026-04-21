@@ -205,3 +205,64 @@ void exit(int status) {
     syscall1(SYS_EXIT, (uint64_t)status);
     __builtin_unreachable();
 }
+
+// ── Port-support stubs (libdrm, libinput, friends) ───────────────────
+
+int getpagesize(void) { return 4096; }
+
+int mknod(const char* path, unsigned mode, unsigned dev) {
+    (void)path; (void)mode; (void)dev;
+    errno = ENOSYS;
+    return -1;
+}
+
+// Symlink-free filesystem: canonical path == input path.  Callers
+// typically pass resolved_path as NULL asking for malloc'd result,
+// or as a PATH_MAX buffer.  Honour both.
+extern void* malloc(size_t);
+extern size_t strlen(const char*);
+extern void*  memcpy(void*, const void*, size_t);
+
+char* realpath(const char* path, char* resolved_path) {
+    if (!path) { errno = EINVAL; return (char*)0; }
+    size_t n = strlen(path);
+    char* out = resolved_path ? resolved_path : (char*)malloc(n + 1);
+    if (!out) { errno = ENOMEM; return (char*)0; }
+    memcpy(out, path, n + 1);
+    return out;
+}
+
+// aligned_alloc-style — our malloc is 16-byte aligned always, so we
+// just forward.  For alignment > 16 callers would need a bigger
+// buffer + manual alignment; libdrm/libinput request 8/16 so OK.
+int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (!memptr) return EINVAL;
+    if (alignment & (alignment - 1)) return EINVAL;   // must be pow2
+    if (alignment == 0)              return EINVAL;
+    *memptr = malloc(size);
+    return *memptr ? 0 : ENOMEM;
+}
+
+// open_memstream + fmemopen: not implemented (need an in-memory
+// FILE* backend).  libdrm uses open_memstream for debug-log
+// buffering; harfbuzz/others use fmemopen for in-memory font
+// loading.  Return NULL → callers fall back.
+#include <stdio.h>
+FILE* open_memstream(char** bufp, size_t* sizep) {
+    (void)bufp; (void)sizep;
+    errno = ENOSYS;
+    return (FILE*)0;
+}
+FILE* fmemopen(void* buf, size_t size, const char* mode) {
+    (void)buf; (void)size; (void)mode;
+    errno = ENOSYS;
+    return (FILE*)0;
+}
+
+// asprintf stub — returns -1, leaves *strp unset.  Real impl would
+// need a pre-probe vsnprintf(NULL) pass.  Not needed by our current
+// ports' happy paths.
+int asprintf(char** strp, const char* fmt, ...) {
+    (void)strp; (void)fmt;
+    return -1;
+}
