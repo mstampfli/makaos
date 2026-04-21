@@ -7,6 +7,11 @@ extern "C" {
 
 #include <stddef.h>
 
+// POSIX puts ffs/bzero/strcasecmp in <strings.h>; many ports use
+// them without including strings.h explicitly.  Pull it in here so
+// every TU that #includes <string.h> gets them transitively.
+#include <strings.h>
+
 // Memory block
 void*  memcpy(void* dst, const void* src, size_t n);
 void*  memmove(void* dst, const void* src, size_t n);
@@ -29,6 +34,11 @@ char*  strncat(char* dst, const char* src, size_t n);
 size_t strlcat(char* dst, const char* src, size_t n);
 char*  strchr(const char* s, int c);
 char*  strrchr(const char* s, int c);
+
+// BSD aliases kept for portability — libinput and a few other legacy
+// ports still reach for them.  Semantically identical to strchr/strrchr.
+char*  index (const char* s, int c);
+char*  rindex(const char* s, int c);
 char*  strstr(const char* haystack, const char* needle);
 char*  strpbrk(const char* s, const char* accept);
 size_t strspn(const char* s, const char* accept);

@@ -88,6 +88,14 @@ size_t mbstowcs(wchar_t* dst, const char* src, size_t n);
 size_t wcstombs(char* dst, const wchar_t* src, size_t n);
 int    mblen(const char* s, size_t n);
 
+// Locale-aware variants (glibc extensions).  MakaOS is "C" locale
+// only; _l variants ignore the locale arg and behave identically to
+// the non-_l version.  Required by libinput / fontconfig parsing.
+#include <locale.h>
+double        strtod_l (const char* s, char** endptr, locale_t loc);
+long          strtol_l (const char* s, char** endptr, int base, locale_t loc);
+unsigned long strtoul_l(const char* s, char** endptr, int base, locale_t loc);
+
 #ifdef __cplusplus
 }
 #endif

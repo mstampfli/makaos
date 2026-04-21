@@ -53,6 +53,10 @@ int clock_getres(clockid_t id, struct timespec* res);
 
 struct tm* gmtime(const time_t* t);
 struct tm* localtime(const time_t* t);
+// Thread-safe reentrant variants — preferred for new code.  Write
+// the decomposed time into *tm and return tm on success, NULL on error.
+struct tm* localtime_r(const time_t* t, struct tm* tm);
+struct tm* gmtime_r   (const time_t* t, struct tm* tm);
 time_t     mktime(struct tm* tm);
 size_t     strftime(char* s, size_t max, const char* fmt, const struct tm* tm);
 char*      ctime(const time_t* t);

@@ -29,4 +29,12 @@ int    closedir(DIR* d);
 void   rewinddir(DIR* d);
 int    dirfd(DIR* d);
 
+// POSIX scandir/alphasort — libinput's device enumeration path uses
+// these to list /dev/input/ for /dev/input/eventN nodes.
+int    scandir(const char* path, struct dirent*** namelist,
+                int (*filter)(const struct dirent*),
+                int (*compar)(const struct dirent**, const struct dirent**));
+int    alphasort(const struct dirent** a, const struct dirent** b);
+int    versionsort(const struct dirent** a, const struct dirent** b);
+
 #endif

@@ -12,6 +12,9 @@
 #define EPOLLET      0x80000000u
 #define EPOLLONESHOT 0x40000000u
 
+// O_CLOEXEC flag for epoll_create1 — close on execve.
+#define EPOLL_CLOEXEC 02000000
+
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
