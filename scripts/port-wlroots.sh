@@ -118,10 +118,10 @@ if [ ! -d "$WLR_BUILD" ]; then
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \
-        -Dbackends= \
+        -Dbackends=drm \
         -Drenderers= \
         -Dallocators= \
-        -Dsession=disabled \
+        -Dsession=enabled \
         -Dxwayland=disabled \
         -Dxcb-errors=disabled \
         -Dexamples=false \
