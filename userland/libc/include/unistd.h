@@ -58,6 +58,8 @@ int     unlink(const char* path);
 int     rmdir(const char* path);
 int     symlink(const char* target, const char* linkpath);
 ssize_t readlink(const char* path, char* buf, size_t n);
+ssize_t pread(int fd, void* buf, size_t n, off_t off);
+ssize_t pwrite(int fd, const void* buf, size_t n, off_t off);
 
 // Process
 pid_t  fork(void);

@@ -71,6 +71,7 @@ extern "C" {
 #define ENOPROTOOPT  92
 #define ESOCKTNOSUPPORT 94
 #define ENOTUNIQ    76
+#define ETIME       62    // timer expired
 
 extern int errno;
 

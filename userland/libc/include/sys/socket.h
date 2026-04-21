@@ -19,6 +19,7 @@
 // an AF_UNIX stream socket.  Used by wayland-server to authenticate
 // compositor clients.  See getsockopt(fd, SOL_SOCKET, SO_PEERCRED).
 #define SO_PEERCRED 17
+#define SO_ACCEPTCONN 30
 struct ucred {
     int32_t  pid;
     uint32_t uid;

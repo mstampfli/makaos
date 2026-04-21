@@ -67,6 +67,35 @@ ssize_t readlink(const char* path, char* buf, size_t n) {
                  (uint64_t)buf, (uint64_t)n));
 }
 
+// ── pread / pwrite — positioned I/O ──────────────────────────────────
+// No SYS_PREAD/SYS_PWRITE in kernel yet.  Emulate with lseek+read /
+// lseek+write — NOT atomic.  Caller must serialize concurrent pread
+// on the same fd.  Fine for wlroots' gamma/EDID paths (single-threaded
+// device reads); NOT OK for threaded databases.
+// TODO(scalability-debt-ledger-#7): fold into readv/writev work — add
+// SYS_PREAD / SYS_PWRITE that atomically lseek+read at the kernel.
+ssize_t pread(int fd, void* buf, size_t n, off_t off) {
+    off_t cur = lseek(fd, 0, 1 /*SEEK_CUR*/);
+    if (cur < 0) return -1;
+    if (lseek(fd, off, 0 /*SEEK_SET*/) < 0) return -1;
+    ssize_t r = read(fd, buf, n);
+    int saved = errno;
+    lseek(fd, cur, 0);  // restore
+    errno = saved;
+    return r;
+}
+
+ssize_t pwrite(int fd, const void* buf, size_t n, off_t off) {
+    off_t cur = lseek(fd, 0, 1);
+    if (cur < 0) return -1;
+    if (lseek(fd, off, 0) < 0) return -1;
+    ssize_t w = write(fd, buf, n);
+    int saved = errno;
+    lseek(fd, cur, 0);
+    errno = saved;
+    return w;
+}
+
 // ── readv / writev — scatter-gather I/O ─────────────────────────────
 // No SYS_READV/SYS_WRITEV in kernel yet; emulate by aggregating into
 // a single buffer + one read/write.  Keeps message atomicity for
@@ -165,3 +194,22 @@ int rmdir(const char* path) {
 // ── Misc ────────────────────────────────────────────────────────────
 // x86_64 page size is fixed at 4 KiB.  No syscall needed.
 int getpagesize(void) { return 4096; }
+
+// isatty — we don't yet track whether an fd is a tty in userland.
+// Report fds 0/1/2 as ttys (stdio) and everything else as non-tty.
+// Good enough for wlroots/bash/harfbuzz "am I interactive?" checks.
+int isatty(int fd) {
+    return (fd == 0 || fd == 1 || fd == 2) ? 1 : 0;
+}
+
+// truncate / ftruncate — kernel-backed file size change.
+int truncate(const char* path, off_t length) {
+    size_t n = 0; while (path && path[n]) n++;
+    return (int)__syscall_ret(
+        syscall3(SYS_TRUNCATE, (uint64_t)path, n, (uint64_t)length));
+}
+
+int ftruncate(int fd, off_t length) {
+    return (int)__syscall_ret(
+        syscall2(SYS_FTRUNCATE, (uint64_t)fd, (uint64_t)length));
+}
