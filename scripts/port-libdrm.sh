@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRM_VERSION="2.4.120"
+DRM_VERSION="2.4.125"
 DRM_URL="https://dri.freedesktop.org/libdrm/libdrm-${DRM_VERSION}.tar.xz"
 
 BUILD_DIR="$REPO_ROOT/build"
@@ -69,6 +69,19 @@ install_headers() {
     cp "$DRM_SRC/include/drm/drm_fourcc.h"    "$SYSROOT/usr/include/libdrm/"
     cp "$DRM_SRC/include/drm/drm_sarea.h"     "$SYSROOT/usr/include/libdrm/"
     cp "$DRM_SRC/include/drm/i915_drm.h"      "$SYSROOT/usr/include/libdrm/" 2>/dev/null || true
+    # MakaOS uses the Linux-style drm ABI (linux/types.h, asm/ioctl.h).
+    # Add __makaos__ to the existing __linux__ guards so our cross-gcc
+    # (which doesn't define __linux__) takes the Linux branch instead
+    # of the BSD <sys/ioccom.h> path.
+    for h in drm.h xf86drm.h; do
+        python3 -c "
+p='$SYSROOT/usr/include/libdrm/$h'
+with open(p) as f: s = f.read()
+s = s.replace('#if   defined(__linux__)', '#if   defined(__linux__) || defined(__makaos__)', 1)
+s = s.replace('#if defined(__linux__)',   '#if defined(__linux__) || defined(__makaos__)', 1)
+with open(p, 'w') as f: f.write(s)
+"
+    done
 }
 
 build_lib() {
@@ -110,8 +123,8 @@ TABLESTUB
 #define MAJOR_IN_MKDEV        0
 #define MAJOR_IN_SYSMACROS    1
 #define PACKAGE               "libdrm"
-#define PACKAGE_VERSION       "2.4.120"
-#define VERSION               "2.4.120"
+#define PACKAGE_VERSION       "2.4.125"
+#define VERSION               "2.4.125"
 EOF
 
     local includes=(
