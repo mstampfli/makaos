@@ -151,13 +151,19 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/dl_locale.c" -o "$BUILD_DIR/user_dl_locale.o"
 
+# libm_extern: real extern symbols for the basic math functions that
+# libc/math.h has only as static inline.  Pixman/freetype/harfbuzz/etc.
+# need link-resolvable sqrt, sqrtf, fabs, floor, fmod and friends.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/libm_extern.c" -o "$BUILD_DIR/user_libm_extern.o"
+
 # libc archive — anything linking sysroot-style pulls this in as -lc.
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_stdio.o" \
    "$BUILD_DIR/user_dns.o" "$BUILD_DIR/user_math.o" \
    "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o" \
    "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o" \
-   "$BUILD_DIR/user_dl_locale.o"
+   "$BUILD_DIR/user_dl_locale.o" "$BUILD_DIR/user_libm_extern.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still
@@ -181,7 +187,7 @@ fi
 # Each port script is a no-op when its target sits newer than its
 # sources, so re-running build.sh is cheap.  Sysroot is always self-
 # consistent because build.sh wipes + re-populates it every run.
-for port in zlib expat; do
+for port in zlib expat libffi pixman libxkbcommon; do
   echo "[+] Building Tier 2 lib: $port"
   SYSROOT="$SYSROOT" bash "scripts/port-$port.sh"
 done
