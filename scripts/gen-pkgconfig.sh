@@ -46,6 +46,7 @@ write_pc libdrm         "direct rendering manager"        "2.4.125"  "-ldrm"    
 # ── Tier 4 (wayland) ──────────────────────────────────────────────
 write_pc wayland-client "Wayland client library"          "1.23.1"   "-lwayland-client -lffi"
 write_pc wayland-server "Wayland server library"          "1.23.1"   "-lwayland-server -lffi"
+write_pc wayland-cursor "Wayland cursor-theme loader"     "1.23.1"   "-lwayland-cursor"
 
 # The wayland-scanner .pc describes the host-tool.  wlroots' meson
 # queries it for the "wayland_scanner" variable so it can run the

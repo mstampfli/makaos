@@ -181,6 +181,49 @@ install_headers() {
     cp "$WL_SRC/generated/wayland-client-protocol.h" "$SYSROOT/usr/include/"
     cp "$WL_SRC/generated/wayland-server-protocol.h" "$SYSROOT/usr/include/"
     cp "$WL_SRC/protocol/wayland.xml"       "$SYSROOT/usr/share/wayland/"
+    # wayland-cursor header
+    cp "$WL_SRC/cursor/wayland-cursor.h"    "$SYSROOT/usr/include/"
+}
+
+# ── libwayland-cursor — cursor-theme loader used by sway + GTK clients
+build_cursor_lib() {
+    local objdir="$BUILD_DIR/wayland_cursor_objs"
+    mkdir -p "$objdir"
+
+    local cflags=(
+        -O2 -fPIC -std=gnu11
+        -Wall
+        -Wno-unused-parameter
+        -Wno-unused-function
+        -Wno-missing-field-initializers
+        -DHAVE_CONFIG_H
+        -I "$WL_SRC"
+        -I "$WL_SRC/src"
+        -I "$WL_SRC/generated"
+        -I "$WL_SRC/cursor"
+        --sysroot="$SYSROOT"
+        -nostdinc
+        -isystem "$SYSROOT/usr/include"
+    )
+
+    local srcs=(
+        cursor/wayland-cursor.c
+        cursor/xcursor.c
+        cursor/os-compatibility.c
+    )
+
+    local objs=()
+    for src in "${srcs[@]}"; do
+        local o="$objdir/$(basename "$src" .c).o"
+        objs+=("$o")
+        if [ "$WL_SRC/$src" -nt "$o" ]; then
+            "$CROSS_CC" "${cflags[@]}" -c "$WL_SRC/$src" -o "$o"
+        fi
+    done
+
+    rm -f "$SYSROOT/usr/lib/libwayland-cursor.a"
+    "$CROSS_AR" rcs "$SYSROOT/usr/lib/libwayland-cursor.a" "${objs[@]}"
+    log "libwayland-cursor.a: $(stat -c%s "$SYSROOT/usr/lib/libwayland-cursor.a") bytes"
 }
 
 main() {
@@ -195,6 +238,7 @@ main() {
     build_scanner
     generate_core_proto
     build_target_libs
+    build_cursor_lib
     install_headers
     log "done"
 }
