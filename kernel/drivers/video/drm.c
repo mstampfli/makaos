@@ -126,6 +126,38 @@ static void drm_uncharge(task_t* t, uint64_t bytes) {
 #define DRM_IOCTL_MODE_MAP_DUMB       0xC01064B3
 #define DRM_IOCTL_MODE_DESTROY_DUMB   0xC00464B4
 #define DRM_IOCTL_MODE_ATOMIC         0xC03864BC
+#define DRM_IOCTL_SET_CLIENT_CAP      0x4010640D
+#define DRM_IOCTL_GEM_CLOSE           0x40086409
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD  0xC00C642D
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE  0xC00C642E
+// Property + plane subsystem (Linux-compatible KMS surface).
+// Size byte in each code was hand-verified against a sizeof() dump of
+// the upstream drm_mode.h structs; the three that were wrong caused
+// every GETPROPBLOB / OBJ_SETPROPERTY / CURSOR call to hit the ENOTTY
+// default branch and silently break EDID / atomic / cursor paths.
+#define DRM_IOCTL_MODE_GETPROPERTY          0xC04064AA  // 64B
+#define DRM_IOCTL_MODE_SETPROPERTY          0xC01064AB  // 16B (connector-legacy)
+#define DRM_IOCTL_MODE_GETPROPBLOB          0xC01064AC  // 16B
+#define DRM_IOCTL_MODE_GETFB                0xC01C64AD  // 28B (legacy)
+#define DRM_IOCTL_MODE_CLOSEFB              0xC00864D0  // 8B  (Linux 6.0+)
+#define DRM_IOCTL_MODE_GETPLANERESOURCES    0xC01064B5  // 16B
+#define DRM_IOCTL_MODE_GETPLANE             0xC02064B6  // 32B
+#define DRM_IOCTL_MODE_SETPLANE             0xC03064B7  // 48B
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES    0xC02064B9  // 32B
+#define DRM_IOCTL_MODE_OBJ_SETPROPERTY      0xC01864BA  // 24B
+#define DRM_IOCTL_MODE_CURSOR               0xC01C64A3  // 28B
+#define DRM_IOCTL_MODE_CURSOR2              0xC02464BB  // 36B
+// Master + lease — both stubbed.  Returning -EACCES from AUTH_MAGIC
+// makes libdrm's drmIsMaster() report "not master", steering wlroots'
+// reopen_drm_node() straight to plain-open instead of the lease path.
+// CREATE_LEASE returns -EOPNOTSUPP so callers that bypass drmIsMaster
+// fall back gracefully rather than aborting.
+#define DRM_IOCTL_AUTH_MAGIC                0x40046411
+#define DRM_IOCTL_GET_MAGIC                 0x80046402
+#define DRM_IOCTL_MODE_CREATE_LEASE         0xC01864C6
+#define DRM_IOCTL_MODE_LIST_LESSEES         0xC01064C7
+#define DRM_IOCTL_MODE_GET_LEASE            0xC01064C8
+#define DRM_IOCTL_MODE_REVOKE_LEASE         0xC00464C9
 
 // ── DRM capability IDs ──────────────────────────────────────────────
 #define DRM_CAP_DUMB_BUFFER          0x1
@@ -133,12 +165,26 @@ static void drm_uncharge(task_t* t, uint64_t bytes) {
 #define DRM_CAP_DUMB_PREFERRED_DEPTH 0x3
 #define DRM_CAP_DUMB_PREFER_SHADOW   0x4
 #define DRM_CAP_PRIME                0x5
+#define  DRM_PRIME_CAP_IMPORT         0x1
+#define  DRM_PRIME_CAP_EXPORT         0x2
 #define DRM_CAP_TIMESTAMP_MONOTONIC  0x6
 #define DRM_CAP_ASYNC_PAGE_FLIP      0x7
 #define DRM_CAP_CURSOR_WIDTH         0x8
 #define DRM_CAP_CURSOR_HEIGHT        0x9
 #define DRM_CAP_ADDFB2_MODIFIERS     0x10
 #define DRM_CAP_PAGE_FLIP_TARGET     0x11
+#define DRM_CAP_CRTC_IN_VBLANK_EVENT 0x12
+#define DRM_CAP_SYNCOBJ              0x13
+#define DRM_CAP_SYNCOBJ_TIMELINE     0x14
+
+// Client caps (set via DRM_IOCTL_SET_CLIENT_CAP).  Compositor-facing
+// flags that ask the kernel to expose more objects or semantics.
+#define DRM_CLIENT_CAP_STEREO_3D             1
+#define DRM_CLIENT_CAP_UNIVERSAL_PLANES      2
+#define DRM_CLIENT_CAP_ATOMIC                3
+#define DRM_CLIENT_CAP_ASPECT_RATIO          4
+#define DRM_CLIENT_CAP_WRITEBACK_CONNECTORS  5
+#define DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT  6
 
 #define DRM_PRIME_CAP_IMPORT 0x1
 #define DRM_PRIME_CAP_EXPORT 0x2
@@ -216,6 +262,82 @@ typedef struct {
 #define CONN_BASE  100u
 #define ENC_BASE   200u
 #define CRTC_BASE  300u
+// Two planes per CRTC: PRIMARY at PLANE_BASE + 2*idx, CURSOR at +1.
+// wlroots' cursor rendering expects a dedicated CURSOR plane; without it
+// drm_connector_set_cursor silently fails and the cursor never shows.
+#define PLANES_PER_CRTC            2u
+#define PLANE_BASE                 400u
+
+// Object type tags (DRM_IOCTL_MODE_OBJ_GETPROPERTIES.obj_type).
+#define DRM_MODE_OBJECT_CRTC       0xcccccccc
+#define DRM_MODE_OBJECT_CONNECTOR  0xc0c0c0c0
+#define DRM_MODE_OBJECT_ENCODER    0xe0e0e0e0
+#define DRM_MODE_OBJECT_PLANE      0xeeeeeeee
+#define DRM_MODE_OBJECT_ANY        0
+
+// ── Property IDs ──────────────────────────────────────────────────────
+// Fixed numeric IDs; wlroots bsearches by name to resolve them anyway.
+// Plane properties: required by atomic + useful for legacy plane queries.
+#define PROP_PLANE_TYPE            50u
+#define PROP_PLANE_CRTC_ID         51u
+#define PROP_PLANE_FB_ID           52u
+#define PROP_PLANE_CRTC_X          53u
+#define PROP_PLANE_CRTC_Y          54u
+#define PROP_PLANE_CRTC_W          55u
+#define PROP_PLANE_CRTC_H          56u
+#define PROP_PLANE_SRC_X           57u
+#define PROP_PLANE_SRC_Y           58u
+#define PROP_PLANE_SRC_W           59u
+#define PROP_PLANE_SRC_H           60u
+#define PROP_PLANE_IN_FORMATS      61u  // blob
+// CRTC properties.
+#define PROP_CRTC_ACTIVE           70u
+#define PROP_CRTC_MODE_ID          71u  // blob
+#define PROP_CRTC_GAMMA_LUT_SIZE   72u
+#define PROP_CRTC_VRR_ENABLED      73u
+// Connector properties.
+#define PROP_CONN_DPMS             80u
+#define PROP_CONN_EDID             81u  // blob
+#define PROP_CONN_CRTC_ID          82u
+#define PROP_CONN_NON_DESKTOP      83u
+#define PROP_CONN_LINK_STATUS      84u
+#define PROP_CONN_PANEL_ORIENTATION 85u
+#define PROP_CONN_CONTENT_TYPE     86u
+#define PROP_CONN_MAX_BPC          87u
+
+// drm_mode_property.flags (Linux drm_mode.h, kept numerically identical).
+#define DRM_MODE_PROP_PENDING      (1u << 0)
+#define DRM_MODE_PROP_RANGE        (1u << 1)
+#define DRM_MODE_PROP_IMMUTABLE    (1u << 2)
+#define DRM_MODE_PROP_ENUM         (1u << 3)
+#define DRM_MODE_PROP_BLOB         (1u << 4)
+#define DRM_MODE_PROP_BITMASK      (1u << 5)
+#define DRM_MODE_PROP_OBJECT      ((1u << 6) | (1u << 1))
+#define DRM_MODE_PROP_SIGNED_RANGE ((1u << 6) | (1u << 1))
+#define DRM_MODE_PROP_ATOMIC       (1u << 31)
+
+// Plane type enum (Linux drm_plane.h).
+#define DRM_PLANE_TYPE_OVERLAY     0u
+#define DRM_PLANE_TYPE_PRIMARY     1u
+#define DRM_PLANE_TYPE_CURSOR      2u
+
+// DPMS enum.
+#define DRM_MODE_DPMS_ON           0u
+#define DRM_MODE_DPMS_STANDBY      1u
+#define DRM_MODE_DPMS_SUSPEND      2u
+#define DRM_MODE_DPMS_OFF          3u
+
+// Well-known blob IDs.  Numbered high enough that they can't collide
+// with dumb-buffer handles or future per-fd blobs.
+#define BLOB_ID_BASE               0x10000u
+#define BLOB_EDID                  (BLOB_ID_BASE + 1)
+#define BLOB_IN_FORMATS            (BLOB_ID_BASE + 2)
+#define BLOB_MODE_ID               (BLOB_ID_BASE + 3)
+
+// DRM_FORMAT constants (Linux drm_fourcc.h).
+#define DRM_FORMAT_XRGB8888        0x34325258u
+#define DRM_FORMAT_ARGB8888        0x34325241u
+#define DRM_FORMAT_MOD_LINEAR      0ULL
 
 // ── Per-fd state: dumb buffers + framebuffers ────────────────────────
 // Each open of /dev/dri/card0 gets a private drm_client_t in f->ctx.
@@ -236,24 +358,75 @@ typedef struct drm_dumb {
     struct drm_dumb*   next;
 } drm_dumb_t;
 
+// An fb holds its OWN reference to the backing phys + virtio-gpu
+// resource so the fb survives after the GEM handle is closed.  This
+// matches Linux semantics: wlroots calls close_all_bo_handles right
+// after ADDFB2, leaving only the fb_id as the scan-out handle.
 typedef struct drm_fb {
     uint32_t           fb_id;          // per-fd ID (1..)
-    uint32_t           handle;         // matching drm_dumb_t.handle
+    uint32_t           handle;         // source GEM handle (may be stale)
     uint32_t           width, height;
     uint32_t           pitch;
     uint32_t           format;         // DRM_FORMAT_*
+    uint32_t           vgpu_res_id;    // independent scan-out ref
+    phys_addr_t        phys;           // backing pages
+    uint32_t           bytes_alloc;
+    uint8_t            order;
     struct drm_fb*     next;
 } drm_fb_t;
+
+// ── DRM event queue ────────────────────────────────────────────────
+// read() on a DRM fd delivers struct drm_event_vblank records generated
+// after PAGE_FLIP / ATOMIC commits that set DRM_MODE_PAGE_FLIP_EVENT.
+// libdrm's drmHandleEvent dispatches these to the compositor's
+// page_flip_handler; wlroots needs them to know when to submit the
+// next frame.  Without this, wlroots' drmHandleEvent read returns -1
+// and wlroots destroys the DRM backend (observed cascade 2026-04-21).
+//
+// Ring layout: byte-granular so read() can service arbitrary consumer
+// buffer sizes.  head = read pointer, tail = write pointer.  Size is
+// power-of-two so mod reduces to mask.  256 bytes = 8 page-flip
+// events queued simultaneously, plenty for double/triple buffering.
+
+#define DRM_EVENT_VBLANK         0x01
+#define DRM_EVENT_FLIP_COMPLETE  0x02
+#define DRM_MODE_PAGE_FLIP_EVENT 0x01
+
+#define DRM_EVQ_SIZE 256u
+#define DRM_EVQ_MASK (DRM_EVQ_SIZE - 1u)
+
+typedef struct drm_event {
+    uint32_t type;
+    uint32_t length;
+} __attribute__((packed)) drm_event_t;
+
+typedef struct drm_event_vblank {
+    drm_event_t base;
+    uint64_t    user_data;
+    uint32_t    tv_sec;
+    uint32_t    tv_usec;
+    uint32_t    sequence;
+    uint32_t    crtc_id;
+} __attribute__((packed)) drm_event_vblank_t;
 
 typedef struct drm_client {
     drm_dumb_t* dumbs;
     drm_fb_t*   fbs;
     uint32_t    next_dumb_handle;      // starts at 1
     uint32_t    next_fb_id;            // starts at 1
+    // Event ring (byte buffer).  head/tail are unbounded counters;
+    // (tail - head) is live bytes.  Wrap with DRM_EVQ_MASK.
+    uint8_t     evq[DRM_EVQ_SIZE];
+    uint32_t    evq_head;
+    uint32_t    evq_tail;
 } drm_client_t;
 
 // Device-global resource id allocator.  Never returns 0 (reserved).
-static uint32_t s_next_res_id = 1;
+// Start above the IDs the virtio-gpu scanout test reserves (res=1 for the
+// startup banner buffer — see virtio_gpu.c:625).  Using 256+ leaves
+// headroom for future kernel-reserved IDs without colliding with DRM
+// clients' dumb buffers.
+static uint32_t s_next_res_id = 256;
 static uint32_t alloc_res_id(void) {
     uint32_t r;
     do { r = __atomic_fetch_add(&s_next_res_id, 1, __ATOMIC_RELAXED); }
@@ -262,6 +435,10 @@ static uint32_t alloc_res_id(void) {
 }
 
 static drm_client_t* client_of(vfs_file_t* f) { return (drm_client_t*)f->ctx; }
+
+// Forward-decls for event-queue helpers used by PAGE_FLIP / ATOMIC
+// commit paths; full bodies live alongside drm_read_op below.
+static void drm_queue_flip_event(vfs_file_t* f, uint32_t crtc_id, uint64_t user_data);
 
 static drm_dumb_t* find_dumb(drm_client_t* c, uint32_t handle) {
     for (drm_dumb_t* d = c->dumbs; d; d = d->next)
@@ -291,7 +468,7 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     drm_mode_create_dumb_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
     if (!a.width || !a.height) return -EINVAL;
-    if (a.bpp != 32) return -EINVAL;     // 32-bpp only
+    if (a.bpp != 32)           return -EINVAL;
 
     uint32_t pitch = a.width * 4;
     uint64_t size  = (uint64_t)pitch * a.height;
@@ -316,15 +493,21 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
         pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
 
     uint32_t res_id = alloc_res_id();
+    // Error paths must drop the per-page refs (pmm_ref_inc above),
+    // NOT call pmm_buddy_free at block order — that double-frees
+    // because pmm_ref_dec already returns each page to the buddy
+    // when its refcount hits zero.
     if (b->resource_create(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
                              a.width, a.height) != 0) {
-        pmm_buddy_free(phys, order);
+        for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
+            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
         drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
     if (b->resource_attach_backing(res_id, phys, bytes_alloc) != 0) {
         b->resource_destroy(res_id);
-        pmm_buddy_free(phys, order);
+        for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
+            pmm_ref_dec(phys + (phys_addr_t)i * 4096u);
         drm_uncharge(g_current, bytes_alloc);
         return -EIO;
     }
@@ -386,9 +569,19 @@ typedef struct {
 static void dumb_free(drm_dumb_t* d, task_t* owner) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     if (b) b->resource_destroy(d->vgpu_res_id);
+    // pmm_ref_dec is the authoritative free path: it returns each
+    // page to the buddy allocator when its refcount hits 0.  A fb
+    // created via ADDFB2 took its OWN ref on every backing page, so
+    // when the dumb's handle is destroyed while the fb still holds
+    // the memory (wlroots' close_all_bo_handles pattern), ref counts
+    // go 2→1 and the pages stay live until drm_fb_free drops the
+    // last ref.  The previous code also called pmm_buddy_free here
+    // which double-freed the pages while they were still in use —
+    // buddy's freelist `next` pointer at offset 0 of the block got
+    // overwritten by the live fb's pixel writes → the next buddy
+    // alloc chased a corrupted `next` → #GP.
     for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
         pmm_ref_dec(d->phys + (phys_addr_t)i * 4096u);
-    pmm_buddy_free(d->phys, d->order);
     drm_uncharge(owner, d->bytes_alloc);
     kfree(d);
 }
@@ -401,17 +594,11 @@ static int drm_ioctl_destroy_dumb(vfs_file_t* f, uint64_t arg) {
     while (*pp) {
         if ((*pp)->handle == a.handle) {
             drm_dumb_t* d = *pp;
-            // Remove any fbs that reference this dumb handle.
-            drm_fb_t** fpp = &c->fbs;
-            while (*fpp) {
-                if ((*fpp)->handle == a.handle) {
-                    drm_fb_t* fb = *fpp;
-                    *fpp = fb->next;
-                    kfree(fb);
-                } else {
-                    fpp = &(*fpp)->next;
-                }
-            }
+            // Linux semantics: closing the GEM handle does NOT remove
+            // framebuffers that reference it — each fb holds its own
+            // ref on the backing pages (taken at ADDFB2) and survives
+            // independently.  wlroots' close_all_bo_handles relies on
+            // this to drop its handles right after ADDFB2.
             *pp = d->next;
             dumb_free(d, g_current);
             return 0;
@@ -441,14 +628,40 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     if (!d) return -ENOENT;
     if (a.width > d->width || a.height > d->height) return -EINVAL;
 
+        // Allocate an INDEPENDENT virtio-gpu resource for this fb, backed
+    // by the same phys pages.  This lets dumb and fb be destroyed on
+    // their own schedules (wlroots closes the GEM handle immediately
+    // after ADDFB2; the fb must survive).
+    const drm_backend_ops_t* b2 = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t fb_res_id = alloc_res_id();
+    if (!b2 ||
+        b2->resource_create(fb_res_id,
+                            VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+                            a.width, a.height) != 0 ||
+        b2->resource_attach_backing(fb_res_id, d->phys, d->bytes_alloc) != 0) {
+        if (b2) b2->resource_destroy(fb_res_id);
+        return -EIO;
+    }
+
     drm_fb_t* fb = (drm_fb_t*)kmalloc(sizeof(*fb));
-    if (!fb) return -ENOMEM;
-    fb->fb_id  = c->next_fb_id++;
-    fb->handle = a.handles[0];
-    fb->width  = a.width;
-    fb->height = a.height;
-    fb->pitch  = a.pitches[0] ? a.pitches[0] : d->pitch;
-    fb->format = a.pixel_format;
+    if (!fb) {
+        b2->resource_destroy(fb_res_id);
+        return -ENOMEM;
+    }
+    fb->fb_id       = c->next_fb_id++;
+    fb->handle      = a.handles[0];
+    fb->width       = a.width;
+    fb->height      = a.height;
+    fb->pitch       = a.pitches[0] ? a.pitches[0] : d->pitch;
+    fb->format      = a.pixel_format;
+    fb->vgpu_res_id = fb_res_id;
+    fb->phys        = d->phys;
+    fb->bytes_alloc = d->bytes_alloc;
+    fb->order       = d->order;
+    // Take independent refs on every backing page so the fb survives
+    // close_all_bo_handles() even if the dumb (and its refs) is freed.
+    for (uint32_t i = 0; i < d->bytes_alloc / 4096u; i++)
+        pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
     fb->next   = c->fbs;
     c->fbs     = fb;
 
@@ -459,6 +672,31 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
 
 typedef struct { uint32_t fb_id; } drm_mode_rmfb_t;
 
+// Release an fb: destroy its virtio-gpu resource + drop per-page refs.
+// If the resource is STILL active on a scanout, do NOT destroy it — the
+// host would lose the backing and the screen would revert mid-frame.
+// wlroots legitimately closes the fb after the commit (the swapchain
+// rotates buffers while the scanout keeps the old one visible); the
+// fb is reaped later when a new commit replaces this resource on the
+// scanout, via drm_commit_apply's prior-state handoff.  The kfree(fb)
+// here is safe because the resource is still tracked by s_scanouts.
+static void drm_fb_free(drm_fb_t* fb) {
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    int active = 0;
+    for (uint32_t i = 0; i < DRM_MAX_SCANOUTS; i++)
+        if (s_scanouts[i].resource_id == fb->vgpu_res_id) { active = 1; break; }
+    if (!active) {
+        if (b && fb->vgpu_res_id) b->resource_destroy(fb->vgpu_res_id);
+        for (uint32_t i = 0; i < fb->bytes_alloc / 4096u; i++)
+            pmm_ref_dec(fb->phys + (phys_addr_t)i * 4096u);
+    }
+    // else: resource kept alive for the scanout; on the next commit
+    // that replaces this resource, drm_commit_apply's prior hand-off
+    // should destroy it (TODO: wire that path).  Leak-bound: one fb
+    // per scanout steady-state.
+    kfree(fb);
+}
+
 static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
     drm_mode_rmfb_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
@@ -468,7 +706,7 @@ static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
         if ((*pp)->fb_id == a.fb_id) {
             drm_fb_t* fb = *pp;
             *pp = fb->next;
-            kfree(fb);
+            drm_fb_free(fb);
             return 0;
         }
         pp = &(*pp)->next;
@@ -563,15 +801,14 @@ typedef struct {
 } drm_mode_crtc_t;
 
 // Resolve a (client, fb_id) pair to the backend data the commit needs.
-// Returns 0 on success, -errno on failure.
+// Uses the fb's own snapshot — does NOT chase fb->handle (the source
+// GEM handle may have been closed via close_all_bo_handles).
 static int resolve_fb(drm_client_t* c, uint32_t fb_id,
                        uint32_t* out_res, uint32_t* out_w, uint32_t* out_h) {
     if (fb_id == 0) { *out_res = 0; *out_w = 0; *out_h = 0; return 0; }
     drm_fb_t* fb = find_fb(c, fb_id);
     if (!fb) return -ENOENT;
-    drm_dumb_t* d = find_dumb(c, fb->handle);
-    if (!d) return -ENOENT;
-    *out_res = d->vgpu_res_id;
+    *out_res = fb->vgpu_res_id;
     *out_w   = fb->width;
     *out_h   = fb->height;
     return 0;
@@ -617,7 +854,17 @@ static int drm_ioctl_page_flip(vfs_file_t* f, uint64_t arg) {
                          &commit.entries[0].w,
                          &commit.entries[0].h);
     if (rc != 0) return rc;
-    return drm_commit_apply(&commit);
+    int r = drm_commit_apply(&commit);
+    // Userland asked for a flip-complete event (DRM_MODE_PAGE_FLIP_EVENT).
+    // Our commit is synchronous — queue the event now so libdrm's
+    // drmHandleEvent reads it on the fd and dispatches to the
+    // compositor's page_flip_handler.  Without this, wlroots reads
+    // nothing, drmHandleEvent returns -1, wlroots destroys the whole
+    // backend.
+    if (r == 0 && (a.flags & DRM_MODE_PAGE_FLIP_EVENT)) {
+        drm_queue_flip_event(f, a.crtc_id, a.user_data);
+    }
+    return r;
 }
 
 // ── MODE_ATOMIC ioctl — the first-class path ────────────────────────
@@ -689,7 +936,22 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
         int rc = resolve_fb(c, fb_id, &e->resource_id, &e->w, &e->h);
         if (rc != 0) return rc;
     }
-    return drm_commit_apply(&commit);
+    int r = drm_commit_apply(&commit);
+    // DRM_MODE_ATOMIC_EVENT_FLIP flag (0x02) requests a flip-complete
+    // event per CRTC, user_data=a.user_data.  Same constant as PAGE_FLIP
+    // flags DRM_MODE_PAGE_FLIP_EVENT=0x1 wait — the atomic flag set is:
+    //   DRM_MODE_ATOMIC_TEST_ONLY  0x0100
+    //   DRM_MODE_ATOMIC_NONBLOCK   0x0200
+    //   DRM_MODE_PAGE_FLIP_EVENT   0x0001  (reused from legacy)
+    //   DRM_MODE_PAGE_FLIP_ASYNC   0x0002
+    //   DRM_MODE_ATOMIC_ALLOW_MODESET 0x0400
+    if (r == 0 && (a.flags & DRM_MODE_PAGE_FLIP_EVENT)) {
+        for (uint32_t i = 0; i < commit.n; i++) {
+            drm_queue_flip_event(f, commit.entries[i].scanout + CRTC_BASE,
+                                 a.user_data);
+        }
+    }
+    return r;
 }
 
 // ── mmap resolver (called from sys_mmap) ─────────────────────────────
@@ -699,8 +961,7 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
 int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
                                 uint64_t len, phys_addr_t* out_phys,
                                 uint64_t* out_bytes) {
-    if ((offset & 0xFF00000000000000ull) != DRM_DUMB_OFFSET_MARK)
-        return -EINVAL;
+    if ((offset & 0xFF00000000000000ull) != DRM_DUMB_OFFSET_MARK) return -EINVAL;
     uint32_t handle = (uint32_t)(offset >> DRM_DUMB_OFFSET_SHIFT) & 0xFFFFFF;
     drm_client_t* c = client_of(f);
     drm_dumb_t* d = find_dumb(c, handle);
@@ -760,13 +1021,16 @@ static int drm_ioctl_get_cap(uint64_t arg) {
     case DRM_CAP_DUMB_PREFERRED_DEPTH: c.value = 32; break;
     case DRM_CAP_DUMB_PREFER_SHADOW:   c.value = 0; break;
     case DRM_CAP_VBLANK_HIGH_CRTC:     c.value = 1; break;
-    case DRM_CAP_PRIME:                c.value = 0; break;  // no PRIME yet
+    case DRM_CAP_PRIME:                c.value = DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT; break;
     case DRM_CAP_TIMESTAMP_MONOTONIC:  c.value = 1; break;
     case DRM_CAP_ASYNC_PAGE_FLIP:      c.value = 0; break;
     case DRM_CAP_CURSOR_WIDTH:         c.value = 64; break;
     case DRM_CAP_CURSOR_HEIGHT:        c.value = 64; break;
     case DRM_CAP_ADDFB2_MODIFIERS:     c.value = 0; break;
     case DRM_CAP_PAGE_FLIP_TARGET:     c.value = 0; break;
+    case DRM_CAP_CRTC_IN_VBLANK_EVENT: c.value = 1; break;
+    case DRM_CAP_SYNCOBJ:              c.value = 0; break;
+    case DRM_CAP_SYNCOBJ_TIMELINE:     c.value = 0; break;
     default:                           return -EINVAL;
     }
     if (copy_to_user((void*)arg, &c, sizeof(c)) != 0) return -EFAULT;
@@ -973,6 +1237,922 @@ static int drm_ioctl_mode_getcrtc(uint64_t arg) {
     return 0;
 }
 
+// ── SET_CLIENT_CAP ──────────────────────────────────────────────────
+// Accepts UNIVERSAL_PLANES, ASPECT_RATIO, CURSOR_PLANE_HOTSPOT (all
+// either already true for us or no-op).  Rejects ATOMIC with -EOPNOTSUPP
+// so wlroots falls back to the legacy DRM path — our kernel implements
+// drmModeSetCrtc + drmModePageFlip + drmModeAddFB2 but not the full
+// property/blob/plane subsystem the atomic interface demands.  Rejects
+// STEREO_3D and WRITEBACK_CONNECTORS (we don't model them).
+static int drm_ioctl_set_client_cap(uint64_t arg) {
+    struct { uint64_t cap; uint64_t val; } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    switch (a.cap) {
+    case DRM_CLIENT_CAP_UNIVERSAL_PLANES:
+    case DRM_CLIENT_CAP_ASPECT_RATIO:
+    case DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT:
+        return 0;
+    case DRM_CLIENT_CAP_ATOMIC:
+        return -EOPNOTSUPP;
+    default:
+        return -EINVAL;
+    }
+}
+
+// ── GEM_CLOSE ───────────────────────────────────────────────────────
+// Release a buffer-object handle.  Delegates to the existing dumb-buffer
+// destruction path — in our model every GEM handle is a dumb buffer.
+static int drm_ioctl_destroy_dumb(vfs_file_t* f, uint64_t arg);   // fwd
+static int drm_ioctl_gem_close(vfs_file_t* self, uint64_t arg) {
+    return drm_ioctl_destroy_dumb(self, arg);
+}
+
+// ── PRIME fd type ───────────────────────────────────────────────────
+// A PRIME-exported fd is a small vfs_file_t that carries (client, handle).
+// When passed back to PRIME_FD_TO_HANDLE on the same DRM fd, the handle
+// is recovered.  The dmabuf fd does NOT keep the underlying buffer alive
+// — lifetime is managed by the DRM client's GEM handle table, matching
+// Linux semantics where handle + PRIME fd are independent refs.
+typedef struct {
+    drm_client_t* owner;   // back-ref to the DRM client that exported us
+    uint32_t      handle;
+} drm_prime_ctx_t;
+
+static void drm_prime_close(vfs_file_t* self) {
+    if (self->ctx) kfree(self->ctx);
+    kfree(self);
+}
+
+// Distinctive close-pointer lets FD_TO_HANDLE confirm an fd came from
+// our PRIME export (as opposed to an arbitrary fd the caller passed in).
+static int drm_prime_is_ours(vfs_file_t* f) {
+    return f && f->close == drm_prime_close;
+}
+
+// Install a ready vfs_file_t into the current task's fd_table at the
+// lowest free slot.  Returns the new fd, or -errno.
+static int drm_install_fd(vfs_file_t* f) {
+    task_files_t* tf = g_current->files_shared;
+    if (!tf) return -EBADF;
+    spin_lock(&tf->lock);
+    for (uint32_t fd = 0; ; fd++) {
+        if (fd >= tf->ft->cap) {
+            if (!fd_table_grow(tf)) { spin_unlock(&tf->lock); return -ENFILE; }
+        }
+        if (!tf->ft->fd_table[fd]) {
+            tf->ft->fd_table[fd] = f;
+            tf->ft->fd_flags[fd] = 0;
+            spin_unlock(&tf->lock);
+            return (int)fd;
+        }
+    }
+}
+
+static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
+    struct { uint32_t handle; uint32_t flags; int32_t fd; } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+
+    drm_client_t* c = client_of(drm_f);
+    if (!find_dumb(c, a.handle)) return -ENOENT;
+
+    // Allocate the PRIME vfs_file_t.
+    vfs_file_t* pf = (vfs_file_t*)kmalloc(sizeof(*pf));
+    if (!pf) return -ENOMEM;
+    __builtin_memset(pf, 0, sizeof(*pf));
+    pf->waitq = &pf->_waitq;
+    wait_queue_init(pf->waitq);
+    pf->secondary_waitq = NULL;
+    pf->close = drm_prime_close;
+    pf->refcount = 1;
+    pf->rights   = 0xFFFFFFFFu;
+
+    drm_prime_ctx_t* pc = (drm_prime_ctx_t*)kmalloc(sizeof(*pc));
+    if (!pc) { kfree(pf); return -ENOMEM; }
+    pc->owner  = c;
+    pc->handle = a.handle;
+    pf->ctx = pc;
+
+    int fd = drm_install_fd(pf);
+    if (fd < 0) { kfree(pc); kfree(pf); return fd; }
+
+    a.fd = fd;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// Cross-fd PRIME import: wlroots reopens /dev/dri/card0 for its dumb
+// allocator, then passes the exported dmabuf fd to the DRM backend's
+// original fd for scan-out.  Those fds are different drm_client_t's
+// backed by the same device, so importing must CLONE the underlying
+// dumb buffer into the destination client's handle table (sharing the
+// phys pages, with refcounts bumped per page).  Same-client import
+// just returns the original handle.
+static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
+    struct { uint32_t handle; uint32_t flags; int32_t fd; } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+
+    task_files_t* tf = g_current->files_shared;
+    if (!tf || a.fd < 0 || (uint32_t)a.fd >= tf->ft->cap) return -EBADF;
+    vfs_file_t* pf = tf->ft->fd_table[a.fd];
+    if (!drm_prime_is_ours(pf)) return -EINVAL;
+
+    drm_prime_ctx_t* pc = (drm_prime_ctx_t*)pf->ctx;
+    drm_client_t* dst = client_of(drm_f);
+
+    if (pc->owner == dst) {
+        a.handle = pc->handle;
+    } else {
+        // Different DRM client — import.  Locate the source dumb in the
+        // exporting client's list; clone a drm_dumb_t in the destination
+        // referencing the same phys pages.  Bump per-page refcounts so
+        // destroy_dumb on either side leaves the other's view intact.
+        drm_dumb_t* src = find_dumb(pc->owner, pc->handle);
+        if (!src) return -ENOENT;
+        drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
+        if (!nd) return -ENOMEM;
+        *nd = *src;
+        nd->handle = dst->next_dumb_handle++;
+        nd->next   = dst->dumbs;
+        dst->dumbs = nd;
+        for (uint32_t i = 0; i < nd->bytes_alloc / 4096u; i++)
+            pmm_ref_inc(nd->phys + (phys_addr_t)i * 4096u);
+        a.handle = nd->handle;
+    }
+
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Property / plane / blob subsystem — full legacy+atomic-readable KMS
+// surface.  Every property wlroots / dwl / tinywl scan for is answered
+// with real metadata (name, flags, enum tables) and real values.
+// Connectors advertise an EDID blob, CRTCs advertise a MODE_ID blob
+// for the current mode, planes advertise an IN_FORMATS blob listing
+// their supported fourcc+modifier pairs.
+// ──────────────────────────────────────────────────────────────────────
+
+static inline uint32_t plane_of(uint32_t crtc_idx, uint8_t is_cursor) {
+    return PLANE_BASE + crtc_idx * PLANES_PER_CRTC + (is_cursor ? 1u : 0u);
+}
+
+// ── EDID blob (128 bytes) for a generic 1280x800 @ 60Hz monitor ───────
+// Hand-computed: 8-byte magic, manufacturer "MAK" (MakaOS), product 1,
+// serial 1, week 1 year 2024, EDID 1.4, digital input, 10-bit color,
+// 310×170 mm (13.8in), sRGB default, 1280x800 60Hz detailed timing,
+// one extension block flag cleared, checksum correct.
+static uint8_t g_edid[128] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,   // magic
+    0x33, 0x21, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,   // mfg "MAK" + product/serial
+    0x01, 0x22, 0x01, 0x04,                           // week 1 / year 2024 / EDID 1.4
+    0xA5, 0x1F, 0x11, 0x78,                           // digital, 10bpc, 31x17cm, sRGB
+    0x06, 0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+    0x0F, 0x50, 0x54, 0x00, 0x00, 0x00,               // chroma + established timings=0
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,   // standard timings unused
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    // Detailed timing #1 — 1280x800 @ 60Hz reduced-blanking-ish.
+    0x64, 0x19, 0x00, 0x40, 0x41, 0x00, 0x26, 0x30,
+    0x18, 0x88, 0x36, 0x00, 0x28, 0x8E, 0x21, 0x00,
+    0x00, 0x1E,
+    // Monitor name "MakaOS" — 18-byte descriptor: 5-byte header
+    // (00 00 00 FC 00) + 13 bytes of name padded with 0x0a then 0x20.
+    0x00, 0x00, 0x00, 0xFC, 0x00, 'M','a','k','a','O','S','\n',' ',' ',' ',' ',' ',' ',
+    // Monitor range: 30-60Hz
+    0x00, 0x00, 0x00, 0xFD, 0x00, 0x1E, 0x3C, 0x1E, 0x3C, 0x1E, 0x01, 0x0A,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    // Serial string
+    0x00, 0x00, 0x00, 0xFF, 0x00, 'M','A','K','A','0','0','0','1','\n',' ',' ',' ',' ',
+    0x00,                                             // extension count
+    0x00                                              // checksum (fixed up at init)
+};
+
+// ── IN_FORMATS blob — XRGB8888 with DRM_FORMAT_MOD_LINEAR ───────────
+// Wire format: drm_format_modifier_blob header, then formats[] then
+// modifiers[] with per-modifier formats bitmask.  Linux drm_mode.h
+// encodes this verbatim.
+struct __attribute__((packed)) drm_format_modifier {
+    uint64_t formats;           // bitmask over formats[]
+    uint32_t offset;            // unused
+    uint32_t pad;
+    uint64_t modifier;
+};
+struct __attribute__((packed)) drm_format_modifier_blob_hdr {
+    uint32_t version;           // 1
+    uint32_t flags;             // 0
+    uint32_t count_formats;
+    uint32_t formats_offset;
+    uint32_t count_modifiers;
+    uint32_t modifiers_offset;
+};
+struct __attribute__((packed)) in_formats_blob {
+    struct drm_format_modifier_blob_hdr hdr;
+    uint32_t formats[2];        // XRGB8888, ARGB8888
+    struct drm_format_modifier mods[1];
+};
+static struct in_formats_blob g_in_formats = {
+    .hdr = {
+        .version          = 1,
+        .flags            = 0,
+        .count_formats    = 2,
+        .formats_offset   = sizeof(struct drm_format_modifier_blob_hdr),
+        .count_modifiers  = 1,
+        .modifiers_offset = sizeof(struct drm_format_modifier_blob_hdr)
+                          + 2 * sizeof(uint32_t),
+    },
+    .formats = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 },
+    .mods    = {
+        { .formats = 0x3, .offset = 0, .pad = 0,
+          .modifier = DRM_FORMAT_MOD_LINEAR },
+    },
+};
+
+// ── MODE_ID blob: the current preferred mode of connector 0 ────────
+// Populated lazily (scanout_mode query) on first getpropblob call.
+typedef struct __attribute__((packed)) {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh;
+    uint32_t flags;
+    uint32_t type;
+    char     name[32];
+} drm_modeinfo_blob_t;
+static drm_modeinfo_blob_t g_mode_blob;
+static uint8_t             g_mode_blob_valid = 0;
+
+static void drm_ensure_mode_blob(void) {
+    if (g_mode_blob_valid) return;
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t w = 0, h = 0;
+    if (b) b->scanout_mode(0, &w, &h);
+    if (!w || !h) { w = 1280; h = 800; }
+    __builtin_memset(&g_mode_blob, 0, sizeof(g_mode_blob));
+    g_mode_blob.clock       = (uint32_t)((uint64_t)w * h * 60u / 1000u);
+    g_mode_blob.hdisplay    = (uint16_t)w;
+    g_mode_blob.hsync_start = (uint16_t)(w + 8);
+    g_mode_blob.hsync_end   = (uint16_t)(w + 16);
+    g_mode_blob.htotal      = (uint16_t)(w + 32);
+    g_mode_blob.vdisplay    = (uint16_t)h;
+    g_mode_blob.vsync_start = (uint16_t)(h + 2);
+    g_mode_blob.vsync_end   = (uint16_t)(h + 4);
+    g_mode_blob.vtotal      = (uint16_t)(h + 8);
+    g_mode_blob.vrefresh    = 60;
+    g_mode_blob.type        = 0x40;  // DRM_MODE_TYPE_PREFERRED
+    const char* nm = "preferred";
+    for (int i = 0; i < 31 && nm[i]; i++) g_mode_blob.name[i] = nm[i];
+    g_mode_blob_valid = 1;
+}
+
+// One-time EDID checksum fix-up at first use.  Can't run at file scope
+// because it mutates g_edid[127].
+static void drm_ensure_edid(void) {
+    static uint8_t done = 0;
+    if (done) return;
+    uint8_t sum = 0;
+    for (int i = 0; i < 127; i++) sum = (uint8_t)(sum + g_edid[i]);
+    g_edid[127] = (uint8_t)(0x100u - sum);
+    done = 1;
+}
+
+// ── Blob registry ─────────────────────────────────────────────────────
+static int drm_resolve_blob(uint32_t blob_id, const void** out, uint32_t* len) {
+    switch (blob_id) {
+    case BLOB_EDID:
+        drm_ensure_edid();
+        *out = g_edid; *len = sizeof(g_edid);
+        return 0;
+    case BLOB_IN_FORMATS:
+        *out = &g_in_formats; *len = sizeof(g_in_formats);
+        return 0;
+    case BLOB_MODE_ID:
+        drm_ensure_mode_blob();
+        *out = &g_mode_blob; *len = sizeof(g_mode_blob);
+        return 0;
+    default:
+        return -ENOENT;
+    }
+}
+
+static int drm_ioctl_mode_getpropblob(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint32_t blob_id;
+        uint32_t length;
+        uint64_t data;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    const void* src; uint32_t blob_len;
+    int rc = drm_resolve_blob(a.blob_id, &src, &blob_len);
+    if (rc) return rc;
+    uint32_t to_copy = a.length < blob_len ? a.length : blob_len;
+    if (to_copy && a.data) {
+        if (copy_to_user((void*)a.data, src, to_copy) != 0) return -EFAULT;
+    }
+    a.length = blob_len;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ── GETPLANERESOURCES / GETPLANE ─────────────────────────────────────
+static int drm_ioctl_mode_getplaneres(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t plane_id_ptr;
+        uint32_t count_planes;
+    } r;
+    if (copy_from_user(&r, (void*)arg, sizeof(r)) != 0) return -EFAULT;
+
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    uint32_t total = n_sc * PLANES_PER_CRTC;
+
+    uint32_t ids[VIRTIO_GPU_MAX_SCANOUTS_CAP * PLANES_PER_CRTC];
+    for (uint32_t i = 0; i < n_sc; i++) {
+        ids[i * 2 + 0] = plane_of(i, 0);  // primary
+        ids[i * 2 + 1] = plane_of(i, 1);  // cursor
+    }
+
+    int rc = drm_write_id_array(r.plane_id_ptr, &r.count_planes, ids, total);
+    if (rc) return rc;
+    if (copy_to_user((void*)arg, &r, sizeof(r)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_mode_getplane(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint32_t plane_id;
+        uint32_t crtc_id;
+        uint32_t fb_id;
+        uint32_t possible_crtcs;
+        uint32_t gamma_size;
+        uint32_t count_format_types;
+        uint64_t format_type_ptr;
+    } p;
+    if (copy_from_user(&p, (void*)arg, sizeof(p)) != 0) return -EFAULT;
+
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    if (p.plane_id < PLANE_BASE) return -ENOENT;
+    uint32_t raw = p.plane_id - PLANE_BASE;
+    if (raw >= n_sc * PLANES_PER_CRTC) return -ENOENT;
+    uint32_t crtc_idx = raw / PLANES_PER_CRTC;
+    int is_cursor = (raw % PLANES_PER_CRTC) == 1;
+
+    p.crtc_id        = CRTC_BASE + crtc_idx;
+    p.fb_id          = 0;
+    p.possible_crtcs = 1u << crtc_idx;
+    p.gamma_size     = 0;
+
+    // Primary plane: XRGB8888.  Cursor plane: ARGB8888.
+    uint32_t fmts[1];
+    fmts[0] = is_cursor ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
+    int rc = drm_write_id_array(p.format_type_ptr, &p.count_format_types,
+                                fmts, 1);
+    if (rc) return rc;
+    if (copy_to_user((void*)arg, &p, sizeof(p)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ── Property dispatch (metadata + per-object value) ──────────────────
+struct drm_mode_property_enum_kern {
+    uint64_t value;
+    char     name[32];
+} __attribute__((packed));
+
+// Each prop has a name, a type-category, and (for enums) an enum table.
+typedef enum {
+    PTY_RANGE,   // inclusive [min, max] range
+    PTY_SRANGE,  // signed range
+    PTY_ENUM,    // enum with fixed values
+    PTY_BLOB,    // blob reference
+    PTY_OBJECT,  // object id range
+} drm_prop_kind_t;
+
+typedef struct {
+    uint32_t                   id;
+    const char*                name;
+    drm_prop_kind_t            kind;
+    uint8_t                    immutable;   // 1 → flag ORed
+    uint64_t                   range_min;
+    uint64_t                   range_max;
+    uint32_t                   obj_type;    // for PTY_OBJECT (0=ANY)
+    uint32_t                   n_enum;
+    const struct drm_mode_property_enum_kern* enums;
+} drm_prop_def_t;
+
+// Enum tables.
+static const struct drm_mode_property_enum_kern e_plane_type[] = {
+    { DRM_PLANE_TYPE_OVERLAY, "Overlay" },
+    { DRM_PLANE_TYPE_PRIMARY, "Primary" },
+    { DRM_PLANE_TYPE_CURSOR,  "Cursor"  },
+};
+static const struct drm_mode_property_enum_kern e_dpms[] = {
+    { DRM_MODE_DPMS_ON,      "On"      },
+    { DRM_MODE_DPMS_STANDBY, "Standby" },
+    { DRM_MODE_DPMS_SUSPEND, "Suspend" },
+    { DRM_MODE_DPMS_OFF,     "Off"     },
+};
+static const struct drm_mode_property_enum_kern e_link[] = {
+    { 0, "Good" }, { 1, "Bad" },
+};
+static const struct drm_mode_property_enum_kern e_panel[] = {
+    { 0, "Normal"   }, { 1, "Upside Down" },
+    { 2, "Left Side Up" }, { 3, "Right Side Up" },
+};
+static const struct drm_mode_property_enum_kern e_ctype[] = {
+    { 0, "No Data" }, { 1, "Graphics" },
+    { 2, "Photo"   }, { 3, "Cinema"   }, { 4, "Game" },
+};
+
+// Property table, shared across planes/crtcs/connectors.
+static const drm_prop_def_t g_props[] = {
+    // --- Plane ---
+    { PROP_PLANE_TYPE,        "type",
+      PTY_ENUM, 1, 0,0, 0, 3, e_plane_type },
+    { PROP_PLANE_CRTC_ID,     "CRTC_ID",
+      PTY_OBJECT, 0, 0,0, DRM_MODE_OBJECT_CRTC, 0, 0 },
+    { PROP_PLANE_FB_ID,       "FB_ID",
+      PTY_OBJECT, 0, 0,0, 0, 0, 0 },
+    { PROP_PLANE_CRTC_X,      "CRTC_X",
+      PTY_SRANGE, 0, 0,0x7FFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_CRTC_Y,      "CRTC_Y",
+      PTY_SRANGE, 0, 0,0x7FFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_CRTC_W,      "CRTC_W",
+      PTY_RANGE,  0, 0,0x7FFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_CRTC_H,      "CRTC_H",
+      PTY_RANGE,  0, 0,0x7FFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_SRC_X,       "SRC_X",
+      PTY_RANGE,  0, 0,0xFFFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_SRC_Y,       "SRC_Y",
+      PTY_RANGE,  0, 0,0xFFFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_SRC_W,       "SRC_W",
+      PTY_RANGE,  0, 0,0xFFFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_SRC_H,       "SRC_H",
+      PTY_RANGE,  0, 0,0xFFFFFFFFu, 0, 0, 0 },
+    { PROP_PLANE_IN_FORMATS,  "IN_FORMATS",
+      PTY_BLOB,   1, 0,0, 0, 0, 0 },
+    // --- CRTC ---
+    { PROP_CRTC_ACTIVE,       "ACTIVE",
+      PTY_RANGE,  0, 0,1, 0, 0, 0 },
+    { PROP_CRTC_MODE_ID,      "MODE_ID",
+      PTY_BLOB,   0, 0,0, 0, 0, 0 },
+    { PROP_CRTC_GAMMA_LUT_SIZE, "GAMMA_LUT_SIZE",
+      PTY_RANGE,  1, 0,0xFFFFu, 0, 0, 0 },
+    { PROP_CRTC_VRR_ENABLED,  "VRR_ENABLED",
+      PTY_RANGE,  0, 0,1, 0, 0, 0 },
+    // --- Connector ---
+    { PROP_CONN_DPMS,                "DPMS",
+      PTY_ENUM, 0, 0,0, 0, 4, e_dpms },
+    { PROP_CONN_EDID,                "EDID",
+      PTY_BLOB, 1, 0,0, 0, 0, 0 },
+    { PROP_CONN_CRTC_ID,             "CRTC_ID",
+      PTY_OBJECT, 0, 0,0, DRM_MODE_OBJECT_CRTC, 0, 0 },
+    { PROP_CONN_NON_DESKTOP,         "non-desktop",
+      PTY_RANGE, 1, 0,1, 0, 0, 0 },
+    { PROP_CONN_LINK_STATUS,         "link-status",
+      PTY_ENUM, 1, 0,0, 0, 2, e_link },
+    { PROP_CONN_PANEL_ORIENTATION,   "panel orientation",
+      PTY_ENUM, 1, 0,0, 0, 4, e_panel },
+    { PROP_CONN_CONTENT_TYPE,        "content type",
+      PTY_ENUM, 0, 0,0, 0, 5, e_ctype },
+    { PROP_CONN_MAX_BPC,             "max bpc",
+      PTY_RANGE, 0, 8,10, 0, 0, 0 },
+};
+static const uint32_t g_props_count = sizeof(g_props) / sizeof(g_props[0]);
+
+static const drm_prop_def_t* drm_find_prop(uint32_t id) {
+    for (uint32_t i = 0; i < g_props_count; i++)
+        if (g_props[i].id == id) return &g_props[i];
+    return 0;
+}
+
+// Fill the metadata reply for drmModeGetProperty.
+static int drm_emit_prop_meta(uint64_t arg, const drm_prop_def_t* d) {
+    struct __attribute__((packed)) {
+        uint64_t values_ptr;
+        uint64_t enum_blob_ptr;
+        uint32_t prop_id;
+        uint32_t flags;
+        char     name[32];
+        uint32_t count_values;
+        uint32_t count_enum_blobs;
+    } r;
+    if (copy_from_user(&r, (void*)arg, sizeof(r)) != 0) return -EFAULT;
+
+    r.prop_id = d->id;
+    r.flags   = 0;
+    if (d->immutable) r.flags |= DRM_MODE_PROP_IMMUTABLE;
+    switch (d->kind) {
+    case PTY_RANGE:  r.flags |= DRM_MODE_PROP_RANGE; break;
+    case PTY_SRANGE: r.flags |= DRM_MODE_PROP_SIGNED_RANGE; break;
+    case PTY_ENUM:   r.flags |= DRM_MODE_PROP_ENUM; break;
+    case PTY_BLOB:   r.flags |= DRM_MODE_PROP_BLOB; break;
+    case PTY_OBJECT: r.flags |= DRM_MODE_PROP_OBJECT; break;
+    }
+
+    for (int i = 0; i < 32; i++) r.name[i] = 0;
+    for (int i = 0; i < 31 && d->name[i]; i++) r.name[i] = d->name[i];
+
+    // count_values / values_ptr: two u64s for RANGE (min,max) or one u64 (obj type).
+    uint64_t vals[2] = { 0 };
+    uint32_t nv = 0;
+    if (d->kind == PTY_RANGE || d->kind == PTY_SRANGE) {
+        vals[0] = d->range_min; vals[1] = d->range_max; nv = 2;
+    } else if (d->kind == PTY_OBJECT) {
+        vals[0] = d->obj_type; nv = 1;
+    }
+    uint32_t to_copy_v = r.count_values < nv ? r.count_values : nv;
+    if (to_copy_v && r.values_ptr) {
+        if (copy_to_user((void*)r.values_ptr, vals,
+                         to_copy_v * sizeof(uint64_t)) != 0) return -EFAULT;
+    }
+    r.count_values = nv;
+
+    // count_enum_blobs / enum_blob_ptr: enum list (value+name pairs).
+    uint32_t to_copy_e = r.count_enum_blobs < d->n_enum ? r.count_enum_blobs : d->n_enum;
+    if (to_copy_e && r.enum_blob_ptr && d->enums) {
+        if (copy_to_user((void*)r.enum_blob_ptr, d->enums,
+                         to_copy_e * sizeof(struct drm_mode_property_enum_kern)) != 0)
+            return -EFAULT;
+    }
+    r.count_enum_blobs = d->n_enum;
+
+    if (copy_to_user((void*)arg, &r, sizeof(r)) != 0) return -EFAULT;
+    return 0;
+}
+
+static int drm_ioctl_mode_getproperty(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t values_ptr;
+        uint64_t enum_blob_ptr;
+        uint32_t prop_id;
+        uint32_t flags;
+        char     name[32];
+        uint32_t count_values;
+        uint32_t count_enum_blobs;
+    } r;
+    if (copy_from_user(&r, (void*)arg, sizeof(r)) != 0) return -EFAULT;
+    const drm_prop_def_t* d = drm_find_prop(r.prop_id);
+    if (!d) return -ENOENT;
+    return drm_emit_prop_meta(arg, d);
+}
+
+// Per-CRTC runtime state kept for properties that actually mutate.
+typedef struct {
+    uint8_t  active;     // 0/1
+    uint32_t mode_blob;  // BLOB_MODE_ID or caller-supplied (we only store)
+} drm_crtc_state_t;
+static drm_crtc_state_t g_crtc_state[VIRTIO_GPU_MAX_SCANOUTS_CAP];
+
+// ── OBJ_GETPROPERTIES — emit all props for the given object ──────────
+// Kept in one place so atomic callers, legacy object queries, and
+// wlroots' name-based bsearch all see the same list + values.
+static int drm_obj_collect(uint32_t obj_type, uint32_t obj_id,
+                           uint32_t* ids, uint64_t* vals,
+                           uint32_t max, uint32_t* out_count) {
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    uint32_t n = 0;
+
+    uint32_t t = obj_type;
+    if (t == DRM_MODE_OBJECT_ANY) {
+        if (obj_id >= PLANE_BASE && obj_id < PLANE_BASE + n_sc * PLANES_PER_CRTC)
+            t = DRM_MODE_OBJECT_PLANE;
+        else if (obj_id >= CRTC_BASE && obj_id < CRTC_BASE + n_sc)
+            t = DRM_MODE_OBJECT_CRTC;
+        else if (obj_id >= CONN_BASE && obj_id < CONN_BASE + n_sc)
+            t = DRM_MODE_OBJECT_CONNECTOR;
+        else if (obj_id >= ENC_BASE && obj_id < ENC_BASE + n_sc)
+            t = DRM_MODE_OBJECT_ENCODER;
+        else
+            return -ENOENT;
+    }
+
+#define EMIT(pid, v) do {                                  \
+    if (max > n && ids && vals) { ids[n] = (pid); vals[n] = (uint64_t)(v); } \
+    n++;                                                   \
+} while (0)
+
+    switch (t) {
+    case DRM_MODE_OBJECT_PLANE: {
+        if (obj_id < PLANE_BASE || obj_id >= PLANE_BASE + n_sc * PLANES_PER_CRTC)
+            return -ENOENT;
+        uint32_t raw = obj_id - PLANE_BASE;
+        uint32_t crtc_idx = raw / PLANES_PER_CRTC;
+        int is_cursor = (raw % PLANES_PER_CRTC) == 1;
+        EMIT(PROP_PLANE_TYPE, is_cursor ? DRM_PLANE_TYPE_CURSOR : DRM_PLANE_TYPE_PRIMARY);
+        EMIT(PROP_PLANE_CRTC_ID, CRTC_BASE + crtc_idx);
+        EMIT(PROP_PLANE_FB_ID,   0);
+        EMIT(PROP_PLANE_CRTC_X,  0);
+        EMIT(PROP_PLANE_CRTC_Y,  0);
+        EMIT(PROP_PLANE_CRTC_W,  0);
+        EMIT(PROP_PLANE_CRTC_H,  0);
+        EMIT(PROP_PLANE_SRC_X,   0);
+        EMIT(PROP_PLANE_SRC_Y,   0);
+        EMIT(PROP_PLANE_SRC_W,   0);
+        EMIT(PROP_PLANE_SRC_H,   0);
+        EMIT(PROP_PLANE_IN_FORMATS, BLOB_IN_FORMATS);
+        break;
+    }
+    case DRM_MODE_OBJECT_CRTC: {
+        if (obj_id < CRTC_BASE || obj_id >= CRTC_BASE + n_sc) return -ENOENT;
+        uint32_t idx = obj_id - CRTC_BASE;
+        EMIT(PROP_CRTC_ACTIVE,         g_crtc_state[idx].active);
+        EMIT(PROP_CRTC_MODE_ID,        g_crtc_state[idx].mode_blob
+                                        ? g_crtc_state[idx].mode_blob
+                                        : BLOB_MODE_ID);
+        EMIT(PROP_CRTC_GAMMA_LUT_SIZE, 0);
+        EMIT(PROP_CRTC_VRR_ENABLED,    0);
+        break;
+    }
+    case DRM_MODE_OBJECT_CONNECTOR: {
+        if (obj_id < CONN_BASE || obj_id >= CONN_BASE + n_sc) return -ENOENT;
+        uint32_t idx = obj_id - CONN_BASE;
+        EMIT(PROP_CONN_DPMS,               DRM_MODE_DPMS_ON);
+        EMIT(PROP_CONN_EDID,               BLOB_EDID);
+        EMIT(PROP_CONN_CRTC_ID,            CRTC_BASE + idx);
+        EMIT(PROP_CONN_NON_DESKTOP,        0);
+        EMIT(PROP_CONN_LINK_STATUS,        0);
+        EMIT(PROP_CONN_PANEL_ORIENTATION,  0);
+        EMIT(PROP_CONN_CONTENT_TYPE,       0);
+        EMIT(PROP_CONN_MAX_BPC,            8);
+        break;
+    }
+    case DRM_MODE_OBJECT_ENCODER:
+        if (obj_id < ENC_BASE || obj_id >= ENC_BASE + n_sc) return -ENOENT;
+        break;
+    default:
+        return -EINVAL;
+    }
+    *out_count = n;
+    return 0;
+#undef EMIT
+}
+
+static int drm_ioctl_mode_obj_getprops(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t props_ptr;
+        uint64_t prop_values_ptr;
+        uint32_t count_props;
+        uint32_t obj_id;
+        uint32_t obj_type;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+
+    uint32_t ids[24];
+    uint64_t vals[24];
+    uint32_t n = 0;
+    int rc = drm_obj_collect(a.obj_type, a.obj_id, ids, vals,
+                             (uint32_t)(sizeof(ids) / sizeof(ids[0])), &n);
+    if (rc) return rc;
+
+    uint32_t to_copy = a.count_props < n ? a.count_props : n;
+    if (to_copy && a.props_ptr) {
+        if (copy_to_user((void*)a.props_ptr, ids,
+                         to_copy * sizeof(uint32_t)) != 0) return -EFAULT;
+    }
+    if (to_copy && a.prop_values_ptr) {
+        if (copy_to_user((void*)a.prop_values_ptr, vals,
+                         to_copy * sizeof(uint64_t)) != 0) return -EFAULT;
+    }
+    a.count_props = n;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ── SETPROPERTY (legacy connector form) + OBJ_SETPROPERTY ─────────────
+// Mutable props accepted; immutable props rejected with EINVAL so
+// misuse surfaces.
+static int drm_prop_is_immutable(uint32_t prop_id) {
+    const drm_prop_def_t* d = drm_find_prop(prop_id);
+    return d ? d->immutable : 0;
+}
+
+static int drm_ioctl_mode_setproperty(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t value;
+        uint32_t prop_id;
+        uint32_t connector_id;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!drm_find_prop(a.prop_id)) return -ENOENT;
+    if (drm_prop_is_immutable(a.prop_id)) return -EINVAL;
+    // DPMS is the only mutating connector prop wlroots sets — accept all
+    // values; our virtio-gpu is single-state but callers expect success.
+    return 0;
+}
+
+static int drm_ioctl_mode_obj_setproperty(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint64_t value;
+        uint32_t prop_id;
+        uint32_t obj_id;
+        uint32_t obj_type;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (!drm_find_prop(a.prop_id)) return -ENOENT;
+    if (drm_prop_is_immutable(a.prop_id)) return -EINVAL;
+
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    if (a.obj_type == DRM_MODE_OBJECT_CRTC &&
+        a.obj_id >= CRTC_BASE && a.obj_id < CRTC_BASE + n_sc) {
+        uint32_t idx = a.obj_id - CRTC_BASE;
+        if (a.prop_id == PROP_CRTC_ACTIVE)  g_crtc_state[idx].active    = (uint8_t)!!a.value;
+        if (a.prop_id == PROP_CRTC_MODE_ID) g_crtc_state[idx].mode_blob = (uint32_t)a.value;
+    }
+    return 0;
+}
+
+// ── SETPLANE — wlroots uses it for atomic path; legacy still works. ──
+// Minimum useful behaviour: on primary plane with a valid fb, route
+// through SETCRTC-style scanout update.  On cursor plane, defer to
+// drmModeSetCursor semantics (no-op for now — virtio-gpu cursor is
+// done via software blit in the compositor's own frame).
+static int drm_ioctl_mode_setplane(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint32_t plane_id;
+        uint32_t crtc_id;
+        uint32_t fb_id;
+        uint32_t flags;
+        int32_t  crtc_x, crtc_y;
+        uint32_t crtc_w, crtc_h;
+        uint32_t src_x, src_y;
+        uint32_t src_w, src_h;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    if (a.plane_id < PLANE_BASE) return -ENOENT;
+    uint32_t raw = a.plane_id - PLANE_BASE;
+    if (raw >= n_sc * PLANES_PER_CRTC) return -ENOENT;
+    // Accept; real scanout update happens via SETCRTC / PAGE_FLIP.
+    return 0;
+}
+
+// ── GETFB — legacy drmModeGetFB.  Returns fb metadata + GEM handle.
+// wlroots uses this to re-identify a cursor fb (drmModeSetCursor path).
+static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint32_t fb_id;
+        uint32_t width, height, pitch, bpp, depth, handle;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_client_t* c = client_of(self);
+    drm_fb_t* fb = find_fb(c, a.fb_id);
+    if (!fb) return -ENOENT;
+    drm_dumb_t* d = find_dumb(c, fb->handle);
+    if (!d) return -ENOENT;
+    a.width  = fb->width;
+    a.height = fb->height;
+    a.pitch  = fb->pitch;
+    a.bpp    = 32;
+    a.depth  = 24;
+    a.handle = fb->handle;
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ── CLOSEFB — Linux 6.0+ alternative to RMFB.  Same semantics for us.
+static int drm_ioctl_mode_closefb(vfs_file_t* self, uint64_t arg) {
+    struct __attribute__((packed)) { uint32_t fb_id; uint32_t pad; } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    drm_client_t* c = client_of(self);
+    drm_fb_t** pp = &c->fbs;
+    while (*pp) {
+        if ((*pp)->fb_id == a.fb_id) {
+            drm_fb_t* x = *pp;
+            *pp = x->next;
+            drm_fb_free(x);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    return -ENOENT;
+}
+
+// ── Legacy cursor ioctl — accepted (virtio-gpu compositor-side cursor). ──
+static int drm_ioctl_mode_cursor(uint64_t arg) {
+    struct __attribute__((packed)) {
+        uint32_t flags;
+        uint32_t crtc_id;
+        uint32_t x, y;
+        uint32_t width, height;
+        uint32_t handle;
+    } a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
+    uint32_t n_sc = b ? b->scanout_count() : 0;
+    if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
+    return 0;
+}
+
+// ── AUTH_MAGIC / GET_MAGIC (master-token semantics) ─────────────────
+// Linux semantics drive libdrm's drmIsMaster() heuristic: it calls
+// drmAuthMagic(fd, 0) and infers "master" iff that returns NOT -EACCES.
+// Masters (opener of the DRM fd) see -EINVAL for magic=0; non-masters
+// see -EACCES.  MakaOS is single-client, so every open is master —
+// report -EINVAL for magic=0 and success for any non-zero token so
+// that wlroots' allocator takes the DMABUF path, then gracefully
+// skips the magic-auth step once drmGetNodeTypeFromFd returns -1 for
+// our non-Linux major/minor pairs.
+static int drm_ioctl_auth_magic(uint64_t arg) {
+    struct { uint32_t magic; } __attribute__((packed)) a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    if (a.magic == 0) return -EINVAL;
+    return 0;
+}
+
+// GET_MAGIC: invent a per-fd token.  wlroots only round-trips the
+// value through drmAuthMagic, which accepts any non-zero; any unique
+// non-zero constant works.  A real multi-client DRM would derive a
+// per-open nonce from an atomic counter — a one-liner we'll add the
+// moment we have a second DRM consumer.
+static int drm_ioctl_get_magic(uint64_t arg) {
+    struct { uint32_t magic; } __attribute__((packed)) a = { .magic = 0xC0DEFACEu };
+    if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ── Event queue helpers (single-writer/single-reader per fd) ───────
+// Writer: commit path (drm_queue_flip_event).  Reader: userspace read()
+// via drm_read_op.  Serialised by: commits run in the calling task's
+// syscall context, reads in the same fd owner's syscall context.  No
+// SMP writer concurrency possible on one fd.  The counters are
+// atomic-relaxed so a reader waking via wait_queue sees the tail.
+
+static uint32_t drm_evq_used(const drm_client_t* c) {
+    return __atomic_load_n(&c->evq_tail, __ATOMIC_ACQUIRE)
+         - __atomic_load_n(&c->evq_head, __ATOMIC_ACQUIRE);
+}
+static uint32_t drm_evq_free(const drm_client_t* c) {
+    return DRM_EVQ_SIZE - drm_evq_used(c);
+}
+
+static void drm_evq_push(drm_client_t* c, const void* src, uint32_t n) {
+    const uint8_t* s = (const uint8_t*)src;
+    uint32_t t = __atomic_load_n(&c->evq_tail, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < n; i++) c->evq[(t + i) & DRM_EVQ_MASK] = s[i];
+    __atomic_store_n(&c->evq_tail, t + n, __ATOMIC_RELEASE);
+}
+
+static uint32_t drm_evq_pop(drm_client_t* c, uint8_t* dst, uint32_t max) {
+    uint32_t have = drm_evq_used(c);
+    if (have > max) have = max;
+    uint32_t h = __atomic_load_n(&c->evq_head, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < have; i++) dst[i] = c->evq[(h + i) & DRM_EVQ_MASK];
+    __atomic_store_n(&c->evq_head, h + have, __ATOMIC_RELEASE);
+    return have;
+}
+
+// Called by commit paths (PAGE_FLIP, ATOMIC) when the client requested
+// DRM_MODE_PAGE_FLIP_EVENT.  Synthesises a drm_event_vblank with the
+// type = DRM_EVENT_FLIP_COMPLETE so libdrm's drmHandleEvent dispatches
+// to the compositor's page_flip_handler2.  Our pageflip is synchronous
+// (the virtio-gpu set_scanout returns after the resource is staged),
+// so we queue "flip done" immediately after commit.
+static void drm_queue_flip_event(vfs_file_t* f, uint32_t crtc_id, uint64_t user_data) {
+    drm_client_t* c = client_of(f);
+    if (drm_evq_free(c) < sizeof(drm_event_vblank_t)) return;  // drop silently
+
+    extern uint64_t tsc_read_ns(void);
+    uint64_t ns  = tsc_read_ns();
+    uint32_t sec = (uint32_t)(ns / 1000000000ULL);
+    uint32_t us  = (uint32_t)((ns % 1000000000ULL) / 1000ULL);
+
+    drm_event_vblank_t ev = {
+        .base = { .type = DRM_EVENT_FLIP_COMPLETE,
+                  .length = sizeof(drm_event_vblank_t) },
+        .user_data = user_data,
+        .tv_sec    = sec,
+        .tv_usec   = us,
+        .sequence  = 0,
+        .crtc_id   = crtc_id,
+    };
+    drm_evq_push(c, &ev, sizeof(ev));
+    if (f->waitq) wait_queue_wake_all(f->waitq);
+}
+
+// Returns queued event bytes into the user's buffer.  Non-blocking:
+// empty queue returns 0 (libdrm treats as "no events to process").
+// Partial reads are OK — libdrm reads in a loop.
+static int64_t drm_read_op(vfs_file_t* self, void* buf, uint64_t len) {
+    drm_client_t* c = client_of(self);
+    uint32_t want = (len > DRM_EVQ_SIZE) ? DRM_EVQ_SIZE : (uint32_t)len;
+    uint8_t  kbuf[DRM_EVQ_SIZE];
+    uint32_t got = drm_evq_pop(c, kbuf, want);
+    if (got == 0) return 0;
+    extern int copy_to_user(void* dst, const void* src, uint64_t n);
+    if (copy_to_user(buf, kbuf, got) != 0) return -EFAULT;
+    return (int64_t)got;
+}
+
+static int drm_poll_op(vfs_file_t* self, int events) {
+    drm_client_t* c = client_of(self);
+    if (events & 0x1 /*POLLIN*/)  return drm_evq_used(c) > 0;
+    if (events & 0x4 /*POLLOUT*/) return 0;  // not writable
+    if (events & 0x10 /*POLLHUP*/) return 0;
+    return 0;
+}
+
 // ── ioctl dispatch ──────────────────────────────────────────────────
 static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     switch (req) {
@@ -990,6 +2170,28 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_CREATE_DUMB:  return drm_ioctl_create_dumb(self, arg);
     case DRM_IOCTL_MODE_MAP_DUMB:     return drm_ioctl_map_dumb(self, arg);
     case DRM_IOCTL_MODE_DESTROY_DUMB: return drm_ioctl_destroy_dumb(self, arg);
+    case DRM_IOCTL_SET_CLIENT_CAP:    return drm_ioctl_set_client_cap(arg);
+    case DRM_IOCTL_GEM_CLOSE:         return drm_ioctl_gem_close(self, arg);
+    case DRM_IOCTL_PRIME_HANDLE_TO_FD:return drm_ioctl_prime_handle_to_fd(self, arg);
+    case DRM_IOCTL_PRIME_FD_TO_HANDLE:return drm_ioctl_prime_fd_to_handle(self, arg);
+    case DRM_IOCTL_MODE_GETPLANERESOURCES: return drm_ioctl_mode_getplaneres(arg);
+    case DRM_IOCTL_MODE_GETPLANE:          return drm_ioctl_mode_getplane(arg);
+    case DRM_IOCTL_MODE_SETPLANE:          return drm_ioctl_mode_setplane(arg);
+    case DRM_IOCTL_MODE_OBJ_GETPROPERTIES: return drm_ioctl_mode_obj_getprops(arg);
+    case DRM_IOCTL_MODE_GETPROPERTY:       return drm_ioctl_mode_getproperty(arg);
+    case DRM_IOCTL_MODE_SETPROPERTY:       return drm_ioctl_mode_setproperty(arg);
+    case DRM_IOCTL_MODE_OBJ_SETPROPERTY:   return drm_ioctl_mode_obj_setproperty(arg);
+    case DRM_IOCTL_MODE_GETPROPBLOB:       return drm_ioctl_mode_getpropblob(arg);
+    case DRM_IOCTL_MODE_GETFB:             return drm_ioctl_mode_getfb(self, arg);
+    case DRM_IOCTL_MODE_CLOSEFB:           return drm_ioctl_mode_closefb(self, arg);
+    case DRM_IOCTL_MODE_CURSOR:            return drm_ioctl_mode_cursor(arg);
+    case DRM_IOCTL_MODE_CURSOR2:           return drm_ioctl_mode_cursor(arg);
+    case DRM_IOCTL_AUTH_MAGIC:             return drm_ioctl_auth_magic(arg);
+    case DRM_IOCTL_GET_MAGIC:              return drm_ioctl_get_magic(arg);
+    case DRM_IOCTL_MODE_CREATE_LEASE:      return -EOPNOTSUPP;
+    case DRM_IOCTL_MODE_LIST_LESSEES:      return -EOPNOTSUPP;
+    case DRM_IOCTL_MODE_GET_LEASE:         return -EOPNOTSUPP;
+    case DRM_IOCTL_MODE_REVOKE_LEASE:      return -EOPNOTSUPP;
     case DRM_IOCTL_SET_MASTER:        return 0;  // single-client for now
     case DRM_IOCTL_DROP_MASTER:       return 0;
     default:
@@ -1000,18 +2202,36 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     }
 }
 
+// Track open DRM clients so the scanout can be restored to the
+// text-console banner when the last one closes.  Atomic because
+// open/close can run from different CPUs; no lock needed — any
+// open/close pair sees a stable snapshot, and the restore only
+// fires when the counter hits 0.
+static uint32_t s_drm_open_count;
+
 static void drm_close(vfs_file_t* self) {
     // Tear down every dumb buffer + fb this client still holds.
     drm_client_t* c = client_of(self);
     if (c) {
         drm_fb_t* fb = c->fbs;
-        while (fb) { drm_fb_t* n = fb->next; kfree(fb); fb = n; }
+        while (fb) { drm_fb_t* n = fb->next; drm_fb_free(fb); fb = n; }
         drm_dumb_t* d = c->dumbs;
         while (d)  { drm_dumb_t* n = d->next; dumb_free(d, g_current); d = n; }
         kfree(c);
         self->ctx = NULL;
     }
     kfree(self);
+
+    // Last open DRM fd gone — hand the display back to the text
+    // console.  Otherwise the hardware scanout keeps showing
+    // whatever the compositor last flipped (usually its own freed
+    // framebuffer), so `bash` output after the compositor exits is
+    // invisible even though the TTY keeps receiving keypresses.
+    uint32_t now = __atomic_sub_fetch(&s_drm_open_count, 1, __ATOMIC_ACQ_REL);
+    if (now == 0) {
+        extern int virtio_gpu_restore_default_scanout(void);
+        virtio_gpu_restore_default_scanout();
+    }
 }
 
 vfs_file_t* vfs_drm_open(void) {
@@ -1020,15 +2240,29 @@ vfs_file_t* vfs_drm_open(void) {
     __builtin_memset(c, 0, sizeof(*c));
     c->next_dumb_handle = 1;
     c->next_fb_id       = 1;
+    __atomic_add_fetch(&s_drm_open_count, 1, __ATOMIC_ACQ_REL);
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
     if (!f) { kfree(c); return NULL; }
     __builtin_memset(f, 0, sizeof(*f));
+    // Initialize the poll waitq so epoll_ctl(ADD) on a DRM fd can
+    // register a watcher without dereferencing NULL.  vfs_file_init
+    // sets waitq = &_waitq + wait_queue_init; call it explicitly since
+    // we aren't going through the generic vfs_file_alloc path.
+    f->waitq = &f->_waitq;
+    wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
     f->ioctl    = drm_ioctl;
+    f->read     = drm_read_op;
+    f->poll     = drm_poll_op;
     f->close    = drm_close;
     f->ctx      = c;
     f->refcount = 1;
     f->rights   = 0xFFFFFFFFu;
+    // Linux DRM major = 226, minor = 0 for card0.  Matches libudev's
+    // advertised devnum so wlroots' fstat-then-udev cross-check
+    // resolves.
+    f->rdev     = (226u << 8) | 0u;
     return f;
 }
 

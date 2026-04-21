@@ -52,6 +52,17 @@ static inline uint32_t fb_rows(void) { return g_fb.height / 16; }
 
 /* ── API ────────────────────────────────────────────────────────────────────── */
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch);
+
+/* Framebuffer-backend flush hook.  Set by backends whose scanout
+ * buffer is not raw host-visible MMIO — virtio-gpu's fbcon resource
+ * needs a TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on every visible
+ * change.  Left NULL for the legacy UEFI GOP path (writes to
+ * g_fb.base_virt are already live on the host).  Called by fb.c
+ * from: end of fb_term_write, '\n' in fb_term_putc, fb_term_scroll,
+ * fb_clear.  The panic path (fb_panic_str) does NOT call it —
+ * dying kernels write pixels directly. */
+void fb_set_flush_hook(void (*fn)(void));
+
 void fb_clear(void);
 void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg);
 void fb_term_putc(char c);

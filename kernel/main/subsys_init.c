@@ -97,7 +97,49 @@ DEFINE_INITCALL(net, INITCALL_LEVEL_SUBSYS, .fn = _net_init);
 // After init, register as the DRM core's backend so /dev/dri/card0
 // ioctls route here.
 static int _virtio_gpu_init(void) {
-    if (virtio_gpu_init()) virtio_gpu_register_backend();
+    if (!virtio_gpu_init()) return 0;
+    virtio_gpu_register_backend();
+
+    // Repoint the text console onto a virtio-gpu resource so the
+    // kernel owns its scanout buffer rather than relying on UEFI GOP
+    // memory being mirrored by QEMU's virtio-vga VGA-compat BAR (it
+    // isn't — SET_SCANOUT(res_id=0) leaves the display blanked).
+    // On success: copy the current GOP contents into the new backing
+    // so boot-time prints don't disappear, then hand the new buffer
+    // to fb_init and install the flush hook.  On failure: the
+    // legacy GOP mapping keeps being used — display goes dark when
+    // a DRM client exits, but boot still proceeds.
+    phys_addr_t phys = 0;
+    uint8_t*    virt = NULL;
+    uint32_t    w = 0, h = 0, pitch = 0;
+    if (virtio_gpu_fbcon_init(&phys, &virt, &w, &h, &pitch)) {
+        // Best-effort GOP → virtio-gpu blit.  Row-by-row because the
+        // two backings have potentially different pitches (GOP pitch
+        // ≠ w*4 in general, virtio-gpu backing is packed).
+        uint8_t* src = (uint8_t*)g_fb.base_virt;
+        if (src && g_fb.width && g_fb.height && g_fb.pitch) {
+            uint32_t rows_copy = g_fb.height < h ? g_fb.height : h;
+            uint32_t bytes_per_row = (g_fb.width < w ? g_fb.width : w) * 4u;
+            for (uint32_t y = 0; y < rows_copy; y++) {
+                __builtin_memcpy(virt + (uint64_t)y * pitch,
+                                 src  + (uint64_t)y * g_fb.pitch,
+                                 bytes_per_row);
+            }
+        }
+        // Preserve the text cursor across the repoint so the next
+        // kprintf continues below the carried-over boot text instead
+        // of overwriting it from the top-left.
+        uint32_t saved_col = g_fb_col, saved_row = g_fb_row;
+        uint32_t saved_fg  = g_fb_fg,  saved_bg  = g_fb_bg;
+        fb_init((uint64_t)phys, w, h, pitch);
+        g_fb_col = saved_col;
+        g_fb_row = saved_row;
+        g_fb_fg  = saved_fg;
+        g_fb_bg  = saved_bg;
+        fb_set_flush_hook(virtio_gpu_fbcon_flush);
+        // Push the carried-over boot text to the host immediately.
+        virtio_gpu_fbcon_flush();
+    }
     return 0;
 }
 

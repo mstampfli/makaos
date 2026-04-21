@@ -25,6 +25,21 @@ uint32_t g_fb_bg  = 0x00000000; /* black */
 // holder get preempted by an IRQ that then tries to retake the same lock.
 static spinlock_t g_fb_lock = SPINLOCK_INIT;
 
+// Backend flush hook — see fb.h.  Raw pointer (not atomic) because
+// it's set exactly once at boot in the virtio-gpu init path before
+// any text-console writes happen via the new backing; readers that
+// miss the store would simply skip the flush for one call, which is
+// harmless (next write will flush everything anyway).
+static void (*g_fb_flush_hook)(void) = NULL;
+
+void fb_set_flush_hook(void (*fn)(void)) { g_fb_flush_hook = fn; }
+
+// Inline wrapper so callers in the hot path don't pay a function
+// call when the hook isn't installed (legacy GOP backend).
+static inline void fb_flush(void) {
+    if (g_fb_flush_hook) g_fb_flush_hook();
+}
+
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
     g_fb.base_virt = fb_phys + HHDM_OFFSET;
     g_fb.width     = w;
@@ -61,6 +76,7 @@ void fb_clear(void) {
     }
     g_fb_col = 0;
     g_fb_row = 0;
+    fb_flush();
 }
 
 void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
@@ -112,6 +128,10 @@ void fb_term_scroll(void) {
         }
     }
     g_fb_row = rows - 1;
+    // Scrolling the entire screen is always a user-visible change —
+    // flush unconditionally so mid-kprintf wraps (lines that overflow
+    // fb_cols() before any '\n') don't stall behind the next newline.
+    fb_flush();
 }
 
 // Internal: emit a single character assuming the caller already holds
@@ -135,6 +155,10 @@ static inline void fb_term_putc_locked(char c) {
         g_fb_col = 0;
         g_fb_row++;
         if (g_fb_row >= rows) fb_term_scroll();
+        // Per-line flush so kprintf output (one kprintf = one line +
+        // '\n') appears as soon as it's written, even when the caller
+        // is fb_term_putc-per-char rather than the batched writer.
+        fb_flush();
         return;
     }
     if (c == '\b' || c == 127) {
@@ -171,6 +195,13 @@ void fb_term_putc(char c) {
     preempt_disable();
     spin_lock(&g_fb_lock);
     fb_term_putc_locked(c);
+    // Per-char flush for the non-batched path: TTY echo calls this
+    // once per keystroke, so without flushing here each typed
+    // character stays invisible on the virtio-gpu backing until
+    // Enter (which finally writes '\n' and flushes).  Batched
+    // callers go through fb_term_write which flushes once at the
+    // end of the whole buffer.
+    fb_flush();
     spin_unlock(&g_fb_lock);
     preempt_enable();
 }
@@ -185,6 +216,12 @@ void fb_term_write(const char* buf, uint64_t len) {
     spin_lock(&g_fb_lock);
     for (uint64_t i = 0; i < len; i++)
         fb_term_putc_locked(buf[i]);
+    // Batch-boundary flush — makes bash's no-newline output (e.g. the
+    // "$ " prompt) visible without waiting for the user to hit Enter.
+    // Intra-line '\n's already flushed inside fb_term_putc_locked,
+    // but it's cheap to issue one extra trailing flush for the
+    // non-'\n' tail rather than tracking a dirty flag.
+    fb_flush();
     spin_unlock(&g_fb_lock);
     preempt_enable();
 }

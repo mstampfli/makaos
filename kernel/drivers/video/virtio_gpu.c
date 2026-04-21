@@ -16,6 +16,7 @@
 #include "pmm.h"
 #include "kheap.h"
 #include "kprintf.h"
+#include "smp.h"
 #include "common.h"
 
 // ── PCI IDs ─────────────────────────────────────────────────────────
@@ -267,12 +268,23 @@ static uint8_t*    s_cmd_virt = NULL;   // request at +0, response at +2048
 #define CMD_REQ_OFF   0u
 #define CMD_RESP_OFF  2048u
 
+// ── Control-queue serialisation ──────────────────────────────────────
+// The bounce buffers + virtqueue state above are global, so two
+// callers (e.g. a DRM ioctl on CPU 0 while fbcon flushes on CPU 1)
+// would corrupt each other's descriptors.  A single IRQ-safe spinlock
+// around the whole submit+poll window is sufficient — virtqueue
+// commands complete in microseconds in QEMU so the contention window
+// is small.  Multiple outstanding commands are not worth the
+// complexity until we have an interrupt-driven completion path.
+static spinlock_t s_ctrl_lock = SPINLOCK_INIT;
+
 static int vgpu_send_ctrl(const void* req, uint32_t req_len,
                            void* resp, uint32_t resp_len) {
     if (!s_cmd_virt) return 0;
     if (req_len  > CMD_RESP_OFF)       return 0;
     if (resp_len > (4096 - CMD_RESP_OFF)) return 0;
 
+    spin_lock(&s_ctrl_lock);
     __builtin_memcpy(s_cmd_virt + CMD_REQ_OFF, req, req_len);
     __builtin_memset(s_cmd_virt + CMD_RESP_OFF, 0, resp_len);
 
@@ -280,9 +292,9 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
     // (device-write).  Allocated from free list.
     virtq_t* vq = &s_ctrl_vq;
     uint16_t d0 = vq->free_head;
-    if (d0 == 0xFFFFu) return 0;
+    if (d0 == 0xFFFFu) { spin_unlock(&s_ctrl_lock); return 0; }
     uint16_t d1 = vq->desc[d0].next;
-    if (d1 == 0xFFFFu) return 0;
+    if (d1 == 0xFFFFu) { spin_unlock(&s_ctrl_lock); return 0; }
     vq->free_head = vq->desc[d1].next;
 
     vq->desc[d0].addr  = (uint64_t)(s_cmd_phys + CMD_REQ_OFF);
@@ -320,10 +332,12 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
             vq->desc[d1].next = vq->free_head;
             vq->desc[d0].next = d1;
             vq->free_head = d0;
+            spin_unlock(&s_ctrl_lock);
             return 1;
         }
     }
     // Timeout → leak descriptors (safer than racing the device).
+    spin_unlock(&s_ctrl_lock);
     return 0;
 }
 
@@ -638,6 +652,7 @@ static int vgpu_setup_scanout_buffer(uint32_t w, uint32_t h) {
         pmm_buddy_free(phys, order); return 0;
     }
 
+    // File-scope; used by virtio_gpu_restore_default_scanout below.
     s_fb_res_id = res_id;
     s_fb_w      = w;
     s_fb_h      = h;
@@ -686,6 +701,76 @@ int virtio_gpu_present_test(void) {
 
 // ── drm_backend_ops adapters ─────────────────────────────────────────
 // Thin wrappers that match the backend vtable signatures.  The DRM
+// Restore the default scanout.  Two paths:
+//   (1) If a kernel-owned banner resource was created via
+//       vgpu_setup_scanout_buffer (present_test / early-boot fbcon),
+//       point scanout at it + transfer+flush so the current backing
+//       contents show up.
+//   (2) Otherwise, disable scanout 0 with res_id=0 — per virtio-gpu
+//       spec this "removes the scanout configuration" and on
+//       virtio-vga reverts the host display to the VGA-compat
+//       framebuffer, which mirrors the UEFI GOP memory our text
+//       console (fb.c) writes into.  Without this, after a
+//       compositor exits the hardware keeps scanning out the
+//       compositor's (freed) framebuffer and the bash prompt is
+//       invisible even though the TTY keeps receiving keypresses.
+int virtio_gpu_restore_default_scanout(void) {
+    // QEMU's virtio-vga does NOT fall back to the VGA-compat BAR when
+    // SET_SCANOUT is called with resource_id=0 — it leaves the display
+    // blanked ("display output not active").  So the fbcon resource
+    // MUST already exist at this point: virtio_gpu_fbcon_init runs at
+    // subsys boot and repoints g_fb.base_virt at its backing.
+    if (!s_fb_res_id || !s_fb_w || !s_fb_h) return 0;
+    if (!virtio_gpu_set_scanout(0, s_fb_res_id, s_fb_w, s_fb_h)) return 0;
+    virtio_gpu_transfer_to_host_2d(s_fb_res_id, s_fb_w, s_fb_h);
+    virtio_gpu_resource_flush(s_fb_res_id, s_fb_w, s_fb_h);
+    return 1;
+}
+
+// ── fbcon-as-DRM-client wiring ───────────────────────────────────────
+// Boot path: virtio_gpu_fbcon_init creates a 2D resource sized to
+// scanout 0's preferred mode, attaches a physically-contiguous
+// backing, sets scanout, and returns the backing phys+virt so main.c
+// can re-call fb_init against it.  Text-console writes land in our
+// backing; virtio_gpu_fbcon_flush pushes the backing to the host
+// resource and flushes the scanout.
+//
+// Correctness notes:
+//  * Reuses vgpu_setup_scanout_buffer's existing logic (which sets
+//    s_fb_res_id / s_fb_phys / s_fb_virt / s_fb_w / s_fb_h).  The
+//    DRM destroy path already calls virtio_gpu_restore_default_scanout
+//    which points scanout back at s_fb_res_id — so once fbcon_init
+//    runs, post-dwl-exit display restoration is automatic.
+//  * When a DRM client (dwl) sets its own scanout, the fbcon backing
+//    keeps being written by the TTY but isn't being scanned out, so
+//    flushes are wasted.  We still issue them (cheap — µs range) to
+//    keep the code trivially correct; a dirty-rect batched flush is
+//    an optimisation for later once the text console is on a timer.
+int virtio_gpu_fbcon_init(phys_addr_t* out_phys,
+                           uint8_t**   out_virt,
+                           uint32_t*   out_w,
+                           uint32_t*   out_h,
+                           uint32_t*   out_pitch) {
+    if (!s_ok || !s_num_scanouts) return 0;
+    uint32_t w = s_scanouts[0].w;
+    uint32_t h = s_scanouts[0].h;
+    if (!w || !h) return 0;
+    if (!vgpu_setup_scanout_buffer(w, h)) return 0;
+
+    if (out_phys)  *out_phys  = s_fb_phys;
+    if (out_virt)  *out_virt  = s_fb_virt;
+    if (out_w)     *out_w     = w;
+    if (out_h)     *out_h     = h;
+    if (out_pitch) *out_pitch = w * 4u;
+    return 1;
+}
+
+void virtio_gpu_fbcon_flush(void) {
+    if (!s_fb_res_id || !s_fb_w || !s_fb_h) return;
+    virtio_gpu_transfer_to_host_2d(s_fb_res_id, s_fb_w, s_fb_h);
+    virtio_gpu_resource_flush(s_fb_res_id, s_fb_w, s_fb_h);
+}
+
 // core calls these; legacy virtio_gpu_* functions are preserved as
 // the adapter targets and for the present_test.
 
