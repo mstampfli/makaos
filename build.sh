@@ -708,6 +708,15 @@ if [ -f "$BUILD_DIR/user_terminal.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_terminal.elf" bin/makaterm
     echo "[+] makaterm ELF installed at bin/makaterm (root:root 0755)"
 fi
+# Wayland compositors — run from the shell prompt after login.
+if [ -f "$SYSROOT/usr/bin/dwl" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/dwl" bin/dwl
+    echo "[+] dwl ELF installed at bin/dwl (root:root 0755)"
+fi
+if [ -f "$SYSROOT/usr/bin/tinywl" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/tinywl" bin/tinywl
+    echo "[+] tinywl ELF installed at bin/tinywl (root:root 0755)"
+fi
 
 WAD_SEARCH=(
     "$DOOM_DIR/doom1.wad"
