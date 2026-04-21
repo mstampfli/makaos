@@ -937,6 +937,25 @@ int munmap(void* addr, size_t len) {
         syscall2(SYS_MUNMAP, (uint64_t)addr, (uint64_t)len));
 }
 
+// msync — our kernel has no cached file-backed mmap path, so the
+// fsync semantics POSIX requires are already satisfied implicitly.
+// Succeed silently so wayland-shm's "flush shared buffer" path works.
+// TODO(scalability-debt-ledger-#5): SYS_MSYNC → page-cache writeback
+// once the kernel gains a page cache with dirty tracking.
+int msync(void* addr, size_t len, int flags) {
+    (void)addr; (void)len; (void)flags;
+    return 0;
+}
+
+// madvise — no backing implementation yet; return 0 like Linux with
+// MADV_NORMAL.  Consumers treat failure as advisory only.
+// TODO(scalability-debt-ledger-#5): SYS_MADVISE → vma-hint table +
+// reclaimer integration.
+int madvise(void* addr, size_t len, int advice) {
+    (void)addr; (void)len; (void)advice;
+    return 0;
+}
+
 // ── POSIX shared memory ─────────────────────────────────────────────────
 
 int shm_open(const char* name, int oflag, int mode) {

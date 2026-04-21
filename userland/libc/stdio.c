@@ -373,6 +373,12 @@ int vprintf(const char* fmt, va_list ap) {
     return vfprintf(stdout, fmt, ap);
 }
 
+// setbuf — thin wrapper over setvbuf.  POSIX says buf==NULL → _IONBF,
+// otherwise → fully-buffered with the caller's buffer.
+void setbuf(FILE* f, char* buf) {
+    setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
 int setvbuf(FILE* f, char* buf, int mode, size_t size) {
     (void)buf; (void)size;
     if (!f) return -1;
@@ -382,5 +388,85 @@ int setvbuf(FILE* f, char* buf, int mode, size_t size) {
     else if (mode == _IOLBF) f->flags |= _FILE_LNBUF;
     // _IOFBF (fully buffered) = default, no flag needed.
     return 0;
+}
+
+// ── perror — print a message followed by strerror(errno) to stderr ────────
+// fontconfig uses it on cache-open failures.  Keep compact — we don't
+// ship a strerror table yet, so just format "prefix: errno=N\n".
+void perror(const char* prefix) {
+    char buf[64];
+    int n = 0;
+    if (prefix) {
+        while (prefix[n] && n < 40) { buf[n] = prefix[n]; n++; }
+        buf[n++] = ':'; buf[n++] = ' ';
+    }
+    // Very small int → decimal for errno value.  Handles 0..999.
+    int e = errno;
+    if (e < 0) { buf[n++] = '-'; e = -e; }
+    char digs[12]; int d = 0;
+    do { digs[d++] = (char)('0' + (e % 10)); e /= 10; } while (e && d < 11);
+    while (d) buf[n++] = digs[--d];
+    buf[n++] = '\n';
+    write(2, buf, (size_t)n);
+}
+
+// ── fileno ────────────────────────────────────────────────────────────────
+// Extract underlying fd from FILE*.  libxkbcommon uses it for
+// mmap-the-file-by-fd; libdrm uses it for select() on device fds.
+int fileno(FILE* f) {
+    if (!f) { errno = EBADF; return -1; }
+    return f->fd;
+}
+
+// ── getline ───────────────────────────────────────────────────────────────
+// POSIX.  Used by libdrm for uevent parsing.  Grows *lineptr as needed.
+ssize_t getline(char** lineptr, size_t* n, FILE* f) {
+    if (!lineptr || !n || !f) { errno = EINVAL; return -1; }
+    if (!*lineptr || *n < 2) { *n = 128; *lineptr = (char*)malloc(128); }
+    if (!*lineptr) { errno = ENOMEM; return -1; }
+    ssize_t used = 0;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF) { if (used == 0) return -1; break; }
+        if (used + 2 > (ssize_t)*n) {
+            *n *= 2;
+            char* nb = (char*)realloc(*lineptr, *n);
+            if (!nb) { errno = ENOMEM; return -1; }
+            *lineptr = nb;
+        }
+        (*lineptr)[used++] = (char)c;
+        if (c == '\n') break;
+    }
+    (*lineptr)[used] = '\0';
+    return used;
+}
+
+// ── fscanf stub ───────────────────────────────────────────────────────────
+// Matches 0 items.  libdrm uses it for optional /sys PCI-ID probes;
+// callers already tolerate a 0 match count.
+int fscanf(FILE* f, const char* fmt, ...) {
+    (void)f; (void)fmt;
+    return 0;
+}
+
+// ── remove ────────────────────────────────────────────────────────────────
+// POSIX: unlink for files, rmdir for directories.  We don't have rmdir
+// yet — unlink handles both in practice on our FS.
+extern int unlink(const char*);
+int remove(const char* path) { return unlink(path); }
+
+// ── open_memstream / fmemopen stubs ───────────────────────────────────────
+// No in-memory FILE backend yet.  libdrm uses open_memstream for debug
+// buffering, harfbuzz/fontconfig for in-memory font loads — they fall
+// back cleanly to malloc+write when NULL is returned.
+FILE* open_memstream(char** bufp, size_t* sizep) {
+    (void)bufp; (void)sizep;
+    errno = ENOSYS;
+    return (FILE*)0;
+}
+FILE* fmemopen(void* buf, size_t size, const char* mode) {
+    (void)buf; (void)size; (void)mode;
+    errno = ENOSYS;
+    return (FILE*)0;
 }
 

@@ -115,7 +115,10 @@ echo "[+] Building user binaries"
 # The only thing the repo owns inside is headers under userland/libc/include
 # and the libc .c sources — everything else is rebuilt on every run.
 SYSROOT="$BUILD_DIR/sysroot"
-rm -rf "$SYSROOT"
+# Do NOT wipe the sysroot here — ports install their own .a + headers
+# into it (fontconfig, wayland, freetype, …) and a wipe would destroy
+# them on every libc rebuild.  `cp -rT` below overwrites libc headers
+# in place, which is all we need for a libc-only refresh.
 mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib"
 cp -rT "$USERLAND_DIR/libc/include" "$SYSROOT/usr/include"
 
@@ -136,34 +139,53 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
-# syscalls.c: extern-linkage wrappers around the raw syscall* ops for
-# sysroot consumers that can't see libc.h's static-inline copies.
-"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
-  -c "$USERLAND_DIR/libc/syscalls.c" -o "$BUILD_DIR/user_syscalls.o"
+# POSIX-header-aligned syscall wrapper files.  One file per header —
+# each provides link-resolvable extern symbols for sysroot consumers
+# (ports linked via -lc).  libc.h keeps its static-inline copies for
+# in-tree apps that include it directly.
+for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
+           sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
+           time arpa_inet string ctype makaos_input poll signal; do
+  "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+    -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
+done
 
 # pthread: POSIX threading on top of sys_thread + sched_yield.  Spins
 # on contention until we add a kernel futex.
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/pthread.c" -o "$BUILD_DIR/user_pthread.o"
 
-# dl_locale: real extern symbols for <dlfcn.h>/<locale.h>/<langinfo.h>
-# so sysroot-linked C++ ports (harfbuzz, ICU, fontconfig, curl) resolve.
+# Split POSIX-header files for sysroot consumers.  One-file-per-header
+# clean layout: dlfcn.c, locale.c, langinfo.c, assert.c, stdlib.c.
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
-  -c "$USERLAND_DIR/libc/dl_locale.c" -o "$BUILD_DIR/user_dl_locale.o"
-
-# libm_extern: real extern symbols for the basic math functions that
-# libc/math.h has only as static inline.  Pixman/freetype/harfbuzz/etc.
-# need link-resolvable sqrt, sqrtf, fabs, floor, fmod and friends.
+  -c "$USERLAND_DIR/libc/dlfcn.c"    -o "$BUILD_DIR/user_dlfcn.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
-  -c "$USERLAND_DIR/libc/libm_extern.c" -o "$BUILD_DIR/user_libm_extern.o"
+  -c "$USERLAND_DIR/libc/locale.c"   -o "$BUILD_DIR/user_locale.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/langinfo.c" -o "$BUILD_DIR/user_langinfo.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/assert.c"   -o "$BUILD_DIR/user_assert.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/stdlib.c"   -o "$BUILD_DIR/user_stdlib.o"
 
 # libc archive — anything linking sysroot-style pulls this in as -lc.
 ar rcs "$SYSROOT/usr/lib/libc.a" \
-   "$BUILD_DIR/user_libc.o" "$BUILD_DIR/user_stdio.o" \
-   "$BUILD_DIR/user_dns.o" "$BUILD_DIR/user_math.o" \
-   "$BUILD_DIR/user_setjmp.o" "$BUILD_DIR/user_syscalls.o" \
-   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o" \
-   "$BUILD_DIR/user_dl_locale.o" "$BUILD_DIR/user_libm_extern.o"
+   "$BUILD_DIR/user_libc.o"    "$BUILD_DIR/user_stdio.o" \
+   "$BUILD_DIR/user_dns.o"     "$BUILD_DIR/user_math.o" \
+   "$BUILD_DIR/user_setjmp.o"  "$BUILD_DIR/user_pthread.o" \
+   "$BUILD_DIR/user_pthread_tramp.o" \
+   "$BUILD_DIR/user_dlfcn.o"    "$BUILD_DIR/user_locale.o" \
+   "$BUILD_DIR/user_langinfo.o" "$BUILD_DIR/user_assert.o" \
+   "$BUILD_DIR/user_stdlib.o"   "$BUILD_DIR/user_string.o" \
+   "$BUILD_DIR/user_unistd.o"   "$BUILD_DIR/user_fcntl.o" \
+   "$BUILD_DIR/user_sys_stat.o" "$BUILD_DIR/user_sys_socket.o" \
+   "$BUILD_DIR/user_sys_eventfd.o"  "$BUILD_DIR/user_sys_timerfd.o" \
+   "$BUILD_DIR/user_sys_signalfd.o" "$BUILD_DIR/user_sys_ioctl.o" \
+   "$BUILD_DIR/user_sys_time.o" "$BUILD_DIR/user_sys_file.o" \
+   "$BUILD_DIR/user_sys_epoll.o" \
+   "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
+   "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
+   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still
@@ -204,6 +226,31 @@ USER_RT=(
     "$BUILD_DIR/user_dns.o"
     "$BUILD_DIR/user_math.o"
     "$BUILD_DIR/user_setjmp.o"
+    # POSIX-header-split extern wrappers — needed for in-tree apps now
+    # that libc.h declares these as prototypes rather than inlining them.
+    "$BUILD_DIR/user_unistd.o"
+    "$BUILD_DIR/user_fcntl.o"
+    "$BUILD_DIR/user_sys_stat.o"
+    "$BUILD_DIR/user_sys_socket.o"
+    "$BUILD_DIR/user_sys_eventfd.o"
+    "$BUILD_DIR/user_sys_timerfd.o"
+    "$BUILD_DIR/user_sys_signalfd.o"
+    "$BUILD_DIR/user_sys_ioctl.o"
+    "$BUILD_DIR/user_sys_time.o"
+    "$BUILD_DIR/user_sys_file.o"
+    "$BUILD_DIR/user_sys_epoll.o"
+    "$BUILD_DIR/user_time.o"
+    "$BUILD_DIR/user_ctype.o"
+    "$BUILD_DIR/user_makaos_input.o"
+    "$BUILD_DIR/user_poll.o"
+    "$BUILD_DIR/user_signal.o"
+    "$BUILD_DIR/user_arpa_inet.o"
+    "$BUILD_DIR/user_string.o"
+    "$BUILD_DIR/user_stdlib.o"
+    "$BUILD_DIR/user_dlfcn.o"
+    "$BUILD_DIR/user_locale.o"
+    "$BUILD_DIR/user_langinfo.o"
+    "$BUILD_DIR/user_assert.o"
 )
 
 USER_LINK="$USERLAND_DIR/link.ld"

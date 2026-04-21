@@ -59,14 +59,23 @@
 
 typedef unsigned long sigset_t;
 
+// Forward-declared so struct sigaction can reference it.
+typedef struct siginfo siginfo_t;
+
+// POSIX sigaction: sa_handler and sa_sigaction alias — callers pick
+// based on SA_SIGINFO in sa_flags.  Anonymous union is the canonical
+// layout shared with glibc/musl.
 struct sigaction {
-    void     (*sa_handler)(int);
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t*, void*);
+    };
     sigset_t   sa_mask;
     int        sa_flags;
     void     (*sa_restorer)(void);
 };
 
-typedef struct siginfo {
+struct siginfo {
     int    si_signo;
     int    si_errno;
     int    si_code;
@@ -75,7 +84,7 @@ typedef struct siginfo {
     int    si_status;
     void*  si_addr;
     int    si_value;
-} siginfo_t;
+};
 
 int kill(pid_t pid, int sig);
 int raise(int sig);

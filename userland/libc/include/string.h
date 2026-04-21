@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_STRING_H
 #define _MAKAOS_STRING_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 // Memory block
@@ -34,5 +38,9 @@ char*  strtok_r(char* s, const char* delim, char** saveptr);
 char*  strdup(const char* s);
 char*  strndup(const char* s, size_t n);
 char*  strerror(int errnum);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

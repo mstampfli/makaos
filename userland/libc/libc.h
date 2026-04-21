@@ -287,14 +287,11 @@ static inline long __syscall_ret(uint64_t r) {
 
 // ── I/O ──────────────────────────────────────────────────────────────────
 
-static inline ssize_t write(int fd, const void* buf, size_t len) {
-    return (ssize_t)__syscall_ret(syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, len));
-}
+ssize_t write(int fd, const void* buf, size_t len);
+ssize_t read(int fd, void* buf, size_t len);
 
-static inline ssize_t read(int fd, void* buf, size_t len) {
-    return (ssize_t)__syscall_ret(syscall3(SYS_READ, (uint64_t)fd, (uint64_t)buf, len));
-}
-
+// read_nonblock is MakaOS-specific (SYS_READ_NONBLOCK flag) — keep as
+// static inline so the hint doesn't leak into the extern libc.
 static inline ssize_t read_nonblock(int fd, void* buf, size_t len) {
     return (ssize_t)__syscall_ret(syscall4(SYS_READ, (uint64_t)fd, (uint64_t)buf, len, SYS_READ_NONBLOCK));
 }
@@ -308,13 +305,10 @@ static inline ssize_t read_nonblock(int fd, void* buf, size_t len) {
 #define O_TRUNC   0x200
 #define O_APPEND  0x400
 
-static inline int open(const char* path, int flags, ...) {
-    return (int)__syscall_ret(syscall3(SYS_OPEN, (uint64_t)path, (uint64_t)flags, 0));
-}
-
-static inline int close(int fd) {
-    return (int)__syscall_ret(syscall1(SYS_CLOSE, (uint64_t)fd));
-}
+// open is variadic (mode is passed when O_CREAT is set) — impl lives
+// in fcntl.c and correctly marshals the va_arg mode.
+int open(const char* path, int flags, ...);
+int close(int fd);
 
 // ── Process ───────────────────────────────────────────────────────────────
 
@@ -322,15 +316,9 @@ static inline int close(int fd) {
 // We can't forward-declare fflush(FILE*) here because FILE isn't defined yet.
 void _flush_all(void);
 
-__attribute__((noreturn)) static inline void exit(int code) {
-    _flush_all();
-    syscall1(SYS_EXIT, (uint64_t)code);
-    for (;;);
-}
+__attribute__((noreturn)) void exit(int code);
 
-static inline int fork(void) {
-    return (int)__syscall_ret(syscall0(SYS_FORK));
-}
+int fork(void);
 
 static inline int exec(const char* path, size_t pathlen) {
     return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, pathlen));
@@ -475,13 +463,8 @@ static inline int wait(int* status) {
     return waitpid(-1, status, 0);
 }
 
-static inline int getpid(void) {
-    return (int)syscall0(SYS_GETPID);   // never fails
-}
-
-static inline int getppid(void) {
-    return (int)syscall0(SYS_GETPPID);  // never fails
-}
+int getpid(void);
+int getppid(void);
 
 // _exit: same as exit (no stdio buffers to flush in our libc).
 __attribute__((noreturn)) static inline void _exit(int code) {
@@ -501,17 +484,9 @@ static inline uint64_t clock_ns(void) {
     return syscall0(SYS_CLOCK_NS);  // never fails
 }
 
-static inline int pipe(int fds[2]) {
-    return (int)__syscall_ret(syscall1(SYS_PIPE, (uint64_t)fds));
-}
-
-static inline int dup(int oldfd) {
-    return (int)__syscall_ret(syscall1(SYS_DUP, (uint64_t)oldfd));
-}
-
-static inline int dup2(int oldfd, int newfd) {
-    return (int)__syscall_ret(syscall2(SYS_DUP2, (uint64_t)oldfd, (uint64_t)newfd));
-}
+int pipe(int fds[2]);
+int dup(int oldfd);
+int dup2(int oldfd, int newfd);
 
 // ── Signals ───────────────────────────────────────────────────────────────
 
@@ -567,10 +542,7 @@ static inline int rename(const char* old, const char* new) {
 }
 
 // POSIX unlink(path)
-static inline int unlink(const char* path) {
-    size_t n = 0; while (path[n]) n++;
-    return (int)__syscall_ret(syscall2(SYS_UNLINK, (uint64_t)path, n));
-}
+int unlink(const char* path);
 
 // POSIX chdir(path)
 static inline int chdir(const char* path) {
@@ -579,11 +551,7 @@ static inline int chdir(const char* path) {
 }
 
 // POSIX mkdir(path, mode)
-static inline int mkdir(const char* path, mode_t mode) {
-    (void)mode;
-    size_t n = 0; while (path[n]) n++;
-    return (int)__syscall_ret(syscall2(SYS_MKDIR, (uint64_t)path, n));
-}
+int mkdir(const char* path, mode_t mode);
 
 static inline uint64_t brk(uint64_t new_brk) {
     return syscall1(SYS_BRK, new_brk);  // returns address, not error code
@@ -594,9 +562,7 @@ static inline uint64_t brk(uint64_t new_brk) {
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-static inline long lseek(int fd, long offset, int whence) {
-    return (long)__syscall_ret(syscall3(SYS_LSEEK, (uint64_t)fd, (uint64_t)offset, (uint64_t)whence));
-}
+long lseek(int fd, long offset, int whence);
 
 // ── String functions ──────────────────────────────────────────────────────
 
@@ -745,15 +711,10 @@ typedef struct sockaddr_in {
 
 typedef uint32_t socklen_t;
 
-static inline uint16_t htons(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
-static inline uint16_t ntohs(uint16_t v) { return htons(v); }
-static inline uint32_t htonl(uint32_t v) {
-    return ((v & 0xFF000000u) >> 24) |
-           ((v & 0x00FF0000u) >>  8) |
-           ((v & 0x0000FF00u) <<  8) |
-           ((v & 0x000000FFu) << 24);
-}
-static inline uint32_t ntohl(uint32_t v) { return htonl(v); }
+uint16_t htons(uint16_t v);
+uint16_t ntohs(uint16_t v);
+uint32_t htonl(uint32_t v);
+uint32_t ntohl(uint32_t v);
 
 // INADDR_ANY / INADDR_BROADCAST — both in network byte order.
 #define INADDR_ANY        0x00000000u
@@ -1022,14 +983,7 @@ static inline long sys_slabinfo(slabinfo_t* info) {
 #define F_SETFL     4
 #define F_DUPFD_CLOEXEC 1030
 
-static inline int fcntl(int fd, int cmd, ...) {
-    __builtin_va_list ap;
-    __builtin_va_start(ap, cmd);
-    long arg = __builtin_va_arg(ap, long);
-    __builtin_va_end(ap);
-    return (int)__syscall_ret(syscall3(SYS_FCNTL, (uint64_t)fd,
-                                       (uint64_t)cmd, (uint64_t)arg));
-}
+int fcntl(int fd, int cmd, ...);
 
 // ── access() mode bits ────────────────────────────────────────────────────
 #define F_OK  0
@@ -1037,9 +991,7 @@ static inline int fcntl(int fd, int cmd, ...) {
 #define W_OK  2
 #define R_OK  4
 
-static inline int access(const char* path, int mode) {
-    return (int)__syscall_ret(syscall2(SYS_ACCESS, (uint64_t)path, (uint64_t)mode));
-}
+int access(const char* path, int mode);
 
 // ── fstat — defined earlier as direct syscall inline ──────────────────────
 
@@ -1076,10 +1028,10 @@ typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 #endif
 
-static inline uid_t getuid(void)  { return (uid_t)syscall0(SYS_GETUID); }
-static inline uid_t geteuid(void) { return (uid_t)syscall0(SYS_GETEUID); }
-static inline gid_t getgid(void)  { return (gid_t)syscall0(SYS_GETGID); }
-static inline gid_t getegid(void) { return (gid_t)syscall0(SYS_GETEGID); }
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
 static inline int getgroups(int sz, gid_t* list) {
     return (int)__syscall_ret(syscall2(SYS_GETGROUPS, (uint64_t)sz, (uint64_t)list));
 }
@@ -1107,10 +1059,9 @@ static inline pid_t getsid(pid_t pid) {
 }
 
 // ── ioctl ─────────────────────────────────────────────────────────────────
-static inline int ioctl(int fd, unsigned long req, void* arg) {
-    return (int)__syscall_ret(syscall3(SYS_IOCTL, (uint64_t)fd,
-                                       (uint64_t)req, (uint64_t)arg));
-}
+// Variadic per POSIX — real callers pass a single trailing pointer arg,
+// which sys_ioctl.c's extern marshals through syscall3.
+int ioctl(int fd, unsigned long req, ...);
 
 // ── termios ───────────────────────────────────────────────────────────────
 #define NCCS 19
@@ -1380,10 +1331,9 @@ static inline int epoll_pwait(int epfd, epoll_event_t* events,
 }
 
 // ── readlink / symlink / link ─────────────────────────────────────────────
-static inline ssize_t readlink(const char* path, char* buf, size_t bufsz) {
-    return (ssize_t)__syscall_ret(syscall3(SYS_READLINK, (uint64_t)path,
-                                            (uint64_t)buf, (uint64_t)bufsz));
-}
+// readlink takes (path, pathlen, buf, buflen) at the syscall ABI — impl
+// in unistd.c handles the pathlen computation.
+ssize_t readlink(const char* path, char* buf, size_t bufsz);
 static inline int symlink(const char* target, const char* linkpath) {
     return (int)__syscall_ret(syscall2(SYS_SYMLINK, (uint64_t)target, (uint64_t)linkpath));
 }
@@ -1392,18 +1342,10 @@ static inline int link(const char* old, const char* newp) {
 }
 
 // ── chmod / chown / fchmod / fchown ──────────────────────────────────────
-static inline int chmod(const char* path, mode_t mode) {
-    return (int)__syscall_ret(syscall2(SYS_CHMOD, (uint64_t)path, (uint64_t)mode));
-}
-static inline int fchmod(int fd, mode_t mode) {
-    return (int)__syscall_ret(syscall2(SYS_FCHMOD, (uint64_t)fd, (uint64_t)mode));
-}
-static inline int chown(const char* path, uid_t uid, gid_t gid) {
-    return (int)__syscall_ret(syscall3(SYS_CHOWN, (uint64_t)path, (uint64_t)uid, (uint64_t)gid));
-}
-static inline int fchown(int fd, uid_t uid, gid_t gid) {
-    return (int)__syscall_ret(syscall3(SYS_FCHOWN, (uint64_t)fd, (uint64_t)uid, (uint64_t)gid));
-}
+int chmod(const char* path, mode_t mode);
+int fchmod(int fd, mode_t mode);
+int chown(const char* path, uid_t uid, gid_t gid);
+int fchown(int fd, uid_t uid, gid_t gid);
 
 // ── truncate / ftruncate ──────────────────────────────────────────────────
 static inline int truncate(const char* path, long length) {
@@ -1532,35 +1474,16 @@ typedef struct stat {
 
 // ── getenv / environ ──────────────────────────────────────────────────────
 extern char** environ;
-static inline char* getenv(const char* name) {
-    if (!environ || !name) return NULL;
-    size_t nlen = 0; while (name[nlen]) nlen++;
-    for (char** e = environ; *e; e++) {
-        char* eq = strchr(*e, '=');
-        if (!eq) continue;
-        size_t klen = (size_t)(eq - *e);
-        if (klen == nlen && strncmp(*e, name, nlen) == 0) return eq + 1;
-    }
-    return NULL;
-}
+char* getenv(const char* name);
 
 int    setenv(const char* name, const char* value, int overwrite);
 int    unsetenv(const char* name);
 int    putenv(char* string);
 
 // ── POSIX stat / lstat / fstat ────────────────────────────────────────────
-// The kernel fills struct stat directly — no bridge needed.
-static inline int stat(const char* path, struct stat* st) {
-    size_t n = 0; while (path[n]) n++;
-    return (int)__syscall_ret(syscall3(SYS_STAT, (uint64_t)path, n, (uint64_t)st));
-}
-static inline int lstat(const char* path, struct stat* st) {
-    // No symlink support yet — lstat behaves like stat.
-    return stat(path, st);
-}
-static inline int fstat(int fd, struct stat* st) {
-    return (int)__syscall_ret(syscall2(SYS_FSTAT, (uint64_t)fd, (uint64_t)st));
-}
+int stat(const char* path, struct stat* st);
+int lstat(const char* path, struct stat* st);
+int fstat(int fd, struct stat* st);
 
 // ── EOF sentinel (defined early so inline stubs can use it) ──────────────
 #ifndef EOF
@@ -1646,11 +1569,7 @@ static inline int isascii(int c)  { return (unsigned)c < 128; }
 static inline int isgraph(int c)  { return c > 0x20 && c < 0x7F; }
 static inline int toupper(int c)  { return islower(c) ? c - 32 : c; }
 static inline int tolower(int c)  { return isupper(c) ? c + 32 : c; }
-static inline void* memchr(const void* s, int c, size_t n) {
-    const unsigned char* p = (const unsigned char*)s;
-    while (n--) { if (*p == (unsigned char)c) return (void*)p; p++; }
-    return NULL;
-}
+void* memchr(const void* s, int c, size_t n);
 
 // ── POSIX signal sets ─────────────────────────────────────────────────────
 // Our sigset is a uint32_t bitmask. These are the standard POSIX operations.
@@ -1832,9 +1751,7 @@ static inline int setitimer(int which, const struct itimerval* nv,
 #define LC_NUMERIC  4
 #define LC_TIME     5
 #define LC_MESSAGES 6
-static inline char* setlocale(int cat, const char* loc) {
-    (void)cat; (void)loc; return "C";
-}
+char* setlocale(int cat, const char* loc);
 struct lconv {
     char* decimal_point;
     char* thousands_sep;
@@ -1855,11 +1772,7 @@ struct lconv {
     char  p_sign_posn;
     char  n_sign_posn;
 };
-static inline struct lconv* localeconv(void) {
-    static struct lconv lc = { ".", "", "", "", "", ".", "", "", "+", "-",
-                                2, 2, 1, 1, 1, 1, 1, 1 };
-    return &lc;
-}
+struct lconv* localeconv(void);
 
 // strftime / localtime / gmtime stubs
 struct tm {
@@ -1877,7 +1790,7 @@ static inline void tzset(void) {}
 // nl_langinfo stub
 #define CODESET       14
 #define RADIXCHAR     'X'
-static inline char* nl_langinfo(int item) { (void)item; return "UTF-8"; }
+char* nl_langinfo(int item);
 
 // iconv stubs (no multibyte conversion, return identity)
 typedef void* iconv_t;
@@ -1891,18 +1804,14 @@ static inline size_t iconv(iconv_t cd, char** in, size_t* inleft,
 }
 static inline int iconv_close(iconv_t cd) { (void)cd; return 0; }
 
-// dlopen stubs (no dynamic linking)
+// dlopen family (no dynamic linking — impl in dlfcn.c returns NULL/stub)
 #define RTLD_LAZY   1
 #define RTLD_NOW    2
 #define RTLD_GLOBAL 0x100
-static inline void* dlopen(const char* f, int flags) {
-    (void)f; (void)flags; errno = ENOSYS; return NULL;
-}
-static inline void* dlsym(void* h, const char* sym) {
-    (void)h; (void)sym; errno = ENOSYS; return NULL;
-}
-static inline char* dlerror(void) { return "dlopen not supported"; }
-static inline int   dlclose(void* h) { (void)h; return 0; }
+void* dlopen(const char* f, int flags);
+void* dlsym(void* h, const char* sym);
+char* dlerror(void);
+int   dlclose(void* h);
 
 // Wide-char stubs — bash only uses these for locale-aware display;
 // on a C-locale OS they can be identity/stub.
@@ -2199,11 +2108,8 @@ typedef struct FILE FILE;
 int setvbuf(FILE* f, char* buf, int mode, size_t size);
 static inline int __fpurge(FILE* f) { (void)f; return 0; }
 
-// gettimeofday — POSIX
-static inline int gettimeofday(struct timeval* tv, void* tz) {
-    (void)tz;
-    return (int)__syscall_ret(syscall2(SYS_GETTOD, (uint64_t)tv, 0));
-}
+// gettimeofday — POSIX (impl in sys_time.c, backed by SYS_CLOCK_NS)
+int gettimeofday(struct timeval* tv, void* tz);
 
 // getaddrinfo / freeaddrinfo stubs (bash uses for network builtins, optional)
 struct addrinfo { int ai_flags; int ai_family; int ai_socktype; int ai_protocol;

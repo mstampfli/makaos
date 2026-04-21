@@ -14,50 +14,42 @@
 #define NAN         __builtin_nanf("")
 #define INFINITY    __builtin_inff()
 
-// ── SSE2 intrinsics via scalar asm ────────────────────────────────────────
-// These are tiny wrappers that emit a single SSE2 scalar instruction.
+// ── Basic math (extern — implemented in math.c) ───────────────────────────
+// Single-expression wrappers over __builtin_* compile to one SSE2
+// instruction (sqrtsd, sqrtss, andpd, roundsd, ...) — no perf loss
+// relative to the previous static-inline version.
+//
+// isnan/isinf/isfinite stay as macros because they're polymorphic over
+// float/double/long double in ISO C and must not decay to a single type.
 
-static inline double fabs(double x) {
-    // Clear the sign bit via SSE2 andpd.
-    double r;
-    __asm__("andpd %1, %0" : "=x"(r) : "x"(x), "0"(x));
-    // Simpler: use the builtin which compiles to andpd anyway.
-    return __builtin_fabs(x);
-}
+double fabs(double x);
+float  fabsf(float x);
+double sqrt(double x);
+float  sqrtf(float x);
+double floor(double x);
+float  floorf(float x);
+double ceil(double x);
+float  ceilf(float x);
+double round(double x);
+float  roundf(float x);
+double trunc(double x);
+float  truncf(float x);
+double fmin(double a, double b);
+double fmax(double a, double b);
+float  fminf(float a, float b);
+float  fmaxf(float a, float b);
+double copysign(double x, double y);
+float  copysignf(float x, float y);
+double fmod(double x, double y);
+float  fmodf(float x, float y);
+double hypot(double x, double y);
+float  hypotf(float x, float y);
+double cbrt(double x);
+float  cbrtf(float x);
 
-static inline float fabsf(float x) { return __builtin_fabsf(x); }
-
-static inline double sqrt(double x) {
-    double r;
-    __asm__("sqrtsd %1, %0" : "=x"(r) : "x"(x));
-    return r;
-}
-
-static inline float sqrtf(float x) {
-    float r;
-    __asm__("sqrtss %1, %0" : "=x"(r) : "x"(x));
-    return r;
-}
-
-static inline double floor(double x) { return __builtin_floor(x); }
-static inline float  floorf(float x) { return __builtin_floorf(x); }
-static inline double ceil(double x)  { return __builtin_ceil(x); }
-static inline float  ceilf(float x)  { return __builtin_ceilf(x); }
-static inline double round(double x) { return __builtin_round(x); }
-static inline float  roundf(float x) { return __builtin_roundf(x); }
-static inline double trunc(double x) { return __builtin_trunc(x); }
-
-static inline int    isnan(double x)   { return __builtin_isnan(x); }
-static inline int    isinf(double x)   { return __builtin_isinf(x); }
-static inline int    isfinite(double x){ return __builtin_isfinite(x); }
-static inline double fmin(double a, double b) { return a < b ? a : b; }
-static inline double fmax(double a, double b) { return a > b ? a : b; }
-static inline double fmod(double x, double y) {
-    return x - (double)(long long)(x / y) * y;
-}
-static inline float  fmodf(float x, float y) {
-    return x - (float)(long long)(x / y) * y;
-}
+#define isnan(x)     __builtin_isnan(x)
+#define isinf(x)     __builtin_isinf(x)
+#define isfinite(x)  __builtin_isfinite(x)
 
 // ── Software implementations (libm) ───────────────────────────────────────
 // Forward declarations — implemented in math.c using polynomial approximations
@@ -91,15 +83,4 @@ float powf(float x, float y);
 float logf(float x);
 float expf(float x);
 
-// ── POSIX: copysign ───────────────────────────────────────────────────────
-static inline double copysign(double x, double y) {
-    return __builtin_copysign(x, y);
-}
-static inline float copysignf(float x, float y) {
-    return __builtin_copysignf(x, y);
-}
-
-// ── POSIX: hypot ──────────────────────────────────────────────────────────
-static inline double hypot(double x, double y) {
-    return sqrt(x*x + y*y);
-}
+// copysign/copysignf/hypot are declared above as externs; impl in math.c.
