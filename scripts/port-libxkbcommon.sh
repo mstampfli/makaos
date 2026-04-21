@@ -69,6 +69,18 @@ build_lib() {
     # Drop the config.h every TU expects to include.
     cp "$REPO_ROOT/scripts/configs/xkbcommon_config.h" "$XKB_SRC/config.h"
 
+    # MakaOS: MAP_SHARED on regular-fd mmap not yet supported (needs
+    # dirty-tracking + writeback).  xkbcommon only reads its mapping
+    # PROT_READ, so MAP_PRIVATE is functionally identical.  Idempotent.
+    python3 -c "
+p='$XKB_SRC/src/utils.c'
+with open(p) as f: s = f.read()
+if 'MAP_SHARED' in s and 'MAKAOS_MAP_PRIVATE' not in s:
+    s = s.replace('MAP_SHARED', '/*MAKAOS_MAP_PRIVATE*/MAP_PRIVATE')
+    with open(p, 'w') as f: f.write(s)
+    print('patched utils.c: MAP_SHARED -> MAP_PRIVATE')
+"
+
     # Generate parser.{h,c} from parser.y via bison — meson would
     # normally do this.  Output header next to parser-priv.h.
     if [ ! -f "$XKB_SRC/src/xkbcomp/parser.h" ]; then

@@ -86,6 +86,31 @@ build_scanner() {
     log "wayland-scanner installed at $HOST_TOOLS/bin/wayland-scanner"
 }
 
+# MakaOS: our kernel SYS_EXEC drops envp, so bash-level exports never
+# reach the child.  Patch wayland-server's XDG_RUNTIME_DIR check to
+# default to /tmp when the env var is missing — works with our libc's
+# mkstemp/eventfd/sockets, which all live at /tmp or elsewhere.
+patch_xdg_runtime_dir() {
+    local f="$WL_SRC/src/wayland-server.c"
+    if grep -q "MAKAOS_XDG_DEFAULT" "$f" 2>/dev/null; then return 0; fi
+    log "patching wayland-server.c: default XDG_RUNTIME_DIR=/tmp when unset"
+    python3 -c "
+p = '$f'
+with open(p) as h: s = h.read()
+old = 'runtime_dir = getenv(\"XDG_RUNTIME_DIR\");\n\t\tif (!runtime_dir || runtime_dir[0] != \'/\') {'
+new = ('runtime_dir = getenv(\"XDG_RUNTIME_DIR\");\n'
+       '\t\t/* MAKAOS_XDG_DEFAULT: SYS_EXEC drops envp; fall back to /tmp */\n'
+       '\t\tif (!runtime_dir || runtime_dir[0] != \'/\') runtime_dir = \"/tmp\";\n'
+       '\t\tif (0) {')
+if old in s:
+    s = s.replace(old, new, 1)
+    with open(p, 'w') as h: h.write(s)
+    print('patched')
+else:
+    print('marker not found')
+"
+}
+
 # ── Generate the core wayland protocol dispatch code ────────────────
 generate_core_proto() {
     local gen_dir="$WL_SRC/generated"
@@ -235,6 +260,7 @@ main() {
                "$SYSROOT/usr/lib/libwayland-server.a"
     fi
     fetch
+    patch_xdg_runtime_dir
     build_scanner
     generate_core_proto
     build_target_libs

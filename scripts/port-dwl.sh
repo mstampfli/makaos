@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 # ── MakaOS dwl port ────────────────────────────────────────────────────
 #
-# dwl is a suckless-style Wayland compositor in ~3 KLOC of C.  Its only
-# "problem" dependency on our stack is libinput: dwl uses it exclusively
-# for laptop-touchpad config (tap-to-click, natural-scroll, etc.) inside
-# a single `if (wlr_input_device_is_libinput(...))` block.  Since we
-# disabled wlroots' libinput backend, that runtime check always returns
-# false — but the block still needs to COMPILE.
+# dwl is a suckless-style Wayland compositor in ~3 KLOC of C.  We now
+# build it unmodified against the real wlroots libinput backend
+# (MakaOS ports libinput + libevdev + mtdev).  The only patches left
+# are compositor-environment workarounds:
 #
-# We patch dwl to remove the libinput dependency entirely.  Keyboard
-# and pointer input flow through our native wlroots backend unchanged;
-# only the touchpad-config fine-tuning is gone (not relevant without
-# a real touchpad anyway).
+#  * stub out wlr_session_change_vt — MakaOS has no VTs
+#  * XDG_RUNTIME_DIR fallback to /tmp — SYS_EXEC drops envp today
 
 set -euo pipefail
 
@@ -45,43 +41,33 @@ patch_dwl() {
     if grep -q "MAKAOS_PATCHED" "$DWL_SRC/dwl.c" 2>/dev/null; then
         log "dwl already patched"; return 0
     fi
-    log "patching dwl: strip libinput-only code, stub wlr_session_change_vt"
+    log "patching dwl: stub wlr_session_change_vt + XDG_RUNTIME_DIR fallback"
 
-    # config.h is derived from config.def.h; make sure it exists AND
-    # pulls in our libinput-shim (enums only) for the config variables.
+    # config.h is derived from config.def.h — create if missing.
+    # (Unlike the earlier libinput-skip port, config.h doesn't need a
+    # prepended <libinput.h> here: dwl.c already includes it via
+    # wlr/backend/libinput.h, and libinput.h is on the sysroot include
+    # path.  Keep the copy step idempotent.)
     if [ ! -f "$DWL_SRC/config.h" ]; then
         cp "$DWL_SRC/config.def.h" "$DWL_SRC/config.h"
     fi
-    # Prepend <libinput.h> include to config.h so the enum type decls
-    # on static-file-scope variables resolve.
-    if ! head -5 "$DWL_SRC/config.h" | grep -q "libinput.h"; then
-        { printf '#include <libinput.h>\n'; cat "$DWL_SRC/config.h"; } > "$DWL_SRC/config.h.new"
-        mv "$DWL_SRC/config.h.new" "$DWL_SRC/config.h"
-    fi
 
     python3 - <<PY
-import re, sys
+import re
 path = "$DWL_SRC/dwl.c"
 with open(path) as h: s = h.read()
-# 1. Drop libinput backend include (keep config.h's <libinput.h> enum
-#    shim; the wlr/backend/libinput.h one is a real runtime dep we
-#    don't have).
-s = re.sub(r'^#include <libinput.h>\n',            '', s, flags=re.M)
-s = re.sub(r'^#include <wlr/backend/libinput.h>\n', '', s, flags=re.M)
-# 2. Remove the per-pointer libinput-config block.  The block starts
-#    at "struct libinput_device *device;" and runs through the closing
-#    brace of the enclosing if.
-old = re.search(
-    r'\tstruct libinput_device \*device;\n'
-    r'\tif \(wlr_input_device_is_libinput\(&pointer->base\).*?\n\t\}\n',
-    s, flags=re.DOTALL)
-assert old, "libinput block not located"
-s = s[:old.start()] + '\t/* MakaOS: libinput-config block removed (native input backend). */\n' + s[old.end():]
-# 3. Replace wlr_session_change_vt calls with a no-op — session backend
-#    is disabled in our wlroots build; VT switching doesn't exist on
-#    MakaOS anyway.
+# 1. Replace wlr_session_change_vt calls with a no-op — MakaOS has no
+#    VTs, so the session backend never dispatches VT switches.
 s = s.replace('wlr_session_change_vt(session,', '(void)(0 &&')
-# 4. First-line marker.
+# 2. Default XDG_RUNTIME_DIR — our kernel's SYS_EXEC drops envp, so
+#    dwl's own die() guard needs to fall back to /tmp.
+s = s.replace(
+    'if (!getenv("XDG_RUNTIME_DIR"))\\n\\t\\tdie("XDG_RUNTIME_DIR must be set");',
+    'if (!getenv("XDG_RUNTIME_DIR")) setenv("XDG_RUNTIME_DIR", "/tmp", 1);')
+s = s.replace(
+    'if (!getenv("XDG_RUNTIME_DIR"))\n\t\tdie("XDG_RUNTIME_DIR must be set");',
+    'if (!getenv("XDG_RUNTIME_DIR")) setenv("XDG_RUNTIME_DIR", "/tmp", 1);')
+# 3. First-line marker.
 s = "/* MAKAOS_PATCHED — see scripts/port-dwl.sh */\n" + s
 with open(path, 'w') as h: h.write(s)
 print("patched")
@@ -128,6 +114,7 @@ build() {
         -Wl,--start-group \
         -lwlroots-0.18 -lwayland-server -lwayland-client \
         -lxkbcommon -lpixman-1 -ldrm -ludev -lseat -lffi -ldisplay-info \
+        -linput -levdev -lmtdev \
         -lc -lm -lrt -lpthread -ldl \
         -Wl,--end-group \
         -o dwl.elf)
