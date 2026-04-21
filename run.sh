@@ -21,8 +21,8 @@ qemu-system-x86_64 \
   -drive format=raw,file="$BUILD_DIR/disk.img",if=none,id=hd0 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd0,bus=ahci.0 \
-  -vga std \
-  -device virtio-gpu-pci \
+  -vga none \
+  -device virtio-vga,xres=1280,yres=800 \
   -display sdl \
   -audiodev pa,id=snd0 \
   -device intel-hda \
