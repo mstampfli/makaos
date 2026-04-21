@@ -55,6 +55,21 @@ syscall_entry:
     ; 3. Re-enable interrupts — we're on a safe kernel stack now.
     sti
 
+    ; 3b. Push user callee-saved registers onto the kernel stack.  The
+    ;     x86-64 syscall ABI requires the kernel preserve rbx/rbp/r12-r15
+    ;     across a syscall.  We *also* stash them in per-CPU scratch
+    ;     (step 1) so signal_setup_frame can read them — but the per-CPU
+    ;     slot is stale if the task migrates CPUs during a blocking
+    ;     dispatch.  The kernel stack is per-task, so values pushed here
+    ;     follow the task across migrations and are guaranteed to match
+    ;     what we promised user space on return.
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
     ; 4. Push the three values sysretq needs so they survive the C call.
     push qword [gs:CPU_SC_USER_RSP] ; user RSP   (pushed first → popped last)
     push r11                         ; user RFLAGS
@@ -101,23 +116,38 @@ syscall_entry:
     ; real code).  Keep interrupts off for the entire consume window.
     cli
 
-    ; 8. Restore sysretq operands (reverse order of step 4).
-    pop  rcx         ; user RIP   — still on kernel stack
-    pop  r11         ; user RFLAGS — still on kernel stack
-    pop  rsp         ; user RSP   — now rsp points at user stack (must be last)
+    ; 8. Unwind the kernel stack IN THE ORDER WE PUSHED.
+    ;    Pop order: step 4 values (user_rip/rflags/rsp) first, then
+    ;    step 3b values (callee-saves).  User RSP goes into r10 (not
+    ;    rsp) because the callee-save pops below still need the kernel
+    ;    stack pointer.
+    pop rcx           ; user RIP
+    pop r11           ; user RFLAGS
+    pop r10           ; user RSP  (held in r10 until the iretq push)
+
+    ; 8b. Pop the user callee-saves we stashed at step 3b.  Kernel
+    ;     stack is per-task, so these follow the task across CPU
+    ;     migrations — guaranteed correct regardless of which CPU
+    ;     the dispatcher returned on.
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
 
     ; 9. Check if exec was requested (sys_exec sets exec_requested = 1).
     cmp byte [gs:CPU_EXEC_REQUESTED], 0
     je  .sysret_normal
     mov byte [gs:CPU_EXEC_REQUESTED], 0
-    mov rcx, [gs:CPU_EXEC_ENTRY]   ; new RIP
-    mov r11, 0x202                  ; new RFLAGS: IF=1 + reserved
-    mov rsp, [gs:CPU_EXEC_RSP]     ; new RSP
+    mov rcx, [gs:CPU_EXEC_ENTRY]    ; new RIP
+    mov r11, 0x202                   ; new RFLAGS: IF=1 + reserved
+    mov r10, [gs:CPU_EXEC_RSP]      ; new RSP (into r10 for the shared iretq push)
     mov rax, [gs:CPU_EXEC_PML4]
-    mov cr3, rax                    ; switch address space
-    ; Clear all GPRs except rcx (RIP) and r11 (RFLAGS) so the new process
-    ; does not inherit kernel values — specifically RAX which just held the
-    ; PML4 physical address and would be used as a pointer by the entry code.
+    mov cr3, rax                     ; switch address space
+    ; Clear all GPRs except rcx (RIP), r10 (user RSP) and r11 (RFLAGS)
+    ; so the new process does not inherit kernel values — specifically
+    ; RAX which just held the PML4 physical address.
     xor  eax, eax
     xor  ebx, ebx
     xor  edx, edx
@@ -126,7 +156,6 @@ syscall_entry:
     xor  ebp, ebp
     xor  r8d,  r8d
     xor  r9d,  r9d
-    xor  r10d, r10d
     xor  r12d, r12d
     xor  r13d, r13d
     xor  r14d, r14d
@@ -136,19 +165,20 @@ syscall_entry:
     ; 10. Check if a user signal handler is being delivered, or sigreturn.
     cmp byte [gs:CPU_SIG_DELIVER], 0
     je  .no_signal
-    movzx r10d, byte [gs:CPU_SIG_DELIVER]
+    movzx eax, byte [gs:CPU_SIG_DELIVER]
     mov byte [gs:CPU_SIG_DELIVER], 0
     mov rcx, [gs:CPU_SC_USER_RIP]
     mov r11, [gs:CPU_SC_USER_RFLAGS]
-    mov rsp, [gs:CPU_SC_USER_RSP]
-    cmp r10d, 1
+    mov r10, [gs:CPU_SC_USER_RSP]    ; override user RSP (goes into r10, not rsp)
+    cmp eax, 1
     jne .signal_restore
     ; Mode 1: handler entry — set rdi = signum (first arg to handler).
     mov rdi, [gs:CPU_SIG_RDI]
     jmp .no_signal
 .signal_restore:
-    ; Mode 2: sigreturn — restore all callee-saved regs so the
-    ; interrupted C code sees its original register state.
+    ; Mode 2: sigreturn — restore callee-saved regs from the sigframe
+    ; values that sys_sigreturn deposited in per-CPU scratch.  These
+    ; OVERRIDE the user's pre-sigreturn-syscall state we just popped.
     mov rbp, [gs:CPU_SC_USER_RBP]
     mov rbx, [gs:CPU_SC_USER_RBX]
     mov r12, [gs:CPU_SC_USER_R12]
@@ -160,13 +190,12 @@ syscall_entry:
 
     ; 12. Return to user space via iretq (sysretq has a KVM bug where
     ;     SS doesn't get RPL=3 OR'd in, giving SS=0x20 instead of 0x23).
-    mov r10, rsp            ; save user RSP in r10
-    mov rsp, [gs:CPU_TSS_RSP0] ; switch to kstack top (this CPU's TSS.RSP0)
+    mov rsp, [gs:CPU_TSS_RSP0]  ; switch to kstack top for iretq push
 
-    push qword 0x23         ; SS = user data64 with RPL=3
-    push r10                 ; RSP = saved user RSP
-    push r11                 ; RFLAGS = user RFLAGS
-    push qword 0x2B          ; CS = user code64 with RPL=3
-    push rcx                 ; RIP = user RIP
+    push qword 0x23              ; SS = user data64 with RPL=3
+    push r10                     ; RSP = user RSP (in r10 all along)
+    push r11                     ; RFLAGS = user RFLAGS
+    push qword 0x2B              ; CS = user code64 with RPL=3
+    push rcx                     ; RIP = user RIP
 
     iretq
