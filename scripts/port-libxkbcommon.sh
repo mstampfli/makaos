@@ -124,7 +124,10 @@ build_lib() {
     local objs=()
     for name in "${srcs[@]}"; do
         local src="$XKB_SRC/$name"
-        local obj="$build_objs/$(basename "$name" .c).o"
+        # Flatten tree path into obj name — src/keymap.c and
+        # src/xkbcomp/keymap.c must not collide as "keymap.o" in ar.
+        local flat="${name//\//_}"
+        local obj="$build_objs/${flat%.c}.o"
         objs+=("$obj")
         if [ "$src" -nt "$obj" ]; then
             "$CROSS_CC" "${CFLAGS[@]}" "${includes[@]}" -c "$src" -o "$obj"
