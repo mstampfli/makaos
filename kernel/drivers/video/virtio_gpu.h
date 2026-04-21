@@ -55,3 +55,37 @@ int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h);
 // Called at subsys init after virtio_gpu_init succeeds.  Registers
 // this device as the DRM core's active backend via drm_backend_register.
 void virtio_gpu_register_backend(void);
+
+// Point scanout 0 back at the startup banner resource (allocated by
+// virtio_gpu_present_test / vgpu_setup_scanout_buffer).  Used by the
+// DRM core when a client exits and we need the text-console
+// framebuffer visible again.  No-op if the banner resource never got
+// created (e.g. boot-time virtio-gpu initialisation did not finish).
+// Returns 1 on success, 0 on failure.
+int virtio_gpu_restore_default_scanout(void);
+
+// ── fbcon-as-DRM-client wiring ───────────────────────────────────────
+// The text console (kernel/drivers/video/fb.c) cannot rely on QEMU's
+// virtio-vga VGA-compat BAR — SET_SCANOUT with resource_id=0 leaves
+// the display *off*, not mirroring the legacy FB.  Instead the text
+// console writes into a kernel-owned virtio-gpu resource, and we
+// explicitly TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on each scroll /
+// newline.  These two calls own that wiring:
+//
+//   virtio_gpu_fbcon_init(out_phys, out_virt, out_w, out_h, out_pitch)
+//       Allocates a resource sized to scanout 0's preferred mode,
+//       attaches a physically-contiguous backing, SET_SCANOUT's it,
+//       and hands back both the phys address (for fb_init) and the
+//       HHDM virt pointer (for text-console writes).  Returns 1.
+//
+//   virtio_gpu_fbcon_flush(void)
+//       Transfers the full backing to the host resource + flushes.
+//       Called from fb.c after any visible write.  Safe to call
+//       concurrently with DRM client ioctls — serialised by the same
+//       control-queue mutex as every other command.
+int virtio_gpu_fbcon_init(phys_addr_t* out_phys,
+                           uint8_t**   out_virt,
+                           uint32_t*   out_w,
+                           uint32_t*   out_h,
+                           uint32_t*   out_pitch);
+void virtio_gpu_fbcon_flush(void);
