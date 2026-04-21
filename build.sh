@@ -187,7 +187,7 @@ fi
 # Each port script is a no-op when its target sits newer than its
 # sources, so re-running build.sh is cheap.  Sysroot is always self-
 # consistent because build.sh wipes + re-populates it every run.
-for port in zlib expat libffi pixman libxkbcommon; do
+for port in zlib expat libffi pixman libxkbcommon freetype; do
   echo "[+] Building Tier 2 lib: $port"
   SYSROOT="$SYSROOT" bash "scripts/port-$port.sh"
 done

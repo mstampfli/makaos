@@ -46,3 +46,31 @@ long double ceill(long double x)  { return (long double)__builtin_ceil((double)x
 long double fmodl(long double x, long double y) {
     return (long double)__builtin_fmod((double)x, (double)y);
 }
+
+// Additional float variants that libm.h declares.  Each wraps the
+// double version via explicit cast — single-precision on x86 would
+// use sqrtss/cvtss2sd under the hood; for these single-use paths the
+// precision is fine.
+extern double atan(double x);
+extern double atan2(double y, double x);
+extern double asin(double x);
+extern double acos(double x);
+extern double log2(double x);
+extern double log10(double x);
+extern double cbrt(double x);
+extern double sinh(double x);
+extern double cosh(double x);
+extern double tanh(double x);
+extern double hypot(double x, double y);
+
+float hypotf(float x, float y) { return (float)hypot((double)x, (double)y); }
+float atanf(float x)           { return (float)atan((double)x); }
+float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
+float asinf(float x)           { return (float)asin((double)x); }
+float acosf(float x)           { return (float)acos((double)x); }
+float log2f(float x)           { return (float)log2((double)x); }
+float log10f(float x)          { return (float)log10((double)x); }
+float cbrtf(float x)           { return (float)cbrt((double)x); }
+float sinhf(float x)           { return (float)sinh((double)x); }
+float coshf(float x)           { return (float)cosh((double)x); }
+float tanhf(float x)           { return (float)tanh((double)x); }
