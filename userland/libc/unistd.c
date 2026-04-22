@@ -7,6 +7,7 @@
 #include <makaos/syscall.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 
 // ── I/O primitives ──────────────────────────────────────────────────
 ssize_t read(int fd, void* buf, size_t n) {
@@ -280,32 +281,80 @@ int execl(const char* path, const char* arg0, ...) {
 }
 
 int execlp(const char* file, const char* arg0, ...) {
-    const char* argv[EXEC_MAX_ARGS + 1];
+    char* argv[EXEC_MAX_ARGS + 1];
     int argc = 0;
-    argv[argc++] = arg0;
+    argv[argc++] = (char*)arg0;
     va_list ap;
     va_start(ap, arg0);
     while (argc < EXEC_MAX_ARGS) {
-        const char* a = va_arg(ap, const char*);
+        char* a = va_arg(ap, char*);
         argv[argc++] = a;
         if (!a) break;
     }
     argv[argc] = NULL;
     va_end(ap);
-    // execlp semantics = execl with PATH search; we honour the call
-    // even if `file` is a bare name — kernel-side SYS_EXEC lookups
-    // resolve via $PATH when the argument lacks a slash.
-    return (int)__syscall_ret(syscall3(SYS_EXEC,
-        (uint64_t)file, (uint64_t)argv, 0));
+    // Route through execvp so PATH search happens.
+    return execvp(file, argv);
 }
 
-int execvp(const char* path, char* const argv[]) {
+// POSIX execvp: if `file` contains '/', pass through unchanged.
+// Otherwise walk $PATH, trying execve(candidate, argv, environ)
+// on each directory, moving on if it returns ENOENT (and a few
+// other non-fatal errnos).  Without this, `execvp("foot", ...)`
+// hits sys_exec's cwd-based resolver and fails with ENOENT for
+// any command not in the current directory.
+extern char** environ;
+
+static int try_exec_path(const char* file, char* const argv[]) {
     return (int)__syscall_ret(syscall3(SYS_EXEC,
-        (uint64_t)path, (uint64_t)argv, 0));
+        (uint64_t)file, (uint64_t)argv, (uint64_t)environ));
+}
+
+static const char* getenv_PATH(void) {
+    if (!environ) return NULL;
+    for (char** e = environ; *e; e++) {
+        const char* s = *e;
+        if (s[0]=='P' && s[1]=='A' && s[2]=='T' && s[3]=='H' && s[4]=='=')
+            return s + 5;
+    }
+    return NULL;
+}
+
+int execvp(const char* file, char* const argv[]) {
+    // Contains '/' → direct exec, no PATH search.
+    for (const char* p = file; *p; p++) {
+        if (*p == '/') return try_exec_path(file, argv);
+    }
+    const char* PATH = getenv_PATH();
+    if (!PATH || !*PATH) PATH = "/bin:/usr/bin";
+    // Walk PATH entries separated by ':'.
+    char candidate[512];
+    const char* cur = PATH;
+    while (1) {
+        const char* colon = cur;
+        while (*colon && *colon != ':') colon++;
+        size_t dir_len = (size_t)(colon - cur);
+        if (dir_len == 0) { dir_len = 1; }  // "::" treated as "."; approximate with "/"
+        if (dir_len + 1 + strlen(file) + 1 > sizeof(candidate)) goto next;
+        size_t j = 0;
+        for (size_t i = 0; i < dir_len; i++) candidate[j++] = cur[i];
+        if (candidate[j-1] != '/') candidate[j++] = '/';
+        for (size_t i = 0; file[i]; i++) candidate[j++] = file[i];
+        candidate[j] = '\0';
+        try_exec_path(candidate, argv);
+        // If we get here, try_exec_path returned -1; errno tells us
+        // whether to keep searching or abort.
+        if (errno != ENOENT && errno != ENOTDIR && errno != EACCES) return -1;
+next:
+        if (!*colon) break;
+        cur = colon + 1;
+    }
+    errno = ENOENT;
+    return -1;
 }
 
 int execv(const char* path, char* const argv[]) {
-    return execvp(path, argv);
+    return try_exec_path(path, argv);
 }
 
 int execvpe(const char* path, char* const argv[], char* const envp[]) {
