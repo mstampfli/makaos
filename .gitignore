@@ -29,3 +29,18 @@ toolchain-rebuild.log
 
 # Editor swap files.
 *.kate-swp
+
+# Port build trees — these are intermediate cmake/meson/ninja
+# scratch.  Regenerated each run; 100+ MB of noise per port.
+build/sdl3_build/
+build/foot_build/
+build/fcft_build/
+build/libinput_build/
+build/tinywl_build/
+build/wlroots_build/
+
+# Port-specific scratch logs.
+build/port_*.log
+build/sdl3_*.log
+build/foot_*.log
+build/fcft_*.log
