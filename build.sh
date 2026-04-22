@@ -169,6 +169,38 @@ done
 "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
   -c "$USERLAND_DIR/libc/stdlib.c"   -o "$BUILD_DIR/user_stdlib.o"
 
+# wayland-egl stubs — Mesa's wayland-egl isn't ported yet, but SDL3's
+# Wayland dyn-loader shim references the symbols unconditionally.
+# Stub them so static link resolves; never invoked on the software
+# path (guarded by SDL_VIDEO_OPENGL_EGL=0 at configure time).
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/wayland_egl_stub.c" -o "$BUILD_DIR/user_wayland_egl_stub.o"
+
+# Extern impls for symbols only exposed inline in the in-tree libc.h
+# (wcslen/wcsncmp/wcscmp, iconv family, _Exit) — link-visible for
+# sysroot consumers like SDL3.  Compiled with SYSROOT_CFLAGS so its
+# wchar.h / stddef.h types agree with its callers.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/sdl_port_stubs.c" -o "$BUILD_DIR/user_sdl_port_stubs.o"
+
+# C11 <threads.h> shim + syslog client stub.  fcft (-> foot) and a
+# handful of other ports use C11 threads even when pthread is
+# available.  Syslog piggy-backs in the same TU because both are
+# small and both forward to lower-level primitives we already have.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/c11_threads.c" -o "$BUILD_DIR/user_c11_threads.o"
+
+# POSIX unnamed semaphores — spin-and-yield implementation.  foot's
+# render pump uses a single sem_t; contention is rare.  Replace with
+# a futex-backed version when the kernel gains one.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/semaphore.c" -o "$BUILD_DIR/user_semaphore.o"
+
+# <wctype.h> — ASCII-only wide-char classification.  Full Unicode
+# handling routes through utf8proc where it matters.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+  -c "$USERLAND_DIR/libc/wctype.c" -o "$BUILD_DIR/user_wctype.o"
+
 # libc archive — anything linking sysroot-style pulls this in as -lc.
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o"    "$BUILD_DIR/user_stdio.o" \
@@ -187,7 +219,12 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
    "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
-   "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o"
+   "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o" \
+   "$BUILD_DIR/user_wayland_egl_stub.o" \
+   "$BUILD_DIR/user_sdl_port_stubs.o" \
+   "$BUILD_DIR/user_c11_threads.o" \
+   "$BUILD_DIR/user_semaphore.o" \
+   "$BUILD_DIR/user_wctype.o"
 
 # crt0 — startup code sysroot-linked binaries get via STARTFILE_SPEC once
 # the real cross-gcc is in place.  For the current host-gcc path we still
@@ -291,6 +328,26 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
+
+# ── sdl3_hello — end-to-end SDL3 smoke test ──────────────────────────
+# Links against the sysroot-installed libSDL3.a + its Wayland/xkbcommon
+# deps + libc/libm/libpthread.  Uses -nostartfiles + crt0.o like every
+# other sysroot-linked app so argv/argc are populated correctly.
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_hello/sdl3_hello.c" \
+        -o "$BUILD_DIR/user_sdl3_hello.o"
+    "$USER_CC" "${USER_CFLAGS[@]}" --sysroot="$SYSROOT" \
+        -nostartfiles -Wl,--build-id=none \
+        "$SYSROOT/usr/lib/crt0.o" \
+        "$BUILD_DIR/user_sdl3_hello.o" \
+        -Wl,--start-group \
+        -lSDL3 -lwayland-client -lwayland-cursor -lxkbcommon -lffi \
+        -lc -lm -lrt -lpthread -ldl \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/user_sdl3_hello.elf"
+fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_shell.o" \
@@ -494,7 +551,7 @@ stat -c "%n %s" \
 echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
-EXT2_SECTORS=65536   # 32 MiB
+EXT2_SECTORS=262144  # 128 MiB — foot + xkb tree + wayland + ports ran out at 32 MiB
 ESP_START=2048
 ESP_END=4095
 
@@ -640,6 +697,10 @@ fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
 fi
+if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
+    echo "[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)"
+fi
 if [ -f "$BUILD_DIR/user_shell.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_shell.elf" bin/shell
     echo "[+] shell ELF installed at bin/shell (root:root 0755)"
@@ -685,6 +746,13 @@ fi
 if [ -f "$BUILD_DIR/user_bash.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/bash
     echo "[+] bash ELF installed at bin/bash (root:root 0755)"
+    # /bin/sh is the universal POSIX shell entry point — dwl's `-s`
+    # flag, wlroots/xdg-open helpers, dozens of ports do execl on
+    # "/bin/sh -c …".  Install bash in-place as /bin/sh so those
+    # paths work.  (Bash in sh-mode is spec-compliant enough for
+    # everything we've hit so far.)
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/sh
+    echo "[+] sh (bash) installed at bin/sh (root:root 0755)"
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
@@ -712,6 +780,10 @@ fi
 if [ -f "$SYSROOT/usr/bin/dwl" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/dwl" bin/dwl
     echo "[+] dwl ELF installed at bin/dwl (root:root 0755)"
+fi
+if [ -f "$SYSROOT/usr/bin/foot" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/foot" bin/foot
+    echo "[+] foot ELF installed at bin/foot (root:root 0755)"
 fi
 if [ -f "$SYSROOT/usr/bin/tinywl" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/tinywl" bin/tinywl
