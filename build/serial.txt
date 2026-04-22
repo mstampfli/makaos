@@ -29,14 +29,17 @@ K
 [virtio-gpu] found at 00:03.0 did=1050
 [virtio-gpu] scanout 0: 1280x800
 [virtio-gpu] initialised (1 scanouts)
-[elf] lazy /bin/login: header 95 us (demand-paged)
-[elf] lazy /bin/svcmgr: header 163 us (demand-paged)
+[elf] lazy /bin/login: header 199 us (demand-paged)
+[elf] lazy /bin/svcmgr: header 366 us (demand-paged)
 [chaselev] self-test starting: N=20000 thieves=3 cap=512
-[chaselev] pushed=20000 owner_popped=16041 thief_stolen=3959 found=20000 missing=0 duplicates=0
-[chaselev] SELF-TEST PASSED
-[slab_test] starting: workers=4 iters=50000 mixed sizes (8..1024)
-[slab_test] allocs=200000 slab_hits=400093 slab_misses=16 hit_rate=9999/10000
-[slab_test] pcp_hits=22 pcp_misses=0 hit_rate=10000/10000
+[elf] lazy /bin/net: header 1488 us (demand-paged)
+[chaselev] pushed=20000 owner_popped=11567 thief_stolen=8433 found=20000 missing=0 duplicates=[0
+socket-dbg] domain=[chaselev] SELF-TEST PASSED
+2 type=2 proto=[slab_test] starting: workers=0 -> 4 ite3
+rs=50000 mixed sizes[ (n8e.t.]1 0i2f4c)o
+nfig IP 10.0.2.15 GW 10.0.2.2
+[slab_test] allocs=200000 slab_hits=400084 slab_misses=13 hit_rate=9999/10000
+[slab_test] pcp_hits=12 pcp_misses=0 hit_rate=10000/10000
 [slab_test] SELF-TEST PASSED (slab hit rate >= 95%)
 [pmm10-test] alloc 0 = 0xe400000
 [pmm10-test] alloc 1 = 0xb800000
@@ -50,31 +53,142 @@ K
 [typesafe_test] starting
 [typesafe_test] SELF-TEST PASSED (defer → grace → reclaim)
 [dcache_test] starting
-[dcache_test] hits=19017 misses=11 hit_rate=9994/10000
-[elf] lazy [dcache_test] cold=/506086 ns/lookbin/net: header up warm=215 us (demand-paged)
-215 ns/lookup speedup=2353x
-[dcache_test] live=14 table_cap=256 installs=9 evictions=0
+[dcache_test] hits=19015 misses=4 hit_rate=9997/10000
+[dcache_test] cold=486 ns/lookup warm=171 ns/lookup speedup=2x
+[dcache_test] live=15 table_cap=256 installs=4 evictions=0
 [dcache_test] SELF-TEST PASSED
 [io_uring_test] starting
-[io_uring_test] NOP batch: 32 ops in 1395 ns (43 ns/op)
-[io_uring_test] steady-state: 100 rounds × 32 ops, 29 ns/op avg
+[io_uring_test] NOP batch: 32 ops in 1157 ns (36 ns/op)
+[io_uring_test] steady-state: 100 rounds × 32 ops, 21 ns/op avg
 [io_uring_test] SELF-TEST PASSED
 [eventfd-selftest] PASS (counter + semaphore + EAGAIN + EINVAL + poll)
-[socket-dbg] domain=2 type=2 proto=0 -> 3
-[net] ifconfig IP 10.0.2.15 GW 10.0.2.2
 [timerfd-selftest] PASS (oneshot + periodic + gettime + no-write)
 [socketpair-selftest] PASS (bidirectional stream)
 [scm_rights-selftest] PASS (fd round-trip over pair)
 [signalfd-selftest] PASS (EAGAIN + signo + drain + no-write)
 [drm-mock-selftest] PASS (vtable + happy path + error paths)
-[elf] lazy /bin/bash: header 238 us (demand-paged)
-[elf] lazy /bin/dwl: header 998 us (demand-paged)
+[elf] lazy /bin/bash: header 426 us (demand-paged)
+[elf] lazy /bin/dwl: header 648 us (demand-paged)
 [socket-dbg] domain=1 type=524289 proto=0 -> 16
-[pf] dwl: 137 disk  216 cache  (61% warm)
-[elf] lazy /bin/dwl: header 947 us (demand-paged)
-[socket-dbg] domain=1 type=524289 proto=0 -> 16
-[pf] dwl: 0 disk  353 cache  (100% warm)
-[pf] bash: 141828344 disk  1090028360 cache  (1% warm)
-[elf] lazy /bin/dwl: header 369 us (demand-paged)
-[socket-dbg] domain=1 type=524289 proto=0 -> 16
-[pf] dwl: 0 disk  353 cache  (100% warm)
+[pf] dwl: 4294849267 disk  4294849756 cache  (0% warm)
+
+===== PF-KILL =====
+  pid=0x000000000000001D
+  ppid=0x000000000000001C
+  home=0x0000000000000003
+  comm=dwl
+  ec=0x0000000000000014
+  CR2=0x0000000000000000
+  RIP=0x0000000000000000
+  RSP=0x00007FFFFFFFD660
+  RFLAGS=0x0000000000010286
+  CS=0x000000000000002B
+  p=0x0000000000000000
+  w=0x0000000000000000
+  x=0x0000000000000001
+  RAX=0xFFFFFFFFFFFFFFFF
+  RBX=0x00007FFFFFFFDC00
+  RCX=0x000000000057D7DE
+  RDX=0x0000000000000001
+  RBP=0x00007FFFFFFFDB28
+  RSI=0x0000000000000000
+  RDI=0xFFFFFFFFFFFFFFF6
+  R8=0x0000000000000000
+  R9=0x0000000000000000
+  R10=0x00007FFFFFFFD570
+  R11=0x0000000000000202
+  R12=0x00000000FFFFFFFF
+  R13=0x0000000000000000
+  R14=0x00000000006A31A0
+  R15=0x00000000FFFFFFFF
+  VMAs:
+    [0x0000000000400000
+ - 0x000000000063B000
+] f=0x0000000000000045
+    [0x000000000063B000
+ - 0x00000000006A3000
+] f=0x0000000000000043
+    [0x00000000006A3000
+ - 0x000000000094A000
+] f=0x000000000000000B
+    [0x00007FEFFF7A4000
+ - 0x00007FEFFFB8C000
+] f=0x000000000000001B
+    [0x00007FEFFFB8C000
+ - 0x00007FEFFFB90000
+] f=0x000000000000001B
+    [0x00007FEFFFB90000
+ - 0x00007FEFFFF78000
+] f=0x000000000000001B
+    [0x00007FFFFF7FE000
+ - 0x00007FFFFFFFE000
+] f=0x000000000000000B
+  STACK@RSP (32 words):
+    0x00007FFFFFFFD660
+: 0x000000000057D3B2
+    0x00007FFFFFFFD668
+: 0x00007FFFFFFFD730
+    0x00007FFFFFFFD670
+: 0x0000000000000206
+    0x00007FFFFFFFD678
+: 0x00007FFFFFFFD770
+    0x00007FFFFFFFD680
+: 0x0000000000580C50
+    0x00007FFFFFFFD688
+: 0x00000000006577E0
+    0x00007FFFFFFFD690
+: 0x0000000000000009
+    0x00007FFFFFFFD698
+: 0x00000000006A71B8
+    0x00007FFFFFFFD6A0
+: 0x0000000000000000
+    0x00007FFFFFFFD6A8
+: 0x0000000000000000
+    0x00007FFFFFFFD6B0
+: 0x00007FFFFFFFD6E0
+    0x00007FFFFFFFD6B8
+: 0x0000000000413B7D
+    0x00007FFFFFFFD6C0
+: 0x00007FFFFFFFD700
+    0x00007FFFFFFFD6C8
+: 0x00007FFFFFFFD7B0
+    0x00007FFFFFFFD6D0
+: 0x00007FFFFFFFD730
+    0x00007FFFFFFFD6D8
+: 0x0000000000706580
+    0x00007FFFFFFFD6E0
+: 0x00007FFFFFFFD700
+    0x00007FFFFFFFD6E8
+: 0x000000000040F167
+    0x00007FFFFFFFD6F0
+: 0x00000000007DD1D0
+    0x00007FFFFFFFD6F8
+: 0x00007FFFFFFFD750
+    0x00007FFFFFFFD700
+: 0x00007FFFFFFFD7E0
+    0x00007FFFFFFFD708
+: 0x000000000040FB48
+    0x00007FFFFFFFD710
+: 0x0000000000000000
+    0x00007FFFFFFFD718
+: 0x00000000006FBF60
+    0x00007FFFFFFFD720
+: 0x00007FFFFFFFD770
+    0x00007FFFFFFFD728
+: 0x000000000052ADE2
+    0x00007FFFFFFFD730
+: 0x00000000006A8788
+    0x00007FFFFFFFD738
+: 0x000000000071CFD8
+    0x00007FFFFFFFD740
+: 0x0000000000000001
+    0x00007FFFFFFFD748
+: 0x00000000006A87B0
+    0x00007FFFFFFFD750
+: 0x00007FFFFFFFD780
+    0x00007FFFFFFFD758
+: 0x0000000000000001
+  CODE@RIP:
+    (RIP not mapped)
+===== END PF-KILL =====
+

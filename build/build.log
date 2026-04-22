@@ -64,6 +64,8 @@ In file included from /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_time.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sdl_port_stubs.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_time.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
 /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_time.o: missing .note.GNU-stack section implies executable stack
@@ -303,6 +305,7 @@ build/BOOTX64.EFI 8704
 [+] /etc/passwd and /etc/shadow installed
 [+] /etc/services/net.svc installed
 [+] smp_test ELF installed at bin/smp_test (root:root 0755)
+[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)
 [+] shell ELF installed at bin/shell (root:root 0755)
 [+] ps ELF installed at bin/ps (root:root 0755)
 [+] net ELF installed at bin/net (root:root 0755)
@@ -314,6 +317,7 @@ build/BOOTX64.EFI 8704
 [+] ls ELF installed at bin/ls (root:root 0755)
 [+] doom ELF installed at bin/doom (root:root 0755)
 [+] bash ELF installed at bin/bash (root:root 0755)
+[+] sh (bash) installed at bin/sh (root:root 0755)
 [+] cat ELF installed at bin/cat (root:root 0755)
 [+] echo ELF installed at bin/echo (root:root 0755)
 [+] mkdir ELF installed at bin/mkdir (root:root 0755)
@@ -325,9 +329,10 @@ build/BOOTX64.EFI 8704
 [+] demo_client ELF installed at bin/demo_client (root:root 0755)
 [+] makaterm ELF installed at bin/makaterm (root:root 0755)
 [+] dwl ELF installed at bin/dwl (root:root 0755)
+[+] foot ELF installed at bin/foot (root:root 0755)
 [+] tinywl ELF installed at bin/tinywl (root:root 0755)
 [+] WAD installed: userland/apps/doom/doom1.wad → /bin/doom1.wad (root:root 0644)
 [+] xkeyboard-config installed at /usr/share/X11/xkb
-build/disk.img 36700160
+build/disk.img 137363456
 [+] Running QEMU (UEFI/OVMF)
-./build.sh: line 819: 403033 Killed                  qemu-system-x86_64 -accel kvm -cpu host -smp 4 -m 256M -nodefaults -no-user-config -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$OVMF_VARS" -drive format=raw,file="$BUILD_DIR/disk.img",if=none,id=hd0 -device ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 -vga std -device virtio-gpu-pci -display none -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -netdev user,id=net0,hostfwd=tcp::18080-:80 -device virtio-net-pci,netdev=net0 -object filter-dump,id=f1,netdev=net0,file=build/net.pcap -serial file:build/serial.txt -monitor none -gdb tcp::1234 -no-reboot -no-shutdown
+./build.sh: line 891: 70612 Killed                  qemu-system-x86_64 -accel kvm -cpu host -smp 4 -m 256M -nodefaults -no-user-config -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$OVMF_VARS" -drive format=raw,file="$BUILD_DIR/disk.img",if=none,id=hd0 -device ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 -vga std -device virtio-gpu-pci -display none -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -netdev user,id=net0,hostfwd=tcp::18080-:80 -device virtio-net-pci,netdev=net0 -object filter-dump,id=f1,netdev=net0,file=build/net.pcap -serial file:build/serial.txt -monitor none -gdb tcp::1234 -no-reboot -no-shutdown
