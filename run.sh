@@ -30,6 +30,6 @@ qemu-system-x86_64 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \
   -device virtio-net-pci,netdev=net0 \
   -serial file:build/serial.txt \
-  -monitor none \
+  -monitor unix:/tmp/qemu-hmp.sock,server,nowait \
   -gdb tcp::1234 \
   -no-reboot -no-shutdown
