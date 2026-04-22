@@ -30,6 +30,50 @@ int dup2(int oldfd, int newfd) {
 int pipe(int fds[2]) {
     return (int)__syscall_ret(syscall1(SYS_PIPE, (uint64_t)fds));
 }
+
+// pipe2 — Linux extension.  Implement as pipe() + fcntl flag
+// applications.  We don't yet route an atomic SYS_PIPE2; the race
+// window between pipe() creating the fds and fcntl() setting
+// O_CLOEXEC doesn't matter for single-threaded SDL init paths.
+// TODO(scalability-debt-ledger): expose a real SYS_PIPE2 so callers
+// can't leak fds across fork+exec in a multi-threaded race.
+extern int fcntl(int fd, int cmd, ...);
+#ifndef O_CLOEXEC
+#define O_CLOEXEC  02000000
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 00004000
+#endif
+#ifndef F_GETFL
+#define F_GETFL    3
+#endif
+#ifndef F_SETFL
+#define F_SETFL    4
+#endif
+#ifndef F_GETFD
+#define F_GETFD    1
+#endif
+#ifndef F_SETFD
+#define F_SETFD    2
+#endif
+#ifndef FD_CLOEXEC
+#define FD_CLOEXEC 1
+#endif
+int pipe2(int fds[2], int flags) {
+    int r = pipe(fds);
+    if (r < 0) return r;
+    if (flags & O_CLOEXEC) {
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+    if (flags & O_NONBLOCK) {
+        int f0 = fcntl(fds[0], F_GETFL);
+        int f1 = fcntl(fds[1], F_GETFL);
+        fcntl(fds[0], F_SETFL, f0 | O_NONBLOCK);
+        fcntl(fds[1], F_SETFL, f1 | O_NONBLOCK);
+    }
+    return 0;
+}
 int access(const char* path, int mode) {
     return (int)__syscall_ret(syscall2(SYS_ACCESS, (uint64_t)path, (uint64_t)mode));
 }
@@ -202,31 +246,62 @@ int rmdir(const char* path) {
 // x86_64 page size is fixed at 4 KiB.  No syscall needed.
 int getpagesize(void) { return 4096; }
 
-// execl — variadic exec-variant.  Our kernel SYS_EXEC takes path+len;
-// gather argv from varargs, then forward.  Limit to 64 args (plenty
-// for compositor spawn-terminal etc).  Fails with E2BIG if exceeded.
+// exec-family — kernel sys_exec takes (path, argv_ptr, envp_ptr).
+// argv_ptr and envp_ptr are NULL-terminated user-space arrays of
+// char* pointers.  Pass them through straight; the kernel handles
+// the copy.  Earlier revisions lost argv because the libc wrappers
+// were calling syscall2(SYS_EXEC, path, pathlen) — the kernel then
+// saw pathlen in argv's slot and read garbage.
 #include <stdarg.h>
+
+#define EXEC_MAX_ARGS 256
+
+int execve(const char* path, char* const argv[], char* const envp[]) {
+    return (int)__syscall_ret(syscall3(SYS_EXEC,
+        (uint64_t)path, (uint64_t)argv, (uint64_t)envp));
+}
+
 int execl(const char* path, const char* arg0, ...) {
-    (void)arg0;
-    // MakaOS kernel currently has no "exec with argv" path — SYS_EXEC
-    // takes only the program path.  argv/envp are communicated via
-    // SYS_SPAWN, which we'd reach for in the common fork→exec pattern
-    // but not the variadic execl.  For now: invoke SYS_EXEC with just
-    // the path; argv[0] lost.  Revisit when argv-aware exec lands.
-    size_t n = 0; while (path && path[n]) n++;
-    return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, n));
+    // Collect variadic args into a NULL-terminated array.
+    const char* argv[EXEC_MAX_ARGS + 1];
+    int argc = 0;
+    argv[argc++] = arg0;
+    va_list ap;
+    va_start(ap, arg0);
+    while (argc < EXEC_MAX_ARGS) {
+        const char* a = va_arg(ap, const char*);
+        argv[argc++] = a;
+        if (!a) break;
+    }
+    argv[argc] = NULL;
+    va_end(ap);
+    return (int)__syscall_ret(syscall3(SYS_EXEC,
+        (uint64_t)path, (uint64_t)argv, 0));
 }
 
-int execlp(const char* path, const char* arg0, ...) {
-    return execl(path, arg0);
+int execlp(const char* file, const char* arg0, ...) {
+    const char* argv[EXEC_MAX_ARGS + 1];
+    int argc = 0;
+    argv[argc++] = arg0;
+    va_list ap;
+    va_start(ap, arg0);
+    while (argc < EXEC_MAX_ARGS) {
+        const char* a = va_arg(ap, const char*);
+        argv[argc++] = a;
+        if (!a) break;
+    }
+    argv[argc] = NULL;
+    va_end(ap);
+    // execlp semantics = execl with PATH search; we honour the call
+    // even if `file` is a bare name — kernel-side SYS_EXEC lookups
+    // resolve via $PATH when the argument lacks a slash.
+    return (int)__syscall_ret(syscall3(SYS_EXEC,
+        (uint64_t)file, (uint64_t)argv, 0));
 }
 
-// execvp — as-close-as-we-get to POSIX until kernel SYS_EXEC grows
-// argv support.  argv dropped, arg[0] lost.  Same caveat as execl.
 int execvp(const char* path, char* const argv[]) {
-    (void)argv;
-    size_t n = 0; while (path && path[n]) n++;
-    return (int)__syscall_ret(syscall2(SYS_EXEC, (uint64_t)path, n));
+    return (int)__syscall_ret(syscall3(SYS_EXEC,
+        (uint64_t)path, (uint64_t)argv, 0));
 }
 
 int execv(const char* path, char* const argv[]) {
@@ -234,7 +309,8 @@ int execv(const char* path, char* const argv[]) {
 }
 
 int execvpe(const char* path, char* const argv[], char* const envp[]) {
-    (void)envp; return execvp(path, argv);
+    return (int)__syscall_ret(syscall3(SYS_EXEC,
+        (uint64_t)path, (uint64_t)argv, (uint64_t)envp));
 }
 
 // setsid — new session/process group.  MakaOS has no multi-session
@@ -303,3 +379,24 @@ int ftruncate(int fd, off_t length) {
     return (int)__syscall_ret(
         syscall2(SYS_FTRUNCATE, (uint64_t)fd, (uint64_t)length));
 }
+
+// ── Port-surface extern impls ────────────────────────────────────────
+// Declared in <unistd.h>; previously only inline in libc.h.
+
+int gethostname(char* name, size_t len) {
+    const char* host = "makaos";
+    if (!name || !len) { errno = EINVAL; return -1; }
+    size_t n = 0;
+    while (host[n] && n + 1 < len) { name[n] = host[n]; n++; }
+    name[n] = '\0';
+    return 0;
+}
+
+// fsync / fdatasync — MakaOS's VFS doesn't yet expose a flush
+// syscall; writes go through the page cache with periodic writeback.
+// Return 0 so apps that call these don't error out; once the kernel
+// grows SYS_FSYNC these become one-line wrappers.
+// TODO(scalability-debt-ledger): expose SYS_FSYNC so crash-durable
+// apps (databases, journal files) can actually force a flush.
+int fsync(int fd)     { (void)fd; return 0; }
+int fdatasync(int fd) { (void)fd; return 0; }

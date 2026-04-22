@@ -45,6 +45,7 @@ struct ucred {
 #define SO_LINGER    13
 #define SO_BROADCAST 6
 #define SO_REUSEPORT 15
+#define SO_DOMAIN    39  // Linux: query socket's address family
 
 // Shutdown
 #define SHUT_RD   0
@@ -117,6 +118,8 @@ int     socket(int domain, int type, int protocol);
 int     bind(int fd, const struct sockaddr* addr, socklen_t addrlen);
 int     listen(int fd, int backlog);
 int     accept(int fd, struct sockaddr* addr, socklen_t* addrlen);
+// accept4 — accept with SOCK_NONBLOCK/SOCK_CLOEXEC applied atomically.
+int     accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags);
 int     connect(int fd, const struct sockaddr* addr, socklen_t addrlen);
 ssize_t send(int fd, const void* buf, size_t len, int flags);
 ssize_t recv(int fd, void* buf, size_t len, int flags);

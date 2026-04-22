@@ -1252,6 +1252,14 @@ char* stpcpy(char* dst, const char* src) {
     return dst - 1;
 }
 
+char* stpncpy(char* dst, const char* src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    char* end = dst + i;
+    for (; i < n; i++) dst[i] = '\0';
+    return end;
+}
+
 char* strchrnul(const char* s, int c) {
     while (*s && *s != (char)c) s++;
     return (char*)s;
@@ -2670,3 +2678,9 @@ static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
 // ── setvbuf ───────────────────────────────────────────────────────────────
 // Defined in stdio.c but needs to be reachable from libc.c's declarations.
 // Forward-declare; actual body is in stdio.c.
+
+// SDL3 / port-surface extern impls — moved to sdl_port_stubs.c,
+// which is compiled with SYSROOT_CFLAGS so its sysroot-header
+// types (wchar_t, size_t, …) agree with the ports that consume
+// them.  Compiling them here against in-tree libc.h caused a
+// wchar.h redefinition storm.

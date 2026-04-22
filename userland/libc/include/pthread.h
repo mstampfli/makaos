@@ -10,13 +10,25 @@
 #include <sys/types.h>
 #include <stddef.h>
 #include <time.h>
+// POSIX allows pthread.h to not include sched.h, but glibc does and
+// upstream code (SDL3's systhread among others) relies on pthread.h
+// transitively providing SCHED_OTHER/RR/FIFO + struct sched_param +
+// sched_get_priority_{min,max}.  Match glibc for compatibility.
+#include <sched.h>
 
 typedef int pthread_t;              // tid = kernel pid of the thread task
 typedef struct {
-    int kind;                       // reserved for attribute future-proofing
+    int    kind;                    // reserved for attribute future-proofing
     size_t stack_size;
-    void* stack;
+    void*  stack;
+    int    detachstate;             // PTHREAD_CREATE_{JOINABLE,DETACHED}
+    int    schedpolicy;             // SCHED_OTHER / SCHED_FIFO / SCHED_RR
+    int    schedpriority;           // 0 for SCHED_OTHER
 } pthread_attr_t;
+
+// Detach state
+#define PTHREAD_CREATE_JOINABLE 0
+#define PTHREAD_CREATE_DETACHED 1
 
 typedef struct {
     volatile int locked;            // 0 = free, 1 = held
@@ -67,14 +79,20 @@ int pthread_attr_destroy(pthread_attr_t* a);
 int pthread_attr_setstacksize(pthread_attr_t* a, size_t sz);
 int pthread_attr_getstacksize(const pthread_attr_t* a, size_t* sz);
 int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz);
+int pthread_attr_setdetachstate(pthread_attr_t* a, int state);
+int pthread_attr_getdetachstate(const pthread_attr_t* a, int* state);
+int pthread_attr_setschedpolicy(pthread_attr_t* a, int policy);
+int pthread_attr_getschedpolicy(const pthread_attr_t* a, int* policy);
+struct sched_param;
+int pthread_attr_setschedparam(pthread_attr_t* a, const struct sched_param* p);
+int pthread_attr_getschedparam(const pthread_attr_t* a, struct sched_param* p);
 
 // ── Thread lifecycle ─────────────────────────────────────────────────
 int  pthread_create(pthread_t* tid, const pthread_attr_t* attr,
                      void* (*start)(void*), void* arg);
 int  pthread_join(pthread_t tid, void** retval);
 int  pthread_detach(pthread_t tid);
-__attribute__((noreturn))
-void pthread_exit(void* retval);
+void pthread_exit(void* retval) __attribute__((__noreturn__));
 pthread_t pthread_self(void);
 int  pthread_equal(pthread_t a, pthread_t b);
 int  pthread_cancel(pthread_t tid);
@@ -136,5 +154,20 @@ int pthread_spin_unlock(pthread_spinlock_t* s);
 int sched_yield(void);
 int pthread_setname_np(pthread_t tid, const char* name);
 int pthread_getname_np(pthread_t tid, char* name, size_t n);
+
+// Per-thread signal mask — MakaOS has a single process-wide mask
+// so this aliases sigprocmask.  Forward-decl the sigset_t from
+// signal.h to avoid pulling the whole header here.
+#ifndef _MAKAOS_SIGNAL_H
+typedef unsigned long sigset_t;
+#endif
+int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+
+// Scheduling parameters — MakaOS has no pluggable scheduler policy,
+// so these accept/report reasonable defaults and the kernel runs
+// every thread at the same priority.  Provided so upstream libs
+// that probe for real-time priorities don't explode at link time.
+int pthread_setschedparam(pthread_t tid, int policy, const struct sched_param* p);
+int pthread_getschedparam(pthread_t tid, int* policy, struct sched_param* p);
 
 #endif

@@ -38,9 +38,9 @@ int   unsetenv(const char* name);
 int   putenv(char* str);
 
 // Process control
-__attribute__((noreturn)) void exit(int status);
-__attribute__((noreturn)) void _Exit(int status);
-__attribute__((noreturn)) void abort(void);
+__attribute__((__noreturn__)) void exit(int status);
+__attribute__((__noreturn__)) void _Exit(int status);
+__attribute__((__noreturn__)) void abort(void);
 int  atexit(void (*fn)(void));
 int  system(const char* cmd);
 
@@ -95,6 +95,15 @@ int    mblen(const char* s, size_t n);
 double        strtod_l (const char* s, char** endptr, locale_t loc);
 long          strtol_l (const char* s, char** endptr, int base, locale_t loc);
 unsigned long strtoul_l(const char* s, char** endptr, int base, locale_t loc);
+
+// PTY master allocation — foot's terminal.c calls posix_openpt to
+// get a master fd, then grantpt/unlockpt/ptsname on it.  Our ptmx
+// path (/dev/ptmx) gives a fresh master/slave pair on each open.
+int   posix_openpt(int flags);
+int   grantpt(int fd);
+int   unlockpt(int fd);
+char* ptsname(int fd);
+int   ptsname_r(int fd, char* buf, size_t len);
 
 #ifdef __cplusplus
 }

@@ -25,6 +25,7 @@
 #define NAME_MAX    255
 #define OPEN_MAX    1024
 #define PIPE_BUF    4096
-#define HOST_NAME_MAX 64
+#define HOST_NAME_MAX        64
+#define _POSIX_HOST_NAME_MAX 255   // POSIX floor; foot uri.c wants it
 
 #endif

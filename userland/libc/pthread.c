@@ -97,9 +97,12 @@ static void slot_free(thr_slot_t* s) {
 
 int pthread_attr_init(pthread_attr_t* a) {
     if (!a) return EINVAL;
-    a->kind = 0;
-    a->stack_size = 256 * 1024;            // 256 KiB default
-    a->stack = NULL;
+    a->kind          = 0;
+    a->stack_size    = 256 * 1024;            // 256 KiB default
+    a->stack         = NULL;
+    a->detachstate   = PTHREAD_CREATE_JOINABLE;
+    a->schedpolicy   = 0;  // SCHED_OTHER
+    a->schedpriority = 0;
     return 0;
 }
 int pthread_attr_destroy(pthread_attr_t* a) { (void)a; return 0; }
@@ -114,6 +117,49 @@ int pthread_attr_getstacksize(const pthread_attr_t* a, size_t* sz) {
 int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz) {
     if (!a || !stack || sz < 16 * 1024) return EINVAL;
     a->stack = stack; a->stack_size = sz; return 0;
+}
+int pthread_attr_setdetachstate(pthread_attr_t* a, int state) {
+    if (!a) return EINVAL;
+    if (state != PTHREAD_CREATE_JOINABLE && state != PTHREAD_CREATE_DETACHED)
+        return EINVAL;
+    a->detachstate = state; return 0;
+}
+int pthread_attr_getdetachstate(const pthread_attr_t* a, int* state) {
+    if (!a || !state) return EINVAL;
+    *state = a->detachstate; return 0;
+}
+int pthread_attr_setschedpolicy(pthread_attr_t* a, int policy) {
+    if (!a) return EINVAL;
+    a->schedpolicy = policy; return 0;
+}
+int pthread_attr_getschedpolicy(const pthread_attr_t* a, int* policy) {
+    if (!a || !policy) return EINVAL;
+    *policy = a->schedpolicy; return 0;
+}
+// struct sched_param is defined in <sched.h>, which <pthread.h>
+// pulls in transitively (glibc-compatible behaviour) — no local
+// redefinition needed.
+int pthread_attr_setschedparam(pthread_attr_t* a, const struct sched_param* p) {
+    if (!a || !p) return EINVAL;
+    a->schedpriority = p->sched_priority; return 0;
+}
+int pthread_attr_getschedparam(const pthread_attr_t* a, struct sched_param* p) {
+    if (!a || !p) return EINVAL;
+    p->sched_priority = a->schedpriority; return 0;
+}
+
+// Per-thread scheduling on MakaOS is a no-op — the kernel runs every
+// thread under its fair CFS-like scheduler.  Report defaults and
+// accept any priority silently so upstream code that probes for
+// SCHED_FIFO/RR at startup doesn't abort.
+int pthread_setschedparam(pthread_t tid, int policy, const struct sched_param* p) {
+    (void)tid; (void)policy; (void)p; return 0;
+}
+int pthread_getschedparam(pthread_t tid, int* policy, struct sched_param* p) {
+    (void)tid;
+    if (policy) *policy = 0;       // SCHED_OTHER
+    if (p) p->sched_priority = 0;
+    return 0;
 }
 
 int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
@@ -152,6 +198,10 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
     if (s) { s->stack = stack; s->stack_size = stack_size; }
 
     *tid_out = (pthread_t)tid;
+    // Honour PTHREAD_CREATE_DETACHED — SDL3 sets it on every non-main
+    // thread to avoid leaking the thread slot on exit.
+    if (attr && attr->detachstate == PTHREAD_CREATE_DETACHED)
+        pthread_detach((pthread_t)tid);
     return 0;
 }
 
@@ -510,6 +560,23 @@ int pthread_spin_unlock(pthread_spinlock_t* s) { if (!s) return EINVAL; __sync_l
 
 int sched_yield(void) {
     return (int)syscall0(SYS_SCHED_YIELD);
+}
+
+// Remaining sched.h functions — MakaOS has a single CFS-like policy,
+// so we report fixed bounds and accept any configuration without
+// error.  Priorities only matter once we expose real-time policies
+// (deferred with the rest of the scheduler work).
+int sched_get_priority_min(int policy) { (void)policy; return 0; }
+int sched_get_priority_max(int policy) { (void)policy; return 99; }
+int sched_getscheduler(pid_t pid) { (void)pid; return 0; }
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param* p) {
+    (void)pid; (void)policy; (void)p; return 0;
+}
+int sched_getparam(pid_t pid, struct sched_param* p) {
+    (void)pid; if (p) p->sched_priority = 0; return 0;
+}
+int sched_setparam(pid_t pid, const struct sched_param* p) {
+    (void)pid; (void)p; return 0;
 }
 
 int pthread_setname_np(pthread_t tid, const char* name) {
