@@ -104,6 +104,22 @@ void wait_queue_wake_all(wait_queue_t* wq) {
     // Walk the detached chain.  next pointers are stable because we
     // own the chain now.
     while (chain) {
+        // Canonical-pointer sanity: next must be NULL or a kernel
+        // higher-half address.  Anything else means the entry's
+        // memory was clobbered after enqueue (classic UAF — entry
+        // freed by its owner but still linked on our list).  Catch
+        // it here with context, rather than letting the next
+        // iteration GP on `mov 0x8(%r15),%r15` with a non-canonical
+        // pointer in r15.
+        if (chain->next != NULL &&
+            ((uintptr_t)chain->next >> 47) != 0x1FFFF) {
+            extern void kprintf(const char*, ...);
+            kprintf("\n=== WAKE UAF next === wq=%p chain=%p func=%p "
+                    "dead=%x next=%p\n",
+                    wq, chain, chain->func,
+                    chain->dead, chain->next);
+            chain->next = NULL;  // truncate the chain, don't GP
+        }
         wake_entry_t* next = chain->next;
         // Read dead once.  If the canceller set it after we grabbed the
         // chain, we see the new value and skip.  If we see dead==0 and
