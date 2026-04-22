@@ -1,0 +1,3 @@
+[  3%] Built target SDL3_test
+[ 13%] Built target SDL_uclibc
+[100%] Built target SDL3-static
