@@ -36,4 +36,11 @@ int epoll_create1(int flags);
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event* ev);
 int epoll_wait(int epfd, struct epoll_event* evs, int max, int timeout);
 
+// epoll_pwait — epoll_wait with an atomic signal-mask swap.  MakaOS
+// has no per-thread sigmask yet; we ignore the mask and forward to
+// epoll_wait.  Foot uses this for its main-loop sleep.
+#include <signal.h>
+int epoll_pwait(int epfd, struct epoll_event* evs, int max, int timeout,
+                const sigset_t* sigmask);
+
 #endif

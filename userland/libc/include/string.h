@@ -49,6 +49,15 @@ char*  strdup(const char* s);
 char*  strndup(const char* s, size_t n);
 char*  strerror(int errnum);
 
+// GNU extension — strcpy variant that returns dst + strlen(src)
+// rather than dst.  Used by SDL3's Wayland clipboard code and
+// various other ports that assume _GNU_SOURCE.
+char*  stpcpy(char* dst, const char* src);
+char*  stpncpy(char* dst, const char* src, size_t n);
+
+// Human-readable signal name — foot uses this to report child exits.
+char*  strsignal(int sig);
+
 #ifdef __cplusplus
 }
 #endif

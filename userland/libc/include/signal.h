@@ -39,6 +39,13 @@
 
 #define NSIG     32
 
+// Realtime signals.  MakaOS has no per-task RT signal delivery yet,
+// so these constants exist only so ports that reference them (foot
+// uses SIGRTMAX for its event-driven wakeup slot) compile.  Sending
+// an RT signal today silently gets treated as out-of-range.
+#define SIGRTMIN  32
+#define SIGRTMAX  63
+
 // sig_handler_t special values
 #define SIG_DFL  ((void (*)(int)) 0)
 #define SIG_IGN  ((void (*)(int)) 1)
@@ -99,5 +106,20 @@ int sigfillset(sigset_t* set);
 int sigaddset(sigset_t* set, int sig);
 int sigdelset(sigset_t* set, int sig);
 int sigismember(const sigset_t* set, int sig);
+
+// Synchronously wait for a signal with a timeout.  POSIX requires
+// signal.h to make `struct timespec` visible via <time.h>; SDL3's
+// clipboard code declares a local `struct timespec zerotime` after
+// only including <signal.h>, so the forward decl we had here left
+// the type incomplete at the declaration site.  Pull <time.h> in
+// for a full definition.
+#include <time.h>
+int sigtimedwait(const sigset_t* set, siginfo_t* info, const struct timespec* timeout);
+int sigwaitinfo(const sigset_t* set, siginfo_t* info);
+int sigwait(const sigset_t* set, int* sig);
+
+// Per-thread signal mask.  MakaOS has a single process-wide mask,
+// so this aliases sigprocmask.  Also declared in <pthread.h>.
+int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
 
 #endif

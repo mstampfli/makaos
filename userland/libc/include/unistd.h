@@ -39,7 +39,22 @@ off_t   lseek(int fd, off_t off, int whence);
 int     dup(int fd);
 int     dup2(int old_fd, int new_fd);
 int     pipe(int fds[2]);
+int     pipe2(int fds[2], int flags);   // Linux ext — O_CLOEXEC | O_NONBLOCK
 int     isatty(int fd);
+
+// sysconf — runtime queries.  MakaOS returns fixed values for the
+// handful of names ports actually look up; anything else returns -1.
+long   sysconf(int name);
+// confstr — string-valued runtime queries (just _CS_PATH for foot).
+size_t confstr(int name, char* buf, size_t len);
+#define _CS_PATH 0
+// _SC_* names — only the subset foot / harfbuzz probe today.
+#define _SC_NPROCESSORS_CONF  10
+#define _SC_NPROCESSORS_ONLN  11
+#define _SC_PAGESIZE          30
+#define _SC_PAGE_SIZE         _SC_PAGESIZE
+#define _SC_CLK_TCK           2
+#define _SC_OPEN_MAX          4
 int     ftruncate(int fd, off_t len);
 int     truncate(const char* path, off_t len);
 int     fsync(int fd);
@@ -71,7 +86,7 @@ int    execvp(const char* file, char* const argv[]);
 int    execl(const char* path, const char* arg, ...);
 int    execlp(const char* file, const char* arg, ...);
 int    execle(const char* path, const char* arg, ...);
-__attribute__((noreturn)) void _exit(int status);
+__attribute__((__noreturn__)) void _exit(int status);
 
 // Identity
 uid_t  getuid(void);
