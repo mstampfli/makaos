@@ -21,8 +21,15 @@ else()
     get_filename_component(_MAKAOS_REPO "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+# CMake needs Platform/MakaOS{,-Initialize}.cmake to understand our
+# OS; without them it won't set UNIX=TRUE and projects like SDL3 that
+# gate Wayland/pthread support on UNIX silently force-disable those.
+# The platform files live in scripts/cmake-modules/Platform/; prepend
+# that dir to CMAKE_MODULE_PATH *before* CMake looks up the platform,
+# which is what toolchain files are for.
 set(CMAKE_SYSTEM_NAME      MakaOS)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake-modules")
 
 set(CMAKE_SYSROOT          "${_MAKAOS_REPO}/build/sysroot")
 
