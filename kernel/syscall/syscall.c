@@ -3576,9 +3576,16 @@ typedef struct {
     uint32_t     events;    // EPOLLIN | EPOLLOUT | ...
     epoll_data_t data;
     // Persistent epoll_we_t entries registered on the watched fd's queues.
-    epoll_we_t   entry;     // on f->waitq
-    epoll_we_t   entry2;    // on f->secondary_waitq (if any)
+    epoll_we_t   entry;     // on wq1
+    epoll_we_t   entry2;    // on wq2 (if has_entry2)
     int          has_entry2;
+    // Backup pointers to the waitqs we're registered on, so we can
+    // unregister even when the target vfs_file_t has already been
+    // freed (close(fd) before epoll_close()).  Otherwise the entries
+    // stay linked on long-lived global queues like g_mouse_waitq and
+    // the next wake walks into our RCU-freed w → #GP.
+    wait_queue_t* wq1;
+    wait_queue_t* wq2;
 } epoll_watch_t;
 
 typedef struct {
@@ -3648,21 +3655,28 @@ static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
                                   vfs_file_t* f) {
     epoll_we_init(&w->entry, &state->wq, &state->has_ready);
     epoll_we_add(f->waitq, &w->entry);
+    w->wq1 = f->waitq;
     if (f->secondary_waitq) {
         epoll_we_init(&w->entry2, &state->wq, &state->has_ready);
         epoll_we_add(f->secondary_waitq, &w->entry2);
+        w->wq2 = f->secondary_waitq;
         w->has_entry2 = 1;
     } else {
+        w->wq2        = NULL;
         w->has_entry2 = 0;
     }
 }
 
 static void epoll_watch_unregister(epoll_watch_t* w, vfs_file_t* f) {
-    if (f) {
-        epoll_we_remove(f->waitq, &w->entry);
-        if (w->has_entry2 && f->secondary_waitq)
-            epoll_we_remove(f->secondary_waitq, &w->entry2);
-    }
+    // Use the saved waitq pointers, not f->waitq — f may already be
+    // freed if the target fd was closed before the epoll fd.  Without
+    // this, our entries stay linked on global waitqs (g_mouse_waitq,
+    // pty master_waitq, …) and the next wake walks freed-w memory.
+    (void)f;
+    if (w->wq1)                  epoll_we_remove(w->wq1, &w->entry);
+    if (w->has_entry2 && w->wq2) epoll_we_remove(w->wq2, &w->entry2);
+    w->wq1 = NULL;
+    w->wq2 = NULL;
     w->has_entry2 = 0;
 }
 
@@ -3786,6 +3800,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         w->events     = ev.events;
         w->data       = ev.data;
         w->has_entry2 = 0;
+        w->wq1        = NULL;
+        w->wq2        = NULL;
         epoll_watch_register(state, w, wf);
         ep_ht_insert_raw(state->slots, state->cap, w);
         state->count++;
