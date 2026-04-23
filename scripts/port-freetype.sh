@@ -35,6 +35,8 @@ CFLAGS=(
     -Wno-missing-field-initializers
     -DFT2_BUILD_LIBRARY
     -DFT_CONFIG_OPTION_SYSTEM_ZLIB   # use sysroot zlib not freetype's copy
+    -DHAVE_UNISTD_H                  # required by builds/unix/ftsystem.c
+    -DHAVE_FCNTL_H
     # Note: FT_CONFIG_OPTION_USE_PNG / USE_HARFBUZZ / USE_BROTLI / MAC_FONTS
     # are gated by `defined()` in the source, not value.  Leaving them
     # undefined is correct; explicitly `-DFOO=0` would trigger the
@@ -73,8 +75,14 @@ build_lib() {
     # Each listed .c is a module aggregator that #includes every
     # sub-file of the module — a deliberate design of freetype's
     # build system.  We just compile each aggregator once.
+    # Use the Unix ftsystem.c (mmap-backed) not the generic stdio one.
+    # The generic version wraps fopen/fread/fseek for every stream I/O,
+    # which turns each of freetype's ~N glyph-index lookups into a
+    # syscall — observed ~9000 syscalls per font open, ~75 s of wall
+    # time on a 343 KB TTF.  The Unix ftsystem.c mmap()s the font at
+    # FT_Stream_Open time, so lookups become pointer derefs.
     local srcs=(
-        "src/base/ftsystem.c"
+        "builds/unix/ftsystem.c"
         "src/base/ftinit.c"
         "src/base/ftdebug.c"
         "src/base/ftbase.c"

@@ -285,8 +285,22 @@ static void unix_sock_free_rcu(void* data) {
 }
 
 void unix_sock_close(vfs_file_t* self) {
+    extern void kprintf(const char*, ...);
     unix_sock_t* s = (unix_sock_t*)self->ctx;
-    if (!s) { kfree(self); return; }
+    if (!s) {
+        kprintf("[unix] close: no ctx on file %p (nothing to free)\n",
+                (void*)self);
+        kfree(self); return;
+    }
+
+    /* Unconditional entry log so we can see every unix sock close,
+     * whether it's bound or not.  (Observed: second dwl's bind got
+     * EADDRINUSE on /tmp/wayland-0 even though the first dwl was
+     * dead — need to know if the close ran at all.) */
+    kprintf("[unix] close: path=\"%s\" state=%u type=%d %s\n",
+            s->path[0] ? s->path : "(unbound)",
+            (unsigned)s->state, (int)s->type,
+            s->path[0] ? "evicting from ns" : "not in ns");
 
     // Unpublish from the namespace first so new ns_find() cannot observe
     // the sock after this point.  Readers that observed the sock in a

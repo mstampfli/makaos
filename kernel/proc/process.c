@@ -107,11 +107,20 @@ task_files_t* task_files_alloc(void) {
 
 void task_files_release(task_files_t* f) {
     if (!f) return;
-    if (--f->refs > 0) return;
+    extern void kprintf(const char*, ...);
+    uint32_t pre_refs = f->refs;
+    if (--f->refs > 0) {
+        kprintf("[files] release: refs %u -> %u (NOT freeing yet)\n",
+                pre_refs, f->refs);
+        return;
+    }
+    kprintf("[files] release: refs %u -> 0, closing fds\n", pre_refs);
     fdtable_t* ft = f->ft;
+    int closed = 0;
     if (ft) {
         for (uint32_t i = 0; i < ft->cap; i++)
-            if (ft->fd_table[i]) vfs_close(ft->fd_table[i]);
+            if (ft->fd_table[i]) { vfs_close(ft->fd_table[i]); closed++; }
+        kprintf("[files] closed %d fds (cap=%u)\n", closed, (unsigned)ft->cap);
         kfree(ft->fd_table);
         kfree(ft->fd_flags);
         kfree(ft);

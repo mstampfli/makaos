@@ -216,13 +216,22 @@ kernel/drivers/input/evdev.c:47:20: warning: unused function 'bit_get64' [-Wunus
    47 | static inline int  bit_get64(const uint64_t* b, uint32_t n) { return (b[n>>6] >> (n & 63)) & 1ULL; }
       |                    ^~~~~~~~~
 1 warning generated.
-kernel/drivers/video/drm.c:1573:50: warning: taking address of packed member 'count_planes' of class or structure 'struct (unnamed at kernel/drivers/video/drm.c:1557:5)' may result in an unaligned pointer value [-Waddress-of-packed-member]
- 1573 |     int rc = drm_write_id_array(r.plane_id_ptr, &r.count_planes, ids, total);
+kernel/drivers/video/drm.c:1627:50: warning: taking address of packed member 'count_planes' of class or structure 'struct (unnamed at kernel/drivers/video/drm.c:1611:5)' may result in an unaligned pointer value [-Waddress-of-packed-member]
+ 1627 |     int rc = drm_write_id_array(r.plane_id_ptr, &r.count_planes, ids, total);
       |                                                  ^~~~~~~~~~~~~~
-kernel/drivers/video/drm.c:1607:53: warning: taking address of packed member 'count_format_types' of class or structure 'struct (unnamed at kernel/drivers/video/drm.c:1580:5)' may result in an unaligned pointer value [-Waddress-of-packed-member]
- 1607 |     int rc = drm_write_id_array(p.format_type_ptr, &p.count_format_types,
+kernel/drivers/video/drm.c:1661:53: warning: taking address of packed member 'count_format_types' of class or structure 'struct (unnamed at kernel/drivers/video/drm.c:1634:5)' may result in an unaligned pointer value [-Waddress-of-packed-member]
+ 1661 |     int rc = drm_write_id_array(p.format_type_ptr, &p.count_format_types,
       |                                                     ^~~~~~~~~~~~~~~~~~~~
-2 warnings generated.
+kernel/drivers/video/drm.c:2318:53: warning: format specifies type 'long' but the argument has type 'int64_t' (aka 'long long') [-Wformat]
+ 2317 |         pr_warn("drm", "ioctl %s req=0x%08x → %ld",
+      |                                               ~~~
+      |                                               %lld
+ 2318 |                 drm_ioctl_name(req), (uint32_t)req, rc);
+      |                                                     ^~
+kernel/include/log.h:72:76: note: expanded from macro 'pr_warn'
+   72 | #define pr_warn(subsys, fmt, ...)  klog_emit(LOG_WARN,  (subsys), (fmt), ##__VA_ARGS__)
+      |                                                                    ~~~     ^~~~~~~~~~~
+3 warnings generated.
     [skip] ac97.c
     [skip] ata_driver_irq.c
     [skip] ata_poll.c
@@ -253,11 +262,11 @@ kernel/time/lapic.c:97:15: warning: duplicate 'static' declaration specifier [-W
    97 | ALWAYS_INLINE static void cpuid(uint32_t leaf,
       |               ^~~~~~
 5 warnings generated.
-kernel/syscall/syscall.c:2487:64: warning: format specifies type 'long' but the argument has type 'int64_t' (aka 'long long') [-Wformat]
- 2486 |     kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
+kernel/syscall/syscall.c:2550:64: warning: format specifies type 'long' but the argument has type 'int64_t' (aka 'long long') [-Wformat]
+ 2549 |     kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
       |                                                         ~~~
       |                                                         %lld
- 2487 |             (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
+ 2550 |             (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
       |                                                                ^~~~~~~~~~
 1 warning generated.
     [skip] asm_offsets.c
@@ -298,7 +307,7 @@ kernel/io/timerfd.c:366:85: warning: format specifies type 'long' but the argume
 3 warnings generated.
 [+] Building UEFI bootloader (clang → PE32+)
 [+] Checking sizes
-build/kernel.bin 394787
+build/kernel.bin 439859
 build/BOOTX64.EFI 8704
 [+] Creating disk image (GPT + ESP + ext2)
 [+] Building ext2 filesystem
@@ -332,7 +341,7 @@ build/BOOTX64.EFI 8704
 [+] foot ELF installed at bin/foot (root:root 0755)
 [+] tinywl ELF installed at bin/tinywl (root:root 0755)
 [+] WAD installed: userland/apps/doom/doom1.wad → /bin/doom1.wad (root:root 0644)
+[+] fonts installed: 22 DejaVu .ttf → /usr/share/fonts/truetype/dejavu
 [+] xkeyboard-config installed at /usr/share/X11/xkb
 build/disk.img 137363456
-[+] Running QEMU (UEFI/OVMF)
-./build.sh: line 891: 70612 Killed                  qemu-system-x86_64 -accel kvm -cpu host -smp 4 -m 256M -nodefaults -no-user-config -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" -drive if=pflash,format=raw,file="$OVMF_VARS" -drive format=raw,file="$BUILD_DIR/disk.img",if=none,id=hd0 -device ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 -vga std -device virtio-gpu-pci -display none -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 -netdev user,id=net0,hostfwd=tcp::18080-:80 -device virtio-net-pci,netdev=net0 -object filter-dump,id=f1,netdev=net0,file=build/net.pcap -serial file:build/serial.txt -monitor none -gdb tcp::1234 -no-reboot -no-shutdown
+[+] Build complete — NO_QEMU set, skipping QEMU launch

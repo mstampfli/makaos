@@ -49,6 +49,9 @@ KERNEL_INCLUDES=(
   -I "$KERNEL_DIR/io"
   -I "$KERNEL_DIR/crypto"
   -I "$KERNEL_DIR/arch/x86_64"
+  -I "$KERNEL_DIR/debug"
+  -I "$KERNEL_DIR/proc"
+  -I "$KERNEL_DIR/time"
   -I "$BUILD_DIR"
 )
 
@@ -442,6 +445,7 @@ KERNEL_C_OBJS=()
 KERNEL_SUBDIRS=(
     "$KERNEL_DIR"
     "$KERNEL_DIR/main"
+    "$KERNEL_DIR/debug"
     "$KERNEL_DIR/mm"
     "$KERNEL_DIR/proc"
     "$KERNEL_DIR/fs"
@@ -520,10 +524,69 @@ for src in "$KERNEL_DIR/arch/x86_64"/*.asm; do
   KERNEL_ASM_OBJS+=("$obj")
 done
 
+# ── Kernel symbol table for the in-kernel stack walker ───────────────────
+# DEBUGGING.md §5.3 requires symbolized backtraces in panic output.  The
+# kernel.bin that actually runs is stripped to .text/.rodata/.data/.bss,
+# so .symtab (present only in kernel.elf) isn't available at runtime.
+# We materialize a sorted (addr, name) table as kernel_symbols.c.
+#
+# Two-pass link: a stub is compiled into the first kernel.elf so `nm`
+# can extract addresses; we then regenerate kernel_symbols.c with the
+# real table and re-link.  The second link's addresses drift by a
+# few bytes from the first (the symbol table grew); a backtrace
+# symbolized as `foo+0xNN` will thus show an offset a few bytes off.
+# Acceptable per spec §5.3 ("let offline tooling resolve them").
+KERNEL_SYMBOLS_C="$BUILD_DIR/kernel_symbols.c"
+KERNEL_SYMBOLS_O="$BUILD_DIR/kernel_symbols.o"
+
+cat > "$KERNEL_SYMBOLS_C" <<'EOF'
+/* Auto-generated stub (pass 1).  Overwritten post-link with real data. */
+#include "stackwalk.h"
+const ksym_entry_t g_ksyms[] = { { 0, "_stub" } };
+const size_t       g_ksyms_count = 1;
+EOF
+"$CLANG" "${KERNEL_CFLAGS[@]}" "${KERNEL_INCLUDES[@]}" \
+    -c "$KERNEL_SYMBOLS_C" -o "$KERNEL_SYMBOLS_O"
+
 "$LD" -nostdlib --no-dynamic-linker \
   -z max-page-size=0x1000 \
   -T "$KERNEL_DIR/link.ld" \
-  "${KERNEL_ASM_OBJS[@]}" "${KERNEL_C_OBJS[@]}" \
+  "${KERNEL_ASM_OBJS[@]}" "${KERNEL_C_OBJS[@]}" "$KERNEL_SYMBOLS_O" \
+  -o "$BUILD_DIR/kernel.elf"
+
+# Extract T/t/D/d/B/b/R/r symbols and synthesize kernel_symbols.c.
+# Sorted by address so stackwalk's binary search works.
+# Filter out absolute-0 entries and the local $a / $d ARM markers (shouldn't
+# exist on x86 but defensive).  Name length capped at 127 chars.
+nm -n "$BUILD_DIR/kernel.elf" \
+  | awk '
+      /^[0-9a-f]+ [tTdDbBrR] / {
+          addr = $1; name = $3;
+          if (addr == "0000000000000000") next;
+          if (length(name) > 127) name = substr(name, 1, 127);
+          gsub(/"/, "\\\"", name);
+          printf "    { 0x%s, \"%s\" },\n", addr, name;
+      }
+  ' > "$BUILD_DIR/kernel_symbols.inc"
+
+{
+  echo '/* Auto-generated pass-2 kernel symbol table. */'
+  echo '#include "stackwalk.h"'
+  echo 'const ksym_entry_t g_ksyms[] = {'
+  cat  "$BUILD_DIR/kernel_symbols.inc"
+  echo '};'
+  echo 'const size_t g_ksyms_count = sizeof(g_ksyms) / sizeof(g_ksyms[0]);'
+} > "$KERNEL_SYMBOLS_C"
+
+"$CLANG" "${KERNEL_CFLAGS[@]}" "${KERNEL_INCLUDES[@]}" \
+    -c "$KERNEL_SYMBOLS_C" -o "$KERNEL_SYMBOLS_O"
+
+# Pass 2 link — the symbol object is bigger now; addresses shift by a
+# few bytes but symbolic lookup tolerates the drift (see note above).
+"$LD" -nostdlib --no-dynamic-linker \
+  -z max-page-size=0x1000 \
+  -T "$KERNEL_DIR/link.ld" \
+  "${KERNEL_ASM_OBJS[@]}" "${KERNEL_C_OBJS[@]}" "$KERNEL_SYMBOLS_O" \
   -o "$BUILD_DIR/kernel.elf"
 
 "$OBJCOPY" -O binary \
@@ -815,6 +878,153 @@ if [ -d "$BUILD_DIR/fs" ]; then
     for f in "$BUILD_DIR/fs"/*; do
         [ -f "$f" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $f $(basename $f)" > /dev/null 2>&1 || true
     done
+fi
+
+# ── Install DejaVu fonts + minimal fontconfig ──────────────────────
+# foot uses fcft → fontconfig → freetype.  Without a fonts tree at the
+# paths fontconfig scans, foot can't open any glyphs and its window
+# stays blank — which is exactly the "dwl blank screen" symptom we hit
+# (dwl has nothing to composite, so it sits on its initial clear-to-
+# black frame).  Stage the host's DejaVu tree and write a minimal
+# fonts.conf pointing fontconfig at /usr/share/fonts.
+DEJAVU_SRC=/usr/share/fonts/truetype/dejavu
+if [ -d "$DEJAVU_SRC" ]; then
+    FONT_SCRIPT="$BUILD_DIR/fonts_install.debugfs"
+    : > "$FONT_SCRIPT"
+    # Stage the DejaVu dir tree inside the ext2 image.
+    for d in usr usr/share usr/share/fonts usr/share/fonts/truetype \
+             usr/share/fonts/truetype/dejavu \
+             etc etc/fonts etc/fonts/conf.d \
+             var var/cache var/cache/fontconfig \
+             root/.cache root/.cache/fontconfig; do
+        echo "mkdir /$d" >> "$FONT_SCRIPT"
+    done
+    for f in "$DEJAVU_SRC"/*.ttf; do
+        [ -f "$f" ] || continue
+        rel=$(basename "$f")
+        echo "write $f /usr/share/fonts/truetype/dejavu/$rel" >> "$FONT_SCRIPT"
+    done
+    # Minimal fonts.conf — points fontconfig at /usr/share/fonts, sets
+    # a writable cache under /var/cache/fontconfig.  Names 'monospace'
+    # → DejaVu Sans Mono and 'sans-serif' → DejaVu Sans via <alias>
+    # elements so foot's default font=monospace resolves without
+    # shipping /etc/fonts/conf.d/*.conf from upstream fontconfig.
+    FONTS_CONF="$BUILD_DIR/fonts.conf"
+    # The <alias> shortcut has been unreliable in our port — fcft's
+    # FcFontMatch kept returning "no match" for monospace despite the
+    # DejaVu TTFs being indexed.  Use the full <match target="pattern">
+    # form instead (what upstream /etc/fonts/conf.d/60-generic.conf
+    # expands to).  Explicit > clever.
+    cat > "$FONTS_CONF" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <!-- Both the top-level /usr/share/fonts and the leaf directory
+       holding the actual TTFs are listed.  Fontconfig's recursive
+       readdir wasn't descending into subdirs in the MakaOS ext2
+       port (observed: opendir(/usr/share/fonts/) returns empty-
+       looking iteration even though the tree is populated), so
+       naming the leaf explicitly is the load-bearing line here. -->
+  <dir>/usr/share/fonts</dir>
+  <dir>/usr/share/fonts/truetype/dejavu</dir>
+  <cachedir>/var/cache/fontconfig</cachedir>
+  <cachedir>~/.cache/fontconfig</cachedir>
+
+  <!-- Resolve generic family names to the DejaVu fonts we ship. -->
+
+  <match target="pattern">
+    <test qual="any" name="family"><string>monospace</string></test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans Mono</string>
+    </edit>
+  </match>
+  <match target="pattern">
+    <test qual="any" name="family"><string>mono</string></test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans Mono</string>
+    </edit>
+  </match>
+
+  <match target="pattern">
+    <test qual="any" name="family"><string>sans-serif</string></test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans</string>
+    </edit>
+  </match>
+  <match target="pattern">
+    <test qual="any" name="family"><string>sans</string></test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans</string>
+    </edit>
+  </match>
+
+  <match target="pattern">
+    <test qual="any" name="family"><string>serif</string></test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Serif</string>
+    </edit>
+  </match>
+
+  <!-- Accept pattern — guarantees the final family list ends in a
+       concrete font we ship, even if upstream substitution pipelines
+       wipe our <match target="pattern"> edits. -->
+  <match target="pattern">
+    <test qual="any" name="family" compare="not_eq">
+      <string>DejaVu Sans Mono</string>
+    </test>
+    <edit name="family" mode="append" binding="weak">
+      <string>DejaVu Sans</string>
+    </edit>
+  </match>
+</fontconfig>
+EOF
+    echo "write $FONTS_CONF /etc/fonts/fonts.conf" >> "$FONT_SCRIPT"
+
+    # Foot config — override the default "monospace" family with the
+    # concrete "DejaVu Sans Mono" name so we don't depend on the
+    # fontconfig generic-family substitution working first-time.  The
+    # file lives at /root/.config/foot/foot.ini because root is our
+    # login user and foot searches $XDG_CONFIG_HOME (default: ~/.config).
+    FOOT_INI="$BUILD_DIR/foot.ini"
+    cat > "$FOOT_INI" <<'EOF'
+# MakaOS default foot config.  Installed by build.sh into
+# /root/.config/foot/foot.ini.  Overrides the upstream default
+# font=monospace:size=8 with an explicit family so fcft's font match
+# doesn't depend on fontconfig aliases resolving.
+shell=/bin/bash
+font=DejaVu Sans Mono:size=12
+[main]
+term=xterm-256color
+EOF
+    for d in root/.config root/.config/foot; do
+        echo "mkdir /$d" >> "$FONT_SCRIPT"
+    done
+    echo "write $FOOT_INI /root/.config/foot/foot.ini" >> "$FONT_SCRIPT"
+
+    debugfs -w "$BUILD_DIR/ext2.img" -f "$FONT_SCRIPT" > /dev/null 2>&1 || true
+    # Directory perms (debugfs inherits root:root 0755 but set explicitly
+    # so the scan matches Linux conventions the compositor expects).
+    for d in /usr/share/fonts /usr/share/fonts/truetype \
+             /usr/share/fonts/truetype/dejavu \
+             /etc/fonts /etc/fonts/conf.d \
+             /var/cache /var/cache/fontconfig; do
+        ext2_setperm "$BUILD_DIR/ext2.img" "$d" 0040755 0 0
+    done
+    # /root/.cache/fontconfig — per-user cache, must be writable by root
+    # (foot runs as root in our setup).  Fontconfig tries to mkdir this
+    # on first run; if /root/.cache doesn't exist as a prior directory
+    # it tries to create the whole chain.  Permissions are 0700 since
+    # they're inside /root (which is 0700 anyway).
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/.cache             0040700 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/.cache/fontconfig  0040700 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/.config            0040700 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/.config/foot       0040700 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/.config/foot/foot.ini 0100644 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /etc/fonts/fonts.conf 0100644 0 0
+    font_count=$(ls "$DEJAVU_SRC"/*.ttf 2>/dev/null | wc -l)
+    echo "[+] fonts installed: $font_count DejaVu .ttf → /usr/share/fonts/truetype/dejavu"
+else
+    echo "[!] DejaVu fonts not found on host ($DEJAVU_SRC) — foot will show blank"
 fi
 
 # ── Install xkeyboard-config data tree (/usr/share/X11/xkb) ──────────

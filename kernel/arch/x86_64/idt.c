@@ -4,6 +4,7 @@
 #include "tss.h"
 #include "cpu.h"
 #include "fb.h"
+#include "panic.h"
 
 /* Kept as NULL for UEFI boots — legacy symbol referenced by signal.c */
 volatile uint16_t* g_vga = (volatile uint16_t*)0;
@@ -52,16 +53,16 @@ static void fb_panic_hex(uint32_t row, uint32_t col_start, uint64_t v) {
 }
 
 void isr_general_exception_no_ec(const char* msg, interrupt_frame_t* frame) {
+    /* FB sidebar stays as-is — some failures happen before serial is
+     * worth reading and the FB banner is the only visible signal. */
     fb_panic_str(0, msg,       FB_LRED);
     fb_panic_str(1, "RIP=",    FB_GRAY); fb_panic_hex(1, 4, frame->ip);
     fb_panic_str(2, "RSP=",    FB_GRAY); fb_panic_hex(2, 4, frame->sp);
     fb_panic_str(3, "RFLAGS=", FB_GRAY); fb_panic_hex(3, 7, frame->flags);
 
-    serial_puts_idt("EXCEPTION: "); serial_puts_idt(msg); serial_putc_idt('\n');
-    serial_puts_idt("ip="); serial_hex_idt(frame->ip);
-    serial_puts_idt("sp="); serial_hex_idt(frame->sp);
-
-    for (;;) { __asm__ __volatile__("cli; hlt"); }
+    /* Rich dump via the debug-subsystem panic (registers, backtrace,
+     * log ring, trace ring, halts other CPUs). */
+    panic_from_exception(msg, frame, 0, /*has_ec=*/0);
 }
 
 void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_t error_code) {
@@ -74,13 +75,7 @@ void isr_general_exception_ec(const char* msg, interrupt_frame_t* frame, uint64_
     fb_panic_str(3, "RIP=",   FB_GRAY); fb_panic_hex(3, 4, frame->ip);
     fb_panic_str(4, "RSP=",   FB_GRAY); fb_panic_hex(4, 4, frame->sp);
 
-    serial_puts_idt("EXCEPTION: "); serial_puts_idt(msg); serial_putc_idt('\n');
-    serial_puts_idt("ec="); serial_hex_idt(error_code);
-    serial_puts_idt("CR2="); serial_hex_idt(cr2);
-    serial_puts_idt("RIP="); serial_hex_idt(frame->ip);
-    serial_puts_idt("RSP="); serial_hex_idt(frame->sp);
-
-    for (;;) { __asm__ __volatile__("cli; hlt"); }
+    panic_from_exception(msg, frame, error_code, /*has_ec=*/1);
 }
 
 // ── Exception dispatch helpers ────────────────────────────────────────────

@@ -30,6 +30,17 @@ void signal_send(task_t* t, int sig) {
     if (!t) return;
     if (sig < 1 || sig >= NSIG) return;
 
+    /* Trace only the fatal/terminating signals to keep volume sane —
+     * SIGCHLD + SIGWINCH fly constantly. */
+    if (sig != SIGCHLD && sig != SIGWINCH) {
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] send: sig=%d → pid=%u comm=\"%s\" "
+                "(sender pid=%u comm=\"%s\")\n",
+                sig, (unsigned)t->pid, t->comm,
+                g_current ? (unsigned)g_current->pid : 0,
+                g_current ? g_current->comm : "(none)");
+    }
+
     uint32_t bit = 1u << (uint32_t)(sig - 1);
 
     // SIGKILL is unblockable — forcibly clear the blocked bit.
@@ -147,13 +158,26 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
         return;
     }
 
-    // Handler/restorer must be canonical user pointers too.  signal_send
-    // has no idea where they came from; we could have stored an older
-    // corrupted value (pre-validation) across exec.  Belt + braces.
-    // Using USER_ADDR_CEIL (= 2^47) rejects the non-canonical gap,
-    // unlike a naive >= HHDM_OFFSET check.
-    if (ka->sa_handler >= USER_ADDR_CEIL ||
-        (ka->sa_restorer != 0 && ka->sa_restorer >= USER_ADDR_CEIL)) {
+    /* Handler / restorer validation.
+     *
+     * Both must be canonical user pointers (< USER_ADDR_CEIL = 2^47).
+     * Additionally, sa_handler must be non-zero — a zero handler means
+     * "SIG_DFL" by POSIX convention, and the caller guards against that
+     * before reaching here, but if the guard is ever bypassed we must
+     * NEVER write RIP=0 into g_syscall_user_rip (§195).
+     *
+     * sa_restorer MUST also be non-zero and valid: when the handler
+     * returns it `ret`s to the restorer, which calls sigreturn(2) to
+     * unwind.  A zero sa_restorer means the handler's `ret` pops 0 off
+     * the user stack → user #PF at RIP=0 (observed: Ctrl+C / SIGINT
+     * against dwl, comm=dwl, CR2=0, RIP=0, RCX inside libc syscall6).
+     *
+     * A syscall that registers a signal handler without a working
+     * restorer is a userland bug, but the kernel must not crash over
+     * it — force SIGKILL and take the SIG_DFL terminate path instead.
+     */
+    if (ka->sa_handler == 0 || ka->sa_handler >= USER_ADDR_CEIL ||
+        ka->sa_restorer == 0 || ka->sa_restorer >= USER_ADDR_CEIL) {
         // Force-queue SIGKILL for the next delivery cycle.  We can't
         // kill the task inline from here — the terminate block below
         // is the only safe place (drops fds, reparents children,
@@ -284,6 +308,20 @@ void signal_deliver_pending(void) {
         for (int i = 0; name[i]; i++) fb_term_putc(name[i]);
         fb_term_putc('\n');
         g_fb_fg = saved_fg;
+
+        /* Also echo to serial so post-mortem log analysis can tell
+         * WHICH task caught the fatal signal.  The fb_term print
+         * above doesn't land in serial.txt. */
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] terminate: pid=%u comm=\"%s\" sig=%s\n",
+                (unsigned)g_current->pid, g_current->comm, name);
+    }
+    /* Log non-fatal SIG_DFL terminations too (SIGTERM, SIGINT, SIGPIPE,
+     * etc.) — we want to see who called sys_kill / whose tty raised it. */
+    else if (sig != SIGCHLD && sig != SIGWINCH) {
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] terminate: pid=%u comm=\"%s\" sig=%d (SIG_DFL)\n",
+                (unsigned)g_current->pid, g_current->comm, sig);
     }
 
     // Reparent any children to init before we vanish.  Batched CAS
@@ -298,8 +336,16 @@ void signal_deliver_pending(void) {
 
     // Drop the fd table now so peers see EOF immediately (matching sys_exit).
     if (g_current->files_shared) {
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] releasing files of pid=%u comm=\"%s\" refs=%u\n",
+                (unsigned)g_current->pid, g_current->comm,
+                (unsigned)g_current->files_shared->refs);
         task_files_release(g_current->files_shared);
         g_current->files_shared = NULL;
+    } else {
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] pid=%u comm=\"%s\" has NO files_shared (leak?)\n",
+                (unsigned)g_current->pid, g_current->comm);
     }
 
     // Zombie instead of TASK_DEAD so the parent can reap via waitpid.

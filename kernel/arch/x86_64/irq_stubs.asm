@@ -199,3 +199,15 @@ ipi_tlb_flush_entry:
     POP_GPRS
     iretq
 
+; ── VEC_IPI_HALT (0x43) — panic-time rendezvous ───────────────────────────
+; Broadcast from panic() on the dying CPU so every other CPU is frozen
+; while we dump context.  Per DEBUGGING.md §3.1: "IPIs other CPUs to
+; halt them (so multi-core state is frozen)."  No EOI needed — we
+; never return from here, and further IPIs are blocked by the cli.
+global ipi_halt_entry
+ipi_halt_entry:
+    cli
+.spin:
+    hlt
+    jmp .spin
+
