@@ -257,6 +257,23 @@ typedef struct __attribute__((aligned(16))) task_t {
     // Incremented atomically in isr14_page_fault; logged at task exit.
     uint32_t pf_disk;   // pages read from disk (cache miss)
     uint32_t pf_cache;  // pages served from page cache (cache hit)
+
+    /* Per-task snapshot of 5th/6th syscall args (r8/r9 at syscall
+     * entry).  The asm stashes r8/r9 into per-CPU scratch in cpu_t
+     * before switching to the kernel stack; but the task may migrate
+     * CPUs during a sleeping or long-running syscall, after which
+     * this_cpu()->syscall_arg5 refers to a DIFFERENT cpu's most-
+     * recent arg5 — stale, and not ours.  native_syscall_dispatch
+     * copies the per-CPU scratch into these task-local fields at
+     * entry (while still guaranteed to be on the entry CPU) so
+     * every 6-arg handler reads from here instead.
+     *
+     * Observed: sys_mmap saw fd=0 (stdin, wrong) on the 2nd run of
+     * dwl, which triggered an EACCES that blew up xkbcommon's keymap
+     * load.  Root cause was precisely this per-CPU-vs-per-task race
+     * during one of mmap's intermediate reschedule points. */
+    uint64_t syscall_a5;
+    uint64_t syscall_a6;
 } task_t;
 
 typedef task_t process_t;

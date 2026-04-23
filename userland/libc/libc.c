@@ -1375,6 +1375,12 @@ struct dirent* readdir(DIR* dirp) {
     if (dirp->pos >= dirp->count) return NULL;
     k_dirent_t* ke = &dirp->entries[dirp->pos++];
     dirp->cur.d_ino    = ke->inode_num;
+    /* d_off is the byte offset to the NEXT dirent.  Our readdir
+     * preloads the whole directory into entries[], so the concept
+     * of a file offset doesn't apply — most Linux libcs return the
+     * index-of-next-entry here and callers treat it as opaque.
+     * Setting it to dirp->pos keeps the contract. */
+    dirp->cur.d_off    = (long)dirp->pos;
     dirp->cur.d_reclen = sizeof(struct dirent);
     dirp->cur.d_type   = ke->is_dir ? DT_DIR : DT_REG;
     size_t i = 0;

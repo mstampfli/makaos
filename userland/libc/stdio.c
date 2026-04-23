@@ -311,10 +311,44 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* f) {
 int fseek(FILE* f, long offset, int whence) {
     // Flush write buffer first.
     if ((f->flags & _FILE_WRITE) && f->wpos) flush_write(f);
-    // Invalidate read buffer.
-    f->rpos = f->rlen = 0;
 
-    long new_pos = lseek(f->fd, offset, whence);
+    // Resolve target absolute position so we can check whether it falls
+    // inside the currently buffered range.  SEEK_CUR is relative to the
+    // caller's view (file_pos already accounts for bytes drained from
+    // rbuf), SEEK_END needs an explicit lseek probe.
+    long target;
+    if (whence == SEEK_SET) {
+        target = offset;
+    } else if (whence == SEEK_CUR) {
+        target = f->file_pos + offset;
+    } else {
+        long end = lseek(f->fd, 0, SEEK_END);
+        if (end < 0) return -1;
+        target = end + offset;
+    }
+    if (target < 0) return -1;
+
+    // Fast path: target lies inside the already-read buffer.  The buffer
+    // spans file offsets [file_pos - rpos .. file_pos + (rlen - rpos)),
+    // so just shift rpos without touching the kernel.  This is the
+    // difference between freetype reading 343 KB once versus hammering
+    // the disk for hundreds of MB of redundant 4 KB reads while doing
+    // 2-byte fseek+fread probes over a TTF glyph table.
+    if (f->rlen > 0) {
+        long buf_base = f->file_pos - f->rpos;
+        long buf_end  = buf_base + f->rlen;
+        if (target >= buf_base && target <= buf_end) {
+            f->rpos     = (int)(target - buf_base);
+            f->file_pos = target;
+            f->flags   &= ~(_FILE_ERR | _FILE_EOF);
+            return 0;
+        }
+    }
+
+    // Slow path: seek target outside buffered range.  Drop buffer and
+    // re-sync the kernel offset.
+    f->rpos = f->rlen = 0;
+    long new_pos = lseek(f->fd, target, SEEK_SET);
     if (new_pos < 0) return -1;
     f->file_pos = new_pos;
     f->flags &= ~(_FILE_ERR | _FILE_EOF);

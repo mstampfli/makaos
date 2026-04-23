@@ -48,6 +48,7 @@
 #define VEC_IPI_RESCHEDULE   0x40   // wake an idle CPU so it picks up a task
 #define VEC_IPI_TLB_FLUSH    0x41   // TLB shootdown IPI
 #define VEC_IPI_CALL         0x42   // generic cross-CPU function call
+#define VEC_IPI_HALT         0x43   // panic rendezvous — freeze the CPU
 
 // ── LAPIC lifecycle ─────────────────────────────────────────────────────
 

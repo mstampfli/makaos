@@ -16,6 +16,8 @@
 #include "pmm.h"
 #include "kheap.h"
 #include "kprintf.h"
+#include "log.h"
+#include "trace.h"
 #include "smp.h"
 #include "common.h"
 
@@ -585,8 +587,17 @@ int virtio_gpu_set_scanout(uint32_t scanout_id, uint32_t res_id,
     req.scanout_id  = scanout_id;
     req.resource_id = res_id;
     virtio_gpu_ctrl_hdr_t resp = {0};
-    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    TRACE(TRACE_GPU_SET_SCANOUT, scanout_id, res_id, w, h);
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) {
+        pr_warn("virtio-gpu", "SET_SCANOUT sc=%u res=%u %ux%u: ctrl send failed",
+                scanout_id, res_id, w, h);
+        return 0;
+    }
+    int ok = (resp.type == VIRTIO_GPU_RESP_OK_NODATA);
+    if (!ok) pr_warn("virtio-gpu",
+                     "SET_SCANOUT sc=%u res=%u: host resp type=0x%x",
+                     scanout_id, res_id, resp.type);
+    return ok;
 }
 
 int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h) {
@@ -597,8 +608,17 @@ int virtio_gpu_transfer_to_host_2d(uint32_t res_id, uint32_t w, uint32_t h) {
     req.offset      = 0;
     req.resource_id = res_id;
     virtio_gpu_ctrl_hdr_t resp = {0};
-    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    TRACE(TRACE_GPU_RES_TRANSFER, res_id, w, h, 0);
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) {
+        pr_warn("virtio-gpu", "XFER_TO_HOST_2D res=%u %ux%u: ctrl send failed",
+                res_id, w, h);
+        return 0;
+    }
+    int ok = (resp.type == VIRTIO_GPU_RESP_OK_NODATA);
+    if (!ok) pr_warn("virtio-gpu",
+                     "XFER_TO_HOST_2D res=%u: host resp type=0x%x",
+                     res_id, resp.type);
+    return ok;
 }
 
 int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h) {
@@ -608,8 +628,17 @@ int virtio_gpu_resource_flush(uint32_t res_id, uint32_t w, uint32_t h) {
     req.r.height    = h;
     req.resource_id = res_id;
     virtio_gpu_ctrl_hdr_t resp = {0};
-    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) return 0;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    TRACE(TRACE_GPU_RES_FLUSH, res_id, w, h, 0);
+    if (!vgpu_send_ctrl(&req, sizeof(req), &resp, sizeof(resp))) {
+        pr_warn("virtio-gpu", "RESOURCE_FLUSH res=%u %ux%u: ctrl send failed",
+                res_id, w, h);
+        return 0;
+    }
+    int ok = (resp.type == VIRTIO_GPU_RESP_OK_NODATA);
+    if (!ok) pr_warn("virtio-gpu",
+                     "RESOURCE_FLUSH res=%u: host resp type=0x%x",
+                     res_id, resp.type);
+    return ok;
 }
 
 // ── Framebuffer state (kept for DRM layer + present_test) ────────────

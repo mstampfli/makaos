@@ -1,0 +1,39 @@
+mkdir /usr
+mkdir /usr/share
+mkdir /usr/share/fonts
+mkdir /usr/share/fonts/truetype
+mkdir /usr/share/fonts/truetype/dejavu
+mkdir /etc
+mkdir /etc/fonts
+mkdir /etc/fonts/conf.d
+mkdir /var
+mkdir /var/cache
+mkdir /var/cache/fontconfig
+mkdir /root/.cache
+mkdir /root/.cache/fontconfig
+write /usr/share/fonts/truetype/dejavu/DejaVuMathTeXGyre.ttf /usr/share/fonts/truetype/dejavu/DejaVuMathTeXGyre.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-BoldOblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-BoldOblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Oblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Oblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSans-ExtraLight.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans-ExtraLight.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-BoldItalic.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-BoldItalic.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-Bold.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-Bold.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-Italic.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed-Italic.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerifCondensed.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf
+write /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf /usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf
+write build/fonts.conf /etc/fonts/fonts.conf
+mkdir /root/.config
+mkdir /root/.config/foot
+write build/foot.ini /root/.config/foot/foot.ini

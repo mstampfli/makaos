@@ -31,3 +31,18 @@ void kprintf(const char* fmt, ...);
 // other CPUs for the duration of the call; use sparingly.
 __attribute__((format(printf, 1, 2)))
 void kprintf_atomic(const char* fmt, ...);
+
+// Format into a caller-provided buffer.  Returns the number of bytes
+// that WOULD have been written (not counting NUL).  Truncates at
+// (size - 1) and always NUL-terminates when size > 0.  No heap, no
+// serial, no locks — safe from any context including panic.
+//
+// Used by the structured logging layer (log.c) to compose a line
+// before emitting it atomically.
+int ksnprintf(char* buf, size_t size, const char* fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
+// Same, with an explicit va_list.  Callers that already captured a
+// va_list (for a wrapping log helper) use this variant.
+typedef __builtin_va_list __kp_va_list;
+int kvsnprintf(char* buf, size_t size, const char* fmt, __kp_va_list ap);

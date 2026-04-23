@@ -101,16 +101,28 @@ void wait_queue_wake_all(wait_queue_t* wq) {
 
     rcu_read_lock();
 
-    // Walk the detached chain.  next pointers are stable because we
-    // own the chain now.
+    /* Walk the detached chain.  next pointers are stable because we
+     * own the chain now.  The hazard: if any entry has been clobbered
+     * (UAF, partial write, whatever), we must NOT dereference a bad
+     * pointer — doing so fires a kernel #PF, which in the panic path
+     * takes down the whole system.  Userland should never be able to
+     * crash the kernel; all defensive checks here happen BEFORE the
+     * first read of the suspect memory. */
     while (chain) {
-        // Canonical-pointer sanity: next must be NULL or a kernel
-        // higher-half address.  Anything else means the entry's
-        // memory was clobbered after enqueue (classic UAF — entry
-        // freed by its owner but still linked on our list).  Catch
-        // it here with context, rather than letting the next
-        // iteration GP on `mov 0x8(%r15),%r15` with a non-canonical
-        // pointer in r15.
+        /* Step 1: chain itself.  A kernel-side wake_entry_t always
+         * lives in kernel memory (either on a kstack or kmalloc'd
+         * from the kernel heap), so its address must be a canonical
+         * high-half pointer.  If it isn't, the wq->head was clobbered
+         * to a user / garbage value.  Log with full context and stop
+         * walking rather than #PF'ing on the next line. */
+        if (((uintptr_t)chain >> 47) != 0x1FFFFull) {
+            extern void kprintf(const char*, ...);
+            kprintf("\n=== WAKE UAF chain === wq=%p corrupt chain=%p "
+                    "(not canonical high-half) — truncating drain\n",
+                    wq, chain);
+            break;
+        }
+        /* Step 2: chain->next.  Same rule — must be NULL or high-half. */
         if (chain->next != NULL &&
             ((uintptr_t)chain->next >> 47) != 0x1FFFF) {
             extern void kprintf(const char*, ...);
@@ -170,20 +182,36 @@ void wait_queue_wake_one(wait_queue_t* wq) {
 
     rcu_read_lock();
 
+    /* Same canonical-pointer guard as wake_all: never dereference
+     * `chain` if it's been clobbered to a non-canonical / user-
+     * address value.  Userland must never take down the kernel. */
+    if (((uintptr_t)chain >> 47) != 0x1FFFFull) {
+        extern void kprintf(const char*, ...);
+        kprintf("\n=== WAKE UAF chain === wq=%p corrupt chain=%p "
+                "(wake_one, not canonical high-half) — dropping drain\n",
+                wq, chain);
+        rcu_read_unlock();
+        return;
+    }
+
     // Fire func on the first live entry.
     wake_entry_t* fired = NULL;
     while (chain && atomic_load_acq(&chain->dead)) {
         wake_entry_t* next = chain->next;
+        if (next && ((uintptr_t)next >> 47) != 0x1FFFFull) break;
         chain = next;
     }
     if (chain) {
         fired = chain;
-        chain = chain->next;  // advance past the fired entry
+        wake_entry_t* next = chain->next;
+        if (next && ((uintptr_t)next >> 47) != 0x1FFFFull) next = NULL;
+        chain = next;  // advance past the fired entry
     }
 
     // Re-push everything else (whether live or dead — we leave cancels
     // to be reaped on the next wake_all).
     while (chain) {
+        if (((uintptr_t)chain >> 47) != 0x1FFFFull) break;
         wake_entry_t* next = chain->next;
         wq_add(wq, chain);
         chain = next;

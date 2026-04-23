@@ -27,6 +27,19 @@
 #include "sched.h"      // g_current
 #include "seqlock.h"
 #include "syscall.h"   // copy_from_user / copy_to_user
+#include "log.h"
+#include "trace.h"
+#include "assert.h"
+
+/* Per-subsystem debug gate.  Keep at 1 while diagnosing wlroots DRM
+ * path; flip to 0 once the pipeline is stable.  See DEBUGGING.md §2.3. */
+#define CONFIG_DEBUG_DRM 1
+
+#if CONFIG_DEBUG_DRM
+#define drm_dbg(fmt, ...) pr_debug("drm", fmt, ##__VA_ARGS__)
+#else
+#define drm_dbg(fmt, ...) do { } while (0)
+#endif
 
 extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
@@ -622,11 +635,24 @@ typedef struct {
 static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     drm_mode_fb_cmd2_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    if (!a.handles[0]) return -EINVAL;
+    drm_dbg("ADDFB2 %ux%u fmt=0x%x handles[0]=%u pitches[0]=%u",
+            a.width, a.height, a.pixel_format, a.handles[0], a.pitches[0]);
+    if (!a.handles[0]) {
+        pr_warn("drm", "ADDFB2: handles[0]=0");
+        return -EINVAL;
+    }
     drm_client_t* c = client_of(f);
     drm_dumb_t* d = find_dumb(c, a.handles[0]);
-    if (!d) return -ENOENT;
-    if (a.width > d->width || a.height > d->height) return -EINVAL;
+    if (!d) {
+        pr_warn("drm", "ADDFB2: handle %u not found", a.handles[0]);
+        return -ENOENT;
+    }
+    if (a.width > d->width || a.height > d->height) {
+        pr_warn("drm", "ADDFB2: size %ux%u > dumb %ux%u",
+                a.width, a.height, d->width, d->height);
+        return -EINVAL;
+    }
+    TRACE(TRACE_DRM_ADDFB, a.width, a.height, a.pixel_format, a.handles[0]);
 
         // Allocate an INDEPENDENT virtio-gpu resource for this fb, backed
     // by the same phys pages.  This lets dumb and fb be destroyed on
@@ -741,7 +767,21 @@ typedef struct drm_commit {
 static int drm_commit_apply(const drm_commit_t* commit) {
     drm_state_init_once();
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
-    if (!b) return -ENODEV;
+    if (!b) {
+        pr_warn("drm", "commit denied: no backend registered");
+        return -ENODEV;
+    }
+    pr_info("drm", "commit n=%u scanout[0]={res=%u fb=%u %ux%u}",
+            commit->n,
+            commit->n ? commit->entries[0].resource_id : 0,
+            commit->n ? commit->entries[0].fb_id       : 0,
+            commit->n ? commit->entries[0].w           : 0,
+            commit->n ? commit->entries[0].h           : 0);
+    TRACE(TRACE_DRM_COMMIT,
+          commit->n,
+          commit->n ? commit->entries[0].resource_id : 0,
+          commit->n ? ((uint64_t)commit->entries[0].w << 32 | commit->entries[0].h) : 0,
+          0);
 
     // Writer: takes the seqlock's internal spinlock.  During
     // seq_write_begin..seq_write_end the seq counter is odd; readers
@@ -758,10 +798,24 @@ static int drm_commit_apply(const drm_commit_t* commit) {
 
     for (uint32_t i = 0; i < commit->n; i++) {
         const drm_commit_entry_t* e = &commit->entries[i];
-        if (b->scanout_set(e->scanout, e->resource_id, e->w, e->h) != 0) goto rollback;
+        if (b->scanout_set(e->scanout, e->resource_id, e->w, e->h) != 0) {
+            pr_err("drm", "commit: backend scanout_set(sc=%u res=%u) failed",
+                   e->scanout, e->resource_id);
+            goto rollback;
+        }
         if (e->resource_id) {
-            if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) goto rollback;
-            if (b->resource_flush   (e->resource_id, e->w, e->h) != 0) goto rollback;
+            if (b->resource_transfer(e->resource_id, e->w, e->h) != 0) {
+                pr_err("drm", "commit: resource_transfer(res=%u) failed", e->resource_id);
+                goto rollback;
+            }
+            if (b->resource_flush   (e->resource_id, e->w, e->h) != 0) {
+                pr_err("drm", "commit: resource_flush(res=%u) failed", e->resource_id);
+                goto rollback;
+            }
+            drm_dbg("commit: scanout=%u res=%u %ux%u applied",
+                     e->scanout, e->resource_id, e->w, e->h);
+        } else {
+            drm_dbg("commit: scanout=%u disabled", e->scanout);
         }
         s_scanouts[e->scanout] = (drm_scanout_state_t){
             .active      = (e->resource_id != 0),
@@ -2153,8 +2207,55 @@ static int drm_poll_op(vfs_file_t* self, int events) {
     return 0;
 }
 
+/* Map an ioctl request number to a short human-readable tag.  Used by
+ * the dispatcher tracing so serial.txt reads as a commit pipeline
+ * rather than a wall of hex. */
+static const char* drm_ioctl_name(uint64_t req) {
+    switch (req) {
+    case DRM_IOCTL_VERSION:                return "VERSION";
+    case DRM_IOCTL_GET_CAP:                return "GET_CAP";
+    case DRM_IOCTL_MODE_GETRESOURCES:      return "GETRESOURCES";
+    case DRM_IOCTL_MODE_GETCONNECTOR:      return "GETCONNECTOR";
+    case DRM_IOCTL_MODE_GETENCODER:        return "GETENCODER";
+    case DRM_IOCTL_MODE_GETCRTC:           return "GETCRTC";
+    case DRM_IOCTL_MODE_SETCRTC:           return "SETCRTC";
+    case DRM_IOCTL_MODE_PAGE_FLIP:         return "PAGE_FLIP";
+    case DRM_IOCTL_MODE_ATOMIC:            return "ATOMIC";
+    case DRM_IOCTL_MODE_ADDFB2:            return "ADDFB2";
+    case DRM_IOCTL_MODE_RMFB:              return "RMFB";
+    case DRM_IOCTL_MODE_CREATE_DUMB:       return "CREATE_DUMB";
+    case DRM_IOCTL_MODE_MAP_DUMB:          return "MAP_DUMB";
+    case DRM_IOCTL_MODE_DESTROY_DUMB:      return "DESTROY_DUMB";
+    case DRM_IOCTL_SET_CLIENT_CAP:         return "SET_CLIENT_CAP";
+    case DRM_IOCTL_GEM_CLOSE:              return "GEM_CLOSE";
+    case DRM_IOCTL_PRIME_HANDLE_TO_FD:     return "PRIME_HANDLE_TO_FD";
+    case DRM_IOCTL_PRIME_FD_TO_HANDLE:     return "PRIME_FD_TO_HANDLE";
+    case DRM_IOCTL_MODE_GETPLANERESOURCES: return "GETPLANERESOURCES";
+    case DRM_IOCTL_MODE_GETPLANE:          return "GETPLANE";
+    case DRM_IOCTL_MODE_SETPLANE:          return "SETPLANE";
+    case DRM_IOCTL_MODE_OBJ_GETPROPERTIES: return "OBJ_GETPROPERTIES";
+    case DRM_IOCTL_MODE_GETPROPERTY:       return "GETPROPERTY";
+    case DRM_IOCTL_MODE_SETPROPERTY:       return "SETPROPERTY";
+    case DRM_IOCTL_MODE_OBJ_SETPROPERTY:   return "OBJ_SETPROPERTY";
+    case DRM_IOCTL_MODE_GETPROPBLOB:       return "GETPROPBLOB";
+    case DRM_IOCTL_MODE_GETFB:             return "GETFB";
+    case DRM_IOCTL_MODE_CLOSEFB:           return "CLOSEFB";
+    case DRM_IOCTL_MODE_CURSOR:            return "CURSOR";
+    case DRM_IOCTL_MODE_CURSOR2:           return "CURSOR2";
+    case DRM_IOCTL_AUTH_MAGIC:             return "AUTH_MAGIC";
+    case DRM_IOCTL_GET_MAGIC:              return "GET_MAGIC";
+    case DRM_IOCTL_MODE_CREATE_LEASE:      return "CREATE_LEASE";
+    case DRM_IOCTL_MODE_LIST_LESSEES:      return "LIST_LESSEES";
+    case DRM_IOCTL_MODE_GET_LEASE:         return "GET_LEASE";
+    case DRM_IOCTL_MODE_REVOKE_LEASE:      return "REVOKE_LEASE";
+    case DRM_IOCTL_SET_MASTER:             return "SET_MASTER";
+    case DRM_IOCTL_DROP_MASTER:            return "DROP_MASTER";
+    }
+    return "?";
+}
+
 // ── ioctl dispatch ──────────────────────────────────────────────────
-static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
+static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     switch (req) {
     case DRM_IOCTL_VERSION:           return drm_ioctl_version(arg);
     case DRM_IOCTL_GET_CAP:           return drm_ioctl_get_cap(arg);
@@ -2195,11 +2296,31 @@ static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_SET_MASTER:        return 0;  // single-client for now
     case DRM_IOCTL_DROP_MASTER:       return 0;
     default:
-        // Unknown ioctl — log once so we learn what wlroots actually calls,
-        // then return ENOTTY (Linux DRM's standard "unsupported").
-        kprintf("[drm] ENOTTY: req=0x%08x\n", (uint32_t)req);
+        pr_warn("drm", "unknown ioctl req=0x%08x arg=0x%lx → ENOTTY",
+                (uint32_t)req, arg);
         return -ENOTTY;
     }
+}
+
+/* Tracing wrapper.  Every ioctl enters here — the switch inside
+ * drm_ioctl_impl fans out by request.  Both the call and the result
+ * are logged + traced; the dwl render pipeline is fully visible in
+ * build/serial.txt from this one hook. */
+static int64_t drm_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
+    drm_dbg("ioctl %s req=0x%08x arg=0x%lx",
+            drm_ioctl_name(req), (uint32_t)req, arg);
+    TRACE(TRACE_DRM_IOCTL, (uint32_t)req, arg, 0, 0);
+    int64_t rc = drm_ioctl_impl(self, req, arg);
+    if (rc != 0) {
+        /* WARN, not DEBUG — any nonzero return may be the first
+         * point where the pipeline diverges from the happy path. */
+        pr_warn("drm", "ioctl %s req=0x%08x → %ld",
+                drm_ioctl_name(req), (uint32_t)req, rc);
+    } else {
+        drm_dbg("ioctl %s → 0", drm_ioctl_name(req));
+    }
+    TRACE(TRACE_DRM_IOCTL, (uint32_t)req, arg, (uint64_t)rc, 1);
+    return rc;
 }
 
 // Track open DRM clients so the scanout can be restored to the

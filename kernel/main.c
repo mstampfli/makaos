@@ -42,6 +42,7 @@ extern void lapic_spurious_entry(void);
 extern void ipi_reschedule_entry(void);
 extern void ipi_call_entry(void);
 extern void ipi_tlb_flush_entry(void);
+extern void ipi_halt_entry(void);
 
 static void serial_init_and_say(void) {
     outb(0x3F8 + 1, 0x00);
@@ -609,6 +610,10 @@ void kmain(void) {
     idt_irq_register(VEC_IPI_RESCHEDULE, (uint64_t)ipi_reschedule_entry);
     idt_irq_register(VEC_IPI_CALL,       (uint64_t)ipi_call_entry);
     idt_irq_register(VEC_IPI_TLB_FLUSH,  (uint64_t)ipi_tlb_flush_entry);
+    /* Panic rendezvous — see DEBUGGING.md §3.1.  panic() broadcasts
+     * this vector to every other CPU so multi-core state is frozen
+     * while the dying CPU dumps context. */
+    idt_irq_register(VEC_IPI_HALT,       (uint64_t)ipi_halt_entry);
 
     // ── CPU structures ────────────────────────────────────────────────────
     tss_init();

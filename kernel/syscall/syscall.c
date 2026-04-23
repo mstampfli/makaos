@@ -7,6 +7,33 @@
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
+#include "log.h"
+#include "trace.h"
+
+/* ── Syscall tracing helpers ─────────────────────────────────────────
+ *
+ * Defined up-front so early handlers (sys_open) can use them too.
+ * The actual trace emission lives in native_syscall_dispatch further
+ * down; these primitives are shared.
+ */
+#ifndef SYSCALL_TRACE_ALL
+#define SYSCALL_TRACE_ALL 0
+#endif
+
+/* NUL-terminated list of comm names to match (leading prefix match). */
+static const char* const s_trace_comms[] = { "foot", "dwl", (const char*)0 };
+
+static inline int comm_match(const char* comm) {
+    if (SYSCALL_TRACE_ALL) return 1;
+    if (!comm) return 0;
+    for (const char* const* p = s_trace_comms; *p; p++) {
+        const char* a = *p;
+        const char* b = comm;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == 0) return 1;
+    }
+    return 0;
+}
 #include "mm.h"
 #include "shmem.h"
 #include "vmm.h"
@@ -57,8 +84,15 @@ extern volatile uint16_t* g_vga;
 #define g_syscall_user_r13    (this_cpu()->syscall_user_r13)
 #define g_syscall_user_r14    (this_cpu()->syscall_user_r14)
 #define g_syscall_user_r15    (this_cpu()->syscall_user_r15)
-#define g_syscall_arg5        (this_cpu()->syscall_arg5)
-#define g_syscall_arg6        (this_cpu()->syscall_arg6)
+/* Per-task snapshot of r8/r9 at syscall entry — populated by
+ * native_syscall_dispatch BEFORE any dispatch that might sleep or
+ * migrate, because this_cpu()->syscall_arg5 only survives as long as
+ * we stay on the entry CPU.  Every 6-arg handler that used to read
+ * this_cpu()->syscall_arg5/6 now reads g_current->syscall_a5/a6. */
+#define g_syscall_arg5        (g_current ? g_current->syscall_a5 \
+                                         : this_cpu()->syscall_arg5)
+#define g_syscall_arg6        (g_current ? g_current->syscall_a6 \
+                                         : this_cpu()->syscall_arg6)
 #define g_exec_requested      (this_cpu()->exec_requested)
 #define g_exec_entry          (this_cpu()->exec_entry)
 #define g_exec_rsp            (this_cpu()->exec_rsp)
@@ -208,6 +242,14 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
     raw[i] = '\0';
     if (i == 0) return (uint64_t)-EINVAL;
+
+    /* Log the path for traced comms — the generic syscall_dispatch
+     * tracer only sees the user pointer, which isn't useful when
+     * diagnosing "what file did foot try to open?" */
+    if (g_current && comm_match(g_current->comm)) {
+        pr_debug("sys", "  open(\"%s\", flags=0x%lx)",
+                  raw, (uint64_t)flags);
+    }
 
     // Resolve relative paths: prepend cwd if path does not start with '/'.
     char path[512];
@@ -1818,6 +1860,14 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
     if (!len) return (uint64_t)-EINVAL;
 
+    /* Trace the full 6-arg mmap for the comms we care about — the
+     * default 4-arg tracer doesn't see fd/off, which is exactly what
+     * we need when diagnosing "why did mmap return EACCES". */
+    if (g_current && comm_match(g_current->comm)) {
+        pr_debug("sys", "  mmap(addr=%p len=%lu prot=0x%lx flags=0x%lx fd=%ld off=%ld)",
+                  (void*)addr, len, prot, flags, (long)fd, (long)off);
+    }
+
     int is_anon   = !!(flags & MAP_ANONYMOUS);
     int is_shared = !!(flags & MAP_SHARED);
     int has_fd    = ((int64_t)fd != -1);
@@ -1910,6 +1960,9 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             // MAP_PRIVATE on a non-regular fd (shmem/tty/socket/pipe) —
             // the old code returned EACCES here.  Preserve that, since
             // those fds don't expose a readable inode to demand-page from.
+            if (g_current && comm_match(g_current->comm))
+                pr_warn("mmap", "%s fd=%ld MAP_PRIVATE on non-regular fd → EACCES",
+                        g_current->comm, (long)fd);
             return (uint64_t)-EACCES;
         }
     }
@@ -1918,9 +1971,19 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         if (!f) return (uint64_t)-EBADF;
         // Must be a regular ext2 file (has a stored path we can stat).
         // Shmem, ttys, sockets, pipes have no inode — reject.
-        if (!f->path[0]) { fdput(f); return (uint64_t)-EACCES; }
+        if (!f->path[0]) {
+            if (g_current && comm_match(g_current->comm))
+                pr_warn("mmap", "%s fd=%ld f->path empty → EACCES",
+                        g_current->comm, (long)fd);
+            fdput(f); return (uint64_t)-EACCES;
+        }
         if (prot & PROT_READ &&
             f->rights != 0 && !rights_check(f->rights, RIGHT_READ)) {
+            if (g_current && comm_match(g_current->comm))
+                pr_warn("mmap", "%s fd=%ld path=\"%s\" rights=0x%x "
+                                "missing RIGHT_READ → EACCES",
+                        g_current->comm, (long)fd, f->path,
+                        (uint32_t)f->rights);
             fdput(f); return (uint64_t)-EACCES;
         }
         // Snapshot file size at mmap time — standard POSIX semantics.
@@ -2502,7 +2565,29 @@ static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto)
     }
 
     if (!f) { serial_puts_dbg("[socket] ENOMEM\n"); return (uint64_t)-ENOMEM; }
+    /* Honor SOCK_NONBLOCK / SOCK_CLOEXEC from the `type` arg.  Linux
+     * OR-encodes them in type just like we strip in unix_sock_open().
+     * Without propagating CLOEXEC into fd_flags, the fd SURVIVES
+     * fork()+exec() — and a parent's wayland-server fd inherited by
+     * every spawned foot child inflates the vfs_file_t refcount above
+     * 1, so when the parent dies task_files_release's vfs_close only
+     * decrements refcount, never reaches 0, never calls unix_sock_close,
+     * never evicts the /tmp/wayland-0 entry from the namespace.  The
+     * next run of dwl then gets EADDRINUSE on bind.
+     *
+     * Observed exactly this chain: after killing dwl via spammed
+     * Alt+Shift+Enter SIGSEGV, a fresh `dwl -s foot` died at
+     * `startup: display_add_socket_auto`. */
+    #define MK_SOCK_CLOEXEC  0x80000
+    #define MK_SOCK_NONBLOCK 0x00800
+    if (type & MK_SOCK_NONBLOCK)
+        f->flags |= O_NONBLOCK;
     int64_t fd = fd_install(f);
+    if (fd >= 0 && (type & MK_SOCK_CLOEXEC)) {
+        task_files_t* tf = g_current->files_shared;
+        if (tf && tf->ft && (uint64_t)fd < tf->ft->cap)
+            tf->ft->fd_flags[fd] = FD_CLOEXEC;
+    }
     serial_puts_dbg("[socket] fd="); serial_hex_dbg((uint64_t)fd);
     return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
 }
@@ -5103,11 +5188,49 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SIGNALFD]            = w_sys_signalfd,
 };
 
+/* Per-comm syscall tracing — DEBUGGING.md §2 + §4.
+ *
+ * Every syscall enter/exit fires a TRACE event into the per-CPU ring
+ * (cheap, always on, dumped on panic).  When the caller's comm matches
+ * one of the SYSCALL_TRACE_COMMS below, we ALSO pr_debug a human-
+ * readable line to serial — useful for diagnosing a specific program
+ * (like foot blanking after wayland connect) without drowning bash /
+ * dwl traffic.  Flip SYSCALL_TRACE_ALL to log every comm.
+ */
 // ── native_syscall_dispatch ───────────────────────────────────────────────
 // Dispatches using our internal syscall numbers via a jump table.
 uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                                   uint64_t arg3, uint64_t arg4) {
     uint64_t ret;
+
+    /* Snapshot arg5/arg6 from the per-CPU scratch into the TASK.  The
+     * asm stashed them in this_cpu() via gs-relative stores, which is
+     * only valid as long as we don't migrate CPUs.  mmap is a 6-arg
+     * syscall whose intermediate paths (ext2 read, vmm_page_map) can
+     * sleep, and if we reschedule onto a different CPU, a subsequent
+     * read of this_cpu()->syscall_arg5 would see whatever OTHER task's
+     * arg5 was most recently written to THAT cpu's slot — typically
+     * stdin (fd=0), which is exactly the corruption we observed.
+     *
+     * Snapshotting here, while still on the entry CPU, pins the real
+     * values to a per-task slot that follows the task across
+     * migrations. */
+    if (g_current) {
+        g_current->syscall_a5 = this_cpu()->syscall_arg5;
+        g_current->syscall_a6 = this_cpu()->syscall_arg6;
+    }
+
+    /* Trace enter.  TRACE() is per-CPU + lock-free + always on — the
+     * ring is the cheapest available instrument and the panic path
+     * dumps it.  pr_debug is heavier (serial lock + formatting) so we
+     * only emit it for comms we care about. */
+    TRACE(TRACE_SYSCALL_ENTER, nr, arg1, arg2, arg3);
+    int traced = 0;
+    if (g_current && comm_match(g_current->comm)) {
+        traced = 1;
+        pr_debug("sys", "→ %s nr=%lu a1=0x%lx a2=0x%lx a3=0x%lx a4=0x%lx",
+                  g_current->comm, nr, arg1, arg2, arg3, arg4);
+    }
     // Pre-9-7 this mirrored every stdout/stderr byte to port 0x3F8 as a
     // debug aid.  That's catastrophically wrong under SMP: per-byte
     // unlocked `inb(0x3F8+5); outb(0x3F8, c)` from every CPU on every
@@ -5127,6 +5250,12 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
     sys_handler_t h = (nr < (uint64_t)(sizeof(s_syscall_table) / sizeof(s_syscall_table[0])))
                       ? s_syscall_table[nr] : NULL;
     ret = h ? h(arg1, arg2, arg3, arg4) : (uint64_t)-ENOSYS;
+
+    TRACE(TRACE_SYSCALL_EXIT, nr, ret, 0, 0);
+    if (traced) {
+        pr_debug("sys", "← %s nr=%lu → 0x%lx",
+                  g_current ? g_current->comm : "?", nr, ret);
+    }
 
     // Deliver any pending signals on the syscall return path.
     // g_signal_in_syscall=1 tells signal_deliver_pending it may set up user frames.

@@ -262,9 +262,38 @@ int main(void) {
         // ── Exec shell as this user ──────────────────────────────────────
         // spawn inherits our (now-dropped) credentials via cred_copy in
         // elf_exec_from_ext2.  The child shell runs as uid=pw->uid.
+        //
+        // Build a minimal env for the shell.  POSIX + systemd consumers
+        // like foot / fcft look up HOME and USER immediately on startup
+        // (foot:conf.c:374 reads $XDG_CONFIG_HOME then $HOME, fcft
+        // parses $XDG_CACHE_HOME for its font cache).  Without these
+        // set every wayland client can't find its config directory and
+        // falls back to defaults that require further machinery (e.g.
+        // foot falls back to getpwuid(getuid()), which fails on our
+        // libc and drops the shell back to "sh").  Set the canonical
+        // four so downstream consumers find what they expect.
+        char env_home[128 + 5];
+        char env_user[32  + 5];
+        char env_shell[128 + 6];
+        s_strcpy(env_home,  "HOME=",  sizeof(env_home));
+        s_strcpy(env_home  + 5,  pw->home, sizeof(env_home)  - 5);
+        s_strcpy(env_user,  "USER=",  sizeof(env_user));
+        s_strcpy(env_user  + 5,  username, sizeof(env_user)  - 5);
+        s_strcpy(env_shell, "SHELL=", sizeof(env_shell));
+        s_strcpy(env_shell + 6,  pw->shell, sizeof(env_shell) - 6);
+        const char* shell_env[] = {
+            env_home,
+            env_user,
+            env_shell,
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "TERM=xterm-256color",
+            "LANG=C.UTF-8",
+            "XDG_RUNTIME_DIR=/tmp",
+            (char*)0,
+        };
         const char* sh_argv[] = { pw->shell, (char*)0 };
         int inherit_stdio[3] = { -1, -1, -1 };
-        int pid = spawn(pw->shell, sh_argv, (void*)0, inherit_stdio, NULL);
+        int pid = spawn(pw->shell, sh_argv, shell_env, inherit_stdio, NULL);
         if (pid < 0) {
             write(1, "login: failed to exec shell\n", 28);
             return 1;

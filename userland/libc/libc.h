@@ -1508,9 +1508,23 @@ static inline int _sys_readdir(const char* path, size_t pathlen,
                                        (uint64_t)buf, (uint64_t)max));
 }
 
-// POSIX dirent — struct dirent for compat, dirent_t for our style
+// POSIX dirent — struct dirent for compat, dirent_t for our style.
+//
+// Layout MUST match build/sysroot/usr/include/dirent.h EXACTLY.
+// That header is what every cross-compiled port (foot, fontconfig,
+// libinput, …) sees when it `#include <dirent.h>`.  If libc.h's
+// copy diverges, libc's readdir() writes d_name at one offset and
+// the caller reads d_name at another — every filename comes back
+// truncated by the size of the missing fields.
+//
+// Observed: d_off (8 bytes) was missing here, so fontconfig saw
+// every font file as `<name>` minus its first 8 bytes — e.g.
+// "DejaVuSansMono-Bold.ttf" came back as "nsMono-Bold.ttf",
+// the FT_New_Face path walk found nothing, the font cache was
+// empty, and foot blanked with "failed to match font".
 typedef struct dirent {
     unsigned long  d_ino;
+    long           d_off;       // off_t — matches sysroot dirent.h
     unsigned short d_reclen;
     unsigned char  d_type;
     char           d_name[256];
