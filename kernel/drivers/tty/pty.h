@@ -35,6 +35,11 @@ typedef struct pty {
     uint32_t     m_head;                        // master ring head (write position)
     uint32_t     m_tail;                        // master ring tail (read position)
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
+    struct vfs_file_t* slave_file;              // stashed slave vfs, attached to /dev/pts/N
+                                                // by pty_open_pts_slave.  Refcount tracks
+                                                // active slave fds; 0 means "allocated but
+                                                // not yet opened".  NULL for pairs created
+                                                // via sys_openpty (both fds installed up-front).
     wait_queue_t master_waitq;                  // wait queue for master-side
                                                 // blocking reads + poll/epoll
     wait_queue_t slave_drain_waitq;             // wait queue for slave-side writers
@@ -50,6 +55,24 @@ typedef struct pty {
 // Caller installs them into the fd table.
 // Returns 0 on success, -errno on failure.
 int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out);
+
+/*
+ * POSIX /dev/ptmx entry point: allocate a fresh PTY pair and return the
+ * master vfs_file_t only.  The slave vfs_file_t is stashed on the pty_t
+ * and reached later via pty_open_pts_slave(index).  The caller only
+ * installs the master — the slave becomes reachable via /dev/pts/N.
+ * Returns 0 on success, -errno on failure.
+ */
+int pty_open_ptmx(vfs_file_t** master_out);
+
+/*
+ * POSIX /dev/pts/N entry point: look up the pty_t by index in the live
+ * list, bump the stashed slave vfs_file_t's refcount, and return it.
+ * Multiple opens of the same /dev/pts/N share the vfs; each close
+ * decrements the refcount.  Returns NULL if the index doesn't exist or
+ * its master has already been closed.
+ */
+vfs_file_t* pty_open_pts_slave(int index);
 
 // Called by slave's write_char to push output to master's read buffer.
 void pty_master_push(pty_t* pty, uint8_t c);

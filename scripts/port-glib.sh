@@ -38,10 +38,10 @@ configure() {
         log "FORCE=1 — wiping prior build"
         rm -rf "$GLIB_BUILD"
     fi
-    [ ! -d "$GLIB_BUILD" ] || return 0
+    [ -f "$GLIB_BUILD/build.ninja" ] && return 0
     log "meson setup"
     meson setup "$GLIB_BUILD" "$GLIB_SRC" \
-        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \

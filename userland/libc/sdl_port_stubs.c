@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <makaos/syscall.h>
 
 size_t wcslen(const wchar_t* s) {
@@ -95,11 +96,14 @@ int posix_openpt(int flags) {
 int grantpt(int fd)  { (void)fd; return 0; }       // no setuid helper needed
 int unlockpt(int fd) { (void)fd; return 0; }       // always unlocked already
 static char s_ptsname_buf[32];
+/*
+ * Returns "/dev/pts/<N>" where <N> is the real pty index, queried from
+ * the kernel via TIOCGPTN.  Deriving N from the fd number is wrong —
+ * fd 9 might wrap a pty index of 2, and opening /dev/pts/9 then ENOENTs.
+ */
 char* ptsname(int fd) {
-    // Our /dev/ptmx assigns per-open slave numbers starting at 0.
-    // Query via TIOCGPTN ioctl.  For now derive from fd number —
-    // fine for single-PTY tools like foot.
-    unsigned n = (unsigned)fd;
+    unsigned int n = 0;
+    if (ioctl(fd, 0x80045430 /* TIOCGPTN */, &n) < 0) return 0;
     int i = 0;
     const char* prefix = "/dev/pts/";
     while (prefix[i]) { s_ptsname_buf[i] = prefix[i]; i++; }

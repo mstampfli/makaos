@@ -37,6 +37,7 @@
 #define HAVE_RAND                1
 #define HAVE_MMAP                1
 #define HAVE_GETOPT              1
+#define HAVE_MKSTEMP             1
 #define HAVE_GETPAGESIZE         1
 #define HAVE_GNUC_ATTRIBUTE      1
 #define HAVE_EXPAT               1

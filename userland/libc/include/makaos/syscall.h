@@ -116,6 +116,7 @@
 #define SYS_SENDMSG           110
 #define SYS_RECVMSG           111
 #define SYS_SIGNALFD          112
+#define SYS_FUTEX             113
 
 // SYS_READ nonblock hint — encoded in the 4th syscall arg to SYS_READ.
 #define SYS_READ_NONBLOCK 1

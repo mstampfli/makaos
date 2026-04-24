@@ -1,14 +1,14 @@
 The Meson build system
-Version: 1.7.0
-Source dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2
-Build dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libinput_build
+Version: 1.3.2
+Source dir: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2
+Build dir: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/libinput_build
 Build type: cross build
 Project name: libinput
 Project version: 1.26.2
-C compiler for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
-C linker for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
-C compiler for the build machine: cc (gcc 14.2.0 "cc (Debian 14.2.0-19) 14.2.0")
-C linker for the build machine: cc ld.bfd 2.44
+C compiler for the host machine: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
+C linker for the host machine: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
+C compiler for the build machine: cc (gcc 13.3.0 "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0")
+C linker for the build machine: cc ld.bfd 2.42
 Build machine cpu family: x86_64
 Build machine cpu: x86_64
 Host machine cpu family: x86_64
@@ -35,7 +35,7 @@ Fetching value of define "static_assert" : _Static_assert
 Header "dirent.h" has symbol "versionsort" : YES 
 Header "errno.h" has symbol "program_invocation_short_name" : YES 
 Has header "xlocale.h" : NO 
-Checking if "locale.h" links: YES 
+Checking if "locale.h" : links: YES 
 Header "sys/ptrace.h" has symbol "PTRACE_ATTACH" : NO 
 Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
 Run-time dependency libudev found: YES 255
@@ -59,12 +59,12 @@ Configuring test-util-includes-util-ratelimit.h.c using configuration
 Configuring test-util-includes-util-strings.h.c using configuration
 Configuring test-util-includes-util-time.h.c using configuration
 Configuring libinput-version.h using configuration
-Program test/test_quirks_files.py found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/test_quirks_files.py)
+Program test/test_quirks_files.py found: YES (/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/test_quirks_files.py)
 Configuring test_tool_option_parsing.py using configuration
-Program test/helper-copy-and-exec-from-tmp.sh found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/helper-copy-and-exec-from-tmp.sh)
-Program test/symbols-leak-test found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/symbols-leak-test)
-C++ compiler for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-g++ (gcc 14.2.0 "x86_64-pc-makaos-g++ (GCC) 14.2.0")
-C++ linker for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-g++ ld.bfd 2.42
+Program test/helper-copy-and-exec-from-tmp.sh found: YES (/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/helper-copy-and-exec-from-tmp.sh)
+Program test/symbols-leak-test found: YES (/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/libinput-1.26.2/test/symbols-leak-test)
+C++ compiler for the host machine: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-g++ (gcc 14.2.0 "x86_64-pc-makaos-g++ (GCC) 14.2.0")
+C++ linker for the host machine: /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-g++ ld.bfd 2.42
 Configuring libinput.1 using configuration
 Configuring libinput-analyze.1 using configuration
 Configuring libinput-analyze-buttons.1 using configuration
@@ -89,19 +89,20 @@ Configuring libinput-quirks-list.1 using configuration
 Configuring libinput-quirks-validate.1 using configuration
 Configuring config.h using configuration
 Build targets in project: 34
+NOTICE: Future-deprecated features used:
+ * 0.64.0: {'copy arg in configure_file'}
 
 libinput 1.26.2
 
   User defined options
-    Cross files    : /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
-    debug-gui      : false
+    Cross files    : /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/makaos-meson-cross.ini
     default_library: static
+    libdir         : lib
+    prefix         : /usr
+    debug-gui      : false
     documentation  : false
     install-tests  : false
-    libdir         : lib
     libwacom       : false
-    prefix         : /usr
     tests          : false
 
-Found ninja-1.12.1 at /usr/bin/ninja
-Generating targets:   0%|          | 0/34 eta ?                                               Writing build.ninja:   0%|          | 0/140 eta ?                                                 
+Found ninja-1.11.1 at /usr/bin/ninja

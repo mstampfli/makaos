@@ -143,6 +143,25 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE)) {
         fdput(f); return (uint64_t)-EACCES;
     }
+    /* MakaOS TEMP: tee fd=2 writes from comm="foot" to serial so we can
+     * see the stderr messages that normally land on the (currently
+     * dwl-owned) framebuffer tty and are invisible elsewhere. */
+    {
+        extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
+        if (fd == 2 && g_current && g_current->comm[0] == 'f'
+                     && g_current->comm[1] == 'o'
+                     && g_current->comm[2] == 'o'
+                     && g_current->comm[3] == 't') {
+            char stderr_buf[256];
+            uint64_t n = len < sizeof(stderr_buf)-1 ? len : sizeof(stderr_buf)-1;
+            if (copy_from_user(stderr_buf, (void*)buf, n) == 0) {
+                stderr_buf[n] = 0;
+                kprintf_atomic("[foot-stderr] %s", stderr_buf);
+                if (n > 0 && stderr_buf[n-1] != '\n')
+                    kprintf_atomic("\n");
+            }
+        }
+    }
     int64_t r = vfs_write(f, (const void*)buf, len);
     fdput(f);
     if (r < 0) return (uint64_t)r;
@@ -328,6 +347,16 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
+        uint8_t match_ptmx   = (dev[0]=='p' && dev[1]=='t' && dev[2]=='m' && dev[3]=='x'
+                             && dev[4]=='\0');
+        /* /dev/pts/<N>: decimal slave index; N must match a live pty_t. */
+        int match_ptsn = -1;
+        if (dev[0]=='p' && dev[1]=='t' && dev[2]=='s' && dev[3]=='/'
+            && dev[4] >= '0' && dev[4] <= '9') {
+            int n = 0; int i = 4;
+            while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
+            if (dev[i] == '\0') match_ptsn = n;
+        }
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
@@ -340,6 +369,18 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_null)   f = vfs_null_open();
         else if (match_zero)   f = vfs_zero_open();
         else if (match_urnd)   f = vfs_urandom_open();
+        else if (match_ptmx)   {
+            extern int pty_open_ptmx(vfs_file_t** master_out);
+            vfs_file_t* m = NULL;
+            int pr = pty_open_ptmx(&m);
+            if (pr < 0) return (uint64_t)(int64_t)pr;
+            f = m;
+        }
+        else if (match_ptsn >= 0) {
+            extern vfs_file_t* pty_open_pts_slave(int index);
+            f = pty_open_pts_slave(match_ptsn);
+            if (!f) return (uint64_t)-ENOENT;
+        }
         else return (uint64_t)-ENOENT;
         // fall through to got_file
     }
@@ -4799,6 +4840,11 @@ extern vfs_file_t* signalfd_new(uint32_t mask, uint32_t flags);
 extern int         signalfd_update(vfs_file_t* f, uint32_t mask);
 extern int         signalfd_is(vfs_file_t* f);
 
+extern int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t timeout);
+static uint64_t w_sys_futex(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return (uint64_t)sys_futex(a, b, c, d);
+}
+
 static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
                                  uint64_t flags, uint64_t d) {
     (void)d;
@@ -4858,9 +4904,19 @@ typedef struct k_cmsghdr {
 
 extern int         unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
 extern int         unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
+extern int         unix_sock_recv_flags(vfs_file_t* f, void* buf, uint32_t len, int flags);
 extern int         unix_sock_sendfd(vfs_file_t* s, vfs_file_t* f, uint32_t r);
 extern vfs_file_t* unix_sock_recvfd(vfs_file_t* s);
+extern vfs_file_t* unix_sock_recvfd_nowait(vfs_file_t* s);
 extern int         is_unix_sock(vfs_file_t* f);
+
+/*
+ * Subset of Linux sendmsg/recvmsg flags we recognise.  MSG_DONTWAIT is
+ * a per-call O_NONBLOCK override — compositors (dwl) rely on it so
+ * their epoll-driven event loop never blocks in recvmsg even when the
+ * fd itself is in blocking mode.
+ */
+#define MSG_DONTWAIT 0x40
 
 static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
@@ -4940,10 +4996,14 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
 
 static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
-    (void)flags; (void)d;
+    (void)d;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
     vfs_file_t* sock = fd_to_file(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+
+    /* MSG_DONTWAIT → per-call O_NONBLOCK for the underlying recv */
+    int recv_extra_flags = (flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
+    int sock_is_unix     = is_unix_sock(sock);
 
     k_msghdr_t mh;
     if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
@@ -4961,7 +5021,7 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
         if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
         while (n_inst < max_fds) {
-            vfs_file_t* rf = unix_sock_recvfd(sock);
+            vfs_file_t* rf = unix_sock_recvfd_nowait(sock);
             if (!rf) break;
             int64_t new_fd = fd_install(rf);
             if (new_fd < 0) { vfs_close(rf); break; }
@@ -4998,7 +5058,13 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
             if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
-            int r = sock->read(sock, bounce, chunk);
+            int r;
+            if (sock_is_unix) {
+                r = unix_sock_recv_flags(sock, bounce, (uint32_t)chunk,
+                                          recv_extra_flags);
+            } else {
+                r = sock->read(sock, bounce, chunk);
+            }
             if (r < 0) {
                 // First read returning an error propagates; a later
                 // partial read returns bytes already gathered.
@@ -5186,6 +5252,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SENDMSG]             = w_sys_sendmsg,
     [SYS_RECVMSG]             = w_sys_recvmsg,
     [SYS_SIGNALFD]            = w_sys_signalfd,
+    [SYS_FUTEX]               = w_sys_futex,
 };
 
 /* Per-comm syscall tracing — DEBUGGING.md §2 + §4.

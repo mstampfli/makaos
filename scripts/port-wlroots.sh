@@ -101,14 +101,23 @@ if [ "${FORCE:-0}" = "1" ]; then
     rm -rf "$WLR_BUILD"
 fi
 
+# ── Patch: c23 → c2x fallback on meson < 1.4 ──────────────────────
+# Upstream gates on >=1.3.0 for c23, but meson 1.3.x only lists c2x
+# in its allowed std set.  Bump the gate so old meson falls back to
+# c11.  Marker comment lets us re-apply after a re-extract.
+if ! grep -q MAKAOS_C23_GATE "$WLR_SRC/meson.build"; then
+    log "patching c23 version gate (meson <1.4 → c11 fallback)"
+    sed -i "s|'c_std=' + (meson.version().version_compare('>=1.3.0') ? 'c23,c11' : 'c11')|'c_std=' + (meson.version().version_compare('>=1.4.0') ? 'c23,c11' : 'c11') # MAKAOS_C23_GATE|" "$WLR_SRC/meson.build"
+fi
+
 # ── meson configure (only re-runs if $WLR_BUILD is fresh) ─────────
 # Backends: drm (native KMS) + libinput (input via libinput port).
 # Renderer: pixman only — GL/Vulkan require libgbm + mesa we haven't
 # ported.  Session support uses our native libseat equivalent.
-if [ ! -d "$WLR_BUILD" ]; then
+if [ ! -f "$WLR_BUILD/build.ninja" ]; then
     log "meson setup ${WLR_BUILD}"
     meson setup "$WLR_BUILD" "$WLR_SRC" \
-        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \
@@ -130,6 +139,12 @@ ninja -C "$WLR_BUILD" 2>&1 | tee "$BUILD_DIR/wlroots_ninja.log"
 log "installing into $SYSROOT"
 DESTDIR="$SYSROOT" ninja -C "$WLR_BUILD" install \
     2>&1 | tee "$BUILD_DIR/wlroots_install.log"
+
+# wlroots's meson install rules don't ship the protocol/*.h it generates,
+# but its public headers #include them.  Copy them next to the wlroots-0.18
+# public headers so downstream compositors (dwl, tinywl) find them.
+log "installing generated protocol headers"
+cp "$WLR_BUILD"/protocol/*.h "$SYSROOT/usr/include/wlroots-0.18/"
 
 log "done — check $SYSROOT/usr/lib/libwlroots*"
 ls -la "$SYSROOT"/usr/lib/libwlroots* 2>/dev/null || true

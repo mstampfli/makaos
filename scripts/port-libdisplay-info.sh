@@ -35,10 +35,10 @@ configure() {
         log "FORCE=1 wiping build dir"
         rm -rf "$DI_BUILD"
     fi
-    [ -d "$DI_BUILD" ] && return 0
+    [ -f "$DI_BUILD/build.ninja" ] && return 0
     log "meson setup"
     meson setup "$DI_BUILD" "$DI_SRC" \
-        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \

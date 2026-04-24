@@ -168,6 +168,13 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
 // Receive data.  Blocks if empty.  Returns bytes read, 0 on EOF, -errno on error.
 int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
 
+/*
+ * Variant that accepts per-call flags.  Pass O_NONBLOCK for MSG_DONTWAIT
+ * semantics: return -EAGAIN instead of blocking on an empty buffer.  The
+ * socket's own f->flags&O_NONBLOCK still forces nonblocking regardless.
+ */
+int unix_sock_recv_flags(vfs_file_t* f, void* buf, uint32_t len, int flags);
+
 // Send datagram to a specific path (SOCK_DGRAM only).
 int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len, const char* path);
 

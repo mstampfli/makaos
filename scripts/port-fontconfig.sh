@@ -10,12 +10,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FC_VERSION="2.15.0"
-FC_URL="https://www.freedesktop.org/software/fontconfig/release/fontconfig-${FC_VERSION}.tar.xz"
+FC_URL="https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${FC_VERSION}/fontconfig-${FC_VERSION}.tar.gz"
 
 BUILD_DIR="$REPO_ROOT/build"
 THIRD_PARTY="$BUILD_DIR/third_party"
 FC_SRC="$THIRD_PARTY/fontconfig-${FC_VERSION}"
-FC_TARBALL="$THIRD_PARTY/fontconfig-${FC_VERSION}.tar.xz"
+FC_TARBALL="$THIRD_PARTY/fontconfig-${FC_VERSION}.tar.gz"
 
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
 
@@ -54,7 +54,50 @@ fetch_fc() {
     fi
     if [ ! -d "$FC_SRC" ]; then
         log "extracting fontconfig"
-        tar -xJf "$FC_TARBALL" -C "$THIRD_PARTY"
+        tar -xzf "$FC_TARBALL" -C "$THIRD_PARTY"
+    fi
+
+    # ── Generate fcstdint.h (upstream meson does this via configure_file;
+    # our raw-gcc path skipped it, which worked once because the build
+    # dir still had a stale copy around).  Content is the same as
+    # src/fcstdint.h.in — just a thin forward to <stdint.h>.
+    if [ ! -f "$FC_SRC/src/fcstdint.h" ]; then
+        cp "$FC_SRC/src/fcstdint.h.in" "$FC_SRC/src/fcstdint.h"
+    fi
+
+    # ── Generate fc-lang/fclang.h via upstream fc-lang.py.
+    # Consumed by src/fclang.c; encodes the .orth charset mappings into
+    # a C table.  Without this the build hits "fclang.h: No such file".
+    if [ ! -f "$FC_SRC/fc-lang/fclang.h" ]; then
+        ( cd "$FC_SRC/fc-lang" && \
+          python3 ./fc-lang.py *.orth --template fclang.tmpl.h \
+            --output fclang.h --directory . > /dev/null 2>&1 )
+    fi
+
+    # ── Generate fc-case/fccase.h via upstream fc-case.py.
+    # Consumed by src/fcstr.c (case folding tables).
+    if [ ! -f "$FC_SRC/fc-case/fccase.h" ]; then
+        ( cd "$FC_SRC/fc-case" && \
+          python3 ./fc-case.py CaseFolding.txt --template fccase.tmpl.h \
+            --output fccase.h > /dev/null 2>&1 )
+    fi
+
+    # ── Patch: guard FamilyTableAdd against NULL family strings.
+    # FcValueString returns NULL when the FcValue is non-string;
+    # FamilyTableAdd then hands NULL to FcHashTableFind which derefs it
+    # in FcStrHashIgnoreCase and segfaults.  Skip the NULL entry.
+    if ! grep -q MAKAOS_FAMILY_NULL_GUARD "$FC_SRC/src/fccfg.c"; then
+        log "patching fccfg.c: NULL-guard in FamilyTableAdd"
+        python3 - <<PY
+path = "$FC_SRC/src/fccfg.c"
+needle = "const FcChar8 *s = FcValueString (&ll->value);\n            FamilyTableEntry *fe;\n\n            if (!FcHashTableFind (table->family_hash,"
+repl   = "const FcChar8 *s = FcValueString (&ll->value);\n            FamilyTableEntry *fe;\n\n            /* MAKAOS_FAMILY_NULL_GUARD */\n            if (!s) continue;\n\n            if (!FcHashTableFind (table->family_hash,"
+with open(path) as h: src = h.read()
+if needle not in src:
+    raise SystemExit("fontconfig FamilyTableAdd shape changed; update patch")
+with open(path, "w") as h: h.write(src.replace(needle, repl, 1))
+print("patched")
+PY
     fi
 }
 

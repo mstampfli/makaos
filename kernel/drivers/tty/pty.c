@@ -445,6 +445,13 @@ static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg
         case 0x540D: // TIOCEXCL
         case 0x540A: // TIOCNXCL
             return 0;
+        case 0x80045430: { // TIOCGPTN — read slave index for ptsname()
+            uint32_t* out = (uint32_t*)arg;
+            *out = (uint32_t)ctx->pty->index;
+            return 0;
+        }
+        case 0x40045431: // TIOCSPTLCK — slave already unlocked; no-op
+            return 0;
         default:
             return -22; // EINVAL
     }
@@ -628,4 +635,48 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     *master_out = master;
     *slave_out = slave;
     return 0;
+}
+
+// ── pty_open_ptmx — POSIX-style master-only allocation ────────────────────
+//
+// posix_openpt → open("/dev/ptmx") lands here.  We allocate a pair the
+// same way pty_alloc does, but hand back only the master vfs_file_t.
+// The slave vfs lives on pty_t->slave_file with refcount=0 until the
+// caller opens /dev/pts/N, at which point pty_open_pts_slave bumps it
+// to 1 and returns the reference.
+
+int pty_open_ptmx(vfs_file_t** master_out) {
+    vfs_file_t* m = NULL;
+    vfs_file_t* s = NULL;
+    int r = pty_alloc(&m, &s);
+    if (r < 0) return r;
+
+    // Slave starts "allocated but not yet opened".  Drop its synthetic
+    // refcount from 1 → 0 so pty_open_pts_slave can transition 0 → 1
+    // on first open; also slave_open_count was set to 1 by pty_alloc,
+    // so rebalance it to 0 here.
+    pty_t* pty = (pty_t*)(((pty_slave_ctx_t*)s->ctx)->pty);
+    pty->slave_file = s;
+    pty->slave_open_count = 0;
+    s->refcount = 0;
+
+    *master_out = m;
+    return 0;
+}
+
+// ── pty_open_pts_slave — POSIX-style slave open by index ──────────────────
+//
+// open("/dev/pts/N") lands here.  Walks s_pty_head, matches on index,
+// bumps the slave vfs's refcount, and returns it.  Returns NULL if no
+// such pty exists or its master has already been closed (ENXIO case).
+
+vfs_file_t* pty_open_pts_slave(int index) {
+    for (pty_t* p = s_pty_head; p; p = p->next) {
+        if (p->index == index && p->slave_file && p->master_open) {
+            __atomic_fetch_add(&p->slave_file->refcount, 1u, __ATOMIC_ACQ_REL);
+            __atomic_fetch_add((int*)&p->slave_open_count, 1, __ATOMIC_ACQ_REL);
+            return p->slave_file;
+        }
+    }
+    return NULL;
 }

@@ -43,7 +43,7 @@ configure() {
         log "FORCE=1 wiping build dir"
         rm -rf "$OUT_DIR"
     fi
-    [ -d "$OUT_DIR" ] && return 0
+    [ -f "$OUT_DIR/build.ninja" ] && return 0
     # libevdev's meson looks up input.h / input-event-codes.h under
     # include/linux/<host_machine.system()>/.  Our cross-file sets
     # system=makaos; point that at the bundled linux copies (same
@@ -62,7 +62,7 @@ configure() {
     done
     log "meson setup"
     meson setup "$OUT_DIR" "$SRC_DIR" \
-        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \
@@ -93,7 +93,7 @@ else:
 PYEOF
         rm -rf "$OUT_DIR"
         meson setup "$OUT_DIR" "$SRC_DIR" \
-            --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+            --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
             --prefix=/usr --libdir=lib \
             -Ddefault_library=static \
             -Dtests=disabled -Ddocumentation=disabled -Dcoverity=false \

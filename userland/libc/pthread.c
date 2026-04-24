@@ -290,6 +290,27 @@ int pthread_mutex_trylock(pthread_mutex_t* m) {
     return EBUSY;
 }
 
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+static inline int sys_futex(volatile unsigned* addr, int op, unsigned val) {
+    return (int)syscall4(SYS_FUTEX, (uint64_t)(uintptr_t)addr,
+                          (uint64_t)op, (uint64_t)val, 0);
+}
+static inline int sys_futex_int(volatile int* addr, int op, int val) {
+    return (int)syscall4(SYS_FUTEX, (uint64_t)(uintptr_t)addr,
+                          (uint64_t)op, (uint64_t)val, 0);
+}
+
+/*
+ * Futex-backed mutex: 3-state encoding of m->locked.
+ *   0 = unlocked
+ *   1 = locked, no known waiters
+ *   2 = locked, at least one waiter parked on futex
+ * The fast path stays a single cmpxchg 0→1.  Contention: cmpxchg 1→2 to
+ * advertise waiters, then FUTEX_WAIT until the owner transitions back
+ * to 0.  Unlock is a free-store + optional FUTEX_WAKE(1) only when
+ * m->locked was 2.
+ */
 int pthread_mutex_lock(pthread_mutex_t* m) {
     if (!m) return EINVAL;
     pthread_t me = pthread_self();
@@ -299,19 +320,32 @@ int pthread_mutex_lock(pthread_mutex_t* m) {
     }
     if (m->kind == PTHREAD_MUTEX_ERRORCHECK && m->owner == me)
         return EDEADLK;
-    // Spin briefly, then yield.  500 pause instructions ≈ 1–2 μs on
-    // modern CPUs before we give up and let the scheduler run someone
-    // else.
-    for (int spin = 0; spin < 500; spin++) {
-        if (__sync_bool_compare_and_swap(&m->locked, 0, 1)) {
-            m->owner = me;
-            m->depth = 1;
-            return 0;
-        }
+
+    int expected = 0;
+    /* Fast path: uncontended 0 → 1. */
+    if (__atomic_compare_exchange_n(&m->locked, &expected, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        goto got_it;
+
+    /* Short adaptive spin before advertising waiters — cheap for short
+     * critical sections where the holder is about to release. */
+    for (int spin = 0; spin < 64; spin++) {
         __builtin_ia32_pause();
+        expected = 0;
+        if (__atomic_compare_exchange_n(&m->locked, &expected, 1, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            goto got_it;
     }
-    while (!__sync_bool_compare_and_swap(&m->locked, 0, 1))
-        sched_yield();
+
+    /* Advertise contention once so the owner fires FUTEX_WAKE on
+     * unlock.  Transition to state 2 means "held + has waiters". */
+    int cur = __atomic_exchange_n(&m->locked, 2, __ATOMIC_ACQUIRE);
+    while (cur != 0) {
+        /* Park until someone transitions locked → 0. */
+        (void)sys_futex_int(&m->locked, FUTEX_WAIT, 2);
+        cur = __atomic_exchange_n(&m->locked, 2, __ATOMIC_ACQUIRE);
+    }
+got_it:
     m->owner = me;
     m->depth = 1;
     return 0;
@@ -326,7 +360,12 @@ int pthread_mutex_unlock(pthread_mutex_t* m) {
         return 0;
     m->owner = 0;
     m->depth = 0;
-    __sync_lock_release(&m->locked);
+    /* Only syscall if there were waiters.  The exchange gives us the
+     * prior value atomically; in the no-waiter common case (was 1),
+     * unlock is a single atomic store with no kernel entry. */
+    int prior = __atomic_exchange_n(&m->locked, 0, __ATOMIC_RELEASE);
+    if (prior == 2)
+        (void)sys_futex_int(&m->locked, FUTEX_WAKE, 1);
     return 0;
 }
 
@@ -360,14 +399,22 @@ int pthread_cond_init(pthread_cond_t* c, const pthread_condattr_t* a) {
 }
 int pthread_cond_destroy(pthread_cond_t* c) { (void)c; return 0; }
 
+/*
+ * Futex-backed condvar (and mutex, defined above).  The kernel provides
+ * SYS_FUTEX with FUTEX_WAIT and FUTEX_WAKE; we park the waiter on the
+ * relevant atomic word and use atomic increments as the wake signal.
+ */
+
 int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
     if (!c || !m) return EINVAL;
-    unsigned seen = c->seq;
+    unsigned seen = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
     c->bound_mutex = m;
     pthread_mutex_unlock(m);
     while (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen) {
-        struct timespec ts = { 0, 1000000 };
-        nanosleep(&ts, NULL);
+        /* Returns 0 on real wake, -EAGAIN if seq changed between our
+         * load and the kernel's re-check (spurious-but-valid), -EINTR
+         * on signal.  All three paths just retry the outer check. */
+        (void)sys_futex(&c->seq, FUTEX_WAIT, seen);
     }
     pthread_mutex_lock(m);
     return 0;
@@ -376,7 +423,7 @@ int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
 int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m,
                             const struct timespec* abs) {
     if (!c || !m || !abs) return EINVAL;
-    unsigned seen = c->seq;
+    unsigned seen = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
     pthread_mutex_unlock(m);
     while (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen) {
         struct timespec now;
@@ -386,8 +433,11 @@ int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m,
             pthread_mutex_lock(m);
             return ETIMEDOUT;
         }
+        /* Kernel ignores timeout today — we fall back to a short
+         * nanosleep so the deadline enforcement above still runs. */
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
+        (void)sys_futex(&c->seq, FUTEX_WAIT, seen);
     }
     pthread_mutex_lock(m);
     return 0;
@@ -396,9 +446,15 @@ int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m,
 int pthread_cond_signal(pthread_cond_t* c) {
     if (!c) return EINVAL;
     __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)sys_futex(&c->seq, FUTEX_WAKE, 1);
     return 0;
 }
-int pthread_cond_broadcast(pthread_cond_t* c) { return pthread_cond_signal(c); }
+int pthread_cond_broadcast(pthread_cond_t* c) {
+    if (!c) return EINVAL;
+    __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    (void)sys_futex(&c->seq, FUTEX_WAKE, 0x7fffffff);
+    return 0;
+}
 
 int pthread_condattr_init(pthread_condattr_t* a)          { if (!a) return EINVAL; a->clock = CLOCK_REALTIME; return 0; }
 int pthread_condattr_destroy(pthread_condattr_t* a)       { (void)a; return 0; }

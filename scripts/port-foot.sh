@@ -54,7 +54,7 @@ configure() {
     [ -f "$OUT_DIR/build.ninja" ] && return 0
     log "meson setup"
     meson setup "$OUT_DIR" "$SRC_DIR" \
-        --cross-file "$REPO_ROOT/scripts/makaos-meson-cross.ini" \
+        --cross-file "$("$REPO_ROOT/scripts/gen-meson-cross.sh")" \
         --prefix=/usr \
         --libdir=lib \
         --buildtype=release \
