@@ -413,7 +413,7 @@ fi
    -o "$BUILD_DIR/user_ls.elf"
 
 # ── Coreutils (cat, echo, mkdir, rm, mv, clear, reboot) ─────────────────
-for util in cat echo mkdir rm mv clear reboot; do
+for util in cat echo mkdir rm mv clear reboot uname; do
     "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
         -c "$USERLAND_DIR/apps/$util/$util.c" -o "$BUILD_DIR/user_${util}.o"
     ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_${util}.o" \
@@ -828,7 +828,7 @@ if [ -f "$BUILD_DIR/user_bash.elf" ]; then
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
-for util in cat echo mkdir rm mv clear reboot; do
+for util in cat echo mkdir rm mv clear reboot uname; do
     if [ -f "$BUILD_DIR/user_${util}.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_${util}.elf" "bin/$util"
         echo "[+] $util ELF installed at bin/$util (root:root 0755)"
