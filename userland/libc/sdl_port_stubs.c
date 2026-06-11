@@ -153,9 +153,9 @@ int wmemcmp(const wchar_t* a, const wchar_t* b, size_t n) {
 // Our SYS_ACCEPT doesn't carry flags yet; fall back to accept() +
 // fcntl for the NONBLOCK bit.  CLOEXEC is a no-op on MakaOS (no
 // exec FD inheritance path yet honours O_CLOEXEC).
-extern int accept(int fd, void* addr, void* addrlen);
+#include <sys/socket.h>
 extern int fcntl(int fd, int cmd, ...);
-int accept4(int fd, void* addr, void* addrlen, int flags) {
+int accept4(int fd, struct sockaddr* addr, socklen_t* addrlen, int flags) {
     int s = accept(fd, addr, addrlen);
     if (s < 0) return s;
     if (flags & 0x00800 /*SOCK_NONBLOCK*/) {
@@ -297,17 +297,20 @@ int fesetround(int round)       { (void)round; return 0; }
 
 // iconv — MakaOS has no locale / charset conversion database yet.
 // iconv_open reports unsupported so callers fall back to UTF-8
-// pass-through (SDL3's string code already does this).
+// pass-through (SDL3's string code already does this).  WEAK: ports
+// that link the real port stub (-liconv from port-libiconv.sh, which
+// glib does) get that strong definition instead of these — both
+// archives on one link line is otherwise a duplicate-symbol error.
 typedef void* iconv_t;
-iconv_t iconv_open(const char* to, const char* from) {
+__attribute__((weak)) iconv_t iconv_open(const char* to, const char* from) {
     (void)to; (void)from; errno = EINVAL; return (iconv_t)-1;
 }
-size_t iconv(iconv_t cd, char** in, size_t* inleft,
+__attribute__((weak)) size_t iconv(iconv_t cd, char** in, size_t* inleft,
              char** out, size_t* outleft) {
     (void)cd; (void)in; (void)inleft; (void)out; (void)outleft;
     errno = EINVAL; return (size_t)-1;
 }
-int iconv_close(iconv_t cd) { (void)cd; return 0; }
+__attribute__((weak)) int iconv_close(iconv_t cd) { (void)cd; return 0; }
 
 // _Exit — skips atexit handlers and stdio flushes; straight syscall.
 __attribute__((noreturn))
@@ -342,4 +345,366 @@ size_t strlcat(char* dst, const char* src, size_t dstsize) {
     for (size_t i = 0; i < copy; i++) dst[dlen + i] = src[i];
     dst[dlen + copy] = '\0';
     return dlen + slen;
+}
+
+// ── Wide-char collation ("C" locale) ─────────────────────────────────
+// glib's gunicollate.c uses wcsxfrm/wcscoll for locale-aware sort keys.
+// MakaOS only ships the C locale, where the transform is the identity:
+// copy the string, return its length; collation is code-point compare.
+size_t wcsxfrm(wchar_t* dst, const wchar_t* src, size_t n) {
+    size_t len = wcslen(src);
+    if (n) {
+        size_t copy = len < n - 1 ? len : n - 1;
+        for (size_t i = 0; i < copy; i++) dst[i] = src[i];
+        dst[copy] = L'\0';
+    }
+    return len;
+}
+
+int wcscoll(const wchar_t* a, const wchar_t* b) {
+    return wcscmp(a, b);
+}
+
+// ── IPv6 well-known addresses + interface naming ─────────────────────
+// Declared in <netinet/in.h> / <net/if.h>; gio links them.  MakaOS is
+// IPv4-only with a single fixed interface.
+#include <netinet/in.h>
+#include <net/if.h>
+#include <string.h>
+const struct in6_addr in6addr_any      = IN6ADDR_ANY_INIT;
+const struct in6_addr in6addr_loopback = IN6ADDR_LOOPBACK_INIT;
+
+unsigned int if_nametoindex(const char* name) {
+    return (name && strcmp(name, "eth0") == 0) ? 1u : 0u;
+}
+char* if_indextoname(unsigned int index, char* name) {
+    if (index != 1 || !name) return 0;
+    strcpy(name, "eth0");
+    return name;
+}
+
+// ── getservbyname / getservbyport ────────────────────────────────────
+// No /etc/services database; gio falls back to numeric ports on NULL.
+#include <netdb.h>
+struct servent* getservbyname(const char* name, const char* proto) {
+    (void)name; (void)proto;
+    return 0;
+}
+struct servent* getservbyport(int port, const char* proto) {
+    (void)port; (void)proto;
+    return 0;
+}
+
+// inet_aton — legacy IPv4 parser; wraps inet_pton (no hex/octal forms).
+#include <arpa/inet.h>
+int inet_aton(const char* s, struct in_addr* out) {
+    return inet_pton(2 /*AF_INET*/, s, out) == 1;
+}
+
+// getsockname / getpeername — the kernel keeps no per-socket local
+// address record yet; gio callers degrade to "address unavailable".
+int getsockname(int fd, struct sockaddr* addr, socklen_t* len) {
+    (void)fd; (void)addr; (void)len;
+    errno = ENOTSUP;
+    return -1;
+}
+int getpeername(int fd, struct sockaddr* addr, socklen_t* len) {
+    (void)fd; (void)addr; (void)len;
+    errno = ENOTSUP;
+    return -1;
+}
+
+// ── Resolver compat stubs ────────────────────────────────────────────
+// res_query (libc/resolv.c) always fails on MakaOS, so gio's DNS
+// answer parsing never executes; these exist for the linker.
+#include <netdb.h>
+#include <resolv.h>
+int h_errno = 0;
+int dn_expand(const unsigned char* msg, const unsigned char* eom,
+              const unsigned char* src, char* dst, int dstsiz) {
+    (void)msg; (void)eom; (void)src; (void)dst; (void)dstsiz;
+    return -1;
+}
+int getnameinfo(const struct sockaddr* sa, socklen_t salen,
+                char* host, socklen_t hostlen,
+                char* serv, socklen_t servlen, int flags) {
+    (void)sa; (void)salen; (void)host; (void)hostlen;
+    (void)serv; (void)servlen; (void)flags;
+    return EAI_FAIL;
+}
+
+// ── mntent — empty mount table ───────────────────────────────────────
+#include <mntent.h>
+FILE* setmntent(const char* filename, const char* type) {
+    (void)filename; (void)type;
+    return 0;            // no mount table — callers see "no mounts"
+}
+struct mntent* getmntent(FILE* fp) { (void)fp; return 0; }
+struct mntent* getmntent_r(FILE* fp, struct mntent* out,
+                           char* buf, int buflen) {
+    (void)fp; (void)out; (void)buf; (void)buflen;
+    return 0;
+}
+int addmntent(FILE* fp, const struct mntent* mnt) { (void)fp; (void)mnt; return 1; }
+int endmntent(FILE* fp) { (void)fp; return 1; }
+char* hasmntopt(const struct mntent* mnt, const char* opt) {
+    (void)mnt; (void)opt;
+    return 0;
+}
+
+// ── grp.h — no /etc/group database ───────────────────────────────────
+#include <grp.h>
+struct group* getgrnam(const char* name) { (void)name; return 0; }
+struct group* getgrgid(gid_t gid)        { (void)gid;  return 0; }
+int getgrnam_r(const char* name, struct group* grp,
+               char* buf, size_t buflen, struct group** result) {
+    (void)name; (void)grp; (void)buf; (void)buflen;
+    if (result) *result = 0;
+    return 0;   // "not found" — POSIX: 0 with *result NULL
+}
+int getgrgid_r(gid_t gid, struct group* grp,
+               char* buf, size_t buflen, struct group** result) {
+    (void)gid; (void)grp; (void)buf; (void)buflen;
+    if (result) *result = 0;
+    return 0;
+}
+
+// ── statvfs — no fs-stats syscall yet ───────────────────────────────
+#include <sys/statvfs.h>
+int statvfs(const char* path, struct statvfs* buf) {
+    (void)path; (void)buf;
+    errno = ENOSYS;
+    return -1;
+}
+int fstatvfs(int fd, struct statvfs* buf) {
+    (void)fd; (void)buf;
+    errno = ENOSYS;
+    return -1;
+}
+
+// ── raise / atol ─────────────────────────────────────────────────────
+extern int kill(int pid, int sig);
+extern int getpid(void);
+int raise(int sig) {
+    return kill(getpid(), sig);
+}
+extern long strtol(const char* s, char** endptr, int base);
+long atol(const char* s) {
+    return strtol(s, 0, 10);
+}
+
+// ── termios — wrap the tty ioctls ────────────────────────────────────
+#include <termios.h>
+int tcgetattr(int fd, struct termios* t) {
+    return ioctl(fd, 0x5401 /*TCGETS*/, t);
+}
+int tcsetattr(int fd, int actions, const struct termios* t) {
+    // TCSANOW/DRAIN/FLUSH map to TCSETS/TCSETSW/TCSETSF.
+    unsigned long req = 0x5402 + (actions > 2 ? 0 : (unsigned long)actions);
+    return ioctl(fd, req, t);
+}
+
+// ── getaddrinfo (IPv4 only) ──────────────────────────────────────────
+// Numeric addresses + the native resolver in dns.c.  One result per
+// query; service strings must be numeric (no /etc/services).
+extern int gethostbyname_ipv4(const char* name, unsigned int* out_ip_be);
+extern void* calloc(unsigned long, unsigned long);
+extern void free(void*);
+extern int atoi(const char*);
+int getaddrinfo(const char* node, const char* svc,
+                const struct addrinfo* hints, struct addrinfo** res) {
+    if (!res) return EAI_FAIL;
+    *res = 0;
+    if (!node) return EAI_NONAME;
+
+    unsigned int ip_be = 0;
+    struct in_addr parsed;
+    if (inet_aton(node, &parsed)) {
+        ip_be = parsed.s_addr;
+    } else {
+        if (hints && (hints->ai_flags & AI_NUMERICHOST)) return EAI_NONAME;
+        if (gethostbyname_ipv4(node, &ip_be) != 0) return EAI_NONAME;
+    }
+
+    struct addrinfo* ai = calloc(1, sizeof(*ai) + sizeof(struct sockaddr_in));
+    if (!ai) return EAI_MEMORY;
+    struct sockaddr_in* sa = (struct sockaddr_in*)(ai + 1);
+    sa->sin_family      = 2 /*AF_INET*/;
+    sa->sin_port        = htons(svc ? (unsigned short)atoi(svc) : 0);
+    sa->sin_addr.s_addr = ip_be;
+    ai->ai_family   = 2;
+    ai->ai_socktype = hints ? hints->ai_socktype : 0;
+    ai->ai_protocol = hints ? hints->ai_protocol : 0;
+    ai->ai_addrlen  = sizeof(*sa);
+    ai->ai_addr     = (struct sockaddr*)sa;
+    *res = ai;
+    return 0;
+}
+void freeaddrinfo(struct addrinfo* ai) {
+    while (ai) {
+        struct addrinfo* next = ai->ai_next;
+        free(ai);   // sockaddr is co-allocated
+        ai = next;
+    }
+}
+const char* gai_strerror(int err) {
+    switch (err) {
+    case EAI_NONAME: return "name or service not known";
+    case EAI_AGAIN:  return "temporary failure in name resolution";
+    case EAI_MEMORY: return "out of memory";
+    default:         return "address resolution error";
+    }
+}
+
+// ── getpwnam_r / getpwuid_r ──────────────────────────────────────────
+// _r variants over the static-buffer getpwnam/getpwuid in libc.c.
+// POSIX: "not found" is return 0 with *result = NULL.
+#include <pwd.h>
+int getpwnam_r(const char* name, struct passwd* pw,
+               char* buf, size_t buflen, struct passwd** result) {
+    (void)buf; (void)buflen;
+    struct passwd* p = getpwnam(name);
+    if (result) *result = 0;
+    if (!p) return 0;
+    *pw = *p;
+    if (result) *result = pw;
+    return 0;
+}
+int getpwuid_r(uid_t uid, struct passwd* pw,
+               char* buf, size_t buflen, struct passwd** result) {
+    (void)buf; (void)buflen;
+    struct passwd* p = getpwuid(uid);
+    if (result) *result = 0;
+    if (!p) return 0;
+    *pw = *p;
+    if (result) *result = pw;
+    return 0;
+}
+
+// ── wctomb — UTF-8 encode one wide character ─────────────────────────
+int wctomb(char* s, wchar_t wc) {
+    if (!s) return 0;            // stateless encoding
+    unsigned int c = (unsigned int)wc;
+    if (c < 0x80)        { s[0] = (char)c; return 1; }
+    if (c < 0x800) {
+        s[0] = (char)(0xC0 | (c >> 6));
+        s[1] = (char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        s[0] = (char)(0xE0 | (c >> 12));
+        s[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        s[2] = (char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    if (c < 0x110000) {
+        s[0] = (char)(0xF0 | (c >> 18));
+        s[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+        s[2] = (char)(0x80 | ((c >> 6) & 0x3F));
+        s[3] = (char)(0x80 | (c & 0x3F));
+        return 4;
+    }
+    return -1;
+}
+
+// ── creat ────────────────────────────────────────────────────────────
+int creat(const char* path, mode_t mode) {
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+}
+
+// ── setrlimit — accepted, unenforced (matches the getrlimit stub) ────
+struct rlimit;
+int setrlimit(int resource, const struct rlimit* rlim) {
+    (void)resource; (void)rlim;
+    return 0;
+}
+
+// ── mktime — civil time (assumed UTC; no timezone db) → epoch ────────
+#include <time.h>
+static int mk_is_leap(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+time_t mktime(struct tm* tm) {
+    static const int mdays[12] =
+        { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (!tm) return (time_t)-1;
+    long days = 0;
+    int year = tm->tm_year + 1900;
+    for (int y = 1970; y < year; y++) days += mk_is_leap(y) ? 366 : 365;
+    for (int m = 0; m < tm->tm_mon && m < 12; m++) {
+        days += mdays[m];
+        if (m == 1 && mk_is_leap(year)) days++;
+    }
+    days += tm->tm_mday - 1;
+    return ((time_t)days * 86400) + tm->tm_hour * 3600
+         + tm->tm_min * 60 + tm->tm_sec;
+}
+
+// ── ctime / asctime — declared in <time.h>, bodies were missing ──────
+extern struct tm* localtime(const time_t* t);
+static char s_asctime_buf[26];
+char* asctime(const struct tm* tm) {
+    static const char wd[7][4]  = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char mo[12][4] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                   "Jul","Aug","Sep","Oct","Nov","Dec"};
+    if (!tm) return 0;
+    int wday = (tm->tm_wday >= 0 && tm->tm_wday < 7)  ? tm->tm_wday : 0;
+    int mon  = (tm->tm_mon  >= 0 && tm->tm_mon  < 12) ? tm->tm_mon  : 0;
+    // "Www Mmm dd hh:mm:ss yyyy\n" — fixed 26-byte POSIX layout.
+    char* p = s_asctime_buf;
+    for (int i = 0; i < 3; i++) *p++ = wd[wday][i];
+    *p++ = ' ';
+    for (int i = 0; i < 3; i++) *p++ = mo[mon][i];
+    *p++ = ' ';
+    *p++ = (char)('0' + tm->tm_mday / 10);
+    *p++ = (char)('0' + tm->tm_mday % 10);
+    *p++ = ' ';
+    *p++ = (char)('0' + tm->tm_hour / 10);
+    *p++ = (char)('0' + tm->tm_hour % 10);
+    *p++ = ':';
+    *p++ = (char)('0' + tm->tm_min / 10);
+    *p++ = (char)('0' + tm->tm_min % 10);
+    *p++ = ':';
+    *p++ = (char)('0' + tm->tm_sec / 10);
+    *p++ = (char)('0' + tm->tm_sec % 10);
+    *p++ = ' ';
+    int y = tm->tm_year + 1900;
+    *p++ = (char)('0' + (y / 1000) % 10);
+    *p++ = (char)('0' + (y / 100) % 10);
+    *p++ = (char)('0' + (y / 10) % 10);
+    *p++ = (char)('0' + y % 10);
+    *p++ = '\n';
+    *p = '\0';
+    return s_asctime_buf;
+}
+char* ctime(const time_t* t) {
+    return asctime(localtime(t));
+}
+
+// difftime — both time_t values are seconds; the difference is exact.
+double difftime(time_t end, time_t start) {
+    return (double)(end - start);
+}
+
+// ── Unlocked stdio ───────────────────────────────────────────────────
+// MakaOS stdio has no internal FILE lock (single-threaded streams);
+// the unlocked variants alias the locked ones.
+#include <stdio.h>
+void flockfile(FILE* f)   { (void)f; }
+void funlockfile(FILE* f) { (void)f; }
+int  ftrylockfile(FILE* f){ (void)f; return 0; }
+extern int fgetc(FILE* f);
+int  getc_unlocked(FILE* f) { return fgetc(f); }
+extern int fputc(int c, FILE* f);
+int  putc_unlocked(int c, FILE* f) { return fputc(c, f); }
+
+// ── getrlimit — unenforced limits, report "unlimited" ────────────────
+struct k_rlimit { unsigned long rlim_cur, rlim_max; };
+int getrlimit(int resource, struct k_rlimit* rlim) {
+    (void)resource;
+    if (rlim) {
+        rlim->rlim_cur = ~0UL;
+        rlim->rlim_max = ~0UL;
+    }
+    return 0;
 }

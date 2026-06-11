@@ -151,17 +151,20 @@ int pthread_spin_trylock(pthread_spinlock_t* s);
 int pthread_spin_unlock(pthread_spinlock_t* s);
 
 // ── Misc ─────────────────────────────────────────────────────────────
-int sched_yield(void);
+// sched_yield is declared in <sched.h>; redeclaring it here trips
+// ports built with -Werror=redundant-decls (pango).
+// Fork preparation handlers (implemented in pthread.c).
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+                   void (*child)(void));
 int pthread_setname_np(pthread_t tid, const char* name);
 int pthread_getname_np(pthread_t tid, char* name, size_t n);
 
 // Per-thread signal mask — MakaOS has a single process-wide mask
 // so this aliases sigprocmask.  Forward-decl the sigset_t from
 // signal.h to avoid pulling the whole header here.
-#ifndef _MAKAOS_SIGNAL_H
-typedef unsigned long sigset_t;
-#endif
-int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+// pthread_sigmask is declared in <signal.h>; include it for the
+// sigset_t type instead of redeclaring (redundant-decls clean).
+#include <signal.h>
 
 // Scheduling parameters — MakaOS has no pluggable scheduler policy,
 // so these accept/report reasonable defaults and the kernel runs

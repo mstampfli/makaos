@@ -34,4 +34,41 @@
 #define NS_INT32SZ       4
 #define NS_INT16SZ       2
 
+// ── BIND4 compat layer (arpa/nameser_compat.h equivalent) ───────────
+// gio's gthreadedresolver.c parses res_query answers with the classic
+// HEADER struct + GETSHORT/GETLONG cursor macros + dn_expand.  Our
+// res_query always fails (no kernel DNS), so these parse paths never
+// see live data — but they must compile.
+
+typedef struct {
+    unsigned id      :16;
+    unsigned rd      :1;
+    unsigned tc      :1;
+    unsigned aa      :1;
+    unsigned opcode  :4;
+    unsigned qr      :1;
+    unsigned rcode   :4;
+    unsigned cd      :1;
+    unsigned ad      :1;
+    unsigned unused  :1;
+    unsigned ra      :1;
+    unsigned qdcount :16;
+    unsigned ancount :16;
+    unsigned nscount :16;
+    unsigned arcount :16;
+} HEADER;
+
+#define GETSHORT(s, cp) do { \
+    const unsigned char* t_cp = (const unsigned char*)(cp); \
+    (s) = ((unsigned short)t_cp[0] << 8) | (unsigned short)t_cp[1]; \
+    (cp) += NS_INT16SZ; \
+} while (0)
+
+#define GETLONG(l, cp) do { \
+    const unsigned char* t_cp = (const unsigned char*)(cp); \
+    (l) = ((unsigned long)t_cp[0] << 24) | ((unsigned long)t_cp[1] << 16) \
+        | ((unsigned long)t_cp[2] << 8)  |  (unsigned long)t_cp[3]; \
+    (cp) += NS_INT32SZ; \
+} while (0)
+
 #endif

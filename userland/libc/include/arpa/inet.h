@@ -11,6 +11,7 @@ uint32_t ntohl(uint32_t v);
 in_addr_t inet_addr(const char* s);
 char*     inet_ntoa(struct in_addr in);
 int       inet_pton(int af, const char* s, void* dst);
+int       inet_aton(const char* s, struct in_addr* out);
 const char* inet_ntop(int af, const void* src, char* dst, socklen_t size);
 
 #endif

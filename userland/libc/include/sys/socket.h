@@ -37,6 +37,10 @@ struct ucred {
 // Socket options
 #define SOL_SOCKET   1
 #define SO_REUSEADDR 2
+#define SOMAXCONN    128
+// Timeouts — accepted by setsockopt, not yet enforced by the stack.
+#define SO_RCVTIMEO  20
+#define SO_SNDTIMEO  21
 #define SO_TYPE      3
 #define SO_ERROR     4
 #define SO_KEEPALIVE 9
@@ -131,6 +135,9 @@ int     setsockopt(int fd, int level, int opt, const void* val, socklen_t n);
 int     getsockopt(int fd, int level, int opt, void* val, socklen_t* n);
 int     shutdown(int fd, int how);
 int     socketpair(int domain, int type, int protocol, int fds[2]);
+// Local/peer address queries — no kernel record yet; fail ENOTSUP.
+int     getsockname(int fd, struct sockaddr* addr, socklen_t* len);
+int     getpeername(int fd, struct sockaddr* addr, socklen_t* len);
 ssize_t sendmsg(int fd, const struct msghdr* msg, int flags);
 ssize_t recvmsg(int fd, struct msghdr* msg, int flags);
 

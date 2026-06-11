@@ -33,7 +33,19 @@ char* getenv(const char* name) {
     return (char*)0;
 }
 
-// ── exit ─────────────────────────────────────────────────────────────
+// ── atexit / exit ────────────────────────────────────────────────────
+// Fixed handler table, LIFO execution per POSIX.  32 slots matches
+// glibc's minimum guarantee; glib registers a small handful.
+#define ATEXIT_MAX 32
+static void (*s_atexit_fns[ATEXIT_MAX])(void);
+static int  s_atexit_count = 0;
+
+int atexit(void (*fn)(void)) {
+    if (!fn || s_atexit_count >= ATEXIT_MAX) return -1;
+    s_atexit_fns[s_atexit_count++] = fn;
+    return 0;
+}
+
 // Flush stdout/stderr before the kernel exit — in-tree apps that write
 // through the stdio buffered path (puts/printf) would otherwise lose
 // their tail on exit.  _flush_all lives in stdio.c.
@@ -41,6 +53,8 @@ extern void _flush_all(void);
 
 __attribute__((noreturn))
 void exit(int status) {
+    while (s_atexit_count > 0)
+        s_atexit_fns[--s_atexit_count]();
     _flush_all();
     syscall1(SYS_EXIT, (uint64_t)status);
     __builtin_unreachable();

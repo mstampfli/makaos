@@ -203,6 +203,17 @@ ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
 
 // ── getcwd(buf, n) ──────────────────────────────────────────────────
 char* getcwd(char* buf, size_t n) {
+    // GNU extension everyone relies on (sway's config loader, glib):
+    // buf == NULL means allocate.  n == 0 with NULL means "big enough".
+    if (!buf) {
+        if (n == 0) n = 4096;   // PATH_MAX
+        buf = (char*)malloc(n);
+        if (!buf) { errno = ENOMEM; return (char*)0; }
+        long r = (long)__syscall_ret(
+            syscall2(SYS_GETCWD, (uint64_t)buf, (uint64_t)n));
+        if (r < 0) { free(buf); return (char*)0; }
+        return buf;
+    }
     long r = (long)__syscall_ret(syscall2(SYS_GETCWD, (uint64_t)buf, (uint64_t)n));
     return r < 0 ? (char*)0 : buf;
 }
@@ -433,6 +444,15 @@ int truncate(const char* path, off_t length) {
 int ftruncate(int fd, off_t length) {
     return (int)__syscall_ret(
         syscall2(SYS_FTRUNCATE, (uint64_t)fd, (uint64_t)length));
+}
+
+// utime — declared in <utime.h>.  No kernel timestamp-update syscall
+// yet; consumers (glib's g_utime) treat failure as a soft error.
+struct utimbuf;
+int utime(const char* path, const struct utimbuf* times) {
+    (void)path; (void)times;
+    errno = ENOSYS;
+    return -1;
 }
 
 // ── Port-surface extern impls ────────────────────────────────────────

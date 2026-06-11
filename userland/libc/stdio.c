@@ -159,6 +159,23 @@ int fclose(FILE* f) {
     return err;
 }
 
+// freopen — re-target an existing stream (glib's gstdio).  Standard
+// use is rebinding stdin/stdout/stderr, whose FILE storage is static,
+// so the stream object must be reused rather than reallocated.
+FILE* freopen(const char* path, const char* mode, FILE* f) {
+    if (!f) return NULL;
+    FILE* fresh = fopen(path, mode);
+    if (!fresh) return NULL;
+    if (f->flags & _FILE_WRITE) flush_write(f);
+    if (f->fd >= 0) close(f->fd);
+    int keep_flags = f->flags & (_FILE_UNBUF | _FILE_LNBUF);
+    *f = *fresh;
+    f->flags |= keep_flags;
+    fresh->fd = -1;          // neutralize before releasing the pool slot
+    free_file(fresh);
+    return f;
+}
+
 // ── _flush_all — called by exit() before SYS_EXIT ────────────────────────
 
 void _flush_all(void) {
@@ -195,6 +212,32 @@ int fgetc(FILE* f) {
 
 int getchar(void) {
     return fgetc(stdin);
+}
+
+// Parenthesised to dodge the getc() convenience macro in stdio.h —
+// sysroot consumers link the real symbol.
+int (getc)(FILE* f) {
+    return fgetc(f);
+}
+
+// ungetc — push one character back into the read buffer.  The common
+// caller pattern is getc-then-ungetc (glib's charset.alias parser,
+// xdgmime magic sniffing), where rpos > 0 and the pushback slot is
+// simply the previous buffer position.  The cold rpos==0 case shifts
+// the buffered remainder right by one when there is room.
+int ungetc(int c, FILE* f) {
+    if (c == EOF || !f || !(f->flags & _FILE_READ)) return EOF;
+    if (f->rpos > 0) {
+        f->rbuf[--f->rpos] = (uint8_t)c;
+    } else {
+        if (f->rlen >= STDIO_BUFSIZ) return EOF;
+        memmove(f->rbuf + 1, f->rbuf, (size_t)f->rlen);
+        f->rbuf[0] = (uint8_t)c;
+        f->rlen++;
+    }
+    f->flags &= ~_FILE_EOF;
+    if (f->file_pos) f->file_pos--;
+    return (uint8_t)c;
 }
 
 // ── fputc ─────────────────────────────────────────────────────────────────
@@ -325,6 +368,16 @@ int fseek(FILE* f, long offset, int whence) {
         long end = lseek(f->fd, 0, SEEK_END);
         if (end < 0) return -1;
         target = end + offset;
+        // The probe moved the KERNEL offset to EOF.  If the target
+        // resolves into the in-memory buffer (fast path below), the
+        // kernel offset must be restored to the buffer's fill point or
+        // the next fill_read continues from EOF and the stream ends
+        // early.  Restoring unconditionally is harmless for the slow
+        // path, which re-seeks anyway.
+        if (f->rlen > 0) {
+            long buf_fill_end = (f->file_pos - f->rpos) + f->rlen;
+            if (lseek(f->fd, buf_fill_end, SEEK_SET) < 0) return -1;
+        }
     }
     if (target < 0) return -1;
 
@@ -358,8 +411,15 @@ int fseek(FILE* f, long offset, int whence) {
 // ── ftell ─────────────────────────────────────────────────────────────────
 
 long ftell(FILE* f) {
-    // Account for buffered but not-yet-read data.
-    return f->file_pos - (long)(f->rlen - f->rpos);
+    // file_pos is maintained in CONSUMER units: fgetc/ungetc move it
+    // per byte handed to (or taken back from) the caller, and
+    // fill_read never touches it.  It already IS the logical stream
+    // position.  The old code subtracted the unread buffer remainder
+    // — a kernel-offset model this FILE doesn't use — which made
+    // every ftell-snapshot/fseek-restore pair (sway's detect_brace
+    // peeks a line ahead after each config command) rewind into
+    // already-consumed bytes and replay the stream mid-line.
+    return f->file_pos;
 }
 
 // ── rewind ────────────────────────────────────────────────────────────────
@@ -504,3 +564,52 @@ FILE* fmemopen(void* buf, size_t size, const char* mode) {
     return (FILE*)0;
 }
 
+
+// ── popen / pclose ───────────────────────────────────────────────────
+// Classic pipe + fork + /bin/sh -c.  The child's pid rides in the
+// FILE so pclose can reap it and return the wait status.
+extern int  pipe(int fds[2]);
+extern int  fork(void);
+extern int  dup2(int oldfd, int newfd);
+extern int  execl(const char* path, const char* arg0, ...);
+extern int  waitpid(int pid, int* status, int options);
+extern void _exit(int code);
+
+FILE* popen(const char* command, const char* mode) {
+    if (!command || !mode) return NULL;
+    int read_mode = (mode[0] == 'r');
+    int fds[2];
+    if (pipe(fds) != 0) return NULL;
+
+    int pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        if (read_mode) dup2(fds[1], 1);
+        else           dup2(fds[0], 0);
+        close(fds[0]);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", command, (char*)0);
+        _exit(127);
+    }
+
+    int keep = read_mode ? fds[0] : fds[1];
+    close(read_mode ? fds[1] : fds[0]);
+    FILE* f = fdopen(keep, mode);
+    if (!f) { close(keep); return NULL; }
+    f->popen_pid = pid;
+    return f;
+}
+
+int pclose(FILE* f) {
+    if (!f) return -1;
+    int pid = f->popen_pid;
+    fclose(f);
+    if (pid <= 0) return -1;
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return status;
+}

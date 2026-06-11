@@ -129,13 +129,8 @@ float  tanhf(float);
 
 double fmin(double, double);
 double fmax(double, double);
-
-// long double variants (alias to double internally)
-long double sqrtl(long double);
-long double fabsl(long double);
-long double floorl(long double);
-long double ceill(long double);
-long double fmodl(long double, long double);
+// (long double variants are declared once in the block above —
+// duplicates trip -Werror=redundant-decls consumers like pango.)
 
 #ifdef __cplusplus
 }

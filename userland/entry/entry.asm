@@ -2,6 +2,8 @@ bits 64
 global _entry
 extern main
 extern environ
+extern __init_array_start
+extern __init_array_end
 
 section .text.entry
 _entry:
@@ -31,6 +33,35 @@ _entry:
     ; SysV ABI: RSP must be 16-byte aligned before the call.
     ; elf_setup_stack already returns a 16-byte aligned RSP.
     and  rsp, ~0xF
+
+    ; Run constructors (.init_array + legacy .ctors — the linker
+    ; script collects both into one window).  glib/gobject's type
+    ; system boots from a constructor; skipping these left every
+    ; statically-linked GLib consumer with NULL type tables (sway
+    ; crashed in g_hash_table_lookup_node on first pango use).
+    ; Entries of 0 and -1 are list terminators some toolchains emit —
+    ; skip them.  rdi/rsi/rdx (argc/argv/envp) are saved around the
+    ; loop in callee-saved registers.
+    mov  r12, rdi
+    mov  r13, rsi
+    mov  r14, rdx
+    lea  rbx, [rel __init_array_start]
+    lea  r15, [rel __init_array_end]
+.ctor_loop:
+    cmp  rbx, r15
+    jae  .ctors_done
+    mov  rax, [rbx]
+    add  rbx, 8
+    test rax, rax
+    jz   .ctor_loop
+    cmp  rax, -1
+    je   .ctor_loop
+    call rax
+    jmp  .ctor_loop
+.ctors_done:
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, r14
 
     call main
 

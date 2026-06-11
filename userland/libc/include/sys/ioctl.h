@@ -8,6 +8,7 @@
 
 // TTY window size
 #define TIOCGWINSZ 0x5413
+#define FIONREAD   0x541B
 #define TIOCSWINSZ 0x5414
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410

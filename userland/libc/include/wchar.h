@@ -43,6 +43,11 @@ wchar_t* wmemmove(wchar_t* dst, const wchar_t* src, size_t n);
 int      wmemcmp(const wchar_t* a, const wchar_t* b, size_t n);
 wchar_t* wcsdup(const wchar_t* s);
 wchar_t* wmemchr(const wchar_t* s, wchar_t c, size_t n);
+
+// Collation — "C" locale only: ordering is plain code-point order, so
+// the transform is an identity copy and wcscoll == wcscmp.
+size_t   wcsxfrm(wchar_t* dst, const wchar_t* src, size_t n);
+int      wcscoll(const wchar_t* a, const wchar_t* b);
 int      wcscoll(const wchar_t* a, const wchar_t* b);
 
 // Classification (operate on wint_t)

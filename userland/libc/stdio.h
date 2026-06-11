@@ -18,6 +18,8 @@ typedef struct FILE {
     int     wpos;        // next write position in wbuf
     // Position tracking (for ftell; updated on flush/fill)
     long    file_pos;    // current logical position in file
+    // popen() child pid — 0 for ordinary streams; pclose() reaps it.
+    int     popen_pid;
 } FILE;
 
 #define _FILE_READ  0x01

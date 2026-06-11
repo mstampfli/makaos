@@ -36,7 +36,8 @@ struct tm {
 time_t     time(time_t* tloc);
 clock_t    clock(void);
 int        nanosleep(const struct timespec* req, struct timespec* rem);
-unsigned   sleep(unsigned seconds);
+// sleep() is declared in <unistd.h> (its POSIX home) — declaring it
+// here too trips -Werror=redundant-decls consumers (pango).
 
 // clockid_t + clock_gettime — POSIX monotonic time.  Backs on to
 // SYS_CLOCK_NS for all clock ids (MakaOS has a single system clock).

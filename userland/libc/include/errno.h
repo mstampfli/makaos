@@ -68,7 +68,10 @@ extern "C" {
 #define EHOSTUNREACH 113
 #define EALREADY    114
 #define EINPROGRESS 115
+#define EPROTOTYPE   91
 #define ENOPROTOOPT  92
+#define EPROTONOSUPPORT 93
+#define EADDRNOTAVAIL 99
 #define ESOCKTNOSUPPORT 94
 #define ENOTUNIQ    76
 #define ETIME       62    // timer expired

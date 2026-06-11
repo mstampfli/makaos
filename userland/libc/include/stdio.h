@@ -58,6 +58,8 @@ int sscanf(const char* s, const char* fmt, ...);
 // Stream I/O
 FILE*  fopen(const char* path, const char* mode);
 FILE*  fdopen(int fd, const char* mode);
+FILE*  popen(const char* command, const char* mode);
+int    pclose(FILE* f);
 FILE*  freopen(const char* path, const char* mode, FILE* f);
 int    fclose(FILE* f);
 int    fflush(FILE* f);
@@ -103,10 +105,18 @@ char* tmpnam(char* buf);
 ssize_t getline(char** lineptr, size_t* n, FILE* f);
 ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* f);
 
-// GNU extensions — stubs for port compat.
+// GNU extensions — stubs for port compat.  asprintf is declared once
+// in the printf block above (pango compiles -Werror=redundant-decls).
 FILE* open_memstream(char** bufp, size_t* sizep);
+
+// Unlocked stdio (POSIX) — MakaOS FILE ops take no lock anyway, so the
+// _unlocked variants alias the plain ones; flockfile is a no-op.
+void flockfile(FILE* f);
+void funlockfile(FILE* f);
+int  ftrylockfile(FILE* f);
+int  getc_unlocked(FILE* f);
+int  putc_unlocked(int c, FILE* f);
 FILE* fmemopen(void* buf, size_t size, const char* mode);
-int   asprintf(char** strp, const char* fmt, ...);
 
 #ifdef __cplusplus
 }

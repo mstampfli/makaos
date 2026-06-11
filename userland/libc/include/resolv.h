@@ -17,6 +17,11 @@ int res_search(const char* dname, int klass, int type,
                unsigned char* answer, int anslen);
 void res_close(void);
 
+// Compressed-name expansion (RFC 1035 §4.1.4).  Stub: our res_query
+// never returns answer data, so no caller sees a live packet.
+int dn_expand(const unsigned char* msg, const unsigned char* eom,
+              const unsigned char* src, char* dst, int dstsiz);
+
 // Convenience — some callers use the non-__ prefixed name.
 typedef struct __res_state res_state_t;
 

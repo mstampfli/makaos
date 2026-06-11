@@ -27,5 +27,7 @@
 #define PIPE_BUF    4096
 #define HOST_NAME_MAX        64
 #define _POSIX_HOST_NAME_MAX 255   // POSIX floor; foot uri.c wants it
+#define SSIZE_MAX   LONG_MAX       // ssize_t is 64-bit; glib giounix.c
+#define MB_LEN_MAX  4              // UTF-8 worst case
 
 #endif
