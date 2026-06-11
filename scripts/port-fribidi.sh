@@ -35,6 +35,14 @@ fetch() {
         log "extracting fribidi"
         tar -xJf "$FRIBIDI_TARBALL" -C "$THIRD_PARTY"
     }
+    # fribidi force-adds -ansi (C90) when gcc accepts it, which rejects
+    # the // comments in MakaOS sysroot headers.  Drop it — the library
+    # compiles fine as gnu11.
+    if grep -q "add_project_arguments('-ansi'" "$FRIBIDI_SRC/meson.build"; then
+        log "patching out -ansi"
+        sed -i "s/add_project_arguments('-ansi', language: 'c')/# MakaOS: -ansi removed — sysroot headers use \/\/ comments/" \
+            "$FRIBIDI_SRC/meson.build"
+    fi
 }
 
 build() {
@@ -52,6 +60,7 @@ build() {
             -Ddocs=false \
             -Dtests=false \
             -Dbin=false \
+            -Dc_std=gnu11 \
             2>&1 | tee "$BUILD_DIR/fribidi_meson.log"
     fi
     log "ninja build"

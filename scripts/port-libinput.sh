@@ -164,3 +164,18 @@ main() {
     ls -la "$SYSROOT/usr/lib/libinput"* 2>/dev/null
 }
 main "$@"
+
+# ── Symbol hygiene for static linking ─────────────────────────────────
+# libinput's internal util-list exports generic list_* symbols.  As a
+# shared library those stay hidden; as a static archive they collide
+# with sway's common/list.c (multiple definition of list_insert).
+# Rename them to a li_util_ prefix across every archive member —
+# objcopy rewrites defs and refs consistently.
+OBJCOPY="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-objcopy"
+"$OBJCOPY" \
+    --redefine-sym list_init=li_util_list_init \
+    --redefine-sym list_insert=li_util_list_insert \
+    --redefine-sym list_append=li_util_list_append \
+    --redefine-sym list_remove=li_util_list_remove \
+    "$SYSROOT/usr/lib/libinput.a"
+log "libinput.a list_* symbols prefixed (static-link hygiene)"

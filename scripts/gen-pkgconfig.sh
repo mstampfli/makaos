@@ -36,10 +36,16 @@ write_pc() {
 write_pc zlib           "zlib compression library"        "1.3.1"    "-lz"
 write_pc expat          "expat XML parser"                "2.6.4"    "-lexpat"
 write_pc libffi         "foreign function interface"      "3.4.6"    "-lffi"
-write_pc pixman-1       "pixman image library"            "0.43.4"   "-lpixman-1"               "-I\${includedir}/pixman-1"
+# MUST match the version port-pixman.sh actually compiles (its
+# pixman-version.h substitution).  Overstating it made cairo's meson
+# enable PIXMAN_r8g8b8_sRGB (a 0.43+ format) against 0.42 headers.
+write_pc pixman-1       "pixman image library"            "0.42.2"   "-lpixman-1"               "-I\${includedir}/pixman-1"
 write_pc xkbcommon      "xkbcommon keyboard layouts"      "1.7.0"    "-lxkbcommon"
-write_pc freetype2      "freetype font rasterizer"        "2.13.3"   "-lfreetype -lz"           "-I\${includedir}/freetype2"
-write_pc harfbuzz       "harfbuzz text shaping"           "8.5.0"    "-lharfbuzz"
+# freetype2.pc carries the LIBTOOL version (release 2.13.3 ⇒ 26.2.20),
+# matching upstream: cairo's `dependency('freetype2', version: '>=9.7.3')`
+# compares against this, and a release-style "2.13.3" fails the check.
+write_pc freetype2      "freetype font rasterizer"        "26.2.20"  "-lfreetype -lz"           "-I\${includedir}/freetype2"
+write_pc harfbuzz       "harfbuzz text shaping"           "8.5.0"    "-lharfbuzz"                "-I\${includedir}/harfbuzz"
 write_pc fontconfig     "fontconfig font discovery"       "2.15.0"   "-lfontconfig -lfreetype -lexpat"
 write_pc libdrm         "direct rendering manager"        "2.4.125"  "-ldrm"                    "-I\${includedir}/libdrm"
 

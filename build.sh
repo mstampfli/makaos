@@ -149,7 +149,7 @@ SYSROOT_CFLAGS=(
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
            sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
            time arpa_inet string ctype makaos_input poll signal resolv \
-           getopt; do
+           getopt wordexp; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
     -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
 done
@@ -223,6 +223,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
    "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
    "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o" \
+   "$BUILD_DIR/user_wordexp.o" \
    "$BUILD_DIR/user_wayland_egl_stub.o" \
    "$BUILD_DIR/user_sdl_port_stubs.o" \
    "$BUILD_DIR/user_c11_threads.o" \
@@ -859,6 +860,28 @@ fi
 if [ -f "$SYSROOT/usr/bin/tinywl" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/tinywl" bin/tinywl
     echo "[+] tinywl ELF installed at bin/tinywl (root:root 0755)"
+fi
+if [ -f "$SYSROOT/usr/bin/sway" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/sway"    bin/sway
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/swaymsg" bin/swaymsg
+    # Default config: sway falls back to /etc/sway/config when the
+    # user has none.  $term is foot; Mod4+Return spawns it.  The
+    # `include /etc/sway/config.d/*` line is stripped: the glob can't
+    # expand (wordexp has no pathname globbing yet, and the directory
+    # doesn't exist on the image) and sway treats a failed include as
+    # a fatal config error.
+    # The wallpaper line is also dropped: sway was built with
+    # -Ddefault-wallpaper=false, so the referenced PNG isn't installed
+    # and sway treats an inaccessible background as a config error.
+    sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
+        -e 's|^output \* bg .*|# (default wallpaper not installed on MakaOS)|' \
+        "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" \
+        -R "write $BUILD_DIR/etc_stage/sway_config etc/sway/config" > /dev/null 2>&1 || true
+    ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway        0040755 0 0
+    ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway/config 0100644 0 0
+    echo "[+] sway + swaymsg installed (+ /etc/sway/config)"
 fi
 
 WAD_SEARCH=(
