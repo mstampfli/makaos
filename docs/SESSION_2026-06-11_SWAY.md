@@ -187,3 +187,74 @@ Also on the shelf:
 - `uname`, `wmenu-run` missing on the image (cosmetic exec failures).
 - swaybar/swaynag enablement once a futex exists (they link today).
 - glob support in wordexp → restore the config.d include line.
+
+
+## 7. Afternoon session — the futex campaign (same day)
+
+User-visible fixes first:
+- **dwl no longer crashes when the mouse moves.**  Root cause: libc
+  passed the glibc-layout `struct sigaction` straight to the kernel,
+  which read `sa_restorer` from the mask field — 0 for the usual empty
+  mask, and the kernel kills on a 0 restorer at the FIRST delivery.
+  Nothing ever delivered until a mouse-wiggle made foot exit and
+  SIGCHLD fired at dwl.  sigaction now marshals to the kernel ABI.
+- **foot quitting no longer takes the whole system down.**
+  kill(-pgid, SIGHUP) fell through to the kill(-1) broadcast and
+  HUP'd login/svcmgr/net.  Proper process-group targeting added.
+- `/bin/uname` exists (sway popens `uname -a` at startup).
+
+Then the structural work, in dependency order:
+
+1. **Kernel futex** (`kernel/proc/futex.c`, SYS_FUTEX=114) — WAIT/WAKE,
+   private keys, relative-ns timeouts, EINTR.  pthread mutex (Drepper
+   3-state), cond (seq word), semaphore, and join all sleep in the
+   kernel now instead of spinning sched_yield/nanosleep.
+2. **Real TLS** — SYS_SET_FS=115 + per-task fs_base restored on every
+   context switch (sanitized: non-user values write 0); PT_TLS in the
+   user link script; crt0 builds the main thread's block from static
+   storage before constructors; pthread threads get heap blocks
+   installed by the trampoline.  **errno is __thread** — the global
+   one let any thread's failed syscall corrupt every other thread's
+   error handling.  Required a full port-chain rebuild (TLS vs
+   non-TLS errno references do not link together).
+3. **Allocator** — free()'s double-free check moved under the heap
+   lock (racing frees could self-link the free list); 16-byte payload
+   alignment per the x86-64 ABI.
+4. **Kernel-owned thread join** (SYS_SET_CLEARTID=116) — pthread_exit
+   setting done=1 from userland let the joiner free the stack and TLS
+   while the dying thread still ran on them; with futex-fast wakeups
+   that raced constantly.  The kernel stores 1 + futex-wakes at task
+   termination, where the thread provably can't touch userspace.
+5. **Lock-free TSS** — pthread_getspecific over a __thread array;
+   the old spin-locked global table deadlocked sway main when a
+   SIGCHLD handler re-entered it (glib g_private_get at signal time).
+6. **sem_post wakes unconditionally** — the 0→1-only wake lost
+   waiters; foot's render fan-out (one post per worker) left workers
+   asleep forever.
+7. signalfd subscriber list: spinlock + sys_thread field init
+   (garbage signalfd_head = nested-#PF panic when a thread crashed).
+
+End state, verified by screenshot/QMP:
+- dwl + foot **multithreaded** (4-way parallel font loading + render
+  workers): interactive terminal, typing renders, mouse-storm soak
+  clean.  `docs/img/foot-on-dwl-threaded-2026-06-11.png`.
+- sway: composites, Mod4+Return spawns foot, foot runs healthy under
+  sway (main + 3 render workers all sleeping in futexes, zero
+  crashes, 23 frame commits).
+
+Open issues, for next session:
+- **foot's window doesn't PRESENT under sway** (fine under dwl).
+  foot is connected, rendered, and idle; sway main is busy in its
+  event loop but composites no client content.  Suspect the
+  xdg-toplevel configure/ack/commit dance or sway's damage tracking
+  with the pixman renderer.  All futex-era kernel work is exonerated
+  (same stack renders under dwl).
+- Intermittent SIGSEGV in ONE of foot's four parallel font-loader
+  threads (strlen of pointer 1 from a static structure; ~1 in 3
+  runs; non-fatal — remaining threads finish).  Suspect a config-
+  macro mismatch between the fontconfig and fcft builds or a
+  fontconfig thread-safety edge.
+- First frame after a client maps shows black until new damage
+  (cursor wiggle / keypress) forces a recomposite — presentation
+  quirk in both compositors on MakaOS.
+- Kernel thread tasks linger as zombies (no thread reaping).
