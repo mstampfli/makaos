@@ -1,12 +1,12 @@
 The Meson build system
 Version: 1.7.0
-Source dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1
-Build dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libevdev_build
+Source dir: /home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1
+Build dir: /home/parrot/bootloader-kernel-in-NASM/build/libevdev_build
 Build type: cross build
 Project name: libevdev
 Project version: 1.13.1
-C compiler for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
-C linker for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
+C compiler for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
+C linker for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
 C compiler for the build machine: cc (gcc 14.2.0 "cc (Debian 14.2.0-19) 14.2.0")
 C linker for the build machine: cc ld.bfd 2.44
 Build machine cpu family: x86_64
@@ -17,7 +17,47 @@ Target machine cpu family: x86_64
 Target machine cpu: x86_64
 Library m found: YES
 Library rt found: YES
-Program libevdev/make-event-names.py found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1/libevdev/make-event-names.py)
+Program libevdev/make-event-names.py found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1/libevdev/make-event-names.py)
+Configuring event-names.h with command
+Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
+Configuring libevdev.3 using configuration
+Dependency check skipped: feature tests disabled
+Program doxygen skipped: feature documentation disabled
+Configuring config.h using configuration
+Build targets in project: 6
+
+libevdev 1.13.1
+
+  User defined options
+    Cross files    : /home/parrot/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
+    coverity       : false
+    default_library: static
+    documentation  : disabled
+    libdir         : lib
+    prefix         : /usr
+    tests          : disabled
+
+Found ninja-1.12.1 at /usr/bin/ninja
+Generating targets:   0%|          | 0/6 eta ?                                              Writing build.ninja:   0%|          | 0/40 eta ?                                                The Meson build system
+Version: 1.7.0
+Source dir: /home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1
+Build dir: /home/parrot/bootloader-kernel-in-NASM/build/libevdev_build
+Build type: cross build
+Project name: libevdev
+Project version: 1.13.1
+C compiler for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
+C linker for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
+C compiler for the build machine: cc (gcc 14.2.0 "cc (Debian 14.2.0-19) 14.2.0")
+C linker for the build machine: cc ld.bfd 2.44
+Build machine cpu family: x86_64
+Build machine cpu: x86_64
+Host machine cpu family: x86_64
+Host machine cpu: x86_64
+Target machine cpu family: x86_64
+Target machine cpu: x86_64
+Library m found: YES
+Library rt found: YES
+Program libevdev/make-event-names.py found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1/libevdev/make-event-names.py)
 Configuring event-names.h with command
 Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
 Configuring libevdev.3 using configuration
@@ -29,7 +69,7 @@ Build targets in project: 1
 libevdev 1.13.1
 
   User defined options
-    Cross files    : /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
+    Cross files    : /home/parrot/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
     coverity       : false
     default_library: static
     documentation  : disabled

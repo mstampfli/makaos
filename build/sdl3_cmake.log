@@ -1,7 +1,7 @@
 -- The C compiler identification is GNU 14.2.0
 -- Detecting C compiler ABI info
 -- Detecting C compiler ABI info - done
--- Check for working C compiler: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc - skipped
+-- Check for working C compiler: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc - skipped
 -- Detecting C compile features
 -- Detecting C compile features - done
 -- Found PkgConfig: /usr/bin/pkg-config (found version "1.8.1")
@@ -326,7 +326,7 @@
 -- Looking for nl_langinfo
 -- Looking for nl_langinfo - found
 -- Looking for sysconf
--- Looking for sysconf - not found
+-- Looking for sysconf - found
 -- Looking for sysctlbyname
 -- Looking for sysctlbyname - not found
 -- Looking for getauxval
@@ -387,7 +387,9 @@
 -- Performing Test HAVE_RECURSIVE_MUTEXES
 -- Performing Test HAVE_RECURSIVE_MUTEXES - Success
 -- Performing Test HAVE_PTHREADS_SEM
--- Performing Test HAVE_PTHREADS_SEM - Failed
+-- Performing Test HAVE_PTHREADS_SEM - Success
+-- Performing Test COMPILER_HAS_SEM_TIMEDWAIT
+-- Performing Test COMPILER_HAS_SEM_TIMEDWAIT - Success
 -- Looking for pthread.h
 -- Looking for pthread.h - found
 -- Looking for pthread_np.h
@@ -403,7 +405,7 @@
 -- 
 -- Platform: MakaOS
 -- 64-bit:   TRUE
--- Compiler: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc
+-- Compiler: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc
 -- Revision: release-3.2.0-0-g535d80bad
 -- Vendor:   
 -- 
@@ -474,7 +476,7 @@
 --   SDL_PIPEWIRE                (Wanted: OFF): OFF
 --   SDL_PIPEWIRE_SHARED         (Wanted: OFF): OFF
 --   SDL_PTHREADS                (Wanted: ON): ON
---   SDL_PTHREADS_SEM            (Wanted: ON): OFF
+--   SDL_PTHREADS_SEM            (Wanted: ON): ON
 --   SDL_PULSEAUDIO              (Wanted: OFF): OFF
 --   SDL_PULSEAUDIO_SHARED       (Wanted: OFF): OFF
 --   SDL_RENDER_D3D              (Wanted: OFF): OFF
@@ -525,7 +527,7 @@
 -- were installed, then make sure you have set the
 -- CMAKE_C_FLAGS and CMAKE_PREFIX_PATH CMake variables correctly.
 -- 
--- Configuring done (23.4s)
+-- Configuring done (10.3s)
 -- Generating done (0.0s)
 CMake Warning:
   Manually-specified variables were not used by the project:
@@ -538,4 +540,4 @@ CMake Warning:
     SDL_TIMERS
 
 
--- Build files have been written to: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sdl3_build
+-- Build files have been written to: /home/parrot/bootloader-kernel-in-NASM/build/sdl3_build

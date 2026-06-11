@@ -1,13 +1,13 @@
-ninja: Entering directory `/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libdisplay_info_build'
+ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/libdisplay_info_build'
 [0/1] Installing files
-Installing subdir /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/cta.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/cvt.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/displayid.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/dmt.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/edid.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/gtf.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/info.h to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
-Installing libdisplay-info.a to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/lib
-Installing di-edid-decode/di-edid-decode to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/bin
-Installing /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libdisplay_info_build/meson-private/libdisplay-info.pc to /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/lib/pkgconfig
+Installing subdir /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/cta.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/cvt.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/displayid.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/dmt.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/edid.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/gtf.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/include/libdisplay-info/info.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libdisplay-info
+Installing libdisplay-info.a to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/lib
+Installing di-edid-decode/di-edid-decode to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/bin
+Installing /home/parrot/bootloader-kernel-in-NASM/build/libdisplay_info_build/meson-private/libdisplay-info.pc to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/lib/pkgconfig

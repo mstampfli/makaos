@@ -1,5 +1,5 @@
-ninja: Entering directory `/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libevdev_build'
-[1/4] Compiling C object libevdev.a.p/libevdev_libevdev-names.c.o
-[2/4] Compiling C object libevdev.a.p/libevdev_libevdev-uinput.c.o
+ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/libevdev_build'
+[1/4] Compiling C object libevdev.a.p/libevdev_libevdev-uinput.c.o
+[2/4] Compiling C object libevdev.a.p/libevdev_libevdev-names.c.o
 [3/4] Compiling C object libevdev.a.p/libevdev_libevdev.c.o
 [4/4] Linking static target libevdev.a

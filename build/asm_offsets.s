@@ -5,7 +5,7 @@
 	.type	asm_offsets,@function
 asm_offsets:                            # @asm_offsets
 .Lfunc_begin0:
-	.file	0 "/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
+	.file	0 "/home/parrot/bootloader-kernel-in-NASM" "kernel/arch/x86_64/asm_offsets.c" md5 0x5b51bd979ed68fb8bdaa7fc692941912
 	.loc	0 28 0                          # kernel/arch/x86_64/asm_offsets.c:28:0
 	.cfi_sections .debug_frame
 	.cfi_startproc
@@ -191,9 +191,9 @@ asm_offsets:                            # @asm_offsets
 .Linfo_string1:
 	.asciz	"kernel/arch/x86_64/asm_offsets.c" # string offset=35
 .Linfo_string2:
-	.asciz	"/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM" # string offset=68
+	.asciz	"/home/parrot/bootloader-kernel-in-NASM" # string offset=68
 .Linfo_string3:
-	.asciz	"asm_offsets"                   # string offset=131
+	.asciz	"asm_offsets"                   # string offset=107
 	.section	.debug_str_offsets,"",@progbits
 	.long	.Linfo_string0
 	.long	.Linfo_string1

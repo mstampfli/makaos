@@ -1,12 +1,12 @@
 The Meson build system
 Version: 1.7.0
-Source dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0
-Build dir: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/libdisplay_info_build
+Source dir: /home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0
+Build dir: /home/parrot/bootloader-kernel-in-NASM/build/libdisplay_info_build
 Build type: cross build
 Project name: libdisplay-info
 Project version: 0.2.0
-C compiler for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
-C linker for the host machine: /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
+C compiler for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc (gcc 14.2.0 "x86_64-pc-makaos-gcc (GCC) 14.2.0")
+C linker for the host machine: /home/parrot/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc ld.bfd 2.42
 C compiler for the build machine: cc (gcc 14.2.0 "cc (Debian 14.2.0-19) 14.2.0")
 C linker for the build machine: cc ld.bfd 2.44
 Build machine cpu family: x86_64
@@ -17,7 +17,7 @@ Target machine cpu family: x86_64
 Target machine cpu: x86_64
 Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
 Build-time dependency hwdata found: YES 0.380
-Program tool/gen-search-table.py found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/tool/gen-search-table.py)
+Program tool/gen-search-table.py found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/tool/gen-search-table.py)
 Library m found: YES
 Compiler for C supports arguments -Wundef: YES 
 Compiler for C supports arguments -Wmissing-prototypes: YES 
@@ -28,9 +28,9 @@ Compiler for C supports arguments -Wno-unused-parameter: YES
 Compiler for C supports arguments -Wno-missing-field-initializers: YES 
 Compiler for C supports arguments -Werror=implicit: YES 
 Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
-Program ./edid-decode-check.sh found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-decode-check.sh)
-Program ./edid-print-check.sh found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-print-check.sh)
-Program ./edid-decode-diff.sh found: YES (/home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-decode-diff.sh)
+Program ./edid-decode-check.sh found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-decode-check.sh)
+Program ./edid-print-check.sh found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-print-check.sh)
+Program ./edid-decode-diff.sh found: YES (/home/parrot/bootloader-kernel-in-NASM/build/third_party/libdisplay-info-0.2.0/test/./edid-decode-diff.sh)
 Automatic wrap-based subproject downloading is disabled
 Subproject  edid-decode is buildable: NO (disabling)
 Program edid-decode found: NO
@@ -42,7 +42,7 @@ libdisplay-info 0.2.0
     edid-decode    : NO Automatic wrap-based subproject downloading is disabled
 
   User defined options
-    Cross files    : /home/parrot/Documents/dev/newMakaOS/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
+    Cross files    : /home/parrot/bootloader-kernel-in-NASM/scripts/makaos-meson-cross.ini
     default_library: static
     libdir         : lib
     prefix         : /usr
