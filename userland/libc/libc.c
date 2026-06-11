@@ -256,11 +256,33 @@ static uint64_t s_heap_start = 0;
 static uint64_t s_heap_end   = 0;
 static block_hdr_t* s_free_list = NULL;
 
+// Allocator lock.  foot/fcft/SDL are multithreaded: with an unlocked
+// bump allocator, two threads could pass the capacity check together
+// and the second write landed past the heap VMA — PF-KILL just above
+// heap end.  Spin+yield avoids a pthread.h dependency inside libc.
+// realloc/calloc stay unlocked: they compose malloc/free, and the
+// header fields they read belong to a block the caller owns.
+static volatile unsigned char s_heap_lock_flag = 0;
+// Raw yield syscall (SYS_SCHED_YIELD) — sched_yield() the function
+// lives in pthread.c, which minimal in-tree binaries don't link.
+#define HEAP_SYS_SCHED_YIELD 104
+static void heap_lock(void) {
+    while (__atomic_test_and_set(&s_heap_lock_flag, __ATOMIC_ACQUIRE))
+        (void)syscall0(HEAP_SYS_SCHED_YIELD);
+}
+static void heap_unlock(void) {
+    __atomic_clear(&s_heap_lock_flag, __ATOMIC_RELEASE);
+}
+
 static int heap_grow(size_t need) {
     size_t new_end = s_heap_end + need + 4096;
     new_end = (new_end + 4095u) & ~4095u;
     uint64_t got = brk(new_end);
-    if (got == (uint64_t)-1) return 0;
+    // brk returns the new break on success and -errno on failure —
+    // NEVER -1.  Accept only the exact address we asked for; the old
+    // `== -1` check let a -ENOMEM return value through as the "new
+    // heap end" and the next allocation indexed unmapped memory.
+    if (got != new_end) return 0;
     s_heap_end = got;
     return 1;
 }
@@ -300,6 +322,8 @@ void* malloc(size_t size) {
     if (!size) size = 1; // POSIX: malloc(0) returns a unique valid pointer
     size = ALIGN8(size);
 
+    heap_lock();
+
     // Search free list for a fitting block.
     block_hdr_t** pp = &s_free_list;
     while (*pp) {
@@ -308,12 +332,14 @@ void* malloc(size_t size) {
             *pp = b->next_free;
             b->free = 0;
             b->next_free = NULL;
+            heap_unlock();
             return (uint8_t*)b + HDR_SIZE;
         }
         pp = &b->next_free;
     }
 
     block_hdr_t* hdr = heap_alloc_raw(size);
+    heap_unlock();
     if (!hdr) return NULL;
     return (uint8_t*)hdr + HDR_SIZE;
 }
@@ -322,9 +348,11 @@ void free(void* ptr) {
     if (!ptr) return;
     block_hdr_t* hdr = (block_hdr_t*)((uint8_t*)ptr - HDR_SIZE);
     if (hdr->magic != BLOCK_MAGIC || hdr->free) return;
+    heap_lock();
     hdr->free = 1;
     hdr->next_free = s_free_list;
     s_free_list = hdr;
+    heap_unlock();
 }
 
 void* realloc(void* ptr, size_t new_size) {
@@ -991,6 +1019,39 @@ int shm_unlink(const char* name) {
     while (name[len]) len++;
     return (int)(long)__syscall_ret(
         syscall2(SYS_SHM_UNLINK, (uint64_t)name, (uint64_t)len));
+}
+
+// memfd_create — anonymous shared-memory fd (Linux extension).  foot
+// and wlroots use it for wl_shm buffer pools and keymap transfer; the
+// mkostemp fallback they otherwise compile backs SHM with a regular
+// ext2 file, whose huge sparse ftruncate the filesystem rejects.
+// Implemented as a uniquely-named shmem object unlinked immediately:
+// the fd keeps the object alive, the name disappears.  Sealing flags
+// (MFD_ALLOW_SEALING/MFD_NOEXEC_SEAL) are accepted and ignored — no
+// F_ADD_SEALS yet; CLOEXEC is irrelevant while exec replaces the fd
+// table wholesale.
+int memfd_create(const char* name, unsigned int flags) {
+    (void)name; (void)flags;
+    static volatile unsigned s_memfd_seq = 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        unsigned seq = __atomic_fetch_add(&s_memfd_seq, 1, __ATOMIC_RELAXED);
+        unsigned tag = ((unsigned)getpid() << 16) ^ seq;
+        char shm_name[32];
+        int i = 0;
+        shm_name[i++] = '/'; shm_name[i++] = 'm'; shm_name[i++] = 'f';
+        shm_name[i++] = 'd'; shm_name[i++] = ':';
+        for (int d = 7; d >= 0; d--)
+            shm_name[i++] = "0123456789abcdef"[(tag >> (d * 4)) & 0xF];
+        shm_name[i] = '\0';
+        int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            shm_unlink(shm_name);
+            return fd;
+        }
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
 }
 
 // ── Framebuffer mapping ──────────────────────────────────────────────────
@@ -1662,6 +1723,13 @@ long sysconf(int name) {
     case _SC_PAGESIZE:   return 4096;
     case _SC_NGROUPS_MAX:return 32;
     case _SC_ARG_MAX:    return 65536;
+    case _SC_NPROCESSORS_CONF:
+    case _SC_NPROCESSORS_ONLN: {
+        // Real CPU count from the kernel.  Returning -1 here made
+        // foot's u16 worker count wrap to 65535 render threads.
+        long n = (long)syscall0(113 /* SYS_NPROC */);
+        return n > 0 ? n : 1;
+    }
     default:             return -1;
     }
 }

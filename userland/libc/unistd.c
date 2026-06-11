@@ -276,8 +276,14 @@ int execl(const char* path, const char* arg0, ...) {
     }
     argv[argc] = NULL;
     va_end(ap);
+    // POSIX: execl passes the caller's environment — only execle takes
+    // an explicit envp.  Passing 0 here stripped WAYLAND_DISPLAY and
+    // XDG_RUNTIME_DIR from every execl'd child: dwl's `-s` startup
+    // command spawned foot into an env with no compositor socket and
+    // foot exited with "failed to connect to wayland".
+    extern char** environ;
     return (int)__syscall_ret(syscall3(SYS_EXEC,
-        (uint64_t)path, (uint64_t)argv, 0));
+        (uint64_t)path, (uint64_t)argv, (uint64_t)environ));
 }
 
 int execlp(const char* file, const char* arg0, ...) {

@@ -95,11 +95,14 @@ int posix_openpt(int flags) {
 int grantpt(int fd)  { (void)fd; return 0; }       // no setuid helper needed
 int unlockpt(int fd) { (void)fd; return 0; }       // always unlocked already
 static char s_ptsname_buf[32];
+extern int ioctl(int fd, unsigned long request, ...);
+#define MAKAOS_TIOCGPTN 0x80045430UL
 char* ptsname(int fd) {
-    // Our /dev/ptmx assigns per-open slave numbers starting at 0.
-    // Query via TIOCGPTN ioctl.  For now derive from fd number —
-    // fine for single-PTY tools like foot.
-    unsigned n = (unsigned)fd;
+    // Ask the kernel for the slave index.  Deriving it from the fd
+    // number (the old shortcut) breaks the moment the master fd isn't
+    // numerically equal to the pty index — which is always.
+    unsigned n = 0;
+    if (ioctl(fd, MAKAOS_TIOCGPTN, &n) != 0) return 0;
     int i = 0;
     const char* prefix = "/dev/pts/";
     while (prefix[i]) { s_ptsname_buf[i] = prefix[i]; i++; }

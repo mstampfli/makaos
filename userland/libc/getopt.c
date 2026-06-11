@@ -15,12 +15,18 @@ int   optopt = 0;
 // State carried across calls within one argv scan.
 static int s_nextchar = 0;      // offset within current argv[optind]
 
+// Only the intra-arg cursor resets between args.  optarg must NOT be
+// cleared here: the option-with-argument paths below assign optarg and
+// then advance/reset in the same breath — wiping optarg at that point
+// handed every caller a NULL argument (dwl's `-s foot` lost its
+// command and silently skipped the startup spawn).  optarg is instead
+// cleared once at the top of each getopt() call.
 static void reset_state(void) {
     s_nextchar = 0;
-    optarg = 0;
 }
 
 int getopt(int argc, char* const argv[], const char* optstring) {
+    optarg = 0;
     if (optind <= 0) optind = 1;
     if (s_nextchar == 0) {
         // Advance to the next arg that looks like an option.

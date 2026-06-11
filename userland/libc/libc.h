@@ -1672,6 +1672,10 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 #define _SC_PAGESIZE        30
 #define _SC_NGROUPS_MAX     3
 #define _SC_ARG_MAX         0
+// Same numbering as include/unistd.h — the two headers must agree on
+// every name sysconf() implements.
+#define _SC_NPROCESSORS_CONF 10
+#define _SC_NPROCESSORS_ONLN 11
 long sysconf(int name);
 long pathconf(const char* path, int name);
 int  confstr(int name, char* buf, size_t len);

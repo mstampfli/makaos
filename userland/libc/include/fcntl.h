@@ -55,4 +55,15 @@ int openat(int dirfd, const char* path, int flags, ...);
 int creat(const char* path, mode_t mode);
 int fcntl(int fd, int cmd, ...);
 
+// memfd sealing (Linux values).  The kernel's fcntl returns -EINVAL
+// for F_ADD_SEALS/F_GET_SEALS today — every caller we ship (foot's
+// wl_shm pool) treats seal failure as non-fatal.  Constants exist so
+// the code compiles on its preferred memfd path.
+#define F_ADD_SEALS     1033
+#define F_GET_SEALS     1034
+#define F_SEAL_SEAL     0x0001
+#define F_SEAL_SHRINK   0x0002
+#define F_SEAL_GROW     0x0004
+#define F_SEAL_WRITE    0x0008
+
 #endif
