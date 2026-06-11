@@ -136,6 +136,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     // in the libc trampoline.
     uint64_t      fs_base;
 
+    // CLEARTID-style death notification (SYS_SET_CLEARTID): on task
+    // termination the kernel stores 1 to this user address and
+    // futex-wakes it.  This is the ONLY safe join signal — userland
+    // setting a flag before SYS_EXIT lets the joiner free the stack
+    // and TLS while the dying thread still runs on them.
+    uint64_t      cleartid_addr;
+
     sigstate_t    sigstate;
 
     // Head of per-task signalfd subscriber list.  signal_send walks

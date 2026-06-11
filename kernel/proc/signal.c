@@ -361,6 +361,10 @@ void signal_deliver_pending(void) {
     // Drop the fd table now so peers see EOF immediately (matching sys_exit).
     if (g_current->files_shared) {
         extern void kprintf(const char*, ...);
+        {
+            extern void task_notify_cleartid(void);
+            task_notify_cleartid();
+        }
         kprintf("[signal] releasing files of pid=%u comm=\"%s\" refs=%u\n",
                 (unsigned)g_current->pid, g_current->comm,
                 (unsigned)g_current->files_shared->refs);

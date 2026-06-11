@@ -24,7 +24,7 @@
  * Empty by default — the per-syscall serial spam destroys the
  * atomicity of [signal]/PF-KILL records exactly when they matter.
  * Add names back locally when chasing a specific interaction. */
-static const char* const s_trace_comms[] = { "foot", (const char*)0 };
+static const char* const s_trace_comms[] = { "foot", "dwl", (const char*)0 };
 
 static inline int comm_match(const char* comm) {
     if (SYSCALL_TRACE_ALL) return 1;
@@ -568,8 +568,26 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // while its parent loops on something else) leaves its sockets half-open and
 // the peer never learns the client is gone. The zombie only needs to retain
 // exit_code / pid for waitpid — fds are not part of that contract.
+// CLEARTID death notification — runs while the mm is still alive and
+// the task can no longer return to userspace.  The joiner may free the
+// thread's stack and TLS the instant this fires; nothing below this
+// point touches user memory of the dying task.  Also called from the
+// signal-terminate path (kernel/proc/signal.c) for killed threads.
+void task_notify_cleartid(void) {
+    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+    if (!g_current || !g_current->cleartid_addr) return;
+    uint64_t addr = g_current->cleartid_addr;
+    g_current->cleartid_addr = 0;
+    uint32_t one = 1;
+    if (copy_to_user((void*)addr, &one, sizeof(one)) == 0) {
+        extern int64_t futex_wake(uint32_t*, uint32_t);
+        futex_wake((uint32_t*)addr, 0x7fffffff);
+    }
+}
+
 static uint64_t sys_exit(uint64_t code) {
     if (g_current) {
+        task_notify_cleartid();
         // Reparent every direct child onto g_init_task in one batched
         // CAS splice (task_children_reparent drains our own list — no
         // race, only self touches it here — then CAS-prepends the
@@ -1180,6 +1198,14 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     // the libc trampoline calls SYS_SET_FS with the thread's own block
     // before running user code.  Non-shared (spawn) tasks start clean.
     t->fs_base          = (flags & THREAD_SHARE_MM) ? g_current->fs_base : 0;
+    // kmalloc gives slab garbage — every pointer-bearing field must be
+    // initialized here.  A garbage signalfd_head made signal_send's
+    // notify walk fault in kernel mode the first time a signal hit a
+    // thread task.
+    t->signalfd_head     = (void*)0;
+    t->cleartid_addr     = 0;
+    t->drm_bytes_charged = 0;
+    t->drm_priority      = g_current->drm_priority;
     t->umask            = g_current->umask;
 
     // Inherit comm, credentials, pledge, unveil, and FPU state from parent.
@@ -4934,6 +4960,15 @@ static uint64_t w_sys_set_fs(uint64_t addr, uint64_t b, uint64_t c, uint64_t d) 
     return 0;
 }
 
+// set_cleartid(addr) — register the join word for this task; the
+// kernel stores 1 there and futex-wakes it at termination.
+static uint64_t w_sys_set_cleartid(uint64_t addr, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d;
+    if (addr && !_access_ok(addr, sizeof(uint32_t))) return (uint64_t)-EFAULT;
+    g_current->cleartid_addr = addr;
+    return 0;
+}
+
 // futex(uaddr, op, val, timeout_ns) — see kernel/proc/futex.h.
 // timeout is RELATIVE nanoseconds (0 = forever); libc owns the ABI.
 static uint64_t w_sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
@@ -5362,6 +5397,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_NPROC]               = w_sys_nproc,
     [SYS_FUTEX]               = w_sys_futex,
     [SYS_SET_FS]              = w_sys_set_fs,
+    [SYS_SET_CLEARTID]        = w_sys_set_cleartid,
 };
 
 /* Per-comm syscall tracing — DEBUGGING.md §2 + §4.
