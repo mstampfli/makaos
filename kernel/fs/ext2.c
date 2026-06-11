@@ -1131,6 +1131,14 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                                 dest + (uint64_t)i * s_block_size,
                                 s_block_size);
             }
+            // file_blks_left rounds UP, so a run covering the file's
+            // final block DMA'd that block's tail slack into dst too.
+            // The buffer is big enough (max_run is bounded by len), but
+            // the byte COUNT must clamp at EOF: without this a
+            // 7447-byte file read back as 8×1024 = 8192 bytes, and
+            // sway's "config file changed during reading" guard fired
+            // on the phantom tail.
+            if (bytes > remain_file) bytes = remain_file;
             total       += bytes;
             fd->cur_pos += bytes;
             continue;

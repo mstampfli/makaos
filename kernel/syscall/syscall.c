@@ -21,7 +21,8 @@
 #endif
 
 /* NUL-terminated list of comm names to match (leading prefix match). */
-static const char* const s_trace_comms[] = { "foot", "dwl", (const char*)0 };
+static const char* const s_trace_comms[] = { "foot", "dwl", "sway",
+                                             (const char*)0 };
 
 static inline int comm_match(const char* comm) {
     if (SYSCALL_TRACE_ALL) return 1;

@@ -139,6 +139,9 @@ typedef struct {
 #define KEY_PAGEDOWN   109
 #define KEY_INSERT     110
 #define KEY_DELETE     111
+#define KEY_LEFTMETA   125   // Super/logo — sway's default $mod (Mod4)
+#define KEY_RIGHTMETA  126
+#define KEY_COMPOSE    127   // menu key
 
 // ── Handler ───────────────────────────────────────────────────────────────
 // Statically allocated by the subsystem that wants keyboard events.

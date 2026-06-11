@@ -155,6 +155,12 @@ static uint16_t ext_to_keycode(uint8_t sc) {
         case 0x51: return KEY_PAGEDOWN;
         case 0x52: return KEY_INSERT;
         case 0x53: return KEY_DELETE;
+        // Super/logo + menu keys — wayland compositors bind Mod4 to
+        // these (sway's default $mod).  Without the mapping the kernel
+        // dropped E0-5B entirely and no Mod4 binding could ever fire.
+        case 0x5B: return KEY_LEFTMETA;
+        case 0x5C: return KEY_RIGHTMETA;
+        case 0x5D: return KEY_COMPOSE;
         default:   return 0;
     }
 }
