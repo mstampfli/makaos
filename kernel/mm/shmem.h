@@ -21,8 +21,13 @@
 //   - Security: each object carries uid/gid/mode.  shm_open checks
 //     these against the caller's credentials before granting access.
 
-// Maximum pages per shmem object (256 MB at 4K pages — raised if needed).
-#define SHMEM_MAX_PAGES  (256UL * 1024 * 1024 / PAGE_SIZE)
+// Maximum pages per shmem object (1 GiB at 4K pages).  Objects are
+// SPARSE — pages materialise on first write, so the cap bounds virtual
+// size only; the page-pointer array costs 8 B/page when actually
+// resized that large (1 GiB → 2 MiB array).  foot's default wl_shm
+// scrollback pool ftruncates its memfd to 512 MiB up front and aborts
+// when that fails, which the old 256 MiB cap guaranteed.
+#define SHMEM_MAX_PAGES  (1024UL * 1024 * 1024 / PAGE_SIZE)
 
 // Named shmem namespace is a dynamic hash table (see shmem.c) — no fixed cap.
 

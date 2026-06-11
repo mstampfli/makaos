@@ -127,6 +127,7 @@
 #define SYS_SENDMSG           110 // sendmsg(fd, msghdr*, flags) → count or -errno
 #define SYS_RECVMSG           111 // recvmsg(fd, msghdr*, flags) → count or -errno
 #define SYS_SIGNALFD          112 // signalfd(fd, mask_ptr, flags) → fd or -errno
+#define SYS_NPROC             113 // nproc() → number of online CPUs
 
 // signalfd flags (Linux-compatible).
 #define SFD_CLOEXEC  0x0002

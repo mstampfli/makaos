@@ -52,8 +52,10 @@ syscall_entry:
     ; 2. Switch to kernel stack (this CPU's TSS.RSP0 — also per-CPU via gs).
     mov rsp, [gs:CPU_TSS_RSP0]
 
-    ; 3. Re-enable interrupts — we're on a safe kernel stack now.
-    sti
+    ; NOTE: interrupts stay OFF until every per-CPU scratch slot has
+    ; been copied onto the per-task kernel stack (end of step 5).  An
+    ; IRQ in this window could preempt + migrate the task; the next
+    ; read of [gs:CPU_SC_*] would then see a DIFFERENT task's values.
 
     ; 3b. Push user callee-saved registers onto the kernel stack.  The
     ;     x86-64 syscall ABI requires the kernel preserve rbx/rbp/r12-r15
@@ -82,6 +84,11 @@ syscall_entry:
     push r10
     push r8
     push r9
+
+    ; The per-task snapshot is complete — the pushes above (steps
+    ; 3b/4/5) are exactly what C reads through SYSCALL_KFRAME().
+    ; Safe to take interrupts/preemption/migration from here on.
+    sti
 
     ; 6. Call dispatcher: syscall_dispatch(nr, arg1, arg2, arg3, arg4)
     ;    SysV calling convention: rdi=1st, rsi=2nd, rdx=3rd, rcx=4th, r8=5th
@@ -162,29 +169,14 @@ syscall_entry:
     xor  r15d, r15d
 
 .sysret_normal:
-    ; 10. Check if a user signal handler is being delivered, or sigreturn.
-    cmp byte [gs:CPU_SIG_DELIVER], 0
-    je  .no_signal
-    movzx eax, byte [gs:CPU_SIG_DELIVER]
-    mov byte [gs:CPU_SIG_DELIVER], 0
-    mov rcx, [gs:CPU_SC_USER_RIP]
-    mov r11, [gs:CPU_SC_USER_RFLAGS]
-    mov r10, [gs:CPU_SC_USER_RSP]    ; override user RSP (goes into r10, not rsp)
-    cmp eax, 1
-    jne .signal_restore
-    ; Mode 1: handler entry — set rdi = signum (first arg to handler).
-    mov rdi, [gs:CPU_SIG_RDI]
-    jmp .no_signal
-.signal_restore:
-    ; Mode 2: sigreturn — restore callee-saved regs from the sigframe
-    ; values that sys_sigreturn deposited in per-CPU scratch.  These
-    ; OVERRIDE the user's pre-sigreturn-syscall state we just popped.
-    mov rbp, [gs:CPU_SC_USER_RBP]
-    mov rbx, [gs:CPU_SC_USER_RBX]
-    mov r12, [gs:CPU_SC_USER_R12]
-    mov r13, [gs:CPU_SC_USER_R13]
-    mov r14, [gs:CPU_SC_USER_R14]
-    mov r15, [gs:CPU_SC_USER_R15]
+    ; 10. (removed) Signal delivery / sigreturn no longer branch here:
+    ;     signal_setup_frame and sys_sigreturn mutate the saved values
+    ;     on the per-task KERNEL STACK — the very slots steps 7/8/8b
+    ;     popped — so the normal unwind already carries the redirected
+    ;     rip/rsp/rflags/rdi and restored callee-saves.  Per-task state
+    ;     migrates with the task; the per-CPU CPU_SIG_*/CPU_SC_* scratch
+    ;     this replaced handed another task's user RSP to bash's
+    ;     SIGWINCH frame after a mid-syscall CPU migration.
 .no_signal:
     ; (cli already executed at top of consume window — do not re-cli.)
 

@@ -31,8 +31,15 @@ static const dev_node_t s_dev_nodes[] = {
     { "input/event1",  0, 0, 0660, FS_TYPE_CHAR },
     { "dri",           0, 0, 0755, FS_TYPE_DIR  },
     { "dri/card0",     0, 0, 0660, FS_TYPE_CHAR },
+    { "ptmx",          0, 0, 0666, FS_TYPE_CHAR },
+    { "pts",           0, 0, 0755, FS_TYPE_DIR  },
     { NULL, 0, 0, 0, 0 }
 };
+
+// Template returned for /dev/pts/<N> — slave indices are dynamic, so
+// they can't be rows in the static table.  Mode 0620 matches Linux
+// (owner rw, tty-group w).
+static const dev_node_t s_pts_slave_node = { "pts/N", 0, 0, 0620, FS_TYPE_CHAR };
 
 static const dev_node_t* dev_find_node(const char* name) {
     for (int i = 0; s_dev_nodes[i].name; i++) {
@@ -40,6 +47,16 @@ static const dev_node_t* dev_find_node(const char* name) {
         const char* b = name;
         while (*a && *b && *a == *b) { a++; b++; }
         if (*a == '\0' && *b == '\0') return &s_dev_nodes[i];
+    }
+    // pts/<digits> — any live slave index.  Existence of the pty is
+    // checked at open time (pty_open_slave_by_index); lookups on a
+    // stale N just report metadata for a node whose open returns
+    // ENOENT, same as Linux devpts after the master closes.
+    if (name[0]=='p' && name[1]=='t' && name[2]=='s' && name[3]=='/'
+        && name[4] >= '0' && name[4] <= '9') {
+        int i = 4;
+        while (name[i] >= '0' && name[i] <= '9') i++;
+        if (name[i] == '\0') return &s_pts_slave_node;
     }
     return NULL;
 }

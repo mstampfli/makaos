@@ -253,9 +253,23 @@ static int pty_master_poll(vfs_file_t* self, int events) {
     return ret;
 }
 
+static void pty_slave_close(vfs_file_t* self);
+
 static void pty_master_close(vfs_file_t* self) {
     pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
     pty_t* pty = ctx->pty;
+
+    // A parked, never-claimed slave handle (ptmx opened, /dev/pts/N
+    // never opened) would leak once the master dies — nobody can claim
+    // it any more.  Release it through the normal slave close path
+    // BEFORE flipping master_open, so pty_slave_close takes the plain
+    // "slave closed, master still open" route and the unified free
+    // check below stays the single pty_free site.
+    if (!pty->slave_claimed && pty->slave_file) {
+        vfs_file_t* sf = pty->slave_file;
+        pty->slave_file = NULL;
+        pty_slave_close(sf);
+    }
 
     pty->master_open = 0;
 
@@ -445,6 +459,11 @@ static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg
         case 0x540D: // TIOCEXCL
         case 0x540A: // TIOCNXCL
             return 0;
+        case 0x80045430: { // TIOCGPTN — slave index for ptsname()
+            uint32_t* out = (uint32_t*)arg;
+            *out = (uint32_t)ctx->pty->index;
+            return 0;
+        }
         default:
             return -22; // EINVAL
     }
@@ -628,4 +647,37 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     *master_out = master;
     *slave_out = slave;
     return 0;
+}
+
+// ── /dev/ptmx + /dev/pts/N open paths ───────────────────────────────────
+// The posix_openpt model: opening /dev/ptmx allocates a fresh pair and
+// returns only the master; the slave handle is parked on the pty until
+// the matching /dev/pts/<index> open claims it (foot, sway, every
+// terminal emulator does exactly this dance via ptsname()).
+
+vfs_file_t* pty_open_master(void) {
+    vfs_file_t* master = NULL;
+    vfs_file_t* slave  = NULL;
+    if (pty_alloc(&master, &slave) != 0) return NULL;
+    pty_master_ctx_t* ctx = (pty_master_ctx_t*)master->ctx;
+    ctx->pty->slave_file    = slave;
+    ctx->pty->slave_claimed = 0;
+    return master;
+}
+
+vfs_file_t* pty_open_slave_by_index(int n) {
+    for (pty_t* p = s_pty_head; p; p = p->next) {
+        if (p->index != n) continue;
+        if (!p->slave_file) return NULL;
+        if (!p->slave_claimed) {
+            // First open consumes the initial reference taken by
+            // pty_alloc (slave_open_count is already 1).
+            p->slave_claimed = 1;
+            return p->slave_file;
+        }
+        // Additional opens share the same vfs_file — dup semantics.
+        __atomic_fetch_add(&p->slave_file->refcount, 1, __ATOMIC_RELAXED);
+        return p->slave_file;
+    }
+    return NULL;
 }

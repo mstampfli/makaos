@@ -278,6 +278,33 @@ typedef struct __attribute__((aligned(16))) task_t {
 
 typedef task_t process_t;
 
+// ── Syscall entry frame (per-task kernel stack) ──────────────────────────
+// syscall_entry.asm pushes the complete user-visible register state onto
+// the task's kernel stack right after switching off the user stack, in
+// this exact order (see steps 3b/4/5 in syscall_entry.asm).  Because the
+// kernel stack is per-task, these values follow the task across CPU
+// migrations — unlike the per-CPU gs scratch slots, which hold whatever
+// task most recently entered a syscall on that CPU.
+//
+// This overlay is the ONLY sanctioned way for C code to read a
+// syscall's saved user context (fork, signal delivery) or to redirect
+// the syscall return (signal frames, sigreturn): mutations here are
+// consumed by the normal pop sequence in the exit path.  Reading the
+// per-CPU slots after any point that can sleep or be preempted is a
+// bug — that pattern delivered foot's thread-stack RSP to bash's
+// SIGWINCH frame and panicked the kernel in signal_setup_frame.
+typedef struct syscall_kframe {
+    // step 5 pushes (last pushed → lowest address)
+    uint64_t r9, r8, r10, rdx, rsi, rdi;
+    // step 4 pushes: sysret triple
+    uint64_t rip, rflags, rsp;
+    // step 3b pushes: user callee-saves
+    uint64_t r15, r14, r13, r12, rbp, rbx;
+} syscall_kframe_t;
+
+#define SYSCALL_KFRAME(t) \
+    ((syscall_kframe_t*)((t)->kstack_top - sizeof(syscall_kframe_t)))
+
 // ── task_mm_t / task_files_t lifecycle ───────────────────────────────────
 task_mm_t*    task_mm_alloc(phys_addr_t pml4, mm_t* mm);
 void          task_mm_release(task_mm_t* m);

@@ -43,6 +43,13 @@ typedef struct pty {
     int          master_open;                   // master fd still open?
     int          slave_open_count;              // refcount of open slave fds
     int          index;                         // pty number (for /dev/pts/N)
+    // The slave vfs_file created by pty_alloc is PARKED here when the
+    // pair comes from a /dev/ptmx open (posix_openpt model): the
+    // caller only receives the master and claims the slave later via
+    // /dev/pts/<index>.  slave_claimed flips on the first such open;
+    // further opens share the same file with a refcount bump.
+    struct vfs_file_t* slave_file;
+    int          slave_claimed;
     struct pty*  next;                          // next node in live PTY list
 } pty_t;
 
@@ -50,6 +57,14 @@ typedef struct pty {
 // Caller installs them into the fd table.
 // Returns 0 on success, -errno on failure.
 int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out);
+
+// /dev/ptmx open: allocate a pair, park the slave handle on the pty
+// (claimed later through /dev/pts/<index>), return the master.
+vfs_file_t* pty_open_master(void);
+
+// /dev/pts/<n> open: claim (or share) the parked slave handle of the
+// live pty with that index.  NULL if no such pty.
+vfs_file_t* pty_open_slave_by_index(int n);
 
 // Called by slave's write_char to push output to master's read buffer.
 void pty_master_push(pty_t* pty, uint8_t c);

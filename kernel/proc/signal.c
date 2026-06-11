@@ -5,22 +5,20 @@
 #include "common.h"
 #include "fb.h"
 
-// ── Per-CPU syscall / signal scratch ─────────────────────────────────────
-// These used to be globals in syscall.c, but under SMP round-robin the
-// scratch data raced between concurrent syscalls on different CPUs.
-// They now live inside cpu_t (see kernel/include/cpu.h); signal.c
-// accesses them via this_cpu()->field aliases for readability.
-#define g_syscall_user_rsp    (this_cpu()->syscall_user_rsp)
-#define g_syscall_user_rip    (this_cpu()->syscall_user_rip)
-#define g_syscall_user_rflags (this_cpu()->syscall_user_rflags)
-#define g_syscall_user_rbp    (this_cpu()->syscall_user_rbp)
-#define g_syscall_user_rbx    (this_cpu()->syscall_user_rbx)
-#define g_syscall_user_r12    (this_cpu()->syscall_user_r12)
-#define g_syscall_user_r13    (this_cpu()->syscall_user_r13)
-#define g_syscall_user_r14    (this_cpu()->syscall_user_r14)
-#define g_syscall_user_r15    (this_cpu()->syscall_user_r15)
-#define g_signal_deliver      (this_cpu()->signal_deliver)
-#define g_signal_rdi          (this_cpu()->signal_rdi)
+// ── Saved user context access ────────────────────────────────────────────
+// The authoritative copy of a syscall's saved user registers lives on
+// the PER-TASK kernel stack (SYSCALL_KFRAME in process.h), pushed by
+// syscall_entry.asm before interrupts are re-enabled.  signal frames
+// are built from — and the syscall return redirected through — that
+// frame.  The per-CPU cpu_t scratch slots must NOT be read here: they
+// go stale the moment the task sleeps mid-syscall and resumes on
+// another CPU (observed: bash received a foot pthread-stack RSP for
+// its SIGWINCH frame; the write to the unmapped address panicked the
+// kernel inside signal_setup_frame).
+//
+// signal_in_syscall stays per-CPU: it is set and consumed around the
+// signal_deliver_pending call inside one dispatch invocation on one
+// CPU, with no sleep in between.
 #define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
 // ── signal_send ───────────────────────────────────────────────────────────
@@ -134,7 +132,9 @@ static inline int sig_user_range_ok(uint64_t addr, uint64_t len) {
 }
 
 static void signal_setup_frame(int sig, k_sigaction_t* ka) {
-    uint64_t user_rsp = g_syscall_user_rsp;
+    // Per-task saved user context — survives mid-syscall CPU migration.
+    syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+    uint64_t user_rsp = kf->rsp;
 
     // Skip the 128-byte red zone, then place the sigframe below it,
     // 16-byte aligned as required for stack-passed arguments.
@@ -190,17 +190,34 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
         return;
     }
 
+    // Defense in depth: the canonical-range check above cannot tell a
+    // VALID-but-unmapped address from a mapped one — and a kernel-mode
+    // write to a user address with NO covering VMA is an unrecoverable
+    // #PF (panic), not a demand-page.  Require the whole frame window
+    // to be VMA-covered; demand paging handles not-yet-present pages.
+    {
+        extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
+        mm_t* mm = g_current->mm_shared->mm;
+        if (!mm || !mm_vma_find(mm, frame_base - 8) ||
+            !mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1)) {
+            atomic_or(&g_current->sigstate.pending,
+                      1u << (uint32_t)(SIGKILL - 1));
+            g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
+            return;
+        }
+    }
+
     sigframe_t* frame = (sigframe_t*)frame_base;
 
-    frame->rip    = g_syscall_user_rip;
+    frame->rip    = kf->rip;
     frame->rsp    = user_rsp;
-    frame->rflags = g_syscall_user_rflags;
-    frame->rbp    = g_syscall_user_rbp;
-    frame->rbx    = g_syscall_user_rbx;
-    frame->r12    = g_syscall_user_r12;
-    frame->r13    = g_syscall_user_r13;
-    frame->r14    = g_syscall_user_r14;
-    frame->r15    = g_syscall_user_r15;
+    frame->rflags = kf->rflags;
+    frame->rbp    = kf->rbp;
+    frame->rbx    = kf->rbx;
+    frame->r12    = kf->r12;
+    frame->r13    = kf->r13;
+    frame->r14    = kf->r14;
+    frame->r15    = kf->r15;
     frame->blocked = g_current->sigstate.blocked;
     frame->_pad   = 0;
 
@@ -215,15 +232,14 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     uint64_t new_rsp = frame_base - 8;
     *(uint64_t*)new_rsp = ka->sa_restorer;
 
-    // Redirect syscall return to the handler.
-    g_syscall_user_rip    = ka->sa_handler;
-    g_syscall_user_rsp    = new_rsp;
-    g_syscall_user_rflags = 0x202;  // IF=1, reserved
-
-    // Tell syscall_entry.asm to load rdi=signum before sysretq.
-    g_signal_rdi     = (uint64_t)(uint32_t)sig;
-    g_signal_deliver = 1;
-
+    // Redirect the syscall return to the handler by mutating the saved
+    // user context in place — the exit path's normal pop sequence
+    // consumes these slots, so no per-CPU flag and no special asm
+    // branch are involved.  rdi is the handler's signum argument.
+    kf->rip    = ka->sa_handler;
+    kf->rsp    = new_rsp;
+    kf->rflags = 0x202;  // IF=1, reserved
+    kf->rdi    = (uint64_t)(uint32_t)sig;
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────

@@ -168,6 +168,14 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
 // Receive data.  Blocks if empty.  Returns bytes read, 0 on EOF, -errno on error.
 int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
 
+// _ex variants: `nonblock` forces O_NONBLOCK semantics for this one
+// call regardless of f->flags — the kernel half of MSG_DONTWAIT.
+// libwayland keeps client fds BLOCKING and passes MSG_DONTWAIT on
+// every sendmsg/recvmsg; without per-call nonblock the compositor's
+// event loop blocks inside the kernel on the first empty read.
+int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len, int nonblock);
+int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock);
+
 // Send datagram to a specific path (SOCK_DGRAM only).
 int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len, const char* path);
 
@@ -183,6 +191,12 @@ int unix_sock_sendfd(vfs_file_t* sock, vfs_file_t* file, uint32_t rights);
 // Dequeue a received file descriptor (called by sys_recvfd).
 // Returns a new vfs_file_t with stamped rights, or NULL if queue empty.
 vfs_file_t* unix_sock_recvfd(vfs_file_t* sock);
+
+// Non-blocking dequeue: NULL immediately when the ancillary queue is
+// empty.  recvmsg's SCM_RIGHTS drain must use this — the blocking
+// recvfd parked compositors forever waiting for fds that never come
+// while payload sat unread in the stream buffer.
+vfs_file_t* unix_sock_recvfd_nb(vfs_file_t* sock);
 
 // ── VFS close callback (exported for type identification) ────────────────
 void unix_sock_close(vfs_file_t* self);

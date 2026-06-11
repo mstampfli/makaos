@@ -75,15 +75,12 @@ extern volatile uint16_t* g_vga;
 // Every expansion is `this_cpu()->field`, which compiles to a single
 // `mov %gs:N, %reg` — same cost as the pre-fix global access (a plain
 // RIP-relative load), but correctly scoped to the executing CPU.
-#define g_syscall_user_rsp    (this_cpu()->syscall_user_rsp)
-#define g_syscall_user_rip    (this_cpu()->syscall_user_rip)
-#define g_syscall_user_rflags (this_cpu()->syscall_user_rflags)
-#define g_syscall_user_rbp    (this_cpu()->syscall_user_rbp)
-#define g_syscall_user_rbx    (this_cpu()->syscall_user_rbx)
-#define g_syscall_user_r12    (this_cpu()->syscall_user_r12)
-#define g_syscall_user_r13    (this_cpu()->syscall_user_r13)
-#define g_syscall_user_r14    (this_cpu()->syscall_user_r14)
-#define g_syscall_user_r15    (this_cpu()->syscall_user_r15)
+// The g_syscall_user_* aliases are GONE on purpose: the per-CPU
+// cpu_t scratch they exposed goes stale whenever a task sleeps
+// mid-syscall and resumes on another CPU.  Saved user context is read
+// (and, for signal delivery / sigreturn, rewritten) exclusively through
+// SYSCALL_KFRAME(g_current) — the per-task kernel-stack snapshot the
+// entry asm takes with interrupts still disabled.
 /* Per-task snapshot of r8/r9 at syscall entry — populated by
  * native_syscall_dispatch BEFORE any dispatch that might sleep or
  * migrate, because this_cpu()->syscall_arg5 only survives as long as
@@ -97,8 +94,6 @@ extern volatile uint16_t* g_vga;
 #define g_exec_entry          (this_cpu()->exec_entry)
 #define g_exec_rsp            (this_cpu()->exec_rsp)
 #define g_exec_pml4           (this_cpu()->exec_pml4)
-#define g_signal_deliver      (this_cpu()->signal_deliver)
-#define g_signal_rdi          (this_cpu()->signal_rdi)
 #define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
 // Forward declaration — defined near copy_from/to_user below.
@@ -328,11 +323,23 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
+        uint8_t match_ptmx   = (dev[0]=='p' && dev[1]=='t' && dev[2]=='m'
+                             && dev[3]=='x' && dev[4]=='\0');
+        // /dev/pts/<N>: claim the slave side of an existing pty.
+        int match_ptsn = -1;
+        if (dev[0]=='p' && dev[1]=='t' && dev[2]=='s' && dev[3]=='/'
+            && dev[4] >= '0' && dev[4] <= '9') {
+            int n = 0; int i = 4;
+            while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
+            if (dev[i] == '\0') match_ptsn = n;
+        }
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_eventn >= 0) { extern vfs_file_t* evdev_open_device(uint32_t); f = evdev_open_device((uint32_t)match_eventn); }
         else if (match_dri0)   { extern vfs_file_t* vfs_drm_open(void); f = vfs_drm_open(); }
+        else if (match_ptmx)   { extern vfs_file_t* pty_open_master(void); f = pty_open_master(); }
+        else if (match_ptsn >= 0) { extern vfs_file_t* pty_open_slave_by_index(int); f = pty_open_slave_by_index(match_ptsn); }
         else if (match_kbd)    f = vfs_kbd_open();
         else if (match_vga)    f = vfs_vga_open();
         else if (match_mouse)  f = vfs_mouse_open();
@@ -656,16 +663,20 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
 // ── sys_fork ──────────────────────────────────────────────────────────────
 static uint64_t sys_fork(void) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
+    // Saved user context comes from the per-task kernel-stack frame —
+    // the per-CPU scratch goes stale if this task was preempted and
+    // migrated between syscall entry and this point.
+    syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
     task_t* child = task_fork(g_current,
-                              g_syscall_user_rip,
-                              g_syscall_user_rflags,
-                              g_syscall_user_rsp,
-                              g_syscall_user_rbp,
-                              g_syscall_user_rbx,
-                              g_syscall_user_r12,
-                              g_syscall_user_r13,
-                              g_syscall_user_r14,
-                              g_syscall_user_r15);
+                              kf->rip,
+                              kf->rflags,
+                              kf->rsp,
+                              kf->rbp,
+                              kf->rbx,
+                              kf->r12,
+                              kf->r13,
+                              kf->r14,
+                              kf->r15);
     if (!child) return (uint64_t)-ENOMEM;
     task_child_add(g_current, child);
     sched_add(child);
@@ -1821,26 +1832,27 @@ static uint64_t sys_sigreturn(void) {
     if (frame.rip >= (1ULL << 47) || frame.rsp >= (1ULL << 47))
         return (uint64_t)-EINVAL;
 
-    // Restore user register context via the globals that syscall_entry.asm reads.
-    g_syscall_user_rip    = frame.rip;
-    g_syscall_user_rsp    = frame.rsp;
+    // Restore the user register context by rewriting the saved slots on
+    // the per-task kernel stack — the exit path's normal pop sequence
+    // then carries the pre-signal state back to user space.  No per-CPU
+    // flags involved (those raced across mid-syscall CPU migrations).
+    syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+    kf->rip    = frame.rip;
+    kf->rsp    = frame.rsp;
     // Preserve kernel-managed flag bits (IF=1, reserved bit 1).  Never
     // let user clear IF via a crafted sigframe.
-    g_syscall_user_rflags = (frame.rflags & 0xCD5) | 0x202;
-    g_syscall_user_rbp    = frame.rbp;
-    g_syscall_user_rbx    = frame.rbx;
-    g_syscall_user_r12    = frame.r12;
-    g_syscall_user_r13    = frame.r13;
-    g_syscall_user_r14    = frame.r14;
-    g_syscall_user_r15    = frame.r15;
+    kf->rflags = (frame.rflags & 0xCD5) | 0x202;
+    kf->rbp    = frame.rbp;
+    kf->rbx    = frame.rbx;
+    kf->r12    = frame.r12;
+    kf->r13    = frame.r13;
+    kf->r14    = frame.r14;
+    kf->r15    = frame.r15;
 
     // Restore the signal mask that was active before the handler ran.
     // SIGKILL must never be masked.
     g_current->sigstate.blocked = frame.blocked & ~(1u << (SIGKILL - 1));
     g_current->sigstate.sigframe_rsp = 0;
-
-    // Ask syscall_entry.asm to override rcx/r11/rsp/rbp/rbx/r12-r15 before sysretq.
-    g_signal_deliver = 2;
     return 0;
 }
 
@@ -1947,23 +1959,35 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     // xkbcommon, fontconfig, freetype, etc. reading read-only keymap/font
     // data.
     int route_file_backed = 0;
+    int private_ro_shmem  = 0;
     if (has_fd) {
         vfs_file_t* probe = fdget(fd);
         if (!probe) return (uint64_t)-EBADF;
         int is_regular_file = probe->path[0] != 0;
+        extern void shmem_fd_close(vfs_file_t*);
+        int is_shmem_fd = (probe->close == shmem_fd_close);
         fdput(probe);
         if (is_regular_file) {
             if (is_shared && (prot & PROT_WRITE))
                 return (uint64_t)-EINVAL;  // TODO: writable MAP_SHARED
             route_file_backed = 1;
         } else if (!is_shared) {
-            // MAP_PRIVATE on a non-regular fd (shmem/tty/socket/pipe) —
-            // the old code returned EACCES here.  Preserve that, since
-            // those fds don't expose a readable inode to demand-page from.
-            if (g_current && comm_match(g_current->comm))
-                pr_warn("mmap", "%s fd=%ld MAP_PRIVATE on non-regular fd → EACCES",
-                        g_current->comm, (long)fd);
-            return (uint64_t)-EACCES;
+            // MAP_PRIVATE on a non-regular fd.  Shmem fds get a
+            // read-only carve-out: a private read-only view of shared
+            // memory is indistinguishable from a shared one (no write
+            // can ever happen), and that is exactly how wayland
+            // clients consume the compositor's xkb keymap fd (foot
+            // mmaps the SCM_RIGHTS-passed keymap PROT_READ +
+            // MAP_PRIVATE).  Writable private shmem would need COW —
+            // still EACCES.
+            if (is_shmem_fd && !(prot & PROT_WRITE)) {
+                private_ro_shmem = 1;
+            } else {
+                if (g_current && comm_match(g_current->comm))
+                    pr_warn("mmap", "%s fd=%ld MAP_PRIVATE on non-regular fd → EACCES",
+                            g_current->comm, (long)fd);
+                return (uint64_t)-EACCES;
+            }
         }
     }
     if (route_file_backed) {
@@ -2015,7 +2039,10 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         return (uint64_t)-ENOMEM;
 
     // ── Attach shmem backing ─────────────────────────────────────────────
-    if (is_shared) {
+    // private_ro_shmem rides the same attach path: the VMA carries
+    // neither VMA_SHARED nor VMA_W, so the demand-pager maps the shmem
+    // pages read-only and a write is impossible by construction.
+    if (is_shared || private_ro_shmem) {
         shmem_t* shm = NULL;
 
         if (has_fd) {
@@ -3679,6 +3706,11 @@ typedef struct {
     uint32_t        count;  // live watches
     wait_queue_t    wq;     // sleeping tasks
     int             has_ready;
+    // The epoll fd's own vfs_file waitq (f->_waitq).  Handed to every
+    // epoll_we_t so epoll_wake_func can propagate readiness to an
+    // OUTER epoll watching this epfd (nested epoll).  Never NULL after
+    // sys_epoll_create wires it.
+    wait_queue_t*   file_wq;
     // Writer lock: serialises epoll_ctl against epoll_wait scans and
     // against other concurrent epoll_ctl calls on the same epfd.  NOT
     // IRQ-off: the wake callback (epoll_wake_func, which can fire from
@@ -3738,11 +3770,11 @@ static int ep_grow(epoll_state_t* st, uint32_t new_cap) {
 // Register/unregister persistent epoll_we_t entries on the watched fd's queues.
 static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
                                   vfs_file_t* f) {
-    epoll_we_init(&w->entry, &state->wq, &state->has_ready);
+    epoll_we_init(&w->entry, &state->wq, &state->has_ready, state->file_wq);
     epoll_we_add(f->waitq, &w->entry);
     w->wq1 = f->waitq;
     if (f->secondary_waitq) {
-        epoll_we_init(&w->entry2, &state->wq, &state->has_ready);
+        epoll_we_init(&w->entry2, &state->wq, &state->has_ready, state->file_wq);
         epoll_we_add(f->secondary_waitq, &w->entry2);
         w->wq2 = f->secondary_waitq;
         w->has_entry2 = 1;
@@ -3787,6 +3819,62 @@ static int64_t epoll_write(vfs_file_t* self, const void* buf, uint64_t len) {
 }
 static int64_t epoll_seek(vfs_file_t* self, int64_t off, int w) {
     (void)self; (void)off; (void)w; return (int64_t)-ESPIPE;
+}
+
+// Poll op for the epoll fd itself — what makes one epoll watchable by
+// another (libinput's context fd is a nested epfd; wlroots registers
+// it in wl_event_loop's epoll).  Ready ⇔ some watched fd is ready
+// right now.
+//
+// Without this, the no-poll-op default in the epoll_wait scan treated
+// a nested epfd as PERMANENTLY readable: wlroots' loop saw the
+// libinput epfd "ready" forever, libinput_dispatch() drained nothing,
+// and every wlroots compositor busy-spun before its first frame — the
+// dwl/sway black screen (a NULL vtable entry, hence the old
+// "null-vtable" label).
+//
+// Locking: trylock only.  The caller may already hold an OUTER
+// epoll's state->lock (its scan invoking f->poll on this epfd), so
+// blocking here would deadlock on a watch cycle (A⊂B, B⊂A).  On
+// contention report "not ready": level-triggered re-scans triggered by
+// the epoll_wake_func→file_wq cascade make a missed ready transient.
+// s_ep_poll_depth bounds A⊂B⊂C… chain recursion at 4 like Linux's
+// ep_loop_check; balanced inc/dec on one CPU keeps it exact (kernel
+// code is non-preemptive; poll ops never run from IRQ context).
+static int s_ep_poll_depth[MAX_CPUS];
+
+static int epoll_poll(vfs_file_t* self, int events) {
+    if (!(events & POLLIN)) return 0;   // never writable, no HUP state
+    epoll_state_t* st = (epoll_state_t*)self->ctx;
+    if (!st || !g_current) return 0;
+
+    unsigned cpu = cpu_id();
+    if (s_ep_poll_depth[cpu] >= 4) return 0;
+    if (!spin_trylock(&st->lock)) return 0;
+    s_ep_poll_depth[cpu]++;
+
+    task_files_t* files = g_current->files_shared;
+    int ready = 0;
+    for (uint32_t i = 0; i < st->cap && !ready; i++) {
+        epoll_watch_t* w = st->slots[i];
+        if (!w || w == EPOLL_DELETED) continue;
+        vfs_file_t* f = ((uint32_t)w->fd < files->ft->cap)
+                        ? files->ft->fd_table[w->fd] : NULL;
+        if (!f) { ready = 1; break; }   // dangling fd → EPOLLERR|EPOLLHUP pending
+        if (f->poll) {
+            if (((w->events & EPOLLIN)  && f->poll(f, POLLIN))  ||
+                ((w->events & EPOLLOUT) && f->poll(f, POLLOUT)) ||
+                f->poll(f, POLLHUP))
+                ready = 1;
+        } else {
+            // No poll op = regular-file semantics: always ready.
+            if (w->events & (EPOLLIN | EPOLLOUT)) ready = 1;
+        }
+    }
+
+    s_ep_poll_depth[cpu]--;
+    spin_unlock(&st->lock);
+    return ready;
 }
 static void epoll_close(vfs_file_t* self) {
     if (self->ctx) {
@@ -3833,10 +3921,11 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     f->write          = epoll_write;
     f->close          = epoll_close;
     f->seek           = epoll_seek;
-    f->poll           = NULL;
+    f->poll           = epoll_poll;   // nested epoll: real readiness, not always-on
     f->ioctl          = NULL;
     f->ctx            = state;
     f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
+    state->file_wq     = f->waitq;    // wake target for outer epolls (see epoll_we_t)
     f->secondary_waitq = NULL;
     f->flags          = 0;
     f->refcount       = 1;
@@ -4799,6 +4888,15 @@ extern vfs_file_t* signalfd_new(uint32_t mask, uint32_t flags);
 extern int         signalfd_update(vfs_file_t* f, uint32_t mask);
 extern int         signalfd_is(vfs_file_t* f);
 
+// nproc() — online CPU count for sysconf(_SC_NPROCESSORS_ONLN).
+// foot sizes its render-worker pool from this; the old sysconf stub
+// returned -1, which foot's u16 worker count read as 65535 threads.
+static uint64_t w_sys_nproc(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    extern unsigned g_num_cpus;
+    return (uint64_t)g_num_cpus;
+}
+
 static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
                                  uint64_t flags, uint64_t d) {
     (void)d;
@@ -4856,15 +4954,24 @@ typedef struct k_cmsghdr {
 // Maximum fds in a single SCM_RIGHTS cmsg.  Matches Linux SCM_MAX_FD.
 #define SCM_MAX_FD 253
 
+// Per-call nonblocking I/O (Linux value).  libwayland leaves its fds
+// BLOCKING and passes MSG_DONTWAIT on every sendmsg/recvmsg — ignoring
+// it blocked compositors inside the kernel on the first empty read.
+#define MSG_DONTWAIT 0x40
+
 extern int         unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
 extern int         unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
+extern int         unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len, int nonblock);
+extern int         unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock);
 extern int         unix_sock_sendfd(vfs_file_t* s, vfs_file_t* f, uint32_t r);
 extern vfs_file_t* unix_sock_recvfd(vfs_file_t* s);
+extern vfs_file_t* unix_sock_recvfd_nb(vfs_file_t* s);
 extern int         is_unix_sock(vfs_file_t* f);
 
 static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
-    (void)flags; (void)d;
+    (void)d;
+    int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
     vfs_file_t* sock = fd_to_file(fd_u);
     if (!sock) return (uint64_t)-EBADF;
@@ -4927,8 +5034,11 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if (copy_from_user(bounce, (void*)(iv.iov_base + done),
                                 chunk) != 0)
                 return (uint64_t)-EFAULT;
-            int w = unix_sock_send(sock, bounce, (uint32_t)chunk);
-            if (w < 0) return (uint64_t)(int64_t)w;
+            int w = unix_sock_send_ex(sock, bounce, (uint32_t)chunk, nonblock);
+            if (w < 0) {
+                if (total > 0) return total;   // partial send wins
+                return (uint64_t)(int64_t)w;
+            }
             if (w == 0) break;
             done  += (uint64_t)w;
             total += (uint64_t)w;
@@ -4940,7 +5050,8 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
 
 static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
-    (void)flags; (void)d;
+    (void)d;
+    int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
     vfs_file_t* sock = fd_to_file(fd_u);
     if (!sock) return (uint64_t)-EBADF;
@@ -4961,7 +5072,11 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
         if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
         while (n_inst < max_fds) {
-            vfs_file_t* rf = unix_sock_recvfd(sock);
+            // Non-blocking drain: take only what is already queued.
+            // The blocking recvfd here parked the caller until an fd
+            // ARRIVED — on a connection that never passes fds, that
+            // is forever, with payload sitting unread.
+            vfs_file_t* rf = unix_sock_recvfd_nb(sock);
             if (!rf) break;
             int64_t new_fd = fd_install(rf);
             if (new_fd < 0) { vfs_close(rf); break; }
@@ -4998,11 +5113,15 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
             if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
-            int r = sock->read(sock, bounce, chunk);
+            int r = is_unix_sock(sock)
+                    ? unix_sock_recv_ex(sock, bounce, chunk, nonblock)
+                    : (int)sock->read(sock, bounce, chunk);
             if (r < 0) {
                 // First read returning an error propagates; a later
-                // partial read returns bytes already gathered.
-                if (total == 0) return (uint64_t)(int64_t)r;
+                // partial read returns bytes already gathered.  A
+                // drained SCM_RIGHTS cmsg counts as progress — return
+                // it with 0 payload rather than erroring it away.
+                if (total == 0 && n_inst == 0) return (uint64_t)(int64_t)r;
                 goto done_gather;
             }
             if (r == 0) goto done_gather;
@@ -5186,6 +5305,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SENDMSG]             = w_sys_sendmsg,
     [SYS_RECVMSG]             = w_sys_recvmsg,
     [SYS_SIGNALFD]            = w_sys_signalfd,
+    [SYS_NPROC]               = w_sys_nproc,
 };
 
 /* Per-comm syscall tracing — DEBUGGING.md §2 + §4.
@@ -5216,8 +5336,13 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
      * values to a per-task slot that follows the task across
      * migrations. */
     if (g_current) {
-        g_current->syscall_a5 = this_cpu()->syscall_arg5;
-        g_current->syscall_a6 = this_cpu()->syscall_arg6;
+        // Read from the per-task kernel-stack frame, not this_cpu():
+        // a preemption between the entry asm's sti and this line can
+        // migrate the task, after which the per-CPU slots belong to
+        // whatever task last entered a syscall on the new CPU.
+        syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+        g_current->syscall_a5 = kf->r8;
+        g_current->syscall_a6 = kf->r9;
     }
 
     /* Trace enter.  TRACE() is per-CPU + lock-free + always on — the

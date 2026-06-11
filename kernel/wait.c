@@ -252,9 +252,28 @@ int task_wake_func(wake_entry_t* we) {
     return WQ_REMOVE;
 }
 
+// Nested-epoll wake cascade depth, per CPU.  Bounds a pathological
+// watch cycle (A watches B, B watches A) the same way Linux's
+// ep_poll_safewake nest limit does.  Balanced inc/dec keeps it correct
+// under IRQ reentrancy; no lock needed.
+static int s_epoll_wake_depth[MAX_CPUS];
+
 int epoll_wake_func(wake_entry_t* we) {
     epoll_we_t* ewe = (epoll_we_t*)we;
     __atomic_store_n(ewe->p_has_ready, 1, __ATOMIC_RELEASE);
     wait_queue_wake_all(ewe->epoll_wq);
+    // Nested epoll: an OUTER epoll watching this epfd has its own
+    // epoll_we_t entries on the epoll FILE's waitq (see epoll_we_t in
+    // wait.h).  Wake it so the outer loop re-scans, else readiness
+    // never propagates upward and the outer epoll_wait sleeps through
+    // inner events.
+    if (ewe->file_wq) {
+        unsigned cpu = cpu_id();
+        if (s_epoll_wake_depth[cpu] < 4) {
+            s_epoll_wake_depth[cpu]++;
+            wait_queue_wake_all(ewe->file_wq);
+            s_epoll_wake_depth[cpu]--;
+        }
+    }
     return WQ_KEEP;
 }

@@ -99,6 +99,12 @@ typedef struct {
     wake_entry_t    we;
     struct wait_queue_t* epoll_wq;   // &epoll_state->wq
     int*            p_has_ready;     // set to 1 so epoll_wait re-scans
+    // The owning epoll FILE's waitq.  Woken on every event so an OUTER
+    // epoll watching this epfd (nested epoll — libinput's context fd is
+    // one) re-scans: the outer epoll's own epoll_we_t entries live on
+    // the file waitq, not on state->wq.  Linux calls this cascade
+    // ep_poll_safewake.
+    struct wait_queue_t* file_wq;
 } epoll_we_t;
 
 // ── Wake callbacks (defined in wait.c — need sched_wake) ────────────────
@@ -272,12 +278,13 @@ ALWAYS_INLINE void wait_group_cleanup(wait_group_t* wg) {
 // ── epoll_we_t helpers ───────────────────────────────────────────────────
 
 ALWAYS_INLINE void epoll_we_init(epoll_we_t* ewe, wait_queue_t* epoll_wq,
-                                  int* p_has_ready) {
+                                  int* p_has_ready, wait_queue_t* file_wq) {
     ewe->we.func     = epoll_wake_func;
     ewe->we.next     = NULL;
     ewe->we.dead     = 0;
     ewe->epoll_wq    = epoll_wq;
     ewe->p_has_ready = p_has_ready;
+    ewe->file_wq     = file_wq;
 }
 
 ALWAYS_INLINE void epoll_we_add(wait_queue_t* wq, epoll_we_t* ewe) {

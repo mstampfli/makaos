@@ -581,7 +581,9 @@ typedef struct {
 
 static void dumb_free(drm_dumb_t* d, task_t* owner) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
-    if (b) b->resource_destroy(d->vgpu_res_id);
+    // vgpu_res_id==0 marks a handle minted by GETFB around an fb's
+    // backing — it owns page refs but no virtio-gpu resource.
+    if (b && d->vgpu_res_id) b->resource_destroy(d->vgpu_res_id);
     // pmm_ref_dec is the authoritative free path: it returns each
     // page to the buddy allocator when its refcount hits 0.  A fb
     // created via ADDFB2 took its OWN ref on every backing page, so
@@ -1422,10 +1424,19 @@ static int drm_ioctl_prime_fd_to_handle(vfs_file_t* drm_f, uint64_t arg) {
         // destroy_dumb on either side leaves the other's view intact.
         drm_dumb_t* src = find_dumb(pc->owner, pc->handle);
         if (!src) return -ENOENT;
+        // Charge the importer: dumb_free unconditionally uncharges, so
+        // an uncharged clone would drift the quota negative over time.
+        if (drm_charge(g_current, src->bytes_alloc) != 0) return -ENOMEM;
         drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
-        if (!nd) return -ENOMEM;
+        if (!nd) { drm_uncharge(g_current, src->bytes_alloc); return -ENOMEM; }
         *nd = *src;
         nd->handle = dst->next_dumb_handle++;
+        // The clone is a HANDLE around shared pages, not a second
+        // owner of the source's virtio-gpu resource: if it inherited
+        // vgpu_res_id, GEM_CLOSE of the clone would destroy the
+        // source's host resource, and the source's own destroy would
+        // then double-UNREF it.  ADDFB2 mints its own resource anyway.
+        nd->vgpu_res_id = 0;
         nd->next   = dst->dumbs;
         dst->dumbs = nd;
         for (uint32_t i = 0; i < nd->bytes_alloc / 4096u; i++)
@@ -2043,7 +2054,16 @@ static int drm_ioctl_mode_setplane(uint64_t arg) {
 }
 
 // ── GETFB — legacy drmModeGetFB.  Returns fb metadata + GEM handle.
-// wlroots uses this to re-identify a cursor fb (drmModeSetCursor path).
+// wlroots' legacy cursor path depends on this: it GETFBs the cursor
+// fb, drmModeSetCursor()s the returned handle, then GEM_CLOSEs it.
+// The fb's creation handle is typically ALREADY CLOSED by the time
+// GETFB runs (wlroots drops every bo handle right after ADDFB2), so
+// the old lookup-by-stale-handle returned -ENOENT — and wlroots'
+// legacy.c crtc_commit treats any GETFB failure as a failed COMMIT,
+// dropping the whole frame.  Net effect: with a visible cursor, every
+// frame was dropped and the screen stayed on the initial black
+// modeset buffer.  Linux semantics: mint a FRESH GEM handle that
+// references the fb's buffer; the caller closes it when done.
 static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
     struct __attribute__((packed)) {
         uint32_t fb_id;
@@ -2053,14 +2073,44 @@ static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
     drm_client_t* c = client_of(self);
     drm_fb_t* fb = find_fb(c, a.fb_id);
     if (!fb) return -ENOENT;
+
+    // Cheap path: the creation handle still exists and still points at
+    // the same backing — hand it back rather than minting a duplicate.
     drm_dumb_t* d = find_dumb(c, fb->handle);
-    if (!d) return -ENOENT;
+    uint32_t out_handle;
+    if (d && d->phys == fb->phys) {
+        out_handle = d->handle;
+    } else {
+        // Mint a new handle around the fb's backing pages.  No
+        // independent virtio-gpu resource (vgpu_res_id=0): the handle
+        // exists for SetCursor/mmap-style consumers, not scan-out —
+        // the fb keeps its own resource.  Page refs taken here are
+        // dropped by the GEM_CLOSE the caller owes us (dumb_free).
+        if (drm_charge(g_current, fb->bytes_alloc) != 0) return -ENOMEM;
+        drm_dumb_t* nd = (drm_dumb_t*)kmalloc(sizeof(*nd));
+        if (!nd) { drm_uncharge(g_current, fb->bytes_alloc); return -ENOMEM; }
+        nd->handle      = c->next_dumb_handle++;
+        nd->width       = fb->width;
+        nd->height      = fb->height;
+        nd->pitch       = fb->pitch;
+        nd->size        = (uint64_t)fb->pitch * fb->height;
+        nd->vgpu_res_id = 0;
+        nd->phys        = fb->phys;
+        nd->bytes_alloc = fb->bytes_alloc;
+        nd->order       = fb->order;
+        for (uint32_t i = 0; i < nd->bytes_alloc / 4096u; i++)
+            pmm_ref_inc(nd->phys + (phys_addr_t)i * 4096u);
+        nd->next = c->dumbs;
+        c->dumbs = nd;
+        out_handle = nd->handle;
+    }
+
     a.width  = fb->width;
     a.height = fb->height;
     a.pitch  = fb->pitch;
     a.bpp    = 32;
     a.depth  = 24;
-    a.handle = fb->handle;
+    a.handle = out_handle;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
     return 0;
 }
