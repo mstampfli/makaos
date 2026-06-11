@@ -336,7 +336,7 @@
 -- Looking for poll
 -- Looking for poll - found
 -- Looking for memfd_create
--- Looking for memfd_create - not found
+-- Looking for memfd_create - found
 -- Looking for posix_fallocate
 -- Looking for posix_fallocate - not found
 -- Performing Test ICONV_IN_LIBC
@@ -527,7 +527,7 @@
 -- were installed, then make sure you have set the
 -- CMAKE_C_FLAGS and CMAKE_PREFIX_PATH CMake variables correctly.
 -- 
--- Configuring done (10.3s)
+-- Configuring done (10.9s)
 -- Generating done (0.0s)
 CMake Warning:
   Manually-specified variables were not used by the project:

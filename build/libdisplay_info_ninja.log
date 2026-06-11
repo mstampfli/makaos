@@ -1,25 +1,25 @@
 ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/libdisplay_info_build'
 [1/20] Compiling C object libdisplay-info.a.p/dmt-table.c.o
-[2/20] Compiling C object libdisplay-info.a.p/memory-stream.c.o
-[3/20] Compiling C object libdisplay-info.a.p/cta-vic-table.c.o
-[4/20] Compiling C object libdisplay-info.a.p/log.c.o
+[2/20] Compiling C object libdisplay-info.a.p/log.c.o
+[3/20] Compiling C object libdisplay-info.a.p/memory-stream.c.o
+[4/20] Compiling C object libdisplay-info.a.p/cta-vic-table.c.o
 [5/20] Compiling C object test/di-edid-print.p/di-edid-print.c.o
-[6/20] Generating pnp-id-table.c with a custom command
-[7/20] Compiling C object libdisplay-info.a.p/gtf.c.o
+[6/20] Compiling C object libdisplay-info.a.p/gtf.c.o
+[7/20] Generating pnp-id-table.c with a custom command
 [8/20] Compiling C object libdisplay-info.a.p/cvt.c.o
 [9/20] Compiling C object di-edid-decode/di-edid-decode.p/main.c.o
-[10/20] Compiling C object di-edid-decode/di-edid-decode.p/displayid.c.o
-[11/20] Compiling C object libdisplay-info.a.p/info.c.o
-[12/20] Compiling C object di-edid-decode/di-edid-decode.p/cta.c.o
-[13/20] Compiling C object libdisplay-info.a.p/displayid.c.o
-[14/20] Compiling C object di-edid-decode/di-edid-decode.p/edid.c.o
+[10/20] Compiling C object libdisplay-info.a.p/info.c.o
+[11/20] Compiling C object di-edid-decode/di-edid-decode.p/displayid.c.o
+[12/20] Compiling C object di-edid-decode/di-edid-decode.p/edid.c.o
+[13/20] Compiling C object di-edid-decode/di-edid-decode.p/cta.c.o
+[14/20] Compiling C object libdisplay-info.a.p/displayid.c.o
 [15/20] Compiling C object libdisplay-info.a.p/edid.c.o
 [16/20] Compiling C object libdisplay-info.a.p/cta.c.o
 [17/20] Compiling C object libdisplay-info.a.p/meson-generated_.._pnp-id-table.c.o
 [18/20] Linking static target libdisplay-info.a
 [19/20] Linking target test/di-edid-print
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_time.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_tls.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
 [20/20] Linking target di-edid-decode/di-edid-decode
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_getopt.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_tls.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker

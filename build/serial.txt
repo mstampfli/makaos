@@ -29,17 +29,17 @@ K
 [virtio-gpu] found at 00:03.0 did=1050
 [virtio-gpu] scanout 0: 1280x800
 [virtio-gpu] initialised (1 scanouts)
-[elf] lazy /bin/login: header 978 us (demand-paged)
-[elf] lazy /bin/svcmgr: header 622 us (demand-paged)
+[elf] lazy /bin/login: header 980 us (demand-paged)
+[elf] lazy /bin/svcmgr: header 222 us (demand-paged)
 [chaselev] self-test starting: N=20000 thieves=3 cap=512
-[chaselev] pushed=20000 owner_popped=9094 thief_sto[elf] lazy l/bin/net: header en=420 us (demand-paged)
-10906 found=20000 missing=0 duplicates=0
+[elf] lazy /bin/net: header 1000 us (demand-paged)
+[socket-dbg] domain=2 type=2 proto=0 -> 3
+[net] ifconfig IP 10.0.2.15 GW 10.0.2.2
+[chaselev] pushed=20000 owner_popped=8337 thief_stolen=11663 found=20000 missing=0 duplicates=0
 [chaselev] SELF-TEST PASSED
-[slab_test] starting:[ workers=socket-dbg] domain=4 2iters= type=2 proto=500000 ->  mixed sizes (38..1024)
-
-[slab_test] allocs=200000 slab_hits=400059 slab_mi[netsses=1] 5i fchonifit_g raItPe =1909.909./21.01050 0G
-W[ s1l0a.b0_.t2e.s2
-t] pcp_hits=16 pcp_misses=0 hit_rate=10000/10000
+[slab_test] starting: workers=4 iters=50000 mixed sizes (8..1024)
+[slab_test] allocs=200000 slab_hits=400028 slab_misses=13 hit_rate=9999/10000
+[slab_test] pcp_hits=11 pcp_misses=1 hit_rate=9166/10000
 [slab_test] SELF-TEST PASSED (slab hit rate >= 95%)
 [pmm10-test] alloc 0 = 0xb800000
 [pmm10-test] alloc 1 = 0x1c00000
@@ -54,12 +54,12 @@ t] pcp_hits=16 pcp_misses=0 hit_rate=10000/10000
 [typesafe_test] SELF-TEST PASSED (defer → grace → reclaim)
 [dcache_test] starting
 [dcache_test] hits=19015 misses=4 hit_rate=9997/10000
-[dcache_test] cold=1791 ns/lookup warm=749 ns/lookup speedup=2x
-[dcache_test] live=14 table_cap=256 installs=4 evictions=0
+[dcache_test] cold=539 ns/lookup warm=182 ns/lookup speedup=2x
+[dcache_test] live=15 table_cap=256 installs=4 evictions=0
 [dcache_test] SELF-TEST PASSED
 [io_uring_test] starting
-[io_uring_test] NOP batch: 32 ops in 4042 ns (126 ns/op)
-[io_uring_test] steady-state: 100 rounds × 32 ops, 92 ns/op avg
+[io_uring_test] NOP batch: 32 ops in 1111 ns (34 ns/op)
+[io_uring_test] steady-state: 100 rounds × 32 ops, 23 ns/op avg
 [io_uring_test] SELF-TEST PASSED
 [eventfd-selftest] PASS (counter + semaphore + EAGAIN + EINVAL + poll)
 [timerfd-selftest] PASS (oneshot + periodic + gettime + no-write)
@@ -72,10 +72,2029 @@ t] pcp_hits=16 pcp_misses=0 hit_rate=10000/10000
 [scm_rights-selftest] PASS (fd round-trip over pair)
 [signalfd-selftest] PASS (EAGAIN + signo + drain + no-write)
 [drm-mock-selftest] PASS (vtable + happy path + error paths)
-[elf] lazy /bin/bash: header 493 us (demand-paged)
+[elf] lazy /bin/bash: header 689 us (demand-paged)
+[stat-dbg] /usr/local/bin/sway -> -2
+[stat-dbg] /usr/bin/sway -> -2
+[elf] lazy /bin/sway: header 237 us (demand-paged)
+[elf] lazy /bin/sh: header 1015 us (demand-paged)
+[stat-dbg] /usr/local/bin/sh -> -2
+[stat-dbg] /usr/bin/sh -> -2
 [stat-dbg] /usr/local/bin/uname -> -2
 [stat-dbg] /usr/bin/uname -> -2
-[elf] lazy /bin/uname: header 658 us (demand-paged)
+[elf] lazy /bin/uname: header 102 us (demand-paged)
 [files] release: refs 1 -> 0, closing fds
 [files] closed 3 fds (cap=256)
-[pf] uname: 4 disk  1 cache  (20% warm)
+[pf] uname: 4 disk  2 cache  (33% warm)
+[    16.175240] [CPU3] [drm:DEBUG] ioctl GETRESOURCES req=0xc04064a0 arg=0x7fffffffdb20
+[    16.175830] [CPU3] [drm:DEBUG] ioctl GETRESOURCES → 0
+[    16.176203] [CPU3] [drm:DEBUG] ioctl VERSION req=0xc0406400 arg=0xc15480
+[    16.176689] [CPU3] [drm:DEBUG] ioctl VERSION → 0
+[    16.177035] [CPU3] [drm:DEBUG] ioctl VERSION req=0xc0406400 arg=0xc15480
+[    16.177538] [CPU3] [drm:DEBUG] ioctl VERSION → 0
+[    16.177878] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.178422] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.178746] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.179297] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.179696] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.180229] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.180572] [CPU3] [drm:DEBUG] ioctl SET_CLIENT_CAP req=0x4010640d arg=0x7fffffffdba0
+[    16.181109] [CPU3] [drm:DEBUG] ioctl SET_CLIENT_CAP → 0
+[    16.181507] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.182046] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.182411] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.182906] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.183236] [CPU3] [drm:DEBUG] ioctl SET_CLIENT_CAP req=0x4010640d arg=0x7fffffffdba0
+[    16.183785] [CPU3] [drm:WARN] ioctl SET_CLIENT_CAP req=0x4010640d → -95
+[    16.184290] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.184794] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.185136] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdb90
+[    16.185672] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.186009] [CPU3] [drm:DEBUG] ioctl GETRESOURCES req=0xc04064a0 arg=0x7fffffffdb30
+[    16.186557] [CPU3] [drm:DEBUG] ioctl GETRESOURCES → 0
+[    16.186908] [CPU3] [drm:DEBUG] ioctl GETRESOURCES req=0xc04064a0 arg=0x7fffffffdb30
+[    16.187454] [CPU3] [drm:DEBUG] ioctl GETRESOURCES → 0
+[    16.187809] [CPU3] [drm:DEBUG] ioctl GETCRTC req=0xc06864a1 arg=0x7fffffffdb30
+[    16.188316] [CPU3] [drm:DEBUG] ioctl GETCRTC → 0
+[    16.188763] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdad0
+[    16.189552] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.190073] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdad0
+[    16.190859] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.191391] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.192080] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.192456] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.192949] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.193299] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.193809] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.194147] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.194690] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.195068] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.195619] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.195966] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.196563] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.196948] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.197502] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.197854] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdac0
+[    16.198394] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.198751] [CPU2] [drm:DEBUG] ioctl GETPLANERESOURCES req=0xc01064b5 arg=0x7fffffffdb10
+[    16.199315] [CPU2] [drm:DEBUG] ioctl GETPLANERESOURCES → 0
+[    16.199722] [CPU2] [drm:DEBUG] ioctl GETPLANERESOURCES req=0xc01064b5 arg=0x7fffffffdb10
+[    16.200245] [CPU2] [drm:DEBUG] ioctl GETPLANERESOURCES → 0
+[    16.200661] [CPU2] [drm:DEBUG] ioctl GETPLANE req=0xc02064b6 arg=0x7fffffffdb00
+[    16.201147] [CPU2] [drm:DEBUG] ioctl GETPLANE → 0
+[    16.201511] [CPU2] [drm:DEBUG] ioctl GETPLANE req=0xc02064b6 arg=0x7fffffffdb00
+[    16.202007] [CPU2] [drm:DEBUG] ioctl GETPLANE → 0
+[    16.202364] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd970
+[    16.202953] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.203386] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd970
+[    16.203957] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.204388] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.204901] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.205392] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.205911] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.206264] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.206796] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.207157] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.207697] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.208053] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.208609] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.208952] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.209493] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.209825] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.210337] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.210717] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.211254] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.211630] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.212152] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.212508] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.213027] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.213399] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.213900] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.214263] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.214791] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.215178] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.215705] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.216056] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.216599] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.216949] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.217491] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.217841] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.218400] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.218757] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.219302] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.219663] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.220187] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.220566] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.221089] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.221464] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.221973] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.222336] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.222852] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.223213] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.223753] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.224105] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.224658] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.225001] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.225530] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.225862] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9b0
+[    16.226441] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.226848] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9b0
+[    16.227450] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.227854] [CPU2] [drm:DEBUG] ioctl GETPLANE req=0xc02064b6 arg=0x7fffffffdb00
+[    16.228364] [CPU2] [drm:DEBUG] ioctl GETPLANE → 0
+[    16.228698] [CPU2] [drm:DEBUG] ioctl GETPLANE req=0xc02064b6 arg=0x7fffffffdb00
+[    16.229207] [CPU2] [drm:DEBUG] ioctl GETPLANE → 0
+[    16.229565] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd970
+[    16.230112] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.230508] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd970
+[    16.231057] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.231487] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.232010] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.232379] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.232912] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.233296] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.233815] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.234169] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.234689] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.235020] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.235532] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.235887] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.236447] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.236794] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.237337] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.237712] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.238278] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.238643] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.239163] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.239547] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.240073] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.240444] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.240970] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.241354] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.241872] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.242234] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.242768] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.243118] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.243650] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.243998] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.244547] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.244898] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.245463] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.245818] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.246349] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.246703] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.247235] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.247600] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.248120] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.248505] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.249055] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.249423] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.249935] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.250297] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.250827] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.251195] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.251721] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.252072] [CPU2] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd960
+[    16.252607] [CPU2] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.252971] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9b0
+[    16.253553] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.253919] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9b0
+[    16.254485] [CPU2] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.255398] [CPU0] [drm:DEBUG] ioctl VERSION req=0xc0406400 arg=0xc16190
+[    16.255853] [CPU0] [drm:DEBUG] ioctl VERSION → 0
+[    16.256169] [CPU0] [drm:DEBUG] ioctl VERSION req=0xc0406400 arg=0xc16190
+[    16.256648] [CPU0] [drm:DEBUG] ioctl VERSION → 0
+[    16.269573] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC req=0x40046411 arg=0x7fffffffdccc
+[    16.270471] [CPU3] [drm:WARN] ioctl AUTH_MAGIC req=0x40046411 → -22
+[    16.271251] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC req=0x40046411 arg=0x7fffffffdc8c
+[    16.272196] [CPU3] [drm:WARN] ioctl AUTH_MAGIC req=0x40046411 → -22
+[    16.273082] [CPU3] [drm:DEBUG] ioctl CREATE_LEASE req=0xc01864c6 arg=0x7fffffffdc70
+[    16.274185] [CPU3] [drm:WARN] ioctl CREATE_LEASE req=0xc01864c6 → -95
+[    16.275231] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC req=0x40046411 arg=0x7fffffffdc8c
+[    16.276494] [CPU3] [drm:WARN] ioctl AUTH_MAGIC req=0x40046411 → -22
+[    16.277659] [CPU3] [drm:DEBUG] ioctl GET_MAGIC req=0x80046402 arg=0x7fffffffdc8c
+[    16.279092] [CPU3] [drm:DEBUG] ioctl GET_MAGIC → 0
+[    16.280133] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC req=0x40046411 arg=0x7fffffffdc9c
+[    16.281806] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC → 0
+[    16.282985] [CPU3] [drm:DEBUG] ioctl GET_CAP req=0xc010640c arg=0x7fffffffdc90
+[    16.284678] [CPU3] [drm:DEBUG] ioctl GET_CAP → 0
+[    16.306889] [CPU3] [drm:DEBUG] ioctl AUTH_MAGIC req=0x40046411 arg=0x7fffffffdc2c
+[    16.308311] [CPU3] [drm:WARN] ioctl AUTH_MAGIC req=0x40046411 → -22
+[    16.309480] [CPU3] [drm:DEBUG] ioctl DROP_MASTER req=0x0000641f arg=0x0
+[    16.310685] [CPU3] [drm:DEBUG] ioctl DROP_MASTER → 0
+[socket-dbg] domain=1 type=524289 proto=0 -> 14
+[socket-dbg] domain=1 type=1 proto=0 -> 17
+[files] release: refs 1 -> 0, closing fds
+[files] closed 22 fds (cap=256)
+[pf] sway: 0 disk  1 cache  (100% warm)
+[files] release: refs 1 -> 0, closing fds
+[unix] close: path="(unbound)" state=4 type=1 not in ns
+[files] closed 22 fds (cap=256)
+[pf] sway: 0 disk  3 cache  (100% warm)
+[    16.535614] [CPU3] [drm:DEBUG] ioctl GETRESOURCES req=0xc04064a0 arg=0x7fffffffdbb0
+[    16.536225] [CPU3] [drm:DEBUG] ioctl GETRESOURCES → 0
+[    16.536608] [CPU3] [drm:DEBUG] ioctl GETRESOURCES req=0xc04064a0 arg=0x7fffffffdbb0
+[    16.537198] [CPU3] [drm:DEBUG] ioctl GETRESOURCES → 0
+[    16.537565] [CPU3] [drm:DEBUG] ioctl GETCONNECTOR req=0xc05064a7 arg=0x7fffffffdb80
+[    16.538098] [CPU3] [drm:DEBUG] ioctl GETCONNECTOR → 0
+[    16.538466] [CPU3] [drm:DEBUG] ioctl GETCONNECTOR req=0xc05064a7 arg=0x7fffffffdb80
+[    16.538987] [CPU3] [drm:DEBUG] ioctl GETCONNECTOR → 0
+[    16.539380] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdb00
+[    16.539939] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.540364] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdb00
+[    16.540928] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.541330] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.541840] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.542210] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.542799] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.543182] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.543693] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.544057] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.544600] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.544949] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.545480] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.545828] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.546381] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.546727] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.547249] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.547599] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.548139] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.548557] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.549159] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.549517] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.550031] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.550392] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.550901] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.551275] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.551800] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.552171] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.552714] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.553174] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.553688] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.554043] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.554591] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.555007] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdaf0
+[    16.555554] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.555907] [CPU3] [drm:DEBUG] ioctl GETENCODER req=0xc01464a6 arg=0x7fffffffdb80
+[    16.556436] [CPU3] [drm:DEBUG] ioctl GETENCODER → 0
+[    16.556821] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdaf0
+[    16.557427] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.557822] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdaf0
+[    16.558406] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.558789] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdb70
+[    16.559357] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.559739] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdb70
+[    16.560299] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.560712] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd920
+[    16.561331] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.561722] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd920
+[    16.562290] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.562672] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB req=0xc01064ac arg=0x7fffffffd980
+[    16.563209] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB → 0
+[    16.563557] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB req=0xc01064ac arg=0x7fffffffd980
+[    16.564086] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB → 0
+[    16.564457] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9d0
+[    16.565033] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.565446] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9d0
+[    16.565998] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.566413] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9d0
+[    16.567013] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.567429] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd9d0
+[    16.567983] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.568393] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd9c0
+[    16.568921] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.569325] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffd9c0
+[    16.569876] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.570258] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd980
+[    16.570810] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.571221] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffd980
+[    16.571773] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.572174] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB req=0xc01064ac arg=0x7fffffffd9e0
+[    16.572705] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB → 0
+[    16.573124] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB req=0xc01064ac arg=0x7fffffffd9e0
+[    16.573689] [CPU3] [drm:DEBUG] ioctl GETPROPBLOB → 0
+[    16.584943] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdaa0
+[    16.585547] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.585953] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES req=0xc02064b9 arg=0x7fffffffdaa0
+[    16.586534] [CPU3] [drm:DEBUG] ioctl OBJ_GETPROPERTIES → 0
+[    16.586896] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdad0
+[    16.587404] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.587750] [CPU3] [drm:DEBUG] ioctl GETPROPERTY req=0xc04064aa arg=0x7fffffffdad0
+[    16.588275] [CPU3] [drm:DEBUG] ioctl GETPROPERTY → 0
+[    16.591910] [CPU3] [drm:DEBUG] ioctl CREATE_DUMB req=0xc02064b2 arg=0x7fffffffd8e0
+[    16.594532] [CPU3] [drm:DEBUG] ioctl CREATE_DUMB → 0
+[    16.594885] [CPU3] [drm:DEBUG] ioctl MAP_DUMB req=0xc01064b3 arg=0x7fffffffd900
+[    16.595383] [CPU3] [drm:DEBUG] ioctl MAP_DUMB → 0
+[    16.599200] [CPU3] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD req=0xc00c642d arg=0x7fffffffd900
+[    16.599772] [CPU3] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD → 0
+[    16.600183] [CPU3] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE req=0xc00c642e arg=0x7fffffffd774
+[    16.600719] [CPU3] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE → 0
+[    16.601120] [CPU3] [drm:DEBUG] ioctl ADDFB2 req=0xc06864b8 arg=0x7fffffffd650
+[    16.601589] [CPU3] [drm:DEBUG] ADDFB2 1280x800 fmt=0x34325258 handles[0]=1 pitches[0]=5120
+[    16.602326] [CPU3] [drm:DEBUG] ioctl ADDFB2 → 0
+[    16.602656] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd758
+[    16.603205] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[    16.640197] [CPU0] [drm:DEBUG] ioctl SETPROPERTY req=0xc01064ab arg=0x7fffffffd860
+[    16.640756] [CPU0] [drm:DEBUG] ioctl SETPROPERTY → 0
+[    16.641365] [CPU0] [drm:DEBUG] ioctl SETCRTC req=0xc06864a2 arg=0x7fffffffd7f0
+[    16.641879] [CPU0] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[    16.643924] [CPU0] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[    16.644426] [CPU0] [drm:DEBUG] ioctl SETCRTC → 0
+[    16.644751] [CPU0] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd850
+[    16.645266] [CPU0] [drm:DEBUG] ioctl CURSOR → 0
+[    16.645602] [CPU0] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd850
+[    16.646175] [CPU0] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[    16.646997] [CPU0] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[    16.647478] [CPU0] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[    16.649281] [CPU0] [drm:DEBUG] ioctl CREATE_DUMB req=0xc02064b2 arg=0x7fffffffd4f0
+[    16.649918] [CPU0] [drm:DEBUG] ioctl CREATE_DUMB → 0
+[    16.650307] [CPU0] [drm:DEBUG] ioctl MAP_DUMB req=0xc01064b3 arg=0x7fffffffd510
+[    16.650803] [CPU0] [drm:DEBUG] ioctl MAP_DUMB → 0
+[    16.651151] [CPU0] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD req=0xc00c642d arg=0x7fffffffd510
+[    16.651728] [CPU0] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD → 0
+[    16.652484] [CPU3] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE req=0xc00c642e arg=0x7fffffffd624
+[    16.653666] [CPU3] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE → 0
+[    16.654052] [CPU3] [drm:DEBUG] ioctl ADDFB2 req=0xc06864b8 arg=0x7fffffffd500
+[    16.654588] [CPU3] [drm:DEBUG] ADDFB2 64x64 fmt=0x34325241 handles[0]=2 pitches[0]=256
+[    16.655242] [CPU3] [drm:DEBUG] ioctl ADDFB2 → 0
+[    16.655554] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd608
+[    16.656050] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[files] release: refs [files] release: refs 1 -> 0, closing fds
+1 -> 0, c[files] closed losing fds
+34 fds (cap=[unix] close: path="2(unbound)" state=56)
+4 type=[pf] 1 sway: not in ns
+0 disk  [files] closed 1 cache  (34 fds (ca100p=% warm)
+256)
+[pf] sway: 1149847552 disk  [unix] 2112364581 cache  (close: path="0% warm)
+(unbound)" state=5 type=1 not in ns
+[unix] close: path="(unbound)" state=5 type=1 not in ns
+[    16.666867] [CPU2] [drm:DEBUG] ioctl CREATE_DUMB req=0xc02064b2 arg=0x7fffffffcf50
+[    16.668787] [CPU2] [drm:DEBUG] ioctl CREATE_DUMB → 0
+[    16.669202] [CPU2] [drm:DEBUG] ioctl MAP_DUMB req=0xc01064b3 arg=0x7fffffffcf70
+[    16.669719] [CPU2] [drm:DEBUG] ioctl MAP_DUMB → 0
+[    16.673473] [CPU2] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD req=0xc00c642d arg=0x7fffffffcf70
+[    16.674092] [CPU2] [drm:DEBUG] ioctl PRIME_HANDLE_TO_FD → 0
+[    16.674688] [CPU2] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE req=0xc00c642e arg=0x7fffffffd064
+[    16.675317] [CPU2] [drm:DEBUG] ioctl PRIME_FD_TO_HANDLE → 0
+[    16.675707] [CPU2] [drm:DEBUG] ioctl ADDFB2 req=0xc06864b8 arg=0x7fffffffcf40
+[    16.676226] [CPU2] [drm:DEBUG] ADDFB2 1280x800 fmt=0x34325258 handles[0]=3 pitches[0]=5120
+[    16.676873] [CPU2] [drm:DEBUG] ioctl ADDFB2 → 0
+[    16.677236] [CPU2] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd048
+[    16.677762] [CPU2] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[    16.678126] [CPU2] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd0b0
+[    16.678618] [CPU2] [drm:DEBUG] ioctl GETFB → 0
+[    16.678946] [CPU2] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd0b0
+[    16.679469] [CPU2] [drm:DEBUG] ioctl CURSOR → 0
+[    16.679787] [CPU2] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd0c8
+[    16.680303] [CPU2] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[    16.680628] [CPU2] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd0b0
+[    16.681143] [CPU2] [drm:DEBUG] ioctl CURSOR → 0
+[    16.681488] [CPU2] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd0b0
+[    16.682013] [CPU2] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[    16.683934] [CPU2] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[    16.684404] [CPU2] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[files] release: refs 1 -> [elf] lazy /bin/sh: header 565 us (demand-paged)
+[stat-dbg] /usr/local/bin/sh -> -2
+[stat-dbg] /usr/bin/sh -> -2
+[stat-dbg] /usr/local/bin/foot -> -2
+[stat-dbg] /usr/bin/foot -> -2
+0, closing fds
+[files] closed 31 fds (cap=256)
+[pf] sway: 0 disk  2 cache  (100% warm)
+[elf] lazy /bin/foot: header 998 us (demand-paged)
+[    58.901970] [CPU2] [sys:DEBUG] → foot nr=115 a1=0x815e00 a2=0x0 a3=0x0 a4=0x0
+[    58.902526] [CPU2] [sys:DEBUG] ← foot nr=115 → 0x0
+[    58.920004] [CPU3] [sys:DEBUG] → foot nr=27 a1=0x2 a2=0x7fffffffd510 a3=0x0 a4=0x0
+[    58.921370] [CPU3] [sys:DEBUG] ← foot nr=27 → 0x0
+[    58.922234] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.923599] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.924430] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.925684] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.926505] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.927728] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.928505] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x4 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.929695] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.930474] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x5 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.931642] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.932385] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x6 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.933523] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.934271] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x7 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.935420] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.936141] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x8 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.937234] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.937945] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x9 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.938998] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.939855] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xa a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.940898] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.941574] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xb a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.942596] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.943417] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xc a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.944417] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.945065] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xd a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.946031] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.946656] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xe a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.947615] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.948222] [CPU3] [sys:DEBUG] → foot nr=26 a1=0xf a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.949149] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.949755] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x10 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.950658] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.951250] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x11 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.952141] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.952701] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x12 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.953575] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.954126] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x13 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.954971] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.955512] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x14 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.956339] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.956868] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x15 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.957682] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.958257] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x16 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.959058] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.959550] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x17 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.960317] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.960815] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x18 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.961568] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.962047] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x19 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.962770] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.963236] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1a a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.963960] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.964415] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1b a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.965112] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.965551] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1c a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.966233] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.966672] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1d a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.967356] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.967786] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1e a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.968444] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.968869] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x1f a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.969501] [CPU3] [sys:DEBUG] ← foot nr=26 → 0x0
+[    58.969912] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x20 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.970535] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.971037] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x21 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.971644] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.972137] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x22 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.972724] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.973204] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x23 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.973779] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.974240] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x24 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.974805] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.975258] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x25 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.975816] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.976260] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x26 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.976809] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.977240] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x27 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.977768] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.978208] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x28 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.978742] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.979171] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x29 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.979698] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.980132] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2a a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.980635] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.981094] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2b a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.981637] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.982088] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2c a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.982585] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.983026] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2d a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.983562] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.984017] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2e a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.984565] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.985069] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x2f a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.985616] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.986049] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x30 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.986575] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.987021] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x31 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.987575] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.988040] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x32 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.988545] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.988979] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x33 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.989512] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.989944] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x34 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.990457] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.990879] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x35 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.991396] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.991849] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x36 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.992399] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.992820] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x37 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.993368] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.993809] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x38 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.994358] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.994802] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x39 a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.995361] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.995825] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3a a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.996367] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.996804] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3b a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.997366] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.997794] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3c a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.998327] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.998760] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3d a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    58.999321] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    58.999785] [CPU3] [sys:DEBUG] → foot nr=26 a1=0x3e a2=0x7fffffffd3e0 a3=0x0 a4=0x0
+[    59.000367] [CPU3] [sys:DEBUG] ← foot nr=26 → 0xffffffffffffffea
+[    59.016875] [CPU3] [sys:DEBUG] → foot nr=14 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.017392] [CPU3] [sys:DEBUG] ← foot nr=14 → 0xdbdb5f28e
+[    59.026573] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.027108] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x818000
+[    59.027500] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x81a000 a2=0x0 a3=0x0 a4=0x0
+[    59.028012] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x81a000
+[    59.033562] [CPU0] [sys:DEBUG] → foot nr=113 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.035022] [CPU0] [sys:DEBUG] ← foot nr=113 → 0x4
+[    59.038598] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x81c000 a2=0x0 a3=0x0 a4=0x0
+[    59.039283] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x81c000
+[    59.040016] [CPU3] [sys:DEBUG] → foot nr=5 a1=0x81e000 a2=0x0 a3=0x0 a4=0x0
+[    59.040544] [CPU3] [sys:DEBUG] ← foot nr=5 → 0x81e000
+[    59.041435] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x81c6e0 a2=0x80000 a3=0x0 a4=0x0
+[    59.043430] [CPU2] [sys:DEBUG]   open("/root/.config/foot/foot.ini", flags=0x80000)
+[    59.044344] [CPU2] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.045743] [CPU2] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x7d3b68 a3=0x1000 a4=0x0
+[    59.046448] [CPU3] [sys:DEBUG] ← foot nr=2 → 0x295
+[    59.056697] [CPU3] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x7d3b68 a3=0x1000 a4=0x0
+[    59.057257] [CPU3] [sys:DEBUG] ← foot nr=2 → 0x0
+[    59.057629] [CPU3] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.058142] [CPU3] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.106485] [CPU3] [sys:DEBUG] → foot nr=14 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.108104] [CPU3] [sys:DEBUG] ← foot nr=14 → 0xdc31e17b2
+[    59.116795] [CPU2] [sys:DEBUG] → foot nr=46 a1=0x81db00 a2=0x4 a3=0x0 a4=0x0
+[    59.117446] [CPU2] [sys:DEBUG] ← foot nr=46 → 0x0
+[    59.117797] [CPU2] [sys:DEBUG] → foot nr=46 a1=0x81db40 a2=0x4 a3=0x0 a4=0x0
+[    59.118323] [CPU2] [sys:DEBUG] ← foot nr=46 → 0x0
+[    59.118703] [CPU2] [sys:DEBUG] → foot nr=15 a1=0x81db40 a2=0x15 a3=0x7fffffffb120 a4=0x0
+[    59.119294] [CPU2] [sys:DEBUG] ← foot nr=15 → 0x0
+[    59.119635] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x81db40 a2=0x80000 a3=0x0 a4=0x0
+[    59.120183] [CPU2] [sys:DEBUG]   open("/etc/fonts/fonts.conf", flags=0x80000)
+[    59.120696] [CPU2] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.121080] [CPU2] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x7fffffffb330 a3=0x1000 a4=0x0
+[    59.122026] [CPU2] [sys:DEBUG] ← foot nr=2 → 0x8a4
+[    59.122427] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x820000 a2=0x0 a3=0x0 a4=0x0
+[    59.123078] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x820000
+[    59.123449] [CPU2] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x7fffffffb330 a3=0x1000 a4=0x0
+[    59.124025] [CPU2] [sys:DEBUG] ← foot nr=2 → 0x0
+[    59.124355] [CPU2] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.124801] [CPU2] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.125689] [CPU3] [sys:DEBUG] → foot nr=5 a1=0x823000 a2=0x0 a3=0x0 a4=0x0
+[    59.126384] [CPU3] [sys:DEBUG] ← foot nr=5 → 0x823000
+[    59.126831] [CPU3] [sys:DEBUG] → foot nr=14 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.127348] [CPU3] [sys:DEBUG] ← foot nr=14 → 0xdc443bc9a
+[    59.127784] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.128249] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.139597] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x827000 a2=0x0 a3=0x0 a4=0x0
+[    59.141547] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x827000
+[    59.146058] [CPU3] [sys:DEBUG] → foot nr=46 a1=0x81e7c0 a2=0x4 a3=0x0 a4=0x0
+[    59.146658] [CPU3] [sys:DEBUG] ← foot nr=46 → 0xfffffffffffffffe
+[    59.147193] [CPU3] [sys:DEBUG] → foot nr=15 a1=0x81db00 a2=0x10 a3=0x7fffffffd220 a4=0x0
+[    59.147768] [CPU3] [sys:DEBUG] ← foot nr=15 → 0x0
+[    59.148157] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x81db00 a2=0x80000 a3=0x0 a4=0x0
+[    59.148688] [CPU3] [sys:DEBUG]   open("/usr/share/fonts", flags=0x80000)
+[    59.149201] [CPU3] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.149629] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x821000 a2=0x80000 a3=0x0 a4=0x0
+[    59.150166] [CPU3] [sys:DEBUG]   open("/var/cache/fontconfig//3830d5c3ddfd5cd38a049b759396e72e-x86_64.cache-9", flags=0x80000)
+[    59.152642] [CPU0] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.153768] [CPU0] [sys:DEBUG] → foot nr=45 a1=0x5 a2=0x7fffffffd1b0 a3=0x0 a4=0x0
+[    59.154884] [CPU0] [sys:DEBUG] ← foot nr=45 → 0x0
+[    59.155239] [CPU0] [sys:DEBUG] → foot nr=14 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.155685] [CPU0] [sys:DEBUG] ← foot nr=14 → 0xdc5f42034
+[    59.156085] [CPU0] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x824a90 a3=0x90 a4=0x0
+[    59.156918] [CPU3] [sys:DEBUG] ← foot nr=2 → 0x90
+[    59.157367] [CPU3] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.157822] [CPU3] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.158204] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x8214f0 a2=0x80000 a3=0x0 a4=0x0
+[    59.158713] [CPU3] [sys:DEBUG]   open("/root/.cache/fontconfig//3830d5c3ddfd5cd38a049b759396e72e-x86_64.cache-9", flags=0x80000)
+[    59.159961] [CPU3] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.160415] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x8248b0 a2=0x80000 a3=0x0 a4=0x0
+[    59.160964] [CPU3] [sys:DEBUG]   open("/usr/share/fonts/.uuid", flags=0x80000)
+[    59.161504] [CPU3] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.161989] [CPU3] [sys:DEBUG] → foot nr=15 a1=0x824a90 a2=0x20 a3=0x7fffffffd220 a4=0x0
+[    59.162594] [CPU3] [sys:DEBUG] ← foot nr=15 → 0x0
+[    59.162979] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x824a90 a2=0x80000 a3=0x0 a4=0x0
+[    59.163503] [CPU3] [sys:DEBUG]   open("/usr/share/fonts/truetype/dejavu", flags=0x80000)
+[    59.164091] [CPU3] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.164525] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x821b50 a2=0x80000 a3=0x0 a4=0x0
+[    59.165161] [CPU3] [sys:DEBUG]   open("/var/cache/fontconfig//d589a48862398ed80a3d6066f4f56f4c-x86_64.cache-9", flags=0x80000)
+[    59.166071] [CPU3] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.166411] [CPU3] [sys:DEBUG] → foot nr=45 a1=0x5 a2=0x7fffffffd1b0 a3=0x0 a4=0x0
+[    59.166991] [CPU3] [sys:DEBUG] ← foot nr=45 → 0x0
+[    59.167375] [CPU3] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0xc498 a3=0x1 a4=0x1
+[    59.167900] [CPU3] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=50328 prot=0x1 flags=0x1 fd=5 off=0)
+[    59.168604] [CPU3] [sys:DEBUG] ← foot nr=29 → 0x7fefffff3000
+[    59.169096] [CPU3] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.169575] [CPU3] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.169935] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x820d80 a2=0x80000 a3=0x0 a4=0x0
+[    59.170456] [CPU3] [sys:DEBUG]   open("/root/.cache/fontconfig//d589a48862398ed80a3d6066f4f56f4c-x86_64.cache-9", flags=0x80000)
+[    59.171307] [CPU3] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.171767] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x821e30 a2=0x80000 a3=0x0 a4=0x0
+[    59.172292] [CPU3] [sys:DEBUG]   open("/usr/share/fonts/truetype/dejavu/.uuid", flags=0x80000)
+[    59.173600] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.174075] [CPU0] [sys:DEBUG] → foot nr=15 a1=0x820d80 a2=0x19 a3=0x7fffffffd220 a4=0x0
+[    59.174638] [CPU0] [sys:DEBUG] ← foot nr=15 → 0x0
+[    59.174996] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x820d80 a2=0x80000 a3=0x0 a4=0x0
+[    59.175523] [CPU0] [sys:DEBUG]   open("/usr/share/fonts/truetype", flags=0x80000)
+[    59.176091] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.176523] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x81dce0 a2=0x80000 a3=0x0 a4=0x0
+[    59.177053] [CPU0] [sys:DEBUG]   open("/var/cache/fontconfig//7ef2298fde41cc6eeb7af42e48b7d293-x86_64.cache-9", flags=0x80000)
+[    59.177842] [CPU0] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.178208] [CPU0] [sys:DEBUG] → foot nr=45 a1=0x5 a2=0x7fffffffd1b0 a3=0x0 a4=0x0
+[    59.178732] [CPU0] [sys:DEBUG] ← foot nr=45 → 0x0
+[    59.179082] [CPU0] [sys:DEBUG] → foot nr=2 a1=0x5 a2=0x821b50 a3=0xa0 a4=0x0
+[    59.180568] [CPU0] [sys:DEBUG] ← foot nr=2 → 0xa0
+[    59.180932] [CPU0] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.181456] [CPU0] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.181878] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x81dc00 a2=0x80000 a3=0x0 a4=0x0
+[    59.182419] [CPU0] [sys:DEBUG]   open("/root/.cache/fontconfig//7ef2298fde41cc6eeb7af42e48b7d293-x86_64.cache-9", flags=0x80000)
+[    59.183224] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.183670] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x821a60 a2=0x80000 a3=0x0 a4=0x0
+[    59.184205] [CPU0] [sys:DEBUG]   open("/usr/share/fonts/truetype/.uuid", flags=0x80000)
+[    59.184754] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.191576] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.192075] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.192427] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.192879] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.193263] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.193716] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.194101] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.194559] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.200615] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x829000 a2=0x0 a3=0x0 a4=0x0
+[    59.201455] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x829000
+[    59.202313] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x82c000 a2=0x0 a3=0x0 a4=0x0
+[    59.202965] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x82c000
+[    59.203887] [CPU3] [sys:DEBUG] → foot nr=5 a1=0x82e000 a2=0x0 a3=0x0 a4=0x0
+[    59.204547] [CPU3] [sys:DEBUG] ← foot nr=5 → 0x82e000
+[    59.204942] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.205437] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.205821] [CPU3] [sys:DEBUG] → foot nr=3 a1=0x82a7c0 a2=0x0 a3=0x0 a4=0x0
+[    59.206314] [CPU3] [sys:DEBUG]   open("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", flags=0x0)
+[    59.208543] [CPU3] [sys:DEBUG] ← foot nr=3 → 0x5
+[    59.208909] [CPU3] [sys:DEBUG] → foot nr=44 a1=0x5 a2=0x2 a3=0x1 a4=0x0
+[    59.209380] [CPU3] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.209713] [CPU3] [sys:DEBUG] → foot nr=45 a1=0x5 a2=0x7fffffffcb80 a3=0x0 a4=0x0
+[    59.210243] [CPU3] [sys:DEBUG] ← foot nr=45 → 0x0
+[    59.210582] [CPU3] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0x53c64 a3=0x1 a4=0x2
+[    59.211071] [CPU3] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=343140 prot=0x1 flags=0x2 fd=5 off=0)
+[    59.211762] [CPU3] [sys:DEBUG] ← foot nr=29 → 0x7feffff9f000
+[    59.212184] [CPU3] [sys:DEBUG] → foot nr=4 a1=0x5 a2=0x0 a3=0x0 a4=0x0
+[    59.212645] [CPU3] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.230579] [CPU0] [sys:DEBUG] → foot nr=5 a1=0x830000 a2=0x0 a3=0x0 a4=0x0
+[    59.231337] [CPU0] [sys:DEBUG] ← foot nr=5 → 0x830000
+[    59.231765] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.232251] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.247574] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x832000 a2=0x0 a3=0x0 a4=0x0
+[    59.248325] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x832000
+[    59.248738] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x834000 a2=0x0 a3=0x0 a4=0x0
+[    59.249492] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x834000
+[    59.249906] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x836000 a2=0x0 a3=0x0 a4=0x0
+[    59.250501] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x836000
+[    59.250924] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x838000 a2=0x0 a3=0x0 a4=0x0
+[    59.251457] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x838000
+[    59.251871] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x83a000 a2=0x0 a3=0x0 a4=0x0
+[    59.252371] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x83a000
+[    59.252757] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x83c000 a2=0x0 a3=0x0 a4=0x0
+[    59.253296] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x83c000
+[    59.253672] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x83e000 a2=0x0 a3=0x0 a4=0x0
+[    59.254218] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x83e000
+[    59.254598] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x840000 a2=0x0 a3=0x0 a4=0x0
+[    59.255194] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x840000
+[    59.255586] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x842000 a2=0x0 a3=0x0 a4=0x0
+[    59.256160] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x842000
+[    59.256541] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x844000 a2=0x0 a3=0x0 a4=0x0
+[    59.257060] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x844000
+[    59.257433] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x846000 a2=0x0 a3=0x0 a4=0x0
+[    59.257960] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x846000
+[    59.258417] [CPU2] [sys:DEBUG] → foot nr=5 a1=0x848000 a2=0x0 a3=0x0 a4=0x0
+[    59.258965] [CPU2] [sys:DEBUG] ← foot nr=5 → 0x848000
+[    59.259340] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.259801] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.260164] [CPU2] [sys:DEBUG] → foot nr=114 a1=0x81f420 a2=0x1 a3=0x7fffffff a4=0x0
+[    59.260690] [CPU2] [sys:DEBUG] ← foot nr=114 → 0x0
+[    59.261067] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.261564] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.261938] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.262402] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.262775] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.263275] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.263636] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.264168] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.264584] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.265117] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.265473] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.265967] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.266613] [CPU3] [sys:DEBUG] → foot nr=5 a1=0x84c000 a2=0x0 a3=0x0 a4=0x0
+[    59.267181] [CPU3] [sys:DEBUG] ← foot nr=5 → 0x84c000
+[    59.274793] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.275524] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.275906] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.276373] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.276727] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.277214] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.277562] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.278049] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.278400] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.278883] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.279231] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.279703] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.282297] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.282846] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.283229] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.283701] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.284098] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.284563] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.284956] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.285469] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.285868] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.286330] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.286695] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.287180] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.287573] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.288073] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.288447] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.288959] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.289327] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.289803] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.290170] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.290643] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.291044] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.291562] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.291956] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.292438] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.292817] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.293321] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.293688] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.294215] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.294601] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.295097] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.295446] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.295972] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.296342] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.296856] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.297241] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.297703] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.298087] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.298562] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.298935] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.299410] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.299778] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.300294] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.300657] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.301165] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.301519] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.302012] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.302397] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.302893] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.303291] [CPU3] [sys:DEBUG] → foot nr=30 a1=0x7feffff9f000 a2=0x53c64 a3=0x0 a4=0x0
+[    59.304144] [CPU3] [sys:DEBUG] ← foot nr=30 → 0x0
+[    59.304533] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.305051] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.305429] [CPU3] [sys:DEBUG] → foot nr=18 a1=0x830470 a2=0x400 a3=0x0 a4=0x0
+[    59.305977] [CPU3] [sys:DEBUG] ← foot nr=18 → 0x830470
+[    59.308634] [CPU2] [sys:DEBUG] → foot nr=27 a1=0x0 a2=0x0 a3=0x7fffffffd3f8 a4=0x0
+[    59.309257] [CPU2] [sys:DEBUG] ← foot nr=27 → 0x0
+[    59.309605] [CPU2] [sys:DEBUG] → foot nr=97 a1=0x80000 a2=0x0 a3=0x0 a4=0x0
+[    59.310130] [CPU2] [sys:DEBUG] ← foot nr=97 → 0x5
+[    59.310476] [CPU2] [sys:DEBUG] → foot nr=27 a1=0x0 a2=0x7fffffffd390 a3=0x7fffffffd398 a4=0x0
+[    59.311108] [CPU2] [sys:DEBUG] ← foot nr=27 → 0x0
+[    59.311477] [CPU2] [sys:DEBUG] → foot nr=26 a1=0x11 a2=0x7fffffffd340 a3=0x0 a4=0x0
+[    59.312070] [CPU2] [sys:DEBUG] ← foot nr=26 → 0x0
+[    59.318063] [CPU3] [sys:DEBUG] → foot nr=35 a1=0x1 a2=0x80001 a3=0x0 a4=0x0
+[socket-dbg] domain=1 type=524289 proto=0 -> 7
+[    59.318998] [CPU3] [sys:DEBUG] ← foot nr=35 → 0x7
+[    59.319364] [CPU3] [sys:DEBUG] → foot nr=39 a1=0x7 a2=0x7fffffffd310 a3=0x11 a4=0x0
+[    59.320196] [CPU3] [sys:DEBUG] ← foot nr=39 → 0x0
+[    59.320840] [CPU3] [sys:DEBUG] → foot nr=5 a1=0x84f000 a2=0x0 a3=0x0 a4=0x0
+[    59.321831] [CPU3] [sys:DEBUG] ← foot nr=5 → 0x84f000
+[    59.322457] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.323194] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.323954] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.324713] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.325129] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.325692] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.326090] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.326609] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.327018] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.327536] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.327950] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.328461] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.328892] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.329424] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.329811] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.330344] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.330777] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.331298] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.331691] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.332213] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.332582] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.333097] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.333509] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.334059] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.334459] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.334985] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.335366] [CPU3] [sys:DEBUG] → foot nr=110 a1=0x7 a2=0x7fffffffd210 a3=0x4040 a4=0x0
+[    59.335985] [CPU3] [sys:DEBUG] ← foot nr=110 → 0x18
+[    59.336371] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.337092] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.337814] [CPU3] [sys:DEBUG] → foot nr=61 a1=0x7fffffffd348 a2=0x1 a3=0xffffffffffffffff a4=0x0
+[    59.338472] [CPU3] [sys:DEBUG] ← foot nr=61 → 0x1
+[    59.338849] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.339378] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.339816] [CPU3] [sys:DEBUG] → foot nr=111 a1=0x7 a2=0x7fffffffd190 a3=0x40000040 a4=0x0
+[    59.340496] [CPU3] [sys:DEBUG] ← foot nr=111 → 0x8bc
+[    59.340891] [CPU3] [sys:DEBUG] → foot nr=111 a1=0x7 a2=0x7fffffffd190 a3=0x40000040 a4=0x0
+[    59.341550] [CPU3] [sys:DEBUG] ← foot nr=111 → 0xfffffffffffffff5
+[    59.342107] [CPU3] [sys:DEBUG] → foot nr=114 a1=0x826f70 a2=0x1 a3=0x7fffffff a4=0x0
+[    59.342701] [CPU3] [sys:DEBUG] ← foot nr=114 → 0x0
+[    59.343092] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.343560] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.343959] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.344439] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.344820] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.345342] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.345757] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.346305] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.346679] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.347188] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.347565] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.348087] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.348447] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.348958] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.349323] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.349837] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.350230] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.350730] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.351152] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.351697] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.352112] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.352600] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.352969] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.353444] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.353852] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.354389] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.354765] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.355274] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.355678] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.356238] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.356608] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.357138] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.357526] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.358089] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.358479] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.359047] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.359423] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.359983] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.360342] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.360845] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.361240] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.361726] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.362139] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.362684] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.363106] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.363682] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.364105] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.364596] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.364996] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.365489] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.365866] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.366393] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.366804] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.367339] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.367731] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.368260] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.368613] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.369128] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.369524] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.370073] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.370466] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.370997] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.371399] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.371949] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.372351] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.372826] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.373214] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.373710] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.374099] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.374578] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.374954] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.375479] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.375901] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.376416] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.376805] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.377294] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.377663] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.378167] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.378550] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.379066] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.379470] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.379981] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.380332] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.380809] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.381193] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.381729] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.382136] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.382634] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.383022] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.383520] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.383915] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.384387] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.384742] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.385232] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.385587] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.386078] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.386455] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.386955] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.387352] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.387894] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.388296] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.388825] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.389299] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.389833] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.390221] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.390701] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.391081] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.391575] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.392000] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.392486] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.392849] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.393325] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.393726] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.394254] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.394679] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.395200] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.395567] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.396094] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.396447] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.396949] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.397342] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.397863] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.398263] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.398797] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.399173] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.399663] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.400076] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.400601] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.400998] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.401486] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.401845] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.402347] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.402719] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.403248] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.403614] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.404107] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.404481] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.405000] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.405367] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.405890] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.406271] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.406802] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.407232] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.407793] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.408187] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.408725] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.409130] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.409636] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.410047] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.410536] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.410926] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.411428] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.411834] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.412349] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.412775] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.413279] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.413638] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.414183] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.414571] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.415100] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.415484] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.416006] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.416373] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.416893] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.417280] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.417807] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.418210] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.418768] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.419138] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.419613] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.420004] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.420513] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.420915] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.421394] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.421786] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.422267] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.422620] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.423113] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.423463] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.423978] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.424351] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.424865] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.425249] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.425727] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.426099] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.426606] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.426979] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.427448] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.427831] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.428312] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.428666] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.429185] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.429545] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.430067] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.430483] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.431042] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.431440] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.432009] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.432372] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.432874] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.433265] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.433768] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.434133] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.434604] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.434965] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.435430] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.435799] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.436321] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.436698] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.437235] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.437598] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.438086] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.438446] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.438948] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.439302] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.439790] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.440161] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.440629] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.441016] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.441488] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.441902] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.442451] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.442891] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.443422] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.443792] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.444283] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.444656] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.445150] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.445523] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.446035] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.446386] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.446881] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.447254] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.447740] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.448117] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.448624] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.449050] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.449559] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.449947] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.450471] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.450890] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.451425] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.451821] [CPU3] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.452339] [CPU3] [sys:DEBUG] ← foot nr=106 → 0x9
+[    59.452705] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.453243] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.453610] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.454160] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.454576] [CPU3] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0x9 a4=0x7fffffffceb4
+[    59.455239] [CPU3] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.459669] [CPU0] [sys:DEBUG] → foot nr=15 a1=0x839b30 a2=0x11 a3=0x7fffffffcdf0 a4=0x0
+[    59.460341] [CPU0] [sys:DEBUG] ← foot nr=15 → 0xfffffffffffffffe
+[    59.460892] [CPU0] [sys:DEBUG] → foot nr=15 a1=0x839b30 a2=0xa a3=0x7fffffffcdf0 a4=0x0
+[    59.461507] [CPU0] [sys:DEBUG] ← foot nr=15 → 0xfffffffffffffffe
+[    59.462004] [CPU0] [sys:DEBUG] → foot nr=15 a1=0x6a8d83 a2=0x0 a3=0x7fffffffcdf0 a4=0x0
+[    59.462684] [CPU0] [sys:DEBUG] ← foot nr=15 → 0xffffffffffffffea
+[    59.463139] [CPU0] [sys:DEBUG] → foot nr=15 a1=0x6a96e0 a2=0x12 a3=0x7fffffffcdf0 a4=0x0
+[    59.464115] [CPU3] [sys:DEBUG] ← foot nr=15 → 0x0
+[    59.467562] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x7fffffffcc30 a2=0x0 a3=0x0 a4=0x0
+[    59.469391] [CPU2] [sys:DEBUG]   open("/usr/share/X11/locale/locale.alias", flags=0x0)
+[    59.471326] [CPU2] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.472873] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x83e4e0 a2=0x0 a3=0x0 a4=0x0
+[    59.474638] [CPU2] [sys:DEBUG]   open("/root/.config/XCompose", flags=0x0)
+[    59.475821] [CPU2] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.476272] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x83e4e0 a2=0x0 a3=0x0 a4=0x0
+[    59.476794] [CPU2] [sys:DEBUG]   open("/root/.XCompose", flags=0x0)
+[    59.477258] [CPU2] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.477689] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x7fffffffcc60 a2=0x0 a3=0x0 a4=0x0
+[    59.478247] [CPU2] [sys:DEBUG]   open("/usr/share/X11/locale/compose.dir", flags=0x0)
+[    59.478840] [CPU2] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.479419] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.480331] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.480715] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.481734] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.482167] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.483407] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.483811] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.485193] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.485597] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.549869] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.550287] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.551219] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.551679] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.552515] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.552988] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.553643] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.554081] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.554844] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.555260] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.555947] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.556377] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.557049] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.557495] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.558280] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.558693] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.559424] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.559891] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.560578] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.560979] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.561698] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.562117] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.562795] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.563203] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.563912] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.564324] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.565017] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.565397] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x48 a4=0x0
+[    59.566094] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x48
+[    59.566512] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0xf a4=0x0
+[    59.567164] [CPU0] [sys:DEBUG] ← foot nr=0 → 0xf
+[    59.567566] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.568278] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.568663] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x10 a4=0x0
+[    59.569442] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x10
+[    59.569876] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.570874] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.571275] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x46 a4=0x0
+[    59.572220] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x46
+[    59.573544] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.575607] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.576777] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.577304] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.577689] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.578205] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.578710] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.579227] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.579616] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.580136] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.580499] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.581060] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.581435] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.581993] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.582409] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.582928] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.583348] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.583880] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.584276] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.584776] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.585167] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.585642] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.586008] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.586521] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.586889] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.587415] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.587845] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.588396] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.588785] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.589289] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.589657] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.590142] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.590508] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.591015] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.591389] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.591952] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.592309] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.592815] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.593192] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.593702] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.594116] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.594680] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.595086] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0xf a4=0x0
+[    59.595865] [CPU0] [sys:DEBUG] ← foot nr=0 → 0xf
+[    59.596253] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.596858] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.598063] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x10 a4=0x0
+[    59.600099] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x10
+[    59.600528] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.601276] [CPU0] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.601655] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x3c a4=0x0
+[    59.602365] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x3c
+[    59.603595] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.605542] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.606816] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.608550] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.609918] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.611890] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.612305] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.612866] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.613263] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.613805] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.614213] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.614774] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.615163] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.615687] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.616093] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.616617] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.617044] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.617564] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.617982] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.618654] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.619063] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.619587] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.619988] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.620491] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.620910] [CPU2] [sys:DEBUG] → foot nr=110 a1=0x7 a2=0x7fffffffd210 a3=0x4040 a4=0x0
+[    59.621540] [CPU2] [sys:DEBUG] ← foot nr=110 → 0x2e8
+[    59.621977] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.622494] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.622896] [CPU2] [sys:DEBUG] → foot nr=61 a1=0x7fffffffd348 a2=0x1 a3=0xffffffffffffffff a4=0x0
+[    59.623593] [CPU2] [sys:DEBUG] ← foot nr=61 → 0x1
+[    59.623998] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.624545] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.624969] [CPU2] [sys:DEBUG] → foot nr=111 a1=0x7 a2=0x7fffffffd190 a3=0x40000040 a4=0x0
+[    59.625607] [CPU2] [sys:DEBUG] ← foot nr=111 → 0x1ec
+[    59.626011] [CPU2] [sys:DEBUG] → foot nr=111 a1=0x7 a2=0x7fffffffd190 a3=0x40000040 a4=0x0
+[    59.626657] [CPU2] [sys:DEBUG] ← foot nr=111 → 0xfffffffffffffff5
+[    59.627164] [CPU2] [sys:DEBUG] → foot nr=114 a1=0x826f70 a2=0x1 a3=0x7fffffff a4=0x0
+[    59.627723] [CPU2] [sys:DEBUG] ← foot nr=114 → 0x0
+[    59.628123] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.628591] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.628995] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.629523] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.629936] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.630495] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.630921] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.631451] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.631864] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.632354] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.632764] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.633286] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.633693] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.634255] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.634645] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.635177] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.635569] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.636134] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.636556] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.637117] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.637530] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.638074] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.638453] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.638992] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.639361] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.639895] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.640284] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.640834] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.641258] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.641837] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.642252] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.642835] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.643273] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.643816] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.644207] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.644737] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.645138] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.645680] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.646099] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.646635] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.647057] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.647579] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.648000] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.648542] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.648972] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.649516] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.649952] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.650509] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.650945] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.651492] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.651910] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.652438] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.652838] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.653359] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.653753] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.654314] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.654748] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.655282] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.655672] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.656192] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.656614] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.657167] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.657570] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.658113] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.658523] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.659055] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.659409] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.659924] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.660315] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.660857] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.661278] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.661839] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.662237] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.662788] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.663172] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.663699] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.664110] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.664636] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.665028] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.665493] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.665889] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.666451] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.666896] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.667450] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.667868] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.668374] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.668765] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.669270] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.669619] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.670129] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.670510] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.671048] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.671450] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.671955] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.672346] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.672911] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.673348] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.673883] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.674258] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.674773] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.675157] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.675625] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.676029] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.676490] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.676866] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.677364] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.677746] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.678241] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.678612] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.679162] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.679564] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.680120] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.680552] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.681062] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.681442] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.681966] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.682369] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.683109] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.683507] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.684014] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.684364] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.684881] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.685275] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.685803] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.686179] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.686647] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.687034] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.687568] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.687965] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.688465] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.688857] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.689323] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.689677] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.690180] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.690541] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.691036] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.691445] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.691974] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.692338] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.692819] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.693205] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.693736] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.694128] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.694592] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.694976] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.695458] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.695869] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.696416] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.696826] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.697358] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.697797] [CPU2] [sys:DEBUG] → foot nr=44 a1=0x7 a2=0x3 a3=0x6a851c a4=0x0
+[    59.698368] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x2
+[    59.698765] [CPU2] [sys:DEBUG] → foot nr=44 a1=0x7 a2=0x4 a3=0x802 a4=0x0
+[    59.699276] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.699658] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0x7 a4=0x7fffffffd374
+[    59.700244] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.700604] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.701129] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.701522] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.702037] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.704190] [CPU2] [sys:DEBUG] → foot nr=3 a1=0x785140 a2=0x102 a3=0x0 a4=0x0
+[    59.704750] [CPU2] [sys:DEBUG]   open("/dev/ptmx", flags=0x102)
+[    59.705233] [CPU2] [sys:DEBUG] ← foot nr=3 → 0xa
+[    59.705621] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.706154] [CPU2] [sys:DEBUG] ← foot nr=106 → 0xb
+[    59.706565] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.707119] [CPU2] [sys:DEBUG] ← foot nr=106 → 0xc
+[    59.707480] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.708023] [CPU2] [sys:DEBUG] ← foot nr=106 → 0xd
+[    59.708419] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.708950] [CPU2] [sys:DEBUG] ← foot nr=106 → 0xe
+[    59.709376] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.709917] [CPU2] [sys:DEBUG] ← foot nr=106 → 0xf
+[    59.710291] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.710786] [CPU2] [sys:DEBUG] ← foot nr=106 → 0x11
+[    59.711166] [CPU2] [sys:DEBUG] → foot nr=106 a1=0x1 a2=0x6 a3=0x0 a4=0x0
+[    59.711677] [CPU2] [sys:DEBUG] ← foot nr=106 → 0x12
+[    59.712076] [CPU2] [sys:DEBUG] → foot nr=59 a1=0xa a2=0x5414 a3=0x7fffffffd398 a4=0x0
+[    59.712666] [CPU2] [sys:DEBUG] ← foot nr=59 → 0x0
+[    59.713060] [CPU2] [sys:DEBUG] → foot nr=44 a1=0xa a2=0x3 a3=0x834cf0 a4=0x0
+[    59.713578] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x2
+[    59.713954] [CPU2] [sys:DEBUG] → foot nr=44 a1=0xa a2=0x4 a3=0x802 a4=0x0
+[    59.714439] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.714813] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0xb a4=0x7fffffffd274
+[    59.715403] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.715802] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0xc a4=0x7fffffffd274
+[    59.716393] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.716795] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0xd a4=0x7fffffffd274
+[    59.717356] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.717772] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0xe a4=0x7fffffffd274
+[    59.718355] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.718721] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0xf a4=0x7fffffffd274
+[    59.719294] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.719688] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0x11 a4=0x7fffffffd274
+[    59.720265] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.720669] [CPU2] [sys:DEBUG] → foot nr=98 a1=0x5 a2=0x1 a3=0x12 a4=0x7fffffffd274
+[    59.721289] [CPU2] [sys:DEBUG] ← foot nr=98 → 0x0
+[    59.721900] [CPU2] [sys:DEBUG] → foot nr=25 a1=0x7fffffffd228 a2=0x0 a3=0x0 a4=0x0
+[    59.722502] [CPU2] [sys:DEBUG] ← foot nr=25 → 0x0
+[    59.722899] [CPU2] [sys:DEBUG] → foot nr=44 a1=0x15 a2=0x2 a3=0x1 a4=0x0
+[    59.723387] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.723794] [CPU2] [sys:DEBUG] → foot nr=44 a1=0x18 a2=0x2 a3=0x1 a4=0x0
+[    59.724356] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.724778] [CPU2] [sys:DEBUG] → foot nr=7 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.725328] [CPU2] [sys:DEBUG] ← foot nr=7 → 0x26
+[    59.725330] [CPU0] [sys:DEBUG] → foot nr=4 a1=0x15 a2=0x0 a3=0x0 a4=0x0
+[    59.725716] [CPU2] [sys:DEBUG] → foot nr=19 a1=0x6ab979 a2=0x1 a3=0x0 a4=0x0
+[    59.726765] [CPU2] [sys:DEBUG] ← foot nr=19 → 0x0
+[    59.727189] [CPU2] [sys:DEBUG] → foot nr=4 a1=0x18 a2=0x0 a3=0x0 a4=0x0
+[    59.727756] [CPU2] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.728178] [CPU2] [sys:DEBUG] → foot nr=2 a1=0x15 a2=0x7fffffffd240 a3=0x4 a4=0x0
+[    59.789647] [CPU0] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.790048] [CPU0] [sys:DEBUG] → foot nr=19 a1=0x8452b0 a2=0x1 a3=0x0 a4=0x0
+[    59.790559] [CPU0] [sys:DEBUG] ← foot nr=19 → 0x0
+[    59.790936] [CPU0] [sys:DEBUG] → foot nr=27 a1=0x2 a2=0x7fffffffd208 a3=0x0 a4=0x0
+[    59.791518] [CPU0] [sys:DEBUG] ← foot nr=27 → 0x0
+[    59.792028] [CPU0] [sys:DEBUG] → foot nr=26 a1=0x1 a2=0x7fffffffd180 a3=0x0 a4=0x0
+[    59.792602] [CPU0] [sys:DEBUG] ← foot nr=26 → 0x0
+[    59.792977] [CPU0] [sys:DEBUG] → foot nr=26 a1=0xd a2=0x7fffffffd180 a3=0x0 a4=0x0
+[    59.793506] [CPU0] [sys:DEBUG] ← foot nr=26 → 0x0
+[    59.793922] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x6a83e0 a2=0x0 a3=0x0 a4=0x0
+[    59.794515] [CPU0] [sys:DEBUG]   open("/etc/shells", flags=0x0)
+[    59.795018] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xfffffffffffffffe
+[    59.795510] [CPU0] [sys:DEBUG] → foot nr=59 a1=0xa a2=0x80045430 a3=0x7fffffffd19c a4=0x0
+[    59.796119] [CPU0] [sys:DEBUG] ← foot nr=59 → 0x0
+[    59.796480] [CPU0] [sys:DEBUG] → foot nr=4 a1=0xa a2=0x0 a3=0x0 a4=0x0
+[    59.796978] [CPU0] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.797383] [CPU0] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.797917] [CPU0] [sys:DEBUG] ← foot nr=10 → 0x26
+[    59.798266] [CPU0] [sys:DEBUG] → foot nr=3 a1=0x817e40 a2=0x2 a3=0x0 a4=0x0
+[    59.798775] [CPU0] [sys:DEBUG]   open("/dev/pts/0", flags=0x2)
+[    59.799182] [CPU0] [sys:DEBUG] ← foot nr=3 → 0xa
+[    59.799537] [CPU0] [sys:DEBUG] → foot nr=59 a1=0xa a2=0x540e a3=0x0 a4=0x0
+[    59.800088] [CPU0] [sys:DEBUG] ← foot nr=59 → 0x0
+[    59.800477] [CPU0] [sys:DEBUG] → foot nr=24 a1=0xa a2=0x0 a3=0x0 a4=0x0
+[    59.801020] [CPU0] [sys:DEBUG] ← foot nr=24 → 0x0
+[    59.801361] [CPU0] [sys:DEBUG] → foot nr=24 a1=0xa a2=0x1 a3=0x0 a4=0x0
+[    59.801871] [CPU0] [sys:DEBUG] ← foot nr=24 → 0x1
+[    59.802251] [CPU0] [sys:DEBUG] → foot nr=24 a1=0xa a2=0x2 a3=0x0 a4=0x0
+[    59.802765] [CPU0] [sys:DEBUG] ← foot nr=24 → 0x2
+[    59.803144] [CPU0] [sys:DEBUG] → foot nr=4 a1=0xa a2=0x0 a3=0x0 a4=0x0
+[    59.803647] [CPU0] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.804037] [CPU0] [sys:DEBUG] → foot nr=8 a1=0x8451b0 a2=0x8325f0 a3=0x833b70 a4=0x0
+[elf] lazy /bin/bash: header 205 us (demand-paged)
+[    59.805679] [CPU2] [sys:DEBUG] ← foot nr=2 → 0x0
+[    59.806060] [CPU2] [sys:DEBUG] → foot nr=4 a1=0x15 a2=0x0 a3=0x0 a4=0x0
+[    59.806620] [CPU2] [sys:DEBUG] ← foot nr=4 → 0x0
+[    59.807028] [CPU2] [sys:DEBUG] → foot nr=44 a1=0xa a2=0x1 a3=0x0 a4=0x0
+[    59.807550] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.807943] [CPU2] [sys:DEBUG] → foot nr=44 a1=0xa a2=0x2 a3=0x1 a4=0x0
+[    59.808482] [CPU2] [sys:DEBUG] ← foot nr=44 → 0x0
+[    59.808880] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.809341] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.809770] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.810271] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.810659] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.811163] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.811552] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.812073] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.812471] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.813053] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.813478] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.814001] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.814384] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.814926] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.815285] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.815817] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.816182] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.816685] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.817072] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.817536] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.817934] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.818452] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.818873] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.819374] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.819755] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.820242] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.820627] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.821120] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.821473] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.821989] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.822342] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.822846] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.823204] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.823692] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.824070] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.824555] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.824969] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.825511] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.825887] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.826353] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.826725] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.827212] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.827567] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.828076] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.828429] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.828942] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.829311] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.829801] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.830194] [CPU2] [sys:DEBUG] ← bash nr=8 → 0x0
+[    59.832248] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.832729] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.833107] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.833610] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.834012] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.834490] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.834865] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.835324] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.835684] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.836174] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.836581] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.837111] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.837518] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.838018] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.838368] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.838856] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.839217] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.839722] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.840092] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.840596] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.840967] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.841450] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.841837] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.842311] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.842707] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.843229] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.843633] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.844096] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.844443] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.844934] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.845281] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.845790] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.846148] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.846614] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.846978] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.847457] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.848469] [CPU0] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0x40000 a3=0x3 a4=0x22
+[    59.849063] [CPU0] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=262144 prot=0x3 flags=0x22 fd=-1 off=0)
+[    59.849829] [CPU0] [sys:DEBUG] ← foot nr=29 → 0x7feffff5f000
+[    59.850256] [CPU0] [sys:DEBUG] → foot nr=13 a1=0x69cd10 a2=0x7feffff9efe0 a3=0x3 a4=0x0
+[    59.850836] [CPU0] [sys:DEBUG] ← foot nr=13 → 0x27
+[    59.851204] [CPU0] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0x40000 a3=0x3 a4=0x22
+[    59.851746] [CPU0] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=262144 prot=0x3 flags=0x22 fd=-1 off=0)
+[    59.851861] [CPU3] [sys:DEBUG] → foot nr=115 a1=0x831740 a2=0xffff80000e5ab830 a3=0xee7e000 a4=0x10
+[    59.852433] [CPU0] [sys:DEBUG] ← foot nr=29 → 0x7feffff1f000
+[    59.853102] [CPU3] [sys:DEBUG] ← foot nr=115 → 0x0
+[    59.853514] [CPU0] [sys:DEBUG] → foot nr=13 a1=0x69cd10 a2=0x7feffff5efe0 a3=0x3 a4=0x0
+[    59.853912] [CPU3] [sys:DEBUG] → foot nr=116 a1=0x815854 a2=0xffff80000e5ab830 a3=0xee7e000 a4=0x7feffff9eff8
+[    59.854524] [CPU0] [sys:DEBUG] ← foot nr=13 → 0x28
+[    59.855316] [CPU3] [sys:DEBUG] ← foot nr=116 → 0x0
+[    59.855740] [CPU0] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0x40000 a3=0x3 a4=0x22
+[    59.856136] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.856702] [CPU0] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=262144 prot=0x3 flags=0x22 fd=-1 off=0)
+[    59.857198] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x27
+[    59.857917] [CPU0] [sys:DEBUG] ← foot nr=29 → 0x7fefffedf000
+[    59.854527] [CPU2] [sys:DEBUG] → foot nr=115 a1=0x82d8c0 a2=0xffff80000e5aa030 a3=0xee7e000 a4=0x10
+[    59.858318] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.859469] [CPU2] [sys:DEBUG] ← foot nr=115 → 0x0
+[    59.858797] [CPU0] [sys:DEBUG] → foot nr=13 a1=0x69cd10 a2=0x7feffff1efe0 a3=0x3 a4=0x0
+[    59.860359] [CPU2] [sys:DEBUG] → foot nr=116 a1=0x814084 a2=0xffff80000e5aa030 a3=0xee7e000 a4=0x7feffff5eff8
+[    59.859994] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x27
+[    59.861834] [CPU2] [sys:DEBUG] ← foot nr=116 → 0x0
+[    59.861022] [CPU0] [sys:DEBUG] ← foot nr=13 → 0x29
+[    59.862654] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.862240] [CPU3] [sys:DEBUG] → foot nr=115 a1=0x82d940 a2=0xffff80000e7a4830 a3=0xee7e000 a4=0xffffffff80686e32
+[    59.863564] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x28
+[    59.864374] [CPU3] [sys:DEBUG] ← foot nr=115 → 0x0
+[    59.863047] [CPU0] [sys:DEBUG] → foot nr=29 a1=0x0 a2=0x40000 a3=0x3 a4=0x22
+[    59.864786] [CPU2] [sys:DEBUG] → foot nr=114 a1=0x7d2070 a2=0x0 a3=0x2 a4=0x0
+[    59.865188] [CPU3] [sys:DEBUG] → foot nr=116 a1=0x8140b4 a2=0xffff80000e7a4830 a3=0xee7e000 a4=0x7feffff1eff8
+[    59.865745] [CPU0] [sys:DEBUG]   mmap(addr=0x0000000000000000 len=262144 prot=0x3 flags=0x22 fd=-1 off=0)
+[    59.867176] [CPU3] [sys:DEBUG] ← foot nr=116 → 0x0
+[    59.867915] [CPU0] [sys:DEBUG] ← foot nr=29 → 0x7fefffe9f000
+[    59.868263] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.868730] [CPU0] [sys:DEBUG] → foot nr=13 a1=0x69cd10 a2=0x7fefffedefe0 a3=0x3 a4=0x0
+[    59.869188] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x29
+[    59.869788] [CPU0] [sys:DEBUG] ← foot nr=13 → 0x2a
+[    59.870138] [CPU3] [sys:DEBUG] → foot nr=114 a1=0x7d2070 a2=0x0 a3=0x2 a4=0x0
+[    59.870502] [CPU0] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0xf a4=0x0
+[    59.871035] [CPU3] [sys:DEBUG] → foot nr=114 a1=0x7d2070 a2=0x1 a3=0x1 a4=0x0
+[    59.871217] [CPU2] [sys:DEBUG] → foot nr=115 a1=0x82e040 a2=0xffff80000e7a5030 a3=0xee7e000 a4=0x10
+[    59.872461] [CPU3] [sys:DEBUG] ← foot nr=0 → 0xf
+[    59.874781] [CPU2] [sys:DEBUG] ← foot nr=115 → 0x0
+[    59.875143] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.876366] [CPU2] [sys:DEBUG] → foot nr=116 a1=0x8140e4 a2=0xffff80000e7a5030 a3=0xee7e000 a4=0x7fefffedeff8
+[    59.877086] [CPU3] [sys:DEBUG] ← foot nr=114 → 0x1
+[    59.879435] [CPU2] [sys:DEBUG] ← foot nr=116 → 0x0
+[    59.877085] [CPU0] [sys:DEBUG] ← foot nr=114 → 0x0
+[    59.880014] [CPU3] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.881147] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.882143] [CPU3] [sys:DEBUG] ← foot nr=10 → 0x27
+[ 
+===    #59.G8P8 2F6A7U8L]T  [=C=P=U
+2e]c =[0s0y0s0:0D0E0B0U0G0]0 0�0�0�0 0f
+oRoIt nPr==01000 0�0�0�0 000x026a8
+D8[6 8 
+ C S5=90.0808030702010]0 0[0C0P0U022]B 
+[FsLyGs=:0D0E0B0U0G0]0 0�0�0�0 1f0o2o8t2 
+nRrS=P1=01040 0a71F=E0FxF7FdF290E7C0B 8a
+2S=S0=x000 0a030=000x020 0a040=000x203
+
+RSP0=FFFFFFFF80687000
+PID=0000000000000027
+PPID=0000000000000012
+KSTK=FFFFFFFF80687000
+CMD=foot
+STACK@RSP:
+94C316CC009058D5
+000000000084523A
+0000000000000000
+00007FEFFFF9ED00
+000000000068DB67
+00007FEFFFF9ED00
+94C316CC009058D5
+00000000008400D0
+=== END #GP ===
+[signal] send: sig=11 → pid=39 comm="foot" (sender pid=39 comm="foot")
+[signal] terminate: pid=39 comm="foot" sig=SIGSEGV
+[signal] releasing files of pid=39 comm="foot" refs=5
+[files] release: refs 5 -> 4 (NOT freeing yet)
+[    59.892216] [CPU0] [sys:DEBUG] → foot nr=114 a1=0x7d2070 a2=0x0 a3=0x2 a4=0x0
+[    59.892218] [CPU3] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.893180] [CPU3] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x11 a4=0x0
+[    59.894194] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x11
+[    59.895131] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x4 a4=0x0
+[    59.896146] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x4
+[    59.896543] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1c a4=0x0
+[    59.897344] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1c
+[    59.897798] [CPU2] [sys:DEBUG] → foot nr=0 a1=0x2 a2=0x7d05b0 a3=0x1 a4=0x0
+[    59.898917] [CPU2] [sys:DEBUG] ← foot nr=0 → 0x1
+[    59.899263] [CPU2] [sys:DEBUG] → foot nr=10 a1=0x0 a2=0x0 a3=0x0 a4=0x0
+[    59.899776] [CPU2] [sys:DEBUG] ← foot nr=10 → 0x25
+[    59.900142] [CPU2] [sys:DEBUG] → foot nr=114 a1=0x7d2070 a2=0x0 a3=0x2 a4=0x0
+[   103.471344] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.471851] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.472154] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.472642] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.472967] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.473475] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.473811] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.474282] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.474598] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.475073] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.476611] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.477097] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.519242] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.519723] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.520078] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.520585] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.520900] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.521424] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.521766] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.522230] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.522547] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.523048] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   103.524586] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   103.525052] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.570174] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.570670] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.570981] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.571460] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.571767] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.572311] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.572660] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.573135] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.573451] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.573945] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.575367] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.575828] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.621069] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.621608] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.621912] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.622407] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.622744] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.623254] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.623572] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.624031] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.624345] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.624837] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   103.626181] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   103.626625] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.671976] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.672471] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.672785] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.673294] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.673615] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.674090] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.674428] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.674912] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.675232] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.675702] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.676689] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.677184] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.722597] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.723138] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.723436] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.723912] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.724246] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.724733] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.725099] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.725604] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.725928] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.726441] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   103.727313] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   103.727775] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.773411] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.773961] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.774292] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.774786] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.775117] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.775600] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.775922] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.776395] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.776700] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.777217] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.778243] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.778713] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.824512] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.825030] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.825336] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.825797] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.826118] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.826596] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.826936] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.827455] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.827810] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.828370] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   103.829356] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   103.829807] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.875432] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.875960] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.876304] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.876833] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.877177] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.877675] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.878034] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.878532] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.878867] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.879396] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.880377] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.880841] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.926083] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.926605] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.926938] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.927460] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.927778] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.928316] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.928651] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.929168] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.929486] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.929996] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   103.930971] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   103.931481] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   103.977068] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   103.977590] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   103.977955] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.978456] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.978790] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   103.979310] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   103.979669] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   103.980209] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   103.980538] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   103.981067] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   103.981991] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   103.982470] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.028087] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.028621] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.028988] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.029486] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.029820] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.030314] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.030635] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.031171] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.031515] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.032071] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   104.033307] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   104.033780] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.079093] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.079680] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.080021] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.080515] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.080835] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.081383] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.081731] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.082230] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.082531] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.083055] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   104.084588] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   104.085077] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.129954] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.130489] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.130841] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.131396] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.131754] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.132292] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.132628] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.133136] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.133454] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.133958] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   104.135488] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   104.135988] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.180847] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.181357] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.181679] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.182180] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.182497] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.183012] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.183346] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.183843] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.184169] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.184667] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   104.186217] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   104.186696] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.231734] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.232228] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.232542] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.233029] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.233348] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.233833] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.234182] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.234667] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.235002] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.235508] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   104.236903] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   104.237369] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.282423] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.282936] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.283247] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.283734] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.284067] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.284558] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.284910] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.285401] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.285731] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.286256] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   104.287695] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   104.288195] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.333487] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.334038] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.334357] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.334863] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.335173] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.335666] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.336040] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.336508] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.336847] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.337374] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   104.338776] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   104.339283] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.384306] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.384827] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.385160] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.385644] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.386011] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.386527] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.386881] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.387345] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.387669] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.388207] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   104.389811] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   104.390304] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   104.435217] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   104.435728] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   104.436076] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.436552] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.436879] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   104.437384] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   104.437710] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   104.438217] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   104.438555] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   104.439097] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   104.440309] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   104.440836] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.174167] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.174764] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.175108] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.175621] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.175968] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.176486] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.176845] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.177331] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.177640] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.178165] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   152.179840] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   152.180321] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.234970] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.235506] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.235843] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.236332] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.236648] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.237169] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.237487] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.237971] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.238289] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.238836] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   152.240327] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   152.240776] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.295753] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.296263] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.296585] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.297101] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.297417] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.297944] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.298290] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.298834] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.299212] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.299797] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   152.301195] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   152.301696] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.356308] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.356836] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.357147] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.357696] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.358025] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.358526] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.358898] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.359425] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.359805] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.360377] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   152.361312] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   152.361789] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.417308] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.417892] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.418203] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.418692] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.419066] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.419551] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.419929] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.420407] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.421028] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.421765] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   152.422844] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   152.423309] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.478204] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.478769] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.479082] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.479581] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.479923] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.480442] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.480801] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.481333] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.481698] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.482241] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   152.483366] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   152.483897] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.538534] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.539033] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.539344] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.539844] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.540171] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.540672] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.541052] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.541547] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.541877] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.542436] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   152.543408] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   152.543918] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.599319] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.599845] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.600158] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.600670] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.601014] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.601516] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.601889] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.602402] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.602769] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.603304] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   152.604205] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   152.604706] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.659747] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.660250] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.660578] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.661112] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.661480] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.662007] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.662347] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.662861] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.663203] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.663809] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=257 fb=1 1280x800}
+[   152.664887] [CPU3] [drm:DEBUG] commit: scanout=0 res=257 1280x800 applied
+[   152.665388] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0
+[   152.720432] [CPU3] [drm:DEBUG] ioctl GETFB req=0xc01c64ad arg=0x7fffffffd590
+[   152.720963] [CPU3] [drm:DEBUG] ioctl GETFB → 0
+[   152.721274] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.721840] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.722186] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE req=0x40086409 arg=0x7fffffffd5a8
+[   152.722744] [CPU3] [drm:DEBUG] ioctl GEM_CLOSE → 0
+[   152.723099] [CPU3] [drm:DEBUG] ioctl CURSOR req=0xc01c64a3 arg=0x7fffffffd590
+[   152.723674] [CPU3] [drm:DEBUG] ioctl CURSOR → 0
+[   152.724031] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP req=0xc01864b0 arg=0x7fffffffd590
+[   152.724587] [CPU3] [drm:INFO] commit n=1 scanout[0]={res=261 fb=3 1280x800}
+[   152.725472] [CPU3] [drm:DEBUG] commit: scanout=0 res=261 1280x800 applied
+[   152.725987] [CPU3] [drm:DEBUG] ioctl PAGE_FLIP → 0

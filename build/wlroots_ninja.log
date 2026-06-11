@@ -13,10 +13,10 @@ ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/wlroots_
 [12/305] Generating protocol/viewporter_client_h with a custom command
 [13/305] Generating protocol/alpha_modifier_v1_c with a custom command
 [14/305] Generating protocol/alpha_modifier_v1_server_h with a custom command
-[15/305] Generating protocol/content_type_v1_c with a custom command
-[16/305] Generating protocol/xdg_shell_c with a custom command
-[17/305] Generating protocol/xdg_shell_server_h with a custom command
-[18/305] Generating protocol/xdg_shell_client_h with a custom command
+[15/305] Generating protocol/xdg_shell_c with a custom command
+[16/305] Generating protocol/xdg_shell_server_h with a custom command
+[17/305] Generating protocol/xdg_shell_client_h with a custom command
+[18/305] Generating protocol/content_type_v1_c with a custom command
 [19/305] Generating protocol/content_type_v1_server_h with a custom command
 [20/305] Generating protocol/cursor_shape_v1_c with a custom command
 [21/305] Generating protocol/cursor_shape_v1_server_h with a custom command
@@ -28,9 +28,9 @@ ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/wlroots_
 [27/305] Generating protocol/ext_idle_notify_v1_server_h with a custom command
 [28/305] Generating protocol/ext_session_lock_v1_c with a custom command
 [29/305] Generating protocol/ext_session_lock_v1_server_h with a custom command
-[30/305] Generating protocol/fractional_scale_v1_c with a custom command
-[31/305] Generating protocol/fractional_scale_v1_server_h with a custom command
-[32/305] Generating protocol/linux_drm_syncobj_v1_c with a custom command
+[30/305] Generating protocol/fractional_scale_v1_server_h with a custom command
+[31/305] Generating protocol/linux_drm_syncobj_v1_c with a custom command
+[32/305] Generating protocol/fractional_scale_v1_c with a custom command
 [33/305] Generating protocol/linux_drm_syncobj_v1_server_h with a custom command
 [34/305] Generating protocol/security_context_v1_c with a custom command
 [35/305] Generating protocol/security_context_v1_server_h with a custom command
@@ -48,8 +48,8 @@ ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/wlroots_
 [47/305] Generating protocol/idle_inhibit_unstable_v1_c with a custom command
 [48/305] Generating protocol/idle_inhibit_unstable_v1_server_h with a custom command
 [49/305] Generating protocol/keyboard_shortcuts_inhibit_unstable_v1_c with a custom command
-[50/305] Generating protocol/pointer_constraints_unstable_v1_c with a custom command
-[51/305] Generating protocol/keyboard_shortcuts_inhibit_unstable_v1_server_h with a custom command
+[50/305] Generating protocol/keyboard_shortcuts_inhibit_unstable_v1_server_h with a custom command
+[51/305] Generating protocol/pointer_constraints_unstable_v1_c with a custom command
 [52/305] Generating protocol/pointer_constraints_unstable_v1_server_h with a custom command
 [53/305] Generating protocol/pointer_gestures_unstable_v1_c with a custom command
 [54/305] Generating protocol/pointer_gestures_unstable_v1_server_h with a custom command
@@ -82,9 +82,9 @@ ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/wlroots_
 [81/305] Generating protocol/virtual_keyboard_unstable_v1_c with a custom command
 [82/305] Generating protocol/virtual_keyboard_unstable_v1_server_h with a custom command
 [83/305] Generating protocol/wlr_data_control_unstable_v1_c with a custom command
-[84/305] Generating protocol/wlr_data_control_unstable_v1_server_h with a custom command
-[85/305] Generating protocol/wlr_export_dmabuf_unstable_v1_c with a custom command
-[86/305] Generating protocol/wlr_export_dmabuf_unstable_v1_server_h with a custom command
+[84/305] Generating protocol/wlr_export_dmabuf_unstable_v1_c with a custom command
+[85/305] Generating protocol/wlr_export_dmabuf_unstable_v1_server_h with a custom command
+[86/305] Generating protocol/wlr_data_control_unstable_v1_server_h with a custom command
 [87/305] Generating protocol/wlr_foreign_toplevel_management_unstable_v1_c with a custom command
 [88/305] Generating protocol/wlr_foreign_toplevel_management_unstable_v1_server_h with a custom command
 [89/305] Generating protocol/wlr_gamma_control_unstable_v1_c with a custom command
@@ -96,211 +96,211 @@ ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/wlroots_
 [95/305] Generating protocol/wlr_output_power_management_unstable_v1_c with a custom command
 [96/305] Generating protocol/wlr_output_power_management_unstable_v1_server_h with a custom command
 [97/305] Generating protocol/wlr_screencopy_unstable_v1_c with a custom command
-[98/305] Generating protocol/wlr_screencopy_unstable_v1_server_h with a custom command
-[99/305] Generating protocol/wlr_virtual_pointer_unstable_v1_c with a custom command
+[98/305] Generating protocol/wlr_virtual_pointer_unstable_v1_c with a custom command
+[99/305] Generating protocol/wlr_screencopy_unstable_v1_server_h with a custom command
 [100/305] Generating protocol/wlr_virtual_pointer_unstable_v1_server_h with a custom command
-[101/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_linux-dmabuf-v1-protocol.c.o
-[102/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_presentation-time-protocol.c.o
-[103/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_tablet-v2-protocol.c.o
-[104/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_viewporter-protocol.c.o
-[105/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-shell-protocol.c.o
-[106/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_alpha-modifier-v1-protocol.c.o
-[107/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-foreign-toplevel-list-v1-protocol.c.o
-[108/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-idle-notify-v1-protocol.c.o
-[109/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-session-lock-v1-protocol.c.o
+[101/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_fractional-scale-v1-protocol.c.o
+[102/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_alpha-modifier-v1-protocol.c.o
+[103/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_cursor-shape-v1-protocol.c.o
+[104/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_drm-lease-v1-protocol.c.o
+[105/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-idle-notify-v1-protocol.c.o
+[106/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_linux-drm-syncobj-v1-protocol.c.o
+[107/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_single-pixel-buffer-v1-protocol.c.o
+[108/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_presentation-time-protocol.c.o
+[109/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-shell-protocol.c.o
 [110/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_content-type-v1-protocol.c.o
-[111/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_cursor-shape-v1-protocol.c.o
-[112/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_drm-lease-v1-protocol.c.o
-[113/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_fractional-scale-v1-protocol.c.o
-[114/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_linux-drm-syncobj-v1-protocol.c.o
-[115/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_security-context-v1-protocol.c.o
-[116/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_single-pixel-buffer-v1-protocol.c.o
-[117/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-activation-v1-protocol.c.o
-[118/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xwayland-shell-v1-protocol.c.o
-[119/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_tearing-control-v1-protocol.c.o
+[111/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-foreign-toplevel-list-v1-protocol.c.o
+[112/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_security-context-v1-protocol.c.o
+[113/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_tearing-control-v1-protocol.c.o
+[114/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_linux-dmabuf-v1-protocol.c.o
+[115/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_tablet-v2-protocol.c.o
+[116/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_viewporter-protocol.c.o
+[117/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-session-lock-v1-protocol.c.o
+[118/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-activation-v1-protocol.c.o
+[119/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xwayland-shell-v1-protocol.c.o
 [120/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_fullscreen-shell-unstable-v1-protocol.c.o
 [121/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_idle-inhibit-unstable-v1-protocol.c.o
-[122/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_primary-selection-unstable-v1-protocol.c.o
-[123/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_relative-pointer-unstable-v1-protocol.c.o
-[124/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-decoration-unstable-v1-protocol.c.o
-[125/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_keyboard-shortcuts-inhibit-unstable-v1-protocol.c.o
-[126/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-foreign-unstable-v2-protocol.c.o
-[127/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-output-unstable-v1-protocol.c.o
-[128/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_server-decoration-protocol.c.o
-[129/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_pointer-constraints-unstable-v1-protocol.c.o
-[130/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_text-input-unstable-v3-protocol.c.o
-[131/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-foreign-unstable-v1-protocol.c.o
-[132/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-transient-seat-v1-protocol.c.o
-[133/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_virtual-keyboard-unstable-v1-protocol.c.o
-[134/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-export-dmabuf-unstable-v1-protocol.c.o
-[135/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_drm-protocol.c.o
+[122/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_keyboard-shortcuts-inhibit-unstable-v1-protocol.c.o
+[123/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_pointer-constraints-unstable-v1-protocol.c.o
+[124/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_pointer-gestures-unstable-v1-protocol.c.o
+[125/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_primary-selection-unstable-v1-protocol.c.o
+[126/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_text-input-unstable-v3-protocol.c.o
+[127/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-decoration-unstable-v1-protocol.c.o
+[128/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-foreign-unstable-v1-protocol.c.o
+[129/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-foreign-unstable-v2-protocol.c.o
+[130/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_xdg-output-unstable-v1-protocol.c.o
+[131/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_relative-pointer-unstable-v1-protocol.c.o
+[132/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_drm-protocol.c.o
+[133/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_input-method-unstable-v2-protocol.c.o
+[134/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_server-decoration-protocol.c.o
+[135/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_virtual-keyboard-unstable-v1-protocol.c.o
 [136/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-data-control-unstable-v1-protocol.c.o
-[137/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-layer-shell-unstable-v1-protocol.c.o
-[138/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-output-power-management-unstable-v1-protocol.c.o
-[139/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-screencopy-unstable-v1-protocol.c.o
-[140/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_pointer-gestures-unstable-v1-protocol.c.o
-[141/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_input-method-unstable-v2-protocol.c.o
-[142/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-foreign-toplevel-management-unstable-v1-protocol.c.o
-[143/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-output-management-unstable-v1-protocol.c.o
-[144/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-gamma-control-unstable-v1-protocol.c.o
+[137/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-export-dmabuf-unstable-v1-protocol.c.o
+[138/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_ext-transient-seat-v1-protocol.c.o
+[139/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-foreign-toplevel-management-unstable-v1-protocol.c.o
+[140/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-gamma-control-unstable-v1-protocol.c.o
+[141/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-layer-shell-unstable-v1-protocol.c.o
+[142/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-output-management-unstable-v1-protocol.c.o
+[143/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-output-power-management-unstable-v1-protocol.c.o
+[144/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-screencopy-unstable-v1-protocol.c.o
 [145/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._protocol_wlr-virtual-pointer-unstable-v1-protocol.c.o
-[146/305] Compiling C object libwlroots-0.18.a.p/render_dmabuf.c.o
-[147/305] Compiling C object libwlroots-0.18.a.p/render_dmabuf_fallback.c.o
-[148/305] Compiling C object libwlroots-0.18.a.p/render_color_fallback.c.o
-[149/305] Compiling C object libwlroots-0.18.a.p/render_color.c.o
+[146/305] Compiling C object libwlroots-0.18.a.p/render_color.c.o
+[147/305] Compiling C object libwlroots-0.18.a.p/render_color_fallback.c.o
+[148/305] Compiling C object libwlroots-0.18.a.p/render_dmabuf_fallback.c.o
+[149/305] Compiling C object libwlroots-0.18.a.p/render_dmabuf.c.o
 [150/305] Compiling C object libwlroots-0.18.a.p/render_swapchain.c.o
-[151/305] Compiling C object libwlroots-0.18.a.p/render_wlr_texture.c.o
-[152/305] Compiling C object libwlroots-0.18.a.p/render_pixman_pixel_format.c.o
-[153/305] Compiling C object libwlroots-0.18.a.p/render_pixel_format.c.o
-[154/305] Compiling C object libwlroots-0.18.a.p/render_allocator_drm_dumb.c.o
-[155/305] Compiling C object libwlroots-0.18.a.p/backend_drm_backend.c.o
-[156/305] Compiling C object libwlroots-0.18.a.p/render_pass.c.o
-[157/305] Compiling C object libwlroots-0.18.a.p/render_drm_format_set.c.o
-[158/305] Compiling C object libwlroots-0.18.a.p/render_wlr_renderer.c.o
-[159/305] Compiling C object libwlroots-0.18.a.p/render_drm_syncobj.c.o
-[160/305] Compiling C object libwlroots-0.18.a.p/render_allocator_shm.c.o
-[161/305] Compiling C object libwlroots-0.18.a.p/backend_session_session.c.o
-[162/305] Compiling C object libwlroots-0.18.a.p/backend_backend.c.o
-[163/305] Compiling C object libwlroots-0.18.a.p/backend_drm_properties.c.o
-[164/305] Compiling C object libwlroots-0.18.a.p/render_pixman_pass.c.o
-[165/305] Compiling C object libwlroots-0.18.a.p/backend_drm_atomic.c.o
+[151/305] Compiling C object libwlroots-0.18.a.p/render_pass.c.o
+[152/305] Compiling C object libwlroots-0.18.a.p/render_allocator_shm.c.o
+[153/305] Compiling C object libwlroots-0.18.a.p/render_drm_format_set.c.o
+[154/305] Compiling C object libwlroots-0.18.a.p/render_allocator_allocator.c.o
+[155/305] Compiling C object libwlroots-0.18.a.p/render_pixman_pass.c.o
+[156/305] Compiling C object libwlroots-0.18.a.p/render_wlr_texture.c.o
+[157/305] Compiling C object libwlroots-0.18.a.p/backend_drm_properties.c.o
+[158/305] Compiling C object libwlroots-0.18.a.p/render_drm_syncobj.c.o
+[159/305] Compiling C object libwlroots-0.18.a.p/render_pixel_format.c.o
+[160/305] Compiling C object libwlroots-0.18.a.p/render_pixman_pixel_format.c.o
+[161/305] Compiling C object libwlroots-0.18.a.p/render_allocator_drm_dumb.c.o
+[162/305] Compiling C object libwlroots-0.18.a.p/backend_session_session.c.o
+[163/305] Compiling C object libwlroots-0.18.a.p/render_pixman_renderer.c.o
+[164/305] Compiling C object libwlroots-0.18.a.p/render_wlr_renderer.c.o
+[165/305] Compiling C object libwlroots-0.18.a.p/backend_drm_monitor.c.o
 [166/305] Compiling C object libwlroots-0.18.a.p/backend_drm_legacy.c.o
-[167/305] Compiling C object libwlroots-0.18.a.p/backend_drm_renderer.c.o
-[168/305] Compiling C object libwlroots-0.18.a.p/backend_drm_monitor.c.o
-[169/305] Compiling C object libwlroots-0.18.a.p/backend_drm_util.c.o
+[167/305] Compiling C object libwlroots-0.18.a.p/backend_backend.c.o
+[168/305] Compiling C object libwlroots-0.18.a.p/backend_drm_renderer.c.o
+[169/305] Compiling C object libwlroots-0.18.a.p/backend_drm_backend.c.o
 [170/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_keyboard.c.o
-[171/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_backend.c.o
-[172/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_events.c.o
+[171/305] Compiling C object libwlroots-0.18.a.p/backend_drm_atomic.c.o
+[172/305] Compiling C object libwlroots-0.18.a.p/backend_drm_util.c.o
 [173/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_switch.c.o
 [174/305] Compiling C object libwlroots-0.18.a.p/backend_drm_fb.c.o
-[175/305] Compiling C object libwlroots-0.18.a.p/render_allocator_allocator.c.o
-[176/305] Compiling C object libwlroots-0.18.a.p/render_pixman_renderer.c.o
-[177/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_pointer.c.o
-[178/305] Generating backend/drm/pnpids.c with a custom command (wrapped by meson to capture output, to feed input)
-[179/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_tablet_pad.c.o
-[180/305] Compiling C object libwlroots-0.18.a.p/backend_multi_backend.c.o
-[181/305] Compiling C object libwlroots-0.18.a.p/types_output_render.c.o
-[182/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_touch.c.o
-[183/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_data_source.c.o
+[175/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_tablet_pad.c.o
+[176/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_touch.c.o
+[177/305] Generating backend/drm/pnpids.c with a custom command (wrapped by meson to capture output, to feed input)
+[178/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_backend.c.o
+[179/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_pointer.c.o
+[180/305] Compiling C object libwlroots-0.18.a.p/backend_headless_backend.c.o
+[181/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_events.c.o
+[182/305] Compiling C object libwlroots-0.18.a.p/backend_headless_output.c.o
+[183/305] Compiling C object libwlroots-0.18.a.p/backend_multi_backend.c.o
 [184/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_data_device.c.o
-[185/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_data_offer.c.o
-[186/305] Compiling C object libwlroots-0.18.a.p/types_scene_drag_icon.c.o
-[187/305] Compiling C object libwlroots-0.18.a.p/types_output_state.c.o
-[188/305] Compiling C object libwlroots-0.18.a.p/types_output_swapchain.c.o
-[189/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_tablet_tool.c.o
-[190/305] Compiling C object libwlroots-0.18.a.p/types_scene_subsurface_tree.c.o
-[191/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_pointer.c.o
-[192/305] Compiling C object libwlroots-0.18.a.p/backend_headless_backend.c.o
-[193/305] Compiling C object libwlroots-0.18.a.p/types_scene_surface.c.o
-[194/305] Compiling C object libwlroots-0.18.a.p/backend_headless_output.c.o
-[195/305] Compiling C object libwlroots-0.18.a.p/types_scene_xdg_shell.c.o
-[196/305] Compiling C object libwlroots-0.18.a.p/types_scene_layer_shell_v1.c.o
-[197/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_drag.c.o
-[198/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_seat.c.o
-[199/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_backend.c.o
-[200/305] Compiling C object libwlroots-0.18.a.p/types_output_output.c.o
-[201/305] Compiling C object libwlroots-0.18.a.p/types_output_cursor.c.o
-[202/305] Compiling C object libwlroots-0.18.a.p/types_scene_output_layout.c.o
-[203/305] Compiling C object libwlroots-0.18.a.p/types_buffer_client.c.o
-[204/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_tablet.c.o
-[205/305] Compiling C object libwlroots-0.18.a.p/types_buffer_dmabuf.c.o
-[206/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat.c.o
-[207/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_pointer.c.o
-[208/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_touch.c.o
-[209/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_output.c.o
-[210/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2.c.o
-[211/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_positioner.c.o
-[212/305] Compiling C object libwlroots-0.18.a.p/types_buffer_resource.c.o
-[213/305] Compiling C object libwlroots-0.18.a.p/backend_drm_drm.c.o
-[214/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_shell.c.o
-[215/305] Compiling C object libwlroots-0.18.a.p/types_buffer_readonly_data.c.o
-[216/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_keyboard.c.o
-[217/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_tablet_v2.c.o
-[218/305] Compiling C object libwlroots-0.18.a.p/types_buffer_buffer.c.o
+[185/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_data_source.c.o
+[186/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_seat.c.o
+[187/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_data_offer.c.o
+[188/305] Compiling C object libwlroots-0.18.a.p/types_output_state.c.o
+[189/305] Compiling C object libwlroots-0.18.a.p/types_output_swapchain.c.o
+[190/305] Compiling C object libwlroots-0.18.a.p/types_output_cursor.c.o
+[191/305] Compiling C object libwlroots-0.18.a.p/types_scene_layer_shell_v1.c.o
+[192/305] Compiling C object libwlroots-0.18.a.p/backend_libinput_tablet_tool.c.o
+[193/305] Compiling C object libwlroots-0.18.a.p/types_scene_subsurface_tree.c.o
+[194/305] Compiling C object libwlroots-0.18.a.p/types_scene_surface.c.o
+[195/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_tablet_v2.c.o
+[196/305] Compiling C object libwlroots-0.18.a.p/types_scene_drag_icon.c.o
+[197/305] Compiling C object libwlroots-0.18.a.p/types_output_render.c.o
+[198/305] Compiling C object libwlroots-0.18.a.p/types_scene_xdg_shell.c.o
+[199/305] Compiling C object libwlroots-0.18.a.p/types_scene_output_layout.c.o
+[200/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_pointer.c.o
+[201/305] Compiling C object libwlroots-0.18.a.p/types_data_device_wlr_drag.c.o
+[202/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_keyboard.c.o
+[203/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_tablet.c.o
+[204/305] Compiling C object libwlroots-0.18.a.p/backend_drm_drm.c.o
+[205/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat.c.o
+[206/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_shell.c.o
+[207/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_touch.c.o
+[208/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_output.c.o
+[209/305] Compiling C object libwlroots-0.18.a.p/types_buffer_client.c.o
+[210/305] Compiling C object libwlroots-0.18.a.p/backend_wayland_backend.c.o
+[211/305] Compiling C object libwlroots-0.18.a.p/types_seat_wlr_seat_pointer.c.o
+[212/305] Compiling C object libwlroots-0.18.a.p/types_buffer_dmabuf.c.o
+[213/305] Compiling C object libwlroots-0.18.a.p/types_output_output.c.o
+[214/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2.c.o
+[215/305] Compiling C object libwlroots-0.18.a.p/types_buffer_resource.c.o
+[216/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_positioner.c.o
+[217/305] Compiling C object libwlroots-0.18.a.p/types_buffer_buffer.c.o
+[218/305] Compiling C object libwlroots-0.18.a.p/types_buffer_readonly_data.c.o
 [219/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_popup.c.o
 [220/305] Compiling C object libwlroots-0.18.a.p/types_wlr_content_type_v1.c.o
-[221/305] Compiling C object libwlroots-0.18.a.p/types_wlr_fullscreen_shell_v1.c.o
-[222/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_toplevel.c.o
-[223/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_pad.c.o
-[224/305] Compiling C object libwlroots-0.18.a.p/types_wlr_export_dmabuf_v1.c.o
-[225/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_tool.c.o
+[221/305] Compiling C object libwlroots-0.18.a.p/types_wlr_alpha_modifier_v1.c.o
+[222/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_pad.c.o
+[223/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_surface.c.o
+[224/305] Compiling C object libwlroots-0.18.a.p/types_wlr_damage_ring.c.o
+[225/305] Compiling C object libwlroots-0.18.a.p/types_wlr_input_device.c.o
 [226/305] Compiling C object libwlroots-0.18.a.p/types_wlr_cursor_shape_v1.c.o
-[227/305] Compiling C object libwlroots-0.18.a.p/types_wlr_damage_ring.c.o
-[228/305] Compiling C object libwlroots-0.18.a.p/types_wlr_input_device.c.o
-[229/305] Compiling C object libwlroots-0.18.a.p/types_wlr_drm.c.o
-[230/305] Compiling C object libwlroots-0.18.a.p/types_wlr_ext_foreign_toplevel_list_v1.c.o
-[231/305] Compiling C object libwlroots-0.18.a.p/types_wlr_gamma_control_v1.c.o
+[227/305] Compiling C object libwlroots-0.18.a.p/types_tablet_v2_wlr_tablet_v2_tool.c.o
+[228/305] Compiling C object libwlroots-0.18.a.p/types_wlr_export_dmabuf_v1.c.o
+[229/305] Compiling C object libwlroots-0.18.a.p/types_wlr_fullscreen_shell_v1.c.o
+[230/305] Compiling C object libwlroots-0.18.a.p/types_wlr_idle_inhibit_v1.c.o
+[231/305] Compiling C object libwlroots-0.18.a.p/types_wlr_drm.c.o
 [232/305] Compiling C object libwlroots-0.18.a.p/types_wlr_idle_notify_v1.c.o
-[233/305] Compiling C object libwlroots-0.18.a.p/types_wlr_alpha_modifier_v1.c.o
-[234/305] Compiling C object libwlroots-0.18.a.p/types_wlr_data_control_v1.c.o
-[235/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_surface.c.o
-[236/305] Compiling C object libwlroots-0.18.a.p/types_wlr_idle_inhibit_v1.c.o
-[237/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard.c.o
-[238/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard_shortcuts_inhibit_v1.c.o
-[239/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard_group.c.o
-[240/305] Compiling C object libwlroots-0.18.a.p/types_wlr_matrix.c.o
-[241/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer.c.o
-[242/305] Compiling C object libwlroots-0.18.a.p/types_wlr_primary_selection.c.o
-[243/305] Compiling C object libwlroots-0.18.a.p/types_wlr_linux_drm_syncobj_v1.c.o
-[244/305] Compiling C object libwlroots-0.18.a.p/types_scene_wlr_scene.c.o
-[245/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_layer.c.o
-[246/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_power_management_v1.c.o
-[247/305] Compiling C object libwlroots-0.18.a.p/types_wlr_foreign_toplevel_management_v1.c.o
-[248/305] Compiling C object libwlroots-0.18.a.p/types_wlr_input_method_v2.c.o
-[249/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_layout.c.o
+[233/305] Compiling C object libwlroots-0.18.a.p/types_xdg_shell_wlr_xdg_toplevel.c.o
+[234/305] Compiling C object libwlroots-0.18.a.p/types_wlr_gamma_control_v1.c.o
+[235/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard.c.o
+[236/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_layer.c.o
+[237/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard_group.c.o
+[238/305] Compiling C object libwlroots-0.18.a.p/types_wlr_data_control_v1.c.o
+[239/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer.c.o
+[240/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_power_management_v1.c.o
+[241/305] Compiling C object libwlroots-0.18.a.p/types_wlr_ext_foreign_toplevel_list_v1.c.o
+[242/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_swapchain_manager.c.o
+[243/305] Compiling C object libwlroots-0.18.a.p/types_scene_wlr_scene.c.o
+[244/305] Compiling C object libwlroots-0.18.a.p/types_wlr_keyboard_shortcuts_inhibit_v1.c.o
+[245/305] Compiling C object libwlroots-0.18.a.p/types_wlr_presentation_time.c.o
+[246/305] Compiling C object libwlroots-0.18.a.p/types_wlr_foreign_toplevel_management_v1.c.o
+[247/305] Compiling C object libwlroots-0.18.a.p/types_wlr_input_method_v2.c.o
+[248/305] Compiling C object libwlroots-0.18.a.p/types_wlr_matrix.c.o
+[249/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer_constraints_v1.c.o
 [250/305] Compiling C object libwlroots-0.18.a.p/types_wlr_layer_shell_v1.c.o
-[251/305] Compiling C object libwlroots-0.18.a.p/types_wlr_switch.c.o
-[252/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer_gestures_v1.c.o
-[253/305] Compiling C object libwlroots-0.18.a.p/types_wlr_region.c.o
-[254/305] Compiling C object libwlroots-0.18.a.p/types_wlr_linux_dmabuf_v1.c.o
-[255/305] Compiling C object libwlroots-0.18.a.p/types_wlr_security_context_v1.c.o
-[256/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tablet_pad.c.o
-[257/305] Compiling C object libwlroots-0.18.a.p/types_wlr_compositor.c.o
-[258/305] Compiling C object libwlroots-0.18.a.p/types_wlr_touch.c.o
-[259/305] Compiling C object libwlroots-0.18.a.p/types_wlr_server_decoration.c.o
-[260/305] Compiling C object libwlroots-0.18.a.p/types_wlr_cursor.c.o
-[261/305] Compiling C object libwlroots-0.18.a.p/types_wlr_relative_pointer_v1.c.o
-[262/305] Compiling C object libwlroots-0.18.a.p/types_wlr_single_pixel_buffer_v1.c.o
-[263/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tablet_tool.c.o
-[264/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_swapchain_manager.c.o
-[265/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._backend_drm_pnpids.c.o
-[266/305] Compiling C object libwlroots-0.18.a.p/types_wlr_primary_selection_v1.c.o
-[267/305] Compiling C object libwlroots-0.18.a.p/types_wlr_session_lock_v1.c.o
-[268/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_management_v1.c.o
-[269/305] Compiling C object libwlroots-0.18.a.p/types_wlr_presentation_time.c.o
-[270/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xcursor_manager.c.o
-[271/305] Compiling C object libwlroots-0.18.a.p/types_wlr_shm.c.o
-[272/305] Compiling C object libwlroots-0.18.a.p/util_array.c.o
-[273/305] Compiling C object libwlroots-0.18.a.p/util_addon.c.o
-[274/305] Compiling C object libwlroots-0.18.a.p/types_wlr_screencopy_v1.c.o
-[275/305] Compiling C object libwlroots-0.18.a.p/types_wlr_fractional_scale_v1.c.o
+[251/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_layout.c.o
+[252/305] Compiling C object libwlroots-0.18.a.p/types_wlr_primary_selection.c.o
+[253/305] Compiling C object libwlroots-0.18.a.p/types_wlr_primary_selection_v1.c.o
+[254/305] Compiling C object libwlroots-0.18.a.p/types_wlr_cursor.c.o
+[255/305] Compiling C object libwlroots-0.18.a.p/types_wlr_region.c.o
+[256/305] Compiling C object libwlroots-0.18.a.p/types_wlr_switch.c.o
+[257/305] Compiling C object libwlroots-0.18.a.p/types_wlr_linux_drm_syncobj_v1.c.o
+[258/305] Compiling C object libwlroots-0.18.a.p/types_wlr_relative_pointer_v1.c.o
+[259/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tablet_pad.c.o
+[260/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer_gestures_v1.c.o
+[261/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tablet_tool.c.o
+[262/305] Compiling C object libwlroots-0.18.a.p/types_wlr_touch.c.o
+[263/305] Compiling C object libwlroots-0.18.a.p/types_wlr_single_pixel_buffer_v1.c.o
+[264/305] Compiling C object libwlroots-0.18.a.p/meson-generated_.._backend_drm_pnpids.c.o
+[265/305] Compiling C object libwlroots-0.18.a.p/types_wlr_output_management_v1.c.o
+[266/305] Compiling C object libwlroots-0.18.a.p/types_wlr_server_decoration.c.o
+[267/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_foreign_registry.c.o
+[268/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xcursor_manager.c.o
+[269/305] Compiling C object libwlroots-0.18.a.p/types_wlr_fractional_scale_v1.c.o
+[270/305] Compiling C object libwlroots-0.18.a.p/types_wlr_compositor.c.o
+[271/305] Compiling C object libwlroots-0.18.a.p/util_addon.c.o
+[272/305] Compiling C object libwlroots-0.18.a.p/types_wlr_security_context_v1.c.o
+[273/305] Compiling C object libwlroots-0.18.a.p/types_wlr_screencopy_v1.c.o
+[274/305] Compiling C object libwlroots-0.18.a.p/types_wlr_session_lock_v1.c.o
+[275/305] Compiling C object libwlroots-0.18.a.p/types_wlr_shm.c.o
 [276/305] Compiling C object libwlroots-0.18.a.p/types_wlr_transient_seat_v1.c.o
 [277/305] Compiling C object libwlroots-0.18.a.p/types_wlr_viewporter.c.o
-[278/305] Compiling C object libwlroots-0.18.a.p/types_wlr_text_input_v3.c.o
-[279/305] Compiling C object libwlroots-0.18.a.p/util_global.c.o
-[280/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_foreign_registry.c.o
-[281/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tearing_control_v1.c.o
-[282/305] Compiling C object libwlroots-0.18.a.p/util_rect_union.c.o
-[283/305] Compiling C object libwlroots-0.18.a.p/types_wlr_pointer_constraints_v1.c.o
-[284/305] Compiling C object libwlroots-0.18.a.p/util_log.c.o
-[285/305] Compiling C object libwlroots-0.18.a.p/util_set.c.o
-[286/305] Compiling C object libwlroots-0.18.a.p/types_wlr_subcompositor.c.o
-[287/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_decoration_v1.c.o
-[288/305] Compiling C object libwlroots-0.18.a.p/util_shm.c.o
-[289/305] Compiling C object libwlroots-0.18.a.p/util_box.c.o
-[290/305] Compiling C object libwlroots-0.18.a.p/util_env.c.o
-[291/305] Compiling C object libwlroots-0.18.a.p/util_token.c.o
-[292/305] Compiling C object libwlroots-0.18.a.p/types_wlr_virtual_keyboard_v1.c.o
-[293/305] Compiling C object libwlroots-0.18.a.p/util_time.c.o
-[294/305] Compiling C object libwlroots-0.18.a.p/util_utf8.c.o
-[295/305] Compiling C object libwlroots-0.18.a.p/types_wlr_virtual_pointer_v1.c.o
-[296/305] Compiling C object libwlroots-0.18.a.p/util_transform.c.o
+[278/305] Compiling C object libwlroots-0.18.a.p/types_wlr_linux_dmabuf_v1.c.o
+[279/305] Compiling C object libwlroots-0.18.a.p/util_env.c.o
+[280/305] Compiling C object libwlroots-0.18.a.p/util_log.c.o
+[281/305] Compiling C object libwlroots-0.18.a.p/util_set.c.o
+[282/305] Compiling C object libwlroots-0.18.a.p/types_wlr_tearing_control_v1.c.o
+[283/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_decoration_v1.c.o
+[284/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_output_v1.c.o
+[285/305] Compiling C object libwlroots-0.18.a.p/types_wlr_subcompositor.c.o
+[286/305] Compiling C object libwlroots-0.18.a.p/util_rect_union.c.o
+[287/305] Compiling C object libwlroots-0.18.a.p/util_shm.c.o
+[288/305] Compiling C object libwlroots-0.18.a.p/util_time.c.o
+[289/305] Compiling C object libwlroots-0.18.a.p/util_token.c.o
+[290/305] Compiling C object libwlroots-0.18.a.p/util_array.c.o
+[291/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_activation_v1.c.o
+[292/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_foreign_v2.c.o
+[293/305] Compiling C object libwlroots-0.18.a.p/types_wlr_text_input_v3.c.o
+[294/305] Compiling C object libwlroots-0.18.a.p/types_wlr_virtual_pointer_v1.c.o
+[295/305] Compiling C object libwlroots-0.18.a.p/util_transform.c.o
+[296/305] Compiling C object libwlroots-0.18.a.p/util_utf8.c.o
 [297/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_foreign_v1.c.o
-[298/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_output_v1.c.o
-[299/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_activation_v1.c.o
-[300/305] Compiling C object libwlroots-0.18.a.p/util_region.c.o
-[301/305] Compiling C object libwlroots-0.18.a.p/xcursor_wlr_xcursor.c.o
-[302/305] Compiling C object libwlroots-0.18.a.p/types_wlr_xdg_foreign_v2.c.o
+[298/305] Compiling C object libwlroots-0.18.a.p/util_global.c.o
+[299/305] Compiling C object libwlroots-0.18.a.p/types_wlr_virtual_keyboard_v1.c.o
+[300/305] Compiling C object libwlroots-0.18.a.p/xcursor_wlr_xcursor.c.o
+[301/305] Compiling C object libwlroots-0.18.a.p/util_region.c.o
+[302/305] Compiling C object libwlroots-0.18.a.p/util_box.c.o
 [303/305] Compiling C object libwlroots-0.18.a.p/types_wlr_drm_lease_v1.c.o
 [304/305] Compiling C object libwlroots-0.18.a.p/xcursor_xcursor.c.o
 [305/305] Linking static target libwlroots-0.18.a

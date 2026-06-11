@@ -160,6 +160,7 @@ Checking for function "accept4" : YES
 Checking for function "close_range" : NO 
 Checking for function "copy_file_range" : NO 
 Checking for function "endmntent" : YES 
+Cloning into 'proxy-libintl'...
 Checking for function "endservent" : NO 
 Checking for function "epoll_create1" : YES 
 Checking for function "fallocate" : NO 
@@ -171,11 +172,11 @@ Checking for function "free_sized" : NO
 Checking for function "fsync" : YES 
 Checking for function "ftruncate64" : NO 
 Checking for function "getauxval" : NO 
-Checking for function "getc_unlocked" : NO 
+Checking for function "getc_unlocked" : YES 
 Checking for function "getfsstat" : NO 
 Checking for function "getgrgid_r" : YES 
 Checking for function "getmntent_r" : YES 
-Checking for function "getpwuid_r" : NO 
+Checking for function "getpwuid_r" : YES 
 Checking for function "getresuid" : NO 
 Checking for function "getvfsstat" : NO 
 Checking for function "gmtime_r" : YES 

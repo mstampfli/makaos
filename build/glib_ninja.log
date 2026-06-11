@@ -1,113 +1,109 @@
 ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/glib_build'
-[1/544] Compiling C object glib/libglib-2.0.a.p/garcbox.c.o
-[2/544] Compiling C object glib/libglib-2.0.a.p/deprecated_gallocator.c.o
-[3/544] Compiling C object subprojects/proxy-libintl/libintl.a.p/libintl.c.o
-[4/544] Compiling C object glib/libglib-2.0.a.p/deprecated_gcache.c.o
-[5/544] Compiling C object glib/gnulib/libgnulib.a.p/asnprintf.c.o
-[6/544] Compiling C object glib/gnulib/libgnulib.a.p/xsize.c.o
-[7/544] Compiling C object glib/libglib-2.0.a.p/gatomic.c.o
-[8/544] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexpl.c.o
-[9/544] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexp.c.o
-[10/544] Compiling C object glib/gnulib/libgnulib.a.p/printf.c.o
-[11/544] Compiling C object glib/libcharset/libcharset.a.p/localcharset.c.o
-[12/544] Compiling C object glib/libglib-2.0.a.p/gbacktrace.c.o
-[13/544] Compiling C object glib/libglib-2.0.a.p/deprecated_gcompletion.c.o
-[14/544] Compiling C object glib/gnulib/libgnulib.a.p/printf-args.c.o
-[15/544] Compiling C object glib/libglib-2.0.a.p/gbitlock.c.o
-[16/544] Compiling C object glib/libglib-2.0.a.p/deprecated_grel.c.o
-[17/544] Compiling C object glib/gnulib/libgnulib.a.p/printf-parse.c.o
-[18/544] Compiling C object glib/libglib-2.0.a.p/gbytes.c.o
-[19/544] Compiling C object glib/libglib-2.0.a.p/gbase64.c.o
-[20/544] Compiling C object glib/libglib-2.0.a.p/gdir.c.o
-[21/544] Compiling C object glib/libglib-2.0.a.p/gcharset.c.o
-[22/544] Compiling C object glib/libglib-2.0.a.p/gasyncqueue.c.o
-[23/544] Compiling C object glib/libglib-2.0.a.p/gdatetime-private.c.o
-[24/544] Compiling C object glib/libglib-2.0.a.p/ghmac.c.o
-[25/544] Compiling C object glib/libglib-2.0.a.p/deprecated_gthread-deprecated.c.o
-[26/544] Compiling C object glib/libglib-2.0.a.p/genviron.c.o
-[27/544] Compiling C object glib/libglib-2.0.a.p/gerror.c.o
-[28/544] Compiling C object glib/libglib-2.0.a.p/ggettext.c.o
-[29/544] Compiling C object glib/libglib-2.0.a.p/ghook.c.o
-[30/544] Compiling C object glib/libglib-2.0.a.p/gmem.c.o
-[31/544] Compiling C object glib/libglib-2.0.a.p/glib-private.c.o
-[32/544] Compiling C object glib/libglib-2.0.a.p/gpoll.c.o
-[33/544] Compiling C object glib/libglib-2.0.a.p/gprimes.c.o
-[34/544] Compiling C object glib/libglib-2.0.a.p/gdataset.c.o
-[35/544] Compiling C object glib/libglib-2.0.a.p/glib-init.c.o
-[36/544] Compiling C object glib/libglib-2.0.a.p/gmappedfile.c.o
-[37/544] Compiling C object glib/libglib-2.0.a.p/glist.c.o
-[38/544] Compiling C object glib/libglib-2.0.a.p/gqsort.c.o
-[39/544] Compiling C object glib/libglib-2.0.a.p/garray.c.o
-[40/544] Compiling C object glib/libglib-2.0.a.p/gdate.c.o
-[41/544] Compiling C object glib/libglib-2.0.a.p/grefcount.c.o
-[42/544] Compiling C object glib/libglib-2.0.a.p/gconvert.c.o
-[43/544] Compiling C object glib/libglib-2.0.a.p/grefstring.c.o
-[44/544] Compiling C object glib/libglib-2.0.a.p/gfileutils.c.o
+[1/566] Generating gobject/gobject-visibility.h with a custom command
+[2/566] Generating gmodule/gmodule-visibility.h with a custom command
+[3/566] Generating gio/gio-visibility.h with a custom command
+[4/566] Copying file gio/gdbus-2.0/codegen/codegen_docbook.py
+[5/566] Copying file gio/gdbus-2.0/codegen/codegen_main.py
+[6/566] Copying file gio/gdbus-2.0/codegen/codegen_rst.py
+[7/566] Copying file gio/gdbus-2.0/codegen/utils.py
+[8/566] Generating glib/gversionmacros.h with a custom command
+[9/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeicon.c.o
+[10/566] Generating glib/glib-visibility.h with a custom command
+[11/566] Generating gio/gconstructor_as_data.h with a custom command
+[12/566] Copying file gio/gdbus-2.0/codegen/dbustypes.py
+[13/566] Compiling C object glib/libcharset/libcharset.a.p/localcharset.c.o
+[14/566] Copying file gio/gdbus-2.0/codegen/codegen_md.py
+[15/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimealias.c.o
+[16/566] Copying file gio/gdbus-2.0/codegen/parser.py
+[17/566] Generating girepository/gi-visibility.h with a custom command
+[18/566] Compiling C object gio/gio-launch-desktop.p/gio-launch-desktop.c.o
+[19/566] Copying file gio/gdbus-2.0/codegen/codegen.py
+[20/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeint.c.o
+[21/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexp.c.o
+[22/566] Copying file gio/gdbus-2.0/codegen/__init__.py
+[23/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-frexpl.c.o
+[24/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeparent.c.o
+[25/566] Compiling C object glib/gnulib/libgnulib.a.p/asnprintf.c.o
+[26/566] Compiling C object subprojects/proxy-libintl/libintl.a.p/libintl.c.o
+[27/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gallocator.c.o
+[28/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gcache.c.o
+[29/566] Compiling C object glib/libglib-2.0.a.p/garcbox.c.o
+[30/566] Compiling C object glib/libglib-2.0.a.p/gatomic.c.o
+[31/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-args.c.o
+[32/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gcompletion.c.o
+[33/566] Compiling C object glib/gnulib/libgnulib.a.p/xsize.c.o
+[34/566] Compiling C object glib/gnulib/libgnulib.a.p/printf.c.o
+[35/566] Generating gobject/glib_enumtypes_h with a custom command (wrapped by meson to capture output)
+[36/566] Compiling C object glib/libglib-2.0.a.p/gasyncqueue.c.o
+[37/566] Compiling C object glib/libglib-2.0.a.p/gbase64.c.o
+[38/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimemagic.c.o
+[39/566] Generating gio/gdbus-daemon-generated with a custom command
+[40/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeglob.c.o
+[41/566] Compiling C object glib/libglib-2.0.a.p/gbytes.c.o
+[42/566] Generating gio/xdp-dbus with a custom command
+[43/566] Compiling C object glib/libglib-2.0.a.p/gbitlock.c.o
+[44/566] Compiling C object glib/libglib-2.0.a.p/deprecated_gthread-deprecated.c.o
+[45/566] Compiling C object glib/gnulib/libgnulib.a.p/printf-parse.c.o
+[46/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmime.c.o
+[47/566] Compiling C object glib/libglib-2.0.a.p/gbacktrace.c.o
+[48/566] Compiling C object glib/libglib-2.0.a.p/deprecated_grel.c.o
+[49/566] Compiling C object glib/libglib-2.0.a.p/gdir.c.o
+[50/566] Compiling C object glib/libglib-2.0.a.p/gdatetime-private.c.o
+[51/566] Compiling C object glib/libglib-2.0.a.p/genviron.c.o
+[52/566] Generating gio/gioenumtypes_h with a custom command (wrapped by meson to capture output)
+[53/566] Compiling C object glib/libglib-2.0.a.p/ghmac.c.o
+[54/566] Compiling C object glib/libglib-2.0.a.p/glib-private.c.o
+[55/566] Generating gobject/glib_enumtypes_c with a custom command (wrapped by meson to capture output)
+[56/566] Compiling C object glib/libglib-2.0.a.p/glib-init.c.o
+[57/566] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimecache.c.o
+[58/566] Compiling C object glib/libglib-2.0.a.p/gmappedfile.c.o
+[59/566] Compiling C object glib/libglib-2.0.a.p/gcharset.c.o
+[60/566] Compiling C object glib/libglib-2.0.a.p/gmem.c.o
+[61/566] Compiling C object glib/libglib-2.0.a.p/ggettext.c.o
+[62/566] Compiling C object glib/libglib-2.0.a.p/gerror.c.o
+[63/566] Compiling C object glib/libglib-2.0.a.p/ghook.c.o
+[64/566] Compiling C object glib/libglib-2.0.a.p/glist.c.o
+[65/566] Compiling C object glib/libglib-2.0.a.p/gpoll.c.o
+[66/566] Compiling C object glib/libglib-2.0.a.p/gconvert.c.o
+[67/566] Compiling C object glib/libglib-2.0.a.p/gprimes.c.o
+[68/566] Compiling C object glib/libglib-2.0.a.p/gdataset.c.o
+[69/566] Compiling C object glib/libglib-2.0.a.p/gdate.c.o
+[70/566] Compiling C object glib/libglib-2.0.a.p/garray.c.o
+[71/566] Compiling C object glib/libglib-2.0.a.p/grefstring.c.o
+[72/566] Compiling C object glib/libglib-2.0.a.p/grefcount.c.o
+[73/566] Compiling C object glib/libglib-2.0.a.p/gpathbuf.c.o
+[74/566] Compiling C object glib/libglib-2.0.a.p/grcbox.c.o
+[75/566] Compiling C object glib/libglib-2.0.a.p/ghostutils.c.o
+[76/566] Compiling C object glib/libglib-2.0.a.p/gquark.c.o
+[77/566] Compiling C object glib/libglib-2.0.a.p/grand.c.o
+[78/566] Compiling C object glib/libglib-2.0.a.p/gqsort.c.o
+[79/566] Compiling C object glib/libglib-2.0.a.p/gqueue.c.o
+[80/566] Compiling C object glib/libglib-2.0.a.p/gfileutils.c.o
 ../third_party/glib-2.82.2/glib/gfileutils.c: In function 'g_get_current_dir':
 ../third_party/glib-2.82.2/glib/gfileutils.c:2995:17: warning: potential null pointer dereference [-Wnull-dereference]
  2995 |       buffer[1] = 0;
       |       ~~~~~~~~~~^~~
 ../third_party/glib-2.82.2/glib/gfileutils.c:2994:17: warning: potential null pointer dereference [-Wnull-dereference]
  2994 |       buffer[0] = G_DIR_SEPARATOR;
-[45/544] Compiling C object glib/libglib-2.0.a.p/gpathbuf.c.o
-[46/544] Compiling C object glib/libglib-2.0.a.p/grcbox.c.o
-[47/544] Compiling C object glib/libglib-2.0.a.p/ghostutils.c.o
-[48/544] Compiling C object glib/libglib-2.0.a.p/grand.c.o
-[49/544] Compiling C object glib/libglib-2.0.a.p/gquark.c.o
-[50/544] Compiling C object glib/libglib-2.0.a.p/gslice.c.o
-[51/544] Compiling C object glib/libglib-2.0.a.p/gpattern.c.o
-[52/544] Compiling C object glib/libglib-2.0.a.p/giochannel.c.o
-[53/544] Compiling C object glib/libglib-2.0.a.p/gspawn.c.o
-[54/544] Compiling C object glib/libglib-2.0.a.p/gnode.c.o
-[55/544] Compiling C object glib/libglib-2.0.a.p/gqueue.c.o
-[56/544] Compiling C object glib/libglib-2.0.a.p/gstringchunk.c.o
-[57/544] Compiling C object glib/libglib-2.0.a.p/ghash.c.o
-[58/544] Compiling C object glib/libglib-2.0.a.p/gshell.c.o
-[59/544] Compiling C object glib/libglib-2.0.a.p/gstrvbuilder.c.o
-[60/544] Compiling C object glib/libglib-2.0.a.p/gstdio.c.o
-[61/544] Compiling C object glib/libglib-2.0.a.p/gtrace.c.o
-[62/544] Compiling C object glib/libglib-2.0.a.p/gtrashstack.c.o
-[63/544] Compiling C object glib/libglib-2.0.a.p/gslist.c.o
-[64/544] Compiling C object glib/libglib-2.0.a.p/gtimer.c.o
-[65/544] Compiling C object glib/libglib-2.0.a.p/gstring.c.o
-[66/544] Compiling C object glib/libglib-2.0.a.p/gtranslit.c.o
-[67/544] Compiling C object glib/libglib-2.0.a.p/gthreadpool.c.o
-[68/544] Compiling C object glib/libglib-2.0.a.p/gunibreak.c.o
-[69/544] Compiling C object glib/libglib-2.0.a.p/gthread.c.o
-../third_party/glib-2.82.2/glib/gthread.c: In function 'g_once_init_leave':
-../third_party/glib-2.82.2/glib/gthread.c:769:9: warning: variable 'old_value' set but not used [-Wunused-but-set-variable]
-  769 |   gsize old_value;
-      |         ^~~~~~~~~
-../third_party/glib-2.82.2/glib/gthread.c: In function 'g_once_init_leave_pointer':
-../third_party/glib-2.82.2/glib/gthread.c:805:12: warning: variable 'old_value' set but not used [-Wunused-but-set-variable]
-  805 |   gpointer old_value;
-      |            ^~~~~~~~~
-[70/544] Compiling C object glib/libglib-2.0.a.p/guuid.c.o
-[71/544] Compiling C object glib/libglib-2.0.a.p/gmessages.c.o
-../third_party/glib-2.82.2/glib/gmessages.c: In function 'g_log_writer_syslog':
-../third_party/glib-2.82.2/glib/gmessages.c:2342:3: warning: potential null pointer dereference [-Wnull-dereference]
- 2342 |   syslog (syslog_level | syslog_facility, "%s", gstring->str);
-      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-[72/544] Compiling C object glib/libglib-2.0.a.p/gdatetime.c.o
-[73/544] Compiling C object glib/libglib-2.0.a.p/gscanner.c.o
-[74/544] Compiling C object glib/libglib-2.0.a.p/gmarkup.c.o
-[75/544] Compiling C object glib/libglib-2.0.a.p/gunicollate.c.o
-[76/544] Compiling C object glib/libglib-2.0.a.p/gversion.c.o
-[77/544] Compiling C object glib/libglib-2.0.a.p/gkeyfile.c.o
-../third_party/glib-2.82.2/glib/gkeyfile.c: In function 'g_key_file_set_group_comment':
-../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
- 3401 |   group = group_node->next->data;
-      |           ~~~~~~~~~~^~~~~~
-../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
-In function 'g_key_file_get_group_comment',
-    inlined from 'g_key_file_get_comment' at ../third_party/glib-2.82.2/glib/gkeyfile.c:3684:12:
-../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
- 3630 |   group_node = group_node->next;
-      |   ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
-../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
-[78/544] Compiling C object glib/libglib-2.0.a.p/gregex.c.o
-[79/544] Compiling C object glib/libglib-2.0.a.p/gvariant-core.c.o
-[80/544] Compiling C object glib/libglib-2.0.a.p/gsequence.c.o
+[81/566] Compiling C object glib/libglib-2.0.a.p/gspawn.c.o
+[82/566] Generating gio/gioenumtypes_c with a custom command (wrapped by meson to capture output)
+[83/566] Compiling C object glib/libglib-2.0.a.p/gslice.c.o
+[84/566] Compiling C object glib/libglib-2.0.a.p/gnode.c.o
+[85/566] Compiling C object glib/libglib-2.0.a.p/gstringchunk.c.o
+[86/566] Compiling C object glib/libglib-2.0.a.p/gpattern.c.o
+[87/566] Compiling C object glib/libglib-2.0.a.p/gstdio.c.o
+[88/566] Compiling C object glib/libglib-2.0.a.p/gstrvbuilder.c.o
+[89/566] Compiling C object glib/libglib-2.0.a.p/gslist.c.o
+[90/566] Compiling C object glib/libglib-2.0.a.p/gshell.c.o
+[91/566] Compiling C object glib/libglib-2.0.a.p/giochannel.c.o
+[92/566] Compiling C object glib/libglib-2.0.a.p/ghash.c.o
+[93/566] Compiling C object glib/libglib-2.0.a.p/gtrashstack.c.o
+[94/566] Compiling C object glib/libglib-2.0.a.p/gtrace.c.o
+[95/566] Compiling C object glib/libglib-2.0.a.p/gtimer.c.o
+[96/566] Compiling C object glib/libglib-2.0.a.p/gunibreak.c.o
+[97/566] Compiling C object glib/libglib-2.0.a.p/gthreadpool.c.o
+[98/566] Compiling C object glib/libglib-2.0.a.p/gunicollate.c.o
+[99/566] Compiling C object glib/libglib-2.0.a.p/gsequence.c.o
 ../third_party/glib-2.82.2/glib/gsequence.c: In function 'g_sequence_remove_range':
 ../third_party/glib-2.82.2/glib/gsequence.c:533:26: warning: variable 'seq_end' set but not used [-Wunused-but-set-variable]
   533 |   GSequence *seq_begin, *seq_end;
@@ -119,16 +115,42 @@ In function 'g_key_file_get_group_comment',
 ../third_party/glib-2.82.2/glib/gsequence.c:143:1: warning: 'seq_is_end' defined but not used [-Wunused-function]
   143 | seq_is_end (GSequence     *seq,
       | ^~~~~~~~~~
-[81/544] Compiling C object glib/libglib-2.0.a.p/gprintf.c.o
-[82/544] Compiling C object glib/libglib-2.0.a.p/gwakeup.c.o
-[83/544] Compiling C object glib/libglib-2.0.a.p/gtree.c.o
-[84/544] Compiling C object glib/libglib-2.0.a.p/gvarianttypeinfo.c.o
-[85/544] Compiling C object glib/libglib-2.0.a.p/glib-unix.c.o
-[86/544] Compiling C object glib/libglib-2.0.a.p/gvarianttype.c.o
-../third_party/glib-2.82.2/glib/gvarianttype.c:194:1: warning: 'g_variant_type_check' defined but not used [-Wunused-function]
-  194 | g_variant_type_check (const GVariantType *type)
-      | ^~~~~~~~~~~~~~~~~~~~
-[87/544] Compiling C object glib/libglib-2.0.a.p/gmain.c.o
+[100/566] Compiling C object glib/libglib-2.0.a.p/gdatetime.c.o
+[101/566] Compiling C object glib/libglib-2.0.a.p/gstring.c.o
+[102/566] Compiling C object glib/libglib-2.0.a.p/gtree.c.o
+[103/566] Compiling C object glib/libglib-2.0.a.p/guuid.c.o
+[104/566] Compiling C object glib/libglib-2.0.a.p/gtranslit.c.o
+[105/566] Compiling C object glib/libglib-2.0.a.p/gversion.c.o
+[106/566] Compiling C object glib/libglib-2.0.a.p/gmarkup.c.o
+[107/566] Compiling C object glib/libglib-2.0.a.p/gthread.c.o
+../third_party/glib-2.82.2/glib/gthread.c: In function 'g_once_init_leave':
+../third_party/glib-2.82.2/glib/gthread.c:769:9: warning: variable 'old_value' set but not used [-Wunused-but-set-variable]
+  769 |   gsize old_value;
+      |         ^~~~~~~~~
+../third_party/glib-2.82.2/glib/gthread.c: In function 'g_once_init_leave_pointer':
+../third_party/glib-2.82.2/glib/gthread.c:805:12: warning: variable 'old_value' set but not used [-Wunused-but-set-variable]
+  805 |   gpointer old_value;
+      |            ^~~~~~~~~
+[108/566] Compiling C object glib/libglib-2.0.a.p/gscanner.c.o
+[109/566] Compiling C object glib/libglib-2.0.a.p/gmessages.c.o
+../third_party/glib-2.82.2/glib/gmessages.c: In function 'g_log_writer_syslog':
+../third_party/glib-2.82.2/glib/gmessages.c:2342:3: warning: potential null pointer dereference [-Wnull-dereference]
+ 2342 |   syslog (syslog_level | syslog_facility, "%s", gstring->str);
+      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[110/566] Compiling C object glib/libglib-2.0.a.p/gwakeup.c.o
+[111/566] Compiling C object glib/libglib-2.0.a.p/gkeyfile.c.o
+../third_party/glib-2.82.2/glib/gkeyfile.c: In function 'g_key_file_set_group_comment':
+../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
+ 3401 |   group = group_node->next->data;
+      |           ~~~~~~~~~~^~~~~~
+../third_party/glib-2.82.2/glib/gkeyfile.c:3401:21: warning: potential null pointer dereference [-Wnull-dereference]
+In function 'g_key_file_get_group_comment',
+    inlined from 'g_key_file_get_comment' at ../third_party/glib-2.82.2/glib/gkeyfile.c:3684:12:
+../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
+ 3630 |   group_node = group_node->next;
+      |   ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+../third_party/glib-2.82.2/glib/gkeyfile.c:3630:14: warning: potential null pointer dereference [-Wnull-dereference]
+[112/566] Compiling C object glib/libglib-2.0.a.p/gmain.c.o
 ../third_party/glib-2.82.2/glib/gmain.c: In function 'g_main_context_ref':
 ../third_party/glib-2.82.2/glib/gmain.c:472:7: warning: variable 'old_ref_count' set but not used [-Wunused-but-set-variable]
   472 |   int old_ref_count;
@@ -137,31 +159,28 @@ In function 'g_key_file_get_group_comment',
 ../third_party/glib-2.82.2/glib/gmain.c:785:12: warning: variable 'acquired_context' set but not used [-Wunused-but-set-variable]
   785 |   gboolean acquired_context;
       |            ^~~~~~~~~~~~~~~~
-[88/544] Compiling C object glib/libglib-2.0.a.p/goption.c.o
-[89/544] Compiling C object glib/libglib-2.0.a.p/gstrfuncs.c.o
-[90/544] Compiling C object gobject/libgobject-2.0.a.p/meson-generated_.._glib-enumtypes.c.o
-[91/544] Compiling C object glib/libglib-2.0.a.p/gutf8.c.o
-[92/544] Compiling C object gobject/libgobject-2.0.a.p/gatomicarray.c.o
-[93/544] Compiling C object glib/libglib-2.0.a.p/giounix.c.o
-[94/544] Compiling C object glib/libglib-2.0.a.p/gunidecomp.c.o
-[95/544] Compiling C object glib/libglib-2.0.a.p/gutils.c.o
-../third_party/glib-2.82.2/glib/gutils.c: In function 'g_get_user_database_entry':
-../third_party/glib-2.82.2/glib/gutils.c:667:21: warning: unused variable 'logname' [-Wunused-variable]
-  667 |         const char *logname;
-      |                     ^~~~~~~
-../third_party/glib-2.82.2/glib/gutils.c:666:14: warning: unused variable 'error' [-Wunused-variable]
-  666 |         gint error;
-      |              ^~~~~
-[96/544] Compiling C object glib/libglib-2.0.a.p/gchecksum.c.o
-[97/544] Compiling C object gobject/libgobject-2.0.a.p/gbindinggroup.c.o
-../third_party/glib-2.82.2/gobject/gbindinggroup.c: In function 'g_binding_group_check_source':
-../third_party/glib-2.82.2/gobject/gbindinggroup.c:412:20: warning: unused variable 'lazy_binding' [-Wunused-variable]
-  412 |       LazyBinding *lazy_binding = g_ptr_array_index (self->lazy_bindings, i);
-      |                    ^~~~~~~~~~~~
-[98/544] Compiling C object gobject/libgobject-2.0.a.p/gtypeplugin.c.o
-[99/544] Compiling C object gobject/libgobject-2.0.a.p/gsourceclosure.c.o
-[100/544] Compiling C object glib/libglib-2.0.a.p/gspawn-posix.c.o
-[101/544] Compiling C object glib/libglib-2.0.a.p/gtimezone.c.o
+[113/566] Compiling C object glib/libglib-2.0.a.p/gvarianttypeinfo.c.o
+[114/566] Compiling C object glib/libglib-2.0.a.p/gunidecomp.c.o
+[115/566] Compiling C object glib/libglib-2.0.a.p/gvariant-core.c.o
+[116/566] Compiling C object glib/libglib-2.0.a.p/goption.c.o
+[117/566] Compiling C object glib/libglib-2.0.a.p/gprintf.c.o
+[118/566] Compiling C object glib/libglib-2.0.a.p/gvarianttype.c.o
+../third_party/glib-2.82.2/glib/gvarianttype.c:194:1: warning: 'g_variant_type_check' defined but not used [-Wunused-function]
+  194 | g_variant_type_check (const GVariantType *type)
+      | ^~~~~~~~~~~~~~~~~~~~
+[119/566] Compiling C object glib/libglib-2.0.a.p/gregex.c.o
+[120/566] Compiling C object glib/libglib-2.0.a.p/gchecksum.c.o
+[121/566] Compiling C object glib/libglib-2.0.a.p/glib-unix.c.o
+[122/566] Compiling C object gobject/libgobject-2.0.a.p/gatomicarray.c.o
+[123/566] Compiling C object glib/libglib-2.0.a.p/giounix.c.o
+[124/566] Compiling C object gobject/libgobject-2.0.a.p/meson-generated_.._glib-enumtypes.c.o
+[125/566] Compiling C object glib/libglib-2.0.a.p/gbookmarkfile.c.o
+[126/566] Compiling C object gobject/libgobject-2.0.a.p/genums.c.o
+../third_party/glib-2.82.2/gobject/genums.c: In function '_g_enum_types_init':
+../third_party/glib-2.82.2/gobject/genums.c:55:19: warning: variable 'initialized' set but not used [-Wunused-but-set-variable]
+   55 |   static gboolean initialized = FALSE;
+      |                   ^~~~~~~~~~~
+[127/566] Compiling C object glib/libglib-2.0.a.p/gtimezone.c.o
 ../third_party/glib-2.82.2/glib/gtimezone.c:2205:1: warning: 'interval_valid' defined but not used [-Wunused-function]
  2205 | interval_valid (GTimeZone *tz,
       | ^~~~~~~~~~~~~~
@@ -173,13 +192,29 @@ In function 'init_zone_from_iana_info',
 ../third_party/glib-2.82.2/glib/gtimezone.c:747:38: warning: potential null pointer dereference [-Wnull-dereference]
   747 |           extra_type_count = footertz->t_info->len;
       |                              ~~~~~~~~^~~~~~~~
-[102/544] Compiling C object glib/libglib-2.0.a.p/gvariant-serialiser.c.o
+[128/566] Compiling C object glib/libglib-2.0.a.p/gutf8.c.o
+[129/566] Compiling C object gobject/libgobject-2.0.a.p/gbindinggroup.c.o
+../third_party/glib-2.82.2/gobject/gbindinggroup.c: In function 'g_binding_group_check_source':
+../third_party/glib-2.82.2/gobject/gbindinggroup.c:412:20: warning: unused variable 'lazy_binding' [-Wunused-variable]
+  412 |       LazyBinding *lazy_binding = g_ptr_array_index (self->lazy_bindings, i);
+      |                    ^~~~~~~~~~~~
+[130/566] Compiling C object gobject/libgobject-2.0.a.p/gtypeplugin.c.o
+[131/566] Compiling C object glib/libglib-2.0.a.p/gstrfuncs.c.o
+[132/566] Compiling C object gobject/libgobject-2.0.a.p/gsourceclosure.c.o
+[133/566] Compiling C object glib/libglib-2.0.a.p/gvariant-serialiser.c.o
 In function 'gvs_tuple_needed_size',
     inlined from 'g_variant_serialiser_needed_size' at ../third_party/glib-2.82.2/glib/gvariant-serialiser.c:1664:3:
 ../third_party/glib-2.82.2/glib/gvariant-serialiser.c:1174:55: warning: potential null pointer dereference [-Wnull-dereference]
  1174 |   return gvs_calculate_total_size (offset, member_info->i + 1);
       |                                            ~~~~~~~~~~~^~~
-[103/544] Compiling C object gobject/libgobject-2.0.a.p/gtypemodule.c.o
+[134/566] Compiling C object gmodule/libgmodule-2.0.a.p/gmodule-deprecated.c.o
+[135/566] Compiling C object glib/libglib-2.0.a.p/gspawn-posix.c.o
+[136/566] Compiling C object glib/libglib-2.0.a.p/guniprop.c.o
+[137/566] Compiling C object gobject/libgobject-2.0.a.p/gsignalgroup.c.o
+[138/566] Compiling C object gobject/libgobject-2.0.a.p/gvaluearray.c.o
+[139/566] Compiling C object gobject/libgobject-2.0.a.p/gboxed.c.o
+[140/566] Compiling C object gobject/libgobject-2.0.a.p/gvalue.c.o
+[141/566] Compiling C object gobject/libgobject-2.0.a.p/gtypemodule.c.o
 ../third_party/glib-2.82.2/gobject/gtypemodule.c: In function 'g_type_module_complete_type_info':
 ../third_party/glib-2.82.2/gobject/gtypemodule.c:337:29: warning: potential null pointer dereference [-Wnull-dereference]
   337 |   if (module_type_info->info.value_table)
@@ -214,35 +249,17 @@ In function 'gvs_tuple_needed_size',
       |   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
 ../third_party/glib-2.82.2/gobject/gtypemodule.c:520:33: warning: potential null pointer dereference [-Wnull-dereference]
   520 |   module_interface_info->loaded = TRUE;
-[104/544] Compiling C object gobject/libgobject-2.0.a.p/gsignalgroup.c.o
-[105/544] Compiling C object glib/libglib-2.0.a.p/guniprop.c.o
-[106/544] Compiling C object gobject/libgobject-2.0.a.p/genums.c.o
-../third_party/glib-2.82.2/gobject/genums.c: In function '_g_enum_types_init':
-../third_party/glib-2.82.2/gobject/genums.c:55:19: warning: variable 'initialized' set but not used [-Wunused-but-set-variable]
-   55 |   static gboolean initialized = FALSE;
-      |                   ^~~~~~~~~~~
-[107/544] Compiling C object gobject/libgobject-2.0.a.p/gvaluearray.c.o
-[108/544] Compiling C object gmodule/libgmodule-2.0.a.p/gmodule-deprecated.c.o
-[109/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimealias.c.o
-[110/544] Compiling C object glib/libglib-2.0.a.p/guri.c.o
-[111/544] Compiling C object gobject/libgobject-2.0.a.p/gbinding.c.o
-[112/544] Compiling C object gobject/libgobject-2.0.a.p/gboxed.c.o
-[113/544] Compiling C object gobject/libgobject-2.0.a.p/gmarshal.c.o
-[114/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeicon.c.o
-[115/544] Compiling C object glib/libglib-2.0.a.p/gbookmarkfile.c.o
-[116/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeint.c.o
-[117/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeparent.c.o
-[118/544] Compiling C object gobject/libgobject-2.0.a.p/gvaluetypes.c.o
-[119/544] Compiling C object gobject/libgobject-2.0.a.p/gparam.c.o
-[120/544] Compiling C object gobject/libgobject-2.0.a.p/gvalue.c.o
-[121/544] Compiling C object gobject/libgobject-2.0.a.p/gparamspecs.c.o
-[122/544] Compiling C object gobject/libgobject-2.0.a.p/gclosure.c.o
-[123/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmime.c.o
-[124/544] Compiling C object gobject/libgobject-2.0.a.p/gvaluetransform.c.o
-[125/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimeglob.c.o
-[126/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimemagic.c.o
-[127/544] Compiling C object gio/libgio-2.0.a.p/gasynchelper.c.o
-[128/544] Compiling C object glib/libglib-2.0.a.p/gvariant-parser.c.o
+[142/566] Compiling C object gobject/libgobject-2.0.a.p/gbinding.c.o
+[143/566] Compiling C object glib/libglib-2.0.a.p/guri.c.o
+[144/566] Compiling C object gobject/libgobject-2.0.a.p/gmarshal.c.o
+[145/566] Compiling C object glib/libglib-2.0.a.p/gutils.c.o
+[146/566] Compiling C object gobject/libgobject-2.0.a.p/gparam.c.o
+[147/566] Compiling C object gmodule/libgmodule-2.0.a.p/gmodule.c.o
+[148/566] Compiling C object gio/libgio-2.0.a.p/gasynchelper.c.o
+[149/566] Compiling C object gio/libgio-2.0.a.p/gasyncinitable.c.o
+[150/566] Compiling C object gio/libgio-2.0.a.p/gasyncresult.c.o
+[151/566] Compiling C object gio/libgio-2.0.a.p/gconverter.c.o
+[152/566] Compiling C object glib/libglib-2.0.a.p/gvariant-parser.c.o
 In function 'string_parse',
     inlined from 'parse' at ../third_party/glib-2.82.2/glib/gvariant-parser.c:2444:14:
 ../third_party/glib-2.82.2/glib/gvariant-parser.c:1693:9: warning: potential null pointer dereference [-Wnull-dereference]
@@ -253,74 +270,63 @@ In function 'bytestring_parse',
 ../third_party/glib-2.82.2/glib/gvariant-parser.c:1824:9: warning: potential null pointer dereference [-Wnull-dereference]
  1824 |   quote = token[1];
       |   ~~~~~~^~~~~~~~~~
-[129/544] Compiling C object gio/libgio-2.0.a.p/gasyncresult.c.o
-[130/544] Compiling C object gmodule/libgmodule-2.0.a.p/gmodule.c.o
-[131/544] Compiling C object gio/libgio-2.0.a.p/gasyncinitable.c.o
-[132/544] Compiling C object gio/libgio-2.0.a.p/gbytesicon.c.o
-[133/544] Compiling C object gio/libgio-2.0.a.p/gconverter.c.o
-[134/544] Compiling C object gio/libgio-2.0.a.p/gcontenttype.c.o
-[135/544] Compiling C object gio/libgio-2.0.a.p/gcharsetconverter.c.o
-[136/544] Compiling C object gio/libgio-2.0.a.p/gcontextspecificgroup.c.o
-[137/544] Compiling C object gio/libgio-2.0.a.p/gbufferedoutputstream.c.o
-[138/544] Compiling C object gio/xdgmime/libxdgmime.a.p/xdgmimecache.c.o
-[139/544] Compiling C object gio/libgio-2.0.a.p/gcancellable.c.o
-[140/544] Compiling C object gio/libgio-2.0.a.p/gdatagrambased.c.o
-[141/544] Compiling C object gio/libgio-2.0.a.p/gdebugcontroller.c.o
-[142/544] Compiling C object glib/libglib-2.0.a.p/gtestutils.c.o
-[143/544] Compiling C object gio/libgio-2.0.a.p/gcredentials.c.o
+[153/566] Compiling C object gio/libgio-2.0.a.p/gcharsetconverter.c.o
+[154/566] Compiling C object gobject/libgobject-2.0.a.p/gvaluetransform.c.o
+[155/566] Compiling C object gio/libgio-2.0.a.p/gcontenttype.c.o
+[156/566] Compiling C object gobject/libgobject-2.0.a.p/gvaluetypes.c.o
+[157/566] Compiling C object gio/libgio-2.0.a.p/gbytesicon.c.o
+[158/566] Compiling C object gobject/libgobject-2.0.a.p/gclosure.c.o
+[159/566] Compiling C object gio/libgio-2.0.a.p/gcontextspecificgroup.c.o
+[160/566] Compiling C object gio/libgio-2.0.a.p/gbufferedoutputstream.c.o
+[161/566] Compiling C object gobject/libgobject-2.0.a.p/gparamspecs.c.o
+[162/566] Compiling C object gio/libgio-2.0.a.p/gbufferedinputstream.c.o
+[163/566] Compiling C object gio/libgio-2.0.a.p/gdatagrambased.c.o
+[164/566] Compiling C object gio/libgio-2.0.a.p/gcredentials.c.o
 ../third_party/glib-2.82.2/gio/gcredentials.c:104:4: warning: #warning Please add GCredentials support for your OS [-Wcpp]
   104 |   #warning Please add GCredentials support for your OS
       |    ^~~~~~~
-[144/544] Compiling C object gio/libgio-2.0.a.p/gbufferedinputstream.c.o
-[145/544] Compiling C object gio/libgio-2.0.a.p/gdummyproxyresolver.c.o
-[146/544] Compiling C object gio/libgio-2.0.a.p/gconverteroutputstream.c.o
-[147/544] Compiling C object gio/libgio-2.0.a.p/gdataoutputstream.c.o
-[148/544] Compiling C object gio/libgio-2.0.a.p/gappinfo.c.o
-[149/544] Compiling C object gio/libgio-2.0.a.p/gdrive.c.o
-[150/544] Compiling C object gio/libgio-2.0.a.p/gconverterinputstream.c.o
-[151/544] Compiling C object glib/libglib-2.0.a.p/gvariant.c.o
+[165/566] Compiling C object gio/libgio-2.0.a.p/gcancellable.c.o
+[166/566] Compiling C object gio/libgio-2.0.a.p/gdebugcontroller.c.o
+[167/566] Compiling C object gio/libgio-2.0.a.p/gconverterinputstream.c.o
+[168/566] Compiling C object gio/libgio-2.0.a.p/gdummyproxyresolver.c.o
+[169/566] Compiling C object gio/libgio-2.0.a.p/gemblem.c.o
+[170/566] Compiling C object gio/libgio-2.0.a.p/gconverteroutputstream.c.o
+[171/566] Compiling C object gio/libgio-2.0.a.p/gdrive.c.o
+[172/566] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._gioenumtypes.c.o
+[173/566] Compiling C object gio/libgio-2.0.a.p/gappinfo.c.o
+[174/566] Compiling C object gio/libgio-2.0.a.p/gdummytlsbackend.c.o
+[175/566] Compiling C object gio/libgio-2.0.a.p/gfileicon.c.o
+[176/566] Compiling C object gio/libgio-2.0.a.p/gdataoutputstream.c.o
+[177/566] Compiling C object gio/libgio-2.0.a.p/gdatainputstream.c.o
+[178/566] Compiling C object gio/libgio-2.0.a.p/gfileinputstream.c.o
+[179/566] Compiling C object glib/libglib-2.0.a.p/gvariant.c.o
 ../third_party/glib-2.82.2/glib/gvariant.c:4648:1: warning: 'valid_format_string' defined but not used [-Wunused-function]
  4648 | valid_format_string (const gchar *format_string,
       | ^~~~~~~~~~~~~~~~~~~
-[152/544] Compiling C object gio/libgio-2.0.a.p/gdummytlsbackend.c.o
-[153/544] Compiling C object gio/libgio-2.0.a.p/gdatainputstream.c.o
-[154/544] Compiling C object gio/libgio-2.0.a.p/gemblem.c.o
-[155/544] Compiling C object gio/libgio-2.0.a.p/gemblemedicon.c.o
-[156/544] Compiling C object gio/libgio-2.0.a.p/gdebugcontrollerdbus.c.o
-[157/544] Compiling C object gio/libgio-2.0.a.p/gfileicon.c.o
-[158/544] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._gioenumtypes.c.o
-[159/544] Compiling C object gio/libgio-2.0.a.p/gfilemonitor.c.o
-[160/544] Compiling C object gio/libgio-2.0.a.p/gfilterinputstream.c.o
-[161/544] Compiling C object gio/libgio-2.0.a.p/gfilenamecompleter.c.o
-[162/544] Compiling C object gio/libgio-2.0.a.p/gfileenumerator.c.o
-[163/544] Compiling C object gio/libgio-2.0.a.p/gfilteroutputstream.c.o
-[164/544] Compiling C object gio/libgio-2.0.a.p/gfileiostream.c.o
-[165/544] Compiling C object gio/libgio-2.0.a.p/ginitable.c.o
-[166/544] Compiling C object gio/libgio-2.0.a.p/gfileinputstream.c.o
-[167/544] Compiling C object gio/libgio-2.0.a.p/gfileoutputstream.c.o
-[168/544] Compiling C object gio/libgio-2.0.a.p/gdummyfile.c.o
-[169/544] Compiling C object gio/libgio-2.0.a.p/giomodule-priv.c.o
-[170/544] Compiling C object gio/libgio-2.0.a.p/gioerror.c.o
-[171/544] Compiling C object gio/libgio-2.0.a.p/gicon.c.o
-[172/544] Compiling C object gio/libgio-2.0.a.p/ginetaddress.c.o
-[173/544] Compiling C object gio/libgio-2.0.a.p/gfileattribute.c.o
+[180/566] Compiling C object gio/libgio-2.0.a.p/gdebugcontrollerdbus.c.o
+[181/566] Compiling C object gio/libgio-2.0.a.p/gfilenamecompleter.c.o
+[182/566] Compiling C object glib/libglib-2.0.a.p/gtestutils.c.o
+[183/566] Compiling C object gio/libgio-2.0.a.p/gemblemedicon.c.o
+[184/566] Compiling C object gio/libgio-2.0.a.p/gfilemonitor.c.o
+[185/566] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._gdbus-daemon-generated.c.o
+[186/566] Compiling C object gio/libgio-2.0.a.p/gfileoutputstream.c.o
+[187/566] Compiling C object gio/libgio-2.0.a.p/gfilteroutputstream.c.o
+[188/566] Compiling C object gio/libgio-2.0.a.p/ginitable.c.o
+[189/566] Compiling C object gio/libgio-2.0.a.p/gfilterinputstream.c.o
+[190/566] Compiling C object gio/libgio-2.0.a.p/gdummyfile.c.o
+[191/566] Compiling C object gio/libgio-2.0.a.p/giomodule-priv.c.o
+[192/566] Compiling C object gio/libgio-2.0.a.p/gioerror.c.o
+[193/566] Compiling C object gio/libgio-2.0.a.p/gfileattribute.c.o
 ../third_party/glib-2.82.2/gio/gfileattribute.c: In function 'g_file_attribute_info_list_ref':
 ../third_party/glib-2.82.2/gio/gfileattribute.c:755:7: warning: variable 'old_ref_count' set but not used [-Wunused-but-set-variable]
   755 |   int old_ref_count;
       |       ^~~~~~~~~~~~~
-[174/544] Compiling C object gio/libgio-2.0.a.p/gmemorymonitor.c.o
-[175/544] Compiling C object gio/libgio-2.0.a.p/gioscheduler.c.o
-[176/544] Compiling C object gio/libgio-2.0.a.p/ginetsocketaddress.c.o
-[177/544] Compiling C object gio/libgio-2.0.a.p/ginetaddressmask.c.o
-[178/544] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._gdbus-daemon-generated.c.o
-[179/544] Compiling C object gio/libgio-2.0.a.p/gnativevolumemonitor.c.o
-[180/544] Compiling C object gio/libgio-2.0.a.p/gnativesocketaddress.c.o
-[181/544] Compiling C object gio/libgio-2.0.a.p/gmount.c.o
-[182/544] Compiling C object gio/libgio-2.0.a.p/gnetworking.c.o
-[183/544] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitor.c.o
-[184/544] Compiling C object gio/libgio-2.0.a.p/gmemorymonitordbus.c.o
-[185/544] Compiling C object gio/libgio-2.0.a.p/gloadableicon.c.o
-[186/544] Compiling C object glib/gnulib/libgnulib.a.p/vasnprintf.c.o
+[194/566] Compiling C object gio/libgio-2.0.a.p/gioscheduler.c.o
+[195/566] Compiling C object gio/libgio-2.0.a.p/gfileiostream.c.o
+[196/566] Compiling C object gio/libgio-2.0.a.p/ginetaddress.c.o
+[197/566] Compiling C object gio/libgio-2.0.a.p/gmemorymonitor.c.o
+[198/566] Compiling C object gio/libgio-2.0.a.p/ginetsocketaddress.c.o
+[199/566] Compiling C object glib/gnulib/libgnulib.a.p/vasnprintf.c.o
 ../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c: In function '_g_gnulib_vasnprintf':
 ../third_party/glib-2.82.2/glib/gnulib/vasnprintf.c:5335:31: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
  5335 |                     if (count >= tmp_length)
@@ -344,21 +350,41 @@ In file included from ../third_party/glib-2.82.2/glib/glist.h:34,
 ../third_party/glib-2.82.2/glib/gmem.h:84:10: note: in a call to allocation function 'g_malloc' declared here
    84 | gpointer g_malloc         (gsize         n_bytes) G_GNUC_MALLOC G_GNUC_ALLOC_SIZE(1);
       |          ^~~~~~~~
-[187/544] Compiling C object gio/libgio-2.0.a.p/ginputstream.c.o
-[188/544] Compiling C object gio/libgio-2.0.a.p/giostream.c.o
-[189/544] Compiling C object gio/libgio-2.0.a.p/gmemoryinputstream.c.o
-[190/544] Compiling C object gio/libgio-2.0.a.p/gmountoperation.c.o
-[191/544] Compiling C object gio/libgio-2.0.a.p/gpermission.c.o
-[192/544] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitor.c.o
-[193/544] Compiling C object gio/libgio-2.0.a.p/giomodule.c.o
-[194/544] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitordbus.c.o
-[195/544] Compiling C object gio/libgio-2.0.a.p/gpollableinputstream.c.o
-[196/544] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitorbase.c.o
-[197/544] Compiling C object gio/libgio-2.0.a.p/gproxy.c.o
-[198/544] Compiling C object gio/libgio-2.0.a.p/gmemoryoutputstream.c.o
-[199/544] Compiling C object gio/libgio-2.0.a.p/gpollfilemonitor.c.o
-[200/544] Compiling C object gio/libgio-2.0.a.p/gproxyaddress.c.o
-[201/544] Compiling C object gobject/libgobject-2.0.a.p/gobject.c.o
+[200/566] Compiling C object gio/libgio-2.0.a.p/gloadableicon.c.o
+[201/566] Compiling C object gio/libgio-2.0.a.p/ginetaddressmask.c.o
+[202/566] Compiling C object gio/libgio-2.0.a.p/gfileenumerator.c.o
+[203/566] Compiling C object gio/libgio-2.0.a.p/gmemorymonitordbus.c.o
+[204/566] Compiling C object gio/libgio-2.0.a.p/gnetworking.c.o
+[205/566] Compiling C object gio/libgio-2.0.a.p/giostream.c.o
+[206/566] Compiling C object gio/libgio-2.0.a.p/gnativevolumemonitor.c.o
+[207/566] Compiling C object gio/libgio-2.0.a.p/gnativesocketaddress.c.o
+[208/566] Compiling C object gio/libgio-2.0.a.p/gmount.c.o
+[209/566] Compiling C object gio/libgio-2.0.a.p/gicon.c.o
+[210/566] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitor.c.o
+[211/566] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitor.c.o
+[212/566] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitorbase.c.o
+[213/566] Compiling C object gio/libgio-2.0.a.p/gmemoryoutputstream.c.o
+[214/566] Compiling C object gio/libgio-2.0.a.p/ginputstream.c.o
+[215/566] Compiling C object gio/libgio-2.0.a.p/gpollableutils.c.o
+[216/566] Compiling C object gio/libgio-2.0.a.p/gpollfilemonitor.c.o
+[217/566] Compiling C object gio/libgio-2.0.a.p/gmountoperation.c.o
+[218/566] Compiling C object gio/libgio-2.0.a.p/gpermission.c.o
+[219/566] Compiling C object gio/libgio-2.0.a.p/gmemoryinputstream.c.o
+[220/566] Compiling C object gio/libgio-2.0.a.p/giomodule.c.o
+[221/566] Compiling C object gio/libgio-2.0.a.p/gnetworkservice.c.o
+[222/566] Compiling C object gio/libgio-2.0.a.p/gproxy.c.o
+[223/566] Compiling C object gio/libgio-2.0.a.p/gpollableoutputstream.c.o
+[224/566] Compiling C object gio/libgio-2.0.a.p/gseekable.c.o
+[225/566] Compiling C object gio/libgio-2.0.a.p/gsimplepermission.c.o
+[226/566] Compiling C object gio/libgio-2.0.a.p/gproxyresolver.c.o
+[227/566] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitordbus.c.o
+[228/566] Compiling C object gio/libgio-2.0.a.p/gproxyaddress.c.o
+[229/566] Compiling C object gio/libgio-2.0.a.p/gnetworkaddress.c.o
+[230/566] Compiling C object gio/libgio-2.0.a.p/gsimpleiostream.c.o
+[231/566] Compiling C object gio/libgio-2.0.a.p/gproxyaddressenumerator.c.o
+[232/566] Compiling C object gio/libgio-2.0.a.p/gpollableinputstream.c.o
+[233/566] Compiling C object gio/libgio-2.0.a.p/gsocketaddressenumerator.c.o
+[234/566] Compiling C object gobject/libgobject-2.0.a.p/gobject.c.o
 ../third_party/glib-2.82.2/gobject/gobject.c: In function '_g_object_type_init':
 ../third_party/glib-2.82.2/gobject/gobject.c:852:19: warning: variable 'initialized' set but not used [-Wunused-but-set-variable]
   852 |   static gboolean initialized = FALSE;
@@ -371,25 +397,28 @@ In file included from ../third_party/glib-2.82.2/glib/glist.h:34,
 ../third_party/glib-2.82.2/gobject/gobject.c:4385:16: warning: unused variable 'object_already_finalized' [-Wunused-variable]
  4385 |       gboolean object_already_finalized = TRUE;
       |                ^~~~~~~~~~~~~~~~~~~~~~~~
-[202/544] Compiling C object gio/libgio-2.0.a.p/gproxyresolver.c.o
-[203/544] Compiling C object gio/libgio-2.0.a.p/gsimplepermission.c.o
-[204/544] Compiling C object gio/libgio-2.0.a.p/gnetworkaddress.c.o
-[205/544] Compiling C object gio/libgio-2.0.a.p/gpollableutils.c.o
-[206/544] Compiling C object gio/libgio-2.0.a.p/gnetworkservice.c.o
-[207/544] Compiling C object gio/libgio-2.0.a.p/gseekable.c.o
-[208/544] Compiling C object gio/libgio-2.0.a.p/gsimpleiostream.c.o
-[209/544] Compiling C object gio/libgio-2.0.a.p/gsocketaddressenumerator.c.o
-[210/544] Compiling C object gio/libgio-2.0.a.p/gproxyaddressenumerator.c.o
-[211/544] Compiling C object gio/libgio-2.0.a.p/gpollableoutputstream.c.o
-[212/544] Compiling C object gio/libgio-2.0.a.p/gsimpleasyncresult.c.o
-[213/544] Compiling C object gio/libgio-2.0.a.p/gsocketconnectable.c.o
-[214/544] Compiling C object gio/libgio-2.0.a.p/gfileinfo.c.o
-[215/544] Compiling C object gio/libgio-2.0.a.p/gresource.c.o
-[216/544] Compiling C object gio/libgio-2.0.a.p/gmarshal-internal.c.o
-[217/544] Compiling C object gio/libgio-2.0.a.p/gsimpleproxyresolver.c.o
-[218/544] Compiling C object gio/libgio-2.0.a.p/gresourcefile.c.o
-[219/544] Compiling C object gio/libgio-2.0.a.p/gsrvtarget.c.o
-[220/544] Compiling C object gobject/libgobject-2.0.a.p/gtype.c.o
+[235/566] Compiling C object gio/libgio-2.0.a.p/gfileinfo.c.o
+[236/566] Compiling C object gio/libgio-2.0.a.p/gsimpleasyncresult.c.o
+[237/566] Compiling C object gio/libgio-2.0.a.p/gsocketconnectable.c.o
+[238/566] Compiling C object gio/libgio-2.0.a.p/gsocketaddress.c.o
+[239/566] Compiling C object gio/libgio-2.0.a.p/gsrvtarget.c.o
+[240/566] Compiling C object gio/libgio-2.0.a.p/gsocketcontrolmessage.c.o
+[241/566] Compiling C object gio/libgio-2.0.a.p/gresourcefile.c.o
+[242/566] Compiling C object gio/libgio-2.0.a.p/gresolver.c.o
+[243/566] Compiling C object gio/libgio-2.0.a.p/gsocketinputstream.c.o
+[244/566] Compiling C object gio/libgio-2.0.a.p/gsimpleproxyresolver.c.o
+[245/566] Compiling C object gio/libgio-2.0.a.p/gtcpwrapperconnection.c.o
+[246/566] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._xdp-dbus.c.o
+[247/566] Compiling C object gio/libgio-2.0.a.p/gresource.c.o
+[248/566] Compiling C object gio/libgio-2.0.a.p/gmarshal-internal.c.o
+[249/566] Compiling C object gio/libgio-2.0.a.p/gsocketoutputstream.c.o
+[250/566] Compiling C object gio/libgio-2.0.a.p/goutputstream.c.o
+[251/566] Compiling C object gio/libgio-2.0.a.p/gthreadedsocketservice.c.o
+[252/566] Compiling C object gio/libgio-2.0.a.p/gsubprocesslauncher.c.o
+[253/566] Compiling C object gio/libgio-2.0.a.p/gtcpconnection.c.o
+[254/566] Compiling C object gio/libgio-2.0.a.p/gsocketservice.c.o
+[255/566] Compiling C object gio/libgio-2.0.a.p/gtlsbackend.c.o
+[256/566] Compiling C object gobject/libgobject-2.0.a.p/gtype.c.o
 ../third_party/glib-2.82.2/gobject/gtype.c: In function 'type_node_fundamental_new_W':
 ../third_party/glib-2.82.2/gobject/gtype.c:535:21: warning: potential null pointer dereference [-Wnull-dereference]
   535 |   finfo->type_flags = type_flags & TYPE_FUNDAMENTAL_FLAG_MASK;
@@ -419,32 +448,44 @@ In function '_g_type_test_flags',
 ../third_party/glib-2.82.2/gobject/gtype.c:3991:26: warning: potential null pointer dereference [-Wnull-dereference]
  3991 |           fflags = (finfo->type_flags & fflags) == fflags;
       |                     ~~~~~^~~~~~~~~~~~
-[221/544] Compiling C object gio/libgio-2.0.a.p/gsocketoutputstream.c.o
-[222/544] Compiling C object gio/libgio-2.0.a.p/gtcpconnection.c.o
-[223/544] Compiling C object gio/libgio-2.0.a.p/meson-generated_.._xdp-dbus.c.o
-[224/544] Compiling C object gio/libgio-2.0.a.p/gsubprocesslauncher.c.o
-[225/544] Compiling C object gio/libgio-2.0.a.p/gsocketaddress.c.o
-[226/544] Compiling C object gio/libgio-2.0.a.p/gsocketservice.c.o
-[227/544] Compiling C object gio/libgio-2.0.a.p/gsocketconnection.c.o
-[228/544] Compiling C object gio/libgio-2.0.a.p/gtcpwrapperconnection.c.o
-[229/544] Compiling C object gio/libgio-2.0.a.p/gsocketinputstream.c.o
-[230/544] Compiling C object gio/libgio-2.0.a.p/gsocketcontrolmessage.c.o
-[231/544] Compiling C object gio/libgio-2.0.a.p/gthreadedsocketservice.c.o
-[232/544] Compiling C object gio/libgio-2.0.a.p/gresolver.c.o
-[233/544] Compiling C object gio/libgio-2.0.a.p/gthemedicon.c.o
-[234/544] Compiling C object gio/libgio-2.0.a.p/gtlsfiledatabase.c.o
-[235/544] Compiling C object gio/libgio-2.0.a.p/gdtlsclientconnection.c.o
-[236/544] Compiling C object gio/libgio-2.0.a.p/gtlsbackend.c.o
-[237/544] Compiling C object gio/libgio-2.0.a.p/gtlsserverconnection.c.o
-[238/544] Compiling C object gio/libgio-2.0.a.p/gsocketlistener.c.o
-[239/544] Compiling C object gio/libgio-2.0.a.p/gtask.c.o
-[240/544] Compiling C object gio/libgio-2.0.a.p/gtlsclientconnection.c.o
-[241/544] Compiling C object gio/libgio-2.0.a.p/goutputstream.c.o
-[242/544] Compiling C object gio/libgio-2.0.a.p/gtlscertificate.c.o
-[243/544] Compiling C object gio/libgio-2.0.a.p/gtlsconnection.c.o
-[244/544] Compiling C object gio/libgio-2.0.a.p/gdtlsconnection.c.o
-[245/544] Compiling C object gio/libgio-2.0.a.p/gdtlsserverconnection.c.o
-[246/544] Compiling C object gobject/libgobject-2.0.a.p/gsignal.c.o
+[257/566] Compiling C object gio/libgio-2.0.a.p/gtlsfiledatabase.c.o
+[258/566] Compiling C object gio/libgio-2.0.a.p/gtlsclientconnection.c.o
+[259/566] Compiling C object gio/libgio-2.0.a.p/gtlsconnection.c.o
+[260/566] Compiling C object gio/libgio-2.0.a.p/gtask.c.o
+[261/566] Compiling C object gio/libgio-2.0.a.p/gthemedicon.c.o
+[262/566] Compiling C object gio/libgio-2.0.a.p/gsocketconnection.c.o
+[263/566] Compiling C object gio/libgio-2.0.a.p/gsocketlistener.c.o
+[264/566] Compiling C object gio/libgio-2.0.a.p/gtlsserverconnection.c.o
+[265/566] Compiling C object gio/libgio-2.0.a.p/gdtlsconnection.c.o
+[266/566] Compiling C object gio/libgio-2.0.a.p/gtlsinteraction.c.o
+[267/566] Compiling C object gio/libgio-2.0.a.p/gdtlsserverconnection.c.o
+[268/566] Compiling C object gio/libgio-2.0.a.p/gsocketclient.c.o
+[269/566] Compiling C object gio/libgio-2.0.a.p/gdtlsclientconnection.c.o
+[270/566] Compiling C object gio/libgio-2.0.a.p/gtlspassword.c.o
+[271/566] Compiling C object gio/libgio-2.0.a.p/gunixcredentialsmessage.c.o
+[272/566] Compiling C object gio/libgio-2.0.a.p/gvolume.c.o
+[273/566] Compiling C object gio/libgio-2.0.a.p/gsubprocess.c.o
+[274/566] Compiling C object gio/libgio-2.0.a.p/gvfs.c.o
+[275/566] Compiling C object gio/libgio-2.0.a.p/gtlsdatabase.c.o
+[276/566] Compiling C object gio/libgio-2.0.a.p/gunixconnection.c.o
+[277/566] Compiling C object gio/libgio-2.0.a.p/gunionvolumemonitor.c.o
+[278/566] Compiling C object gio/libgio-2.0.a.p/gunixfdlist.c.o
+[279/566] Compiling C object gio/libgio-2.0.a.p/glistmodel.c.o
+[280/566] Compiling C object gio/libgio-2.0.a.p/gvolumemonitor.c.o
+[281/566] Compiling C object gio/libgio-2.0.a.p/gzlibdecompressor.c.o
+[282/566] Compiling C object gio/libgio-2.0.a.p/giounix-private.c.o
+[283/566] Compiling C object gio/libgio-2.0.a.p/gunixsocketaddress.c.o
+[284/566] Compiling C object gio/libgio-2.0.a.p/gfiledescriptorbased.c.o
+[285/566] Compiling C object gio/libgio-2.0.a.p/gliststore.c.o
+../third_party/glib-2.82.2/gio/gliststore.c: In function 'g_list_store_splice':
+../third_party/glib-2.82.2/gio/gliststore.c:472:9: warning: variable 'n_items' set but not used [-Wunused-but-set-variable]
+  472 |   guint n_items;
+      |         ^~~~~~~
+[286/566] Compiling C object gio/libgio-2.0.a.p/gtlscertificate.c.o
+[287/566] Compiling C object gio/libgio-2.0.a.p/gzlibcompressor.c.o
+[288/566] Compiling C object gio/libgio-2.0.a.p/ggtknotificationbackend.c.o
+[289/566] Compiling C object gio/libgio-2.0.a.p/gthreadedresolver.c.o
+[290/566] Compiling C object gobject/libgobject-2.0.a.p/gsignal.c.o
 ../third_party/glib-2.82.2/gobject/gsignal.c: In function 'handler_insert':
 ../third_party/glib-2.82.2/gobject/gsignal.c:685:13: warning: potential null pointer dereference [-Wnull-dereference]
   685 |   if (!hlist->handlers)
@@ -583,70 +624,49 @@ In function 'handler_unref_R',
       |           ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~
 ../third_party/glib-2.82.2/gobject/gsignal.c:638:27: warning: potential null pointer dereference [-Wnull-dereference]
 ../third_party/glib-2.82.2/gobject/gsignal.c:638:27: warning: potential null pointer dereference [-Wnull-dereference]
-[247/544] Compiling C object gio/libgio-2.0.a.p/gtlspassword.c.o
-[248/544] Compiling C object gio/libgio-2.0.a.p/gtlsdatabase.c.o
-[249/544] Compiling C object gio/libgio-2.0.a.p/glistmodel.c.o
-[250/544] Compiling C object gio/libgio-2.0.a.p/gvolumemonitor.c.o
-[251/544] Compiling C object gio/libgio-2.0.a.p/gvolume.c.o
-[252/544] Compiling C object gio/libgio-2.0.a.p/gunixcredentialsmessage.c.o
-[253/544] Compiling C object gio/libgio-2.0.a.p/gtlsinteraction.c.o
-[254/544] Compiling C object gio/libgio-2.0.a.p/gunixconnection.c.o
-[255/544] Compiling C object gio/libgio-2.0.a.p/gsubprocess.c.o
-[256/544] Compiling C object gio/libgio-2.0.a.p/gsocketclient.c.o
-[257/544] Compiling C object gio/libgio-2.0.a.p/gzlibcompressor.c.o
-[258/544] Compiling C object gio/libgio-2.0.a.p/gunionvolumemonitor.c.o
-[259/544] Compiling C object gio/libgio-2.0.a.p/gvfs.c.o
-[260/544] Compiling C object gio/libgio-2.0.a.p/gfiledescriptorbased.c.o
-[261/544] Compiling C object gio/libgio-2.0.a.p/gunixfdlist.c.o
-[262/544] Compiling C object gio/libgio-2.0.a.p/giounix-private.c.o
-[263/544] Compiling C object gio/libgio-2.0.a.p/gzlibdecompressor.c.o
-[264/544] Compiling C object gio/libgio-2.0.a.p/gliststore.c.o
-../third_party/glib-2.82.2/gio/gliststore.c: In function 'g_list_store_splice':
-../third_party/glib-2.82.2/gio/gliststore.c:472:9: warning: variable 'n_items' set but not used [-Wunused-but-set-variable]
-  472 |   guint n_items;
-      |         ^~~~~~~
-[265/544] Compiling C object gio/libgio-2.0.a.p/gunixsocketaddress.c.o
-[266/544] Compiling C object gio/libgio-2.0.a.p/gactionmap.c.o
-[267/544] Compiling C object gio/libgio-2.0.a.p/ggtknotificationbackend.c.o
-[268/544] Compiling C object gio/libgio-2.0.a.p/gremoteactiongroup.c.o
-[269/544] Compiling C object gio/libgio-2.0.a.p/gunixvolumemonitor.c.o
-[270/544] Compiling C object gio/libgio-2.0.a.p/gactiongroup.c.o
-[271/544] Compiling C object gio/libgio-2.0.a.p/gaction.c.o
+[291/566] Compiling C object gio/libgio-2.0.a.p/gunixfdmessage.c.o
+[292/566] Compiling C object gio/libgio-2.0.a.p/gunixinputstream.c.o
+[293/566] Compiling C object gio/libgio-2.0.a.p/gunixvolumemonitor.c.o
+[294/566] Compiling C object gio/libgio-2.0.a.p/gunixmount.c.o
+[295/566] Compiling C object gio/libgio-2.0.a.p/gremoteactiongroup.c.o
+[296/566] Compiling C object gio/libgio-2.0.a.p/gunixvolume.c.o
+[297/566] Compiling C object gio/libgio-2.0.a.p/gfdonotificationbackend.c.o
+[298/566] Compiling C object gio/libgio-2.0.a.p/gactionmap.c.o
+[299/566] Compiling C object gio/libgio-2.0.a.p/gsimpleactiongroup.c.o
+[300/566] Compiling C object gio/libgio-2.0.a.p/gaction.c.o
 ../third_party/glib-2.82.2/gio/gaction.c: In function 'g_action_change_state':
 ../third_party/glib-2.82.2/gio/gaction.c:180:23: warning: variable 'state_type' set but not used [-Wunused-but-set-variable]
   180 |   const GVariantType *state_type;
       |                       ^~~~~~~~~~
-[272/544] Compiling C object gio/libgio-2.0.a.p/gunixvolume.c.o
-[273/544] Compiling C object gio/libgio-2.0.a.p/gsimpleactiongroup.c.o
-[274/544] Compiling C object gio/libgio-2.0.a.p/gunixinputstream.c.o
-[275/544] Compiling C object gio/libgio-2.0.a.p/gunixmount.c.o
-[276/544] Compiling C object gio/libgio-2.0.a.p/gthreadedresolver.c.o
-[277/544] Compiling C object gio/libgio-2.0.a.p/gapplicationcommandline.c.o
-[278/544] Compiling C object gio/libgio-2.0.a.p/gunixfdmessage.c.o
-[279/544] Compiling C object gio/libgio-2.0.a.p/gfile.c.o
-[280/544] Compiling C object gio/libgio-2.0.a.p/gsimpleaction.c.o
+[301/566] Compiling C object gio/libgio-2.0.a.p/gpropertyaction.c.o
+[302/566] Compiling C object gio/libgio-2.0.a.p/gapplicationcommandline.c.o
+[303/566] Compiling C object gio/libgio-2.0.a.p/gactiongroup.c.o
+[304/566] Compiling C object gio/libgio-2.0.a.p/gdbusactiongroup.c.o
+[305/566] Compiling C object gio/libgio-2.0.a.p/gsimpleaction.c.o
 ../third_party/glib-2.82.2/gio/gsimpleaction.c: In function 'g_simple_action_set_state':
 ../third_party/glib-2.82.2/gio/gsimpleaction.c:163:25: warning: variable 'state_type' set but not used [-Wunused-but-set-variable]
   163 |     const GVariantType *state_type;
       |                         ^~~~~~~~~~
-[281/544] Compiling C object gio/libgio-2.0.a.p/gpropertyaction.c.o
-[282/544] Compiling C object gio/libgio-2.0.a.p/gfdonotificationbackend.c.o
-[283/544] Compiling C object gio/libgio-2.0.a.p/gactiongroupexporter.c.o
-[284/544] Compiling C object gio/libgio-2.0.a.p/gnotificationbackend.c.o
-[285/544] Compiling C object gio/libgio-2.0.a.p/gdbusactiongroup.c.o
-[286/544] Compiling C object gio/libgio-2.0.a.p/gunixoutputstream.c.o
-[287/544] Compiling C object gio/libgio-2.0.a.p/gdbusmenumodel.c.o
-[288/544] Compiling C object gio/libgio-2.0.a.p/gapplicationimpl-dbus.c.o
-[289/544] Compiling C object gio/libgio-2.0.a.p/gnullsettingsbackend.c.o
-[290/544] Compiling C object gio/libgio-2.0.a.p/gsocket.c.o
-[291/544] Compiling C object gio/libgio-2.0.a.p/gmenu.c.o
+[306/566] Compiling C object gio/libgio-2.0.a.p/gnotificationbackend.c.o
+[307/566] Compiling C object gio/libgio-2.0.a.p/gactiongroupexporter.c.o
+[308/566] Compiling C object gio/libgio-2.0.a.p/gfile.c.o
+[309/566] Compiling C object gio/libgio-2.0.a.p/gcontenttype-fdo.c.o
+[310/566] Compiling C object gio/libgio-2.0.a.p/gnullsettingsbackend.c.o
+[311/566] Compiling C object gio/libgio-2.0.a.p/gunixoutputstream.c.o
+[312/566] Compiling C object gio/libgio-2.0.a.p/gsocket.c.o
+[313/566] Compiling C object gio/libgio-2.0.a.p/gmenumodel.c.o
+[314/566] Compiling C object gio/libgio-2.0.a.p/gmenu.c.o
 ../third_party/glib-2.82.2/gio/gmenu.c:607:1: warning: 'valid_attribute_name' defined but not used [-Wunused-function]
   607 | valid_attribute_name (const gchar *name)
       | ^~~~~~~~~~~~~~~~~~~~
-[292/544] Compiling C object gio/libgio-2.0.a.p/gnotification.c.o
-[293/544] Compiling C object gio/libgio-2.0.a.p/gdbusauthobserver.c.o
-[294/544] Compiling C object gio/libgio-2.0.a.p/gmenuexporter.c.o
-[295/544] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismanon.c.o
+[315/566] Compiling C object gio/libgio-2.0.a.p/gnotification.c.o
+[316/566] Compiling C object gio/libgio-2.0.a.p/gmemorysettingsbackend.c.o
+[317/566] Compiling C object gio/libgio-2.0.a.p/gmenuexporter.c.o
+[318/566] Compiling C object gio/libgio-2.0.a.p/gdelayedsettingsbackend.c.o
+[319/566] Compiling C object gio/libgio-2.0.a.p/gdbusauthobserver.c.o
+[320/566] Compiling C object gio/libgio-2.0.a.p/gdbusmenumodel.c.o
+[321/566] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanism.c.o
+[322/566] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismanon.c.o
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismanon.c: In function 'mechanism_server_data_receive':
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismanon.c:198:27: warning: unused variable 'm' [-Wunused-variable]
   198 |   GDBusAuthMechanismAnon *m = G_DBUS_AUTH_MECHANISM_ANON (mechanism);
@@ -667,7 +687,9 @@ In function 'handler_unref_R',
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismanon.c:303:27: warning: unused variable 'm' [-Wunused-variable]
   303 |   GDBusAuthMechanismAnon *m = G_DBUS_AUTH_MECHANISM_ANON (mechanism);
       |                           ^
-[296/544] Compiling C object gio/libgio-2.0.a.p/gsettingsbackend.c.o
+[323/566] Compiling C object gio/libgio-2.0.a.p/gapplicationimpl-dbus.c.o
+[324/566] Compiling C object gio/libgio-2.0.a.p/gdbusdaemon.c.o
+[325/566] Compiling C object gio/libgio-2.0.a.p/gsettingsbackend.c.o
 ../third_party/glib-2.82.2/gio/gsettingsbackend.c: In function 'is_key':
 ../third_party/glib-2.82.2/gio/gsettingsbackend.c:85:8: warning: variable 'length' set but not used [-Wunused-but-set-variable]
    85 |   gint length;
@@ -683,10 +705,14 @@ In function 'handler_unref_R',
 ../third_party/glib-2.82.2/gio/gsettingsbackend.c:83:1: warning: 'is_key' defined but not used [-Wunused-function]
    83 | is_key (const gchar *key)
       | ^~~~~~
-[297/544] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanism.c.o
-[298/544] Compiling C object gio/libgio-2.0.a.p/gdelayedsettingsbackend.c.o
-[299/544] Compiling C object gio/libgio-2.0.a.p/gdbusdaemon.c.o
-[300/544] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismexternal.c.o
+[326/566] Compiling C object gio/libgio-2.0.a.p/gapplication.c.o
+[327/566] Compiling C object gio/libgio-2.0.a.p/gunixmounts.c.o
+../third_party/glib-2.82.2/gio/gunixmounts.c: In function '_resolve_dev_root':
+../third_party/glib-2.82.2/gio/gunixmounts.c:3564:38: warning: comparison of integer expressions of different signedness: 'int' and 'dev_t' {aka 'long long unsigned int'} [-Wsign-compare]
+ 3564 |                       statbuf.st_dev == root_dev)
+      |                                      ^~
+[328/566] Compiling C object gio/libgio-2.0.a.p/gkeyfilesettingsbackend.c.o
+[329/566] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismexternal.c.o
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismexternal.c: In function 'mechanism_server_get_reject_reason':
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismexternal.c:326:31: warning: unused variable 'm' [-Wunused-variable]
   326 |   GDBusAuthMechanismExternal *m = G_DBUS_AUTH_MECHANISM_EXTERNAL (mechanism);
@@ -695,55 +721,35 @@ In function 'handler_unref_R',
 ../third_party/glib-2.82.2/gio/gdbusauthmechanismexternal.c:437:31: warning: unused variable 'm' [-Wunused-variable]
   437 |   GDBusAuthMechanismExternal *m = G_DBUS_AUTH_MECHANISM_EXTERNAL (mechanism);
       |                               ^
-[301/544] Compiling C object gio/libgio-2.0.a.p/gmemorysettingsbackend.c.o
-[302/544] Compiling C object gio/libgio-2.0.a.p/gkeyfilesettingsbackend.c.o
-[303/544] Compiling C object gio/libgio-2.0.a.p/gcontenttype-fdo.c.o
-[304/544] Compiling C object gio/libgio-2.0.a.p/gapplication.c.o
-[305/544] Compiling C object gio/libgio-2.0.a.p/gdbuserror.c.o
-[306/544] Compiling C object gio/libgio-2.0.a.p/gdbusinterface.c.o
-[307/544] Compiling C object gio/libgio-2.0.a.p/gsettings-mapping.c.o
-[308/544] Compiling C object gio/libgio-2.0.a.p/gmenumodel.c.o
-[309/544] Compiling C object gio/libgio-2.0.a.p/gdbusobject.c.o
-[310/544] Compiling C object gio/libgio-2.0.a.p/gdbusutils.c.o
-[311/544] Compiling C object gio/libgio-2.0.a.p/gdbusnamewatching.c.o
-[312/544] Compiling C object gio/libgio-2.0.a.p/gdbusnameowning.c.o
-[313/544] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanager.c.o
-[314/544] Compiling C object gio/libgio-2.0.a.p/gunixmounts.c.o
-../third_party/glib-2.82.2/gio/gunixmounts.c: In function '_resolve_dev_root':
-../third_party/glib-2.82.2/gio/gunixmounts.c:3564:38: warning: comparison of integer expressions of different signedness: 'int' and 'dev_t' {aka 'long long unsigned int'} [-Wsign-compare]
- 3564 |                       statbuf.st_dev == root_dev)
-      |                                      ^~
-[315/544] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismsha1.c.o
-[316/544] Compiling C object gio/libgio-2.0.a.p/gdbusobjectskeleton.c.o
-[317/544] Compiling C object gio/libgio-2.0.a.p/gdbusobjectproxy.c.o
-[318/544] Compiling C object gio/libgio-2.0.a.p/gdbusmethodinvocation.c.o
-[319/544] Compiling C object gio/libgio-2.0.a.p/gdbusinterfaceskeleton.c.o
-[320/544] Compiling C object gio/libgio-2.0.a.p/gdbusaddress.c.o
-[321/544] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitorportal.c.o
-[322/544] Compiling C object gio/libgio-2.0.a.p/gdbusserver.c.o
-[323/544] Compiling C object gio/libgio-2.0.a.p/gtestdbus.c.o
-[324/544] Compiling C object gio/libgio-2.0.a.p/gdocumentportal.c.o
-[325/544] Compiling C object gio/libgio-2.0.a.p/gdbusauth.c.o
-[326/544] Compiling C object gio/libgio-2.0.a.p/gopenuriportal.c.o
-[327/544] Compiling C object gio/libgio-2.0.a.p/gsettings.c.o
+[330/566] Compiling C object gio/libgio-2.0.a.p/gdbusinterface.c.o
+[331/566] Compiling C object gio/libgio-2.0.a.p/gdbusnameowning.c.o
+[332/566] Compiling C object gio/libgio-2.0.a.p/gdbusutils.c.o
+[333/566] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanager.c.o
+[334/566] Compiling C object gio/libgio-2.0.a.p/gdbuserror.c.o
+[335/566] Compiling C object gio/libgio-2.0.a.p/gsettings-mapping.c.o
+[336/566] Compiling C object gio/libgio-2.0.a.p/gdbusobjectproxy.c.o
+[337/566] Compiling C object gio/libgio-2.0.a.p/gdbusnamewatching.c.o
+[338/566] Compiling C object gio/libgio-2.0.a.p/gdbusobject.c.o
+[339/566] Compiling C object gio/libgio-2.0.a.p/gdbusauthmechanismsha1.c.o
+[340/566] Compiling C object gio/libgio-2.0.a.p/gdbusobjectskeleton.c.o
+[341/566] Compiling C object gio/libgio-2.0.a.p/gpowerprofilemonitorportal.c.o
+[342/566] Compiling C object gio/libgio-2.0.a.p/gdbusaddress.c.o
+[343/566] Compiling C object gio/libgio-2.0.a.p/gdbusserver.c.o
+[344/566] Compiling C object gio/libgio-2.0.a.p/gtrashportal.c.o
+[345/566] Compiling C object gio/libgio-2.0.a.p/gmemorymonitorportal.c.o
+[346/566] Compiling C object gio/libgio-2.0.a.p/gtestdbus.c.o
+[347/566] Compiling C object gio/libgio-2.0.a.p/gportalnotificationbackend.c.o
+[348/566] Compiling C object gio/libgio-2.0.a.p/gdbusinterfaceskeleton.c.o
+[349/566] Compiling C object gio/libgio-2.0.a.p/gproxyresolverportal.c.o
+[350/566] Compiling C object gio/libgio-2.0.a.p/gsettings.c.o
 ../third_party/glib-2.82.2/gio/gsettings.c:969:1: warning: 'path_is_valid' defined but not used [-Wunused-function]
   969 | path_is_valid (const gchar *path)
       | ^~~~~~~~~~~~~
-[328/544] Compiling C object gio/libgio-2.0.a.p/gportalnotificationbackend.c.o
-[329/544] Compiling C object gio/libgio-2.0.a.p/gtrashportal.c.o
-[330/544] Compiling C object gio/libgio-2.0.a.p/gproxyresolverportal.c.o
-[331/544] Compiling C object gio/libgio-2.0.a.p/gmemorymonitorportal.c.o
-[332/544] Compiling C object gio/libgio-2.0.a.p/gportalsupport.c.o
-[333/544] Compiling C object gio/libgio-2.0.a.p/gsocks4proxy.c.o
-[334/544] Compiling C object gio/libgio-2.0.a.p/ghttpproxy.c.o
-[335/544] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanagerserver.c.o
+[351/566] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanagerserver.c.o
 ../third_party/glib-2.82.2/gio/gdbusobjectmanagerserver.c:474:1: warning: 'is_valid_child_object_path' defined but not used [-Wunused-function]
   474 | is_valid_child_object_path (GDBusObjectManagerServer *manager,
       | ^~~~~~~~~~~~~~~~~~~~~~~~~~
-[336/544] Compiling C object gio/libgio-2.0.a.p/gsandbox.c.o
-[337/544] Compiling C object gio/libgio-2.0.a.p/glocalfileinputstream.c.o
-[338/544] Compiling C object gio/libgio-2.0.a.p/glocalfileenumerator.c.o
-[339/544] Compiling C object gio/libgio-2.0.a.p/gsettingsschema.c.o
+[352/566] Compiling C object gio/libgio-2.0.a.p/gsettingsschema.c.o
 ../third_party/glib-2.82.2/gio/gsettingsschema.c: In function 'g_settings_schema_key_to_enum':
 ../third_party/glib-2.82.2/gio/gsettingsschema.c:1526:10: warning: 'result' may be used uninitialized [-Wmaybe-uninitialized]
  1526 |   return result;
@@ -758,92 +764,117 @@ In function 'handler_unref_R',
 ../third_party/glib-2.82.2/gio/gsettingsschema.c:1557:13: note: 'flag_value' was declared here
  1557 |       guint flag_value;
       |             ^~~~~~~~~~
-[340/544] Compiling C object gio/libgio-2.0.a.p/glocalfileiostream.c.o
-[341/544] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitorportal.c.o
-[342/544] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanagerclient.c.o
-[343/544] Compiling C object gio/libgio-2.0.a.p/glocalfilemonitor.c.o
-[344/544] Compiling C object girepository/cmph/libcmph.a.p/buffer_entry.c.o
-[345/544] Compiling C object gio/libgio-2.0.a.p/glocalvfs.c.o
-[346/544] Compiling C object gio/libgio-2.0.a.p/gdbusproxy.c.o
-[347/544] Compiling C object girepository/cmph/libcmph.a.p/buffer_manager.c.o
-[348/544] Compiling C object gio/libgio-2.0.a.p/thumbnail-verify.c.o
-[349/544] Compiling C object gio/libgio-2.0.a.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
-[350/544] Compiling C object gio/libgio-2.0.a.p/gsocks5proxy.c.o
-[351/544] Compiling C object gio/libgio-2.0.a.p/gsocks4aproxy.c.o
-[352/544] Compiling C object girepository/cmph/libcmph.a.p/chd.c.o
-[353/544] Compiling C object gio/libgio-2.0.a.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
-[354/544] Compiling C object girepository/cmph/libcmph.a.p/cmph_structs.c.o
-[355/544] Compiling C object gio/libgio-2.0.a.p/gdbusprivate.c.o
-[356/544] Compiling C object girepository/cmph/libcmph.a.p/hash.c.o
-[357/544] Compiling C object girepository/cmph/libcmph.a.p/miller_rabin.c.o
-[358/544] Compiling C object gio/libgio-2.0.a.p/gdbusintrospection.c.o
-[359/544] Compiling C object girepository/cmph/libcmph.a.p/bdz_ph.c.o
-[360/544] Compiling C object gio/libgio-2.0.a.p/glocalfileinfo.c.o
-../third_party/glib-2.82.2/gio/glocalfileinfo.c: In function 'lookup_uid_data':
-../third_party/glib-2.82.2/gio/glocalfileinfo.c:1162:17: warning: unused variable 'pwbuf' [-Wunused-variable]
- 1162 |   struct passwd pwbuf;
-      |                 ^~~~~
-../third_party/glib-2.82.2/gio/glocalfileinfo.c:1161:8: warning: unused variable 'buffer' [-Wunused-variable]
- 1161 |   char buffer[4096];
-      |        ^~~~~~
-[361/544] Compiling C object girepository/cmph/libcmph.a.p/cmph.c.o
-[362/544] Compiling C object girepository/cmph/libcmph.a.p/bmz8.c.o
-[363/544] Compiling C object gio/libgio-2.0.a.p/glocalfileoutputstream.c.o
-[364/544] Compiling C object gio/libgio-2.0.a.p/gdbusmessage.c.o
-[365/544] Compiling C object girepository/cmph/libcmph.a.p/jenkins_hash.c.o
-[366/544] Compiling C object girepository/cmph/libcmph.a.p/fch_buckets.c.o
-[367/544] Compiling C object girepository/cmph/libcmph.a.p/compressed_rank.c.o
-[368/544] Compiling C object girepository/cmph/libcmph.a.p/chm.c.o
-[369/544] Compiling C object girepository/cmph/libcmph.a.p/bmz.c.o
-[370/544] Compiling C object girepository/cmph/libcmph.a.p/vstack.c.o
-[371/544] Compiling C object girepository/cmph/libcmph.a.p/fch.c.o
-[372/544] Compiling C object girepository/cmph/libcmph.a.p/compressed_seq.c.o
-[373/544] Compiling C object girepository/cmph/libcmph.a.p/vqueue.c.o
-[374/544] Compiling C object girepository/cmph/libcmph.a.p/select.c.o
-[375/544] Compiling C object girepository/cmph/libcmph.a.p/bdz.c.o
-[376/544] Compiling C object girepository/cmph/libcmph.a.p/graph.c.o
-[377/544] Compiling C object girepository/libgirepository-gthash.a.p/gthash.c.o
-[378/544] Compiling C object girepository/libgirepository-2.0.a.p/giarginfo.c.o
-[379/544] Compiling C object girepository/libgirepository-2.0.a.p/gicallbackinfo.c.o
-[380/544] Compiling C object girepository/libgirepository-internals.a.p/giroffsets.c.o
-[381/544] Compiling C object girepository/cmph/libcmph.a.p/chd_ph.c.o
-[382/544] Compiling C object girepository/libgirepository-2.0.a.p/gifieldinfo.c.o
-[383/544] Compiling C object girepository/cmph/libcmph.a.p/brz.c.o
-[384/544] Compiling C object gio/libgio-2.0.a.p/gdesktopappinfo.c.o
+[353/566] Compiling C object gio/libgio-2.0.a.p/gportalsupport.c.o
+[354/566] Compiling C object gio/libgio-2.0.a.p/gdbusobjectmanagerclient.c.o
+[355/566] Compiling C object gio/libgio-2.0.a.p/gdbusmethodinvocation.c.o
+[356/566] Compiling C object gio/libgio-2.0.a.p/gopenuriportal.c.o
+[357/566] Compiling C object gio/libgio-2.0.a.p/gsandbox.c.o
+[358/566] Compiling C object gio/libgio-2.0.a.p/gdocumentportal.c.o
+[359/566] Compiling C object gio/libgio-2.0.a.p/ghttpproxy.c.o
+[360/566] Compiling C object gio/libgio-2.0.a.p/glocalfileenumerator.c.o
+[361/566] Compiling C object gio/libgio-2.0.a.p/gdbusauth.c.o
+[362/566] Compiling C object gio/libgio-2.0.a.p/gnetworkmonitorportal.c.o
+[363/566] Compiling C object gio/libgio-2.0.a.p/gsocks4aproxy.c.o
+[364/566] Compiling C object gio/libgio-2.0.a.p/gsocks4proxy.c.o
+[365/566] Compiling C object gio/libgio-2.0.a.p/glocalfileinputstream.c.o
+[366/566] Compiling C object gio/libgio-2.0.a.p/gdbusproxy.c.o
+[367/566] Compiling C object girepository/cmph/libcmph.a.p/buffer_entry.c.o
+[368/566] Compiling C object gio/libgio-2.0.a.p/glocalfileiostream.c.o
+[369/566] Compiling C object gio/libgio-2.0.a.p/gdbusintrospection.c.o
+[370/566] Compiling C object gio/libgio-2.0.a.p/thumbnail-verify.c.o
+[371/566] Compiling C object girepository/cmph/libcmph.a.p/buffer_manager.c.o
+[372/566] Compiling C object gio/libgio-2.0.a.p/gdbusprivate.c.o
+[373/566] Compiling C object gio/libgio-2.0.a.p/glocalfilemonitor.c.o
+[374/566] Compiling C object girepository/cmph/libcmph.a.p/chd.c.o
+[375/566] Compiling C object gio/libgio-2.0.a.p/gsocks5proxy.c.o
+[376/566] Compiling C object girepository/cmph/libcmph.a.p/cmph_structs.c.o
+[377/566] Compiling C object gio/libgio-2.0.a.p/glocalvfs.c.o
+[378/566] Compiling C object gio/libgio-2.0.a.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
+[379/566] Compiling C object gio/libgio-2.0.a.p/gdbusmessage.c.o
+[380/566] Compiling C object girepository/cmph/libcmph.a.p/bdz_ph.c.o
+[381/566] Compiling C object gio/libgio-2.0.a.p/glocalfileoutputstream.c.o
+[382/566] Compiling C object girepository/cmph/libcmph.a.p/miller_rabin.c.o
+[383/566] Compiling C object girepository/cmph/libcmph.a.p/vqueue.c.o
+[384/566] Compiling C object girepository/cmph/libcmph.a.p/jenkins_hash.c.o
+[385/566] Compiling C object gio/libgio-2.0.a.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
+[386/566] Compiling C object girepository/cmph/libcmph.a.p/vstack.c.o
+[387/566] Compiling C object girepository/cmph/libcmph.a.p/hash.c.o
+[388/566] Compiling C object girepository/cmph/libcmph.a.p/compressed_rank.c.o
+[389/566] Compiling C object girepository/cmph/libcmph.a.p/fch_buckets.c.o
+[390/566] Compiling C object girepository/cmph/libcmph.a.p/bdz.c.o
+[391/566] Compiling C object girepository/cmph/libcmph.a.p/cmph.c.o
+[392/566] Compiling C object girepository/cmph/libcmph.a.p/compressed_seq.c.o
+[393/566] Compiling C object girepository/cmph/libcmph.a.p/bmz.c.o
+[394/566] Compiling C object girepository/cmph/libcmph.a.p/select.c.o
+[395/566] Compiling C object girepository/cmph/libcmph.a.p/bmz8.c.o
+[396/566] Compiling C object girepository/cmph/libcmph.a.p/graph.c.o
+[397/566] Compiling C object girepository/cmph/libcmph.a.p/fch.c.o
+[398/566] Compiling C object girepository/cmph/libcmph.a.p/chm.c.o
+[399/566] Compiling C object girepository/libgirepository-gthash.a.p/gthash.c.o
+[400/566] Compiling C object girepository/libgirepository-2.0.a.p/giflagsinfo.c.o
+[401/566] Compiling C object girepository/libgirepository-2.0.a.p/gienuminfo.c.o
+[402/566] Compiling C object gio/libgio-2.0.a.p/glocalfileinfo.c.o
+[403/566] Compiling C object girepository/cmph/libcmph.a.p/brz.c.o
+[404/566] Compiling C object girepository/libgirepository-internals.a.p/giroffsets.c.o
+[405/566] Compiling C object girepository/libgirepository-2.0.a.p/gicallbackinfo.c.o
+[406/566] Compiling C object girepository/cmph/libcmph.a.p/chd_ph.c.o
+[407/566] Compiling C object girepository/libgirepository-2.0.a.p/giarginfo.c.o
+[408/566] Compiling C object girepository/libgirepository-2.0.a.p/giconstantinfo.c.o
+[409/566] Compiling C object girepository/libgirepository-2.0.a.p/gifunctioninfo.c.o
+[410/566] Compiling C object girepository/libgirepository-2.0.a.p/gifieldinfo.c.o
+[411/566] Compiling C object girepository/libgirepository-2.0.a.p/gipropertyinfo.c.o
+[412/566] Linking static target subprojects/proxy-libintl/libintl.a
+[413/566] Linking static target glib/libglib-2.0.a
+[414/566] Compiling C object girepository/libgirepository-2.0.a.p/ginvoke.c.o
+[415/566] Linking static target gobject/libgobject-2.0.a
+[416/566] Compiling C object girepository/libgirepository-2.0.a.p/giregisteredtypeinfo.c.o
+[417/566] Linking static target gmodule/libgmodule-2.0.a
+[418/566] Compiling C object girepository/libgirepository-2.0.a.p/giunresolvedinfo.c.o
+[419/566] Compiling C object gio/libgio-2.0.a.p/glocalfile.c.o
+[420/566] Compiling C object girepository/libgirepository-2.0.a.p/girffi.c.o
+[421/566] Compiling C object girepository/libgirepository-2.0.a.p/gicallableinfo.c.o
+[422/566] Compiling C object girepository/libgirepository-2.0.a.p/givalueinfo.c.o
+[423/566] Compiling C object girepository/libgirepository-2.0.a.p/gibaseinfo.c.o
+[424/566] Compiling C object gio/libgio-2.0.a.p/gdesktopappinfo.c.o
 ../third_party/glib-2.82.2/gio/gdesktopappinfo.c:5077:1: warning: 'app_info_has_action' defined but not used [-Wunused-function]
  5077 | app_info_has_action (GDesktopAppInfo *info,
       | ^~~~~~~~~~~~~~~~~~~
-[385/544] Compiling C object girepository/libgirepository-2.0.a.p/giflagsinfo.c.o
-[386/544] Compiling C object girepository/libgirepository-2.0.a.p/giregisteredtypeinfo.c.o
-[387/544] Compiling C object girepository/libgirepository-2.0.a.p/gienuminfo.c.o
-[388/544] Linking static target subprojects/proxy-libintl/libintl.a
-[389/544] Compiling C object girepository/libgirepository-2.0.a.p/giconstantinfo.c.o
-[390/544] Compiling C object girepository/libgirepository-internals.a.p/girmodule.c.o
-[391/544] Compiling C object girepository/libgirepository-2.0.a.p/gifunctioninfo.c.o
-[392/544] Compiling C object gio/libgio-2.0.a.p/glocalfile.c.o
-[393/544] Compiling C object girepository/libgirepository-2.0.a.p/gdump.c.o
-[394/544] Compiling C object girepository/libgirepository-2.0.a.p/gicallableinfo.c.o
-[395/544] Compiling C object girepository/libgirepository-2.0.a.p/gisignalinfo.c.o
-[396/544] Linking static target gmodule/libgmodule-2.0.a
-[397/544] Linking static target gobject/libgobject-2.0.a
-[398/544] Linking static target glib/libglib-2.0.a
-[399/544] Compiling C object girepository/libgirepository-2.0.a.p/ginvoke.c.o
-[400/544] Compiling C object girepository/libgirepository-2.0.a.p/gipropertyinfo.c.o
-[401/544] Compiling C object gio/gio-launch-desktop.p/gio-launch-desktop.c.o
-[402/544] Compiling C object girepository/libgirepository-2.0.a.p/giinterfaceinfo.c.o
-[403/544] Compiling C object girepository/libgirepository-2.0.a.p/givalueinfo.c.o
-[404/544] Compiling C object girepository/libgirepository-2.0.a.p/girffi.c.o
-[405/544] Compiling C object girepository/libgirepository-2.0.a.p/gibaseinfo.c.o
-[406/544] Compiling C object girepository/libgirepository-2.0.a.p/giunresolvedinfo.c.o
-[407/544] Compiling C object gthread/libgthread-2.0.a.p/gthread-impl.c.o
-[408/544] Compiling C object girepository/libgirepository-2.0.a.p/gitypeinfo.c.o
-[409/544] Compiling C object girepository/libgirepository-2.0.a.p/giobjectinfo.c.o
-[410/544] Compiling C object girepository/libgirepository-2.0.a.p/gistructinfo.c.o
-[411/544] Compiling C object girepository/libgirepository-2.0.a.p/giunioninfo.c.o
-[412/544] Compiling C object gobject/gobject-query.p/gobject-query.c.o
-[413/544] Compiling C object girepository/libgirepository-2.0.a.p/givfuncinfo.c.o
-[414/544] Compiling C object gio/gio.p/gio-tool-cat.c.o
-[415/544] Compiling C object girepository/libgirepository-internals.a.p/girwriter.c.o
+[425/566] Compiling C object girepository/libgirepository-internals.a.p/girmodule.c.o
+[426/566] Compiling C object girepository/libgirepository-2.0.a.p/gisignalinfo.c.o
+[427/566] Compiling C object girepository/libgirepository-2.0.a.p/gistructinfo.c.o
+[428/566] Compiling C object girepository/libgirepository-2.0.a.p/gdump.c.o
+[429/566] Compiling C object girepository/libgirepository-2.0.a.p/givfuncinfo.c.o
+[430/566] Compiling C object gobject/gobject-query.p/gobject-query.c.o
+[431/566] Compiling C object gthread/libgthread-2.0.a.p/gthread-impl.c.o
+[432/566] Compiling C object girepository/libgirepository-2.0.a.p/giobjectinfo.c.o
+[433/566] Compiling C object girepository/libgirepository-2.0.a.p/giunioninfo.c.o
+[434/566] Compiling C object girepository/libgirepository-2.0.a.p/gitypeinfo.c.o
+[435/566] Compiling C object girepository/libgirepository-2.0.a.p/giinterfaceinfo.c.o
+[436/566] Compiling C object gio/gio.p/gio-tool-mkdir.c.o
+[437/566] Compiling C object gio/gio.p/gio-tool-launch.c.o
+[438/566] Compiling C object gio/gio.p/gio-tool-mime.c.o
+[439/566] Compiling C object gio/gio.p/gio-tool.c.o
+[440/566] Compiling C object gio/gio.p/gio-tool-move.c.o
+[441/566] Compiling C object gio/gio-querymodules.p/giomodule-priv.c.o
+[442/566] Compiling C object gio/gio.p/gio-tool-rename.c.o
+[443/566] Compiling C object gio/gio.p/gio-tool-remove.c.o
+[444/566] Compiling C object gio/gio.p/gio-tool-monitor.c.o
+[445/566] Compiling C object glib/gtester.p/gtester.c.o
+[446/566] Compiling C object gio/gio.p/gio-tool-list.c.o
+[447/566] Compiling C object gio/gio.p/gio-tool-cat.c.o
+[448/566] Compiling C object gio/gio.p/gio-tool-info.c.o
+[449/566] Linking static target girepository/cmph/libcmph.a
+[450/566] Compiling C object gio/gio.p/gio-tool-trash.c.o
+[451/566] Linking static target girepository/libgirepository-gthash.a
+[452/566] Compiling C object gio/gio.p/gio-tool-set.c.o
+[453/566] Compiling C object gio/gio.p/gio-tool-open.c.o
+[454/566] Compiling C object girepository/libgirepository-2.0.a.p/girepository.c.o
+[455/566] Compiling C object gio/gio.p/gio-tool-save.c.o
+[456/566] Compiling C object gio/gio.p/gio-tool-copy.c.o
+[457/566] Compiling C object fuzzing/fuzz_bookmark.p/driver.c.o
+[458/566] Compiling C object fuzzing/fuzz_canonicalize_filename.p/driver.c.o
+[459/566] Compiling C object gio/gio-querymodules.p/gio-querymodules.c.o
+[460/566] Compiling C object girepository/libgirepository-internals.a.p/girwriter.c.o
 In file included from ../third_party/glib-2.82.2/glib/glib.h:64,
                  from ../third_party/glib-2.82.2/girepository/girwriter-private.h:26,
                  from ../third_party/glib-2.82.2/girepository/girwriter.c:27:
@@ -860,215 +891,192 @@ In file included from ../third_party/glib-2.82.2/glib/glib.h:64,
 ../third_party/glib-2.82.2/girepository/girwriter.c:1438:59: note: in expansion of macro 'G_TYPE_FROM_INSTANCE'
  1438 |             g_error ("unknown info type %s", g_type_name (G_TYPE_FROM_INSTANCE (info)));
       |                                                           ^~~~~~~~~~~~~~~~~~~~
-[416/544] Compiling C object gio/gio.p/gio-tool-launch.c.o
-[417/544] Compiling C object gio/gio.p/gio-tool-remove.c.o
-[418/544] Compiling C object gio/gio.p/gio-tool.c.o
-[419/544] Compiling C object gio/gio.p/gio-tool-monitor.c.o
-[420/544] Compiling C object glib/gtester.p/gtester.c.o
-[421/544] Compiling C object gio/gio.p/gio-tool-open.c.o
-[422/544] Compiling C object gio/gio.p/gio-tool-list.c.o
-[423/544] Compiling C object gio/gio.p/gio-tool-set.c.o
-[424/544] Compiling C object gio/gio.p/gio-tool-mime.c.o
-[425/544] Compiling C object gio/gio.p/gio-tool-save.c.o
-[426/544] Compiling C object gio/gio.p/gio-tool-mkdir.c.o
-[427/544] Compiling C object gio/gio.p/gio-tool-copy.c.o
-[428/544] Linking static target girepository/cmph/libcmph.a
-[429/544] Linking static target girepository/libgirepository-gthash.a
-[430/544] Compiling C object gio/gio.p/gio-tool-info.c.o
-[431/544] Compiling C object gio/gio.p/gio-tool-move.c.o
-[432/544] Compiling C object gio/libgio-2.0.a.p/gdbusconnection.c.o
+[461/566] Compiling C object gio/gio.p/gio-tool-tree.c.o
+[462/566] Compiling C object fuzzing/fuzz_date_parse.p/driver.c.o
+[463/566] Compiling C object fuzzing/fuzz_date_time_new_from_iso8601.p/driver.c.o
+[464/566] Compiling C object fuzzing/fuzz_dbus_message.p/driver.c.o
+[465/566] Compiling C object fuzzing/fuzz_inet_address_mask_new_from_string.p/driver.c.o
+[466/566] Compiling C object fuzzing/fuzz_canonicalize_filename.p/fuzz_canonicalize_filename.c.o
+[467/566] Compiling C object gio/gresource.p/gresource-tool.c.o
+[468/566] Compiling C object fuzzing/fuzz_bookmark.p/fuzz_bookmark.c.o
+[469/566] Compiling C object fuzzing/fuzz_inet_address_new_from_string.p/driver.c.o
+[470/566] Compiling C object gio/glib-compile-resources.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
+[471/566] Compiling C object fuzzing/fuzz_date_time_new_from_iso8601.p/fuzz_date_time_new_from_iso8601.c.o
+[472/566] Compiling C object girepository/inspector/gi-inspect-typelib.p/inspector.c.o
+[473/566] Compiling C object fuzzing/fuzz_inet_socket_address_new_from_string.p/driver.c.o
+[474/566] Compiling C object fuzzing/fuzz_date_parse.p/fuzz_date_parse.c.o
+[475/566] Compiling C object gio/glib-compile-schemas.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
+[476/566] Compiling C object girepository/gi-dump-types.p/gi-dump-types.c.o
+[477/566] Compiling C object girepository/decompiler/gi-decompile-typelib.p/decompiler.c.o
+[478/566] Compiling C object fuzzing/fuzz_key.p/driver.c.o
+[479/566] Compiling C object gio/gapplication.p/gapplication-tool.c.o
+[480/566] Compiling C object fuzzing/fuzz_dbus_message.p/fuzz_dbus_message.c.o
+[481/566] Compiling C object gio/glib-compile-schemas.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
+[482/566] Compiling C object gio/gio.p/gio-tool-mount.c.o
+[483/566] Compiling C object fuzzing/fuzz_network_address_parse.p/driver.c.o
+[484/566] Compiling C object fuzzing/fuzz_paths.p/driver.c.o
+[485/566] Compiling C object fuzzing/fuzz_uri_escape.p/driver.c.o
+[486/566] Compiling C object fuzzing/fuzz_network_address_parse_uri.p/driver.c.o
+[487/566] Compiling C object fuzzing/fuzz_resolver.p/driver.c.o
+[488/566] Compiling C object fuzzing/fuzz_inet_address_mask_new_from_string.p/fuzz_inet_address_mask_new_from_string.c.o
+[489/566] Compiling C object fuzzing/fuzz_uri_parse.p/driver.c.o
+[490/566] Compiling C object gio/glib-compile-resources.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
+[491/566] Compiling C object gio/libgio-2.0.a.p/gdbusconnection.c.o
 ../third_party/glib-2.82.2/gio/gdbusconnection.c: In function 'check_initialized':
 ../third_party/glib-2.82.2/gio/gdbusconnection.c:688:8: warning: unused variable 'flags' [-Wunused-variable]
   688 |   gint flags = g_atomic_int_get (&connection->atomic_flags);
       |        ^~~~~
-[433/544] Compiling C object girepository/libgirepository-2.0.a.p/girepository.c.o
-[434/544] Compiling C object gio/gio-querymodules.p/gio-querymodules.c.o
-[435/544] Compiling C object gio/gio-querymodules.p/giomodule-priv.c.o
-[436/544] Compiling C object gio/gio.p/gio-tool-rename.c.o
-[437/544] Compiling C object fuzzing/fuzz_bookmark.p/driver.c.o
-[438/544] Compiling C object fuzzing/fuzz_canonicalize_filename.p/driver.c.o
-[439/544] Compiling C object gio/gio.p/gio-tool-tree.c.o
-[440/544] Compiling C object gio/gresource.p/gresource-tool.c.o
-[441/544] Compiling C object fuzzing/fuzz_date_parse.p/driver.c.o
-[442/544] Linking static target gio/libgio-2.0.a
-[443/544] Compiling C object gio/gio.p/gio-tool-trash.c.o
-[444/544] Compiling C object fuzzing/fuzz_date_time_new_from_iso8601.p/driver.c.o
-[445/544] Compiling C object fuzzing/fuzz_inet_address_mask_new_from_string.p/driver.c.o
-[446/544] Compiling C object gio/gio.p/gio-tool-mount.c.o
-[447/544] Compiling C object fuzzing/fuzz_dbus_message.p/driver.c.o
-[448/544] Compiling C object girepository/inspector/gi-inspect-typelib.p/inspector.c.o
-[449/544] Compiling C object fuzzing/fuzz_inet_address_new_from_string.p/driver.c.o
-[450/544] Compiling C object fuzzing/fuzz_inet_socket_address_new_from_string.p/driver.c.o
-[451/544] Compiling C object fuzzing/fuzz_date_parse.p/fuzz_date_parse.c.o
-[452/544] Compiling C object girepository/decompiler/gi-decompile-typelib.p/decompiler.c.o
-[453/544] Compiling C object gio/glib-compile-schemas.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
-[454/544] Compiling C object fuzzing/fuzz_key.p/driver.c.o
-[455/544] Compiling C object fuzzing/fuzz_network_address_parse.p/driver.c.o
-[456/544] Compiling C object girepository/gi-dump-types.p/gi-dump-types.c.o
-[457/544] Compiling C object gio/glib-compile-resources.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
-[458/544] Compiling C object fuzzing/fuzz_paths.p/driver.c.o
-[459/544] Compiling C object fuzzing/fuzz_network_address_parse_uri.p/driver.c.o
-[460/544] Compiling C object gio/glib-compile-schemas.p/.._subprojects_gvdb_gvdb_gvdb-builder.c.o
-[461/544] Compiling C object fuzzing/fuzz_resolver.p/driver.c.o
-[462/544] Compiling C object fuzzing/fuzz_bookmark.p/fuzz_bookmark.c.o
-[463/544] Compiling C object fuzzing/fuzz_canonicalize_filename.p/fuzz_canonicalize_filename.c.o
-[464/544] Compiling C object fuzzing/fuzz_uri_escape.p/driver.c.o
-[465/544] Compiling C object gio/glib-compile-resources.p/.._subprojects_gvdb_gvdb_gvdb-reader.c.o
-[466/544] Compiling C object fuzzing/fuzz_inet_address_new_from_string.p/fuzz_inet_address_new_from_string.c.o
-[467/544] Compiling C object fuzzing/fuzz_date_time_new_from_iso8601.p/fuzz_date_time_new_from_iso8601.c.o
-[468/544] Compiling C object girepository/libgirepository-internals.a.p/girnode.c.o
-[469/544] Compiling C object fuzzing/fuzz_uri_parse_params.p/driver.c.o
-[470/544] Compiling C object fuzzing/fuzz_uri_parse.p/driver.c.o
-[471/544] Compiling C object fuzzing/fuzz_inet_address_mask_new_from_string.p/fuzz_inet_address_mask_new_from_string.c.o
-[472/544] Compiling C object fuzzing/fuzz_utf8_normalize.p/driver.c.o
-[473/544] Compiling C object fuzzing/fuzz_key.p/fuzz_key.c.o
-[474/544] Compiling C object fuzzing/fuzz_uuid_string_is_valid.p/driver.c.o
-[475/544] Compiling C object fuzzing/fuzz_dbus_message.p/fuzz_dbus_message.c.o
-[476/544] Compiling C object fuzzing/fuzz_variant_binary_byteswap.p/driver.c.o
-[477/544] Compiling C object fuzzing/fuzz_utf8_validate.p/driver.c.o
-[478/544] Linking static target glib/libcharset/libcharset.a
-[479/544] Compiling C object fuzzing/fuzz_resolver.p/fuzz_resolver.c.o
-[480/544] Compiling C object fuzzing/fuzz_paths.p/fuzz_paths.c.o
-[481/544] Compiling C object fuzzing/fuzz_variant_binary.p/driver.c.o
-[482/544] Linking static target glib/gnulib/libgnulib.a
-[483/544] Compiling C object girepository/libgirepository-2.0.a.p/gitypelib.c.o
-[484/544] Compiling C object fuzzing/fuzz_network_address_parse.p/fuzz_network_address_parse.c.o
-[485/544] Linking static target gthread/libgthread-2.0.a
-[486/544] Linking static target gio/xdgmime/libxdgmime.a
-[487/544] Linking target gio/gio-launch-desktop
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_time.o: missing .note.GNU-stack section implies executable stack
+[492/566] Compiling C object girepository/libgirepository-internals.a.p/girnode.c.o
+[493/566] Compiling C object girepository/compiler/gi-compile-repository.p/compiler.c.o
+[494/566] Compiling C object fuzzing/fuzz_uri_parse_params.p/driver.c.o
+[495/566] Compiling C object fuzzing/fuzz_variant_binary.p/driver.c.o
+[496/566] Compiling C object fuzzing/fuzz_inet_socket_address_new_from_string.p/fuzz_inet_socket_address_new_from_string.c.o
+[497/566] Compiling C object fuzzing/fuzz_utf8_normalize.p/driver.c.o
+[498/566] Compiling C object fuzzing/fuzz_utf8_validate.p/driver.c.o
+[499/566] Compiling C object fuzzing/fuzz_uuid_string_is_valid.p/driver.c.o
+[500/566] Linking static target glib/libcharset/libcharset.a
+[501/566] Linking static target glib/gnulib/libgnulib.a
+[502/566] Compiling C object fuzzing/fuzz_inet_address_new_from_string.p/fuzz_inet_address_new_from_string.c.o
+[503/566] Linking static target gio/libgio-2.0.a
+[504/566] Compiling C object fuzzing/fuzz_variant_binary_byteswap.p/driver.c.o
+[505/566] Linking static target gthread/libgthread-2.0.a
+[506/566] Linking target gio/gio-launch-desktop
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_tls.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[488/544] Compiling C object fuzzing/fuzz_variant_text.p/driver.c.o
-[489/544] Compiling C object gio/gapplication.p/gapplication-tool.c.o
-[490/544] Compiling C object girepository/compiler/gi-compile-repository.p/compiler.c.o
-[491/544] Linking target glib/gtester
+[507/566] Compiling C object fuzzing/fuzz_key.p/fuzz_key.c.o
+[508/566] Linking static target gio/xdgmime/libxdgmime.a
+[509/566] Compiling C object fuzzing/fuzz_network_address_parse.p/fuzz_network_address_parse.c.o
+[510/566] Compiling C object fuzzing/fuzz_variant_text.p/driver.c.o
+[511/566] Compiling C object fuzzing/fuzz_paths.p/fuzz_paths.c.o
+[512/566] Linking target gobject/gobject-query
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[492/544] Compiling C object fuzzing/fuzz_uri_escape.p/fuzz_uri_escape.c.o
-[493/544] Compiling C object fuzzing/fuzz_inet_socket_address_new_from_string.p/fuzz_inet_socket_address_new_from_string.c.o
-[494/544] Compiling C object fuzzing/fuzz_network_address_parse_uri.p/fuzz_network_address_parse_uri.c.o
-[495/544] Compiling C object fuzzing/fuzz_uri_parse.p/fuzz_uri_parse.c.o
-[496/544] Compiling C object gio/glib-compile-resources.p/glib-compile-resources.c.o
-[497/544] Linking target gobject/gobject-query
+[513/566] Compiling C object fuzzing/fuzz_utf8_normalize.p/fuzz_utf8_normalize.c.o
+[514/566] Compiling C object fuzzing/fuzz_network_address_parse_uri.p/fuzz_network_address_parse_uri.c.o
+[515/566] Compiling C object fuzzing/fuzz_uri_parse.p/fuzz_uri_parse.c.o
+[516/566] Compiling C object fuzzing/fuzz_uri_parse_params.p/fuzz_uri_parse_params.c.o
+[517/566] Linking target glib/gtester
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[498/544] Linking target fuzzing/fuzz_inet_address_mask_new_from_string
+[518/566] Compiling C object fuzzing/fuzz_resolver.p/fuzz_resolver.c.o
+[519/566] Linking target fuzzing/fuzz_canonicalize_filename
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[499/544] Linking target fuzzing/fuzz_bookmark
+[520/566] Compiling C object fuzzing/fuzz_uuid_string_is_valid.p/fuzz_uuid_string_is_valid.c.o
+[521/566] Compiling C object fuzzing/fuzz_uri_escape.p/fuzz_uri_escape.c.o
+[522/566] Compiling C object gio/glib-compile-resources.p/glib-compile-resources.c.o
+[523/566] Linking target fuzzing/fuzz_bookmark
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[500/544] Linking target fuzzing/fuzz_date_parse
+[524/566] Linking target fuzzing/fuzz_date_parse
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[501/544] Linking target fuzzing/fuzz_date_time_new_from_iso8601
+[525/566] Linking target fuzzing/fuzz_date_time_new_from_iso8601
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[502/544] Compiling C object fuzzing/fuzz_variant_binary.p/fuzz_variant_binary.c.o
-[503/544] Compiling C object fuzzing/fuzz_utf8_validate.p/fuzz_utf8_validate.c.o
-[504/544] Linking target fuzzing/fuzz_canonicalize_filename
+[526/566] Compiling C object fuzzing/fuzz_variant_binary.p/fuzz_variant_binary.c.o
+[527/566] Linking target fuzzing/fuzz_inet_address_mask_new_from_string
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[505/544] Linking target fuzzing/fuzz_key
+[528/566] Linking target fuzzing/fuzz_paths
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[506/544] Compiling C object fuzzing/fuzz_uuid_string_is_valid.p/fuzz_uuid_string_is_valid.c.o
-[507/544] Linking target fuzzing/fuzz_inet_address_new_from_string
+[529/566] Linking target gio/gio-querymodules
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[508/544] Linking target fuzzing/fuzz_paths
+[530/566] Linking target fuzzing/fuzz_key
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[509/544] Compiling C object gio/gsettings.p/gsettings-tool.c.o
-[510/544] Linking target gio/gio-querymodules
+[531/566] Linking target fuzzing/fuzz_inet_address_new_from_string
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[511/544] Compiling C object fuzzing/fuzz_uri_parse_params.p/fuzz_uri_parse_params.c.o
-[512/544] Compiling C object fuzzing/fuzz_utf8_normalize.p/fuzz_utf8_normalize.c.o
-[513/544] Compiling C object fuzzing/fuzz_variant_binary_byteswap.p/fuzz_variant_binary_byteswap.c.o
-[514/544] Compiling C object fuzzing/fuzz_variant_text.p/fuzz_variant_text.c.o
-[515/544] Linking target fuzzing/fuzz_uri_escape
+[532/566] Compiling C object fuzzing/fuzz_utf8_validate.p/fuzz_utf8_validate.c.o
+[533/566] Compiling C object fuzzing/fuzz_variant_binary_byteswap.p/fuzz_variant_binary_byteswap.c.o
+[534/566] Compiling C object girepository/libgirepository-2.0.a.p/gitypelib.c.o
+[535/566] Linking target fuzzing/fuzz_utf8_normalize
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[516/544] Linking target fuzzing/fuzz_uri_parse
+[536/566] Linking target fuzzing/fuzz_uuid_string_is_valid
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[517/544] Linking target fuzzing/fuzz_uuid_string_is_valid
+[537/566] Linking target fuzzing/fuzz_uri_parse
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[518/544] Linking target fuzzing/fuzz_variant_binary
+[538/566] Linking target fuzzing/fuzz_uri_parse_params
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[519/544] Linking target fuzzing/fuzz_variant_binary_byteswap
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[520/544] Linking target fuzzing/fuzz_utf8_validate
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[521/544] Linking target fuzzing/fuzz_utf8_normalize
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[522/544] Linking target fuzzing/fuzz_uri_parse_params
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[523/544] Linking target fuzzing/fuzz_variant_text
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[524/544] Linking target gio/gresource
+[539/566] Linking target gio/gapplication
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[525/544] Linking target gio/gio
+[540/566] Linking target fuzzing/fuzz_variant_binary
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[541/566] Linking target fuzzing/fuzz_uri_escape
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[542/566] Linking target fuzzing/fuzz_utf8_validate
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[543/566] Compiling C object gio/gsettings.p/gsettings-tool.c.o
+[544/566] Linking target fuzzing/fuzz_variant_binary_byteswap
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[545/566] Linking target gio/gio
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[526/544] Linking target gio/gapplication
+[546/566] Compiling C object fuzzing/fuzz_variant_text.p/fuzz_variant_text.c.o
+[547/566] Linking target gio/gresource
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[527/544] Linking target fuzzing/fuzz_network_address_parse
+[548/566] Linking target fuzzing/fuzz_variant_text
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[549/566] Linking target fuzzing/fuzz_inet_socket_address_new_from_string
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[528/544] Linking target fuzzing/fuzz_inet_socket_address_new_from_string
+[550/566] Linking target fuzzing/fuzz_network_address_parse
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[529/544] Linking target fuzzing/fuzz_resolver
+[551/566] Linking target gio/glib-compile-resources
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[530/544] Linking target fuzzing/fuzz_dbus_message
+[552/566] Linking target fuzzing/fuzz_dbus_message
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[531/544] Linking target gio/glib-compile-resources
+[553/566] Linking target fuzzing/fuzz_resolver
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[532/544] Linking target gio/gsettings
+[554/566] Linking target fuzzing/fuzz_network_address_parse_uri
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[533/544] Linking target fuzzing/fuzz_network_address_parse_uri
+[555/566] Linking target gio/gsettings
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[534/544] Compiling C object gio/glib-compile-schemas.p/glib-compile-schemas.c.o
-[535/544] Compiling C object girepository/libgirepository-internals.a.p/girparser.c.o
+[556/566] Compiling C object gio/glib-compile-schemas.p/glib-compile-schemas.c.o
+[557/566] Linking target gio/glib-compile-schemas
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[558/566] Compiling C object girepository/libgirepository-internals.a.p/girparser.c.o
 In function 'parse_type_internal',
     inlined from 'parse_type' at ../third_party/glib-2.82.2/girepository/girparser.c:794:10:
 ../third_party/glib-2.82.2/girepository/girparser.c:668:11: warning: potential null pointer dereference [-Wnull-dereference]
   668 |       if (*str == '<')
       |           ^~~~
-[536/544] Linking static target girepository/libgirepository-internals.a
-[537/544] Linking static target girepository/libgirepository-2.0.a
-[538/544] Linking target gio/glib-compile-schemas
+[559/566] Linking static target girepository/libgirepository-internals.a
+[560/566] Linking static target girepository/libgirepository-2.0.a
+[561/566] Linking target girepository/gi-dump-types
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[562/566] Linking target girepository/decompiler/gi-decompile-typelib
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[563/566] Linking target girepository/inspector/gi-inspect-typelib
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
+/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[564/566] Compiling C object gio/gdbus.p/gdbus-tool.c.o
+[565/566] Linking target girepository/compiler/gi-compile-repository
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[539/544] Compiling C object gio/gdbus.p/gdbus-tool.c.o
-[540/544] Linking target girepository/inspector/gi-inspect-typelib
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[541/544] Linking target girepository/gi-dump-types
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[542/544] Linking target girepository/decompiler/gi-decompile-typelib
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_arpa_inet.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[543/544] Linking target gio/gdbus
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
-/home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
-[544/544] Linking target girepository/compiler/gi-compile-repository
+[566/566] Linking target gio/gdbus
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: user_sys_epoll.o: missing .note.GNU-stack section implies executable stack
 /home/parrot/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker

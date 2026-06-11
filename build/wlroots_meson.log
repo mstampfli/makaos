@@ -36,7 +36,7 @@ Found pkg-config: YES (/usr/bin/pkg-config) 1.8.1
 Run-time dependency wayland-server found: YES 1.23.1
 Run-time dependency libdrm found: YES 2.4.125
 Run-time dependency xkbcommon found: YES 1.7.0
-Run-time dependency pixman-1 found: YES 0.43.4
+Run-time dependency pixman-1 found: YES 0.42.2
 Library m found: YES
 Library rt found: YES
 Run-time dependency wayland-protocols found: YES 1.38
@@ -45,7 +45,7 @@ Build-time dependency wayland-scanner found: YES 1.23.1
 Program /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/bin/wayland-scanner found: YES (/home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/bin/wayland-scanner)
 Has header "linux/dma-buf.h" : NO 
 Has header "sys/eventfd.h" : YES 
-Dependency pixman-1 found: YES 0.43.4 (cached)
+Dependency pixman-1 found: YES 0.42.2 (cached)
 Dependency lcms2 skipped: feature color-management disabled
 Run-time dependency libudev found: YES 255
 Run-time dependency libseat found: YES 0.9.1
