@@ -87,7 +87,32 @@ Serial output goes to `build/serial.txt`. `build/net.pcap` captures every
 frame on the virtio-net link. `gdb -ex 'target remote :1234' build/kernel.elf`
 attaches to the kernel — see "Debugging" below.
 
-## Recent landing (this session's delta)
+## Recent landing — 2026-06-11: the Wayland session works
+
+Read `docs/SESSION_2026-06-11_SWAY.md` for the full account.  Summary:
+
+- **dwl + foot run end-to-end** (rendered terminal, live shell,
+  keyboard input) — screenshot at `docs/img/foot-on-dwl-2026-06-11.png`.
+- **sway 1.10.1 is ported and composites** (full default config,
+  workspaces, frame commits, Mod4 bindings spawn clients).  The
+  spawned client stalls before mapping its window — scheduler/wake
+  lead documented in the session notes §6 (futex-less pthread_cond is
+  suspect #1; a kernel futex is the next high-leverage kernel item).
+- Kernel: nested-epoll readiness + wake cascade, DRM GETFB minted
+  handles, MSG_DONTWAIT, /dev/ptmx + /dev/pts/N, read-only
+  MAP_PRIVATE shmem, SYS_NPROC, per-task syscall kframe (signal
+  delivery survives CPU migration — was a kernel panic), 1GiB sparse
+  shmem, ext2 fast-path EOF clamp, Super/Meta scancodes, bounded ESP
+  FAT in build.sh (the "FATAL: kernel read" boot hang).
+- libc: getopt optarg fix, execl environ, thread-safe malloc,
+  memfd_create, stdio ftell/fseek model fix + popen/ungetc/freopen,
+  getcwd(NULL), wordexp, atexit, .init_array/.ctors in crt0 (GLib
+  type system), and the whole glib/cairo/pango port surface.
+- Ports: fribidi, libpng, glib, cairo, pango, sway (+ scripts/
+  run-port-chain.sh to rebuild a fresh checkout end to end, and
+  scripts/compositor-test.sh as the headless QMP test harness).
+
+## Previous landing (older session's delta)
 
 Functional fixes — all commit-worthy:
 1. **bcache coherence bug** (`kernel/fs/ext2.c:bcache_fill`) — the 4-way
