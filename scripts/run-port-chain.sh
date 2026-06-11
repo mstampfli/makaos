@@ -36,6 +36,13 @@ PORTS=(
     fcft
     foot
     sdl3
+    # sway tier — text stack + the compositor itself
+    fribidi
+    libpng
+    glib
+    cairo
+    pango
+    sway
 )
 
 # The meson cross file embeds absolute paths; regenerate it for this

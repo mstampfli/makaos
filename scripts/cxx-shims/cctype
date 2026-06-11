@@ -1,0 +1,7 @@
+#pragma once
+#include <ctype.h>
+namespace std {
+  using ::isalnum; using ::isalpha; using ::isdigit; using ::isspace;
+  using ::isupper; using ::islower; using ::isprint; using ::ispunct;
+  using ::isxdigit; using ::tolower; using ::toupper;
+}

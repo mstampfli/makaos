@@ -9,6 +9,7 @@
 ;     [rsp + 0]  start_fn    (void* (*)(void*))
 ;     [rsp + 8]  arg          (void*)
 ;     [rsp + 16] tls_tp       (thread pointer for SYS_SET_FS)
+;     [rsp + 24] cleartid     (&slot->done — kernel join signal)
 ;
 ; We read them, call start_fn(arg), then jump to pthread_exit with
 ; the return value in rdi.  Never returns — pthread_exit does the
@@ -24,6 +25,9 @@ pthread_trampoline:
     pop  rdi                ; tls_tp
     mov  rax, 115           ; SYS_SET_FS — TLS live before any C code
     syscall
+    pop  rdi                ; cleartid word (&slot->done)
+    mov  rax, 116           ; SYS_SET_CLEARTID — kernel stores 1 +
+    syscall                 ; futex-wakes it when this task terminates
     mov  rdi, r13
     call r12                ; rax = start_fn(arg) → return value
     mov  rdi, rax           ; retval → pthread_exit arg

@@ -29,8 +29,13 @@ int sem_destroy(sem_t* s) {
 
 int sem_post(sem_t* s) {
     if (!s) { errno = EINVAL; return -1; }
-    if (__atomic_fetch_add(&s->value, 1, __ATOMIC_RELEASE) == 0)
-        _futex(&s->value, FUTEX_OP_WAKE, 1, 0);
+    __atomic_fetch_add(&s->value, 1, __ATOMIC_RELEASE);
+    // Wake unconditionally.  Waking only on the 0→1 transition loses
+    // waiters: post(); post() back-to-back wakes ONE sleeper — foot's
+    // render fan-out (one post per worker) left workers asleep and
+    // the frame never completed.  One spurious FUTEX_WAKE per post is
+    // the price of correctness until we track a waiter count.
+    _futex(&s->value, FUTEX_OP_WAKE, 1, 0);
     return 0;
 }
 

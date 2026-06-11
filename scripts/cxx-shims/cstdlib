@@ -1,0 +1,11 @@
+// MakaOS shim — replaces the freestanding libstdc++ <cstdlib>, which
+// omits the allocation functions C++ ports (harfbuzz) call through it.
+#pragma once
+#include <stdlib.h>
+namespace std {
+  using ::size_t; using ::malloc; using ::calloc; using ::realloc;
+  using ::free; using ::abort; using ::exit; using ::atexit;
+  using ::atoi; using ::atol; using ::strtol; using ::strtoul;
+  using ::strtod; using ::qsort; using ::bsearch; using ::getenv;
+  using ::rand; using ::srand; using ::abs; using ::labs;
+}

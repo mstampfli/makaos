@@ -35,6 +35,10 @@
 #define HAVE_STRCASECMP          1
 #define HAVE_STRDUP              1
 #define HAVE_RAND                1
+/* libc grew mkstemp during the glib port — without this define
+ * fccompat.c defines its own static mkstemp and collides with the
+ * stdlib.h declaration. */
+#define HAVE_MKSTEMP             1
 #define HAVE_MMAP                1
 #define HAVE_GETOPT              1
 #define HAVE_GETPAGESIZE         1

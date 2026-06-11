@@ -1,0 +1,10 @@
+#pragma once
+#include <math.h>
+#include <stdlib.h>
+namespace std {
+  using ::sqrt; using ::sin; using ::cos; using ::tan; using ::asin;
+  using ::acos; using ::atan; using ::atan2; using ::pow; using ::exp;
+  using ::log; using ::log2; using ::log10; using ::floor; using ::ceil;
+  using ::round; using ::fabs; using ::fmod; using ::ldexp; using ::frexp;
+  using ::modf; using ::abs;
+}

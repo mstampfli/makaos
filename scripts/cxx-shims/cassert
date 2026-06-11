@@ -1,0 +1,3 @@
+// MakaOS shim — freestanding libstdc++ omits the hosted C wrappers.
+#pragma once
+#include <assert.h>

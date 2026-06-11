@@ -1,0 +1,10 @@
+#pragma once
+#include <stdio.h>
+namespace std {
+  using ::FILE; using ::size_t; using ::fopen; using ::fclose;
+  using ::fread; using ::fwrite; using ::fseek; using ::ftell;
+  using ::fflush; using ::fprintf; using ::printf; using ::sprintf;
+  using ::snprintf; using ::sscanf; using ::fgets; using ::fputs;
+  using ::fgetc; using ::fputc; using ::getc; using ::putc;
+  using ::perror; using ::rename; using ::remove;
+}

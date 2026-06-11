@@ -1,0 +1,7 @@
+#pragma once
+#include <wchar.h>
+namespace std {
+  using ::wchar_t; using ::size_t; using ::mbstate_t;
+  using ::wcslen; using ::wcscpy; using ::wcsncpy; using ::wcscmp;
+  using ::wcsncmp; using ::wcschr; using ::wcsrchr;
+}

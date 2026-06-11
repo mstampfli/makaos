@@ -1,0 +1,9 @@
+#pragma once
+#include <string.h>
+namespace std {
+  using ::size_t; using ::memcpy; using ::memmove; using ::memset;
+  using ::memcmp; using ::memchr; using ::strcpy; using ::strncpy;
+  using ::strcat; using ::strncat; using ::strcmp; using ::strncmp;
+  using ::strchr; using ::strrchr; using ::strstr; using ::strlen;
+  using ::strerror; using ::strtok;
+}

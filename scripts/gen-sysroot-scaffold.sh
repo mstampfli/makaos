@@ -46,3 +46,15 @@ done
 
 "$REPO_ROOT/scripts/gen-pkgconfig.sh" >/dev/null
 log "done"
+
+# Freestanding libstdc++ omits the hosted C-wrapper headers
+# (<cassert>, <cstring>, ...) that harfbuzz and other C++ ports use.
+# Install our shims (scripts/cxx-shims/) into the toolchain's C++
+# include dir, which is already on g++'s default search path.
+CXXINC="$REPO_ROOT/toolchain/x86_64-pc-makaos/include/c++/${GCC_VER:-14.2.0}"
+if [ -d "$CXXINC" ]; then
+    # Force-copy: some shims (cstdlib) intentionally REPLACE the
+    # freestanding originals, which omit malloc/free.
+    cp -f "$REPO_ROOT"/scripts/cxx-shims/* "$CXXINC/"
+    echo "[sysroot-scaffold] C++ wrapper shims installed"
+fi

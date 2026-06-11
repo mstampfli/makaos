@@ -76,12 +76,22 @@ static thr_slot_t* slot_alloc(int tid) {
     lock_table();
     for (unsigned i = 0; i < THR_TABLE_SZ; i++) {
         unsigned idx = (unsigned)(tid + i) & (THR_TABLE_SZ - 1);
+        // Lazy-reclaim detached threads: nobody joins them, so their
+        // stack/TLS are freed here once the kernel marked them dead.
+        if (g_slots[idx].tid != 0 && g_slots[idx].detached &&
+            __atomic_load_n(&g_slots[idx].done, __ATOMIC_ACQUIRE)) {
+            if (g_slots[idx].stack) munmap(g_slots[idx].stack,
+                                           g_slots[idx].stack_size);
+            if (g_slots[idx].tls_block) free(g_slots[idx].tls_block);
+            g_slots[idx].tid = 0;
+        }
         if (g_slots[idx].tid == 0) {
-            g_slots[idx].tid      = tid;
-            g_slots[idx].done     = 0;
-            g_slots[idx].detached = 0;
-            g_slots[idx].retval   = NULL;
-            g_slots[idx].stack    = NULL;
+            g_slots[idx].tid       = tid;
+            g_slots[idx].done      = 0;
+            g_slots[idx].detached  = 0;
+            g_slots[idx].retval    = NULL;
+            g_slots[idx].stack     = NULL;
+            g_slots[idx].tls_block = NULL;
             unlock_table();
             return &g_slots[idx];
         }
@@ -203,9 +213,24 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
     }
     void* tls_tp = __makaos_tls_setup_block(tls_block);
 
+    // The slot must exist BEFORE the thread runs: the trampoline hands
+    // &s->done to the kernel (SYS_SET_CLEARTID) as the join word.  The
+    // kernel — never userland — stores 1 there at task termination, so
+    // the joiner can only free the stack/TLS once the thread truly
+    // cannot touch them again.
+    thr_slot_t* s = slot_alloc(-1);
+    if (!s) {
+        if (!attr || !attr->stack) munmap(stack, stack_size);
+        free(tls_block);
+        return EAGAIN;
+    }
+    s->stack = stack; s->stack_size = stack_size;
+    s->tls_block = tls_block;
+
     uint8_t* top = (uint8_t*)stack + stack_size;
     top = (uint8_t*)((uintptr_t)top & ~(uintptr_t)15);   // 16-byte align
     uint64_t* slot = (uint64_t*)top;
+    *(--slot) = (uint64_t)&s->done;  // popped 4th (SYS_SET_CLEARTID)
     *(--slot) = (uint64_t)tls_tp;    // popped 3rd (SYS_SET_FS)
     *(--slot) = (uint64_t)arg;       // popped 2nd (rdi)
     *(--slot) = (uint64_t)start;     // popped 1st
@@ -217,12 +242,10 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
     if (tid < 0) {
         if (!attr || !attr->stack) munmap(stack, stack_size);
         free(tls_block);
+        slot_free(s);
         errno = (int)-tid; return (int)-tid;
     }
-
-    thr_slot_t* s = slot_alloc((int)tid);
-    if (s) { s->stack = stack; s->stack_size = stack_size;
-             s->tls_block = tls_block; }
+    __atomic_store_n(&s->tid, (int)tid, __ATOMIC_RELEASE);
 
     *tid_out = (pthread_t)tid;
     // Honour PTHREAD_CREATE_DETACHED — SDL3 sets it on every non-main
@@ -238,18 +261,36 @@ pthread_t pthread_self(void) {
 
 int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
 
+// Defined with the TSS machinery below; needed by the exit-time walk.
+static void (*g_tls_dtors[PTHREAD_KEYS_MAX])(void*);
+
 __attribute__((noreturn))
 void pthread_exit(void* retval) {
+    // POSIX key-destructor walk (dtor walk) — runs on the exiting
+    // thread's own TLS, so it's lock-free like get/setspecific.
+    for (int round = 0; round < 4; round++) {
+        int again = 0;
+        for (unsigned k = 0; k < PTHREAD_KEYS_MAX; k++) {
+            void* v = pthread_getspecific(k);
+            if (v && g_tls_dtors[k]) {
+                pthread_setspecific(k, NULL);
+                g_tls_dtors[k](v);
+                again = 1;
+            }
+        }
+        if (!again) break;
+    }
     pthread_t me = pthread_self();
     thr_slot_t* s = slot_find((int)me);
     if (s) {
+        // Store ONLY the return value.  The done flag belongs to the
+        // KERNEL (SYS_SET_CLEARTID): it stores 1 + futex-wakes at task
+        // termination, when this thread provably cannot touch its
+        // stack or TLS again.  The old userland done=1-then-SYS_EXIT
+        // let the joiner free both while we were still running on
+        // them — with futex-fast wakeups that raced constantly
+        // (poisoned heap, threads jumping through scribbled pointers).
         s->retval = retval;
-        __atomic_store_n(&s->done, 1, __ATOMIC_RELEASE);
-        _futex(&s->done, _FUTEX_WAKE, 0x7fffffff, 0);
-        if (s->detached && s->stack) {
-            // Can't munmap our own stack and still run code — leak it.
-            // The kernel reclaims on exit; this is only userland tracking.
-        }
     }
     // SYS_EXIT terminates just this thread (TASK_FLAG_THREAD path).
     syscall1(SYS_EXIT, (uint64_t)(uintptr_t)retval);
@@ -477,8 +518,14 @@ typedef struct tls_entry {
     void*         val;
 } tls_entry_t;
 
-#define TLS_MAX  1024
-static tls_entry_t g_tls[TLS_MAX];
+// Per-thread slot array in REAL TLS (%fs) — pthread_getspecific and
+// pthread_setspecific are lock-free and async-signal-safe.  The old
+// global (tid,key) table took a raw spin lock on every access; a
+// SIGCHLD handler that landed while its own thread held the lock
+// (glib calls g_private_get from everywhere, including signal-time
+// logging) spun forever — sway main deadlocked exactly this way the
+// moment its child exec'd.
+static __thread void* g_tss[PTHREAD_KEYS_MAX];
 static void (*g_tls_dtors[PTHREAD_KEYS_MAX])(void*);
 static volatile pthread_key_t g_tls_next = 1;
 static volatile int g_tls_lock;
@@ -505,37 +552,13 @@ int pthread_key_delete(pthread_key_t key) {
 }
 
 void* pthread_getspecific(pthread_key_t key) {
-    int me = (int)pthread_self();
-    tls_lock();
-    for (unsigned i = 0; i < TLS_MAX; i++) {
-        if (g_tls[i].tid == me && g_tls[i].key == key) {
-            void* v = g_tls[i].val;
-            tls_unlock();
-            return v;
-        }
-    }
-    tls_unlock();
-    return NULL;
+    if (key >= PTHREAD_KEYS_MAX) return NULL;
+    return g_tss[key];
 }
 
 int pthread_setspecific(pthread_key_t key, const void* val) {
-    int me = (int)pthread_self();
-    tls_lock();
-    // Update existing or allocate fresh slot.
-    int free_idx = -1;
-    for (unsigned i = 0; i < TLS_MAX; i++) {
-        if (g_tls[i].tid == me && g_tls[i].key == key) {
-            g_tls[i].val = (void*)val;
-            tls_unlock();
-            return 0;
-        }
-        if (free_idx < 0 && g_tls[i].tid == 0) free_idx = (int)i;
-    }
-    if (free_idx < 0) { tls_unlock(); return ENOMEM; }
-    g_tls[free_idx].tid = me;
-    g_tls[free_idx].key = key;
-    g_tls[free_idx].val = (void*)val;
-    tls_unlock();
+    if (key >= PTHREAD_KEYS_MAX) return EINVAL;
+    g_tss[key] = (void*)val;
     return 0;
 }
 
