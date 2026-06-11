@@ -97,6 +97,7 @@ rm -f "$SYSROOT/usr/lib/libiconv.a"
 
 cp "$SRC_DIR/iconv.h" "$SYSROOT/usr/include/iconv.h"
 
+mkdir -p "$SYSROOT/usr/lib/pkgconfig"
 cat > "$SYSROOT/usr/lib/pkgconfig/iconv.pc" <<EOF
 prefix=/usr
 libdir=\${prefix}/lib

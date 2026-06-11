@@ -628,7 +628,15 @@ sgdisk --clear \
   "$BUILD_DIR/disk.img" > /dev/null 2>&1
 
 ESP_OFFSET=$((ESP_START * 512))
-mformat -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} -F -v "MAKAOS_ESP" ::
+# -T bounds the FAT volume to the partition's actual sector count.
+# Without it, mformat sized the filesystem to the END OF THE IMAGE
+# (266240 sectors claimed inside a 2048-sector partition) and the FAT
+# data region silently extended into the ext2 area: any file cluster
+# past partition end was clobbered by the ext2 dd below.  kernel.bin
+# crossing that line is exactly "FATAL: kernel read" + boot hang.
+# With -T, an oversized kernel makes mcopy fail loudly instead.
+ESP_SECTORS=$((ESP_END - ESP_START + 1))
+mformat -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} -T ${ESP_SECTORS} -v "MAKAOS_ESP" ::
 mmd -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} ::/EFI
 mmd -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} ::/EFI/BOOT
 mmd -i "$BUILD_DIR/disk.img"@@${ESP_OFFSET} ::/EFI/MAKA

@@ -106,6 +106,23 @@ build() {
             "$scanner" private-code   "$xml" "$pdir/${base}-protocol.c"
     done
 
+    # wlroots' installed public headers also include generated protocol
+    # headers (cursor-shape-v1, tablet-v2, …) whose XMLs ship with
+    # wayland-protocols, not with dwl.  Generate the server header for
+    # every protocol any wlroots header references; the matching
+    # private-code is already compiled inside libwlroots itself.
+    local wp_dir="$SYSROOT/usr/share/wayland-protocols"
+    grep -rhoE '#include "[A-Za-z0-9_-]+-protocol\.h"' \
+            "$SYSROOT/usr/include/wlroots-0.18" \
+        | sed -E 's/#include "(.*)-protocol\.h"/\1/' | sort -u \
+        | while read -r proto; do
+        [ -f "$pdir/${proto}-protocol.h" ] && continue
+        pxml=$(find "$wp_dir" -name "${proto}.xml" 2>/dev/null | head -1)
+        [ -n "$pxml" ] || { log "no XML for ${proto} — skipped"; continue; }
+        log "generating ${proto}-protocol.h (from wayland-protocols)"
+        "$scanner" server-header "$pxml" "$pdir/${proto}-protocol.h"
+    done
+
     (cd "$DWL_SRC" && \
         "$CROSS_CC" "${cflags[@]}" -I "$pdir" \
         -nostartfiles -Wl,--build-id=none \
