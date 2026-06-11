@@ -130,6 +130,12 @@ typedef struct __attribute__((aligned(16))) task_t {
     cpu_ctx_t     ctx;
     virt_addr_t   kstack_top;
 
+    // Userspace TLS pointer (MSR_FS_BASE).  Set by SYS_SET_FS, restored
+    // on every context switch.  Forked children inherit (same address
+    // space, same TLS block); threads set their own block first thing
+    // in the libc trampoline.
+    uint64_t      fs_base;
+
     sigstate_t    sigstate;
 
     // Head of per-task signalfd subscriber list.  signal_send walks

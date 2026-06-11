@@ -152,6 +152,10 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
         // zombifies), and it wants a fall-through, not a nested call.
         // Leaving the signal pending-with-no-handler means the next
         // signal_deliver_pending takes the SIG_DFL-terminate path.
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] setup_frame RANGE kill: comm=\"%s\" sig=%d "
+                "kf_rsp=%p frame=%p\n",
+                g_current->comm, sig, (void*)user_rsp, (void*)frame_base);
         atomic_or(&g_current->sigstate.pending,
                   1u << (uint32_t)(SIGKILL - 1));
         g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;
@@ -200,6 +204,10 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
         mm_t* mm = g_current->mm_shared->mm;
         if (!mm || !mm_vma_find(mm, frame_base - 8) ||
             !mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1)) {
+            extern void kprintf(const char*, ...);
+            kprintf("[signal] setup_frame VMA kill: comm=\"%s\" sig=%d "
+                    "kf_rsp=%p frame=%p\n",
+                    g_current->comm, sig, (void*)user_rsp, (void*)frame_base);
             atomic_or(&g_current->sigstate.pending,
                       1u << (uint32_t)(SIGKILL - 1));
             g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;

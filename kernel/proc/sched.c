@@ -678,6 +678,7 @@ void sched_init_idle_for_cpu(uint32_t id) {
     // pops proc_trampoline, which `sti; call r12` enters cpu_idle_loop.
     virt_addr_t kstack_top = kstack_alloc();
     idle->kstack_top = kstack_top;
+    idle->fs_base    = 0;
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;                          // dummy retaddr (unused)
     *(--stk) = (uint64_t)proc_trampoline;  // ret from context_switch lands here
@@ -1301,6 +1302,20 @@ static void do_switch(uint8_t preempted) {
     rcu_note_qs();
 
     tss_set_rsp0(next->kstack_top);
+
+    // Userspace TLS (%fs) — per task, not per CPU.  Cheap relative to
+    // the CR3 write below; unconditionally restoring avoids tracking
+    // a per-CPU shadow of the MSR.
+    {
+        uint64_t fsb = next->fs_base;
+        // Non-canonical wrmsr is a #GP *in the scheduler* — and tasks
+        // created outside the user paths (idle, kthreads) come from
+        // kmalloc with whatever was in the slab.  Anything outside the
+        // user half simply isn't a TLS pointer: write 0.
+        if (fsb >> 47) fsb = 0;
+        __asm__ volatile("wrmsr" :: "c"(0xC0000100u /*MSR_FS_BASE*/),
+                         "a"((uint32_t)fsb), "d"((uint32_t)(fsb >> 32)));
+    }
 
     // ── Phase 9-7 TLB shootdown bookkeeping ──────────────────────────────
     // Update the per-mm cpumasks *before* touching CR3.  The mask is

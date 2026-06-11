@@ -35,6 +35,14 @@ typedef struct signalfd_state {
     struct signalfd_state* next;
 } signalfd_state_t;
 
+// Guards every task's signalfd_head list (link, unlink, walk).  All
+// three paths are cold (signalfd_new/close, fatal-signal notify), so
+// one global IRQ-safe lock is plenty — and it closes the race where a
+// close() unlinks a node while signal_send's notify walk is mid-list
+// (observed as a nested #PF → panic when a crashing foot thread was
+// being killed while another thread tore its signalfd down).
+static spinlock_t s_sfd_lock = SPINLOCK_INIT;
+
 // Layout must match userspace <sys/signalfd.h> struct signalfd_siginfo.
 // We only populate the fields a typical reader needs; the rest are zero.
 typedef struct {
@@ -132,11 +140,13 @@ static void signalfd_close_op(vfs_file_t* self) {
     if (s) {
         // Unlink from owner's subscriber list.
         if (s->owner) {
+            uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
             signalfd_state_t** pp = (signalfd_state_t**)&s->owner->signalfd_head;
             while (*pp) {
                 if (*pp == s) { *pp = s->next; break; }
                 pp = &(*pp)->next;
             }
+            spin_unlock_irqrestore(&s_sfd_lock, fl);
         }
         kfree(s);
         self->ctx = NULL;
@@ -167,8 +177,10 @@ vfs_file_t* signalfd_new(uint32_t mask, uint32_t flags) {
 
     // Link into owner's subscriber list (head-insert, O(1)).
     if (g_current) {
+        uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
         s->next = (signalfd_state_t*)g_current->signalfd_head;
         g_current->signalfd_head = s;
+        spin_unlock_irqrestore(&s_sfd_lock, fl);
     }
     return f;
 }
@@ -193,11 +205,13 @@ int signalfd_is(vfs_file_t* f) { return f && f->close == signalfd_close_op; }
 void signalfd_notify(task_t* t, int sig) {
     if (!t) return;
     uint32_t bit = 1u << (sig - 1);
+    uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
     signalfd_state_t* s = (signalfd_state_t*)t->signalfd_head;
     while (s) {
         if (s->mask & bit) wait_queue_wake_all(&s->wq);
         s = s->next;
     }
+    spin_unlock_irqrestore(&s_sfd_lock, fl);
 }
 
 // ── Boot-time selftest ───────────────────────────────────────────────

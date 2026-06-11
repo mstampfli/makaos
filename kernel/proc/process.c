@@ -195,6 +195,7 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     t->sigstate.blocked = 0;
     t->sigstate.sigframe_rsp = 0;
     t->signalfd_head    = NULL;  // no signalfd subscribers until signalfd_new
+    t->fs_base           = 0;    // no TLS until SYS_SET_FS
     t->drm_bytes_charged = 0;
     t->drm_priority      = 0;
     // Zero the whole handlers[] array.  task_t comes out of kmalloc
@@ -448,6 +449,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
     // are duplicated in the fd table but each signalfd's wait_queue list
     // is its owner-specific subscriber membership.
     t->signalfd_head     = NULL;
+    t->fs_base           = parent->fs_base;  // same address space → same TLS block
     t->drm_bytes_charged = 0;   // fresh tasks start with no DRM charges
     t->drm_priority      = parent->drm_priority;   // inherit priority
     t->cwd = kmalloc(KPATH_MAX);

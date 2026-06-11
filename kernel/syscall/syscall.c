@@ -20,9 +20,11 @@
 #define SYSCALL_TRACE_ALL 0
 #endif
 
-/* NUL-terminated list of comm names to match (leading prefix match). */
-static const char* const s_trace_comms[] = { "foot", "dwl", "sway",
-                                             (const char*)0 };
+/* NUL-terminated list of comm names to match (leading prefix match).
+ * Empty by default — the per-syscall serial spam destroys the
+ * atomicity of [signal]/PF-KILL records exactly when they matter.
+ * Add names back locally when chasing a specific interaction. */
+static const char* const s_trace_comms[] = { "foot", (const char*)0 };
 
 static inline int comm_match(const char* comm) {
     if (SYSCALL_TRACE_ALL) return 1;
@@ -648,8 +650,19 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     }
 
     if (pid == 0) {
+        // POSIX: signal the CALLER'S PROCESS GROUP (not thread group).
         if (!g_current) return (uint64_t)-ESRCH;
-        signal_send_group(g_current->tgid, sig);
+        signal_send_pgrp(g_current->pgid, sig);
+        return 0;
+    }
+
+    if (pid < -1) {
+        // kill(-pgid): every member of process group |pid|.  This is
+        // how a terminal emulator HUPs its shell's job on shutdown
+        // (foot does exactly this).  This case used to fall through
+        // to the -1 broadcast below, SIGHUP'ing every process on the
+        // system — login, svcmgr and net included.
+        signal_send_pgrp((uint32_t)(-pid), sig);
         return 0;
     }
 
@@ -867,6 +880,13 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
     // Unblock all signals (POSIX: exec resets the signal mask).
     g_current->sigstate.blocked = 0;
+
+    // Drop the pre-exec TLS pointer — those addresses belong to the
+    // torn-down image.  The new image's crt0 installs fresh TLS via
+    // SYS_SET_FS before any %fs access.
+    g_current->fs_base = 0;
+    __asm__ volatile("wrmsr" :: "c"(0xC0000100u /*MSR_FS_BASE*/),
+                     "a"(0), "d"(0));
 
     // Update comm to the basename of argv[0] (or the resolved path if
     // argv[0] is NULL / empty).  POSIX exec() semantics — every debug
@@ -1156,6 +1176,10 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
+    // Threads inherit the spawner's TLS pointer only as a placeholder —
+    // the libc trampoline calls SYS_SET_FS with the thread's own block
+    // before running user code.  Non-shared (spawn) tasks start clean.
+    t->fs_base          = (flags & THREAD_SHARE_MM) ? g_current->fs_base : 0;
     t->umask            = g_current->umask;
 
     // Inherit comm, credentials, pledge, unveil, and FPU state from parent.
@@ -4898,6 +4922,35 @@ static uint64_t w_sys_nproc(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return (uint64_t)g_num_cpus;
 }
 
+// set_fs(addr) — point MSR_FS_BASE at a userspace TLS block for the
+// calling task.  Canonical-user check only; a garbage base just makes
+// the caller's own %fs loads fault.
+static uint64_t w_sys_set_fs(uint64_t addr, uint64_t b, uint64_t c, uint64_t d) {
+    (void)b; (void)c; (void)d;
+    if (addr >> 47) return (uint64_t)-EINVAL;
+    g_current->fs_base = addr;
+    __asm__ volatile("wrmsr" :: "c"(0xC0000100u /*MSR_FS_BASE*/),
+                     "a"((uint32_t)addr), "d"((uint32_t)(addr >> 32)));
+    return 0;
+}
+
+// futex(uaddr, op, val, timeout_ns) — see kernel/proc/futex.h.
+// timeout is RELATIVE nanoseconds (0 = forever); libc owns the ABI.
+static uint64_t w_sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
+                            uint64_t timeout_ns) {
+    extern int64_t futex_wait(uint32_t*, uint32_t, uint64_t);
+    extern int64_t futex_wake(uint32_t*, uint32_t);
+    if (!_access_ok(uaddr, sizeof(uint32_t))) return (uint64_t)-EFAULT;
+    switch ((int)(op & ~(uint64_t)(128 | 256))) {   // mask PRIVATE/CLOCK flags
+    case 0 /*FUTEX_OP_WAIT*/:
+        return (uint64_t)futex_wait((uint32_t*)uaddr, (uint32_t)val, timeout_ns);
+    case 1 /*FUTEX_OP_WAKE*/:
+        return (uint64_t)futex_wake((uint32_t*)uaddr, (uint32_t)val);
+    default:
+        return (uint64_t)-ENOSYS;
+    }
+}
+
 static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
                                  uint64_t flags, uint64_t d) {
     (void)d;
@@ -5307,6 +5360,8 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_RECVMSG]             = w_sys_recvmsg,
     [SYS_SIGNALFD]            = w_sys_signalfd,
     [SYS_NPROC]               = w_sys_nproc,
+    [SYS_FUTEX]               = w_sys_futex,
+    [SYS_SET_FS]              = w_sys_set_fs,
 };
 
 /* Per-comm syscall tracing — DEBUGGING.md §2 + §4.

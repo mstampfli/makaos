@@ -128,6 +128,8 @@
 #define SYS_RECVMSG           111 // recvmsg(fd, msghdr*, flags) → count or -errno
 #define SYS_SIGNALFD          112 // signalfd(fd, mask_ptr, flags) → fd or -errno
 #define SYS_NPROC             113 // nproc() → number of online CPUs
+#define SYS_FUTEX             114 // futex(uaddr, op, val, timeout_ns) → see futex.h
+#define SYS_SET_FS            115 // set_fs(addr) — userspace TLS base (MSR_FS_BASE)
 
 // signalfd flags (Linux-compatible).
 #define SFD_CLOEXEC  0x0002
