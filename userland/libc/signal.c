@@ -10,18 +10,42 @@
 
 extern void __sigreturn_trampoline(void);
 
+// The KERNEL ABI for SYS_SIGACTION (k_sigaction_t in kernel/proc/
+// signal.h): handler, restorer, mask32, flags32 — 24 bytes.  The
+// public <signal.h> struct sigaction uses the glibc layout (handler,
+// mask, flags, restorer).  Passing the public struct straight to the
+// kernel made it read sa_restorer from the MASK field — for the usual
+// empty mask that registered restorer = 0, and the kernel's
+// handler-validation killed the process on the FIRST real delivery
+// (dwl died of SIGKILL the moment foot exited and SIGCHLD fired).
+// Marshal explicitly; never pass the public struct to the kernel.
+typedef struct {
+    uint64_t handler;
+    uint64_t restorer;
+    uint32_t mask;
+    uint32_t flags;
+} k_sigaction_abi_t;
+
 int sigaction(int sig, const struct sigaction* act, struct sigaction* oldact) {
-    // Install the restorer trampoline for userspace→kernel signal
-    // return.  The in-tree inline does the same rewrite; we mirror it
-    // here so external callers don't need to know about the contract.
+    k_sigaction_abi_t kact, kold;
+    k_sigaction_abi_t* kap = 0;
     if (act) {
-        struct sigaction fixed = *act;
-        fixed.sa_restorer = __sigreturn_trampoline;
-        act = &fixed;
+        kact.handler  = (uint64_t)act->sa_handler;
+        kact.restorer = (uint64_t)__sigreturn_trampoline;
+        kact.mask     = (uint32_t)act->sa_mask;
+        kact.flags    = (uint32_t)act->sa_flags;
+        kap = &kact;
     }
-    return (int)__syscall_ret(
+    long r = (long)__syscall_ret(
         syscall3(SYS_SIGACTION, (uint64_t)(uint32_t)sig,
-                 (uint64_t)act, (uint64_t)oldact));
+                 (uint64_t)kap, (uint64_t)(oldact ? &kold : 0)));
+    if (r == 0 && oldact) {
+        oldact->sa_handler  = (void (*)(int))kold.handler;
+        oldact->sa_mask     = (sigset_t)kold.mask;
+        oldact->sa_flags    = (int)kold.flags;
+        oldact->sa_restorer = (void (*)(void))kold.restorer;
+    }
+    return (int)r;
 }
 
 int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {

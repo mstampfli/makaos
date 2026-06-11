@@ -28,6 +28,17 @@
 #include <time.h>
 #include <signal.h>
 
+// Raw futex.  Returns 0, or -errno (no errno global games — callers
+// branch on the raw value).  timeout_ns: relative, 0 = forever.
+#define _FUTEX_WAIT 0
+#define _FUTEX_WAKE 1
+static inline long _futex(volatile void* uaddr, int op, unsigned val,
+                          unsigned long timeout_ns) {
+    return (long)syscall4(114 /*SYS_FUTEX*/, (uint64_t)uaddr,
+                          (uint64_t)op, (uint64_t)val,
+                          (uint64_t)timeout_ns);
+}
+
 // Declared by pthread_trampoline.asm.
 extern void pthread_trampoline(void);
 
@@ -47,6 +58,7 @@ typedef struct thr_slot {
     void*            retval;
     void*            stack;         // for munmap on join/detach-exit
     size_t           stack_size;
+    void*            tls_block;     // freed on join
 } thr_slot_t;
 
 static thr_slot_t g_slots[THR_TABLE_SZ];
@@ -179,11 +191,24 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
     //     [top - 8]   start_fn
     //     [top - 16]  arg
     // Trampoline does: pop rax (start_fn); pop rdi (arg).
+    // Per-thread TLS block — the trampoline installs it via SYS_SET_FS
+    // before start() runs, so errno and every other __thread variable
+    // is private from the first instruction of user code.
+    extern size_t __makaos_tls_block_size(void);
+    extern void*  __makaos_tls_setup_block(void*);
+    void* tls_block = malloc(__makaos_tls_block_size());
+    if (!tls_block) {
+        if (!attr || !attr->stack) munmap(stack, stack_size);
+        return ENOMEM;
+    }
+    void* tls_tp = __makaos_tls_setup_block(tls_block);
+
     uint8_t* top = (uint8_t*)stack + stack_size;
     top = (uint8_t*)((uintptr_t)top & ~(uintptr_t)15);   // 16-byte align
     uint64_t* slot = (uint64_t*)top;
-    *(--slot) = (uint64_t)arg;       // pushed 2nd → popped 2nd (rdi)
-    *(--slot) = (uint64_t)start;     // pushed 1st → popped 1st (rax)
+    *(--slot) = (uint64_t)tls_tp;    // popped 3rd (SYS_SET_FS)
+    *(--slot) = (uint64_t)arg;       // popped 2nd (rdi)
+    *(--slot) = (uint64_t)start;     // popped 1st
 
     long tid = (long)syscall3(SYS_THREAD,
                                 (uint64_t)(void*)pthread_trampoline,
@@ -191,11 +216,13 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
                                 THREAD_SHARE_MM | THREAD_SHARE_FILES);
     if (tid < 0) {
         if (!attr || !attr->stack) munmap(stack, stack_size);
+        free(tls_block);
         errno = (int)-tid; return (int)-tid;
     }
 
     thr_slot_t* s = slot_alloc((int)tid);
-    if (s) { s->stack = stack; s->stack_size = stack_size; }
+    if (s) { s->stack = stack; s->stack_size = stack_size;
+             s->tls_block = tls_block; }
 
     *tid_out = (pthread_t)tid;
     // Honour PTHREAD_CREATE_DETACHED — SDL3 sets it on every non-main
@@ -218,6 +245,7 @@ void pthread_exit(void* retval) {
     if (s) {
         s->retval = retval;
         __atomic_store_n(&s->done, 1, __ATOMIC_RELEASE);
+        _futex(&s->done, _FUTEX_WAKE, 0x7fffffff, 0);
         if (s->detached && s->stack) {
             // Can't munmap our own stack and still run code — leak it.
             // The kernel reclaims on exit; this is only userland tracking.
@@ -233,13 +261,12 @@ int pthread_join(pthread_t tid, void** retval) {
     if (!s)            return ESRCH;
     if (s->detached)   return EINVAL;
 
-    // Spin-wait with sched_yield.  No futex, so this is the best we've got.
-    while (!__atomic_load_n(&s->done, __ATOMIC_ACQUIRE)) {
-        struct timespec ts = { 0, 1000000 };   // 1 ms
-        nanosleep(&ts, NULL);
-    }
+    // Sleep on the done flag; pthread_exit futex-wakes it.
+    while (!__atomic_load_n(&s->done, __ATOMIC_ACQUIRE))
+        _futex(&s->done, _FUTEX_WAIT, 0, 0);
     if (retval) *retval = s->retval;
     if (s->stack) munmap(s->stack, s->stack_size);
+    if (s->tls_block) { free(s->tls_block); s->tls_block = NULL; }
     slot_free(s);
     return 0;
 }
@@ -299,19 +326,26 @@ int pthread_mutex_lock(pthread_mutex_t* m) {
     }
     if (m->kind == PTHREAD_MUTEX_ERRORCHECK && m->owner == me)
         return EDEADLK;
-    // Spin briefly, then yield.  500 pause instructions ≈ 1–2 μs on
-    // modern CPUs before we give up and let the scheduler run someone
-    // else.
-    for (int spin = 0; spin < 500; spin++) {
-        if (__sync_bool_compare_and_swap(&m->locked, 0, 1)) {
+    // Three-state futex mutex (Drepper, "Futexes Are Tricky" §mutex2):
+    // 0 = free, 1 = locked, 2 = locked with (possible) waiters.  The
+    // unlock side only pays the FUTEX_WAKE syscall when state was 2.
+    // A short pause-spin first — most wlroots/glib critical sections
+    // are tens of nanoseconds.
+    for (int spin = 0; spin < 100; spin++) {
+        int expect = 0;
+        if (__atomic_compare_exchange_n(&m->locked, &expect, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
             m->owner = me;
             m->depth = 1;
             return 0;
         }
         __builtin_ia32_pause();
     }
-    while (!__sync_bool_compare_and_swap(&m->locked, 0, 1))
-        sched_yield();
+    int c = __atomic_exchange_n(&m->locked, 2, __ATOMIC_ACQUIRE);
+    while (c != 0) {
+        _futex(&m->locked, _FUTEX_WAIT, 2, 0);   // EAGAIN/EINTR → retry
+        c = __atomic_exchange_n(&m->locked, 2, __ATOMIC_ACQUIRE);
+    }
     m->owner = me;
     m->depth = 1;
     return 0;
@@ -326,7 +360,8 @@ int pthread_mutex_unlock(pthread_mutex_t* m) {
         return 0;
     m->owner = 0;
     m->depth = 0;
-    __sync_lock_release(&m->locked);
+    if (__atomic_exchange_n(&m->locked, 0, __ATOMIC_RELEASE) == 2)
+        _futex(&m->locked, _FUTEX_WAKE, 1, 0);
     return 0;
 }
 
@@ -362,13 +397,14 @@ int pthread_cond_destroy(pthread_cond_t* c) { (void)c; return 0; }
 
 int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
     if (!c || !m) return EINVAL;
-    unsigned seen = c->seq;
+    unsigned seen = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
     c->bound_mutex = m;
     pthread_mutex_unlock(m);
-    while (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen) {
-        struct timespec ts = { 0, 1000000 };
-        nanosleep(&ts, NULL);
-    }
+    // Sleep until the sequence moves.  EAGAIN means it already moved
+    // (signal raced our unlock — exactly the wake we wanted); EINTR
+    // re-checks.  Spurious wakeups are POSIX-legal.
+    while (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen)
+        _futex(&c->seq, _FUTEX_WAIT, seen, 0);
     pthread_mutex_lock(m);
     return 0;
 }
@@ -376,29 +412,42 @@ int pthread_cond_wait(pthread_cond_t* c, pthread_mutex_t* m) {
 int pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m,
                             const struct timespec* abs) {
     if (!c || !m || !abs) return EINVAL;
-    unsigned seen = c->seq;
+    unsigned seen = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
+    c->bound_mutex = m;
     pthread_mutex_unlock(m);
+    int rc = 0;
     while (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen) {
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
-        if (now.tv_sec > abs->tv_sec ||
-            (now.tv_sec == abs->tv_sec && now.tv_nsec >= abs->tv_nsec)) {
-            pthread_mutex_lock(m);
-            return ETIMEDOUT;
+        long long rel = (abs->tv_sec - now.tv_sec) * 1000000000LL
+                      + (abs->tv_nsec - now.tv_nsec);
+        if (rel <= 0) { rc = ETIMEDOUT; break; }
+        long fr = _futex(&c->seq, _FUTEX_WAIT, seen,
+                         (unsigned long)rel);
+        if (fr == -110 /*-ETIMEDOUT*/) { 
+            // Deadline hit while asleep; one final seq check decides.
+            if (__atomic_load_n(&c->seq, __ATOMIC_ACQUIRE) == seen)
+                rc = ETIMEDOUT;
+            break;
         }
-        struct timespec ts = { 0, 1000000 };
-        nanosleep(&ts, NULL);
+        // 0 / -EAGAIN / -EINTR all re-check the predicate.
     }
     pthread_mutex_lock(m);
-    return 0;
+    return rc;
 }
 
 int pthread_cond_signal(pthread_cond_t* c) {
     if (!c) return EINVAL;
     __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    _futex(&c->seq, _FUTEX_WAKE, 1, 0);
     return 0;
 }
-int pthread_cond_broadcast(pthread_cond_t* c) { return pthread_cond_signal(c); }
+int pthread_cond_broadcast(pthread_cond_t* c) {
+    if (!c) return EINVAL;
+    __atomic_add_fetch(&c->seq, 1, __ATOMIC_RELEASE);
+    _futex(&c->seq, _FUTEX_WAKE, 0x7fffffff, 0);
+    return 0;
+}
 
 int pthread_condattr_init(pthread_condattr_t* a)          { if (!a) return EINVAL; a->clock = CLOCK_REALTIME; return 0; }
 int pthread_condattr_destroy(pthread_condattr_t* a)       { (void)a; return 0; }

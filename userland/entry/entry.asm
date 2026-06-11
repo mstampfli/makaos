@@ -2,6 +2,7 @@ bits 64
 global _entry
 extern main
 extern environ
+extern __makaos_tls_init
 extern __init_array_start
 extern __init_array_end
 
@@ -45,6 +46,11 @@ _entry:
     mov  r12, rdi
     mov  r13, rsi
     mov  r14, rdx
+
+    ; TLS before constructors — a constructor (or anything it calls)
+    ; may touch errno, which lives at %fs-relative storage now.
+    call __makaos_tls_init
+
     lea  rbx, [rel __init_array_start]
     lea  r15, [rel __init_array_end]
 .ctor_loop:

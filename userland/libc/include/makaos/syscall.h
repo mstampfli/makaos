@@ -116,6 +116,14 @@
 #define SYS_SENDMSG           110
 #define SYS_RECVMSG           111
 #define SYS_SIGNALFD          112
+#define SYS_NPROC             113
+#define SYS_FUTEX             114
+#define SYS_SET_FS            115
+
+// futex ops (kernel/proc/futex.h).  timeout arg is RELATIVE
+// nanoseconds, 0 = wait forever.
+#define FUTEX_OP_WAIT 0
+#define FUTEX_OP_WAKE 1
 
 // SYS_READ nonblock hint — encoded in the 4th syscall arg to SYS_READ.
 #define SYS_READ_NONBLOCK 1
@@ -160,7 +168,7 @@ static inline uint64_t syscall0(uint64_t nr) {
 
 // -errno decode: negative kernel return → set errno + return -1; positive
 // → pass through unchanged.
-extern int errno;
+extern __thread int errno;
 static inline long __syscall_ret(uint64_t r) {
     long s = (long)r;
     if (s < 0 && s > -4096) { errno = (int)-s; return -1; }

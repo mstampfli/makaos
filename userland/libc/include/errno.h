@@ -93,7 +93,7 @@ extern "C" {
 #define ETXTBSY    26
 #define ENOTBLK    15
 
-extern int errno;
+extern __thread int errno;
 
 // glibc extensions a handful of ports (libinput, systemd, elfutils)
 // log messages through.  We populate both from argv[0] when crt0 runs.

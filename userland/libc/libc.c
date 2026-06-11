@@ -1,7 +1,11 @@
 #include "libc.h"
 
 // ── errno ─────────────────────────────────────────────────────────────────
-int errno = 0;
+// Thread-local — every thread sees its own errno (the global version
+// poisoned every multithreaded port: one thread's failed open changed
+// another thread's error-handling branch).  Lives in .tbss; crt0 sets
+// up the TLS block before anything can touch it.
+__thread int errno;
 
 // glibc-ism: argv[0] split into "/path/to/prog" and "prog".  Several
 // upstream ports (systemd, libinput, elfutils, util-linux) log
@@ -240,6 +244,7 @@ long atoi(const char* s) {
 // Uses SYS_BRK to grow the heap.
 
 #define ALIGN8(x)    (((x) + 7u) & ~7u)
+#define ALIGN16(x)   (((x) + 15u) & ~15u)
 #define BLOCK_MAGIC  0xDEADBEEFu
 
 typedef struct block_hdr {
@@ -250,7 +255,9 @@ typedef struct block_hdr {
     struct block_hdr* next_free;
 } block_hdr_t;
 
-#define HDR_SIZE ALIGN8(sizeof(block_hdr_t))
+// Header padded to 16 so a 16-aligned header yields a 16-aligned
+// payload — the x86-64 ABI guarantee gcc's vectorizer relies on.
+#define HDR_SIZE ALIGN16(sizeof(block_hdr_t))
 
 static uint64_t s_heap_start = 0;
 static uint64_t s_heap_end   = 0;
@@ -288,7 +295,7 @@ static int heap_grow(size_t need) {
 }
 
 static block_hdr_t* heap_alloc_raw(size_t size) {
-    size_t total = HDR_SIZE + ALIGN8(size);
+    size_t total = HDR_SIZE + ALIGN16(size);   // every block keeps successors 16-aligned
     if (s_heap_start == 0) {
         s_heap_start = brk(0);
         if (s_heap_start == (uint64_t)-1) return NULL;
@@ -302,7 +309,7 @@ static block_hdr_t* heap_alloc_raw(size_t size) {
     // Actually we track end of used space with a separate cursor.
     // Use a static bump pointer instead.
     static uint64_t s_bump = 0;
-    if (s_bump == 0) s_bump = s_heap_start;
+    if (s_bump == 0) s_bump = ALIGN16(s_heap_start);   // headers stay 16-aligned
 
     if (s_bump + total > s_heap_end) {
         if (!heap_grow(total)) return NULL;
@@ -347,8 +354,14 @@ void* malloc(size_t size) {
 void free(void* ptr) {
     if (!ptr) return;
     block_hdr_t* hdr = (block_hdr_t*)((uint8_t*)ptr - HDR_SIZE);
-    if (hdr->magic != BLOCK_MAGIC || hdr->free) return;
+    if (hdr->magic != BLOCK_MAGIC) return;
     heap_lock();
+    // The double-free check MUST be under the lock: two threads
+    // racing the same pointer could both pass an unlocked check and
+    // push the block twice — the list self-links and a later malloc
+    // walks garbage.  (Double-free is an app bug, but it must not be
+    // able to corrupt the allocator.)
+    if (hdr->free) { heap_unlock(); return; }
     hdr->free = 1;
     hdr->next_free = s_free_list;
     s_free_list = hdr;

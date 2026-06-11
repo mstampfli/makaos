@@ -3,6 +3,8 @@ ENTRY(_entry)
 PHDRS {
     text PT_LOAD FLAGS(5);   /* r-x */
     data PT_LOAD FLAGS(6);   /* rw- */
+    tls  PT_TLS  FLAGS(4);   /* TLS template — ld needs this segment to
+                                resolve local-exec @tpoff relocations */
 }
 
 SECTIONS {
@@ -26,5 +28,15 @@ SECTIONS {
     } :text
     . = ALIGN(4096);
     .data   : { *(.data*) } :data
+
+    /* TLS template.  __makaos_tls_init copies .tdata and zeroes .tbss
+       into each thread's block (variant II: %fs points just past it). */
+    . = ALIGN(64);
+    PROVIDE(__tdata_start = .);
+    .tdata  : { *(.tdata .tdata.*) } :data :tls
+    PROVIDE(__tdata_end = .);
+    .tbss   : { *(.tbss .tbss.*) *(.tcommon) } :tls
+    PROVIDE(__tbss_end = .);
+
     .bss    : { *(.bss*) *(COMMON) } :data
 }

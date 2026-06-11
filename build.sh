@@ -149,7 +149,7 @@ SYSROOT_CFLAGS=(
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
            sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
            time arpa_inet string ctype makaos_input poll signal resolv \
-           getopt wordexp; do
+           getopt wordexp tls; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
     -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
 done
@@ -223,7 +223,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
    "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
    "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o" \
-   "$BUILD_DIR/user_wordexp.o" \
+   "$BUILD_DIR/user_wordexp.o" "$BUILD_DIR/user_tls.o" \
    "$BUILD_DIR/user_wayland_egl_stub.o" \
    "$BUILD_DIR/user_sdl_port_stubs.o" \
    "$BUILD_DIR/user_c11_threads.o" \
@@ -264,6 +264,7 @@ USER_INCLUDES=(
 
 USER_RT=(
     "$BUILD_DIR/user_entry.o"
+    "$BUILD_DIR/user_tls.o"
     "$BUILD_DIR/user_libc.o"
     "$BUILD_DIR/user_stdio.o"
     "$BUILD_DIR/user_dns.o"
@@ -1024,6 +1025,14 @@ EOF
 # doesn't depend on fontconfig aliases resolving.
 shell=/bin/bash
 font=DejaVu Sans Mono:size=12
+# Single-threaded rendering.  MakaOS pthread_cond is a spin+yield
+# (no kernel futex yet); foot's render worker pool can stall in the
+# cond hand-off under SMP and the window never maps.  workers=0
+# renders on the main thread — slower scrolling, reliable startup.
+# Drop this once the kernel grows a futex.
+workers=0
+[tweak]
+grapheme-shaping=no
 [main]
 term=xterm-256color
 EOF

@@ -25,7 +25,7 @@
 #define EPIPE       32
 
 // ── errno global ──────────────────────────────────────────────────────────
-extern int errno;
+extern __thread int errno;
 
 // ── Basic types ───────────────────────────────────────────────────────────
 typedef unsigned char      uint8_t;
@@ -2059,7 +2059,7 @@ int __libc_start_main(int (*main)(int, char**, char**),
 
 // __errno_location — glibc's way of getting &errno (used by -D_REENTRANT code)
 static inline int* __errno_location(void) {
-    extern int errno;
+    extern __thread int errno;
     return &errno;
 }
 

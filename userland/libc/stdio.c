@@ -32,9 +32,12 @@ static FILE s_file_pool[MAX_FILES];
 static uint8_t s_file_used[MAX_FILES];  // 1 = in use
 
 static FILE* alloc_file(void) {
+    // Atomic claim — two threads fopen()ing concurrently (fcft's
+    // worker pool scanning fonts) must never share a slot.
     for (int i = 0; i < MAX_FILES; i++) {
-        if (!s_file_used[i]) {
-            s_file_used[i] = 1;
+        uint8_t expect = 0;
+        if (__atomic_compare_exchange_n(&s_file_used[i], &expect, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
             memset(&s_file_pool[i], 0, sizeof(FILE));
             return &s_file_pool[i];
         }
@@ -45,7 +48,7 @@ static FILE* alloc_file(void) {
 static void free_file(FILE* f) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (&s_file_pool[i] == f) {
-            s_file_used[i] = 0;
+            __atomic_store_n(&s_file_used[i], 0, __ATOMIC_RELEASE);
             return;
         }
     }

@@ -102,6 +102,9 @@ def typestr(t, per=0.15):
         elif c == '"': combo(['shift', '2'])   # CH-DE: '"' = shift+2
         elif c == '>': combo(['shift', 'less'])# CH-DE: '>' = shift+<
         elif c == '<': key('less')
+        elif c == ';': combo(['shift', 'comma']) # CH-DE: ';' = shift+,
+        elif c == ':': combo(['shift', 'dot'])   # CH-DE: ':' = shift+.
+        elif c == '$': combo(['shift', '4'])     # CH-DE: '$' = shift+4
         elif c.isalpha() and c.islower(): key(CH_DE.get(c, c))
         elif c.isalpha() and c.isupper():
             low = c.lower(); combo(['shift', CH_DE.get(low, low)])
