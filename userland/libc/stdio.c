@@ -458,6 +458,33 @@ int vfprintf(FILE* f, const char* fmt, va_list ap) {
     return n;
 }
 
+// POSIX dprintf/vdprintf — formatted output straight to a file descriptor
+// (no FILE buffering).  Used by swaybar's i3bar status protocol and other
+// ports.  Writes the formatted bytes with a single write(2) when they fit
+// in the stack buffer, else via a heap bounce.
+int vdprintf(int fd, const char* fmt, va_list ap) {
+    char buf[512];
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n <= 0) return n;
+    if ((size_t)n < sizeof(buf)) {
+        return (int)write(fd, buf, (size_t)n);
+    }
+    char* big = (char*)malloc((size_t)(n + 1));
+    if (!big) { write(fd, buf, sizeof(buf) - 1); return -1; }
+    vsnprintf(big, (size_t)(n + 1), fmt, ap);
+    int w = (int)write(fd, big, (size_t)n);
+    free(big);
+    return w;
+}
+
+int dprintf(int fd, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vdprintf(fd, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 int fprintf(FILE* f, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

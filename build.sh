@@ -139,6 +139,7 @@ SYSROOT_CFLAGS=(
 "$NASM" -f elf64 "$USERLAND_DIR/libc/pthread_trampoline.asm" -o "$BUILD_DIR/user_pthread_tramp.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/libc.c"  -o "$BUILD_DIR/user_libc.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/stdio.c" -o "$BUILD_DIR/user_stdio.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/fts.c" -o "$BUILD_DIR/user_fts.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
 
@@ -214,6 +215,7 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_langinfo.o" "$BUILD_DIR/user_assert.o" \
    "$BUILD_DIR/user_stdlib.o"   "$BUILD_DIR/user_string.o" \
    "$BUILD_DIR/user_unistd.o"   "$BUILD_DIR/user_fcntl.o" \
+   "$BUILD_DIR/user_fts.o" \
    "$BUILD_DIR/user_sys_stat.o" "$BUILD_DIR/user_sys_socket.o" \
    "$BUILD_DIR/user_sys_eventfd.o"  "$BUILD_DIR/user_sys_timerfd.o" \
    "$BUILD_DIR/user_sys_signalfd.o" "$BUILD_DIR/user_sys_ioctl.o" \
@@ -274,6 +276,7 @@ USER_RT=(
     # that libc.h declares these as prototypes rather than inlining them.
     "$BUILD_DIR/user_unistd.o"
     "$BUILD_DIR/user_fcntl.o"
+    "$BUILD_DIR/user_fts.o"
     "$BUILD_DIR/user_sys_stat.o"
     "$BUILD_DIR/user_sys_socket.o"
     "$BUILD_DIR/user_sys_eventfd.o"
@@ -616,7 +619,7 @@ stat -c "%n %s" \
 echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
-EXT2_SECTORS=262144  # 128 MiB — foot + xkb tree + wayland + ports ran out at 32 MiB
+EXT2_SECTORS=786432  # 384 MiB — room for the DE stack (sway+swaybar+swaybg+tofi) + xkb tree
 ESP_START=2048
 ESP_END=4095
 
@@ -874,8 +877,13 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # The wallpaper line is also dropped: sway was built with
     # -Ddefault-wallpaper=false, so the referenced PNG isn't installed
     # and sway treats an inaccessible background as a config error.
+    # MakaOS desktop wiring: keep the swaybar `bar {}` block (taskbar);
+    # point the wallpaper at the installed asset (swaybg loads it); route
+    # $menu through tofi-run → swaymsg exec (no xargs on the image — sh -c
+    # evaluates the $(...) at keypress time).
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
-        -e 's|^output \* bg .*|# (default wallpaper not installed on MakaOS)|' \
+        -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
+        -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
@@ -883,6 +891,32 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway        0040755 0 0
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway/config 0100644 0 0
     echo "[+] sway + swaymsg installed (+ /etc/sway/config)"
+
+    # ── Desktop environment components ────────────────────────────────
+    # swaybar (taskbar) + swaynag, swaybg (wallpaper daemon), tofi
+    # (launcher).  Installed only if their ports produced binaries.
+    for de_bin in swaybar swaynag swaybg tofi; do
+        if [ -f "$SYSROOT/usr/bin/$de_bin" ]; then
+            ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/$de_bin" "bin/$de_bin"
+            echo "[+] DE: $de_bin installed at bin/$de_bin"
+        fi
+    done
+    # Launcher is plain `tofi` in stdin/dmenu mode, fed by `ls /bin` from
+    # the keybind ($menu).  No tofi-run/tofi-drun wrappers: the kernel ELF
+    # loader has no shebang support, so a #!/bin/sh wrapper can't be exec'd
+    # directly, and argv[0]-mode aliases would need 18 MB binary copies.
+    # Default wallpaper → /usr/share/backgrounds/sway/wallpaper.png
+    SWAY_WALL="$BUILD_DIR/third_party/sway-1.10.1/assets/Sway_Wallpaper_Blue_1920x1080.png"
+    if [ -f "$SWAY_WALL" ]; then
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir usr/share/backgrounds"      >/dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir usr/share/backgrounds/sway" >/dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" \
+            -R "write $SWAY_WALL usr/share/backgrounds/sway/wallpaper.png" >/dev/null 2>&1 || true
+        ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds            0040755 0 0
+        ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds/sway       0040755 0 0
+        ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds/sway/wallpaper.png 0100644 0 0
+        echo "[+] DE: wallpaper installed → /usr/share/backgrounds/sway/wallpaper.png"
+    fi
 fi
 
 WAD_SEARCH=(

@@ -1540,6 +1540,7 @@ typedef struct {
     k_dirent_t* entries;        // heap buffer of kernel entries
     int         count;          // total entries returned by readdir syscall
     int         pos;            // current read position
+    int         at_fd;          // synthetic dir-fd from dirfd(); -1 if none
     struct dirent cur;          // storage for current POSIX dirent
 } DIR;
 

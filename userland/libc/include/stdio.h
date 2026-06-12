@@ -49,6 +49,8 @@ int vsprintf(char* buf, const char* fmt, va_list ap);
 int vsnprintf(char* buf, size_t size, const char* fmt, va_list ap);
 int asprintf(char** strp, const char* fmt, ...);
 int vasprintf(char** strp, const char* fmt, va_list ap);
+int dprintf(int fd, const char* fmt, ...);
+int vdprintf(int fd, const char* fmt, va_list ap);
 
 // Formatted input
 int scanf(const char* fmt, ...);

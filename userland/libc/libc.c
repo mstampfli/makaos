@@ -1,5 +1,14 @@
 #include "libc.h"
 
+// AT_* — duplicated from <fcntl.h> (libc.c is compiled freestanding, so
+// pulling fcntl.h here would clash with the toolchain stdint/stddef).
+#ifndef AT_FDCWD
+#define AT_FDCWD            (-100)
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+
 // ── errno ─────────────────────────────────────────────────────────────────
 // Thread-local — every thread sees its own errno (the global version
 // poisoned every multithreaded port: one thread's failed open changed
@@ -383,6 +392,17 @@ void* realloc(void* ptr, size_t new_size) {
     memcpy(new_ptr, ptr, copy);
     free(ptr);
     return new_ptr;
+}
+
+// reallocarray(ptr, nmemb, size) — realloc to nmemb*size with overflow
+// check (BSD/glibc extension; many ports use it instead of a manual
+// multiply).  Returns NULL + ENOMEM on overflow without touching ptr.
+void* reallocarray(void* ptr, size_t nmemb, size_t size) {
+    if (nmemb != 0 && size > (size_t)-1 / nmemb) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return realloc(ptr, nmemb * size);
 }
 
 // ── printf / snprintf ─────────────────────────────────────────────────────
@@ -1441,6 +1461,7 @@ DIR* opendir(const char* path) {
     dir->entries = entries;
     dir->count   = count;
     dir->pos     = 0;
+    dir->at_fd   = -1;
     return dir;
 }
 
@@ -1463,11 +1484,69 @@ struct dirent* readdir(DIR* dirp) {
     return &dirp->cur;
 }
 
+// ── Synthetic dir-fd registry (for dirfd()/fstatat()) ────────────────
+// The kernel has no openat/fstatat (no dir-relative resolution), and our
+// DIR* carries the directory PATH rather than a real fd.  To support
+// fstatat(dirfd(dir), name, …) — used by ports like tofi to scan $PATH —
+// dirfd() hands out a synthetic fd that this table maps back to the
+// directory path; fstatat() rebuilds dirpath + "/" + name and stats it.
+// Synthetic fds sit well above any real fd so they can't collide.
+#define AT_FD_BASE  0x40000000
+#define AT_FD_SLOTS 32
+static struct { int in_use; char path[512]; } s_at_dirs[AT_FD_SLOTS];
+
+int dirfd(DIR* dirp) {
+    if (!dirp) { errno = EINVAL; return -1; }
+    if (dirp->at_fd >= 0) return dirp->at_fd;     // already assigned
+    for (int i = 0; i < AT_FD_SLOTS; i++) {
+        if (!s_at_dirs[i].in_use) {
+            s_at_dirs[i].in_use = 1;
+            size_t j = 0;
+            while (j < 511 && dirp->path[j]) { s_at_dirs[i].path[j] = dirp->path[j]; j++; }
+            s_at_dirs[i].path[j] = '\0';
+            dirp->at_fd = AT_FD_BASE + i;
+            return dirp->at_fd;
+        }
+    }
+    errno = EMFILE;
+    return -1;
+}
+
 int closedir(DIR* dirp) {
     if (!dirp) { errno = EBADF; return -1; }
+    if (dirp->at_fd >= AT_FD_BASE) {
+        int slot = dirp->at_fd - AT_FD_BASE;
+        if (slot >= 0 && slot < AT_FD_SLOTS) s_at_dirs[slot].in_use = 0;
+    }
     free(dirp->entries);
     free(dirp);
     return 0;
+}
+
+// fstatat — relative-to-dirfd stat.  AT_FDCWD (or an absolute path) →
+// plain stat/lstat; a synthetic dir-fd → resolve dirpath + "/" + path,
+// then stat.  AT_SYMLINK_NOFOLLOW maps to lstat (== stat in this libc).
+int fstatat(int dirfd_, const char* path, struct stat* buf, int flags) {
+    if (!path || !buf) { errno = EINVAL; return -1; }
+    if (dirfd_ == AT_FDCWD || path[0] == '/') {
+        return (flags & AT_SYMLINK_NOFOLLOW) ? lstat(path, buf)
+                                             : stat(path, buf);
+    }
+    if (dirfd_ >= AT_FD_BASE && (dirfd_ - AT_FD_BASE) < AT_FD_SLOTS &&
+        s_at_dirs[dirfd_ - AT_FD_BASE].in_use) {
+        const char* dp = s_at_dirs[dirfd_ - AT_FD_BASE].path;
+        char full[1024];
+        size_t n = 0;
+        while (dp[n] && n < 511) { full[n] = dp[n]; n++; }
+        if (n == 0 || full[n - 1] != '/') full[n++] = '/';
+        size_t k = 0;
+        while (path[k] && n < 1023) full[n++] = path[k++];
+        full[n] = '\0';
+        return (flags & AT_SYMLINK_NOFOLLOW) ? lstat(full, buf)
+                                             : stat(full, buf);
+    }
+    errno = EBADF;
+    return -1;
 }
 
 void rewinddir(DIR* dirp) {

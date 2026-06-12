@@ -55,8 +55,8 @@ build() {
             --libdir=lib \
             --wrap-mode=nofallback \
             -Ddefault_library=static \
-            -Dswaybar=false \
-            -Dswaynag=false \
+            -Dswaybar=true \
+            -Dswaynag=true \
             -Dtray=disabled \
             -Dgdk-pixbuf=disabled \
             -Dman-pages=disabled \

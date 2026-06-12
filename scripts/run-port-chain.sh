@@ -43,6 +43,10 @@ PORTS=(
     cairo
     pango
     sway
+    # desktop environment: wallpaper + launcher (taskbar = swaybar,
+    # built by the sway port; -Dswaybar/-Dswaynag enabled in port-sway.sh)
+    swaybg
+    tofi
 )
 
 # The meson cross file embeds absolute paths; regenerate it for this
