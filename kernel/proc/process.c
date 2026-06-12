@@ -21,7 +21,12 @@ task_mm_t* task_mm_alloc(phys_addr_t pml4, mm_t* mm) {
 
 void task_mm_release(task_mm_t* m) {
     if (!m) return;
-    if (--m->refs > 0) return;
+    // ATOMIC: threads sharing this mm inc/dec refs from multiple CPUs
+    // concurrently (sys_thread create vs task exit).  A non-atomic RMW
+    // could lose an increment, drop refs to 0 early, and free the whole
+    // address space while the process is still running on it — arbitrary
+    // heap corruption.  ACQ_REL so the teardown happens-after every use.
+    if (__atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     // Sanity: on final release every task that referenced this mm has
     // exited or exec'd, and do_switch's mask-clear ran as they left
     // their CPUs.  If a bit is still set here it's an accounting bug,
@@ -107,20 +112,16 @@ task_files_t* task_files_alloc(void) {
 
 void task_files_release(task_files_t* f) {
     if (!f) return;
-    extern void kprintf(const char*, ...);
-    uint32_t pre_refs = f->refs;
-    if (--f->refs > 0) {
-        kprintf("[files] release: refs %u -> %u (NOT freeing yet)\n",
-                pre_refs, f->refs);
+    // ATOMIC — see task_mm_release.  Shared fd tables are inc/dec'd
+    // concurrently by sharing threads; a torn RMW frees the table early.
+    if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0)
         return;
-    }
-    kprintf("[files] release: refs %u -> 0, closing fds\n", pre_refs);
     fdtable_t* ft = f->ft;
     int closed = 0;
     if (ft) {
         for (uint32_t i = 0; i < ft->cap; i++)
             if (ft->fd_table[i]) { vfs_close(ft->fd_table[i]); closed++; }
-        kprintf("[files] closed %d fds (cap=%u)\n", closed, (unsigned)ft->cap);
+        (void)closed;
         kfree(ft->fd_table);
         kfree(ft->fd_flags);
         kfree(ft);
@@ -137,8 +138,15 @@ void task_files_release(task_files_t* f) {
 
 static uint64_t s_pid_bitmap[PID_WORDS] = { [0] = 0x3FFu }; // reserve 0-9
 static uint32_t s_pid_next = 10;
+// The pid pool is mutated lock-free from every task/thread/kthread
+// spawner across all CPUs.  A non-atomic bitmap RMW let two concurrent
+// pid_alloc()s pick the SAME free bit and hand out a DUPLICATE pid —
+// pid_ht then aliases two tasks, and lookups/signals hit the wrong one.
+// One serialized path; the critical section is a tiny O(1)-amortized scan.
+static spinlock_t s_pid_lock;
 
 uint32_t pid_alloc(void) {
+    uint64_t _f = spin_lock_irqsave(&s_pid_lock);
     for (uint32_t pass = 0; pass < 2; pass++) {
         uint32_t start = (pass == 0) ? s_pid_next : 10u;
         uint32_t end   = (pass == 0) ? PID_MAX    : s_pid_next;
@@ -156,15 +164,19 @@ uint32_t pid_alloc(void) {
             if (pid > PID_MAX) break;
             s_pid_bitmap[w] |= (1ull << b);
             s_pid_next = (pid + 1u <= PID_MAX) ? pid + 1u : 10u;
+            spin_unlock_irqrestore(&s_pid_lock, _f);
             return pid;
         }
     }
+    spin_unlock_irqrestore(&s_pid_lock, _f);
     return 0; // out of PIDs
 }
 
 void pid_free(uint32_t pid) {
     if (pid < 10u || pid > PID_MAX) return;
+    uint64_t _f = spin_lock_irqsave(&s_pid_lock);
     s_pid_bitmap[pid / 64u] &= ~(1ull << (pid % 64u));
+    spin_unlock_irqrestore(&s_pid_lock, _f);
 }
 
 // ── Common task init ──────────────────────────────────────────────────────

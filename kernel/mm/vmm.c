@@ -1013,6 +1013,25 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             ser_str("  R13=");ser_hex64(g[12]);
             ser_str("  R14=");ser_hex64(g[13]);
             ser_str("  R15=");ser_hex64(g[14]);
+
+            // Dump 64 bytes at RDI (g[6]) — for a struct-field NULL deref
+            // (CR2 small), RDI is usually the object pointer; the dump
+            // reveals whether ONE field was zeroed (targeted write) or a
+            // RANGE (memset/alloc overlap).  Read via the current mm; guard
+            // the read so a bad RDI doesn't fault us.
+            {
+                uint64_t rdi = g[6];
+                if (rdi >= 0x1000 && rdi < 0x800000000000ULL) {
+                    phys_addr_t pp = vmm_page_phys(vmm_pml4_get(), rdi & ~0xFFFULL);
+                    if (pp != PMM_INVALID_ADDR) {
+                        ser_str("\n  [RDI..+64]:");
+                        uint64_t* o = (uint64_t*)(rdi & ~7ULL);
+                        for (int i = 0; i < 8; i++) {
+                            ser_str(" "); ser_hex64(o[i]);
+                        }
+                    }
+                }
+            }
         }
 
         // ── VMAs ──────────────────────────────────────────────────────────

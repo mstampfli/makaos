@@ -617,18 +617,30 @@ static uint64_t sys_exit(uint64_t code) {
         }
 
         g_current->exit_code = (int32_t)(int)code;
-        g_current->state = TASK_ZOMBIE;
-        sched_add_zombie(g_current);
 
-        // Wake parent and deliver SIGCHLD so it can reap background jobs.
-        // Skip zombie parents (they can't handle anything any more).
-        // signal_send unconditionally calls sched_wake under the target
-        // rq_lock, so the racy "if state == TASK_SLEEPING" check that
-        // used to gate the second sched_wake call is gone — it was an
-        // SMP lost-wakeup waiting to happen.
-        task_t* parent = sched_find_pid(g_current->ppid);
-        if (parent && parent->state != TASK_ZOMBIE)
-            signal_send(parent, SIGCHLD);
+        // A pthread (TASK_FLAG_THREAD) is NOT a child anyone wait()s on —
+        // userland joins via the futex 'done' word (SYS_SET_CLEARTID,
+        // already signalled above), not sys_wait.  So a thread must NOT
+        // become a wait()-able zombie (it would linger forever — a kernel
+        // task-struct + pid leak per thread) and must NOT send SIGCHLD to
+        // the PROCESS's parent (a font thread exiting would spuriously
+        // wake dwl's child reaper).  Self-reap instead: TASK_DEAD is
+        // collected by the idle reaper right after we switch away, which
+        // refcount-releases the shared mm/files (task_free_rcu).
+        if (g_current->flags & TASK_FLAG_THREAD) {
+            g_current->state = TASK_DEAD;     // idle reaper frees it
+        } else {
+            g_current->state = TASK_ZOMBIE;
+            sched_add_zombie(g_current);
+
+            // Wake parent and deliver SIGCHLD so it can reap background
+            // jobs.  Skip zombie parents (they can't handle anything any
+            // more).  signal_send unconditionally calls sched_wake under
+            // the target rq_lock, so no racy state check is needed.
+            task_t* parent = sched_find_pid(g_current->ppid);
+            if (parent && parent->state != TASK_ZOMBIE)
+                signal_send(parent, SIGCHLD);
+        }
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
@@ -1134,7 +1146,7 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     // Address space: share or deep-copy.
     if (flags & THREAD_SHARE_MM) {
         t->mm_shared = g_current->mm_shared;
-        t->mm_shared->refs++;
+        __atomic_add_fetch(&t->mm_shared->refs, 1, __ATOMIC_RELAXED);
     } else {
         phys_addr_t new_pml4 = vmm_alloc_pml4();
         if (new_pml4 == PMM_INVALID_ADDR) { pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }
@@ -1164,7 +1176,7 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     // File descriptors: share or copy.
     if (flags & THREAD_SHARE_FILES) {
         t->files_shared = g_current->files_shared;
-        t->files_shared->refs++;
+        __atomic_add_fetch(&t->files_shared->refs, 1, __ATOMIC_RELAXED);
     } else {
         task_files_t* files = task_files_alloc();
         if (!files) { task_mm_release(t->mm_shared); pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }

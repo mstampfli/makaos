@@ -566,8 +566,8 @@ static int io_sqp_spawn(io_uring_t* uring) {
         task_files_release(t->files_shared);
     t->mm_shared    = uring->owner_task->mm_shared;
     t->files_shared = uring->owner_task->files_shared;
-    if (t->mm_shared)    t->mm_shared->refs++;
-    if (t->files_shared) t->files_shared->refs++;
+    if (t->mm_shared)    __atomic_add_fetch(&t->mm_shared->refs, 1, __ATOMIC_RELAXED);
+    if (t->files_shared) __atomic_add_fetch(&t->files_shared->refs, 1, __ATOMIC_RELAXED);
 
     t->kthread_ctx = uring;
     uring->sqp_task = t;
@@ -679,8 +679,8 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     }
     t->mm_shared    = uring->owner_task->mm_shared;
     t->files_shared = uring->owner_task->files_shared;
-    if (t->mm_shared)    t->mm_shared->refs++;
-    if (t->files_shared) t->files_shared->refs++;
+    if (t->mm_shared)    __atomic_add_fetch(&t->mm_shared->refs, 1, __ATOMIC_RELAXED);
+    if (t->files_shared) __atomic_add_fetch(&t->files_shared->refs, 1, __ATOMIC_RELAXED);
 
     // Stash the ring pointer so the worker can find it.
     t->kthread_ctx = uring;
