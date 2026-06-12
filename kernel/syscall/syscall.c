@@ -1937,6 +1937,38 @@ static uint64_t sys_sigreturn(void) {
 //                                 data segments use).  Writes never reach
 //                                 disk — it's the caller's private view.
 // MAP_FIXED is supported for all of the above.
+// ── mm_unmap_range_flush_free ────────────────────────────────────────
+// Unmap [addr, addr+len), shoot down the cross-CPU TLB for each batch,
+// and only THEN return the frames to the allocator.  NEVER free before
+// the shootdown: vmm_page_unmap does a local-only invlpg, so a sibling
+// thread on another CPU keeps a stale writable TLB entry until the IPI
+// lands; a frame freed earlier gets recycled + zero-filled for a new
+// owner while the sibling still writes it — heap-wide corruption.  MMIO
+// frames are device memory and never freed here.  One shared mechanism
+// for both sys_munmap and the MAP_FIXED replace path.
+static void mm_unmap_range_flush_free(task_mm_t* mm_shared, phys_addr_t pml4,
+                                      mm_t* mm, virt_addr_t addr, virt_addr_t len) {
+    enum { UNMAP_BATCH = 64 };
+    phys_addr_t freeing[UNMAP_BATCH];
+    virt_addr_t p = addr;
+    while (p < addr + len) {
+        virt_addr_t batch_start = p;
+        int nfree = 0;
+        for (; p < addr + len && nfree < UNMAP_BATCH; p += PAGE_SIZE) {
+            int is_mmio = 0;
+            rcu_read_lock();
+            { vma_t* vma = mm_vma_find(mm, p);
+              if (vma && (vma->flags & VMA_MMIO)) is_mmio = 1; }
+            rcu_read_unlock();
+            phys_addr_t frame;
+            if (vmm_page_unmap(pml4, p, &frame) && !is_mmio)
+                freeing[nfree++] = frame;     // defer free until after flush
+        }
+        tlb_flush_range(mm_shared, batch_start, p);   // shoot down + wait
+        for (int i = 0; i < nfree; i++) pmm_ref_dec(freeing[i]);
+    }
+}
+
 static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t off) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
@@ -1973,27 +2005,11 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
     if (flags & MAP_FIXED) {
         if (!addr || (addr & PAGE_MASK)) return (uint64_t)-EINVAL;
         phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-        for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
-            phys_addr_t frame;
-            if (vmm_page_unmap(pml4, p, &frame)) {
-                int is_shared = 0;
-                rcu_read_lock();
-                {
-                    // Only MMIO skips the frame free.  shmem frames are
-                    // refcounted RAM now — this PTE held a ref, drop it.
-                    vma_t* old_vma = mm_vma_find(mm, p);
-                    if (old_vma && (old_vma->flags & VMA_MMIO)) is_shared = 1;
-                }
-                rcu_read_unlock();
-                if (!is_shared) pmm_ref_dec(frame);
-            }
-        }
-        mm_vma_remove(mm, addr, addr + len);
         // MAP_FIXED replaces any existing mapping in [addr, addr+len) —
-        // invalidate the now-stale translations on every remote CPU
-        // that still has this mm in CR3.  The new mapping that follows
-        // demand-pages in, so no eager fill is needed here.
-        tlb_flush_range(g_current->mm_shared, addr, addr + len);
+        // unmap → cross-CPU flush → free, same ordering as munmap.  The
+        // new mapping demand-pages in, so no eager fill is needed here.
+        mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, addr + len);
+        mm_vma_remove(mm, addr, addr + len);
         vaddr = addr;
     } else if (addr) {
         addr &= ~PAGE_MASK;
@@ -2234,29 +2250,11 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     // skipped; shmem frames are ordinary refcounted RAM and this PTE
     // held one ref — dropping it lets the frame free once the shmem
     // object and every other mapper have also released it.
-    for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
-        int is_mmio = 0;
-        rcu_read_lock();
-        {
-            vma_t* vma = mm_vma_find(mm, p);
-            if (vma && (vma->flags & VMA_MMIO)) is_mmio = 1;
-        }
-        rcu_read_unlock();
-        phys_addr_t frame;
-        if (vmm_page_unmap(pml4, p, &frame)) {
-            if (!is_mmio) pmm_ref_dec(frame);
-        }
-    }
+    // unmap → cross-CPU flush → free (see mm_unmap_range_flush_free).
+    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, addr + len);
 
     // Remove VMA descriptors covering the range (this also unrefs shmem).
     mm_vma_remove(mm, addr, addr + len);
-
-    // Shoot down any remote CPU that still has this mm in CR3 so its
-    // TLB doesn't keep a stale, now-invalid translation alive.  Self
-    // flush is handled inline by tlb_flush_range.  For single-CPU
-    // processes this is a local invlpg loop; for multithreaded apps
-    // it IPIs just the CPUs that currently run a thread in this mm.
-    tlb_flush_range(g_current->mm_shared, addr, addr + len);
     return 0;
 }
 
