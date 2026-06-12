@@ -1869,6 +1869,18 @@ static int drm_ioctl_mode_getproperty(uint64_t arg) {
 typedef struct {
     uint8_t  active;     // 0/1
     uint32_t mode_blob;  // BLOB_MODE_ID or caller-supplied (we only store)
+
+    // ── Hardware-cursor state ────────────────────────────────────────
+    // The cursor BO is a client dumb buffer, but the dumb's device
+    // resource is X8 (no alpha); the cursor needs ARGB so the device
+    // alpha-blends the pointer shape.  We mint a SEPARATE B8G8R8A8
+    // resource aliasing the same backing pages, owned by this crtc and
+    // re-minted whenever the compositor switches cursor BOs.
+    uint32_t cursor_res;     // device resource id (0 = none)
+    uint32_t cursor_handle;  // dumb handle the res aliases (cache key)
+    uint32_t cursor_w, cursor_h;
+    uint32_t hot_x, hot_y;
+    int32_t  cur_x, cur_y;   // last position (UPDATE_CURSOR needs it)
 } drm_crtc_state_t;
 static drm_crtc_state_t g_crtc_state[VIRTIO_GPU_MAX_SCANOUTS_CAP];
 
@@ -2139,19 +2151,86 @@ static int drm_ioctl_mode_closefb(vfs_file_t* self, uint64_t arg) {
 }
 
 // ── Legacy cursor ioctl — accepted (virtio-gpu compositor-side cursor). ──
-static int drm_ioctl_mode_cursor(uint64_t arg) {
+#define DRM_MODE_CURSOR_BO   0x01u
+#define DRM_MODE_CURSOR_MOVE 0x02u
+
+// Legacy CURSOR (28B) and CURSOR2 (36B, adds hotspot).  Wired to the
+// backend hardware cursor (virtio-gpu cursor queue).  Backends without
+// cursor ops get -ENOTSUP so wlroots falls back to software cursors —
+// returning fake success here leaves the user with an invisible
+// pointer (sway trusts the ioctl and skips the software path).
+static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     struct __attribute__((packed)) {
         uint32_t flags;
         uint32_t crtc_id;
-        uint32_t x, y;
-        uint32_t width, height;
-        uint32_t handle;
-    } a;
-    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+        uint32_t x, y;             // MOVE: position
+        uint32_t width, height;    // BO: cursor dimensions
+        uint32_t handle;           // BO: dumb handle; 0 = hide
+        int32_t  hot_x, hot_y;     // CURSOR2 only
+    } a = {0};
+    uint64_t copy_len = has_hotspot ? sizeof(a) : sizeof(a) - 8;
+    if (copy_from_user(&a, (void*)arg, copy_len) != 0) return -EFAULT;
+
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     uint32_t n_sc = b ? b->scanout_count() : 0;
     if (a.crtc_id < CRTC_BASE || a.crtc_id >= CRTC_BASE + n_sc) return -ENOENT;
-    return 0;
+    if (!b->cursor_update || !b->cursor_move) return -EOPNOTSUPP;
+
+    uint32_t idx = a.crtc_id - CRTC_BASE;
+    drm_crtc_state_t* cs = &g_crtc_state[idx];
+
+    if (a.flags & DRM_MODE_CURSOR_MOVE) {
+        cs->cur_x = (int32_t)a.x;
+        cs->cur_y = (int32_t)a.y;
+        return b->cursor_move(idx, cs->cur_x, cs->cur_y);
+    }
+
+    if (!(a.flags & DRM_MODE_CURSOR_BO)) return -EINVAL;
+
+    if (a.handle == 0) {
+        // Hide: resource 0 + drop our aliased resource.
+        b->cursor_update(idx, 0, 0, 0, cs->cur_x, cs->cur_y);
+        if (cs->cursor_res) b->resource_destroy(cs->cursor_res);
+        cs->cursor_res = 0;
+        cs->cursor_handle = 0;
+        return 0;
+    }
+
+    drm_client_t* c = client_of(f);
+    drm_dumb_t* d = find_dumb(c, a.handle);
+    if (!d) return -ENOENT;
+    if (!a.width || !a.height ||
+        (uint64_t)a.width * a.height * 4 > d->size) return -EINVAL;
+
+    // (Re)mint the ARGB alias when the BO or its dimensions change.
+    if (cs->cursor_res &&
+        (cs->cursor_handle != a.handle ||
+         cs->cursor_w != a.width || cs->cursor_h != a.height)) {
+        b->resource_destroy(cs->cursor_res);
+        cs->cursor_res = 0;
+    }
+    if (!cs->cursor_res) {
+        uint32_t id = alloc_res_id();
+        if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+                               a.width, a.height) != 0)
+            return -EIO;
+        if (b->resource_attach_backing(id, d->phys, d->bytes_alloc) != 0) {
+            b->resource_destroy(id);
+            return -EIO;
+        }
+        cs->cursor_res    = id;
+        cs->cursor_handle = a.handle;
+        cs->cursor_w      = a.width;
+        cs->cursor_h      = a.height;
+    }
+    if (has_hotspot) { cs->hot_x = (uint32_t)a.hot_x;
+                       cs->hot_y = (uint32_t)a.hot_y; }
+
+    // Push the (possibly re-rendered) cursor pixels, then bind.
+    if (b->resource_transfer(cs->cursor_res, a.width, a.height) != 0)
+        return -EIO;
+    return b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y,
+                            cs->cur_x, cs->cur_y);
 }
 
 // ── AUTH_MAGIC / GET_MAGIC (master-token semantics) ─────────────────
@@ -2340,8 +2419,8 @@ static int64_t drm_ioctl_impl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     case DRM_IOCTL_MODE_GETPROPBLOB:       return drm_ioctl_mode_getpropblob(arg);
     case DRM_IOCTL_MODE_GETFB:             return drm_ioctl_mode_getfb(self, arg);
     case DRM_IOCTL_MODE_CLOSEFB:           return drm_ioctl_mode_closefb(self, arg);
-    case DRM_IOCTL_MODE_CURSOR:            return drm_ioctl_mode_cursor(arg);
-    case DRM_IOCTL_MODE_CURSOR2:           return drm_ioctl_mode_cursor(arg);
+    case DRM_IOCTL_MODE_CURSOR:            return drm_ioctl_mode_cursor(self, arg, 0);
+    case DRM_IOCTL_MODE_CURSOR2:           return drm_ioctl_mode_cursor(self, arg, 1);
     case DRM_IOCTL_AUTH_MAGIC:             return drm_ioctl_auth_magic(arg);
     case DRM_IOCTL_GET_MAGIC:              return drm_ioctl_get_magic(arg);
     case DRM_IOCTL_MODE_CREATE_LEASE:      return -EOPNOTSUPP;

@@ -2471,8 +2471,12 @@ static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
     (void)flags;
     if (!src_ptr || !src_w || !src_h) return (uint64_t)-EINVAL;
     if (!g_fb.base_virt)              return (uint64_t)-EIO;
+    // Bound the source rect: src_w*src_h*4 is computed in 64-bit below, but
+    // user_buf_prefault and the inner loop index `src` with src_w/src_h, so
+    // a huge or overflowing rect would prefault/read arbitrary user range.
+    if (src_w > 16384 || src_h > 16384) return (uint64_t)-EINVAL;
 
-    user_buf_prefault(src_ptr, src_w * src_h * 4);
+    user_buf_prefault(src_ptr, (uint64_t)src_w * src_h * 4);
     const uint32_t* src   = (const uint32_t*)src_ptr;
     uint32_t*       fb    = (uint32_t*)g_fb.base_virt;
     uint32_t        dw    = g_fb.width;

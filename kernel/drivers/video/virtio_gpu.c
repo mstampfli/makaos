@@ -11,6 +11,7 @@
 
 #include "virtio_gpu.h"
 #include "drm_backend.h"
+#include "errno.h"
 #include "pci.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -343,6 +344,86 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
     return 0;
 }
 
+// ── Cursor queue (§5.7.6.10) ─────────────────────────────────────────
+// UPDATE_CURSOR / MOVE_CURSOR go on the dedicated cursor virtqueue so
+// pointer motion never queues behind bulk control-queue transfers.
+// Own bounce page + own lock: the ctrl path's response window may span
+// its whole page, and mouse-move frequency must not contend with
+// scanout flushes.
+
+#define VIRTIO_GPU_CMD_UPDATE_CURSOR  0x0300u
+#define VIRTIO_GPU_CMD_MOVE_CURSOR    0x0301u
+
+typedef struct __attribute__((packed)) {
+    uint32_t scanout_id;
+    uint32_t x, y;
+    uint32_t padding;
+} virtio_gpu_cursor_pos_t;
+
+typedef struct __attribute__((packed)) {
+    virtio_gpu_ctrl_hdr_t   hdr;       // UPDATE_CURSOR or MOVE_CURSOR
+    virtio_gpu_cursor_pos_t pos;
+    uint32_t resource_id;              // UPDATE only; 0 hides the cursor
+    uint32_t hot_x, hot_y;             // UPDATE only
+    uint32_t padding;
+} virtio_gpu_update_cursor_t;
+
+static phys_addr_t s_cursor_phys = 0;
+static uint8_t*    s_cursor_virt = NULL;   // request at +0, response at +2048
+static spinlock_t  s_cursor_lock = SPINLOCK_INIT;
+
+static int vgpu_send_cursor(const virtio_gpu_update_cursor_t* req) {
+    if (!s_cursor_virt) return 0;
+
+    spin_lock(&s_cursor_lock);
+    __builtin_memcpy(s_cursor_virt, req, sizeof(*req));
+    __builtin_memset(s_cursor_virt + 2048, 0, sizeof(virtio_gpu_ctrl_hdr_t));
+
+    virtq_t* vq = &s_cursor_vq;
+    uint16_t d0 = vq->free_head;
+    if (d0 == 0xFFFFu) { spin_unlock(&s_cursor_lock); return 0; }
+    uint16_t d1 = vq->desc[d0].next;
+    if (d1 == 0xFFFFu) { spin_unlock(&s_cursor_lock); return 0; }
+    vq->free_head = vq->desc[d1].next;
+
+    vq->desc[d0].addr  = (uint64_t)s_cursor_phys;
+    vq->desc[d0].len   = sizeof(*req);
+    vq->desc[d0].flags = VIRTQ_DESC_F_NEXT;
+    vq->desc[d0].next  = d1;
+
+    vq->desc[d1].addr  = (uint64_t)(s_cursor_phys + 2048);
+    vq->desc[d1].len   = sizeof(virtio_gpu_ctrl_hdr_t);
+    vq->desc[d1].flags = VIRTQ_DESC_F_WRITE;
+    vq->desc[d1].next  = 0;
+
+    uint16_t slot = vq->avail_idx % VIRTQ_SIZE;
+    vq->avail->ring[slot] = d0;
+    __asm__ volatile("mfence" ::: "memory");
+    vq->avail_idx++;
+    vq->avail->idx = vq->avail_idx;
+    __asm__ volatile("mfence" ::: "memory");
+
+    *(volatile uint16_t*)(s_notify + vq->notify_off * s_notify_mult) = VQ_CURSORQ;
+    __asm__ volatile("mfence" ::: "memory");
+
+    // Poll for completion (QEMU answers in microseconds; same bounded
+    // poll as the control queue until we go interrupt-driven).
+    for (int i = 0; i < 10000000; i++) {
+        uint16_t used_idx = vq->used->idx;
+        __asm__ volatile("lfence" ::: "memory");
+        if (used_idx != vq->last_used_idx) {
+            vq->last_used_idx = used_idx;
+            vq->desc[d1].next = vq->free_head;
+            vq->desc[d0].next = d1;
+            vq->free_head = d0;
+            spin_unlock(&s_cursor_lock);
+            return 1;
+        }
+    }
+    spin_unlock(&s_cursor_lock);
+    return 0;
+}
+
 // ── Init ────────────────────────────────────────────────────────────
 int virtio_gpu_init(void) {
     pci_device_t dev;
@@ -432,6 +513,11 @@ int virtio_gpu_init(void) {
     s_cmd_phys = pmm_buddy_alloc(0);
     if (!s_cmd_phys) return 0;
     s_cmd_virt = (uint8_t*)((uintptr_t)s_cmd_phys + HHDM_OFFSET);
+
+    // Cursor-queue bounce buffer (separate page — see vgpu_send_cursor).
+    s_cursor_phys = pmm_buddy_alloc(0);
+    if (!s_cursor_phys) return 0;
+    s_cursor_virt = (uint8_t*)((uintptr_t)s_cursor_phys + HHDM_OFFSET);
 
     s_common->device_status = VIRTIO_STATUS_ACKNOWLEDGE |
                               VIRTIO_STATUS_DRIVER |
@@ -826,6 +912,28 @@ static int vgpu_be_flush(uint32_t id, uint32_t w, uint32_t h) {
     return virtio_gpu_resource_flush(id, w, h) ? 0 : -1;
 }
 
+static int vgpu_be_cursor_update(uint32_t scanout, uint32_t res_id,
+                                 uint32_t hot_x, uint32_t hot_y,
+                                 int32_t x, int32_t y) {
+    virtio_gpu_update_cursor_t c = {
+        .hdr  = { .type = VIRTIO_GPU_CMD_UPDATE_CURSOR },
+        .pos  = { .scanout_id = scanout,
+                  .x = (uint32_t)x, .y = (uint32_t)y },
+        .resource_id = res_id,
+        .hot_x = hot_x, .hot_y = hot_y,
+    };
+    return vgpu_send_cursor(&c) ? 0 : -EIO;
+}
+
+static int vgpu_be_cursor_move(uint32_t scanout, int32_t x, int32_t y) {
+    virtio_gpu_update_cursor_t c = {
+        .hdr  = { .type = VIRTIO_GPU_CMD_MOVE_CURSOR },
+        .pos  = { .scanout_id = scanout,
+                  .x = (uint32_t)x, .y = (uint32_t)y },
+    };
+    return vgpu_send_cursor(&c) ? 0 : -EIO;
+}
+
 static const drm_backend_ops_t vgpu_backend_ops = {
     .scanout_count           = vgpu_be_scanout_count,
     .scanout_mode            = vgpu_be_scanout_mode,
@@ -835,6 +943,8 @@ static const drm_backend_ops_t vgpu_backend_ops = {
     .scanout_set             = vgpu_be_scanout_set,
     .resource_transfer       = vgpu_be_transfer,
     .resource_flush          = vgpu_be_flush,
+    .cursor_update           = vgpu_be_cursor_update,
+    .cursor_move             = vgpu_be_cursor_move,
 };
 
 // drm_backend global pointer + registration — defined here so the

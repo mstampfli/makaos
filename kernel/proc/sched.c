@@ -1058,7 +1058,10 @@ void task_children_reparent(task_t* from, task_t* to) {
 //   - Walking and mutating sleep_head.
 //   - Mutating runqueue heads/tails during priority boost.
 void sched_tick(void) {
-    s_tick_count++;
+    // Per-CPU tick; the global counter is bumped by all CPUs.  Atomic so
+    // the MLFQ-boost modulo test below fires on exactly one CPU per
+    // interval instead of racing/skipping.
+    uint64_t tick = __atomic_add_fetch(&s_tick_count, 1, __ATOMIC_RELAXED);
 
     // Fallback for lost MSI-X: rescan AHCI completions every tick.
     // If an IRQ was swallowed, this catches it within ~1ms.
@@ -1115,7 +1118,7 @@ void sched_tick(void) {
     //     — the next tick catches it.
     int need_lock = 0;
     if (rq->sleep_head) need_lock = 1;
-    if (s_tick_count % BOOST_INTERVAL == 0) need_lock = 1;
+    if (tick % BOOST_INTERVAL == 0) need_lock = 1;
 
     if (!need_lock) return;
 
@@ -1142,7 +1145,7 @@ void sched_tick(void) {
     // may race with thieves on other CPUs — harmless, the thief gets
     // the task before we boost it, but then it'll re-enter at its
     // level on the thief's CPU and be boosted on a later tick there).
-    if (s_tick_count % BOOST_INTERVAL == 0) {
+    if (tick % BOOST_INTERVAL == 0) {
         for (uint8_t i = 1; i < MLFQ_LEVELS; i++) {
             for (;;) {
                 task_t* t = (task_t*)chaselev_pop(&rq->levels[i]);

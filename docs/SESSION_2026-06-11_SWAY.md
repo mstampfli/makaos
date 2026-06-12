@@ -444,3 +444,41 @@ load), 0 PF-KILL/PANIC, 0 WAKE-UAF, 0 tripwire hits, all 4 CPUs
 healthy-idle at end-of-run.  Keybind facts confirmed along the way:
 sway spawns foot with Win+Enter (`$mod Mod4`); dwl uses ALT —
 Alt+Shift+Enter (its `MODKEY` is `WLR_MODIFIER_ALT`, line config.h:110).
+
+## 11. Hardware cursor + kernel-wide correctness audit (2026-06-12)
+
+**Hardware cursor.**  The DRM `CURSOR`/`CURSOR2` ioctls used to fake success
+(`return 0`) without drawing — sway/wlroots trusted that and skipped the
+software cursor, so the pointer was invisible.  Wired a real backend cursor
+path: `drm_backend_ops` gains `cursor_update`/`cursor_move` (NULL → core
+returns `-ENOTSUP` so compositors fall back to software cursors — never fake
+success); virtio-gpu drives the dedicated cursor virtqueue
+(UPDATE_CURSOR/MOVE_CURSOR, own bounce page + lock); the DRM core mints a
+B8G8R8A8 alias resource over the client's cursor dumb BO (dumbs are X8, the
+cursor needs alpha) and re-mints on BO/dimension change.  Verified via QEMU's
+`virtio_gpu_update_cursor` tracepoint: live positions tracking the mouse +
+real cursor resources bound.  (NB: QEMU `screendump` captures the scanout,
+NOT the cursor overlay — don't test the cursor that way.)
+
+**Audit.**  A 24-agent workflow (5 class-hunters → adversarial verify)
+swept for the just-fixed bug classes.  13 confirmed / 6 refuted.  Fixed:
+- signalfd_notify: wake_all under the global `s_sfd_lock` with no preempt
+  guard — the timerfd lock-leak class, but on EVERY signal delivery
+  (SIGCHLD/^C/SIGSEGV).  preempt_disable guard added.
+- virtio-net RX: clamp device-reported `pkt_len` to `ETH_MAX_FRAME` before
+  the memcpy (was an unbounded over-read into kernel memory).
+- virtio-net TX: add `s_tx_lock` — the descriptor free list / avail ring /
+  bounce buffer had no cross-CPU serialization.
+- AHCI TFES ISR: take `s_ci_lock` for the `s_active_mask` exchange (raced
+  issue_cmd's set-SACT-then-mask-then-CI window → could free a live cmd).
+- HDA `/dev/audio`: producer-side lock around the FIFO write (multi-open).
+- SYS_FB_BLIT: bound the source rect (`>16384` reject) + 64-bit prefault
+  length (was integer-overflowable, unvalidated user read).
+- timer tick counters (`g_irq_count`, `s_tick_count`): atomic — MLFQ boost
+  modulo was racing/skipping across CPUs.
+
+Deferred (documented, NOT rushed — need FS/io_uring stress harnesses and the
+ext2 file is partially do-not-touch): ext2 holds per-inode seqlock /
+per-group / rename spinlocks across SLEEPING disk I/O (leak-the-lock hang
+class), and io_uring_register does faultable copy/kmalloc under a fixed
+spinlock.  Tracked for a dedicated FS-locking pass.

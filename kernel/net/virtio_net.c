@@ -3,6 +3,7 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "kheap.h"
+#include "smp.h"
 #include "idt.h"
 #include "lapic.h"
 #include "irq_wait.h"
@@ -354,9 +355,17 @@ void virtio_net_irq_handler(void) {
 
 // ── Public TX API ─────────────────────────────────────────────────────────
 
+// Serializes the entire TX submit+poll window: the descriptor free list,
+// the shared TX bounce buffer, the avail ring, and last_used_idx are all
+// global and TX can be entered concurrently by any task (eth.c) and the
+// net RX thread.  The device's TX side never touches these from an ISR,
+// so a plain spin_lock (no irqsave) suffices — contention is cross-CPU.
+static spinlock_t s_tx_lock = SPINLOCK_INIT;
+
 int virtio_net_tx(const void* data, uint16_t len) {
     if (!s_ok || len > ETH_MAX_FRAME) return -1;
 
+    spin_lock(&s_tx_lock);
     // Build virtio-net header + frame in the TX buffer.
     __builtin_memset(s_tx_buf_virt, 0, VIRTIO_NET_HDR_LEN);
     __builtin_memcpy(s_tx_buf_virt + VIRTIO_NET_HDR_LEN, data, len);
@@ -365,7 +374,7 @@ int virtio_net_tx(const void* data, uint16_t len) {
 
     // Allocate one descriptor for the combined header + frame.
     uint16_t idx = virtq_alloc_desc(&s_txq);
-    if (idx == 0xFFFFu) return -1;  // TX ring full
+    if (idx == 0xFFFFu) { spin_unlock(&s_tx_lock); return -1; }  // TX ring full
 
     s_txq.desc[idx].addr  = s_tx_buf_phys;
     s_txq.desc[idx].len   = VIRTIO_NET_HDR_LEN + len;
@@ -380,12 +389,13 @@ int virtio_net_tx(const void* data, uint16_t len) {
     uint32_t spins = 0;
     while (s_txq.used->idx == s_txq.last_used_idx) {
         __asm__ volatile("pause" ::: "memory");
-        if (++spins > 10000000u) return -1;  // timeout
+        if (++spins > 10000000u) { spin_unlock(&s_tx_lock); return -1; }  // timeout
     }
     uint16_t used_idx = (uint16_t)(s_txq.last_used_idx & (VIRTQ_SIZE - 1));
     virtq_free_desc(&s_txq, (uint16_t)s_txq.used->ring[used_idx].id);
     s_txq.last_used_idx++;
 
+    spin_unlock(&s_tx_lock);
     return 0;
 }
 
@@ -407,6 +417,12 @@ int virtio_net_rx_poll(skbuff_t** skb_out) {
     uint8_t* raw    = s_rx_bufs[desc_id].virt;
     uint32_t eth_len = (pkt_len > VIRTIO_NET_HDR_LEN)
                        ? (pkt_len - VIRTIO_NET_HDR_LEN) : 0;
+    // CLAMP against the actual RX buffer payload — pkt_len comes straight
+    // from the device-written used ring and is otherwise untrusted.  The
+    // source buffer holds at most ETH_MAX_FRAME payload bytes; a device
+    // reporting more would make the memcpy over-read past the source page
+    // into adjacent kernel memory (info leak / corruption).
+    if (eth_len > ETH_MAX_FRAME) eth_len = ETH_MAX_FRAME;
 
     skbuff_t* skb = skb_alloc(eth_len);
     if (skb && eth_len > 0) {

@@ -7,6 +7,7 @@
 #include "idt.h"
 #include "lapic.h"
 #include "common.h"
+#include "smp.h"
 
 extern void hda_irq_entry(void);
 
@@ -166,6 +167,10 @@ static uint8_t* s_buf[BDL_ENTRIES];
 // Software FIFO — producer: hda_write(), consumer: IRQ handler
 static uint8_t*          s_fifo    = NULL;
 static volatile uint32_t s_fifo_wp = 0;   // written by hda_write()
+// /dev/audio is multi-open (vfs); two writers on different CPUs would
+// race s_fifo_wp and the lazy-start block.  Producer-side lock only —
+// the ISR consumer (SPSC reader) never takes it.
+static spinlock_t s_hda_wlock = SPINLOCK_INIT;
 static volatile uint32_t s_fifo_rp = 0;   // written by IRQ handler
 
 // Which DMA slot to fill next (advanced by IRQ handler)
@@ -313,10 +318,17 @@ int hda_write(const void* buf, uint32_t len) {
     const uint8_t* src  = (const uint8_t*)buf;
     uint32_t       done = 0;
 
+    spin_lock(&s_hda_wlock);
+
     while (done < len) {
         uint32_t space = fifo_free();
         while (space == 0) {
+            // Must not sleep holding the producer lock — drop it across the
+            // IRQ wait, re-take after.  Another writer may make progress
+            // meanwhile; we re-read space after re-acquiring.
+            spin_unlock(&s_hda_wlock);
             irq_wait(g_hda_irq);
+            spin_lock(&s_hda_wlock);
             space = fifo_free();
         }
 
@@ -341,6 +353,7 @@ int hda_write(const void* buf, uint32_t len) {
         sd_w32(SD_CTL, SD_CTL_TAG(1) | SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE | SD_CTL_RUN);
     }
 
+    spin_unlock(&s_hda_wlock);
     return (int)done;
 }
 

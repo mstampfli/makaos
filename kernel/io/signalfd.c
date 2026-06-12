@@ -17,6 +17,7 @@
 #include "kheap.h"
 #include "wait.h"
 #include "smp.h"
+#include "preempt.h"
 #include "cpu.h"
 #include "sched.h"
 #include "process.h"
@@ -205,6 +206,15 @@ int signalfd_is(vfs_file_t* f) { return f && f->close == signalfd_close_op; }
 void signalfd_notify(task_t* t, int sig) {
     if (!t) return;
     uint32_t bit = 1u << (sig - 1);
+    // preempt_disable across the locked walk: wait_queue_wake_all's
+    // rcu_read_unlock is a preempt_enable, and sched_wake sets
+    // reschedule_pending — without the guard the unlock-at-depth-0
+    // context-switches away WHILE HOLDING the global s_sfd_lock, and
+    // every later signal_send on any CPU spins forever with IRQs off.
+    // Exact same bug class as timerfd_tick / the mouse ISR; the wake
+    // cannot move outside the lock (the lock keeps signalfd_state
+    // alive against concurrent close).  Direct depth-- at the end.
+    preempt_disable();
     uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
     signalfd_state_t* s = (signalfd_state_t*)t->signalfd_head;
     while (s) {
@@ -212,6 +222,7 @@ void signalfd_notify(task_t* t, int sig) {
         s = s->next;
     }
     spin_unlock_irqrestore(&s_sfd_lock, fl);
+    this_cpu()->preempt_depth--;
 }
 
 // ── Boot-time selftest ───────────────────────────────────────────────

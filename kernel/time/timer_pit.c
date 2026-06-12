@@ -16,7 +16,7 @@ void timer_register_tick(void (*fn)(void)) {
 
 // Called from irq0_entry (LAPIC timer stub) after LAPIC EOI.
 void timer_irq_handler(void) {
-    g_irq_count++;
+    __atomic_fetch_add(&g_irq_count, 1, __ATOMIC_RELAXED);
     if (s_tick_fn) s_tick_fn();
     sched_preempt();
 }

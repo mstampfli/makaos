@@ -302,7 +302,14 @@ void ahci_irq_handler(void) {
     if (port_is & PORT_IS_TFES) {
         // Task file error: fail all active slots.  The port is now dirty;
         // leaving it is safe for a restart (next submit re-issues).
+        // Take s_ci_lock for the active-mask exchange: issue_cmd sets SACT
+        // then s_active_mask then CI under this lock; reading s_active_mask
+        // here WITHOUT it can observe a slot already in active_mask whose CI
+        // write issue_cmd hasn't published yet, so we'd fail+free a slot the
+        // device is about to execute → use-after-free of its command table.
+        uint64_t tfes_fl = spin_lock_irqsave(&s_ci_lock);
         uint32_t active = __atomic_exchange_n(&s_active_mask, 0u, __ATOMIC_ACQ_REL);
+        spin_unlock_irqrestore(&s_ci_lock, tfes_fl);
         uint32_t mask = active;
         while (mask) {
             uint32_t slot = (uint32_t)__builtin_ctz(mask);

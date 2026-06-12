@@ -53,6 +53,21 @@ typedef struct drm_backend_ops {
     // Commit transferred bytes to the display.  After resource_flush
     // returns, the new pixels are visible.
     int (*resource_flush)(uint32_t id, uint32_t w, uint32_t h);
+
+    // ── Hardware cursor (OPTIONAL — may be NULL) ─────────────────
+    // When NULL the DRM core returns -ENOTSUP from the cursor ioctls,
+    // which makes wlroots/sway fall back to software cursor rendering.
+    // NEVER fake success without drawing: compositors trust a
+    // successful cursor ioctl and skip the software fallback, leaving
+    // the user with an invisible cursor (observed with sway).
+    //
+    // cursor_update: bind cursor image `resource_id` (ARGB format,
+    // hotspot hot_x/hot_y) to `scanout` at position x,y.  id 0 hides.
+    // cursor_move: reposition without changing the image.
+    int (*cursor_update)(uint32_t scanout, uint32_t resource_id,
+                          uint32_t hot_x, uint32_t hot_y,
+                          int32_t x, int32_t y);
+    int (*cursor_move)(uint32_t scanout, int32_t x, int32_t y);
 } drm_backend_ops_t;
 
 // The single backend registration.  Set by the backend's init code
