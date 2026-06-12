@@ -47,6 +47,7 @@ PORTS=(
     # built by the sway port; -Dswaybar/-Dswaynag enabled in port-sway.sh)
     swaybg
     tofi
+    wlr-randr
 )
 
 # The meson cross file embeds absolute paths; regenerate it for this

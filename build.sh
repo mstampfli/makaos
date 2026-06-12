@@ -895,7 +895,7 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # ── Desktop environment components ────────────────────────────────
     # swaybar (taskbar) + swaynag, swaybg (wallpaper daemon), tofi
     # (launcher).  Installed only if their ports produced binaries.
-    for de_bin in swaybar swaynag swaybg tofi; do
+    for de_bin in swaybar swaynag swaybg tofi wlr-randr; do
         if [ -f "$SYSROOT/usr/bin/$de_bin" ]; then
             ext2_install_bin "$BUILD_DIR/ext2.img" "$SYSROOT/usr/bin/$de_bin" "bin/$de_bin"
             echo "[+] DE: $de_bin installed at bin/$de_bin"
