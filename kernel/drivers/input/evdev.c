@@ -261,6 +261,8 @@ static int evdev_vfs_poll(vfs_file_t* self, int events) {
 static void evdev_vfs_close(vfs_file_t* self) {
     evdev_client_t* c = (evdev_client_t*)self->ctx;
     if (c) {
+        // Un-mute the console when the compositor releases the keyboard.
+        if (c->dev == s_keyboard_dev) input_kbd_ungrab();
         // Drop grab if we hold it.
         if (c->grabbed && c->dev) {
             if (c->dev->grabbed > 0) c->dev->grabbed--;
@@ -514,6 +516,12 @@ vfs_file_t* evdev_open_device(uint32_t event_nr) {
     // Push into device's client list.
     c->next    = d->clients;
     d->clients = c;
+
+    // A userland reader of the keyboard means a compositor has taken
+    // over input.  Mute the kernel console TTY for the lifetime of this
+    // fd (refcounted) so keystrokes go to the compositor, not the shell
+    // behind it.  (No VT switching on MakaOS — this is the equivalent.)
+    if (d == s_keyboard_dev) input_kbd_grab();
 
     return f;
 }
