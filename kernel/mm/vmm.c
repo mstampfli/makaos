@@ -292,6 +292,11 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             } else {
                 out[i] = (void*)(phys + HHDM_OFFSET);
             }
+            // Pin under the lock: the frame is now committed to the
+            // caller (DMA target).  Pinning here, atomically with
+            // resolution, closes the window where another CPU could
+            // free + recycle it before the caller's DMA lands.
+            pmm_pin((phys_addr_t)((uint64_t)out[i] - HHDM_OFFSET));
             if (lock_mm) spin_unlock(&lock_mm->vma_lock);
         } else {
             if (lock_mm) spin_unlock(&lock_mm->vma_lock);
@@ -310,13 +315,15 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             }
             if (*pte & PAGE_PRESENT) {
                 phys_addr_t have = *pte & PAGE_ADDR_MASK;
+                out[i] = (void*)(have + HHDM_OFFSET);
+                pmm_pin(have);                     // pin before unlock
                 if (lock_mm) spin_unlock(&lock_mm->vma_lock);
                 pmm_ref_dec(frame);          // alloc rc==1 → freed
-                out[i] = (void*)(have + HHDM_OFFSET);
             } else {
                 *pte = frame | leaf;
-                if (lock_mm) spin_unlock(&lock_mm->vma_lock);
                 out[i] = (void*)(frame + HHDM_OFFSET);
+                pmm_pin(frame);                    // pin before unlock
+                if (lock_mm) spin_unlock(&lock_mm->vma_lock);
             }
         }
     }

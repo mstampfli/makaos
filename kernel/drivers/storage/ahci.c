@@ -831,12 +831,12 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
     void* page_ptrs[130];
     if (!vmm_get_user_pages(pml4, va, npages, page_ptrs)) return 0;
 
-    // Pin pages so CoW fork doesn't share a frame while DMA is in flight.
+    // vmm_get_user_pages already pinned each frame UNDER its resolution
+    // lock (closing the resolve→DMA recycle window).  We own those pins;
+    // release them after the DMA completes.
     phys_addr_t pin_addrs[130];
-    for (uint32_t i = 0; i < npages; i++) {
+    for (uint32_t i = 0; i < npages; i++)
         pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
-        pmm_pin(pin_addrs[i]);
-    }
 
     uint8_t ok = ahci_submit_sg(lba, (uint8_t**)page_ptrs, npages,
                                   first_off, count, 0);
