@@ -258,3 +258,47 @@ Open issues, for next session:
   (cursor wiggle / keypress) forces a recomposite — presentation
   quirk in both compositors on MakaOS.
 - Kernel thread tasks linger as zombies (no thread reaping).
+
+## 8. The multithreaded-foot corruption campaign (2026-06-12)
+
+After dwl+foot rendered, foot's 4 concurrent font-loader threads corrupted
+the heap intermittently (font-name pointers overwritten with small ints →
+SIGSEGV in sdbm_hash).  Single-threaded font loading was always clean, so the
+bug was strictly in concurrency.  Root causes, found and fixed in order:
+
+1. **TLS block mis-sized (the dominant bug).** Binaries whose first PT_LOAD
+   skips file offset 0 (foot/sway from meson) have no PT_PHDR and leave the
+   ELF phdr table unmapped, so the kernel reported `AT_PHDR=0`.  libc sizes
+   its %fs TLS block from PT_TLS via AT_PHDR; a zero there sized every
+   thread's block to ~0 bytes, so `errno` and the pthread-key array wrote
+   ~1.4 KiB into the neighbouring malloc heap.  Fix: kernel maps a read-only
+   page with the ELF header+phdrs below the lowest segment and points AT_PHDR
+   at it (`elf.c`); `tls.c` reads `p_memsz`/`p_align` from PT_TLS and lays out
+   the variant-II block correctly (template at `tp - align_up(memsz,align)`).
+   Took 5/8 → mostly clean.
+
+2. **pthread slot-table key mismatch.** The cleartid rework allocated the
+   join slot under a placeholder tid `-1` (hash position A) but looked it up
+   by the real tid (hash position B), so `pthread_join` occasionally freed a
+   *still-live* thread's stack+TLS.  First fixed with a full-table scan
+   (13/15), then — per the new prime directive — rewritten properly.
+
+3. **pthread_t is now a descriptor pointer (no table at all).**  glibc/NPTL
+   model: `pthread_t` is a pointer to a heap `struct __pthread`; join/detach/
+   kill/equal dereference it directly (O(1), no scan/hash/lock).  Each thread
+   caches its descriptor in %fs; detached threads self-reap via a lock-free
+   stack.  `pthread_mutex_t.owner` became a plain kernel-tid int so the mutex
+   layout is unchanged.
+
+Supporting kernel fixes landed the same campaign: shmem/pcache/pcp folded into
+the one global per-frame refcount (no frame freed while still referenced);
+`signal_deliver_pending` takes an explicit may-setup-frame arg instead of a
+stale per-CPU flag; CoW-break/demand-page run under `mm->vma_lock` with a
+presence re-check; fork shoots down sibling-CPU TLBs; AHCI DMA frames pinned
+under the resolution lock; `mm_vma_remove` case-4 split carries the file
+fields.  Diagnosis used per-frame `DOUBLE-ALLOC`/`REF-INC-ON-FREE`/heap
+double-free tripwires, a 6-VM parallel soak harness, forced-uniprocessor
+isolation, and two adversarial multi-agent audit workflows.
+
+`CLAUDE.md` now records the prime directive: always the best/most performant/
+scalable design — beat Linux, eliminate lookups rather than optimize them.
