@@ -24,7 +24,7 @@
  * Empty by default — the per-syscall serial spam destroys the
  * atomicity of [signal]/PF-KILL records exactly when they matter.
  * Add names back locally when chasing a specific interaction. */
-static const char* const s_trace_comms[] = { "foot", "dwl", (const char*)0 };
+static const char* const s_trace_comms[] = { (const char*)0 };
 
 static inline int comm_match(const char* comm) {
     if (SYSCALL_TRACE_ALL) return 1;
@@ -538,7 +538,7 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
             if (new_brk <= heap_vma_start) {
                 rcu_assign_pointer(*pp, v->next);
                 // Expedited: user-visible brk() return latency matters.
-                call_rcu_expedited(vma_free_rcu, v);
+                call_rcu_head(&v->rcu_head, vma_free_rcu, v);
             } else {
                 v->end = new_brk;  // in-place shrink — safe under RCU
             }
@@ -1612,7 +1612,7 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
             if (v->start == heap_start) {
                 rcu_assign_pointer(*pp2, v->next);
                 // Expedited: user-visible brk()/munmap return latency matters.
-                call_rcu_expedited(vma_free_rcu, v);
+                call_rcu_head(&v->rcu_head, vma_free_rcu, v);
                 break;
             }
             pp2 = &v->next;
@@ -1946,15 +1946,20 @@ static uint64_t sys_sigreturn(void) {
 // owner while the sibling still writes it — heap-wide corruption.  MMIO
 // frames are device memory and never freed here.  One shared mechanism
 // for both sys_munmap and the MAP_FIXED replace path.
+// `end` is EXCLUSIVE (== addr + length).  Both callers pass `addr + len`,
+// so this takes the end pointer directly — NOT a length.  (A prior version
+// named this `len` but still computed `addr + len` in the loop bound, so a
+// caller passing `addr + len` made the loop run to `addr + (addr + len)` —
+// ~2*addr iterations, an effectively unbounded hang.  Take `end` as-is.)
 static void mm_unmap_range_flush_free(task_mm_t* mm_shared, phys_addr_t pml4,
-                                      mm_t* mm, virt_addr_t addr, virt_addr_t len) {
+                                      mm_t* mm, virt_addr_t addr, virt_addr_t end) {
     enum { UNMAP_BATCH = 64 };
     phys_addr_t freeing[UNMAP_BATCH];
     virt_addr_t p = addr;
-    while (p < addr + len) {
+    while (p < end) {
         virt_addr_t batch_start = p;
         int nfree = 0;
-        for (; p < addr + len && nfree < UNMAP_BATCH; p += PAGE_SIZE) {
+        for (; p < end && nfree < UNMAP_BATCH; p += PAGE_SIZE) {
             int is_mmio = 0;
             rcu_read_lock();
             { vma_t* vma = mm_vma_find(mm, p);

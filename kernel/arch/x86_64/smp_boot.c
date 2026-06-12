@@ -147,7 +147,6 @@ static int bring_up_one_ap(uint32_t target_id, uint32_t target_apic_id,
 
 // ── Entry: smp_boot_aps ─────────────────────────────────────────────────
 void smp_boot_aps(void) {
-    if (1) { serial_puts_dbg("[smp] FORCED-UNIPROCESSOR (debug)\n"); return; }
     if (!g_acpi.ok || g_acpi.cpu_count <= 1) {
         serial_puts_dbg("[smp] uniprocessor — skipping AP bring-up\n");
         return;

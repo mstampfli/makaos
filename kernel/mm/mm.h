@@ -2,6 +2,7 @@
 #include "common.h"
 #include "vmm.h"
 #include "smp.h"
+#include "rcu.h"   // rcu_head_t — vmas are freed via async call_rcu_head
 
 // ── VMA flags (protection bits) ───────────────────────────────────────────
 #define VMA_R      (1U << 0)   // readable
@@ -37,6 +38,13 @@ typedef struct vma_t {
     struct vfs_file_t* file;     // open file handle (one ref per VMA)
     uint64_t           file_off; // file offset corresponding to vma->start
     uint64_t           file_len; // bytes in file backing this VMA (rest = zero/BSS)
+
+    // Async deferred-free hook.  vmas are unlinked under mm->vma_lock and
+    // freed via call_rcu_head AFTER a grace period — NOT via the synchronous
+    // call_rcu_expedited (which IPIs every CPU and waits, and would deadlock
+    // when a sibling CPU is page-faulting and spinning on this same vma_lock
+    // with IRQs off).  See vma_free_rcu / mm_vma_remove.
+    rcu_head_t      rcu_head;
 } vma_t;
 
 // ── Memory descriptor ─────────────────────────────────────────────────────

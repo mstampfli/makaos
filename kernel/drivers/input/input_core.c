@@ -1,5 +1,20 @@
 #include "input_core.h"
 #include "common.h"
+#include "smp.h"
+
+// ── i8042 controller lock ─────────────────────────────────────────────────
+// One PS/2 controller, two IRQ lines (IRQ1 keyboard, IRQ12 mouse), shared
+// data/status ports 0x60/0x64.  Under SMP the IOAPIC can deliver the two
+// IRQs to different CPUs concurrently — and the same IRQ can re-fire on a
+// second CPU while the first is mid-handler.  Every status-read + data-read
+// pair, and every byte-stream accumulator state touched by the ISRs, must
+// be serialized by this one lock or bytes get stolen/garbled across CPUs
+// and stream indices race (the mouse packet index escaping its bound was
+// observed scribbling PS/2 packet bytes over .bss: g_mouse_waitq et al).
+// Same design as Linux's i8042_lock.  ISRs run with local IRQs off, so a
+// plain spin_lock (no irqsave) is sufficient: the only contention is
+// cross-CPU.
+spinlock_t g_i8042_lock = SPINLOCK_INIT;
 
 // ── Handler list ──────────────────────────────────────────────────────────
 // Singly-linked list of registered handlers.  Modified only at init time

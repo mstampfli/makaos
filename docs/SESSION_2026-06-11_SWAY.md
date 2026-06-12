@@ -290,6 +290,35 @@ bug was strictly in concurrency.  Root causes, found and fixed in order:
    stack.  `pthread_mutex_t.owner` became a plain kernel-tid int so the mutex
    layout is unchanged.
 
+4. **TLB-shootdown sender missing its StoreLoad fence (the residual ~8-10%
+   SMP race — root cause).** After fixes 1-3 the frequent corruption was gone
+   but a rare (~8-10% of boots) pointer-zeroing crash remained, *only* under
+   SMP: a forced-uniprocessor soak was 16/16 clean while the SMP baseline
+   crashed on run 1.  So it was a genuine cross-CPU race, not a logic bug.
+   The TLB-shootdown protocol is two-sided Dekker:
+   - **switcher** (`sched.c`, taking an mm): `task_mm_cpumask_set` (`lock or`
+     = full barrier) → `mov %cr3` (serializing) → touch user memory.  Its bit
+     is globally visible before it can cache any PTE.  Correctly fenced.
+   - **shootdowner** (`vmm_page_unmap`: `*pte = 0` plain store → `tlb.c`
+     `tlb_flush_common` reads the cpumask with a plain ACQUIRE `mov`).  On
+     x86-TSO a later load to a different address may float ahead of an earlier
+     store still in the store buffer; ACQUIRE is a bare `mov` and does **not**
+     stop it.  **No StoreLoad barrier between the PTE teardown and the cpumask
+     read.**
+
+   So the unmapping CPU could read the cpumask *before* its `*pte = 0` was
+   globally visible, miss the just-published bit of a CPU concurrently
+   switching into the mm, skip IPIing it, and free the frame — while that CPU
+   kept a stale TLB entry.  The frame was reused and `calloc`-zeroed, and the
+   victim read zeros where a pointer lived.  SMP-only, narrow window (matches
+   the ~8-10% rate), pointer-shaped, and orthogonal to the earlier munmap
+   free-ordering fix (that fixed *when* the frame frees; this is *which* CPUs
+   get flushed).  Fix: a single `__atomic_thread_fence(__ATOMIC_SEQ_CST)` in
+   `tlb_flush_common` immediately before the cpumask read — one barrier at the
+   chokepoint every shootdown funnels through, covering every PTE-modifying
+   caller (munmap / MAP_FIXED / mprotect / CoW frame-swap) present and future,
+   with no way to drift.  Validated by a 30-run SMP soak (see §9).
+
 Supporting kernel fixes landed the same campaign: shmem/pcache/pcp folded into
 the one global per-frame refcount (no frame freed while still referenced);
 `signal_deliver_pending` takes an explicit may-setup-frame arg instead of a
@@ -302,3 +331,116 @@ isolation, and two adversarial multi-agent audit workflows.
 
 `CLAUDE.md` now records the prime directive: always the best/most performant/
 scalable design — beat Linux, eliminate lookups rather than optimize them.
+
+## 9. Real-SMP bringup: dwl composites under 4 CPUs (2026-06-12)
+
+A forced-uniprocessor debug hack (`smp_boot.c: if (1) return;`) had been masking
+every SMP defect — and had shipped in the last several commits, so "dwl+foot
+working" was really *uniprocessor* working.  Removing it surfaced three bugs,
+found in this order.  After all three, dwl runs the DRM backend, commits
+1280×800 scanouts, and spawns foot on real 4-CPU SMP (`lazy /bin/foot`,
+`commit: scanout=0 ... applied`), 0 PF-KILLs.
+
+1. **TLB-shootdown sender missing its StoreLoad fence (heap corruption).**
+   `vmm_page_unmap` clears a leaf PTE with a plain `*pte = 0`, then
+   `tlb_flush_common` reads the per-mm cpumask with a plain ACQUIRE load — no
+   StoreLoad barrier between them.  On x86-TSO the cpumask load may float ahead
+   of the not-yet-visible PTE store, so the unmapping CPU can miss the bit of a
+   CPU concurrently entering the mm (whose `switch_mm` IS fenced: `lock or` +
+   `mov cr3`), skip IPIing it, free the page — and that CPU keeps a stale TLB
+   entry to a reused+zeroed frame.  SMP-only, pointer-shaped.  Fix: one
+   `__atomic_thread_fence(SEQ_CST)` at the shootdown chokepoint in `tlb.c`.
+
+2. **Two-CPUs-on-one-kstack work-steal race (the `task->on_cpu` gate).**
+   `do_switch` re-enqueues the still-running `prev` (making it steal-able)
+   BEFORE `context_switch` saves its rsp.  A remote idle CPU's lock-free
+   `chaselev_steal` (pure CAS, needs no IRQ on the victim — the in-tree comment
+   wrongly claimed IRQs-off mitigated this) can resume `prev` on a stale rsp.
+   Fix: Linux's `on_cpu` flag in `cpu_ctx_t` (reuses the fxsave pad, `CTX_ONCPU`
+   = 56); `context_switch`'s asm release-clears it right after the rsp store
+   (covers the trampoline first-run paths too); the **producers** —
+   `sched_try_steal` and `sched_wake`'s migrate branch — acquire-spin on it
+   before placing a task on a destination rq.  The resume path (`do_switch`)
+   never spins, which is what makes it deadlock-free (the clearer always
+   progresses); a `next==prev` self-switch re-arms the flag.  First draft spun
+   in `do_switch` and self-deadlocked at boot — moved to the producer side.
+
+3. **munmap range arg bug (THE dwl wedge — and it wasn't SMP-specific).**
+   The session's `mm_unmap_range_flush_free` refactor took a `len` parameter
+   but both callers (`sys_munmap`, the MAP_FIXED replace path) pass `addr + len`
+   (an END pointer).  The loop bound `p < addr + len` then meant
+   `p < addr + (addr + len)`, so unmapping dwl's 36 KB xkb mapping looped
+   ~`addr`/PAGE_SIZE ≈ 34 billion times — a multi-hour hang inside `munmap`.
+   GDB caught it: CPU2 cycling `mm_vma_find`→`vmm_page_unmap` with the range arg
+   = `addr + 36864`.  Fix: the parameter IS `end`; loop `while (p < end)`.
+   This hung on 1 CPU too — but a runaway *loop* is not a PF-KILL, so the
+   crash-counting soaks (incl. forced-uni 16/16) scored these hangs as "clean,"
+   which is what made it look SMP-specific.  Lesson baked into the harness:
+   **gate soak success on the workload actually running (`lazy /bin/foot`), not
+   just on the absence of a crash.**
+
+Diagnosis tools that mattered: per-syscall serial trace narrowed the wedge to
+`SYS_MUNMAP` (an enter with no return); `gdb -nx` over the QEMU gdbstub with
+multi-sample RIP showed CPU2 *looping* (not stuck) and the bogus range arg;
+a multi-agent workflow (6 investigators → synthesis → 2 adversarial verifiers)
+correctly fingered the `on_cpu` race and corrected the first fix's deadlock.
+
+Note on the `on_cpu` gate: the producer-side version still deadlocked under
+load (a CPU wedged in `sched_try_steal`'s spin) and was REVERTED.  The
+two-CPUs-on-one-kstack steal race it targeted is real but rare; redoing it
+needs the clear to be carried through `context_switch` correctly AND a proof
+the producer spins can't entangle with a task that never re-enters do_switch.
+Tracked as known debt — do not re-land without a deterministic kthread
+canary harness (victim sched_yield/sched_sleep loops + cross-CPU stealers).
+
+## 10. The "fix everything" correctness sweep (2026-06-12 afternoon)
+
+User-visible state at the start: sway ran, Win+Enter did nothing, the live VM
+was wedged.  GDB + serial forensics found four distinct correctness bugs:
+
+1. **PS/2 mouse ISR scribbled .bss (THE mouse-move corruption).**  The IRQ12
+   accumulator did `s_packet[s_packet_idx++]` with an `==` reset and no
+   cross-CPU serialization.  Two CPUs in the ISR concurrently push the index
+   past the reset and it never resets again (uint8_t walks 255 bytes of
+   .bss), splattering raw packets — `0x18 0x00 0xff` — over `g_mouse_waitq`
+   and the evdev ring.  The symbol map nailed it: `s_packet` ends 7 bytes
+   before `g_mouse_waitq`, and the corruption value WAS a mouse-move packet.
+   Explains every historical "crashes when I move the mouse" report; the
+   uniprocessor era was immune (one CPU = serialized ISR).  Fix:
+   `g_i8042_lock` serializing both i8042 ISRs' port-pair reads + stream
+   state (Linux's i8042_lock design), `>=` clamp so desync can never escape
+   the buffer, decode moved outside the lock on a snapshot.
+
+2. **timerfd tick leaked its per-CPU spinlock (the recurring stuck locks).**
+   `timerfd_tick` ran `wait_queue_wake_all` UNDER `pc->lock` with no preempt
+   guard.  wake_all's `rcu_read_unlock` is a `preempt_enable`; during a tick
+   `reschedule_pending` is nearly always set → `sched_preempt → do_switch`
+   context-switched away WHILE HOLDING the lock.  Every later settime/tick
+   on that CPU spun forever — twice observed in GDB as a CPU eternally in
+   `timerfd_settime` on its own slot's lock with all other CPUs idle.  Fix:
+   `preempt_disable` across the locked section (direct depth-- exit, same
+   pattern as the mouse ISR; the deferred preempt fires via
+   timer_irq_handler's own sched_preempt).
+
+3. **irq_wait SMP lost-wakeup closed.**  The check-then-enqueue was guarded
+   by local `cli` only — useless against `irq_notify` on another CPU.  Now:
+   register-then-recheck (the WAIT_EVENT pattern) + atomic saturating CAS
+   credit counter on both sides.  The old header's apology paragraph (the
+   level-triggered redesign "reverted until the AHCI bug is fixed") is
+   resolved — the corruption that revert was hiding from is fixed at root.
+
+4. **Buddy free-list tripwire armed.**  One storm run caught a kernel #PF in
+   `pmm_buddy_alloc_locked`: a FREE frame's intrusive `{next,prev}` overlay
+   contained a user-text-shaped pointer (`0x4a6095`) — write-after-free into
+   a free frame through some still-live mapping (rare; not yet reproduced
+   post-fixes).  `free_list_pop/remove` now validate overlay pointers are
+   HHDM-range before following and, on violation, dump the frame address +
+   first 64 bytes (the scribbler's fingerprint) and panic with provenance
+   instead of wild-faulting.  Open lead, armed to self-diagnose.
+
+Validation: 6/6 consecutive SMP boots of sway → Win+Enter → foot with a
+380-event QMP mouse storm each — foot PRESENTS (~150 commits/run after
+load), 0 PF-KILL/PANIC, 0 WAKE-UAF, 0 tripwire hits, all 4 CPUs
+healthy-idle at end-of-run.  Keybind facts confirmed along the way:
+sway spawns foot with Win+Enter (`$mod Mod4`); dwl uses ALT —
+Alt+Shift+Enter (its `MODKEY` is `WLR_MODIFIER_ALT`, line config.h:110).

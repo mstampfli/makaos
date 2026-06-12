@@ -173,8 +173,36 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
 
     uint32_t me   = this_cpu()->id;
     int self_hit  = 0;
-    // Snapshot targets.  task_mm_cpumask_read is an ACQUIRE load so we
-    // see every bit any CPU has published before this point.
+
+    // StoreLoad fence between the caller's PTE teardown and the cpumask
+    // read — the load-bearing barrier of the whole shootdown protocol.
+    //
+    // The caller has just modified leaf PTEs (e.g. vmm_page_unmap's
+    // `*pte = 0`) with plain stores, then called us to read who to IPI.
+    // On x86-TSO a later load to a *different* address may be reordered
+    // ahead of an earlier store still sitting in this CPU's store buffer
+    // (the one reordering x86 permits).  An ACQUIRE load does NOT stop
+    // it — ACQUIRE is a bare `mov` on x86.  Without a full barrier here,
+    // this read of cpu_mask can execute before our PTE store is globally
+    // visible.
+    //
+    // That opens a Dekker race with switch_mm (sched.c): a CPU taking
+    // this mm does `cpumask_set (lock or = full barrier) ; mov cr3 ;
+    // walk PTE`.  If our cpumask read floats above our PTE store, we can
+    // simultaneously (a) miss its just-published bit and (b) let its page
+    // walk cache our pre-clear PTE — the double-miss the barrier exists to
+    // forbid.  Result: we skip IPIing it, it keeps a stale TLB entry for a
+    // page we then free, the frame is reused+zeroed, and it reads zeros
+    // where a pointer lived.  SMP-only, rare, pointer-shaped corruption.
+    //
+    // switch_mm already fences its side (lock or + serializing mov cr3);
+    // this is the matching fence on the shootdown side.  One barrier at
+    // the single point every shootdown funnels through covers every
+    // PTE-modifying caller — present and future — with no way to drift.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    // Snapshot targets.  task_mm_cpumask_read is an ACQUIRE load; the
+    // SEQ_CST fence above gives it the missing StoreLoad ordering.
     cpumask_t targets = task_mm_cpumask_read(mm);
 
     // Remote-target descriptors live in the per-sender row of the global

@@ -117,6 +117,38 @@ static inline void bit_toggle(uint64_t* words, uint64_t bit_index) {
   words[word_index(bit_index)] ^= bit_mask(bit_index);
 }
 
+// ── Free-list integrity tripwire ─────────────────────────────────────
+// The {next,prev} overlay lives in the first 16 bytes of each FREE frame.
+// Any write into a free frame (write-after-free through a stale TLB
+// entry, a mapping freed while still live, DMA into a freed frame, …)
+// clobbers these pointers; the next pop/remove then dereferences garbage
+// and the kernel #PFs deep inside the allocator with zero provenance
+// (observed: next = 0x4a6095, a user-text-shaped pointer scribbled into
+// a free frame).  Validate before following: a legitimate overlay pointer
+// is NULL or HHDM-mapped physical memory.  On violation, dump WHICH frame
+// was scribbled and its first 64 bytes — that fingerprint identifies the
+// writer (user stack frame? auxv? pixels?) — then panic loudly instead
+// of wild-faulting.  Cost: two compares per list op, nothing on the
+// per-CPU fast path (pcp/slab hit rate ~99.99%).
+static inline int overlay_ptr_ok(const free_block_t* p) {
+  if (!p) return 1;
+  uint64_t v = (uint64_t)p;
+  return v >= HHDM_OFFSET && v < HHDM_OFFSET + g_phys_ceiling;
+}
+
+static void free_frame_scribbled(const free_block_t* node, const char* who) {
+  extern void kprintf_atomic(const char*, ...);
+  extern void panic(const char* fmt, ...);
+  phys_addr_t phys = virt_to_phys((virt_addr_t)node);
+  kprintf_atomic("\n=== PMM FREE-FRAME SCRIBBLED (%s) === frame=%p "
+                 "next=%p prev=%p\n  first 64B:",
+                 who, (void*)phys, (void*)node->next, (void*)node->prev);
+  const uint64_t* q = (const uint64_t*)node;
+  for (int i = 0; i < 8; i++) kprintf_atomic(" %p", (void*)q[i]);
+  kprintf_atomic("\n");
+  panic("write-after-free into a free frame (overlay clobbered)");
+}
+
 // Internal list helpers handling HHDM conversion
 static inline void free_list_push(uint8_t order, phys_addr_t phys) {
   free_block_t* node = (free_block_t*)phys_to_virt(phys);
@@ -135,6 +167,9 @@ static inline void free_list_remove(uint8_t order, phys_addr_t phys) {
   free_block_t* node = (free_block_t*)phys_to_virt(phys);
   free_block_t** head = &g_free_lists[order];
 
+  if (UNLIKELY(!overlay_ptr_ok(node->next) || !overlay_ptr_ok(node->prev)))
+    free_frame_scribbled(node, "remove");
+
   if (node->prev) node->prev->next = node->next;
   else *head = node->next;
 
@@ -147,6 +182,9 @@ static inline void free_list_remove(uint8_t order, phys_addr_t phys) {
 static inline phys_addr_t free_list_pop(uint8_t order) {
   free_block_t* node = g_free_lists[order];
   if (!node) return PMM_INVALID_ADDR;
+
+  if (UNLIKELY(!overlay_ptr_ok(node->next) || !overlay_ptr_ok(node->prev)))
+    free_frame_scribbled(node, "pop");
 
   g_free_lists[order] = node->next;
   if (g_free_lists[order]) {

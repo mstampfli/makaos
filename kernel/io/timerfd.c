@@ -18,6 +18,8 @@
 #include "common.h"
 #include "kheap.h"
 #include "wait.h"
+#include "preempt.h"   // preempt_disable guard in timerfd_tick
+#include "cpu.h"
 #include "smp.h"
 #include "cpu.h"
 #include "sched.h"
@@ -120,6 +122,20 @@ void timerfd_tick(void) {
     uint64_t now = tsc_read_ns();
     if (__atomic_load_n(&pc->head_expiry, __ATOMIC_ACQUIRE) > now) return;
 
+    // preempt_disable across the locked section: wait_queue_wake_all
+    // below runs UNDER pc->lock (the timer state may be kfree'd by a
+    // concurrent close the instant the lock drops, so the wake cannot
+    // move outside it).  wake_all's rcu_read_unlock is a preempt_enable;
+    // during a tick reschedule_pending is almost always set, so without
+    // this guard it fires sched_preempt → do_switch and context-switches
+    // away WHILE HOLDING pc->lock — the lock leaks until the descheduled
+    // task resumes, and every timerfd_settime/tick on this CPU spins
+    // forever (observed: CPU stuck in timerfd_settime on its own slot's
+    // lock with no running holder).  Direct depth-- at the end, same as
+    // the mouse ISR: preempt_enable() here would itself re-trigger the
+    // switch this guard exists to defer.  The deferred preempt is not
+    // lost — timer_irq_handler calls sched_preempt right after sched_tick.
+    preempt_disable();
     uint64_t flags = spin_lock_irqsave(&pc->lock);
     while (pc->head && pc->head->next_expiry_ns <= now) {
         timerfd_state_t* t = pc->head;
@@ -147,6 +163,7 @@ void timerfd_tick(void) {
                      pc->head ? pc->head->next_expiry_ns : ~(uint64_t)0,
                      __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&pc->lock, flags);
+    this_cpu()->preempt_depth--;   // see preempt_disable above
 }
 
 // ── vfs_file_t ops ────────────────────────────────────────────────────

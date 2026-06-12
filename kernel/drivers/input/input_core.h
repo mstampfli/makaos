@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "smp.h"   // spinlock_t for g_i8042_lock
 
 // ── Input core — decoupled keyboard publish/subscribe bus ─────────────────
 //
@@ -176,6 +177,13 @@ void input_unregister_handler(input_handler_t* h);
 // Iterates all registered handlers synchronously, honouring the grab
 // counter (console handlers skipped while grabbed).
 void input_emit(const kbd_event_t* ev);
+
+// ── i8042 controller lock ─────────────────────────────────────────────────
+// Serializes ALL access to PS/2 ports 0x60/0x64 and the ISR byte-stream
+// state across CPUs (IRQ1 and IRQ12 can run concurrently on different
+// CPUs).  Take with plain spin_lock from ISR context (local IRQs already
+// off; contention is cross-CPU only).  Defined in input_core.c.
+extern spinlock_t g_i8042_lock;
 
 // ── Keyboard grab ────────────────────────────────────────────────────────
 // Bump the grab refcount when a userland process takes exclusive ownership
