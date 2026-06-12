@@ -49,6 +49,9 @@ _entry:
 
     ; TLS before constructors — a constructor (or anything it calls)
     ; may touch errno, which lives at %fs-relative storage now.
+    ; Pass envp (r14) so __makaos_tls_init can find auxv (AT_PHDR…)
+    ; right after the envp NULL terminator and read PT_TLS exactly.
+    mov  rdi, r14
     call __makaos_tls_init
 
     lea  rbx, [rel __init_array_start]

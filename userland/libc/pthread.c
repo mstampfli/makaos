@@ -120,7 +120,10 @@ static void slot_free(thr_slot_t* s) {
 int pthread_attr_init(pthread_attr_t* a) {
     if (!a) return EINVAL;
     a->kind          = 0;
-    a->stack_size    = 256 * 1024;            // 256 KiB default
+    a->stack_size    = 1024 * 1024;           // 1 MiB default — fontconfig's
+                                              // XML parse blew through 256K
+                                              // (no guard pages yet: overflow
+                                              // scribbled the neighbour map)
     a->stack         = NULL;
     a->detachstate   = PTHREAD_CREATE_JOINABLE;
     a->schedpolicy   = 0;  // SCHED_OTHER
@@ -188,7 +191,7 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
                     void* (*start)(void*), void* arg) {
     if (!tid_out || !start) return EINVAL;
 
-    size_t stack_size = attr ? attr->stack_size : 256 * 1024;
+    size_t stack_size = attr ? attr->stack_size : 1024 * 1024;
     void*  stack      = attr ? attr->stack      : NULL;
     if (!stack) {
         stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
@@ -266,8 +269,7 @@ static void (*g_tls_dtors[PTHREAD_KEYS_MAX])(void*);
 
 __attribute__((noreturn))
 void pthread_exit(void* retval) {
-    // POSIX key-destructor walk (dtor walk) — runs on the exiting
-    // thread's own TLS, so it's lock-free like get/setspecific.
+    // POSIX key-destructor walk — runs on the exiting thread's own TLS.
     for (int round = 0; round < 4; round++) {
         int again = 0;
         for (unsigned k = 0; k < PTHREAD_KEYS_MAX; k++) {
