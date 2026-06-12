@@ -84,7 +84,17 @@ int unlink(const char* path) {
 }
 
 // ── Process identity ────────────────────────────────────────────────
-pid_t fork(void)     { return (pid_t)__syscall_ret(syscall0(SYS_FORK)); }
+pid_t fork(void) {
+    pid_t r = (pid_t)__syscall_ret(syscall0(SYS_FORK));
+    if (r == 0) {
+        // Child: its new pid must not keep the parent's TLS-cached
+        // pthread identity (mutex ownership / pthread_self would alias).
+        // Weak ref: a no-op for in-tree binaries that never link pthread.
+        extern void __pthread_reset_self(void) __attribute__((weak));
+        if (__pthread_reset_self) __pthread_reset_self();
+    }
+    return r;
+}
 pid_t getpid(void)   { return (pid_t)syscall0(SYS_GETPID); }
 pid_t getppid(void)  { return (pid_t)syscall0(SYS_GETPPID); }
 uid_t getuid(void)   { return (uid_t)syscall0(SYS_GETUID); }

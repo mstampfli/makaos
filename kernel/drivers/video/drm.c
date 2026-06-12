@@ -497,19 +497,22 @@ static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     if (rc < 0) return rc;
 
     phys_addr_t phys = pmm_buddy_alloc(order);
-    if (!phys) { drm_uncharge(g_current, bytes_alloc); return -ENOMEM; }
+    if (phys == PMM_INVALID_ADDR) { drm_uncharge(g_current, bytes_alloc); return -ENOMEM; }
 
     uint8_t* virt = (uint8_t*)((uintptr_t)phys + HHDM_OFFSET);
     __builtin_memset(virt, 0, bytes_alloc);
 
-    for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)
-        pmm_ref_inc(phys + (phys_addr_t)i * 4096u);
+    // The allocator already stamps every page of the block at rc=1 — that
+    // IS this dumb buffer's reference.  An extra per-page pmm_ref_inc here
+    // double-counted, so DESTROY_DUMB's single pmm_ref_dec only reached
+    // rc=1 and the framebuffer pages leaked forever.  fb (ADDFB2) and
+    // GETFB-minted handles take their OWN +1 each, so the page frees only
+    // when the dumb AND every fb/handle have released — exactly right.
 
     uint32_t res_id = alloc_res_id();
-    // Error paths must drop the per-page refs (pmm_ref_inc above),
-    // NOT call pmm_buddy_free at block order — that double-frees
-    // because pmm_ref_dec already returns each page to the buddy
-    // when its refcount hits zero.
+    // Error paths free the block via per-page pmm_ref_dec (alloc rc=1 →
+    // 0), NOT pmm_buddy_free at block order — pmm_ref_dec already returns
+    // each page to the buddy when its refcount hits zero.
     if (b->resource_create(res_id, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
                              a.width, a.height) != 0) {
         for (uint32_t i = 0; i < bytes_alloc / 4096u; i++)

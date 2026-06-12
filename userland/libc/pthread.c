@@ -7,17 +7,13 @@
 //   sys_mmap anon                              — thread stacks
 //   atomic compare-exchange                    — lock state
 //
-// The kernel has no futex, so contended mutex / cond waits spin with
-// __builtin_ia32_pause + sched_yield.  Wayland and wlroots do most
-// work on a single thread with epoll, so the lock traffic is light —
-// this is a real tradeoff that pays for itself later when / if we
-// add a kernel futex.
+// Contended mutex / cond / join waits sleep in the kernel futex
+// (SYS_FUTEX); the kernel sets a thread's join word (SYS_SET_CLEARTID)
+// and futex-wakes it at task death.
 //
-// Thread state lives in a bounded-size table shared across all
-// threads (THREAD_SHARE_MM makes globals visible to every thread).
-// Indexed by a 1:1 hash of tid mod TABLE_SIZE; collisions scan.
-// Holds: tid, joined flag, retval, detached flag.  pthread_join
-// spin-waits on the flag.
+// pthread_t is a pointer to the thread's heap descriptor (struct
+// __pthread) — the handle IS the object (glibc/NPTL style), so there is
+// no lookup table: join/detach/kill/equal/self are O(1) pointer ops.
 
 #include <pthread.h>
 #include <makaos/syscall.h>
@@ -63,10 +59,11 @@ extern void pthread_trampoline(void);
 struct __pthread {
     int    tid;                  // kernel pid of the task
     volatile int done;           // kernel cleartid word: 1 when task is dead
-    int    detached;
+    volatile int state;          // lifecycle: JOINABLE / DETACHED / EXITED
     void*  retval;
-    void*  stack;                // mmap'd thread stack (munmap on reap)
+    void*  stack;                // thread stack
     size_t stack_size;
+    int    owns_stack;           // libc-mmap'd (munmap on reap) vs caller-supplied
     void*  tls_block;            // %fs block (free on reap)
     struct __pthread* reap_next; // lock-free reap stack link (detached)
 };
@@ -75,8 +72,23 @@ struct __pthread {
 static __thread struct __pthread* g_self;
 static __thread int               g_self_tid;
 
+// Lifecycle states.  pthread_exit and pthread_detach each do ONE atomic
+// exchange into the state; whichever runs second observes the other's
+// value and becomes responsible for the reap — so exactly one party
+// frees, with no torn window, no leak, and no double-detach UAF.
+#define PT_JOINABLE 0
+#define PT_DETACHED 1
+#define PT_EXITED   2
+
 // Lock-free LIFO of dead detached descriptors awaiting reap.
 static struct __pthread* _Atomic g_reap_head;
+
+static void reap_push(struct __pthread* d) {
+    struct __pthread* old = __atomic_load_n(&g_reap_head, __ATOMIC_RELAXED);
+    do { d->reap_next = old; }
+    while (!__atomic_compare_exchange_n(&g_reap_head, &old, d, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+}
 
 static void reap_detached(void) {
     // Detach the whole list with one swap, free the dead, re-push the
@@ -86,7 +98,8 @@ static void reap_detached(void) {
     while (head) {
         struct __pthread* next = head->reap_next;
         if (__atomic_load_n(&head->done, __ATOMIC_ACQUIRE)) {
-            if (head->stack)     munmap(head->stack, head->stack_size);
+            if (head->stack && head->owns_stack)
+                munmap(head->stack, head->stack_size);
             if (head->tls_block) free(head->tls_block);
             free(head);
         } else {
@@ -109,6 +122,10 @@ void __pthread_thread_setup(struct __pthread* self) {
     self->tid  = g_self_tid;
     syscall1(SYS_SET_CLEARTID, (uint64_t)(uintptr_t)&self->done);
 }
+
+// Reset the TLS-cached thread identity — called in a fork() child, whose
+// new pid must not keep the parent's cached tid/descriptor.
+void __pthread_reset_self(void) { g_self = (struct __pthread*)0; g_self_tid = 0; }
 
 // Current thread's kernel tid (for mutex ownership, kill, etc.) — TLS
 // read for spawned threads, getpid() once for the main thread.
@@ -230,9 +247,11 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
         return ENOMEM;
     }
     d->tid = 0; d->done = 0;
-    d->detached = (attr && attr->detachstate == PTHREAD_CREATE_DETACHED);
+    d->state = (attr && attr->detachstate == PTHREAD_CREATE_DETACHED)
+               ? PT_DETACHED : PT_JOINABLE;
     d->retval = NULL;
     d->stack = stack; d->stack_size = stack_size;
+    d->owns_stack = !(attr && attr->stack);   // we mmap'd it ⇒ we munmap it
     d->tls_block = tls_block; d->reap_next = NULL;
 
     // Opportunistically reap any dead detached threads (amortized O(1)).
@@ -256,16 +275,27 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
         free(d);
         errno = (int)-tid; return (int)-tid;
     }
+    // Publish the kernel tid from the create side so it is valid the
+    // instant pthread_create returns — the child also sets it, but a
+    // pthread_cancel() racing ahead of the child must NOT read tid 0
+    // (kill(0) would SIGKILL the whole process group).
+    __atomic_store_n(&d->tid, (int)tid, __ATOMIC_RELEASE);
     *tid_out = (pthread_t)d;
     return 0;
 }
 
+// The main thread has no create-time descriptor.  Bind it to a static
+// one on first pthread_self() so the handle is ALWAYS a dereferenceable
+// struct __pthread* (join/detach/cancel never get a fake pointer).  Only
+// the main thread ever reaches this (spawned threads have g_self set),
+// and it is single-threaded with respect to its own g_self.
+static struct __pthread g_main_desc;
 pthread_t pthread_self(void) {
-    // Spawned threads cache their descriptor in %fs.  The main thread
-    // has no descriptor; return a stable sentinel (its tid as a pointer)
-    // so pthread_self()/equal stay consistent without a heap descriptor.
     if (g_self) return (pthread_t)g_self;
-    return (pthread_t)(uintptr_t)self_tid();
+    g_main_desc.tid   = self_tid();
+    g_main_desc.state = PT_JOINABLE;
+    g_self = &g_main_desc;
+    return (pthread_t)g_self;
 }
 
 int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
@@ -297,13 +327,14 @@ void pthread_exit(void* retval) {
         // is running on, so it hands its descriptor to the reap stack;
         // the next pthread_create frees it once the kernel marks it dead.
         self->retval = retval;
-        if (self->detached) {
-            struct __pthread* old =
-                __atomic_load_n(&g_reap_head, __ATOMIC_RELAXED);
-            do { self->reap_next = old; }
-            while (!__atomic_compare_exchange_n(&g_reap_head, &old, self, 0,
-                                                __ATOMIC_RELEASE, __ATOMIC_RELAXED));
-        }
+        // If we were already detached (or get detached and the detacher
+        // hasn't observed our exit), WE own the reap: a detached thread
+        // can't free the stack/TLS it is running on, so hand the
+        // descriptor to the reap stack.  If still joinable, leave it for
+        // pthread_join.  Exactly one of exit/detach takes this branch.
+        if (__atomic_exchange_n(&self->state, PT_EXITED, __ATOMIC_ACQ_REL)
+                == PT_DETACHED)
+            reap_push(self);
     }
     // SYS_EXIT terminates just this thread (TASK_FLAG_THREAD path).
     syscall1(SYS_EXIT, (uint64_t)(uintptr_t)retval);
@@ -312,13 +343,14 @@ void pthread_exit(void* retval) {
 
 int pthread_join(pthread_t t, void** retval) {
     struct __pthread* d = (struct __pthread*)t;     // handle IS the descriptor
-    if (!d || d->detached) return EINVAL;
+    if (!d || __atomic_load_n(&d->state, __ATOMIC_ACQUIRE) == PT_DETACHED)
+        return EINVAL;
     // Sleep on the kernel's cleartid word; it is set + futex-woken at
     // task death (when the thread's stack/TLS are provably idle).
     while (!__atomic_load_n(&d->done, __ATOMIC_ACQUIRE))
         _futex(&d->done, _FUTEX_WAIT, 0, 0);
     if (retval) *retval = d->retval;
-    if (d->stack)     munmap(d->stack, d->stack_size);
+    if (d->stack && d->owns_stack) munmap(d->stack, d->stack_size);
     if (d->tls_block) free(d->tls_block);
     free(d);                                         // O(1) — no table
     return 0;
@@ -327,7 +359,13 @@ int pthread_join(pthread_t t, void** retval) {
 int pthread_detach(pthread_t t) {
     struct __pthread* d = (struct __pthread*)t;
     if (!d) return ESRCH;
-    d->detached = 1;
+    // If the thread already EXITED (joinable, awaiting reap), WE own the
+    // reap now — push it; reap_detached frees it once done==1.  If it was
+    // still JOINABLE, the thread will see PT_DETACHED at its own exit and
+    // push.  Double-detach (old==PT_DETACHED) is a harmless no-op.
+    if (__atomic_exchange_n(&d->state, PT_DETACHED, __ATOMIC_ACQ_REL)
+            == PT_EXITED)
+        reap_push(d);
     return 0;
 }
 
@@ -338,7 +376,9 @@ int pthread_cancel(pthread_t t) {
     // / wlroots code avoids cancel, so this is acceptable for now.
     struct __pthread* d = (struct __pthread*)t;
     if (!d) return ESRCH;
-    return (int)__syscall_ret(syscall2(SYS_KILL, (uint64_t)d->tid, 9 /* SIGKILL */));
+    int tid = __atomic_load_n(&d->tid, __ATOMIC_ACQUIRE);
+    if (tid <= 0) return ESRCH;   // never kill(0) → that is a process-group kill
+    return (int)__syscall_ret(syscall2(SYS_KILL, (uint64_t)tid, 9 /* SIGKILL */));
 }
 
 // ── Mutex ────────────────────────────────────────────────────────────
