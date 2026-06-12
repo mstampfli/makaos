@@ -89,6 +89,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     if (!mm) { pmm_buddy_free(pml4, 0); return 0; }
 
     virt_addr_t seg_end_max = 0;
+    virt_addr_t seg_start_min = (virt_addr_t)-1;
 
     // Walk program headers.
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
@@ -160,6 +161,37 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         }
 
         if (seg_end > seg_end_max) seg_end_max = seg_end;
+        if (seg_start < seg_start_min) seg_start_min = seg_start;
+    }
+
+    // ── AT_PHDR safety net ────────────────────────────────────────────────
+    // If the phdr table isn't inside any PT_LOAD (binaries whose first
+    // LOAD skips file offset 0 — e.g. foot/sway from meson), the loop
+    // above left phdr_va == 0, so the program never finds its own program
+    // headers.  Userland TLS setup reads PT_TLS from AT_PHDR to size the
+    // %fs block; a zero AT_PHDR there sized every thread's TLS to ~0 and
+    // every __thread access (errno, the pthread-key table) scribbled the
+    // malloc heap.  Map a read-only page holding the ELF header + phdrs
+    // just below the lowest segment and point AT_PHDR at it.
+    if (out_phdr_vaddr && *out_phdr_vaddr == 0 && seg_start_min != (virt_addr_t)-1) {
+        uint64_t hdr_bytes = ehdr->e_phoff
+                           + (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
+        if (hdr_bytes <= PAGE_SIZE && hdr_bytes <= size) {
+            virt_addr_t hpage = seg_start_min - PAGE_SIZE;
+            phys_addr_t frame = pmm_buddy_alloc(0);
+            if (frame != PMM_INVALID_ADDR) {
+                uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
+                __builtin_memset(fptr, 0, PAGE_SIZE);
+                __builtin_memcpy(fptr, data, hdr_bytes);
+                if (mm_vma_add(mm, hpage, hpage + PAGE_SIZE, VMA_R | VMA_ANON)) {
+                    vmm_page_map(pml4, hpage, frame,
+                                 mm_vma_pte_flags(VMA_R | VMA_ANON));
+                    *out_phdr_vaddr = hpage + ehdr->e_phoff;
+                } else {
+                    pmm_buddy_free(frame, 0);
+                }
+            }
+        }
     }
 
     // Heap: starts after last segment, page-aligned.

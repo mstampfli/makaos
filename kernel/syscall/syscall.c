@@ -1144,6 +1144,13 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
             vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
+        // Same CoW-vs-stale-TLB shootdown as task_fork — see
+        // kernel/proc/process.c.  Without it a multithreaded spawner
+        // corrupts its own heap.
+        {
+            extern void tlb_flush_mm(task_mm_t* mm);
+            tlb_flush_mm(g_current->mm_shared);
+        }
         mm_t* new_mm = g_current->mm_shared->mm ? mm_clone(g_current->mm_shared->mm) : NULL;
         task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
         if (!tmm) {
@@ -1960,8 +1967,10 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 int is_shared = 0;
                 rcu_read_lock();
                 {
+                    // Only MMIO skips the frame free.  shmem frames are
+                    // refcounted RAM now — this PTE held a ref, drop it.
                     vma_t* old_vma = mm_vma_find(mm, p);
-                    if (old_vma && old_vma->shmem) is_shared = 1;
+                    if (old_vma && (old_vma->flags & VMA_MMIO)) is_shared = 1;
                 }
                 rcu_read_unlock();
                 if (!is_shared) pmm_ref_dec(frame);
@@ -2114,6 +2123,27 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 uint64_t    dlen  = 0;
                 int64_t rc = drm_resolve_dumb_mmap(f, off, len, &dphys, &dlen);
                 if (rc != 0) { fdput(f); goto fail_unmap; }
+
+                // Mark the VMA as a direct physical mapping.  Without
+                // VMA_MMIO, fork()'s COW clone treated this like a
+                // private anon mapping: the parent's first post-fork
+                // pixel write COPIED the framebuffer page and every
+                // render after that landed in the copy while the GPU
+                // kept scanning the original — dwl forking to spawn
+                // foot turned its first swapchain buffer permanently
+                // black (and the cursor buffer invisible).  VMA_MMIO
+                // makes the clone share the PTEs and the teardown /
+                // munmap paths leave the pages alone: their lifetime
+                // is owned by drm.c's dumb/fb structures, not by VMA
+                // refs (so no pmm_ref_inc here either — the old ref
+                // leaked on every teardown skip).
+                {
+                    extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
+                    spin_lock(&mm->vma_lock);
+                    vma_t* v = mm_vma_find(mm, vaddr);
+                    if (v) v->flags |= VMA_MMIO;
+                    spin_unlock(&mm->vma_lock);
+                }
                 uint64_t pte = mm_vma_pte_flags(vma_flags);
                 phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
                 for (uint64_t i = 0; i < npages; i++) {
@@ -2121,7 +2151,6 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                                        dphys + i * 4096u, pte)) {
                         fdput(f); goto fail_unmap;
                     }
-                    pmm_ref_inc(dphys + i * 4096u);
                 }
                 fdput(f);
                 return vaddr;
@@ -2189,20 +2218,21 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
     mm_t* mm = g_current->mm_shared->mm;
 
-    // Unmap physical pages.  Only free frames for private VMAs —
-    // shared frames are owned by the shmem_t and freed when its
-    // refcount drops to zero.
+    // Unmap physical pages.  Only MMIO frames (device memory) are
+    // skipped; shmem frames are ordinary refcounted RAM and this PTE
+    // held one ref — dropping it lets the frame free once the shmem
+    // object and every other mapper have also released it.
     for (virt_addr_t p = addr; p < addr + len; p += PAGE_SIZE) {
-        int is_shared = 0;
+        int is_mmio = 0;
         rcu_read_lock();
         {
             vma_t* vma = mm_vma_find(mm, p);
-            if (vma && vma->shmem) is_shared = 1;
+            if (vma && (vma->flags & VMA_MMIO)) is_mmio = 1;
         }
         rcu_read_unlock();
         phys_addr_t frame;
         if (vmm_page_unmap(pml4, p, &frame)) {
-            if (!is_shared) pmm_ref_dec(frame);
+            if (!is_mmio) pmm_ref_dec(frame);
         }
     }
 
@@ -5474,11 +5504,10 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
                   g_current ? g_current->comm : "?", nr, ret);
     }
 
-    // Deliver any pending signals on the syscall return path.
-    // g_signal_in_syscall=1 tells signal_deliver_pending it may set up user frames.
-    g_signal_in_syscall = 1;
-    signal_deliver_pending();
-    g_signal_in_syscall = 0;
+    // Deliver any pending signals on the syscall return path.  This is
+    // the one site that may set up a user signal frame — we own this
+    // task's SYSCALL_KFRAME and are about to return through it.
+    signal_deliver_pending(1);
     return ret;
 }
 

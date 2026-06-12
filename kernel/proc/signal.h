@@ -97,7 +97,7 @@ struct task_t;
 void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
 void signal_send_pgrp(uint32_t pgid, int sig);
-void signal_deliver_pending(void);
+void signal_deliver_pending(int may_setup_frame);
 
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these
 // is pending with SIG_DFL, signal_deliver_pending silently drops it and

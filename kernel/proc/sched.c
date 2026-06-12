@@ -1339,7 +1339,7 @@ static void do_switch(uint8_t preempted) {
 
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
-    signal_deliver_pending();
+    signal_deliver_pending(0);
 
     if (prev != c->idle && prev->state == TASK_DEAD)
         process_destroy(prev);

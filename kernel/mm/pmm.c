@@ -476,17 +476,36 @@ static phys_addr_t pmm_buddy_alloc_locked(uint8_t order) {
     block_index = (block_index << 1);
   }
 
-  // Set refcount = 1 for every frame in the allocated block.
-  {
-      uint64_t fi = allocated_phys >> PAGE_SHIFT;
-      uint64_t n  = order_to_pages(order);
-      for (uint64_t k = 0; k < n; k++)
-          if (fi + k < g_total_frames)
-              g_frame_refcount[fi + k] = 1;
-  }
-
+  // NOTE: refcount is intentionally NOT touched here.  This function
+  // is purely structural buddy bookkeeping.  The single place that
+  // stamps an allocation's refcount is pmm_mark_allocated(), called
+  // by the public allocators at hand-out — that keeps the
+  // "free frame ⇒ rc==0, handed-out frame ⇒ rc==1" invariant in ONE
+  // shared code path (refill, which parks frames in the pcp stash
+  // WITHOUT handing them out, deliberately skips the mark).
   __atomic_fetch_sub(&g_free_pages, order_to_pages(order), __ATOMIC_RELAXED);
   return allocated_phys;
+}
+
+// ── Shared allocation-stamp chokepoint ───────────────────────────────────
+// Every frame leaving the allocator to a real owner passes through here
+// (pcp fast path + slow buddy path + slab grow).  Sets rc=1 and asserts
+// the frame really was free (rc==0).  A nonzero prior count means the
+// frame was freed while still referenced and then re-handed-out — the
+// double-allocation class this centralisation exists to make impossible.
+static void pmm_mark_allocated(phys_addr_t phys, uint8_t order) {
+    uint64_t fi = phys >> PAGE_SHIFT;
+    uint64_t n  = order_to_pages(order);
+    for (uint64_t k = 0; k < n; k++) {
+        if (fi + k >= g_total_frames) continue;
+        uint32_t prev = __atomic_exchange_n(&g_frame_refcount[fi + k], 1,
+                                             __ATOMIC_ACQ_REL);
+        if (prev != 0) {
+            extern void kprintf(const char* fmt, ...);
+            kprintf("[pmm] DOUBLE-ALLOC frame=%p rc=%u order=%u\n",
+                    (void*)(phys + k * 4096), (unsigned)prev, (unsigned)order);
+        }
+    }
 }
 
 // Internal implementation — caller holds g_pmm_lock.
@@ -495,6 +514,19 @@ static void pmm_buddy_free_locked(phys_addr_t addr, uint8_t order) {
 
   uint64_t frame_index = (addr >> PAGE_SHIFT);
   if (frame_index >= g_total_frames) return;
+
+  // Clear refcount for the whole freed block.  Direct buddy_free
+  // callers (page-table frames, error paths) never went through
+  // pmm_ref_dec, so without this their stale rc=1 survives onto the
+  // free list and the next alloc inherits it — breaking the
+  // "free frame ⇒ rc==0" invariant that the double-alloc detector
+  // and the pinned-frame guard both rely on.
+  {
+      uint64_t n = order_to_pages(order);
+      for (uint64_t k = 0; k < n; k++)
+          if (frame_index + k < g_total_frames)
+              g_frame_refcount[frame_index + k] = 0;
+  }
 
   uint64_t block_index = (frame_index >> order);
   if (block_index >= g_buddy_blocks[order]) return;
@@ -638,6 +670,7 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
     extern phys_addr_t pcp_alloc(void);
     phys_addr_t r = pcp_alloc();
     if (r != PMM_INVALID_ADDR) {
+      pmm_mark_allocated(r, 0);          // shared stamp — see above
 #if PMM_DEBUG_ALWAYS_ZERO
       __builtin_memset((void*)(r + HHDM_OFFSET), 0, PAGE_SIZE);
 #endif
@@ -655,6 +688,7 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
     pmm_slab_shrink_all_locked();
     r = pmm_buddy_alloc_locked(order);
   }
+  if (r != PMM_INVALID_ADDR) pmm_mark_allocated(r, order);   // shared stamp
   spin_unlock_irqrestore(&g_pmm_lock, flags);
 #if PMM_DEBUG_ALWAYS_ZERO
   if (r != PMM_INVALID_ADDR) {
@@ -725,6 +759,7 @@ static inline void slab_list_push(slab_header_t** head, slab_header_t* h) {
 static slab_header_t* pmm_slab_grow_locked(slab_cache_t* cache) {
   phys_addr_t slab_phys = pmm_buddy_alloc_locked(cache->slab_order);
   if (slab_phys == PMM_INVALID_ADDR) return NULL;
+  pmm_mark_allocated(slab_phys, cache->slab_order);   // shared stamp
 
   uint64_t head_frame_index = (slab_phys >> PAGE_SHIFT);
   uint64_t pages_in_slab = (1ULL << cache->slab_order);
@@ -1257,6 +1292,17 @@ void pmm_ref_inc(phys_addr_t addr) {
     uint64_t fi = addr >> PAGE_SHIFT;
     if (fi >= g_total_frames) return;
     uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    // TRIPWIRE: incrementing a frame with rc==0 resurrects a page that
+    // is currently FREE (on the buddy/pcp free list).  That is a
+    // use-after-free — the caller is bumping a frame the allocator
+    // already gave to (or is about to give to) someone else.  Catch it
+    // at the inc, where the caller's return address points straight at
+    // the offending site.
+    if (g_frame_refcount[fi] == 0) {
+        extern void kprintf(const char* fmt, ...);
+        kprintf("[pmm] REF-INC-ON-FREE frame=%p caller=%p\n",
+                (void*)addr, __builtin_return_address(0));
+    }
     g_frame_refcount[fi]++;
     spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
@@ -1272,10 +1318,30 @@ void pmm_ref_dec(phys_addr_t addr) {
     g_frame_refcount[fi]--;
     int last_ref = (g_frame_refcount[fi] == 0);
     if (last_ref) {
-        pmm_buddy_free_locked(addr, 0);
-        __atomic_fetch_add(&g_free_pages, 1, __ATOMIC_RELAXED);
+        // NEVER free a pinned frame — DMA may be in flight (AHCI
+        // scatter-gather pins its target pages).  A racing double-dec
+        // dropping a pinned frame to the buddy let the next allocator
+        // reuse it while the HBA was still writing file data into it.
+        // Leak it instead and scream; the pin owner's unpin can't
+        // resurrect the ref, so a leak here always indicates a bug
+        // upstream — but a leak is debuggable, silent reuse is not.
+        if (g_frame_pincount[fi] > 0) {
+            extern void kprintf(const char* fmt, ...);
+            kprintf("[pmm] BUG: last ref dropped on PINNED frame %p "
+                    "(pins=%u) — leaking\n", (void*)addr,
+                    (unsigned)g_frame_pincount[fi]);
+        } else {
+            pmm_buddy_free_locked(addr, 0);
+            __atomic_fetch_add(&g_free_pages, 1, __ATOMIC_RELAXED);
+        }
     }
     spin_unlock_irqrestore(&g_pmm_lock, flags);
+}
+
+void pmm_ref_zero(phys_addr_t addr) {
+    uint64_t fi = addr >> PAGE_SHIFT;
+    if (fi >= g_total_frames) return;
+    __atomic_store_n(&g_frame_refcount[fi], 0, __ATOMIC_RELEASE);
 }
 
 uint32_t pmm_ref_get(phys_addr_t addr) {

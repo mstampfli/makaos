@@ -118,7 +118,12 @@ static void shmem_free_rcu(void* data) {
     shmem_t* shm = (shmem_t*)data;
     for (uint32_t i = 0; i < shm->npages; i++) {
         if (shm->pages[i])
-            pmm_buddy_free(shm->pages[i], 0);
+            // Drop the OBJECT's ref.  Frames still mapped by a surviving
+            // PTE (a process that hasn't munmapped yet) stay alive until
+            // that PTE is torn down — they are NOT recycled out from
+            // under a live mapping.  Same per-frame refcount every other
+            // RAM page uses.
+            pmm_ref_dec(shm->pages[i]);
     }
     kfree(shm->pages);
     kfree(shm);
@@ -150,18 +155,26 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
     if (!shm || pg_idx >= shm->npages)
         return PMM_INVALID_ADDR;
 
-    if (shm->pages[pg_idx])
-        return shm->pages[pg_idx]; // already allocated
+    // Caller installs a PTE for the returned frame, so it gets one
+    // reference.  The shmem object also holds one reference per
+    // allocated page (taken at first touch below).  A frame is only
+    // physically freed when BOTH the object (shmem_unref/resize) and
+    // every mapping PTE (munmap/teardown) have released it — so a
+    // shrink or destroy can never recycle a frame a process still maps.
+    if (shm->pages[pg_idx]) {
+        pmm_ref_inc(shm->pages[pg_idx]);   // ref for the caller's PTE
+        return shm->pages[pg_idx];
+    }
 
-    // First touch: allocate a zeroed physical frame.
+    // First touch: allocate a zeroed physical frame (rc=1 = object ref).
     phys_addr_t frame = pmm_buddy_alloc(0);
     if (frame == PMM_INVALID_ADDR)
         return PMM_INVALID_ADDR;
 
-    // Zero the frame (security: never expose stale data) — full page.
     __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
     shm->pages[pg_idx] = frame;
+    pmm_ref_inc(frame);    // +1 for the caller's PTE (object keeps rc=1)
     return frame;
 }
 
@@ -173,10 +186,16 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
     if (new_npages == shm->npages) return 0;
 
     if (new_npages < shm->npages) {
-        // Shrinking: free pages beyond the new size.
+        // Shrinking: drop the OBJECT's ref on pages beyond the new
+        // size.  If a process still maps one, the PTE's ref keeps the
+        // frame alive (stale-but-private) until munmap — never
+        // recycled under the live mapping.  This was the heisenbug:
+        // foot ftruncate-shrinks its grid/scrollback shm while still
+        // mapped, and the old pmm_buddy_free recycled the frame into a
+        // new thread's stack while foot kept writing to it.
         for (uint32_t i = new_npages; i < shm->npages; i++) {
             if (shm->pages[i]) {
-                pmm_buddy_free(shm->pages[i], 0);
+                pmm_ref_dec(shm->pages[i]);
                 shm->pages[i] = 0;
             }
         }

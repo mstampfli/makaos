@@ -251,7 +251,7 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────
-void signal_deliver_pending(void) {
+void signal_deliver_pending(int may_setup_frame) {
     if (!g_current || g_current->state == TASK_DEAD) return;
 
     sigstate_t* ss = &g_current->sigstate;
@@ -285,7 +285,17 @@ void signal_deliver_pending(void) {
     // work when we're about to return to user space via one of those
     // instructions, which the kernel signals by setting
     // g_signal_in_syscall=1.
-    if (handler != (uint64_t)SIG_DFL && g_signal_in_syscall &&
+    // Frame setup is ONLY valid when the caller guarantees we are on
+    // the current task's own syscall-return path (it owns its
+    // SYSCALL_KFRAME and is about to sysret/iret through it).  This is
+    // now an explicit per-call argument instead of a per-CPU flag: the
+    // old g_signal_in_syscall could be stale-1 when an IRQ preempted a
+    // syscall return and do_switch then built a sigframe for the
+    // WRONG (incoming) task at its stale kframe rsp — corrupting that
+    // task's user stack (a return address overwritten with the signal
+    // number / register bytes).  do_switch and the fault/exception
+    // paths pass 0 → defer; only the syscall-return caller passes 1.
+    if (handler != (uint64_t)SIG_DFL && may_setup_frame &&
         !(g_current->flags & TASK_FLAG_KTHREAD)) {
         signal_setup_frame(sig, ka);
         return;

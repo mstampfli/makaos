@@ -144,6 +144,14 @@ phys_addr_t pcache_get(uint32_t ino, uint32_t pg_idx) {
         if (e->ino == ino && e->pg_idx == pg_idx) {
             phys_addr_t frame = e->frame;
             e->accessed = 1;  // CLOCK: mark as recently used
+            // Hand the caller a reference, taken UNDER the bucket lock.
+            // Without this, pcache_evict_one could see rc==1 (cache's
+            // own ref), free the frame, and pmm_buddy_alloc re-hand it
+            // as a thread stack — all in the window between this return
+            // and the caller installing its PTE.  That recycled a live
+            // font-cache page into a stack: font bytes appeared in the
+            // new thread's stack and the heap corruption cascaded.
+            pmm_ref_inc(frame);
             spin_unlock(&b->lock);
             return frame;
         }
@@ -181,15 +189,22 @@ phys_addr_t pcache_insert(uint32_t ino, uint32_t pg_idx, phys_addr_t frame) {
     while (e) {
         if (e->ino == ino && e->pg_idx == pg_idx) {
             phys_addr_t existing = e->frame;
+            // Caller gets a ref on the winner (taken under the lock),
+            // and its losing frame is released.  Uniform contract:
+            // every non-INVALID return hands the caller exactly one ref.
+            pmm_ref_inc(existing);
             spin_unlock(&b->lock);
             kfree(ne);
-            pmm_ref_dec(frame);
+            pmm_ref_dec(frame);     // drop the caller's losing alloc
             return existing;
         }
         e = e->next;
     }
 
-    // Insert into hash chain.
+    // Insert into hash chain.  The cache takes its OWN ref so it can
+    // outlive the caller's; the caller keeps the alloc ref it passed
+    // in (that becomes its one owned ref on return).
+    pmm_ref_inc(frame);
     ne->next = b->head;
     b->head  = ne;
     spin_unlock(&b->lock);

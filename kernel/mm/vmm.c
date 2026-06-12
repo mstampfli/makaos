@@ -6,6 +6,7 @@
 #include "vfs.h"
 #include "pcache.h"
 #include "process.h"
+#include "tlb.h"
 #include "sched.h"
 #include "rcu.h"
 
@@ -250,9 +251,20 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
     uint64_t inter = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
     uint64_t leaf  = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NX;
 
+    // CoW breaks MUST be serialized with isr14_page_fault's — this
+    // path runs on syscall CPUs while other threads of the same
+    // process fault the same pages.  Unsynchronized, both sides
+    // copied the frame and both pmm_ref_dec'd the original: the
+    // double-dec freed a frame that live PTEs (and in-flight DMA
+    // pins) still referenced.  That frame came back as the next
+    // thread's stack while AHCI wrote font-file bytes into it.
+    extern mm_t* task_get_mm(void* task);
+    mm_t* lock_mm = g_current ? task_get_mm(g_current) : NULL;
+
     for (uint32_t i = 0; i < count; i++) {
         virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
 
+        if (lock_mm) spin_lock(&lock_mm->vma_lock);
         pte_t* pte = vmm_pte_get(pml4_phys, va, 0, 0);
 
         if (pte && (*pte & PAGE_PRESENT)) {
@@ -261,7 +273,10 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             // CoW break: shared page (rc > 1) without write bit → copy.
             if (!(*pte & PAGE_WRITABLE) && pmm_ref_get(phys) > 1) {
                 phys_addr_t nf = pmm_buddy_alloc(0);
-                if (nf == PMM_INVALID_ADDR) return 0;
+                if (nf == PMM_INVALID_ADDR) {
+                    if (lock_mm) spin_unlock(&lock_mm->vma_lock);
+                    return 0;
+                }
                 uint8_t* s = (uint8_t*)(phys + HHDM_OFFSET);
                 uint8_t* d = (uint8_t*)(nf + HHDM_OFFSET);
                 __builtin_memcpy(d, s, PAGE_SIZE);
@@ -277,16 +292,32 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             } else {
                 out[i] = (void*)(phys + HHDM_OFFSET);
             }
+            if (lock_mm) spin_unlock(&lock_mm->vma_lock);
         } else {
-            // Not mapped — demand-allocate.
+            if (lock_mm) spin_unlock(&lock_mm->vma_lock);
+            // Not mapped — demand-allocate.  Prepare outside the lock,
+            // install under it with a presence re-check (a concurrent
+            // isr14 fault may install first — use its frame).
             phys_addr_t frame = pmm_buddy_alloc(0);
             if (frame == PMM_INVALID_ADDR) return 0;
-            uint8_t* p = (uint8_t*)(frame + HHDM_OFFSET);
-            __builtin_memset(p, 0, PAGE_SIZE);
+            __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
+            if (lock_mm) spin_lock(&lock_mm->vma_lock);
             pte = vmm_pte_get(pml4_phys, va, 1, inter);
-            if (!pte) { pmm_buddy_free(frame, 0); return 0; }
-            *pte = frame | leaf;
-            out[i] = (void*)(frame + HHDM_OFFSET);
+            if (!pte) {
+                if (lock_mm) spin_unlock(&lock_mm->vma_lock);
+                pmm_buddy_free(frame, 0);
+                return 0;
+            }
+            if (*pte & PAGE_PRESENT) {
+                phys_addr_t have = *pte & PAGE_ADDR_MASK;
+                if (lock_mm) spin_unlock(&lock_mm->vma_lock);
+                pmm_ref_dec(frame);          // alloc rc==1 → freed
+                out[i] = (void*)(have + HHDM_OFFSET);
+            } else {
+                *pte = frame | leaf;
+                if (lock_mm) spin_unlock(&lock_mm->vma_lock);
+                out[i] = (void*)(frame + HHDM_OFFSET);
+            }
         }
     }
     return count;
@@ -349,17 +380,23 @@ void vmm_free_user_ex(phys_addr_t pml4_phys, mm_t* mm) {
                     virt_addr_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30)
                                    | ((uint64_t)k << 21) | ((uint64_t)l << 12);
 
+                    // Only MMIO (device memory, not buddy RAM) skips the
+                    // frame free.  shmem frames are now ordinary
+                    // refcounted RAM: this PTE held one ref, drop it.
+                    // The shmem object's own ref (and any other process's
+                    // PTE ref) keeps the frame alive until everyone
+                    // releases — so teardown can't recycle a live frame.
                     int skip_free = 0;
                     if (mm) {
                         rcu_read_lock();
                         vma_t* vma = mm_vma_find(mm, va);
-                        if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
+                        if (vma && (vma->flags & VMA_MMIO))
                             skip_free = 1;
                         rcu_read_unlock();
                     }
 
                     if (!skip_free)
-                        pmm_ref_dec(leaf);  // CoW-aware: only frees when rc→0
+                        pmm_ref_dec(leaf);  // CoW/shmem-aware: frees at rc→0
                 }
                 pmm_buddy_free(pd[k] & PAGE_ADDR_MASK, 0);     // free PT frame
             }
@@ -447,16 +484,20 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                                    | ((uint64_t)ri << 21) | ((uint64_t)si << 12);
 
                     // Shared/MMIO VMAs: share frame with original flags (no CoW).
-                    int is_shared = 0;
+                    // shmem frames are refcounted RAM, so the child's
+                    // PTE is a new reference — bump it.  MMIO (device
+                    // memory) is not buddy RAM and carries no refcount.
+                    int is_shared = 0, is_shmem = 0;
                     if (src_mm) {
                         rcu_read_lock();
                         vma_t* vma = mm_vma_find(src_mm, va);
-                        if (vma && (vma->shmem || (vma->flags & VMA_MMIO)))
-                            is_shared = 1;
+                        if (vma && vma->shmem)             { is_shared = 1; is_shmem = 1; }
+                        else if (vma && (vma->flags & VMA_MMIO)) is_shared = 1;
                         rcu_read_unlock();
                     }
 
                     if (is_shared) {
+                        if (is_shmem) pmm_ref_inc(src_frame);  // child PTE ref
                         dst_pt[si] = src_frame | leaf_flags;
                         continue;
                     }
@@ -545,9 +586,9 @@ static void ser_str(const char* s) {
 
 static void kill_current(void) {
     extern void signal_send(struct task_t* t, int sig);
-    extern void signal_deliver_pending(void);
+    extern void signal_deliver_pending(int);
     if (g_current) signal_send(g_current, 11); // SIGSEGV = 11
-    signal_deliver_pending();
+    signal_deliver_pending(0);
     for (;;) __asm__ volatile("cli; hlt");
 }
 
@@ -590,32 +631,66 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
             if (have_vma) {
                 virt_addr_t page = fault_addr & ~PAGE_MASK;
-                phys_addr_t old_frame = vmm_page_phys(vmm_pml4_get(), page);
-                if (old_frame != PMM_INVALID_ADDR) {
-                    uint32_t rc = pmm_ref_get(old_frame);
-                    if (rc > 1) {
-                        // Shared CoW page — allocate a private copy.
-                        phys_addr_t new_frame = pmm_buddy_alloc(0);
-                        if (new_frame == PMM_INVALID_ADDR) {
-                            if (is_user) goto kill; else goto kernel_panic;
-                        }
-                        uint8_t* s = (uint8_t*)(old_frame + HHDM_OFFSET);
-                        uint8_t* d = (uint8_t*)(new_frame + HHDM_OFFSET);
-                        __builtin_memcpy(d, s, PAGE_SIZE);
-
-                        vmm_page_map(vmm_pml4_get(), page, new_frame,
-                                     mm_vma_pte_flags(vma_flags));
-                        pmm_ref_dec(old_frame);
-                        return; // fault resolved
-                    }
-                    if (rc == 1) {
-                        pte_t* pte = vmm_pte_get(vmm_pml4_get(), page, 0, 0);
-                        if (pte) {
+                // Concurrent CoW breaks of the same page MUST be
+                // serialized.  The unlocked version let every faulting
+                // CPU copy the frame and install its own private page;
+                // the last map won and the losers' subsequent writes
+                // landed in orphaned frames — lost updates that
+                // surfaced as random small-int heap corruption in any
+                // multithreaded process that had forked (foot's font
+                // loaders, sway's GLib worker).  Re-check the PTE under
+                // mm->vma_lock: losers see the winner's writable
+                // mapping and simply retry the instruction.
+                int resolved = 0;
+                virt_addr_t flush_page = 0;
+                spin_lock(&mm->vma_lock);
+                pte_t* pte = vmm_pte_get(vmm_pml4_get(), page, 0, 0);
+                if (pte && (*pte & PAGE_PRESENT)) {
+                    if (*pte & PAGE_WRITABLE) {
+                        // Another CPU already broke this page between
+                        // our fault and the lock.  Drop the stale
+                        // read-only translation and retry.
+                        invlpg(page);
+                        resolved = 1;
+                    } else {
+                        phys_addr_t old_frame = *pte & PAGE_ADDR_MASK;
+                        uint32_t rc = pmm_ref_get(old_frame);
+                        if (rc > 1) {
+                            phys_addr_t new_frame = pmm_buddy_alloc(0);
+                            if (new_frame != PMM_INVALID_ADDR) {
+                                __builtin_memcpy(
+                                    (void*)(new_frame + HHDM_OFFSET),
+                                    (void*)(old_frame + HHDM_OFFSET),
+                                    PAGE_SIZE);
+                                *pte = new_frame | mm_vma_pte_flags(vma_flags);
+                                invlpg(page);
+                                pmm_ref_dec(old_frame);
+                                flush_page = page;
+                                resolved = 1;
+                            }
+                            // OOM falls through unresolved → kill below.
+                        } else if (rc == 1) {
+                            // Sole owner, still RO from an old CoW.
                             *pte |= PAGE_WRITABLE;
                             invlpg(page);
+                            resolved = 1;
                         }
-                        return; // fault resolved
                     }
+                }
+                spin_unlock(&mm->vma_lock);
+                if (resolved) {
+                    // Readers on other CPUs may still cache the
+                    // pre-break translation (writers re-fault and are
+                    // caught by the locked re-check above).  Flush them
+                    // AFTER unlocking: tlb_flush_range waits for IPI
+                    // acks, and a target spinning on vma_lock with IRQs
+                    // off would deadlock us if we still held it.
+                    if (flush_page && g_current) {
+                        extern task_mm_t* task_get_mm_shared(void* task);
+                        tlb_flush_range(task_get_mm_shared(g_current),
+                                        flush_page, flush_page + PAGE_SIZE);
+                    }
+                    return; // fault resolved
                 }
             }
             // Not a CoW page — genuine protection violation, fall through to kill.
@@ -682,21 +757,20 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             uint32_t pg_file_idx = (uint32_t)((vma_file_off + pg_off) >> PAGE_SHIFT);
             uint32_t ino         = vma_file->ino;
 
-            // clean_frame: on-disk page content (from cache or fresh read).
-            // clean_in_cache == 1 → cache holds a ref; caller must pmm_ref_inc
-            //                       before installing as a PTE.
-            // clean_in_cache == 0 → alloc ref IS the only ref (no inc needed
-            //                       for a sole-owner PTE, but must pmm_ref_dec
-            //                       if we're making a private copy instead).
+            // clean_frame: on-disk page content (cache or fresh read).
+            // INVARIANT after the block below: we own exactly ONE ref on
+            // clean_frame, regardless of hit/miss/insert-race.  That ref
+            // either becomes the PTE ref (RO) or is released after the
+            // private copy (RW).
             phys_addr_t clean_frame;
-            uint8_t     clean_in_cache;
 
             clean_frame = (ino != 0) ? pcache_get(ino, pg_file_idx)
                                      : PMM_INVALID_ADDR;
 
             if (clean_frame != PMM_INVALID_ADDR) {
-                // Cache hit — no disk I/O.
-                clean_in_cache = 1;
+                // Cache hit — no disk I/O.  pcache_get handed us one
+                // ref (taken under its lock); we own it until we either
+                // transfer it to the PTE (RO) or release it (RW copy).
                 if (g_current)
                     __atomic_fetch_add(&g_current->pf_cache, 1, __ATOMIC_RELAXED);
             } else {
@@ -737,19 +811,14 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                 }
 
                 if (ino != 0) {
-                    // Offer to cache.  pcache_insert takes the alloc ref and
-                    // returns: our frame (inserted) or a racer's frame (ours
-                    // freed).  PMM_INVALID_ADDR means OOM on entry node.
+                    // Offer to cache.  Either way we come out owning
+                    // exactly one ref on clean_frame: pcache_insert adds
+                    // the cache's own ref and returns our frame (or a
+                    // racer's, with our losing alloc freed and a fresh
+                    // ref handed to us).  OOM → keep our alloc ref.
                     phys_addr_t c = pcache_insert(ino, pg_file_idx, clean_frame);
-                    if (c != PMM_INVALID_ADDR) {
-                        clean_frame    = c;
-                        clean_in_cache = 1;
-                    } else {
-                        // Entry OOM: use frame directly, not cached.
-                        clean_in_cache = 0;
-                    }
-                } else {
-                    clean_in_cache = 0;
+                    if (c != PMM_INVALID_ADDR)
+                        clean_frame = c;
                 }
 
                 // ── Read-ahead: prefetch pages N+1..N+7 into pcache ──────────
@@ -793,15 +862,15 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                             pmm_ref_dec(ra_frame);  // read failed — discard
                             continue;
                         }
-                        // pcache_insert: on success cache owns the alloc ref.
-                        // On race (another CPU just inserted same page):
-                        //   returns existing frame; our ra_frame is freed.
-                        // On OOM for the entry node:
-                        //   returns PMM_INVALID_ADDR; we must free ra_frame.
+                        // Read-ahead never maps the frame, so it must
+                        // release the one ref pcache_insert hands back
+                        // (the cache keeps its own independent ref).
+                        // OOM → free our alloc.
                         phys_addr_t ra_c = pcache_insert(ino, ra_pg_idx, ra_frame);
-                        if (ra_c == PMM_INVALID_ADDR)
-                            pmm_ref_dec(ra_frame);  // OOM on entry alloc
-                        // else: ra_c owns the ref (either our frame or racer's)
+                        if (ra_c != PMM_INVALID_ADDR)
+                            pmm_ref_dec(ra_c);      // release our owned ref
+                        else
+                            pmm_ref_dec(ra_frame);  // not cached — free alloc
                     }
 #undef RA_PAGES
                 }
@@ -811,21 +880,20 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             // RO segments (text/rodata): share clean_frame directly.
             // RW segments (data/BSS):    private copy — cache keeps clean.
             if (vma_flags & VMA_W) {
+                // RW (data/BSS): private copy; release our ref on the
+                // clean page (cache keeps its own if cached).
                 frame = pmm_buddy_alloc(0);
                 if (frame == PMM_INVALID_ADDR) {
-                    if (!clean_in_cache) pmm_ref_dec(clean_frame);
+                    pmm_ref_dec(clean_frame);
                     if (is_user) goto kill; else goto kernel_panic;
                 }
                 __builtin_memcpy((void*)(frame       + HHDM_OFFSET),
                                  (void*)(clean_frame + HHDM_OFFSET),
                                  PAGE_SIZE);
-                if (!clean_in_cache) pmm_ref_dec(clean_frame);
+                pmm_ref_dec(clean_frame);
                 // frame: rc == 1 (alloc ref) → PTE ref.
             } else {
-                // RO: reuse clean_frame as the PTE frame.
-                if (clean_in_cache)
-                    pmm_ref_inc(clean_frame); // +1 for PTE; cache keeps its own.
-                // else: rc == 1 (alloc ref) → PTE ref directly.
+                // RO (text/rodata): our owned ref becomes the PTE ref.
                 frame = clean_frame;
             }
 
@@ -845,14 +913,31 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
         }
 
-        if (!vmm_page_map(vmm_pml4_get(), page, frame,
-                          mm_vma_pte_flags(vma_flags))) {
-            // Free the frame we prepared but couldn't map.
-            // shmem frames are owned by the shmem object; anon/file frames
-            // are PMM-ref-counted (rc == 1 here → pmm_ref_dec frees them).
-            if (vma_shmem) shmem_unref(vma_shmem);
-            else pmm_ref_dec(frame);
-            if (is_user) goto kill; else goto kernel_panic;
+        // Install under the lock with a presence re-check: two threads
+        // that faulted the same missing page both prepared frames; only
+        // the first installs.  The old code let the second map overwrite
+        // the first — the early thread's writes (made between its return
+        // and the overwrite) silently vanished with its orphaned frame.
+        {
+            int lost_race = 0, map_fail = 0;
+            spin_lock(&mm->vma_lock);
+            if (vmm_page_phys(vmm_pml4_get(), page) != PMM_INVALID_ADDR) {
+                lost_race = 1;
+            } else if (!vmm_page_map(vmm_pml4_get(), page, frame,
+                                     mm_vma_pte_flags(vma_flags))) {
+                map_fail = 1;
+            }
+            spin_unlock(&mm->vma_lock);
+            if (lost_race || map_fail) {
+                // We hold one frame ref for the PTE we tried to install
+                // (anon: from pmm_buddy_alloc; shmem: from
+                // shmem_get_page).  Release it uniformly.  shmem also
+                // owes its object ref (from tryget at fault entry).
+                pmm_ref_dec(frame);
+                if (vma_shmem) shmem_unref(vma_shmem);
+                if (lost_race) return;       // racer resolved the fault
+                if (is_user) goto kill; else goto kernel_panic;
+            }
         }
         if (vma_shmem) shmem_unref(vma_shmem);
         return; // fault resolved

@@ -348,6 +348,21 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
             right->shmem_pgoff = v->shmem_pgoff +
                 (uint32_t)((end - v->start) / PAGE_SIZE);
             if (right->shmem) shmem_ref(right->shmem);
+            // File backing: kmalloc memory is NOT zeroed — leaving these
+            // uninitialized gave the right fragment a GARBAGE vfs_file_t
+            // pointer; the next fault on it did disk I/O through wild
+            // function pointers.  Carry the backing over with its own
+            // reference and a file offset advanced by the split.
+            if (v->file) {
+                right->file     = vfs_dup(v->file);
+                right->file_off = v->file_off + (end - v->start);
+                right->file_len = (v->file_len > (end - v->start))
+                                  ? v->file_len - (end - v->start) : 0;
+            } else {
+                right->file     = NULL;
+                right->file_off = 0;
+                right->file_len = 0;
+            }
             // Publish right, then shrink v.  A concurrent reader sees
             // either {v covers [v->start, old_end)} or
             // {v covers [v->start, start), right covers [end, old_end)} —

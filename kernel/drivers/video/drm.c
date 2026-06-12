@@ -692,6 +692,8 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
         pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
     fb->next   = c->fbs;
     c->fbs     = fb;
+    pr_info("drm", "ADDFB2 fb=%u res=%u phys=%p %ux%u",
+            fb->fb_id, fb->vgpu_res_id, (void*)fb->phys, a.width, a.height);
 
     a.fb_id = fb->fb_id;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;

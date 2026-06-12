@@ -127,79 +127,78 @@ static void pcp_drain_one(cpu_t* c, uint32_t how_many) {
 }
 
 phys_addr_t pcp_alloc(void) {
-    // Fast path: cmpxchg16b decrement-and-pop.
-    //
-    // snap = LOAD16 pcp_hdr → {count, tid}
-    // if count == 0 → slow refill
-    // p = pcp_pages[count - 1]            (per-CPU memory; migration-safe)
-    // CAS pcp_hdr {count, tid} → {count-1, tid+1}
-    // retry on failure
+    // The old "migration-safe" fast path read pcp_pages[count-1] on
+    // one CPU and then CAS'd whatever CPU the task had migrated to.
+    // When the two CPUs' {count, tid} pairs coincided (trivially
+    // common early on — both counters start at 0), the CAS succeeded
+    // against the WRONG header and the same physical frame was handed
+    // to two owners.  Frames double-allocated this way showed up as
+    // foot's heap overlapping the page cache's font reads ("FFTM"
+    // bytes inside pointers), thread stacks overlapping each other,
+    // and the buddy freelist #GP.  Pop with IRQs off and this_cpu()
+    // resolved exactly once — no remote CPU ever touches our slots,
+    // so plain reads are safe; the header CAS stays (pcp_drain_all
+    // CASes remote headers during OOM reclaim).
     for (;;) {
+        uint64_t flags = local_irq_save_pcp();
+        cpu_t*   c     = this_cpu();
         uint64_t snap_lo, snap_hi;
         this_cpu_load16b_field(pcp_hdr, &snap_lo, &snap_hi);
         uint32_t count = (uint32_t)snap_lo;
         if (count == 0) {
-            uint64_t flags = local_irq_save_pcp();
-            cpu_t*   c     = this_cpu();
-            // Re-check under IRQ-disable (an interrupt-time push may
-            // have refilled while we were turning off IRQs).
-            if (c->pcp_hdr.count > 0) {
-                local_irq_restore_pcp(flags);
-                continue;  // retry fast path
-            }
             phys_addr_t r = pcp_refill_one(c);
             c->pcp_misses++;
             local_irq_restore_pcp(flags);
             return r;
         }
-
-        cpu_t*      c = this_cpu();
         phys_addr_t p = c->pcp_pages[count - 1];
         uint64_t    new_lo = ((uint64_t)(count - 1)) & 0xFFFFFFFFULL;
         if (this_cpu_cmpxchg16b_field(pcp_hdr, &snap_lo, &snap_hi,
                                        new_lo, snap_hi + 1)) {
-            this_cpu()->pcp_hits++;
+            c->pcp_hits++;
+            local_irq_restore_pcp(flags);
             return p;
         }
-        // CAS failed: retry.
+        local_irq_restore_pcp(flags);
+        // CAS failed (remote drain raced): retry.
     }
 }
 
 void pcp_free(phys_addr_t phys) {
     if (phys == PMM_INVALID_ADDR) return;
-    // Fast path: cmpxchg16b increment-and-push.
-    //
-    // snap = LOAD16 pcp_hdr → {count, tid}
-    // if count == DEPTH → slow drain
-    // pcp_pages[count] = phys              (per-CPU; migration-safe write)
-    // CAS pcp_hdr {count, tid} → {count+1, tid+1}
-    // retry on failure
+    // Frames enter the per-CPU stash with refcount cleared, so a later
+    // pcp_alloc starts every frame from a known-zero count (it then
+    // sets 1).  Without this a page-table frame freed via the public
+    // pmm_buddy_free (which routes order-0 here, NOT through
+    // pmm_ref_dec) carried its stale rc into the stash.
+    extern void pmm_ref_zero(phys_addr_t addr);
+    pmm_ref_zero(phys);
+    // Mirror of pcp_alloc: the old path wrote pcp_pages[count] on one
+    // CPU and could publish count+1 on another after migrating — the
+    // second CPU's slot held a stale frame that a later pop handed
+    // out as "free" while its real owner still used it.  IRQs off +
+    // single this_cpu() resolution; see pcp_alloc.
     for (;;) {
+        uint64_t flags = local_irq_save_pcp();
+        cpu_t*   c     = this_cpu();
         uint64_t snap_lo, snap_hi;
         this_cpu_load16b_field(pcp_hdr, &snap_lo, &snap_hi);
         uint32_t count = (uint32_t)snap_lo;
         if (count >= SLAB_PCPU_PCP_DEPTH) {
-            uint64_t flags = local_irq_save_pcp();
-            cpu_t*   c     = this_cpu();
-            // Re-check under IRQ-disable.
-            if (c->pcp_hdr.count < SLAB_PCPU_PCP_DEPTH) {
-                local_irq_restore_pcp(flags);
-                continue;
-            }
             pcp_drain_one(c, SLAB_PCPU_PCP_REFILL);
             local_irq_restore_pcp(flags);
             // Now retry the push — should fit.
             continue;
         }
-
-        cpu_t* c = this_cpu();
         c->pcp_pages[count] = phys;
         uint64_t new_lo = ((uint64_t)(count + 1)) & 0xFFFFFFFFULL;
         if (this_cpu_cmpxchg16b_field(pcp_hdr, &snap_lo, &snap_hi,
                                        new_lo, snap_hi + 1)) {
-            this_cpu()->pcp_hits++;
+            c->pcp_hits++;
+            local_irq_restore_pcp(flags);
             return;
         }
+        local_irq_restore_pcp(flags);
     }
 }
 

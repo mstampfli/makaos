@@ -221,6 +221,7 @@ uint64_t    pmm_free_pages_get(void);
 void     pmm_ref_inc(phys_addr_t addr);
 void     pmm_ref_dec(phys_addr_t addr);   // frees frame when rc hits 0
 uint32_t pmm_ref_get(phys_addr_t addr);
+void     pmm_ref_zero(phys_addr_t addr);  // force rc=0 (free-path invariant)
 
 // ── Per-frame pin count (DMA safety) ─────────────────────────────────────
 // Pinned frames must not be CoW-shared — fork deep-copies them instead.

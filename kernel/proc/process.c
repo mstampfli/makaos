@@ -310,6 +310,10 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
     return t;
 }
 
+task_mm_t* task_get_mm_shared(void* task) {
+    return task ? ((task_t*)task)->mm_shared : NULL;
+}
+
 // ── task_get_mm ───────────────────────────────────────────────────────────
 mm_t* task_get_mm(void* task) {
     return ((task_t*)task)->mm_shared->mm;
@@ -387,6 +391,18 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
                            parent->mm_shared->mm)) {
         vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
         return NULL;
+    }
+
+    // CoW marking just write-protected every parent PTE — but only
+    // the local CPU's TLB got flushed (inside the clone).  Any OTHER
+    // CPU running a parent thread still holds stale WRITABLE entries
+    // and keeps writing into frames that CoW break-off has already
+    // redirected — silent heap corruption in every multithreaded
+    // parent that forks (foot's font loaders died of this; sway's
+    // glib worker too).  Shoot down every CPU running this mm.
+    {
+        extern void tlb_flush_mm(task_mm_t* mm);
+        tlb_flush_mm(parent->mm_shared);
     }
 
     mm_t* new_mm = mm_clone(parent->mm_shared->mm);
