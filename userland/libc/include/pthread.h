@@ -16,7 +16,10 @@
 // sched_get_priority_{min,max}.  Match glibc for compatibility.
 #include <sched.h>
 
-typedef int pthread_t;              // tid = kernel pid of the thread task
+// pthread_t is a pointer to the thread's descriptor (struct __pthread,
+// defined privately in pthread.c) — the handle IS the object, glibc/NPTL
+// style, so join/detach/kill/equal need NO lookup table.  Opaque to apps.
+typedef struct __pthread* pthread_t;
 typedef struct {
     int    kind;                    // reserved for attribute future-proofing
     size_t stack_size;
@@ -32,7 +35,7 @@ typedef struct {
 
 typedef struct {
     volatile int locked;            // 0 = free, 1 = held
-    pthread_t    owner;             // owning tid (debug + recursive)
+    int          owner;             // owning KERNEL TID (recursive/errorcheck)
     int          kind;              // PTHREAD_MUTEX_NORMAL / RECURSIVE / ERRORCHECK
     int          depth;             // recursion count (kind == RECURSIVE)
 } pthread_mutex_t;
