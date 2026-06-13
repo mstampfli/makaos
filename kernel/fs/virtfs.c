@@ -29,6 +29,7 @@ static const dev_node_t s_dev_nodes[] = {
     { "input",         0, 0, 0755, FS_TYPE_DIR  },
     { "input/event0",  0, 0, 0660, FS_TYPE_CHAR },
     { "input/event1",  0, 0, 0660, FS_TYPE_CHAR },
+    { "input/event2",  0, 0, 0660, FS_TYPE_CHAR },
     { "dri",           0, 0, 0755, FS_TYPE_DIR  },
     { "dri/card0",     0, 0, 0660, FS_TYPE_CHAR },
     { "ptmx",          0, 0, 0666, FS_TYPE_CHAR },

@@ -185,6 +185,22 @@ void input_emit(const kbd_event_t* ev);
 // off; contention is cross-CPU only).  Defined in input_core.c.
 extern spinlock_t g_i8042_lock;
 
+// ── Shared i8042 ISR drain ───────────────────────────────────────────────
+// The single consume path for BOTH IRQ1 and IRQ12: drains every pending
+// byte, routing by the status AUX bit.  Defined in input_core.c; both
+// keyboard_irq_handler and mouse_irq_handler are thin wrappers around it.
+void i8042_isr_drain(void);
+
+// Per-driver byte sinks for the drain (caller holds g_i8042_lock):
+// keyboard: push one scancode into the sc ring.
+void keyboard_isr_byte(uint8_t sc);
+// mouse: accumulate one AUX byte; returns 1 with pkt_out[3] filled when a
+// complete packet is ready.
+int  mouse_isr_byte(uint8_t byte, uint8_t* pkt_out);
+// mouse: decode a completed packet + wake waiters (call OUTSIDE the lock,
+// under a preempt guard).
+void mouse_isr_packet(const uint8_t* pkt);
+
 // ── Keyboard grab ────────────────────────────────────────────────────────
 // Bump the grab refcount when a userland process takes exclusive ownership
 // of keyboard input (currently: any open fd on /dev/input/event0).  Drop it

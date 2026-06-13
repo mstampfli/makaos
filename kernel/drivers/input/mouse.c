@@ -145,67 +145,48 @@ static void packet_decode(const uint8_t* pkt) {
     evdev_on_mouse_packet((int32_t)dx, (int32_t)dy, evdev_buttons);
 }
 
+// ── ISR byte sink + packet completion (called from i8042_isr_drain) ──────
+
+// Accumulate one AUX byte (caller holds g_i8042_lock).  Returns 1 with
+// pkt_out[3] filled when a 3-byte packet completes.
+int mouse_isr_byte(uint8_t byte, uint8_t* pkt_out) {
+    // Sync: the first byte of a packet always has bit 3 set.
+    // If we're out of sync, wait for a valid first byte.
+    if (s_packet_idx == 0 && !(byte & (1 << 3)))
+        return 0;
+    // Belt-and-braces clamp: whatever desync history led here, the
+    // index can never escape the buffer.
+    if (s_packet_idx >= PACKET_BYTES)
+        s_packet_idx = 0;
+    s_packet[s_packet_idx++] = byte;
+    if (s_packet_idx >= PACKET_BYTES) {
+        s_packet_idx = 0;
+        if (pkt_out) {
+            pkt_out[0] = s_packet[0];
+            pkt_out[1] = s_packet[1];
+            pkt_out[2] = s_packet[2];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Decode a completed packet + wake waiters.  Called OUTSIDE the i8042
+// lock under the caller's preempt guard (see i8042_isr_drain): the decode
+// fans out to the evt ring and evdev (both wake waiters), which must not
+// run under the controller lock or trip a mid-ISR context switch.
+void mouse_isr_packet(const uint8_t* pkt) {
+    packet_decode(pkt);
+    wait_queue_wake_all(&g_mouse_waitq);
+}
+
 // ── IRQ12 handler — runs in interrupt context ─────────────────────────────
 
 extern void irq12_entry(void);
 
 void mouse_irq_handler(void) {
-    // ── Serialized section: port pair + accumulator state ─────────────────
-    // g_i8042_lock makes the status-read → data-read pair atomic against
-    // the keyboard ISR on another CPU (shared ports 0x60/0x64) and
-    // serializes s_packet/s_packet_idx against a concurrent IRQ12 on a
-    // second CPU.  Without it, two CPUs increment s_packet_idx past the
-    // `== PACKET_BYTES` reset and the index walks off the end of s_packet
-    // forever — observed scribbling raw packet bytes (0x18 0x00 0xff …)
-    // across .bss: g_mouse_waitq, the evdev event ring, etc.
-    uint8_t pkt[PACKET_BYTES];
-    uint8_t complete = 0;
-
-    spin_lock(&g_i8042_lock);
-    uint8_t status = inb(KBC_STATUS);
-    if ((status & KBC_STATUS_AUX) && (status & KBC_STATUS_OBF)) {
-        uint8_t byte = inb(KBC_DATA);
-
-        // Sync: the first byte of a packet always has bit 3 set.
-        // If we're out of sync, wait for a valid first byte.
-        if (s_packet_idx != 0 || (byte & (1 << 3))) {
-            // Belt-and-braces clamp: whatever desync history led here,
-            // the index can never escape the buffer.
-            if (s_packet_idx >= PACKET_BYTES)
-                s_packet_idx = 0;
-            s_packet[s_packet_idx++] = byte;
-            if (s_packet_idx >= PACKET_BYTES) {
-                pkt[0] = s_packet[0];
-                pkt[1] = s_packet[1];
-                pkt[2] = s_packet[2];
-                s_packet_idx = 0;
-                complete = 1;
-            }
-        }
-    }
-    spin_unlock(&g_i8042_lock);
-
-    // ── Decode + wake outside the lock ────────────────────────────────────
-    // evt_push / evdev_on_mouse_packet / wait_queue_wake_all take ring and
-    // runqueue locks and sched_wake remote tasks; doing that while holding
-    // the controller lock would stall the keyboard ISR on another CPU for
-    // the whole decode.  pkt[] is a private snapshot, so this is race-free.
-    if (complete) {
-        // preempt_disable around decode + wake — packet_decode fans out to
-        // the evt ring and evdev (both wake waiters), and rcu_read_unlock
-        // inside any wait_queue_wake_all is a preempt_enable: with
-        // reschedule_pending set it trips sched_preempt → do_switch →
-        // `sti` mid-ISR, re-enabling IRQs and allowing nested ISR delivery
-        // on the same vector.  Direct depth-- (not preempt_enable) so the
-        // guard itself can't re-trigger the switch; the deferred preempt
-        // fires at the next tick.
-        preempt_disable();
-        packet_decode(pkt);
-        wait_queue_wake_all(&g_mouse_waitq);
-        this_cpu()->preempt_depth--;
-    }
-
-    irq_notify(12);
+    // One shared consume path with the keyboard ISR — see input_core.c.
+    i8042_isr_drain();
 }
 
 // ── Mouse driver thread ───────────────────────────────────────────────────

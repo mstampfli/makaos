@@ -81,6 +81,7 @@ static const devdesc_t s_devices[] = {
     { "/sys/class/drm/card0",       "card0",   "drm",   "/dev/dri/card0",   226,   0, "seat0", "1",  NULL, NULL, NULL },
     { "/sys/class/input/event0",    "event0",  "input", "/dev/input/event0", 13,  64, "seat0", NULL, "1", "ID_INPUT_KEYBOARD", "MakaOS PS/2 Keyboard" },
     { "/sys/class/input/event1",    "event1",  "input", "/dev/input/event1", 13,  65, "seat0", NULL, "1", "ID_INPUT_MOUSE",    "MakaOS PS/2 Mouse"    },
+    { "/sys/class/input/event2",    "event2",  "input", "/dev/input/event2", 13,  66, "seat0", NULL, "1", "ID_INPUT_MOUSE",    "QEMU Virtio Tablet"   },
 };
 static const int s_device_count = (int)(sizeof(s_devices) / sizeof(s_devices[0]));
 

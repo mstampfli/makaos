@@ -35,6 +35,7 @@
 #define VEC_AHCI_MSI         0x32   // AHCI MSI
 #define VEC_HDA_MSI          0x33   // HDA MSI
 #define VEC_VIRTIO_NET       0x34   // virtio-net MSI (RX+TX shared)
+#define VEC_VIRTIO_INPUT     0x35   // virtio-input (tablet) MSI-X eventq
 // NVMe I/O completion — one vector per CPU (per-CPU I/O queue pair).
 // VEC_NVME_IO_BASE + cpu_id is programmed into MSI-X entry `cpu_id`
 // with the MSI destination set to that CPU's LAPIC ID.  A completion

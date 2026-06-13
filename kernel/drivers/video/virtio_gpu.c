@@ -912,6 +912,15 @@ static int vgpu_be_flush(uint32_t id, uint32_t w, uint32_t h) {
     return virtio_gpu_resource_flush(id, w, h) ? 0 : -1;
 }
 
+// Last cursor resource latched per scanout.  CRITICAL: QEMU's
+// update_cursor() computes cursor VISIBILITY from `resource_id != 0` on
+// EVERY command — including MOVE_CURSOR.  A MOVE with resource_id=0
+// therefore HIDES the cursor (this was the invisible/flickering cursor:
+// every motion frame hid it again).  Linux's virtio-gpu driver keeps a
+// persistent cursor struct so MOVEs carry the live resource id; mirror
+// that by latching the id from the last UPDATE.
+static uint32_t s_cursor_res_latched[VIRTIO_GPU_MAX_SCANOUTS];
+
 static int vgpu_be_cursor_update(uint32_t scanout, uint32_t res_id,
                                  uint32_t hot_x, uint32_t hot_y,
                                  int32_t x, int32_t y) {
@@ -922,6 +931,8 @@ static int vgpu_be_cursor_update(uint32_t scanout, uint32_t res_id,
         .resource_id = res_id,
         .hot_x = hot_x, .hot_y = hot_y,
     };
+    if (scanout < VIRTIO_GPU_MAX_SCANOUTS)
+        s_cursor_res_latched[scanout] = res_id;
     return vgpu_send_cursor(&c) ? 0 : -EIO;
 }
 
@@ -930,6 +941,8 @@ static int vgpu_be_cursor_move(uint32_t scanout, int32_t x, int32_t y) {
         .hdr  = { .type = VIRTIO_GPU_CMD_MOVE_CURSOR },
         .pos  = { .scanout_id = scanout,
                   .x = (uint32_t)x, .y = (uint32_t)y },
+        .resource_id = (scanout < VIRTIO_GPU_MAX_SCANOUTS)
+                           ? s_cursor_res_latched[scanout] : 0,
     };
     return vgpu_send_cursor(&c) ? 0 : -EIO;
 }

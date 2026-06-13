@@ -193,25 +193,17 @@ static uint8_t sc_pop(void) {
 // ── IRQ1 handler — interrupt context, minimal work ────────────────────────
 extern void irq1_entry(void);
 
-void keyboard_irq_handler(void) {
-    // g_i8042_lock: the status-read → data-read pair must be atomic
-    // against the mouse ISR running concurrently on another CPU (shared
-    // controller ports 0x60/0x64), and sc_push must be serialized against
-    // a second IRQ1 delivery on another CPU.  See input_core.c.
-    spin_lock(&g_i8042_lock);
-    // Discard bytes that originated from the aux (mouse) port — the KBC
-    // shares port 0x60 between keyboard and mouse; bit 5 of the status
-    // register distinguishes them.  Without this check, mouse ACKs during
-    // mouse_init would be stolen from the polling path, causing a hang.
-    if (inb(0x64) & (1 << 5)) {
-        inb(KB_DATA_PORT);
-        spin_unlock(&g_i8042_lock);
-        return;
-    }
-    uint8_t sc = inb(KB_DATA_PORT);
+// ISR byte sink (called from i8042_isr_drain; caller holds g_i8042_lock).
+void keyboard_isr_byte(uint8_t sc) {
     sc_push(sc);
-    spin_unlock(&g_i8042_lock);
-    irq_notify(1);
+}
+
+void keyboard_irq_handler(void) {
+    // One shared consume path with the mouse ISR — see input_core.c.
+    // The drain routes every pending byte by the status AUX bit, so a
+    // keyboard byte can never be stolen by (or strand behind) a mouse
+    // byte and vice versa.
+    i8042_isr_drain();
 }
 
 // ── Keyboard thread — process context, full decoding + emit ──────────────

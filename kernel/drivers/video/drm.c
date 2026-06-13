@@ -1874,13 +1874,26 @@ typedef struct {
     // The cursor BO is a client dumb buffer, but the dumb's device
     // resource is X8 (no alpha); the cursor needs ARGB so the device
     // alpha-blends the pointer shape.  We mint a SEPARATE B8G8R8A8
-    // resource aliasing the same backing pages, owned by this crtc and
-    // re-minted whenever the compositor switches cursor BOs.
-    uint32_t cursor_res;     // device resource id (0 = none)
-    uint32_t cursor_handle;  // dumb handle the res aliases (cache key)
+    // resource aliasing the same backing pages, owned by this crtc.
+    //
+    // CACHE KEY = backing PHYS, not the dumb handle.  wlroots' legacy
+    // cursor path re-GETFBs a FRESH dumb handle for the SAME cursor
+    // pages on every commit (then closes it); keying on the handle made
+    // the cache miss every frame → resource_destroy+recreate each frame
+    // → a RESOURCE_UNREF on the latched cursor every frame = the flicker
+    // (and unbounded res-id growth).  The pages are stable, so we key on
+    // phys: same phys → cache hit → no churn → cursor persists when
+    // static and is stable in motion.  We PIN the aliased pages (own
+    // ref, like an fb) so the per-commit handle close / eventual BO free
+    // can't return them to the buddy allocator while the device scans
+    // them out.
+    uint32_t cursor_res;       // device resource id (0 = none)
+    phys_addr_t cursor_phys;   // backing phys the res aliases (cache key)
+    uint32_t cursor_pin_pages; // pages we pmm_ref_inc'd (drop on re-mint)
     uint32_t cursor_w, cursor_h;
     uint32_t hot_x, hot_y;
     int32_t  cur_x, cur_y;   // last position (UPDATE_CURSOR needs it)
+    uint8_t  cursor_latched; // 1 = device shows cursor_res (UPDATE sent OK)
 } drm_crtc_state_t;
 static drm_crtc_state_t g_crtc_state[VIRTIO_GPU_MAX_SCANOUTS_CAP];
 
@@ -2159,6 +2172,19 @@ static int drm_ioctl_mode_closefb(vfs_file_t* self, uint64_t arg) {
 // cursor ops get -ENOTSUP so wlroots falls back to software cursors —
 // returning fake success here leaves the user with an invisible
 // pointer (sway trusts the ioctl and skips the software path).
+// Drop the current ARGB cursor alias: destroy the device resource and
+// release the page pin taken when it was minted.  Idempotent.
+static void cursor_drop_alias(const drm_backend_ops_t* b, drm_crtc_state_t* cs) {
+    if (!cs->cursor_res) return;
+    if (b) b->resource_destroy(cs->cursor_res);
+    for (uint32_t i = 0; i < cs->cursor_pin_pages; i++)
+        pmm_ref_dec(cs->cursor_phys + (phys_addr_t)i * 4096u);
+    cs->cursor_res       = 0;
+    cs->cursor_phys      = 0;
+    cs->cursor_pin_pages = 0;
+    cs->cursor_latched   = 0;
+}
+
 static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     struct __attribute__((packed)) {
         uint32_t flags;
@@ -2188,11 +2214,9 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     if (!(a.flags & DRM_MODE_CURSOR_BO)) return -EINVAL;
 
     if (a.handle == 0) {
-        // Hide: resource 0 + drop our aliased resource.
+        // Hide: unbind device cursor, drop our aliased resource + pin.
         b->cursor_update(idx, 0, 0, 0, cs->cur_x, cs->cur_y);
-        if (cs->cursor_res) b->resource_destroy(cs->cursor_res);
-        cs->cursor_res = 0;
-        cs->cursor_handle = 0;
+        cursor_drop_alias(b, cs);
         return 0;
     }
 
@@ -2202,14 +2226,19 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     if (!a.width || !a.height ||
         (uint64_t)a.width * a.height * 4 > d->size) return -EINVAL;
 
-    // (Re)mint the ARGB alias when the BO or its dimensions change.
+    // (Re)mint the ARGB alias ONLY when the backing PHYS or the cursor
+    // dimensions actually change — never merely because wlroots handed us
+    // a fresh GETFB handle for the same pages (that per-commit churn was
+    // the flicker).  Keyed on phys → cache hits every frame in motion and
+    // when static, so the latched cursor is never destroyed mid-display.
     if (cs->cursor_res &&
-        (cs->cursor_handle != a.handle ||
-         cs->cursor_w != a.width || cs->cursor_h != a.height)) {
-        b->resource_destroy(cs->cursor_res);
-        cs->cursor_res = 0;
-    }
+        (cs->cursor_phys != d->phys ||
+         cs->cursor_w != a.width || cs->cursor_h != a.height))
+        cursor_drop_alias(b, cs);
+
+    uint8_t fresh = 0;
     if (!cs->cursor_res) {
+        fresh = 1;
         uint32_t id = alloc_res_id();
         if (b->resource_create(id, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
                                a.width, a.height) != 0)
@@ -2218,19 +2247,47 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
             b->resource_destroy(id);
             return -EIO;
         }
-        cs->cursor_res    = id;
-        cs->cursor_handle = a.handle;
-        cs->cursor_w      = a.width;
-        cs->cursor_h      = a.height;
+        // Pin the pages the device scans out for this cursor (own ref,
+        // like an fb) so the per-commit close of the transient GETFB
+        // handle — and the eventual cursor-BO teardown — can't return
+        // them to the buddy allocator while the alias is still latched.
+        uint32_t pages = (uint32_t)(((uint64_t)a.width * a.height * 4u
+                                     + 4095u) / 4096u);
+        for (uint32_t i = 0; i < pages; i++)
+            pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
+        cs->cursor_res       = id;
+        cs->cursor_phys      = d->phys;
+        cs->cursor_pin_pages = pages;
+        cs->cursor_w         = a.width;
+        cs->cursor_h         = a.height;
     }
-    if (has_hotspot) { cs->hot_x = (uint32_t)a.hot_x;
-                       cs->hot_y = (uint32_t)a.hot_y; }
+    uint8_t hot_changed = 0;
+    if (has_hotspot && ((uint32_t)a.hot_x != cs->hot_x ||
+                        (uint32_t)a.hot_y != cs->hot_y)) {
+        cs->hot_x = (uint32_t)a.hot_x;
+        cs->hot_y = (uint32_t)a.hot_y;
+        hot_changed = 1;
+    }
+
+    // DEDUPE: wlroots' legacy cursor path re-issues SetCursor with the
+    // SAME buffer on every output commit (~per frame during motion).
+    // Re-sending UPDATE_CURSOR makes the host (QEMU SDL) redefine its
+    // cursor sprite each time → visible flicker while moving.  The image
+    // only actually changes when the compositor hands us a different
+    // buffer (different phys → re-mint above), a new size, or a new
+    // hotspot — wlroots never mutates a displayed cursor buffer in place
+    // (it swaps swapchain slots).  Identical re-binds are no-ops: skip
+    // the transfer + update entirely and leave the latched cursor alone.
+    if (!fresh && !hot_changed && cs->cursor_latched)
+        return 0;
 
     // Push the (possibly re-rendered) cursor pixels, then bind.
     if (b->resource_transfer(cs->cursor_res, a.width, a.height) != 0)
         return -EIO;
-    return b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y,
-                            cs->cur_x, cs->cur_y);
+    int rc = b->cursor_update(idx, cs->cursor_res, cs->hot_x, cs->hot_y,
+                              cs->cur_x, cs->cur_y);
+    if (rc == 0) cs->cursor_latched = 1;
+    return rc;
 }
 
 // ── AUTH_MAGIC / GET_MAGIC (master-token semantics) ─────────────────

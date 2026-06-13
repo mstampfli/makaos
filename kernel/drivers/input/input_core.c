@@ -1,6 +1,9 @@
 #include "input_core.h"
 #include "common.h"
 #include "smp.h"
+#include "preempt.h"
+#include "cpu.h"
+#include "irq_wait.h"
 
 // ── i8042 controller lock ─────────────────────────────────────────────────
 // One PS/2 controller, two IRQ lines (IRQ1 keyboard, IRQ12 mouse), shared
@@ -15,6 +18,56 @@
 // plain spin_lock (no irqsave) is sufficient: the only contention is
 // cross-CPU.
 spinlock_t g_i8042_lock = SPINLOCK_INIT;
+
+// ── Shared i8042 ISR drain ────────────────────────────────────────────────
+// ONE consume path for BOTH IRQ1 (keyboard) and IRQ12 (mouse), Linux-style.
+// Each interrupt drains EVERY pending byte from the controller, routing
+// each by the status AUX bit: keyboard bytes → sc ring, mouse bytes → the
+// 3-byte packet accumulator.  This kills two whole failure classes the
+// previous split handlers had:
+//   - byte THEFT: the keyboard ISR consuming (discarding) a mouse byte
+//     desyncs the packet stream → cursor teleporting;
+//   - byte STRANDING: the keyboard ISR leaving an AUX byte but its IRQ12
+//     edge already lost → the byte blocks the single output buffer forever
+//     and BOTH devices go dead (observed: keyboard+mouse silent mid-boot).
+// With the drain, whichever IRQ fires consumes everything pending and no
+// byte can ever block the queue.  The loop is bounded as a guard against
+// a wedged OBF bit; real FIFOs hold a handful of bytes.
+void i8042_isr_drain(void) {
+    uint8_t  pkts[8][3];
+    uint32_t npkt = 0;
+    uint8_t  got_kbd = 0;
+
+    spin_lock(&g_i8042_lock);
+    for (int i = 0; i < 32; i++) {
+        uint8_t st = inb(0x64);
+        if (!(st & 0x01)) break;               // output buffer empty
+        uint8_t b = inb(0x60);
+        if (st & (1u << 5)) {                  // AUX = mouse byte
+            if (npkt < 8 && mouse_isr_byte(b, pkts[npkt]))
+                npkt++;
+        } else {
+            keyboard_isr_byte(b);
+            got_kbd = 1;
+        }
+    }
+    spin_unlock(&g_i8042_lock);
+
+    // Decode + wake OUTSIDE the controller lock (same rationale as the
+    // old mouse handler: the wakeups take ring/runqueue locks).  The
+    // preempt guard prevents a wake-side rcu unlock from context-
+    // switching mid-ISR; direct depth-- so the guard itself can't
+    // re-trigger the switch (pattern from mouse.c).
+    if (npkt) {
+        preempt_disable();
+        for (uint32_t i = 0; i < npkt; i++)
+            mouse_isr_packet(pkts[i]);
+        this_cpu()->preempt_depth--;
+        irq_notify(12);
+    }
+    if (got_kbd)
+        irq_notify(1);
+}
 
 // ── Handler list ──────────────────────────────────────────────────────────
 // Singly-linked list of registered handlers.  Modified only at init time

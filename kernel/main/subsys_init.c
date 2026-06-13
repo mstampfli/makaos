@@ -68,6 +68,10 @@ static int _input_init(void) {
     // mouse_init unmasks IRQ12 itself (no interference with keyboard path).
     keyboard_init();
     mouse_init();
+    // virtio-input absolute tablet (QEMU -device virtio-tablet-pci) —
+    // registers event2 if present; absence is fine (PS/2 still works).
+    extern int virtio_input_init(void);
+    virtio_input_init();
     keyboard_flush();
     ioapic_unmask(ioapic_isa_to_gsi(1));
     tty_flush_input(&g_tty0);

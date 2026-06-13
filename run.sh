@@ -23,6 +23,7 @@ qemu-system-x86_64 \
   -device ide-hd,drive=hd0,bus=ahci.0 \
   -vga none \
   -device virtio-vga,xres=1280,yres=800 \
+  -device virtio-tablet-pci \
   -display sdl \
   -audiodev pa,id=snd0 \
   -device intel-hda \
