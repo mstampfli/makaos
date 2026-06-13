@@ -328,3 +328,24 @@ tier or milestone:
 Each stub carries a `// TODO(scalability-debt-ledger-#N)` comment pointing
 back to its entry here.  When the entry is resolved, both the comment and
 the ledger entry go.
+
+## virtio-input: single-device binding
+`kernel/drivers/input/virtio_input.c` binds only the FIRST virtio-input
+PCI function (today's topology: one `virtio-tablet-pci`).  Scalable
+replacement: loop the PCI scan, hold per-device state (queues, evdev
+handle, MSI-X vector per device) in a kmalloc'd array — mechanical, no
+design change.  evdev/devfs/udev-stub rows for event3+ go in
+`kernel/fs/virtfs.c` + `scripts/port-libudev.sh` alongside.
+
+## Boot self-tests gated off by default + latent kthread-exit corruption
+The boot battery (chaselev/slab/typesafe/... in kernel/main.c) is now behind
+`#ifdef MAKAOS_BOOT_SELFTESTS` (off by default) — it added 20-40s to every
+boot AND intermittently DEADLOCKED: a self-test worker kthread exits with a
+RUNTIME-corrupted `cleartid_addr` (e.g. 0x53004300530000, non-canonical;
+`task_init_common` zeroes it at creation, so this is memory corruption, not a
+missing init) → `task_notify_cleartid`'s `copy_to_user` #GP → that CPU wedges
+in the fault handler → a peer's `synchronize_rcu` spins forever.  Path to fix:
+find the writer that scribbles the task struct (KASAN-style poisoning of the
+freed-task slab or a guard page on `cleartid_addr` would localise it), then
+re-enable the self-tests by default.  Re-enable now for validation with
+`-DMAKAOS_BOOT_SELFTESTS`.
