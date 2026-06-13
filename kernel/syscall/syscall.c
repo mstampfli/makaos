@@ -894,12 +894,28 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     }
 
     // ── Swap in new address space ─────────────────────────────────────────
-    vmm_free_user_ex(g_current->mm_shared->pml4_phys, g_current->mm_shared->mm);
-    pmm_buddy_free(g_current->mm_shared->pml4_phys, 0);
-    mm_destroy(g_current->mm_shared->mm);
+    // CRITICAL ORDERING: switch CR3 to the new PML4 *before* freeing the old
+    // page-table hierarchy.  The deferred sysret switch (syscall_entry.asm)
+    // doesn't load CR3 until the very end of the return path, so freeing the
+    // old tables here while CR3 still points at them is a write-after-free:
+    // the hardware page-table walker sets A/D bits — and a racing fault could
+    // deposit a PTE — into frames already back on the buddy free list.
+    // (Observed: 0x..027 = phys|P|W|U|A scribbled into a freed PT page,
+    // caught by the PMM free-frame tripwire; whole-DE instability under the
+    // exec churn of spawning foot/tofi.)  new_pml4 shares the kernel
+    // upper-half mappings (vmm_alloc_pml4 copied PML4[256..511]), so the
+    // kernel keeps running across the switch and the remaining exec code
+    // touches only kernel state — never the old lower-half image.
+    phys_addr_t old_pml4 = g_current->mm_shared->pml4_phys;
+    mm_t*       old_mm   = g_current->mm_shared->mm;
 
     g_current->mm_shared->pml4_phys = new_pml4;
     g_current->mm_shared->mm        = new_mm;
+    vmm_switch(new_pml4);   // CR3 = new_pml4; old hierarchy now unreferenced
+
+    vmm_free_user_ex(old_pml4, old_mm);   // safe: no CPU walks old_pml4 now
+    pmm_buddy_free(old_pml4, 0);
+    mm_destroy(old_mm);
 
     // Reset signal handlers to SIG_DFL (POSIX: exec clears custom handlers).
     for (int si = 0; si < NSIG; si++) {
