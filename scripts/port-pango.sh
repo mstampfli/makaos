@@ -67,8 +67,37 @@ build() {
     log "done — $(ls "$SYSROOT"/usr/lib/libpango-1.0.a)"
 }
 
+# MakaOS: pango shapes text via HarfBuzz's NATIVE OT cmap path, which
+# returns glyph 0 (.notdef) for every codepoint in this port — so all
+# pango-rendered text (swaybar/swaynag) came out as tofu boxes while
+# foot/tofi (FreeType-backed hb_ft path) render perfectly.  Route pango's
+# glyph lookup through FreeType's cmap (the proven-good path) by attaching
+# hb_ft funcs to the shaping font.  Idempotent (marker-gated).
+patch_pango() {
+    local f="$PANGO_SRC/pango/pangofc-font.c"
+    grep -q "shape via FreeType cmap" "$f" 2>/dev/null && { log "already patched"; return 0; }
+    python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("#include <hb-ot.h>\n",
+              "#include <hb-ot.h>\n#include <hb-ft.h>   /* MakaOS: shape via FreeType cmap, not HB native OT */\n", 1)
+needle = "  hb_font = hb_font_create (hb_face);\n"
+ins = ("  hb_font = hb_font_create (hb_face);\n"
+       "  /* MakaOS: HarfBuzz native OT cmap returns glyph 0 for every codepoint\n"
+       "   * in this port (all pango text rendered tofu); route glyph lookup\n"
+       "   * through FreeType's cmap, the path foot/fcft prove works. */\n"
+       "  hb_ft_font_set_funcs (hb_font);\n")
+assert needle in s, "port-pango: hb_font_create anchor not found"
+s = s.replace(needle, ins, 1)
+open(p, 'w').write(s)
+PY
+    log "patched pangofc-font.c → FreeType-backed shaping"
+}
+
 main() {
     fetch
+    patch_pango
     build
 }
 main "$@"

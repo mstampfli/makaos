@@ -908,14 +908,26 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # Default wallpaper → /usr/share/backgrounds/sway/wallpaper.png
     SWAY_WALL="$BUILD_DIR/third_party/sway-1.10.1/assets/Sway_Wallpaper_Blue_1920x1080.png"
     if [ -f "$SWAY_WALL" ]; then
-        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir usr/share/backgrounds"      >/dev/null 2>&1 || true
-        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir usr/share/backgrounds/sway" >/dev/null 2>&1 || true
+        # debugfs mkdir does NOT create parents, and /usr + /usr/share may
+        # not exist yet at this point (the fonts block below is what usually
+        # creates them).  Create the WHOLE chain or the write silently fails
+        # and swaybg gets a path that isn't there → black background.
+        for d in usr usr/share usr/share/backgrounds usr/share/backgrounds/sway; do
+            debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir $d" >/dev/null 2>&1 || true
+        done
         debugfs -w "$BUILD_DIR/ext2.img" \
             -R "write $SWAY_WALL usr/share/backgrounds/sway/wallpaper.png" >/dev/null 2>&1 || true
         ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds            0040755 0 0
         ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds/sway       0040755 0 0
         ext2_setperm "$BUILD_DIR/ext2.img" /usr/share/backgrounds/sway/wallpaper.png 0100644 0 0
-        echo "[+] DE: wallpaper installed → /usr/share/backgrounds/sway/wallpaper.png"
+        # VERIFY the wallpaper actually landed — a silent miss here is exactly
+        # what shipped a black desktop before.  Fail loudly, don't pretend.
+        if debugfs -R "stat /usr/share/backgrounds/sway/wallpaper.png" \
+               "$BUILD_DIR/ext2.img" 2>/dev/null | grep -q "Size:"; then
+            echo "[+] DE: wallpaper installed → /usr/share/backgrounds/sway/wallpaper.png"
+        else
+            echo "[!] DE: wallpaper FAILED to install — desktop will be black" >&2
+        fi
     fi
 fi
 
