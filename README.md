@@ -1,51 +1,80 @@
-# Engineering Guidelines
+# MakaOS
 
-This directory contains the rules and principles that govern how code is
-written, reviewed, and accepted across systems-level projects. The
-guidelines target AI agents first (Claude Code and similar), but humans
-should follow them too.
+A 64-bit hobby operating system for x86-64, built from scratch — from the UEFI
+bootloader up through a 4-way SMP kernel, a custom libc, and a ported
+wlroots/Wayland desktop stack, all booted and tested in QEMU.
 
-## Files
+## Features
 
-- [`CODE_STYLE.md`](./CODE_STYLE.md) — **How code looks.** Formatting,
-  naming, file layout, commenting rules, language-specific conventions
-  for C and NASM. The mechanical stuff.
-- [`PRINCIPLES.md`](./PRINCIPLES.md) — **How code is built.** The
-  architectural philosophy: modularity, performance, correctness, error
-  handling, concurrency, and how decisions should be made when the style
-  guide runs out.
-- [`DEBUGGING.md`](./DEBUGGING.md) — **How bugs get found.** Serial
-  logging format, panic handling, tracing, stack walking, GDB + QEMU
-  monitor workflow, assertions, memory debugging, and a methodology
-  checklist for diagnosing crashes.
-- [`MAKAOS.md`](./MAKAOS.md) — **Project-specific rules.** Conventions
-  that only apply to MakaOS: the build system, subsystem boundaries,
-  flagged do-not-touch areas, and tooling quirks.
+**Boot**
+- UEFI/OVMF boot (`boot/uefi`): a `BOOTX64.EFI` (clang COFF) collects the E820
+  memory map and GOP framebuffer, installs a higher-half mapping, and hands off
+  to the kernel. A legacy second-stage C loader (`kernelLoader/`) with its own
+  AHCI/PMM/VMM is kept in-tree as well.
 
-## Precedence
+**Kernel** (`kernel/`)
+- 4-way **SMP**: per-CPU runqueues, an MLFQ scheduler over a Chase-Lev
+  work-stealing deque, RCU, and lock-minimized hot paths.
+- Memory: buddy-allocator PMM with per-CPU magazines, VMM with demand paging,
+  copy-on-write `fork`, per-process VMAs, and a slab + kernel-heap allocator.
+- Ring-3 userspace: ELF64 loader, `syscall`/`sysret` fast path, per-process
+  kernel stacks via TSS, real TLS (`%fs`), futexes, and kernel-owned thread
+  join — enough to run pthreads-heavy programs.
+- ~118 syscalls with Linux-style `-errno` returns, including POSIX signals,
+  `pipe`, `dup`/`fcntl`, `epoll`/`eventfd`/`timerfd`/`signalfd`, `io_uring`,
+  and Unix-domain sockets with `SCM_RIGHTS`.
+- Drivers: PCI, IRQ-driven AHCI, NVMe, virtio-gpu (DRM/KMS), virtio-net,
+  virtio-input (absolute tablet), Intel HD Audio, and PS/2 keyboard + mouse.
+- Networking: an ARP / IPv4 / UDP / TCP stack over virtio-net.
+- Filesystems: ext2 (read **and** write) behind a small VFS, with pollable
+  `/dev` character devices.
 
-When two rules appear to conflict, resolve in this order:
+**Userspace** (`userland/`)
+- A from-scratch libc (System V AMD64 ABI) with TLS, pthreads, and a `__thread`
+  `errno`; **bash 5.2** runs as `/bin/sh`.
+- A POSIX conformance suite (`test_posix1`, 156 assertions) plus assorted apps,
+  including a DOOM port.
 
-1. `MAKAOS.md` — project-specific reality wins over general style.
-2. `PRINCIPLES.md` — architecture wins over cosmetics.
-3. `CODE_STYLE.md` — style is the default, not the tiebreaker.
+**Desktop** (upstream ports, not custom code)
+- A wlroots-0.18 stack cross-compiled and run on the kernel's
+  virtio-gpu/DRM + libinput path: the **sway** compositor, **foot** terminal,
+  **swaybg** wallpaper, **tofi** launcher, and `wlr-randr`, with an absolute
+  virtio-tablet pointer. Actively being stabilized — see `docs/`.
 
-## How to use as an agent
+## Repository layout
 
-Before writing or modifying code:
+```
+boot/           UEFI bootloader (boot/uefi) + early boot assets
+kernelLoader/   Legacy second-stage C loader (AHCI/ATA, early PMM/VMM)
+kernel/         mm, proc/sched, syscalls, signals, VFS/ext2, net stack,
+                drivers (AHCI / NVMe / virtio-gpu/-net/-input / HDA / PS-2)
+userland/       libc, pthreads, and apps; bash as /bin/sh
+scripts/        Cross-toolchain + upstream-port build scripts (port-*.sh)
+docs/           Architecture, SMP design, lock inventory, session notes
+build.sh        Build the sysroot and assemble the ext2 disk image
+run.sh          Boot the image in QEMU (UEFI/OVMF, virtio-gpu + SDL display)
+```
 
-1. Read the relevant section of `PRINCIPLES.md` for the kind of change
-   you're about to make (e.g., new subsystem → read the modularity
-   section; touching a hot path → read the performance section).
-2. Check `MAKAOS.md` for any project-specific overrides or do-not-touch
-   flags.
-3. Apply `CODE_STYLE.md` as you write.
-4. If a rule seems wrong for the situation, **stop and ask** — do not
-   silently deviate.
+Engineering rules live in `PRINCIPLES.md`, `CODE_STYLE.md`, `MAKAOS.md`,
+`DEBUGGING.md`, and `DO_NOT_TOUCH.md`; `CLAUDE.md` indexes them.
+
+## Building and running
+
+Prerequisites: the cross toolchain built by `scripts/build-toolchain.sh`, plus
+`qemu-system-x86_64`, `e2fsprogs` (`mkfs.ext2`, `debugfs`), OVMF, and `nasm`.
+
+```sh
+bash build.sh   # build + assemble build/disk.img
+./run.sh        # boot it in QEMU (UEFI/OVMF, SDL window)
+```
+
+QEMU exposes a GDB stub on `tcp::1234`; the kernel ELF carries DWARF, so
+`gdb build/kernel.elf` then `target remote :1234` attaches.
 
 ## Status
 
-These are strong defaults with documented exceptions. A rule can be
-broken when the rule itself says it can, or when a deviation is
-explicitly justified in the code or commit message. Silent deviation is
-not a valid exception.
+In active development and unmistakably a learning project — but a substantial
+one. It boots under QEMU (TCG and KVM), runs bash and multithreaded userland,
+brings up a Wayland compositor, and drives real input/audio/network/storage
+devices. Rough edges remain: the desktop's client-presentation path and a few
+subsystems are still being hardened.
