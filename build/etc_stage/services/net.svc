@@ -1,7 +1,0 @@
-path=/bin/net
-uid=0
-gid=0
-stdio=null
-pledge=net stdio cpath wpath
-unveil=/etc rwc
-restart=on-failure

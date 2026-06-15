@@ -1,7 +1,0 @@
-ninja: Entering directory `/home/parrot/bootloader-kernel-in-NASM/build/libevdev_build'
-[0/1] Installing files
-Installing libevdev.a to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/lib
-Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1/libevdev/libevdev.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libevdev-1.0/libevdev
-Installing /home/parrot/bootloader-kernel-in-NASM/build/third_party/libevdev-libevdev-1.13.1/libevdev/libevdev-uinput.h to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/include/libevdev-1.0/libevdev
-Installing /home/parrot/bootloader-kernel-in-NASM/build/libevdev_build/libevdev.3 to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/share/man/man3
-Installing /home/parrot/bootloader-kernel-in-NASM/build/libevdev_build/meson-private/libevdev.pc to /home/parrot/bootloader-kernel-in-NASM/build/sysroot/usr/lib/pkgconfig
