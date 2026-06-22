@@ -1,0 +1,32 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -1699,11 +1699,24 @@
+ 	 */
+ 	wl_display_roundtrip(tofi.wl_display);
+ 	log_debug("Initialising second buffer.\n");
+-	memcpy(
+-		cairo_image_surface_get_data(tofi.window.entry.cairo[1].surface),
+-		cairo_image_surface_get_data(tofi.window.entry.cairo[0].surface),
+-		tofi.window.surface.width * tofi.window.surface.height * sizeof(uint32_t)
+-	);
++	/*
++	 * MakaOS: size this copy by the destination surface's OWN dimensions,
++	 * not window.surface.width/height.  The wl_display_roundtrip() above
++	 * can deliver a configure that changes window.surface.* after
++	 * entry_init() already allocated the double-buffer shm pool; using the
++	 * new (larger) size here overran cairo[1] past the pool end and
++	 * SIGSEGV'd tofi inside memcpy (intermittent).  The surface dimensions
++	 * always match what was allocated, so the copy stays in bounds.
++	 */
++	{
++		int _w = cairo_image_surface_get_width(tofi.window.entry.cairo[1].surface);
++		int _h = cairo_image_surface_get_height(tofi.window.entry.cairo[1].surface);
++		memcpy(
++			cairo_image_surface_get_data(tofi.window.entry.cairo[1].surface),
++			cairo_image_surface_get_data(tofi.window.entry.cairo[0].surface),
++			(size_t)_w * (size_t)_h * sizeof(uint32_t)
++		);
++	}
+ 	log_debug("Second buffer initialised.\n");
+ 
+ 	/* We've just rendered, so we don't need to do it again right now. */
