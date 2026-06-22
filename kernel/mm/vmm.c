@@ -1069,6 +1069,31 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             }
         }
 
+        // ── User frame-pointer backtrace ──────────────────────────────────
+        // On a stack overflow RSP sits below the mapped stack, so STACK@RSP
+        // is useless; the RBP frames near the bottom are still mapped.  Walk
+        // the %rbp chain ([rbp]=saved rbp, [rbp+8]=return addr) and print
+        // return addresses — a runaway recursion shows the same call site
+        // repeating.  Symbolize offline against the faulting binary.
+        ser_str("  BT@RBP (ret addrs):\n");
+        {
+            uint64_t* g = (uint64_t*)((uintptr_t)f + 5 * 8);
+            uint64_t rbp = g[4];
+            for (int i = 0; i < 24; i++) {
+                if (rbp < 0x1000 || rbp >= 0x800000000000ULL || (rbp & 7)) break;
+                phys_addr_t bpg = vmm_page_phys(vmm_pml4_get(), rbp & ~0xFFFULL);
+                if (bpg == PMM_INVALID_ADDR) { ser_str("    (rbp unmapped)\n"); break; }
+                uint64_t saved = *(uint64_t*)((bpg + HHDM_OFFSET) + (rbp & 0xFF8ULL));
+                uint64_t ra_va = rbp + 8;
+                phys_addr_t rpg = vmm_page_phys(vmm_pml4_get(), ra_va & ~0xFFFULL);
+                if (rpg == PMM_INVALID_ADDR) break;
+                uint64_t ra = *(uint64_t*)((rpg + HHDM_OFFSET) + (ra_va & 0xFF8ULL));
+                ser_str("    ret="); ser_hex64(ra);
+                if (saved <= rbp) break;   // chain must climb toward the top
+                rbp = saved;
+            }
+        }
+
         // ── Instruction bytes at faulting RIP ─────────────────────────────
         ser_str("  CODE@RIP:\n");
         {
