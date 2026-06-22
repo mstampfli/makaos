@@ -890,9 +890,15 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # point the wallpaper at the installed asset (swaybg loads it); route
     # $menu through tofi-run → swaymsg exec (no xargs on the image — sh -c
     # evaluates the $(...) at keypress time).
+    # The default status_command shells out to `date` and `sleep`, which the
+    # image doesn't ship (no coreutils).  `while date; ...` then exits at once
+    # (date: not found), so swaybar shows no clock.  Rewrite it to bash-5.2
+    # builtins: printf '%()T' for the time, `read -t 1` (on swaybar's still-open
+    # status pipe) for the 1s tick — no external binaries needed.
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
+        -e 's|^[[:space:]]*status_command .*|    status_command while printf "%(%Y-%m-%d %X)T\\n"; do read -t 1; done|' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
