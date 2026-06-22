@@ -489,6 +489,20 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     // stall: a compositor died as soon as a helper (swaybg, status cmd,
     // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
     __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // exec also resets these per-task fields, which the elf.c exec paths
+    // previously left as slab garbage (a drift from process.c's task init):
+    //   cleartid_addr — a garbage value makes exit write 0 to a wild futex
+    //                   address (futex clear-on-exit) and wake on it;
+    //   fs_base       — garbage %fs base until libc sets TLS;
+    //   wake_pending  — garbage feeds the lost-wakeup scheduler guard;
+    //   last_ran_cpu  — garbage CPU-affinity hint;
+    //   pf_disk/cache — produced UINT_MAX "[pf] … (109% warm)" accounting.
+    t->cleartid_addr = 0;
+    t->fs_base       = 0;
+    t->last_ran_cpu  = 0;
+    t->wake_pending  = 0;
+    t->pf_disk       = 0;
+    t->pf_cache      = 0;
     t->signalfd_head      = NULL;
     t->drm_bytes_charged  = 0;
     t->drm_priority       = 0;
@@ -601,6 +615,20 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     // stall: a compositor died as soon as a helper (swaybg, status cmd,
     // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
     __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // exec also resets these per-task fields, which the elf.c exec paths
+    // previously left as slab garbage (a drift from process.c's task init):
+    //   cleartid_addr — a garbage value makes exit write 0 to a wild futex
+    //                   address (futex clear-on-exit) and wake on it;
+    //   fs_base       — garbage %fs base until libc sets TLS;
+    //   wake_pending  — garbage feeds the lost-wakeup scheduler guard;
+    //   last_ran_cpu  — garbage CPU-affinity hint;
+    //   pf_disk/cache — produced UINT_MAX "[pf] … (109% warm)" accounting.
+    t->cleartid_addr = 0;
+    t->fs_base       = 0;
+    t->last_ran_cpu  = 0;
+    t->wake_pending  = 0;
+    t->pf_disk       = 0;
+    t->pf_cache      = 0;
     t->signalfd_head      = NULL;
     t->drm_bytes_charged  = 0;
     t->drm_priority       = 0;
