@@ -447,6 +447,27 @@ ALWAYS_INLINE cpu_t* this_cpu(void) {
     *(out_hi_p) = __exp_hi;                                                           \
 } while (0)
 
+// Absolute-address LOCKed 16-byte CAS — for cross-CPU access to a remote
+// core's 16-byte-aligned cmpxchg16b slot (e.g. another CPU's pcp_hdr during a
+// cross-CPU drain).  Unlike the %gs per-CPU variants this targets an arbitrary
+// pointer and takes the LOCK prefix, so it is atomic across cores.  ptr16 MUST
+// be 16-byte aligned.  Returns 1 on success; on mismatch it writes the observed
+// value back through old_lo_p/old_hi_p (standard cmpxchg semantics for a retry
+// loop).
+#define cmpxchg16b_abs(ptr16, old_lo_p, old_hi_p, new_lo, new_hi) ({                  \
+    uint8_t  __ok;                                                                    \
+    uint64_t __old_lo = *(old_lo_p);                                                  \
+    uint64_t __old_hi = *(old_hi_p);                                                  \
+    __asm__ volatile("lock cmpxchg16b %1\n\tsetz %0"                                  \
+        : "=q"(__ok), "+m"(*(volatile __uint128_t*)(ptr16)),                          \
+          "+a"(__old_lo), "+d"(__old_hi)                                              \
+        : "b"((uint64_t)(new_lo)), "c"((uint64_t)(new_hi))                            \
+        : "memory", "cc");                                                            \
+    *(old_lo_p) = __old_lo;                                                           \
+    *(old_hi_p) = __old_hi;                                                           \
+    __ok;                                                                             \
+})
+
 // Read a per-CPU pointer at a runtime offset.
 #define this_cpu_read_ptr_at(byte_off_var) ({                                        \
     void* __v;                                                                       \

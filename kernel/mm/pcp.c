@@ -203,42 +203,54 @@ void pcp_free(phys_addr_t phys) {
 }
 
 void pcp_drain_all(void) {
-    // Walk every CPU's pcp and drain it to buddy.  Used by the
-    // shrinker (4F) and as a synchronous reclaim hook in
-    // pmm_buddy_alloc on OOM.  Cross-CPU: we touch other CPUs'
-    // pcp_pages and pcp_hdr, which is normally per-CPU only — but
-    // here we IPI-equivalent ensure no one is touching them by
-    // requiring the caller hold the appropriate barrier (in practice,
-    // 4F runs this from a kthread that runs on each CPU in turn via
-    // sched migration; OOM-pressure path runs single-threaded under
-    // g_pmm_lock).
+    // Walk every CPU's pcp and drain it to buddy.  Used by the shrinker (4F)
+    // and as a synchronous reclaim hook in pmm_buddy_alloc on OOM.  This is a
+    // genuine cross-CPU access to another core's pcp_hdr/pcp_pages, which the
+    // owning core also mutates lock-free.  We do NOT rely on a quiescence
+    // "contract" (the previous code did, and it was false: pcp_alloc/free take
+    // no g_pmm_lock, so a remote owner can race a drain — the source of the
+    // [pmm] DOUBLE-ALLOC).  Instead each per-CPU drain snapshots the frames and
+    // then claims the header with a LOCKed cmpxchg16b; any concurrent owner op
+    // bumps tid and fails the claim, forcing a retry.
     extern cpu_t g_cpus[MAX_CPUS];
     for (uint32_t i = 0; i < MAX_CPUS; i++) {
         cpu_t* c = &g_cpus[i];
         if (!c->self) continue;  // CPU slot not initialised
-        // Snapshot count via cmpxchg load (atomic 16B).
-        uint64_t lo, hi;
-        // Cross-CPU: can't use %gs.  Plain reads — under shrinker
-        // serialisation contract this is safe.
-        lo = c->pcp_hdr.count;
-        hi = c->pcp_hdr.tid;
-        (void)hi;
-        if (lo == 0) continue;
-
-        // For cross-CPU drain we need to hand pages to the buddy
-        // without going through the per-CPU cmpxchg (we're not on
-        // the owning CPU).  Just clear count and free the contents.
-        // Per the contract above, no fast path is racing with us.
-        uint32_t cnt = (uint32_t)lo;
-        c->pcp_hdr.count = 0;
-        c->pcp_hdr.tid++;
-        uint64_t pmm_flags;
-        pmm_pcp_lock(&pmm_flags);
-        for (uint32_t j = 0; j < cnt; j++) {
-            pmm_buddy_free_locked_for_pcp(c->pcp_pages[j], 0);
+        // Cross-CPU drain: the owning core may concurrently pcp_alloc/free.
+        // It bumps pcp_hdr.tid on EVERY op, so we snapshot the frames first
+        // and then claim the whole stash with a LOCKed cmpxchg16b that only
+        // succeeds if the header (count,tid) is unchanged — which proves the
+        // snapshot was consistent.  On any concurrent owner op the CAS fails
+        // and we retry.  (The old code used plain reads then plain
+        // count=0/tid++ writes here, so a concurrent pcp_alloc could hand out
+        // a frame that this drain also freed to buddy — the [pmm] DOUBLE-ALLOC
+        // class.  Read-then-claim closes it without an IPI.)
+        for (;;) {
+            // Read both 8-byte words exactly as the cmpxchg16b will compare
+            // them: lo = [count|pad], hi = [tid].
+            uint64_t lo = *((volatile uint64_t*)&c->pcp_hdr);
+            uint64_t hi = *((volatile uint64_t*)&c->pcp_hdr + 1);
+            uint32_t cnt = (uint32_t)lo;
+            if (cnt == 0) break;
+            if (cnt > SLAB_PCPU_PCP_DEPTH) continue;   // torn header; retry
+            phys_addr_t frames[SLAB_PCPU_PCP_DEPTH];
+            for (uint32_t j = 0; j < cnt; j++)
+                frames[j] = c->pcp_pages[j];
+            // Claim: header (lo,hi) -> (0, hi+1).  Fails (retry) if the owner
+            // popped/pushed since our read, which also means our frame
+            // snapshot would be stale.
+            uint64_t exp_lo = lo, exp_hi = hi;
+            if (!cmpxchg16b_abs(&c->pcp_hdr, &exp_lo, &exp_hi,
+                                (uint64_t)0, hi + 1))
+                continue;
+            uint64_t pmm_flags;
+            pmm_pcp_lock(&pmm_flags);
+            for (uint32_t j = 0; j < cnt; j++)
+                pmm_buddy_free_locked_for_pcp(frames[j], 0);
+            pmm_pcp_unlock(pmm_flags);
+            c->pcp_drains++;
+            break;
         }
-        pmm_pcp_unlock(pmm_flags);
-        c->pcp_drains++;
     }
 }
 
