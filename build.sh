@@ -1203,7 +1203,7 @@ qemu-system-x86_64 \
   -accel kvm \
   -cpu host \
   -smp 4 \
-  -m 256M \
+  -m 1024M \
   -nodefaults \
   -no-user-config \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
