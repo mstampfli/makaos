@@ -337,15 +337,27 @@ handle, MSI-X vector per device) in a kmalloc'd array — mechanical, no
 design change.  evdev/devfs/udev-stub rows for event3+ go in
 `kernel/fs/virtfs.c` + `scripts/port-libudev.sh` alongside.
 
-## Boot self-tests gated off by default + latent kthread-exit corruption
-The boot battery (chaselev/slab/typesafe/... in kernel/main.c) is now behind
-`#ifdef MAKAOS_BOOT_SELFTESTS` (off by default) — it added 20-40s to every
-boot AND intermittently DEADLOCKED: a self-test worker kthread exits with a
-RUNTIME-corrupted `cleartid_addr` (e.g. 0x53004300530000, non-canonical;
-`task_init_common` zeroes it at creation, so this is memory corruption, not a
-missing init) → `task_notify_cleartid`'s `copy_to_user` #GP → that CPU wedges
-in the fault handler → a peer's `synchronize_rcu` spins forever.  Path to fix:
-find the writer that scribbles the task struct (KASAN-style poisoning of the
-freed-task slab or a guard page on `cleartid_addr` would localise it), then
-re-enable the self-tests by default.  Re-enable now for validation with
-`-DMAKAOS_BOOT_SELFTESTS`.
+## Boot self-tests: latent kthread-exit corruption — RESOLVED (2026-06-22)
+The boot battery (chaselev/slab/typesafe/... in kernel/main.c) is behind
+`#ifdef MAKAOS_BOOT_SELFTESTS` (off by default to keep normal boot fast; enable
+with `SELFTESTS=1 bash build.sh`).  It used to intermittently DEADLOCK: a
+self-test worker kthread exited with a RUNTIME-corrupted `cleartid_addr`
+(e.g. 0x53004300530000, non-canonical) → `task_notify_cleartid`'s
+`copy_to_user` #GP → that CPU wedged in the fault handler → a peer's
+`synchronize_rcu` spun forever.
+
+ROOT CAUSE (found): the PMM per-CPU page cache `pcp_drain_all()` claimed a
+remote CPU's stash with plain reads/writes while the owner popped via
+cmpxchg16b, so the same physical frame was handed to two owners — one of them
+the task slab, which is how a kthread's `cleartid_addr` got scribbled with
+another allocation's bytes.  FIXED in `mm/pcp` (commit 809127d): read-then-
+cmpxchg16b-claim drain (see `cmpxchg16b_abs`).  The `_access_ok`/user-copy
+hardening (iter2-3) had already made the resulting #GP non-fatal; this fix
+removes the corruption itself.
+
+VERIFIED 2026-06-22 (`SELFTESTS=1 bash build.sh`, headless boot): the FULL
+battery PASSES — chaselev (0 duplicates), slab_test (200k allocs, hit rate
+9999/10000, no crash), pmm10-test (all 8 order=10 allocs DISTINCT, the
+double-alloc detector), typesafe/dcache/io_uring/eventfd/timerfd/socketpair/
+scm_rights/signalfd/drm-mock — all PASS, with no `[pmm] DOUBLE-ALLOC`, no #GP,
+no RCU stall.  Safe to enable by default if the boot-time cost is acceptable.

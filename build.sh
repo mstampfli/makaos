@@ -84,6 +84,15 @@ KERNEL_CFLAGS=(
   -Wno-missing-field-initializers
 )
 
+# Opt-in boot self-tests (chase-lev / slab+pcp stress / buddy uniqueness).
+# Gated off by default because the slab stress test used to trip the PMM
+# cross-CPU double-alloc (now fixed, mm/pcp 809127d).  Enable with
+# `SELFTESTS=1 bash build.sh` to run them at boot.
+if [ "${SELFTESTS:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_BOOT_SELFTESTS )
+  echo "[build] boot self-tests ENABLED (-DMAKAOS_BOOT_SELFTESTS)"
+fi
+
 # ── User compile flags ─────────────────────────────────────────────────────
 USER_CFLAGS=(
   -ffreestanding -m64 -mno-red-zone
