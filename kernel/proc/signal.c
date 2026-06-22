@@ -188,6 +188,11 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
         // zombifies), and it wants a fall-through, not a nested call.
         // Leaving the signal pending-with-no-handler means the next
         // signal_deliver_pending takes the SIG_DFL-terminate path.
+        extern void kprintf(const char*, ...);
+        kprintf("[signal] setup_frame HANDLER kill: comm=\"%s\" sig=%d "
+                "handler=%p restorer=%p\n",
+                g_current->comm, sig,
+                (void*)ka->sa_handler, (void*)ka->sa_restorer);
         atomic_or(&g_current->sigstate.pending,
                   1u << (uint32_t)(SIGKILL - 1));
         g_current->sigstate.handlers[SIGKILL].sa_handler = (uint64_t)SIG_DFL;

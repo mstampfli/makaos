@@ -479,6 +479,16 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending   = 0;
     t->sigstate.blocked   = 0;
+    t->sigstate.sigframe_rsp = 0;
+    // exec resets all caught signals to SIG_DFL (POSIX).  The task_t was
+    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..)
+    // — leaving it makes signal_setup_frame read poison as a "handler" and
+    // force-SIGKILL the process the moment ANY signal is delivered for an
+    // unregistered slot (e.g. SIGCHLD when a child exits).  That was the
+    // silent killer of sway/svcmgr/login behind the desktop presentation
+    // stall: a compositor died as soon as a helper (swaybg, status cmd,
+    // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
+    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     t->signalfd_head      = NULL;
     t->drm_bytes_charged  = 0;
     t->drm_priority       = 0;
@@ -581,6 +591,16 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending   = 0;
     t->sigstate.blocked   = 0;
+    t->sigstate.sigframe_rsp = 0;
+    // exec resets all caught signals to SIG_DFL (POSIX).  The task_t was
+    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..)
+    // — leaving it makes signal_setup_frame read poison as a "handler" and
+    // force-SIGKILL the process the moment ANY signal is delivered for an
+    // unregistered slot (e.g. SIGCHLD when a child exits).  That was the
+    // silent killer of sway/svcmgr/login behind the desktop presentation
+    // stall: a compositor died as soon as a helper (swaybg, status cmd,
+    // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
+    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     t->signalfd_head      = NULL;
     t->drm_bytes_charged  = 0;
     t->drm_priority       = 0;
