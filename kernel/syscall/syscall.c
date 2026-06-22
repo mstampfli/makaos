@@ -1502,7 +1502,7 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     if (fsr != 0) {
         // TEMP: trace xkb lookup failures so we can see why dwl's keymap init fails.
         if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r')
-            kprintf("[stat-dbg] %s -> %d\n", path, fsr);
+            kprintf_atomic("[stat-dbg] %s -> %d\n", path, fsr);  // atomic: no 4-CPU interleave garble
         return (uint64_t)(int64_t)fsr;
     }
 
