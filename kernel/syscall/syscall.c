@@ -3718,7 +3718,6 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
     if (nfds > 1024) return (uint64_t)-EINVAL;
 
-    pollfd_t* ufds = (pollfd_t*)fds_ptr;
     task_files_t* files = g_current->files_shared;
 
     int infinite = (timeout_ms == (uint64_t)-1);
@@ -3727,22 +3726,39 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
     uint64_t deadline = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // Copy the user pollfd array into a kernel buffer instead of dereferencing
+    // the user pointer directly.  copy_from_user validates the whole range
+    // (_access_ok + prefault), so a bad/kernel/non-canonical fds pointer now
+    // returns -EFAULT rather than faulting the kernel, or worse granting an
+    // arbitrary kernel read/write through the fds pointer (up to nfds*8).  The
+    // copy also keeps the per-iteration re-poll off the user pointer.
+    pollfd_t* kfds = NULL;
+    uint64_t  fds_bytes = nfds * sizeof(pollfd_t);
+    if (nfds > 0) {
+        kfds = (pollfd_t*)kmalloc(fds_bytes);
+        if (!kfds) return (uint64_t)-ENOMEM;
+        if (copy_from_user(kfds, (const void*)fds_ptr, fds_bytes) != 0) {
+            kfree(kfds);
+            return (uint64_t)-EFAULT;
+        }
+    }
+
     do {
         count = 0;
         for (uint64_t i = 0; i < nfds; i++) {
-            ufds[i].revents = 0;
-            int fd = ufds[i].fd;
+            kfds[i].revents = 0;
+            int fd = kfds[i].fd;
             if (fd < 0) continue;
             vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-            if (!f) { ufds[i].revents = POLLNVAL; count++; continue; }
+            if (!f) { kfds[i].revents = POLLNVAL; count++; continue; }
 
             uint16_t rev = 0;
-            if ((ufds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
-            if ((ufds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
+            if ((kfds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
+            if ((kfds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
             // POLLHUP and POLLERR are always reported, regardless of the
             // caller's events mask (POSIX requirement).
             if (fd_has_hup(f)) rev |= POLLHUP;
-            if (rev) { ufds[i].revents = rev; count++; }
+            if (rev) { kfds[i].revents = rev; count++; }
         }
         if (count > 0) break;
         if (timeout_ms == 0) break;
@@ -3758,7 +3774,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             wait_group_init(&wg, wes, wqs, p_nslots);
 
             for (uint64_t i = 0; i < nfds; i++) {
-                int fd = ufds[i].fd;
+                int fd = kfds[i].fd;
                 if (fd < 0) continue;
                 vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
                                 ? files->ft->fd_table[fd] : NULL;
@@ -3770,12 +3786,12 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             // Re-check after registering — close race between first check and add.
             int recheck = 0;
             for (uint64_t i = 0; i < nfds; i++) {
-                int fd = ufds[i].fd;
+                int fd = kfds[i].fd;
                 if (fd < 0) continue;
                 vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
                 if (!f) continue;
-                if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
-                    ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
+                if (((kfds[i].events & POLLIN)  && fd_is_readable(f)) ||
+                    ((kfds[i].events & POLLOUT) && fd_is_writable(f)) ||
                     fd_has_hup(f)) { recheck = 1; break; }
             }
             if (!recheck) {
@@ -3788,6 +3804,12 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         }
     } while (infinite || tsc_read_ns() < deadline);
 
+    // Publish the resulting revents back to user space (best-effort: the array
+    // was already validated on the way in via copy_from_user).
+    if (nfds > 0) {
+        copy_to_user((void*)fds_ptr, kfds, fds_bytes);
+        kfree(kfds);
+    }
     return (uint64_t)(int64_t)count;
 }
 
