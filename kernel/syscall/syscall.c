@@ -2964,11 +2964,20 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
     return (uint64_t)(int64_t)r;
 }
 
+// Top of the canonical low (user) half.  User pointers may ONLY live here.
+// Checking against HHDM_OFFSET alone let non-canonical addresses through —
+// anything in the 0x0000_8000_.. .. 0xffff_7fff_.. gap is < HHDM_OFFSET, so
+// e.g. a scribbled 0x0053004300530000 passed _access_ok and the subsequent
+// memcpy #GP'd the kernel (writing a non-canonical address faults) instead
+// of cleanly returning -EFAULT.  An untrusted user pointer must never crash
+// the kernel: reject everything above the user ceiling (kernel AND the
+// non-canonical gap).
+#define USER_ADDR_MAX 0x00007FFFFFFFFFFFULL
 static inline int _access_ok(uint64_t addr, uint64_t len) {
     if (!addr) return 0;
-    if (addr >= HHDM_OFFSET) return 0;
-    if (len && (addr + len) < addr) return 0;       // overflow
-    if (len && (addr + len) > HHDM_OFFSET) return 0;
+    if (addr > USER_ADDR_MAX) return 0;                      // kernel or non-canonical
+    if (len && (addr + len) < addr) return 0;                // overflow
+    if (len && (addr + len - 1) > USER_ADDR_MAX) return 0;   // end past user ceiling
     return 1;
 }
 
