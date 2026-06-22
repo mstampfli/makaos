@@ -314,6 +314,33 @@ void unix_sock_close(vfs_file_t* self) {
     kfree(self);
 }
 
+// ── unix_sock_ioctl ──────────────────────────────────────────────────────
+// FIONREAD = _IOR('T', 0x1b, int): number of bytes available to read now.
+// sway's IPC server calls ioctl(fd, FIONREAD, &n) to size each request read;
+// with a NULL ioctl the call failed and sway never read the queued command,
+// so swaybar (and any i3-IPC client) hung forever in ipc_initialize.
+#define UNIX_FIONREAD 0x541b
+
+int64_t unix_sock_ioctl(vfs_file_t* f, uint64_t request, uint64_t arg) {
+    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+    unix_sock_t* s = (unix_sock_t*)f->ctx;
+    if (!s) return -EBADF;
+    if ((uint32_t)request == UNIX_FIONREAD) {
+        // Mirror what a subsequent recv() would return: SOCK_STREAM reads
+        // from this socket's own circular buffer; SOCK_DGRAM returns the
+        // size of the next queued datagram (POSIX semantics).
+        int navail;
+        if (s->type == SOCK_DGRAM)
+            navail = s->dgram_head ? (int)s->dgram_head->len : 0;
+        else
+            navail = (int)s->buf_count;
+        if (copy_to_user((void*)arg, &navail, sizeof(navail)) != 0)
+            return -EFAULT;
+        return 0;
+    }
+    return -ENOTTY;
+}
+
 // ── unix_sock_open ───────────────────────────────────────────────────────
 
 vfs_file_t* unix_sock_open(int type) {
@@ -341,7 +368,7 @@ vfs_file_t* unix_sock_open(int type) {
     f->close       = unix_sock_close;
     f->seek        = NULL;
     f->poll           = unix_vfs_poll;
-    f->ioctl          = NULL;
+    f->ioctl          = unix_sock_ioctl;
     f->ctx            = s;
     f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
     f->secondary_waitq = NULL;
