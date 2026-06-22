@@ -149,6 +149,30 @@ static int pipe_write_poll(vfs_file_t* self, int events) {
     return (p->count < PIPE_BUF_SIZE && p->reader_refs > 0) ? 1 : 0;
 }
 
+// ── pipe_ioctl ────────────────────────────────────────────────────────────
+// FIONREAD = _IOR('T', 0x1b, int): bytes available to read right now.
+// Consumers size a read by it — swaybar's status reader does
+// ioctl(read_fd, FIONREAD, &n) then read(read_fd, buf, n).  Without a pipe
+// ioctl handler the call fell through sys_ioctl to the controlling-tty
+// fallback, which never wrote the user int, so `n` stayed UNINITIALIZED:
+// swaybar then read a garbage-sized buffer, producing a multi-KB status
+// string that rendered to ~175K cairo commands and blew up the recording
+// surface's bbtree (intermittent stack-overflow / heap-exhaustion crash).
+// Answer FIONREAD with the queued byte count; anything else is -ENOTTY (a
+// pipe is not a terminal — this also makes isatty() correctly return false).
+#define PIPE_FIONREAD 0x541b
+static int64_t pipe_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+    if ((uint32_t)request == PIPE_FIONREAD) {
+        pipe_buf_t* p = (pipe_buf_t*)self->ctx;
+        int navail = p ? (int)p->count : 0;
+        if (copy_to_user((void*)arg, &navail, sizeof(navail)) != 0)
+            return -EFAULT;
+        return 0;
+    }
+    return -ENOTTY;
+}
+
 // ── pipe_create ───────────────────────────────────────────────────────────
 
 int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
@@ -176,7 +200,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     r->seek        = NULL;
     r->close       = pipe_read_close;
     r->poll           = pipe_read_poll;
-    r->ioctl          = NULL;
+    r->ioctl          = pipe_ioctl;
     r->ctx            = p;
     r->waitq           = &r->_waitq; wait_queue_init(r->waitq);
     r->secondary_waitq = NULL;
