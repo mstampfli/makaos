@@ -34,6 +34,12 @@ fetch() {
     [ -d "$CAIRO_SRC" ] || {
         log "extracting cairo"
         tar -xJf "$CAIRO_TARBALL" -C "$THIRD_PARTY"
+        # MakaOS patches — applied once, right after a fresh extraction.
+        for p in "$REPO_ROOT"/scripts/patches/cairo/*.patch; do
+            [ -e "$p" ] || continue
+            log "applying $(basename "$p")"
+            patch -p1 -d "$CAIRO_SRC" < "$p"
+        done
     }
 }
 
