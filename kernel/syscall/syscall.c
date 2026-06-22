@@ -154,10 +154,16 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
 //
 // Must be called while the process's PML4 is active in CR3 (i.e. inside a
 // syscall handler, before any address-space switch).
-static void user_buf_prefault(virt_addr_t addr, size_t len) {
-    if (!len || !g_current) return;
+// Returns 0 if the whole range is backed by user VMAs (and now mapped), or
+// -1 if any page has NO VMA / can't be backed.  Callers writing into the
+// range (copy_to_user etc.) MUST treat -1 as -EFAULT: a bad user pointer
+// (e.g. a scribbled cleartid_addr 0x0000680073006900 — canonical but
+// unmapped) would otherwise #PF in the subsequent memcpy and panic the
+// kernel ("kernel #PF unrecoverable") instead of failing cleanly.
+static int user_buf_prefault(virt_addr_t addr, size_t len) {
+    if (!len || !g_current) return 0;
     mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
-    if (!mm) return;
+    if (!mm) return 0;
 
     virt_addr_t page = addr & ~(virt_addr_t)0xFFF;
     virt_addr_t end  = (addr + len + 0xFFF) & ~(virt_addr_t)0xFFF;
@@ -170,7 +176,7 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
         rcu_read_lock();
         {
             vma_t* vma = mm_vma_find(mm, page);
-            if (!vma) { rcu_read_unlock(); continue; }
+            if (!vma) { rcu_read_unlock(); return -1; }  // no VMA → bad pointer
             vma_flags = vma->flags;
         }
         rcu_read_unlock();
@@ -200,15 +206,17 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
     map_page:;
         // Allocate a frame, zero it, map it with the VMA's permissions.
         phys_addr_t frame = pmm_buddy_alloc(0);
-        if (frame == PMM_INVALID_ADDR) break;  // OOM — abort prefault
+        if (frame == PMM_INVALID_ADDR) return -1;  // OOM — can't back the range
 
         // Zero the full page (512 × 8 bytes = 4096).
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
         if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
             pmm_buddy_free(frame, 0);
+            return -1;
         }
     }
+    return 0;
 }
 
 // ── sys_read ──────────────────────────────────────────────────────────────
@@ -219,7 +227,9 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     if (f->rights != 0 && !rights_check(f->rights, RIGHT_READ)) {
         fdput(f); return (uint64_t)-EACCES;
     }
-    user_buf_prefault((virt_addr_t)buf, (size_t)len);
+    if (user_buf_prefault((virt_addr_t)buf, (size_t)len) != 0) {
+        fdput(f); return (uint64_t)-EFAULT;
+    }
     int64_t r = vfs_read(f, (void*)buf, len);
     fdput(f);
     return (uint64_t)r;
@@ -2492,7 +2502,8 @@ static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
     // a huge or overflowing rect would prefault/read arbitrary user range.
     if (src_w > 16384 || src_h > 16384) return (uint64_t)-EINVAL;
 
-    user_buf_prefault(src_ptr, (uint64_t)src_w * src_h * 4);
+    if (user_buf_prefault(src_ptr, (uint64_t)src_w * src_h * 4) != 0)
+        return (uint64_t)-EFAULT;
     const uint32_t* src   = (const uint32_t*)src_ptr;
     uint32_t*       fb    = (uint32_t*)g_fb.base_virt;
     uint32_t        dw    = g_fb.width;
@@ -2985,14 +2996,14 @@ static inline int _access_ok(uint64_t addr, uint64_t len) {
 // Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
 int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
-    user_buf_prefault((virt_addr_t)src_u, len);
+    if (user_buf_prefault((virt_addr_t)src_u, len) != 0) return -EFAULT;
     __builtin_memcpy(dst, src_u, len);
     return 0;
 }
 
 int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
-    user_buf_prefault((virt_addr_t)dst_u, len);
+    if (user_buf_prefault((virt_addr_t)dst_u, len) != 0) return -EFAULT;
     __builtin_memcpy(dst_u, src, len);
     return 0;
 }
