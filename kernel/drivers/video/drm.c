@@ -2373,6 +2373,7 @@ static void drm_queue_flip_event(vfs_file_t* f, uint32_t crtc_id, uint64_t user_
         .crtc_id   = crtc_id,
     };
     drm_evq_push(c, &ev, sizeof(ev));
+    drm_dbg("flipev QUEUED crtc=%u", crtc_id);   /* AUTOFIX: repaint-loop trace */
     if (f->waitq) wait_queue_wake_all(f->waitq);
 }
 
@@ -2385,6 +2386,7 @@ static int64_t drm_read_op(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t  kbuf[DRM_EVQ_SIZE];
     uint32_t got = drm_evq_pop(c, kbuf, want);
     if (got == 0) return 0;
+    drm_dbg("flipev READ %u bytes", got);   /* AUTOFIX: repaint-loop trace */
     extern int copy_to_user(void* dst, const void* src, uint64_t n);
     if (copy_to_user(buf, kbuf, got) != 0) return -EFAULT;
     return (int64_t)got;
