@@ -690,7 +690,9 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
 
 int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
                       int nonblock) {
-    if (!f || !buf || !len) return -EINVAL;
+    if (!f) return -EINVAL;
+    if (len == 0) return 0;   // POSIX: a 0-length read/write is a successful no-op
+    if (!buf) return -EINVAL;
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
     if (s->shutdown_wr) return -EPIPE;
@@ -747,7 +749,9 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
 // ── unix_sock_recv ───────────────────────────────────────────────────────
 
 int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
-    if (!f || !buf || !len) return -EINVAL;
+    if (!f) return -EINVAL;
+    if (len == 0) return 0;   // POSIX: a 0-length read/write is a successful no-op
+    if (!buf) return -EINVAL;
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
     if (s->shutdown_rd) return 0; // EOF
@@ -811,7 +815,9 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
 
 int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
                       const char* path) {
-    if (!f || !buf || !len) return -EINVAL;
+    if (!f) return -EINVAL;
+    if (len == 0) return 0;   // POSIX: a 0-length read/write is a successful no-op
+    if (!buf) return -EINVAL;
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
     if (s->type != SOCK_DGRAM) return -EOPNOTSUPP;
