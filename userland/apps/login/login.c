@@ -20,6 +20,7 @@
 
 #define PASSWD_PATH  "/etc/passwd"
 #define SHADOW_PATH  "/etc/shadow"
+#define AUTOLOGIN_PATH "/etc/autologin"
 #define MAX_USERS    32
 #define MAX_LINE     256
 
@@ -178,6 +179,78 @@ static int read_password(char* buf, int max) {
     return n;
 }
 
+// ── Session start — drop creds, set env, exec the session, wait ───────────
+// Shared by the interactive and auto-login paths so the two cannot drift.
+// `cmd_override`, when non-NULL, is exec'd in place of pw->shell (auto-login
+// uses it to launch a compositor directly).  Returns the session's exit
+// status, or -1 if it could not be spawned.
+static int start_session(passwd_entry_t* pw, const char* username,
+                         const char* cmd_override) {
+    // ── Credentials drop ────────────────────────────────────────────
+    // Order matters: setgid BEFORE setuid (once uid != 0 we may lose
+    // the ability to setgid to arbitrary groups).
+    setgid(pw->gid);
+    setgroups(0, (uint32_t*)0);   // clear supplemental groups
+    setuid(pw->uid);
+
+    // ── Change to home directory ─────────────────────────────────────
+    if (chdir(pw->home) < 0) {
+        // Fall back to / if home doesn't exist yet.
+        chdir("/");
+    }
+
+    // ── Clear screen before session ──────────────────────────────────
+    write(1, "\f", 1);
+
+    // ── Print welcome ────────────────────────────────────────────────
+    write(1, "Welcome, ", 9);
+    write(1, username, s_strlen(username));
+    write(1, "!\n", 2);
+
+    // ── Exec session as this user ────────────────────────────────────
+    // spawn inherits our (now-dropped) credentials via cred_copy in
+    // elf_exec_from_ext2.  The child runs as uid=pw->uid.
+    //
+    // Build a minimal env.  POSIX + systemd consumers like foot / fcft
+    // look up HOME and USER immediately on startup (foot:conf.c:374 reads
+    // $XDG_CONFIG_HOME then $HOME, fcft parses $XDG_CACHE_HOME for its font
+    // cache).  Without these set every wayland client can't find its config
+    // directory and falls back to defaults that require further machinery.
+    // Set the canonical four so downstream consumers find what they expect.
+    char env_home[128 + 5];
+    char env_user[32  + 5];
+    char env_shell[128 + 6];
+    s_strcpy(env_home,  "HOME=",  sizeof(env_home));
+    s_strcpy(env_home  + 5,  pw->home, sizeof(env_home)  - 5);
+    s_strcpy(env_user,  "USER=",  sizeof(env_user));
+    s_strcpy(env_user  + 5,  username, sizeof(env_user)  - 5);
+    s_strcpy(env_shell, "SHELL=", sizeof(env_shell));
+    s_strcpy(env_shell + 6,  pw->shell, sizeof(env_shell) - 6);
+    const char* shell_env[] = {
+        env_home,
+        env_user,
+        env_shell,
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "TERM=xterm-256color",
+        "LANG=C.UTF-8",
+        "XDG_RUNTIME_DIR=/tmp",
+        (char*)0,
+    };
+    const char* prog = cmd_override ? cmd_override : pw->shell;
+    const char* sh_argv[] = { prog, (char*)0 };
+    int inherit_stdio[3] = { -1, -1, -1 };
+    int pid = spawn(prog, sh_argv, shell_env, inherit_stdio, NULL);
+    if (pid < 0) {
+        write(1, "login: failed to exec session\n", 30);
+        return -1;
+    }
+
+    // Wait for the session to exit.
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return status;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
 int main(void) {
@@ -201,6 +274,33 @@ int main(void) {
         return 1;
     }
     foreach_line(shadow_buf, parse_shadow_line, (void*)0);
+
+    // ── Auto-login (kiosk / test, agetty -a analog) ────────────────────────
+    // If /etc/autologin exists, start a session for the named user without an
+    // interactive prompt.  One line: "username" or "username:command" (command
+    // replaces the login shell).  Used by the headless boot-test harness to
+    // reach the compositor deterministically without blind console keystrokes.
+    // Absent from the normal image build, so default boots still prompt.
+    static char autologin_buf[256];
+    if (read_file(AUTOLOGIN_PATH, autologin_buf, sizeof(autologin_buf)) >= 0) {
+        char* nl = autologin_buf;
+        while (*nl && *nl != '\n') nl++;
+        *nl = '\0';
+        char* al_cmd = (char*)0;
+        char* c = autologin_buf;
+        while (*c && *c != ':') c++;
+        if (*c == ':') { *c = '\0'; al_cmd = c + 1; }
+        if (autologin_buf[0]) {
+            passwd_entry_t* pw = find_passwd(autologin_buf);
+            if (pw) {
+                // Re-launch the session if it exits (kiosk behavior).  Safe
+                // for the uid=0 case the harness uses (setuid(0) is a no-op,
+                // so each relaunch re-drops cleanly).
+                for (;;) start_session(pw, autologin_buf, al_cmd);
+            }
+        }
+        // Misconfigured autologin (no such user) falls through to prompts.
+    }
 
     // Login loop — retry on bad credentials.
     char username[64];
@@ -238,70 +338,8 @@ int main(void) {
         // If no shadow entry: allow login without password (not recommended,
         // but lets root in even if shadow is misconfigured).
 
-        // ── Credentials drop ────────────────────────────────────────────
-        // Order matters: setgid BEFORE setuid (once uid != 0 we may lose
-        // the ability to setgid to arbitrary groups).
-        setgid(pw->gid);
-        setgroups(0, (uint32_t*)0);   // clear supplemental groups
-        setuid(pw->uid);
-
-        // ── Change to home directory ─────────────────────────────────────
-        if (chdir(pw->home) < 0) {
-            // Fall back to / if home doesn't exist yet.
-            chdir("/");
-        }
-
-        // ── Clear screen before shell ────────────────────────────────────
-        write(1, "\f", 1);
-
-        // ── Print welcome ────────────────────────────────────────────────
-        write(1, "Welcome, ", 9);
-        write(1, username, s_strlen(username));
-        write(1, "!\n", 2);
-
-        // ── Exec shell as this user ──────────────────────────────────────
-        // spawn inherits our (now-dropped) credentials via cred_copy in
-        // elf_exec_from_ext2.  The child shell runs as uid=pw->uid.
-        //
-        // Build a minimal env for the shell.  POSIX + systemd consumers
-        // like foot / fcft look up HOME and USER immediately on startup
-        // (foot:conf.c:374 reads $XDG_CONFIG_HOME then $HOME, fcft
-        // parses $XDG_CACHE_HOME for its font cache).  Without these
-        // set every wayland client can't find its config directory and
-        // falls back to defaults that require further machinery (e.g.
-        // foot falls back to getpwuid(getuid()), which fails on our
-        // libc and drops the shell back to "sh").  Set the canonical
-        // four so downstream consumers find what they expect.
-        char env_home[128 + 5];
-        char env_user[32  + 5];
-        char env_shell[128 + 6];
-        s_strcpy(env_home,  "HOME=",  sizeof(env_home));
-        s_strcpy(env_home  + 5,  pw->home, sizeof(env_home)  - 5);
-        s_strcpy(env_user,  "USER=",  sizeof(env_user));
-        s_strcpy(env_user  + 5,  username, sizeof(env_user)  - 5);
-        s_strcpy(env_shell, "SHELL=", sizeof(env_shell));
-        s_strcpy(env_shell + 6,  pw->shell, sizeof(env_shell) - 6);
-        const char* shell_env[] = {
-            env_home,
-            env_user,
-            env_shell,
-            "PATH=/usr/local/bin:/usr/bin:/bin",
-            "TERM=xterm-256color",
-            "LANG=C.UTF-8",
-            "XDG_RUNTIME_DIR=/tmp",
-            (char*)0,
-        };
-        const char* sh_argv[] = { pw->shell, (char*)0 };
-        int inherit_stdio[3] = { -1, -1, -1 };
-        int pid = spawn(pw->shell, sh_argv, shell_env, inherit_stdio, NULL);
-        if (pid < 0) {
-            write(1, "login: failed to exec shell\n", 28);
-            return 1;
-        }
-
-        // Wait for shell to exit, then re-show login prompt.
-        int status = 0;
-        waitpid(pid, &status, 0);
+        // ── Start the user's session (shared with the auto-login path) ───
+        start_session(pw, username, (const char*)0);
 
         // Re-read databases for next login (they may have changed).
         s_npasswd = 0; s_nshadow = 0;

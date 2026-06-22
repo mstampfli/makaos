@@ -723,6 +723,19 @@ ext2_setperm "$BUILD_DIR/ext2.img" /etc/passwd 0100644 0 0
 debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/shadow etc/shadow" > /dev/null 2>&1 || true
 ext2_setperm "$BUILD_DIR/ext2.img" /etc/shadow 0100600 0 0
 
+# Optional auto-login (test/kiosk only, agetty -a analog).  `AUTOLOGIN=1 bash
+# build.sh` installs /etc/autologin so login starts a session without an
+# interactive prompt — lets the headless boot-test harness reach the
+# compositor deterministically without blind console keystrokes.  Default
+# builds omit the file, so normal boots still prompt for credentials.
+# Format: "user" or "user:command" (command replaces the login shell).
+if [ "${AUTOLOGIN:-0}" = "1" ]; then
+  printf '%s\n' "${AUTOLOGIN_SPEC:-root:/bin/sway}" > "$BUILD_DIR/etc_stage/autologin"
+  debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/autologin etc/autologin" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /etc/autologin 0100600 0 0
+  echo "[build] AUTOLOGIN enabled: /etc/autologin = ${AUTOLOGIN_SPEC:-root:/bin/sway}"
+fi
+
 # Put a secret file in /root to test permission enforcement
 echo "root's secret — maka cannot read this" > "$BUILD_DIR/etc_stage/root_secret.txt"
 debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/root_secret.txt root/secret.txt" > /dev/null 2>&1 || true
