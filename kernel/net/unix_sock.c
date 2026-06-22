@@ -237,6 +237,13 @@ static int unix_vfs_poll(vfs_file_t* self, int events) {
         }
         if (s->type == SOCK_DGRAM) return 1; // dgram always writable
     }
+    if (events & 0x0010 /* POLLHUP */) {
+        // Peer closed its end.  poll/epoll users (e.g. sway's IPC server)
+        // rely on POLLHUP to stop polling a dead fd; without it they see the
+        // EOF socket as perpetually POLLIN-readable, read 0 bytes, and
+        // busy-loop forever.  Report HUP once the peer is gone.
+        if (s->state == UNIX_STATE_DISCONNECTED) return 1;
+    }
     return 0;
 }
 
