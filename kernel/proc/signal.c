@@ -131,7 +131,7 @@ static inline int sig_user_range_ok(uint64_t addr, uint64_t len) {
     return 1;
 }
 
-static void signal_setup_frame(int sig, k_sigaction_t* ka) {
+static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     // Per-task saved user context — survives mid-syscall CPU migration.
     syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
     uint64_t user_rsp = kf->rsp;
@@ -231,8 +231,25 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
     frame->r13    = kf->r13;
     frame->r14    = kf->r14;
     frame->r15    = kf->r15;
+    // Save the caller-saved arg registers BEFORE kf->rdi is overwritten with
+    // the signum below — the handler will clobber all of these.
+    frame->rdi    = kf->rdi;
+    frame->rsi    = kf->rsi;
+    frame->rdx    = kf->rdx;
+    frame->r10    = kf->r10;
+    frame->r8     = kf->r8;
+    frame->r9     = kf->r9;
+    frame->rax    = saved_rax;
     frame->blocked = g_current->sigstate.blocked;
     frame->_pad   = 0;
+
+    // Save the interrupted FPU/SSE state.  g_current is running and the
+    // kernel is -mno-sse, so its FPU registers still hold the user's live
+    // state; the handler about to run will clobber them.  fxrstor in
+    // sys_sigreturn puts them back so the interrupted code resumes with an
+    // intact x87/XMM state.  Target is 16-byte aligned (frame_base & ~0xF,
+    // fpu aligned(16)); the frame window is already VMA-validated above.
+    __asm__ volatile("fxsave %0" : "=m"(frame->fpu));
 
     // Remember where the frame is for sys_sigreturn.
     g_current->sigstate.sigframe_rsp = frame_base;
@@ -256,7 +273,7 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka) {
 }
 
 // ── signal_deliver_pending ────────────────────────────────────────────────
-void signal_deliver_pending(int may_setup_frame) {
+void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
     if (!g_current || g_current->state == TASK_DEAD) return;
 
     sigstate_t* ss = &g_current->sigstate;
@@ -302,7 +319,7 @@ void signal_deliver_pending(int may_setup_frame) {
     // paths pass 0 → defer; only the syscall-return caller passes 1.
     if (handler != (uint64_t)SIG_DFL && may_setup_frame &&
         !(g_current->flags & TASK_FLAG_KTHREAD)) {
-        signal_setup_frame(sig, ka);
+        signal_setup_frame(sig, ka, saved_rax);
         return;
     }
 

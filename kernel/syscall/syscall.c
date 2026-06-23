@@ -1944,12 +1944,31 @@ static uint64_t sys_sigreturn(void) {
     kf->r13    = frame.r13;
     kf->r14    = frame.r14;
     kf->r15    = frame.r15;
+    // Caller-saved arg registers (clobbered by the handler) — restore so the
+    // interrupted code resumes with the exact register state it had.
+    kf->rdi    = frame.rdi;
+    kf->rsi    = frame.rsi;
+    kf->rdx    = frame.rdx;
+    kf->r10    = frame.r10;
+    kf->r8     = frame.r8;
+    kf->r9     = frame.r9;
 
     // Restore the signal mask that was active before the handler ran.
     // SIGKILL must never be masked.
     g_current->sigstate.blocked = frame.blocked & ~(1u << (SIGKILL - 1));
     g_current->sigstate.sigframe_rsp = 0;
-    return 0;
+
+    // Restore the interrupted FPU/SSE state saved by signal_setup_frame.
+    // Sanitize MXCSR first: a crafted sigframe with reserved MXCSR bits set
+    // would #GP the kernel on FXRSTOR (a userland-triggerable DoS).  Mask to
+    // the architecturally writable bits.  `frame` is a 16-byte-aligned kernel
+    // copy (sigframe_t is aligned(16)), so FXRSTOR's alignment rule holds.
+    *(uint32_t*)(frame.fpu + 24) &= 0x0000FFBFu;   // MXCSR is at FXSAVE off 24
+    __asm__ volatile("fxrstor %0" : : "m"(frame.fpu));
+    // Return the interrupted syscall's rax so the resumed code sees the
+    // original return value rather than sigreturn's own (this becomes rax
+    // on the sigreturn syscall's exit path).
+    return frame.rax;
 }
 
 // ── sys_mmap ──────────────────────────────────────────────────────────────
@@ -5584,7 +5603,7 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
     // Deliver any pending signals on the syscall return path.  This is
     // the one site that may set up a user signal frame — we own this
     // task's SYSCALL_KFRAME and are about to return through it.
-    signal_deliver_pending(1);
+    signal_deliver_pending(1, ret);
     return ret;
 }
 

@@ -593,9 +593,9 @@ static void ser_str(const char* s) {
 
 static void kill_current(void) {
     extern void signal_send(struct task_t* t, int sig);
-    extern void signal_deliver_pending(int);
+    extern void signal_deliver_pending(int, uint64_t);
     if (g_current) signal_send(g_current, 11); // SIGSEGV = 11
-    signal_deliver_pending(0);
+    signal_deliver_pending(0, 0);
     for (;;) __asm__ volatile("cli; hlt");
 }
 

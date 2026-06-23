@@ -89,7 +89,7 @@ static inline uint8_t from_user(interrupt_frame_t* f) {
 static void user_signal_or_halt_noec(interrupt_frame_t* f, int sig, const char* msg) {
     if (from_user(f)) {
         signal_send(g_current, sig);
-        signal_deliver_pending(0);
+        signal_deliver_pending(0, 0);
         return;
     }
     isr_general_exception_no_ec(msg, f);
@@ -101,7 +101,7 @@ static void user_signal_or_halt_ec(interrupt_frame_t* f, uint64_t ec, int sig, c
         serial_puts_idt("ec="); serial_hex_idt(ec);
         serial_puts_idt("ip="); serial_hex_idt(f->ip);
         signal_send(g_current, sig);
-        signal_deliver_pending(0);
+        signal_deliver_pending(0, 0);
         return;
     }
     isr_general_exception_ec(msg, f, ec);
@@ -180,7 +180,7 @@ void isr13_gp(interrupt_frame_t* f, uint64_t ec) {
 
     if (from_user(f)) {
         signal_send(g_current, SIGSEGV);
-        signal_deliver_pending(0);
+        signal_deliver_pending(0, 0);
         return;
     }
     // Kernel GP — halt

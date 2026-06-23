@@ -1401,7 +1401,7 @@ static void do_switch(uint8_t preempted) {
         if (so) __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
     }
 
-    signal_deliver_pending(0);
+    signal_deliver_pending(0, 0);
 
     if (prev != c->idle && prev->state == TASK_DEAD)
         process_destroy(prev);

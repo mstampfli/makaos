@@ -55,7 +55,7 @@ typedef struct {
 // ── Signal frame saved on the user stack during handler delivery ──────────
 // Laid out at (user_rsp - sizeof(sigframe_t)) & ~0xF before calling handler.
 // sys_sigreturn reads this to restore the interrupted context.
-typedef struct {
+typedef struct __attribute__((aligned(16))) {
     uint64_t rip;
     uint64_t rsp;
     uint64_t rflags;
@@ -65,8 +65,29 @@ typedef struct {
     uint64_t r13;
     uint64_t r14;
     uint64_t r15;
+    // Caller-saved registers the x86-64 syscall ABI nonetheless preserves
+    // (only rcx/r11/rax are clobbered by `syscall`).  Userland holds live
+    // values in these across an inline syscall; a signal handler clobbers
+    // them, so they must be saved/restored too or the interrupted code
+    // resumes with garbage (observed: integer text-metric intermediates).
+    uint64_t rdi, rsi, rdx, r10, r8, r9;
+    // The syscall's return value.  `syscall` itself clobbers rax, but the
+    // interrupted userland instruction is about to READ it (the return
+    // value), so a handler clobbering rax corrupts the result unless we
+    // restore it on sigreturn.
+    uint64_t rax;
     uint32_t blocked;   // signal mask at time of delivery
     uint32_t _pad;
+    // Interrupted FPU/SSE state (x87 + XMM), saved by FXSAVE on delivery and
+    // restored by FXRSTOR on sigreturn.  The kernel is built -mno-sse, so it
+    // never touches these registers; userland relies on them surviving a
+    // syscall.  A signal handler clobbers them, so WITHOUT this save a signal
+    // landing mid-float-computation corrupts the interrupted code's result
+    // (observed: swaybar's pango text-height measurement returning garbage,
+    // blowing up the bar layout so the taskbar never maps).  FXSAVE/FXRSTOR
+    // require a 16-byte-aligned target: the struct is aligned(16) and the
+    // user frame is placed at (rsp & ~0xF), so `fpu` (offset 80) is aligned.
+    uint8_t  fpu[512] __attribute__((aligned(16)));
 } sigframe_t;
 
 // ── Per-task signal state (embedded in task_t) ────────────────────────────
@@ -97,7 +118,7 @@ struct task_t;
 void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
 void signal_send_pgrp(uint32_t pgid, int sig);
-void signal_deliver_pending(int may_setup_frame);
+void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax);
 
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these
 // is pending with SIG_DFL, signal_deliver_pending silently drops it and
