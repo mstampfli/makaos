@@ -1381,6 +1381,26 @@ static void do_switch(uint8_t preempted) {
 
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
+    // on_cpu handshake (prompt clear): we are now the incoming task, resumed
+    // on this physical CPU.  Clear the on_cpu flag of whatever task was just
+    // switched away from here (recorded in switching_from before the switch).
+    // It has fully saved its context (context_switch completed before yielding
+    // to us), so it is provably off-CPU.  Doing it HERE — not only lazily at
+    // the next do_switch entry — is critical: when this CPU switches to idle
+    // and then has no work, it never re-enters do_switch, so the lazy clear
+    // would leave the previous task on_cpu==1 forever.  A remote sched_wake
+    // then perpetually defers that task (the do_switch on_cpu backstop) and it
+    // never runs — observed as sway's threaded init hanging mid-startup.
+    // Re-read this_cpu(): `c` may be stale if we migrated here; the physical
+    // CPU is unchanged across context_switch.  RELEASE pairs with the waker's
+    // ACQUIRE so it also sees our fully-saved context.  Fresh tasks that resume
+    // via a trampoline instead of here are still covered by the entry clear.
+    {
+        cpu_t* cc = this_cpu();
+        task_t* so = cc->switching_from;
+        if (so) __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+    }
+
     signal_deliver_pending(0);
 
     if (prev != c->idle && prev->state == TASK_DEAD)
