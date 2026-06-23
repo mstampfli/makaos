@@ -859,6 +859,17 @@ if [ -f "$BUILD_DIR/user_bash.elf" ]; then
     # everything we've hit so far.)
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/sh
     echo "[+] sh (bash) installed at bin/sh (root:root 0755)"
+else
+    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "[build] !! WARNING: build/user_bash.elf is MISSING — /bin/bash AND /bin/sh"
+    echo "[build] !! will NOT be installed.  /etc/passwd makes /bin/bash root's login"
+    echo "[build] !! shell, so login WILL FAIL ('login: failed to exec session' loop"
+    echo "[build] !! / stuck after login).  build/user_bash.elf is git-untracked since"
+    echo "[build] !! b00dfe2 and built from \$BASH_SRC (default /tmp/bash-5.2), which is"
+    echo "[build] !! ephemeral.  Fix: restore the prebuilt ELF from git ->"
+    echo "[build] !!   git show f260b18:build/user_bash.elf > build/user_bash.elf"
+    echo "[build] !! (or re-provide the bash source tree at \$BASH_SRC and rebuild)."
+    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
