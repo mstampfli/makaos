@@ -1267,6 +1267,23 @@ static void do_switch(uint8_t preempted) {
         next = c->idle;
     }
 
+    // on_cpu handshake (cross-CPU backstop): never context_switch INTO a task
+    // that is still marked on_cpu.  Such a task is still executing — finishing
+    // its own context_switch — on another CPU; the prime case is one that
+    // work-stealing pulled out of a remote rq before that CPU's next do_switch
+    // cleared on_cpu (sched_wake's migration guard alone does not cover the
+    // steal path).  Running it here puts two CPUs on one kstack and scribbles
+    // its saved-register frame — exactly the corruption the on_cpu handshake
+    // exists to prevent.  Defer it back onto our rq and run idle this round;
+    // on_cpu clears within a tick (its home CPU's next do_switch), after which
+    // we pick it up cleanly.  No-op for the common case (same-CPU re-dequeue,
+    // where on_cpu was already cleared at this do_switch's entry).
+    if (next != c->idle &&
+        __atomic_load_n(&next->on_cpu, __ATOMIC_ACQUIRE)) {
+        enqueue_on(rq, next);
+        next = c->idle;
+    }
+
     task_t* prev = c->current;
     if (prev != c->idle && prev->state == TASK_RUNNING) {
         if (preempted) {
