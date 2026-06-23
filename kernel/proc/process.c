@@ -246,6 +246,10 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
 task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
+    // Drift-proof: kmalloc returns slab poison.  Zero the whole task_t so any
+    // member not explicitly initialized below defaults to 0 instead of garbage
+    // (see the exec paths' history of init drift); explicit inits override.
+    __builtin_memset(t, 0, sizeof(*t));
 
     task_mm_t* mm = task_mm_alloc(vmm_alloc_pml4(), NULL);
     if (!mm) { kfree(t); return NULL; }
@@ -276,6 +280,10 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
 task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pid) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
+    // Drift-proof: kmalloc returns slab poison.  Zero the whole task_t so any
+    // member not explicitly initialized below defaults to 0 instead of garbage
+    // (see the exec paths' history of init drift); explicit inits override.
+    __builtin_memset(t, 0, sizeof(*t));
 
     phys_addr_t pml4 = vmm_alloc_pml4();
     mm_t* mm = mm_create();
@@ -394,6 +402,10 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
                   uint64_t user_r12, uint64_t user_r13, uint64_t user_r14, uint64_t user_r15) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
+    // Drift-proof: kmalloc returns slab poison.  Zero the whole task_t so any
+    // member not explicitly initialized below defaults to 0 instead of garbage
+    // (see the exec paths' history of init drift); explicit inits override.
+    __builtin_memset(t, 0, sizeof(*t));
 
     // Fork = new process: deep-copy both mm and files.
     phys_addr_t new_pml4 = vmm_alloc_pml4();

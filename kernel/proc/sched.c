@@ -650,6 +650,8 @@ void sched_init_idle_for_cpu(uint32_t id) {
         serial_hex_dbg((uint64_t)id);
         for (;;) __asm__ volatile("cli; hlt");
     }
+    // Drift-proof: zero the slab-poison task_t so unset members default to 0.
+    __builtin_memset(idle, 0, sizeof(*idle));
     __builtin_memset(idle, 0, sizeof(*idle));
     idle->pid          = 0;
     idle->tgid         = 0;
