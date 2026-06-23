@@ -93,6 +93,14 @@ if [ "${SELFTESTS:-0}" = "1" ]; then
   echo "[build] boot self-tests ENABLED (-DMAKAOS_BOOT_SELFTESTS)"
 fi
 
+# `CONSOLE_SERIAL=1 bash build.sh` mirrors userland console output to the
+# serial port — makes headless boots diagnosable and userland program/test
+# output capturable.  Off by default (would flood the serial under a desktop).
+if [ "${CONSOLE_SERIAL:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_CONSOLE_SERIAL )
+  echo "[build] console->serial mirror ENABLED (-DMAKAOS_CONSOLE_SERIAL)"
+fi
+
 # ── User compile flags ─────────────────────────────────────────────────────
 USER_CFLAGS=(
   -ffreestanding -m64 -mno-red-zone

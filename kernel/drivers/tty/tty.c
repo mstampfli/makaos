@@ -365,6 +365,24 @@ static void console_write_char(tty_t* tty, uint8_t c) {
 // goes.  Called from tty_vfs_write when it sees tty->write_buf != NULL.
 static void console_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
     extern void fb_term_write(const char* buf, uint64_t len);
+#ifdef MAKAOS_CONSOLE_SERIAL
+    // Opt-in (CONSOLE_SERIAL=1 build): mirror userland console output to the
+    // serial port so headless boots are diagnosable and userland program/test
+    // output is capturable (e.g. POSIX conformance runs).  Default-off — it
+    // would flood the serial under a running desktop.  '\n' -> "\r\n" so a
+    // serial terminal renders cleanly.
+    {
+        extern uint64_t serial_lock_irqsave(void);
+        extern void     serial_unlock_irqrestore(uint64_t);
+        extern void     serial_raw_putc(char);
+        uint64_t _sf = serial_lock_irqsave();
+        for (uint64_t _i = 0; _i < len; _i++) {
+            if (buf[_i] == '\n') serial_raw_putc('\r');
+            serial_raw_putc((char)buf[_i]);
+        }
+        serial_unlock_irqrestore(_sf);
+    }
+#endif
     int opost_onlcr = (tty->termios.c_oflag & OPOST) &&
                       (tty->termios.c_oflag & ONLCR);
     if (!opost_onlcr) {
