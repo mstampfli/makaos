@@ -2,6 +2,11 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "cpu.h"     // g_cpus[], this_cpu(), cpu_id()
+#include "smp.h"     // spinlock_t, spin_lock_irqsave (kstack slot recycling)
+#include "panic.h"   // panic() on kernel-stack allocation failure
+#include "tlb.h"     // tlb_flush_kernel_range — recycled-slot TLB shootdown
+
+extern void kprintf_atomic(const char* fmt, ...);
 
 // ── GDT in kernel BSS ─────────────────────────────────────────────────────
 // One table shared by every CPU.  It holds the six fixed descriptors
@@ -33,9 +38,24 @@
 //     [63:32] reserved (must be 0)
 static uint64_t g_gdt[GDT_ENTRIES];
 
-// Slot counter and dynamic base for kstack_alloc.
-static uint32_t g_kstack_slots = 0;
+// ── kstack slot allocator: monotonic high-water + free-list recycling ──────
+// A kstack "slot" is a KSTACK_SLOT_SIZE (12 KiB) window in the shared kernel
+// higher half.  A naive monotonic counter that only ever increments never
+// reuses a slot, so under fork/exec churn the kstack VA region grows without
+// bound — and every new 2 MiB band it crosses leaks a fresh PT (and every
+// 1 GiB band a PD/PDPT) that kstack_free never reclaims, walking the region
+// toward neighbouring kernel mappings.  Instead we recycle: kstack_free
+// pushes the freed slot index back, kstack_alloc pops a recycled slot before
+// bumping the high-water counter.  That caps the live region (and its backing
+// page tables) at the high-water mark of *concurrent* tasks and lets a
+// recycled slot's already-built page tables be reused instead of re-created.
+// g_kstack_lock guards the counter + free stack (see docs/LOCKS.md).
+#define KSTACK_MAX_SLOTS  65536u   // hard ceiling on concurrent kstacks
+static uint32_t    g_kstack_slots = 0;        // monotonic high-water mark
 static virt_addr_t g_kstack_region_base = 0;
+static spinlock_t  g_kstack_lock = SPINLOCK_INIT;
+static uint32_t    g_kstack_free[KSTACK_MAX_SLOTS];  // recycled slot indices
+static uint32_t    g_kstack_free_count = 0;          // depth of the free stack
 
 // ── Internal: write one TSS descriptor pair pointing at &g_cpus[id].tss ─
 static void gdt_write_tss_slot(uint32_t id) {
@@ -222,6 +242,10 @@ void tss_set_rsp0(uint64_t rsp0) {
 
 // ── kstack_alloc ─────────────────────────────────────────────────────────
 virt_addr_t kstack_alloc(void) {
+    // Pick a slot under the lock: recycle a freed one, else extend the
+    // high-water mark.  The lock (not a bare atomic) is needed because the
+    // free stack and the counter must be consulted as one unit.
+    uint64_t f = spin_lock_irqsave(&g_kstack_lock);
     if (!g_kstack_region_base) {
         // Round __kernel_end up to the next 2MB boundary so we start at a
         // fresh PD entry, never overlapping the kernel image no matter its size.
@@ -229,11 +253,21 @@ virt_addr_t kstack_alloc(void) {
         g_kstack_region_base = (end + (2ULL * 1024 * 1024 - 1))
                                & ~(2ULL * 1024 * 1024 - 1);
     }
-
-    // Atomic: concurrent kstack_alloc on different CPUs would otherwise
-    // race and hand out the same VA to two tasks, silently corrupting
-    // whichever mapping lost the vmm_page_map write.
-    uint32_t slot = __atomic_fetch_add(&g_kstack_slots, 1, __ATOMIC_RELAXED);
+    uint32_t slot;
+    int recycled;
+    if (g_kstack_free_count > 0) {
+        slot = g_kstack_free[--g_kstack_free_count];   // reuse a freed slot
+        recycled = 1;
+    } else {
+        if (g_kstack_slots >= KSTACK_MAX_SLOTS) {
+            spin_unlock_irqrestore(&g_kstack_lock, f);
+            panic("kstack_alloc: slot space exhausted (%u concurrent kstacks)",
+                  (unsigned)g_kstack_slots);
+        }
+        slot = g_kstack_slots++;
+        recycled = 0;
+    }
+    spin_unlock_irqrestore(&g_kstack_lock, f);
 
     // Base of this slot's stack pages (guard page immediately below this).
     virt_addr_t stack_base = g_kstack_region_base
@@ -246,9 +280,31 @@ virt_addr_t kstack_alloc(void) {
 
     for (uint32_t i = 0; i < KSTACK_PAGES; i++) {
         phys_addr_t phys = pmm_buddy_alloc(0);
+        // A kernel stack cannot be partially mapped: if we cannot back it
+        // with real RAM, or the page-table walk fails, mapping whatever we
+        // got (a sentinel / stale value) would silently corrupt the kernel.
+        // There is no safe degraded mode for a missing kstack — panic loudly
+        // instead of running a task on garbage (this is what previously
+        // surfaced as a frame=0 DOUBLE-BUDDY-FREE in kstack_free).
+        if (phys == PMM_INVALID_ADDR)
+            panic("kstack_alloc: out of memory (slot=%u page=%u)",
+                  (unsigned)slot, (unsigned)i);
         // vmm_page_map handles intermediate table creation; VMM_KDATA = P|RW|NX
-        vmm_page_map(kpml4, stack_base + (virt_addr_t)i * PAGE_SIZE, phys, VMM_KDATA);
+        if (!vmm_page_map(kpml4, stack_base + (virt_addr_t)i * PAGE_SIZE,
+                          phys, VMM_KDATA))
+            panic("kstack_alloc: map failed (slot=%u page=%u phys=%p)",
+                  (unsigned)slot, (unsigned)i, (void*)phys);
     }
+
+    // A RECYCLED slot's VA was previously mapped to a now-freed frame and may
+    // still be cached in a remote CPU's TLB: kstack PTEs aren't global, but
+    // context_switch only reloads CR3 when the mm changes (sched.c), so a CPU
+    // that ran the prior owner — or a same-mm sibling thread — can hold a stale
+    // entry aliasing the old frame.  Shoot the range down on every CPU before
+    // the new owner runs.  Fresh (never-used) slots are pristine and skip this.
+    if (recycled)
+        tlb_flush_kernel_range(stack_base,
+                               stack_base + (virt_addr_t)KSTACK_PAGES * PAGE_SIZE);
 
     // Return the TOP (highest address + 1 byte).  Stacks grow downward.
     return stack_base + KSTACK_SIZE;
@@ -263,7 +319,27 @@ void kstack_free(virt_addr_t stack_top) {
 
     for (uint32_t i = 0; i < KSTACK_PAGES; i++) {
         phys_addr_t phys;
-        if (vmm_page_unmap(kpml4, stack_base + (virt_addr_t)i * PAGE_SIZE, &phys))
-            pmm_buddy_free(phys, 0);
+        if (vmm_page_unmap(kpml4, stack_base + (virt_addr_t)i * PAGE_SIZE, &phys)) {
+            // Never hand a reserved/invalid frame to the buddy allocator: a
+            // corrupted PTE (present bit set, address field zero) would yield
+            // phys==0 and double-free reserved low memory.  Frames below
+            // PMM_RESERVED_FRAMES are never owned by the buddy pool.
+            if (phys != 0 && (phys >> PAGE_SHIFT) >= PMM_RESERVED_FRAMES) {
+                pmm_buddy_free(phys, 0);
+            } else {
+                kprintf_atomic("[kstack] skipped bogus free phys=%p va=%p\n",
+                               (void*)phys,
+                               (void*)(stack_base + (virt_addr_t)i * PAGE_SIZE));
+            }
+        }
     }
+
+    // Recycle the slot so its VA window (and the page tables already built
+    // for it) can be reused by a later kstack_alloc.
+    uint32_t slot = (uint32_t)(((stack_base - KSTACK_GUARD_SIZE)
+                                - g_kstack_region_base) / KSTACK_SLOT_SIZE);
+    uint64_t f = spin_lock_irqsave(&g_kstack_lock);
+    if (g_kstack_free_count < KSTACK_MAX_SLOTS)
+        g_kstack_free[g_kstack_free_count++] = slot;
+    spin_unlock_irqrestore(&g_kstack_lock, f);
 }

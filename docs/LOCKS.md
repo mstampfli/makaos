@@ -216,6 +216,74 @@ not 4 096 times. This is the hot path.
 
 ---
 
+## `g_kpml4_lock` — `kernel/mm/vmm.c`
+
+**Guards:** structural mutation of the **shared kernel PML4** — the
+upper-half (PML4[256..511]) page tables every process inherits. Held
+across the `vmm_pte_get` walk + leaf-PTE write in `vmm_page_map` /
+`vmm_page_unmap`, but **only** when `pml4_phys == g_kernel_pml4`. User
+PML4 mutations skip it entirely (they are serialized by their owning
+mm's `vma_lock`), so user demand-fault / CoW scalability is unaffected.
+
+**Added:** kstack-corruption fix (this branch).
+
+**Why a lock here:**
+- User address spaces have an owner (the `mm`, with `vma_lock`); the
+  kernel PML4 has none. `kstack_alloc` / `kstack_free` mutate it from
+  every CPU on each task create/reap, and kernel-heap demand-faults map
+  into it from IRQ context. Concurrent, those walks raced: two CPUs
+  calling `vmm_pte_get(create=1)` for VAs sharing an absent intermediate
+  entry both allocate a page-table frame and one overwrites the other's
+  install — a leaked/aliased table — and the leaf writes/clears tore.
+- This surfaced as `[pmm] DOUBLE-ALLOC` + `DOUBLE-BUDDY-FREE` under
+  fork+exec churn (the kstack subsystem mutates the kernel PML4 hardest).
+
+**IRQ-safety:** `spin_lock_irqsave` — kernel-heap page faults take it
+from interrupt/trap context, so a plain `spin_lock` could self-deadlock.
+
+**Lock ordering:** `g_kpml4_lock` → `g_pmm_lock` (the walk allocates
+intermediate tables via `pmm_buddy_alloc` while held). Never the
+reverse — pmm code never maps. `g_kstack_lock` is always **released**
+before the mapping calls, so it never nests with `g_kpml4_lock`.
+
+---
+
+## `g_kstack_lock` — `kernel/arch/x86_64/tss.c`
+
+**Guards:** the kernel-stack **slot allocator** state — the monotonic
+high-water counter `g_kstack_slots` and the recycled-slot free stack
+(`g_kstack_free` / `g_kstack_free_count`). `kstack_alloc` consults the
+free stack and the counter as one unit; `kstack_free` pushes a freed
+slot back.
+
+**Added:** kstack-corruption fix (this branch).
+
+**Why a lock here (and why recycling needs it):**
+- The previous allocator only ever did `atomic_fetch_add` on the
+  counter — slots were never reused, so the kstack VA region grew
+  without bound under fork/exec churn and leaked a page-table frame per
+  new band. Recycling freed slots caps the region at the high-water of
+  *concurrent* tasks, but "pop a free slot else bump the counter" is a
+  read-modify-write across two variables — a bare atomic can't make it
+  one decision, so a short spinlock guards it.
+- The critical section is tiny (a couple of integer ops); the
+  expensive work (`pmm_buddy_alloc`, `vmm_page_map`, and the recycled-
+  slot `tlb_flush_kernel_range` shootdown) all happens **outside** the
+  lock.
+
+**IRQ-safety:** `spin_lock_irqsave` — `kstack_free` runs from the task
+reap path which may be entered with IRQs disabled.
+
+**Lock ordering:** a leaf lock — taken alone, released before any
+mapping or shootdown. Never held across `g_kpml4_lock` / `g_pmm_lock`.
+
+**Related:** a recycled slot's VA may be cached in a remote CPU's TLB
+(kstack PTEs aren't global and `context_switch` skips CR3 reload on
+same-mm switches), so `kstack_alloc` calls `tlb_flush_kernel_range`
+(an all-CPU kernel-range shootdown, `kernel/mm/tlb.c`) on reuse.
+
+---
+
 ## Planned locks (not yet added — for Phase 3–8)
 
 Each entry will be added as the phase lands, with the same justification

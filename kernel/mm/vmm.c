@@ -14,6 +14,19 @@
 // Set by vmm_init(); used by vmm_alloc_pml4() to clone kernel entries.
 static phys_addr_t g_kernel_pml4 = 0;
 
+// Serializes structural mutations of the SHARED kernel PML4 (the upper-half
+// page tables every process inherits).  User PML4s are serialized by their
+// per-mm vma_lock, but kernel-PML4 mutators have no such owner: kstack_alloc/
+// kstack_free hammer it from every CPU on each task create/reap, and IRQ-
+// context kheap demand-paging maps into it too.  Unlocked, the concurrent
+// page-table walk in vmm_page_map/vmm_page_unmap raced -> a torn PTE handed
+// the same frame to two owners / freed one frame twice ([pmm] DOUBLE-ALLOC +
+// DOUBLE-BUDDY-FREE caller=kstack_free under fork+exec churn -> userland heap
+// corruption, e.g. swaybar/pango).  IRQ-save because kheap faults take it from
+// interrupt context.  Taken ONLY for the kernel PML4, so user-fault
+// scalability (per-mm vma_lock) is unaffected.  See docs/LOCKS.md.
+static spinlock_t g_kpml4_lock = SPINLOCK_INIT;
+
 // ── Index extraction (9 bits per level) ──────────────────────────────────
 // A 64-bit canonical virtual address is split as:
 //   [63:48] sign extension (must mirror bit 47)
@@ -212,25 +225,41 @@ uint8_t vmm_page_map(phys_addr_t pml4_phys, virt_addr_t vaddr,
     uint64_t inter = PAGE_PRESENT | PAGE_WRITABLE;
     if (flags & PAGE_USER) inter |= PAGE_USER;
 
-    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 1, inter);
-    if (!pte) return 0;
+    int klock = (pml4_phys == g_kernel_pml4 && g_kernel_pml4 != 0);
+    uint64_t kf = 0;
+    if (klock) kf = spin_lock_irqsave(&g_kpml4_lock);
 
-    *pte = (paddr & PAGE_ADDR_MASK) | flags;
-    invlpg(vaddr);
-    return 1;
+    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 1, inter);
+    uint8_t ok = 0;
+    if (pte) {
+        *pte = (paddr & PAGE_ADDR_MASK) | flags;
+        invlpg(vaddr);
+        ok = 1;
+    }
+
+    if (klock) spin_unlock_irqrestore(&g_kpml4_lock, kf);
+    return ok;
 }
 
 // Unmap one 4KiB page.  Optionally returns the old physical address.
 // Does NOT free the physical frame.
 uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr,
                        phys_addr_t* out_paddr) {
-    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 0, 0);
-    if (!pte || !(*pte & PAGE_PRESENT)) return 0;
+    int klock = (pml4_phys == g_kernel_pml4 && g_kernel_pml4 != 0);
+    uint64_t kf = 0;
+    if (klock) kf = spin_lock_irqsave(&g_kpml4_lock);
 
-    if (out_paddr) *out_paddr = *pte & PAGE_ADDR_MASK;
-    *pte = 0;
-    invlpg(vaddr);
-    return 1;
+    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 0, 0);
+    uint8_t ret = 0;
+    if (pte && (*pte & PAGE_PRESENT)) {
+        if (out_paddr) *out_paddr = *pte & PAGE_ADDR_MASK;
+        *pte = 0;
+        invlpg(vaddr);
+        ret = 1;
+    }
+
+    if (klock) spin_unlock_irqrestore(&g_kpml4_lock, kf);
+    return ret;
 }
 
 phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr) {

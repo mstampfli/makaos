@@ -255,3 +255,47 @@ void tlb_flush_mm(task_mm_t* mm) {
     // end == 0 → full flush marker the receiver honours.
     tlb_flush_common(mm, 0, 0);
 }
+
+// ── tlb_flush_kernel_range ─────────────────────────────────────────────────
+//
+// Shoot down a KERNEL higher-half VA range on EVERY online CPU.  The mm-scoped
+// path above can't be used for shared kernel mappings (kstack slots, etc.):
+// those live in PML4[511], inherited by every process, so no single mm owns
+// them and any CPU may hold a stale entry.  We therefore target all CPUs
+// unconditionally rather than reading an mm cpumask.  Same descriptor / IPI /
+// ACK-wait protocol as tlb_flush_common; same SEQ_CST fence so the caller's
+// PTE teardown is globally visible before any remote CPU re-walks.
+void tlb_flush_kernel_range(uint64_t start, uint64_t end) {
+    preempt_disable();
+
+    uint32_t me  = this_cpu()->id;
+    int self_hit = 0;
+
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    tlb_flush_slot_t* my_slots = s_send_slots[me];
+    uint32_t slot_idx = 0;
+
+    for (uint32_t cpu = 0; cpu < g_num_cpus; cpu++) {
+        if (cpu == me) { self_hit = 1; continue; }
+
+        tlb_flush_slot_t* s = &my_slots[slot_idx++];
+        s->start = start;
+        s->end   = end;
+        s->done  = 0;
+        s->next  = NULL;
+        tlb_queue_push(cpu, s);
+
+        lapic_send_ipi(g_cpus[cpu].apic_id, VEC_IPI_TLB_FLUSH);
+    }
+
+    if (self_hit)
+        tlb_do_flush(start, end);
+
+    for (uint32_t i = 0; i < slot_idx; i++) {
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE))
+            cpu_relax();
+    }
+
+    preempt_enable();
+}
