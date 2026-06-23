@@ -200,10 +200,14 @@ void synchronize_rcu_expedited(void) {
 //     rcu_head_t must remain valid.  Embedding the head in the object
 //     being freed satisfies this trivially.
 
-void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
+// Lock-free push of `head` onto a SPECIFIC cpu's pending list.  The CAS
+// loop makes a cross-CPU push as safe as a local one, so rcu_barrier() can
+// place a barrier on every CPU's list (not just the local one).  One shared
+// mechanism; call_rcu_head is just this with c = this_cpu().
+static void rcu_push_on_cpu(cpu_t* c, rcu_head_t* head,
+                            rcu_func_t func, void* data) {
     head->func = func;
     head->data = data;
-    cpu_t* c = this_cpu();
     rcu_head_t* old = (rcu_head_t*)__atomic_load_n(&c->rcu_pending_head,
                                                     __ATOMIC_RELAXED);
     do {
@@ -214,6 +218,10 @@ void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
                  0,
                  __ATOMIC_RELEASE,
                  __ATOMIC_RELAXED));
+}
+
+void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
+    rcu_push_on_cpu(this_cpu(), head, func, data);
 }
 
 // Layout compatibility check: pmm.h declares a bit-identical
@@ -274,11 +282,23 @@ static void rcu_gp_kthread_entry(void) {
                 NULL,
                 __ATOMIC_ACQUIRE);
             if (!cpu_chain) continue;
-            // Append cpu_chain to collected — find tail, link.
-            rcu_head_t* tail = cpu_chain;
+            // The per-CPU list is a LIFO push-stack (call_rcu_head prepends).
+            // Reverse it to FIFO order (oldest first) so callbacks fire in
+            // the order they were queued ON THAT CPU.  rcu_barrier() relies
+            // on this: its per-CPU barrier, pushed last, must be invoked
+            // LAST for that CPU — after every callback queued before it.
+            rcu_head_t* fifo = NULL;
+            while (cpu_chain) {
+                rcu_head_t* nx = cpu_chain->next;
+                cpu_chain->next = fifo;
+                fifo = cpu_chain;
+                cpu_chain = nx;
+            }
+            // Append this CPU's FIFO chain to collected (find tail, link).
+            rcu_head_t* tail = fifo;
             while (tail->next) tail = tail->next;
             tail->next = collected;
-            collected  = cpu_chain;
+            collected  = fifo;
         }
 
         if (collected) {
@@ -346,27 +366,22 @@ void rcu_barrier(void) {
     rcu_barrier_t    barriers[MAX_CPUS];
     volatile uint32_t done = 0;
 
-    // Push one barrier onto each CPU's pending list.  We can't easily
-    // target a specific remote CPU's pending head from here (our
-    // this_cpu() reflects wherever we happen to be running), so all
-    // N pushes land on our local CPU.  That's still correct: the GP
-    // kthread drains EVERY CPU's list each pass and preserves the
-    // per-CPU FIFO within a batch — so by the time all N barriers
-    // have fired, every callback queued before rcu_barrier() on the
-    // same CPU has also fired.  Cross-CPU ordering is handled by
-    // synchronize_rcu() implicitly: the GP kthread only invokes
-    // callbacks AFTER a grace period elapses, during which every
-    // pre-barrier call_rcu_head must have landed somewhere.
+    // Push one barrier onto EACH CPU's pending list (rcu_push_on_cpu's CAS
+    // makes the cross-CPU push safe).  Combined with the GP kthread's
+    // per-CPU FIFO invocation, CPU i's barrier is invoked after every
+    // callback that was queued on CPU i before rcu_barrier() ran.  So once
+    // all N barriers have fired, every pre-barrier callback on every CPU has
+    // also fired — the correct rcu_barrier guarantee.
     //
-    // To explicitly guarantee coverage of callbacks on other CPUs
-    // (which may have been enqueued after the GP kthread's last
-    // snapshot), we queue one barrier per CPU and trust the GP
-    // kthread to batch-drain everyone.  A simpler N-barriers-on-one-
-    // CPU design works because the synchronize_rcu inside the
-    // kthread waits for ALL CPUs' outstanding readers.
+    // The earlier design pushed all N barriers on the LOCAL CPU, which only
+    // ordered against local-CPU callbacks: a callback queued on a different
+    // CPU (e.g. a typesafe slab free from pmm_slab_shrink_all_locked running
+    // elsewhere) could still be pending when rcu_barrier() returned, an
+    // intermittent use-after-reclaim (caught as is_slab_ptr=1 after barrier).
     for (unsigned i = 0; i < n; i++) {
         barriers[i].done_count = &done;
-        call_rcu_head(&barriers[i].head, rcu_barrier_cb, &barriers[i]);
+        rcu_push_on_cpu(&g_cpus[i], &barriers[i].head,
+                        rcu_barrier_cb, &barriers[i]);
     }
 
     while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < n) {
