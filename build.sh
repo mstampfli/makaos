@@ -350,6 +350,10 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_smp_test.o" \
    -o "$BUILD_DIR/user_smp_test.elf"
 
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/heapalias/heapalias.c" -o "$BUILD_DIR/user_heapalias.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_heapalias.o" \
+   -o "$BUILD_DIR/user_heapalias.elf"
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
@@ -799,6 +803,10 @@ fi
 if [ -f "$BUILD_DIR/user_smp_test.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_smp_test.elf" bin/smp_test
     echo "[+] smp_test ELF installed at bin/smp_test (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_heapalias.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_heapalias.elf" bin/heapalias
+    echo "[+] heapalias ELF installed at bin/heapalias (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
