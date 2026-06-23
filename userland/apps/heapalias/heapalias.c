@@ -24,6 +24,16 @@
 #define NCHURN  8             // 2x CPUs -> heavy concurrent exec teardown
 #define CITERS  900           // fork+exec cycles per churner
 
+// Serial-visible verdict markers.  heapalias' stdout does NOT reach the serial
+// log, so the PASS/CORRUPT result was invisible to the headless harness.  The
+// kernel logs a stat() of any non-existent /usr/... path as
+// "[stat-dbg] <path> -> -2" (syscall.c), so probe a marker path to surface a
+// result.  HAMARKN encodes a runtime value (e.g. the foreign word read).
+#define HAMARK(s)  do { struct stat _hs; (void)stat("/usr/HA_" s, &_hs); } while (0)
+#define HAMARKN(pfx, n) do { char _hp[64]; struct stat _hs; \
+    snprintf(_hp, sizeof _hp, "/usr/HA_" pfx "_%lx", (unsigned long)(n)); \
+    (void)stat(_hp, &_hs); } while (0)
+
 static int verify_worker(void) {
     unsigned long pid = (unsigned long)getpid();
     unsigned int  pat = 0xC0DE0000u | (unsigned int)(pid & 0xFFFFu);
@@ -35,6 +45,9 @@ static int verify_worker(void) {
     for (int it = 0; it < WITERS; it++) {
         for (int i = 0; i < WORDS; i++) {
             if (buf[i] != pat) {
+                HAMARK("CORRUPT");
+                HAMARKN("got", buf[i]);
+                HAMARKN("want", pat);
                 printf("[heapalias] CORRUPT worker pid=%lu it=%d off=%d got=%08x want=%08x\n",
                        pid, it, i, buf[i], pat);
                 return 1;
@@ -72,6 +85,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    HAMARK("start");
     printf("[heapalias] start: %d workers + %d exec-churners (%d execs each)\n",
            NWORKER, NCHURN, CITERS);
 
@@ -88,6 +102,7 @@ int main(int argc, char** argv) {
     }
     for (int k = 0; k < n; k++) { int st = 0; wait(&st); }
 
+    HAMARK("PASS");
     printf("[heapalias] PASS (no aliasing; workers + exec-churn)\n");
     return 0;
 }
