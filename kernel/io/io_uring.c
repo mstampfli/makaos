@@ -85,18 +85,36 @@ void io_uring_close_file(struct vfs_file_t* f) {
     if (!f) return;
     io_uring_t* uring = (io_uring_t*)f->ctx;
     if (uring) {
-        // Phase 8E: stop the worker.  Set worker_stop then wake so
-        // the worker exits its wait loop and transitions to TASK_DEAD.
-        // We do NOT wait for the worker here — it'll reap itself via
-        // the scheduler's normal zombie path.
-        if (uring->worker) {
+        // Phase 8E/8F: stop AND JOIN the worker + SQPOLL kthreads before
+        // we free anything.  Both kthreads dereference `uring` (the Treiber
+        // queue, the SQ/CQ ring, owner_task, the backing pages) right up
+        // until they observe their stop flag and exit.  Freeing `uring` or
+        // pmm_buddy_free()ing the backing while a kthread is still draining
+        // is a use-after-free: the freed slab/pages get reused (commonly as
+        // page tables or another task_mm_t), and the dangling kthread then
+        // walks a garbage work-chain / reads a poisoned descriptor — which
+        // surfaced as a non-deterministic #PF/#GP on a corrupt mm_shared in
+        // do_switch / the page-fault handler under the io_uring bench.
+        //
+        // Each kthread publishes *_done as its LAST act before TASK_DEAD, so
+        // once we observe it set, the kthread provably touches `uring` no
+        // more and it is safe to free.  We re-wake every spin to close the
+        // park-after-stop lost-wakeup window, and sched_yield so the kthread
+        // (typically on another CPU) makes progress.  close()/task-exit both
+        // run in process context, so yielding here is safe.
+        if (uring->worker)
             __atomic_store_n(&uring->worker_stop, 1u, __ATOMIC_RELEASE);
-            wait_queue_wake_all(&uring->wq_waitq);
-        }
-        // Phase 8F: stop the SQPOLL kthread similarly.
-        if (uring->sqp_task) {
+        if (uring->sqp_task)
             __atomic_store_n(&uring->sqp_stop, 1u, __ATOMIC_RELEASE);
+        while (uring->worker &&
+               !__atomic_load_n(&uring->worker_done, __ATOMIC_ACQUIRE)) {
+            wait_queue_wake_all(&uring->wq_waitq);
+            sched_yield();
+        }
+        while (uring->sqp_task &&
+               !__atomic_load_n(&uring->sqp_done, __ATOMIC_ACQUIRE)) {
             wait_queue_wake_all(&uring->sqp_waitq);
+            sched_yield();
         }
         // Phase 8G: release fixed files.
         if (uring->fixed_files) {
@@ -105,12 +123,42 @@ void io_uring_close_file(struct vfs_file_t* f) {
             kfree(uring->fixed_files);
             uring->fixed_files = NULL;
         }
-        // Free backing pages.  The user mapping will have been torn
-        // down already by task exit (task_mm_release walks all VMAs).
-        // We only own the phys pages here.
+        // ── Unmap the backing from the owner's address space BEFORE we
+        // return its physical pages to the buddy allocator.  On an explicit
+        // close(2) — the common case — the user VMA is still live (it is
+        // only auto-torn-down at task exit).  Freeing the pages first lets
+        // the buddy re-hand them out (as a kstack, page table, or a fresh
+        // ring's backing) while the stale user mapping still aliases them:
+        // a use-after-free that scribbles the reused victim.  io_uring_create
+        // even memset()s a freshly allocated backing to zero — so a reused
+        // page that is now a live kstack gets a saved register zeroed, which
+        // surfaced as a NULL cpu_t in do_switch (and as a poisoned task_mm_t).
+        //
+        // We can only touch the mapping from the owning address space.
+        // close(2) and task-exit fd cleanup both run in it (g_current's mm is
+        // the one the ring was created in), which covers every real caller.
+        // If some other AS closes an inherited ring fd we skip the unmap and
+        // leak the mapping rather than risk freeing live, aliased pages.
+        uint64_t npg = uring->backing_bytes >> PAGE_SHIFT;
+        if (uring->user_vaddr && uring->owner_mm && g_current &&
+            g_current->mm_shared &&
+            g_current->mm_shared->mm == uring->owner_mm) {
+            extern uint8_t mm_vma_remove(struct mm_t*, uint64_t, uint64_t);
+            extern void tlb_flush_range(task_mm_t*, uint64_t, uint64_t);
+            phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+            for (uint64_t i = 0; i < npg; i++) {
+                phys_addr_t fr = 0;
+                vmm_page_unmap(pml4, uring->user_vaddr + i * PAGE_SIZE, &fr);
+            }
+            mm_vma_remove(uring->owner_mm, uring->user_vaddr,
+                          uring->user_vaddr + uring->backing_bytes);
+            tlb_flush_range(g_current->mm_shared, uring->user_vaddr,
+                            uring->user_vaddr + uring->backing_bytes);
+            uring->user_vaddr = 0;
+        }
+        // Now that no mapping aliases them, return the backing pages.
         uint8_t order = 0;
-        uint64_t pages = uring->backing_bytes >> PAGE_SHIFT;
-        while ((1ULL << order) < pages) order++;
+        while ((1ULL << order) < npg) order++;
         pmm_buddy_free(uring->backing_phys, order);
         kfree(uring);
     }
@@ -160,8 +208,10 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
     uring->worker = NULL;
     uring->wq_head = NULL;
     uring->worker_stop = 0;
+    uring->worker_done = 0;
     uring->sqp_task = NULL;
     uring->sqp_stop = 0;
+    uring->sqp_done = 0;
     uring->sqp_idle_ms = kparams->sq_thread_idle ? kparams->sq_thread_idle : 1000;
     uring->fixed_files    = NULL;
     uring->fixed_files_nr = 0;
@@ -482,6 +532,9 @@ static void io_sqp_kthread_entry(void) {
 
     for (;;) {
         if (__atomic_load_n(&uring->sqp_stop, __ATOMIC_ACQUIRE)) {
+            // Last touch of `uring`: publish done so io_uring_close_file can
+            // safely free it (see the join in io_uring_close_file).
+            __atomic_store_n(&uring->sqp_done, 1u, __ATOMIC_RELEASE);
             g_current->state = TASK_DEAD;
             sched_yield();
             return;
@@ -610,6 +663,9 @@ static void io_wq_worker_entry(void) {
 
         if (!chain) {
             if (__atomic_load_n(&uring->worker_stop, __ATOMIC_ACQUIRE)) {
+                // Last touch of `uring`: publish done so io_uring_close_file
+                // can safely free it (see the join in io_uring_close_file).
+                __atomic_store_n(&uring->worker_done, 1u, __ATOMIC_RELEASE);
                 g_current->state = TASK_DEAD;
                 sched_yield();
                 return;

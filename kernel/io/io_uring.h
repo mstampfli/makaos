@@ -183,6 +183,7 @@ typedef struct io_uring {
     struct io_wq_work* volatile wq_head;  // pending work (Treiber)
     wait_queue_t           wq_waitq;    // worker sleeps here when head==NULL
     volatile uint32_t      worker_stop; // set on ring close
+    volatile uint32_t      worker_done; // worker's last write before TASK_DEAD
 
     // ── Phase 8F: SQPOLL kthread ───────────────────────────────
     // When IORING_SETUP_SQPOLL was requested, a dedicated poller
@@ -195,6 +196,7 @@ typedef struct io_uring {
     wait_queue_t      sqp_waitq;
     volatile uint32_t sqp_idle_ms;     // sq_thread_idle
     volatile uint32_t sqp_stop;
+    volatile uint32_t sqp_done;        // poller's last write before TASK_DEAD
 
     // ── Phase 8G: fixed files ──────────────────────────────────
     // User registers an array of fds once; subsequent SQEs with
