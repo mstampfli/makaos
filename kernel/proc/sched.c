@@ -1185,6 +1185,19 @@ static void do_switch(uint8_t preempted) {
     cpu_rq_t* rq = &c->rq;
     task_t*   next;
 
+    // on_cpu handshake (clear side): the task this CPU switched away from in
+    // the PREVIOUS do_switch is, by now, fully off its kstack (its context_
+    // switch completed before this CPU could re-enter do_switch).  Clear its
+    // on_cpu with RELEASE so a remote sched_wake that observes on_cpu==0 also
+    // observes the task's fully-saved context before migrating it.  Doing it
+    // here (rather than just after context_switch) also covers tasks whose
+    // successor resumed via a trampoline (first run) instead of returning
+    // into do_switch.  RELAXED read: only this CPU writes switching_from.
+    {
+        task_t* so = c->switching_from;
+        if (so) __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+    }
+
     // ── Deferred preemption for mid-exit tasks ──────────────────────────
     //
     // A preempted (timer-triggered) switch MUST NOT yank a task off its
@@ -1278,6 +1291,13 @@ static void do_switch(uint8_t preempted) {
 
     next->state = TASK_RUNNING;
     c->current  = next;     // g_current expands to this via the sched.h macro
+    // on_cpu handshake: mark the incoming task as on-CPU before the switch,
+    // and record the outgoing task so the incoming task can clear ITS on_cpu
+    // immediately after the switch completes (see below + sched_wake).  This
+    // is what lets sched_wake tell "SLEEPING but still on its kstack" apart
+    // from "fully switched out and safe to migrate".
+    __atomic_store_n(&next->on_cpu, 1u, __ATOMIC_RELAXED);
+    c->switching_from = prev;
     // Cache-affinity hint: remember where this task last ran so
     // sched_wake can route future wakes to the same CPU.  Plain
     // store — only the owning CPU reads this value with a relaxed
@@ -1472,6 +1492,19 @@ void sched_wake(task_t* proc) {
     // locally or drop the lock and re-acquire target's.
     cpu_t* target = home;
     unsigned n = num_cpus();
+    // ── on_cpu handshake (SMP correctness) ────────────────────────────────
+    // A task that called sched_sleep has set state=SLEEPING and dropped its
+    // rq_lock, but it is STILL executing on its CPU until its context_switch
+    // finishes (c->current is already advanced, but rsp is still on the
+    // sleeper's kstack).  If we migrate it to another CPU's runqueue here,
+    // that CPU can context_switch INTO it and run on its kstack while the
+    // original CPU is still using the same kstack — two CPUs on one stack,
+    // which scribbles the saved register frame (seen as garbage prev/c in
+    // do_switch).  on_cpu stays 1 across that window (cleared only AFTER the
+    // switch completes), so if it's still set, keep the task on its home CPU
+    // (same-CPU re-enqueue is serialized and safe); only migrate once it is
+    // provably off-CPU.
+    if (__atomic_load_n(&proc->on_cpu, __ATOMIC_ACQUIRE)) n = 0;
     if (n >= 2) {
         uint32_t home_load = __atomic_load_n(&home->rq.nr_running,
                                                __ATOMIC_RELAXED);

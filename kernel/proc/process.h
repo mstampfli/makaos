@@ -196,6 +196,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     // consumed by sched_sleep.
     uint8_t       wake_pending;
 
+    // SMP on_cpu handshake: 1 while this task is executing on a CPU (set on
+    // the incoming task just before context_switch, cleared on the outgoing
+    // task just after).  sched_wake reads it to avoid migrating a task that
+    // has gone SLEEPING but not yet finished switching off its kstack — see
+    // the handshake comment in sched_wake.  Accessed with atomics across CPUs.
+    volatile uint8_t on_cpu;
+
     // Persistent wait entry — lives in the task struct instead of the
     // caller's stack frame so a drain firing AFTER sched_sleep returned
     // via wake_pending (from an unrelated sched_wake: signal delivery,

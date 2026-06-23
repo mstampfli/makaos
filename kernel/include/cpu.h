@@ -112,6 +112,10 @@ typedef struct cpu_t {
     // Scheduling.
     struct task_t*  current;            // task currently executing
     struct task_t*  idle;               // this CPU's idle task
+    struct task_t*  switching_from;     // task being switched away from across
+                                        // the current context_switch; the
+                                        // incoming task clears its on_cpu flag
+                                        // (set before the switch, read after).
     cpu_rq_t        rq;                 // run queue / sleep list / zombie list
     spinlock_t      rq_lock;            // protects rq state; IRQ-safe
 
