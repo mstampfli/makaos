@@ -448,6 +448,14 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     // Allocate task + shared resources.
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+    // Zero the freshly slab-allocated task_t up front.  kmalloc returns slab
+    // poison, and these exec paths have historically drifted from process.c's
+    // field-by-field init, leaving members as garbage (sigstate.handlers ->
+    // force-kill; cleartid_addr -> wild futex write on exit; fs_base /
+    // wake_pending / pf_disk / pf_cache).  Zeroing first makes any member not
+    // explicitly set below default to 0; the explicit non-zero inits (mm,
+    // files, pledge, ctx, ...) still run after and override.  Drift-proof.
+    __builtin_memset(t, 0, sizeof(*t));
 
     task_mm_t* tmm = task_mm_alloc(pml4, mm);
     if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
@@ -574,6 +582,14 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
     // Allocate task + shared resources (same as elf_load).
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+    // Zero the freshly slab-allocated task_t up front.  kmalloc returns slab
+    // poison, and these exec paths have historically drifted from process.c's
+    // field-by-field init, leaving members as garbage (sigstate.handlers ->
+    // force-kill; cleartid_addr -> wild futex write on exit; fs_base /
+    // wake_pending / pf_disk / pf_cache).  Zeroing first makes any member not
+    // explicitly set below default to 0; the explicit non-zero inits (mm,
+    // files, pledge, ctx, ...) still run after and override.  Drift-proof.
+    __builtin_memset(t, 0, sizeof(*t));
 
     task_mm_t* tmm = task_mm_alloc(pml4, mm);
     if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
