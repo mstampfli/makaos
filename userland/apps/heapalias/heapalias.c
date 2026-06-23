@@ -19,10 +19,10 @@
 #include "libc.h"
 
 #define WORDS   (64 * 1024)   // 256 KB region per worker
-#define WITERS  4000          // verify passes per worker (long-lived)
-#define NWORKER 4
-#define NCHURN  4
-#define CITERS  400           // fork+exec cycles per churner
+#define WITERS  3000          // verify passes per worker (long-lived)
+#define NWORKER 2
+#define NCHURN  8             // 2x CPUs -> heavy concurrent exec teardown
+#define CITERS  900           // fork+exec cycles per churner
 
 static int verify_worker(void) {
     unsigned long pid = (unsigned long)getpid();
@@ -63,7 +63,14 @@ static int churn_exec(void) {
 
 int main(int argc, char** argv) {
     (void)argv;
-    if (argc > 1) return 0;   // exec-target mode: silent immediate exit
+    if (argc > 1) {
+        // exec-target mode: fault in a real heap (so exec/exit teardown has
+        // actual page-table + leaf frames to free -> stresses the double-free
+        // path), touch it, then exit silently.
+        volatile unsigned char* p = (volatile unsigned char*)malloc(64 * 1024);
+        if (p) { for (int i = 0; i < 64 * 1024; i += 4096) p[i] = (unsigned char)i; }
+        return 0;
+    }
 
     printf("[heapalias] start: %d workers + %d exec-churners (%d execs each)\n",
            NWORKER, NCHURN, CITERS);

@@ -27,6 +27,12 @@
 // critical section — it would self-deadlock.
 static spinlock_t g_pmm_lock = SPINLOCK_INIT;
 
+// The corruption detectors below (DOUBLE-ALLOC / DOUBLE-BUDDY-FREE /
+// REF-INC-ON-FREE) emit via kprintf_atomic, which holds the serial lock for
+// the whole line so the frame=/caller= fields stay contiguous even while four
+// CPUs flood the UART with per-char kprintf ([elf]/[pf]/[socket-dbg]) noise.
+extern void kprintf_atomic(const char* fmt, ...);
+
 // Forward declarations for _locked internals so init code can call them
 // without going through the public lock-taking wrappers.
 static phys_addr_t pmm_buddy_alloc_locked(uint8_t order);
@@ -539,9 +545,9 @@ static void pmm_mark_allocated(phys_addr_t phys, uint8_t order) {
         uint32_t prev = __atomic_exchange_n(&g_frame_refcount[fi + k], 1,
                                              __ATOMIC_ACQ_REL);
         if (prev != 0) {
-            extern void kprintf(const char* fmt, ...);
-            kprintf("[pmm] DOUBLE-ALLOC frame=%p rc=%u order=%u\n",
-                    (void*)(phys + k * 4096), (unsigned)prev, (unsigned)order);
+            kprintf_atomic("[pmm] DOUBLE-ALLOC frame=%p rc=%u order=%u caller=%p\n",
+                    (void*)(phys + k * 4096), (unsigned)prev, (unsigned)order,
+                    __builtin_return_address(0));
         }
     }
 }
@@ -738,6 +744,19 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
 }
 
 void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
+  // DOUBLE-FREE tripwire: the public free is used for page-table frames and
+  // explicit alloc-cleanup, which all carry rc==1 while live (leaf frees go
+  // through pmm_ref_dec, not here).  rc==0 here means the frame was already
+  // freed -- a double pmm_buddy_free.  caller= points at the offending free
+  // site (e.g. vmm_free_user_ex's PT/PD/PDPT frees).
+  {
+    uint64_t _fi = addr >> PAGE_SHIFT;
+    if (_fi < g_total_frames &&
+        __atomic_load_n(&g_frame_refcount[_fi], __ATOMIC_RELAXED) == 0) {
+      kprintf_atomic("[pmm] DOUBLE-BUDDY-FREE frame=%p order=%u caller=%p\n",
+              (void*)addr, (unsigned)order, __builtin_return_address(0));
+    }
+  }
   // Phase 4E: order-0 hits the per-CPU pcp push.
   if (order == 0) {
     extern void pcp_free(phys_addr_t);
@@ -1337,8 +1356,7 @@ void pmm_ref_inc(phys_addr_t addr) {
     // at the inc, where the caller's return address points straight at
     // the offending site.
     if (g_frame_refcount[fi] == 0) {
-        extern void kprintf(const char* fmt, ...);
-        kprintf("[pmm] REF-INC-ON-FREE frame=%p caller=%p\n",
+        kprintf_atomic("[pmm] REF-INC-ON-FREE frame=%p caller=%p\n",
                 (void*)addr, __builtin_return_address(0));
     }
     g_frame_refcount[fi]++;
