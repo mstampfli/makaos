@@ -444,6 +444,14 @@ static void init_kthread(void) {
     extern void copy_user_selftest(void);
     copy_user_selftest();
 
+    // Audit fix: sys_mmap/sys_munmap page-rounded user len with a wrapping add
+    // and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
+    // munmap) at a higher-half address drove the unmap+free path through the
+    // shared kernel/HHDM page tables -> live-kernel-frame free / LPE.  Verify
+    // the overflow-safe range helpers reject the wrap + escape cases.
+    extern void mmap_range_selftest(void);
+    mmap_range_selftest();
+
     // Audit fix: ext2_readdir read a dirent's name_len without bounding it to
     // the block, so a corrupt dirent could over-read past the bcache slot.
     // Verify the clamp keeps the name within block bounds.

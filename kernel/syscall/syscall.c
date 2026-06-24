@@ -107,6 +107,44 @@ static inline int _access_ok(uint64_t addr, uint64_t len);
 int copy_to_user(void* dst_u, const void* src, uint64_t len);
 int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
+// ── mmap_round_len / mmap_range_ok ────────────────────────────────────────
+// Overflow-safe primitives for the user-controlled (addr, len) of the VMA
+// range syscalls (mmap / munmap / MAP_FIXED replace).  WITHOUT them, the
+// page-rounding `len = (len + PAGE_MASK) & ~PAGE_MASK` wraps to 0 (or a tiny
+// value) for len > UINT64_MAX - PAGE_MASK, and `addr + len` walks past the
+// canonical user ceiling — letting a MAP_FIXED at a higher-half address drive
+// mm_unmap_range_flush_free into the kernel/HHDM page tables (PML4[256..511]
+// are shared into every process), where it would unmap a live kernel PTE and
+// pmm_ref_dec a live kernel frame → kernel memory corruption / LPE.
+//
+// mmap_round_len: round `len_in` up to a whole number of pages, rejecting the
+// wrapping add.  Returns the rounded length, or 0 if zero/overflowing (callers
+// treat 0 as EINVAL).  Single source of truth for the rounding — both the
+// addr==0 "kernel picks" mmap path and the addr-present path round through it.
+static inline uint64_t mmap_round_len(uint64_t len_in) {
+    if (!len_in) return 0;
+    if (len_in > UINT64_MAX - PAGE_MASK) return 0;   // guard before the wrap
+    return (len_in + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+}
+
+// mmap_range_ok: validate that an EXPLICIT user range [addr, addr+rounded_len)
+// is page-aligned and lies strictly in the user half.  On success writes the
+// rounded length to *out_len and the EXCLUSIVE end to *out_end.  NULL / kernel
+// / non-canonical addr and any wrap are rejected via the shared _access_ok
+// predicate.  Use only when `addr` is caller-supplied (MAP_FIXED, addr hint,
+// munmap) — not the addr==0 path, which _access_ok rejects by design.  Pure
+// (no globals) → unit-testable.  Returns 1 if valid, 0 otherwise.
+static inline int mmap_range_ok(uint64_t addr, uint64_t len_in,
+                                uint64_t* out_len, uint64_t* out_end) {
+    uint64_t len = mmap_round_len(len_in);
+    if (!len) return 0;
+    if (addr & PAGE_MASK) return 0;           // explicit addr must be page-aligned
+    if (!_access_ok(addr, len)) return 0;     // NULL/kernel/non-canonical/overflow
+    if (out_len) *out_len = len;
+    if (out_end) *out_end = addr + len;       // no wrap: guaranteed by _access_ok
+    return 1;
+}
+
 // ── MSR helpers ───────────────────────────────────────────────────────────
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
@@ -2061,13 +2099,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 
     mm_t* mm = g_current->mm_shared->mm;
 
-    // Round len up to page boundary.
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    // Round len up to page boundary (overflow-safe; rejects a len that would
+    // wrap the page-rounding add to 0).
+    len = mmap_round_len(len);
+    if (!len) return (uint64_t)-EINVAL;
     uint32_t npages = (uint32_t)(len / PAGE_SIZE);
 
     virt_addr_t vaddr;
     if (flags & MAP_FIXED) {
-        if (!addr || (addr & PAGE_MASK)) return (uint64_t)-EINVAL;
+        // MAP_FIXED maps EXACTLY at addr: the whole [addr, addr+len) range
+        // must be page-aligned and inside the user half.  Without this an
+        // addr in the kernel/HHDM higher half (shared into every process's
+        // PML4[256..511]) would drive the unmap+free path below straight
+        // through live kernel page tables.
+        if (!mmap_range_ok(addr, len, NULL, NULL)) return (uint64_t)-EINVAL;
         phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
         // MAP_FIXED replaces any existing mapping in [addr, addr+len) —
         // unmap → cross-CPU flush → free, same ordering as munmap.  The
@@ -2076,13 +2121,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         mm_vma_remove(mm, addr, addr + len);
         vaddr = addr;
     } else if (addr) {
+        // Non-fixed addr is a HINT.  Honour it only if [addr, addr+len) is a
+        // valid, unmapped user-half range; otherwise fall back to a
+        // kernel-chosen placement.  A kernel/non-canonical hint must never
+        // become `vaddr` (it would install a user VMA over the shared higher
+        // half), so reject it here and let mm_vma_find_free pick instead.
         addr &= ~PAGE_MASK;
-        uint8_t free_hint = 1;
-        rcu_read_lock();
-        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
-            if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
+        uint8_t free_hint = mmap_range_ok(addr, len, NULL, NULL);
+        if (free_hint) {
+            rcu_read_lock();
+            for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
+                if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
+            }
+            rcu_read_unlock();
         }
-        rcu_read_unlock();
         vaddr = free_hint ? addr : mm_vma_find_free(mm, len);
     } else {
         vaddr = mm_vma_find_free(mm, len);
@@ -2303,10 +2355,14 @@ fail_unmap:
 // ── sys_munmap ────────────────────────────────────────────────────────────
 static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
-    if (!addr || (addr & PAGE_MASK))              return (uint64_t)-EINVAL;
-    if (!len)                                     return (uint64_t)-EINVAL;
 
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    // Validate + page-round the user range in one overflow-safe step.  This
+    // rejects a misaligned/NULL addr, a len that overflows page-rounding, and
+    // — critically — any [addr, addr+len) that escapes the user half, so an
+    // unmap can never walk the shared kernel/HHDM page tables and free a live
+    // kernel frame.
+    uint64_t end;
+    if (!mmap_range_ok(addr, len, &len, &end)) return (uint64_t)-EINVAL;
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
     mm_t* mm = g_current->mm_shared->mm;
 
@@ -2315,10 +2371,10 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     // held one ref — dropping it lets the frame free once the shmem
     // object and every other mapper have also released it.
     // unmap → cross-CPU flush → free (see mm_unmap_range_flush_free).
-    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, addr + len);
+    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, end);
 
     // Remove VMA descriptors covering the range (this also unrefs shmem).
-    mm_vma_remove(mm, addr, addr + len);
+    mm_vma_remove(mm, addr, end);
     return 0;
 }
 
@@ -3106,6 +3162,61 @@ void copy_user_selftest(void) {
     }
     kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
                   : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
+}
+
+// Audit fix: sys_mmap/sys_munmap page-rounded a user `len` with a wrapping
+// add and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
+// munmap) at a higher-half address drove the unmap+free path through the
+// shared kernel/HHDM page tables → live-kernel-frame free / LPE.  Verify the
+// pure helpers reject the wrap + escape cases and accept legal ranges.
+void mmap_range_selftest(void) {
+    kprintf("[mmap_range_test] mmap_round_len + mmap_range_ok must reject overflow/escape\n");
+    int fails = 0;
+
+    // mmap_round_len: zero and page-rounding-overflow must return 0; legal
+    // lengths round up to a page multiple.
+    if (mmap_round_len(0) != 0) {
+        kprintf("[mmap_range_test] FAIL: round_len(0) accepted\n"); fails++; }
+    if (mmap_round_len(UINT64_MAX) != 0) {
+        kprintf("[mmap_range_test] FAIL: round_len(UINT64_MAX) wrapped instead of 0\n"); fails++; }
+    if (mmap_round_len(UINT64_MAX - PAGE_MASK + 1) != 0) {
+        kprintf("[mmap_range_test] FAIL: round_len(just-overflowing) accepted\n"); fails++; }
+    if (mmap_round_len(1) != PAGE_SIZE) {
+        kprintf("[mmap_range_test] FAIL: round_len(1) != PAGE_SIZE\n"); fails++; }
+    if (mmap_round_len(PAGE_SIZE) != PAGE_SIZE) {
+        kprintf("[mmap_range_test] FAIL: round_len(PAGE_SIZE) changed it\n"); fails++; }
+    if (mmap_round_len(PAGE_SIZE + 1) != 2 * PAGE_SIZE) {
+        kprintf("[mmap_range_test] FAIL: round_len(PAGE_SIZE+1) != 2 pages\n"); fails++; }
+
+    // mmap_range_ok: every escape/overflow case must be rejected (0).
+    static const struct { uint64_t addr, len; } bad[] = {
+        { 0ULL,                          PAGE_SIZE },   // NULL addr
+        { 0xFFFF800000000000ULL,         PAGE_SIZE },   // kernel higher half (the LPE)
+        { 0x0000800000000000ULL,         PAGE_SIZE },   // first non-canonical page
+        { 0xDEAD000000000000ULL,         PAGE_SIZE },   // non-canonical scribble
+        { 0x0000000000401000ULL,         UINT64_MAX },  // len overflows page-round
+        { USER_ADDR_MAX & ~PAGE_MASK,    2 * PAGE_SIZE},// end spills past the ceiling
+        { 0x0000000000401001ULL,         PAGE_SIZE },   // misaligned addr
+    };
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        if (mmap_range_ok(bad[i].addr, bad[i].len, NULL, NULL)) {
+            kprintf("[mmap_range_test] FAIL: range_ok accepted addr=0x%lx len=0x%lx\n",
+                    (unsigned long)bad[i].addr, (unsigned long)bad[i].len);
+            fails++;
+        }
+    }
+
+    // A legal user mapping must be accepted with the rounded len + exclusive end.
+    {
+        uint64_t olen = 0, oend = 0;
+        uint64_t a = 0x0000000040000000ULL;   // 1GiB, well inside the user half
+        if (!mmap_range_ok(a, PAGE_SIZE + 1, &olen, &oend) ||
+            olen != 2 * PAGE_SIZE || oend != a + 2 * PAGE_SIZE) {
+            kprintf("[mmap_range_test] FAIL: rejected/miscomputed a legal range\n"); fails++; }
+    }
+
+    kprintf(fails ? "[mmap_range_test] SELF-TEST FAILED\n"
+                  : "[mmap_range_test] SELF-TEST PASSED (mmap/munmap range overflow + higher-half escape rejected)\n");
 }
 #endif
 

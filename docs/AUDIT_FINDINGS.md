@@ -366,3 +366,79 @@ cleanliness one (sys_select) this pass; the other four are the refreshed backlog
   (1920x1080 -> pitch 7680 size 8294400; 1x1; MAX x MAX -> 65536 / 2^30; 0x40000000
   & 0x40000001 -> -EINVAL [the overflow rows]; zero w/h; bpp 24; MAX+1 -> -EINVAL).
   Boot still fork-execs /bin/login and the compositor create_dumb path works.
+
+## FOURTH AUDIT PASS (5-agent fan-out, 2026-06-25) — backlog refill
+
+Fan-out over futex, mmap/VMA, pipe+fd-table, signal/sigreturn, and
+storage-queue/allocator. Signal/sigreturn was audited and found CORRECTLY
+HARDENED (sigreturn validates RIP/RSP < 2^47, forces user CS/SS via hardcoded
+iretq immediates, sanitizes RFLAGS to (x & 0xCD5)|0x202, sanitizes MXCSR; auxv/
+argv/envp stack construction is fully bounded) -- no fix needed there. Four real
+findings; fixed the highest reachability x severity (mmap LPE) this pass.
+
+- **sys_mmap/sys_munmap unbounded MAP_FIXED -> live kernel-frame free (LPE)**
+  (`kernel/syscall/syscall.c` sys_mmap/sys_munmap) -> FIXED (F24). The
+  page-rounding `len = (len + PAGE_MASK) & ~PAGE_MASK` wrapped to 0 for a huge
+  len, and `[addr, addr+len)` was never bounded to the user half (MAP_FIXED only
+  checked nonzero+aligned; munmap likewise). Every process shares the kernel's
+  higher half (PML4[256..511] shallow-copied, vmm.c:198), so a MAP_FIXED or
+  munmap at a kernel/HHDM address (e.g. 0xFFFF800000000000) drove
+  mm_unmap_range_flush_free -> vmm_page_unmap -> pmm_ref_dec on a LIVE kernel
+  frame -> kernel memory corruption / LPE, reachable from ANY unprivileged
+  process (pledge only gates PROT_EXEC). Fixed with two pure overflow-safe
+  helpers reusing the existing _access_ok predicate: mmap_round_len(len) (rejects
+  zero/overflow) and mmap_range_ok(addr,len,*olen,*oend) (page-aligned + strictly
+  in the user half). sys_mmap MAP_FIXED + munmap now reject an out-of-range
+  request with -EINVAL; a non-fixed addr HINT that fails validation falls back to
+  kernel-chosen placement (correct POSIX). Deterministic mmap_range_selftest
+  (NULL/kernel-half/non-canonical/len-overflow/end-past-ceiling/misaligned all
+  rejected; legal range accepted with rounded len + exclusive end). Boot
+  fork-execs /bin/login (mmap/munmap are on every process's hot path) -> no
+  regression. (Found + drafted by the fan-out subagent; independently verified:
+  _access_ok rejects NULL/>USER_ADDR_MAX/overflow/end-past-ceiling, the shared
+  higher half + unmap->pmm_ref_dec chain confirmed, full SELFTESTS build + clean
+  boot.) Note: no sys_mremap exists; sys_mprotect changes perms (not a frame
+  free) so it is a separate lower-severity concern if it lacks a user-half bound.
+
+- **futex_wait raw user deref under the bucket spinlock**
+  (`kernel/proc/futex.c:77` futex_wait) -> OPEN. The authoritative post-enqueue
+  compare is `cur = *(volatile uint32_t*)uaddr;` done UNDER b->lock; a concurrent
+  munmap/mprotect(PROT_NONE) of that page (same address space, another CPU,
+  unserialized vs the futex bucket) faults the read -> the page-fault handler
+  takes mm->vma_lock and may alloc/sleep while a raw spinlock is held
+  (fault-under-spinlock + lock-nest -> panic/DoS, attacker-controlled). The
+  "stays mapped, cannot fault" comment is false (no swap != no munmap). Fix:
+  do the compare with a fault-safe read (copy_from_user / get_user) OUTSIDE
+  b->lock, keeping enqueue-before-recheck for the lost-wake fence; on -EFAULT
+  unlink + return -EFAULT (the timeout path already implements the unlink).
+  Verify: code-proof + a boot-selftest that FUTEX_WAITs on an unmapped addr and
+  asserts -EFAULT instead of panic. Confidence MED-HIGH (race-class). Reachable
+  via every pthread mutex. Good NEXT item (clean, high-value).
+
+- **pipe double-free / UAF on concurrent last-close**
+  (`kernel/fs/pipe.c:127,138` pipe_read_close/pipe_write_close) -> OPEN. The
+  shared pipe_buf_t is freed by a NON-ATOMIC decrement-and-test
+  (`if (reader_refs==0 && writer_refs==0) kfree(p)`) with zero locking; the read
+  end and write end are distinct vfs_file_t sharing one pipe_buf_t, so a
+  simultaneous last-close of both ends on two CPUs can have both observe
+  refs==0 and both kfree(p) -> double free (and concurrent pipe_read/write/poll
+  deref the freed p -> UAF). Same CLASS as F14/F15 AF_UNIX, missed in pipes. Fix:
+  a single atomic last-ref transition like vfs_close/unix_put -- add
+  `uint32_t open_ends` (init 2) and free only on
+  `__atomic_sub_fetch(&p->open_ends,1,ACQ_REL)==0`; extract a pure
+  pipe_last_end_release helper + unit-test it (mirrors unix_refcount_tryget).
+  Confidence HIGH. Clean, deterministically testable.
+
+- **NVMe completion CID OOB (device-controlled index)**
+  (`kernel/drivers/storage/nvme.c:484` nvme_irq_handler) -> OPEN. `cqe.cid`
+  (uint16, device-written into the completion queue) indexes the 64-entry
+  q->req[] with NO bounds check -> OOB write of req->status/->done + a
+  wait_queue_wake_all on a fabricated wait_queue_t (walks/writes a wake-list
+  through garbage pointers). Exact F22 class for NVMe (the submit side IS bounded
+  by a 64-bit bitmap; only the device-echoed completion CID is trusted). AHCI is
+  unaffected (slots derived via ctz of the hardware mask into a 32-entry array).
+  Fix: pure nvme_cid_valid(cid)=cid<NVME_IOQ_DEPTH, `continue` on a bad cid (the
+  CQE is already consumed). Deterministic selftest (verbatim F22 shape).
+  Confidence HIGH. Threat model: malicious/buggy NVMe controller or CQ-page DMA
+  corruption (the repo already treats this device-echo-index class as a real bug
+  worth a guard, per F22).
