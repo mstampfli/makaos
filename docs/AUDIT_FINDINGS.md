@@ -137,3 +137,40 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
 - **AF_UNIX data buffers non-atomic** (`unix_sock.h:106`): `buf_count`/`head`/
   `tail` plain fields RMW'd by sender+receiver on different CPUs. The lost-wakeup
   interlock is TSO-safe, but the byte-copy loops tear under concurrent r/w.
+
+## Second audit pass (2026-06-24) - un-audited subsystems
+
+### F8. ext2 dir_lookup name over-read (`kernel/fs/ext2.c`) - commit pending
+The F6 readdir clamp MISSED the parallel dirent walk in `dir_lookup` (path
+resolution - more reachable than readdir: every open/stat/exec hits it). Same
+class: `kmemeq(de->name, name, name_len)` with only the `off+8<=blk_bytes`
+header guard -> OOB read past the 4096-byte bcache slot on a corrupt dirent.
+Fixed by routing through the existing `ext2_dirent_namelen_clamp` helper (only
+compare when the name fits the block). Covered by `ext2_readdir_clamp_selftest`.
+
+### F9. io_uring OP_READ/OP_WRITE unvalidated sqe->addr (`kernel/io/io_uring.c`) - commit pending
+CRITICAL. OP_READ/OP_WRITE passed the user-controlled `sqe->addr` straight to
+`vfs_read`/`vfs_write`/`pread` with no validation (every other opcode taking a
+user pointer routes through a `sys_*` wrapper that validates). OP_READ with a
+kernel address = arbitrary kernel WRITE; OP_WRITE = arbitrary kernel READ -> LPE
+from an unprivileged process. Fixed: new exported `user_buf_check(addr,len)`
+(= `_access_ok` range-check, the mm-independent LPE guard, + `user_buf_prefault`
+for unmapped-user-ptr panic-prevention) called before both ops. `copy_user_selftest`
+extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
+
+### TODO (from second pass) - careful but high value:
+- **PTY ioctl arbitrary kernel R/W** (`kernel/drivers/tty/pty.c` pty_master_ioctl
+  ~414, pty_slave_ioctl ~474): TCGETS/TIOCGWINSZ/TIOCGPGRP/TIOCGPTN do
+  `*(user_ptr) = tty->field` (arbitrary kernel WRITE) and TCSETS/TIOCSWINSZ/
+  TIOCSPGRP do `tty->field = *(user_ptr)` (arbitrary kernel READ) on the raw
+  ioctl `arg`. CRITICAL LPE, reachable via /dev/ptmx + ioctl. The console tty0
+  path was fixed (copy_*_user) but PTY was missed. Fix: copy_from_user/copy_to_user
+  each case (ideally hoist a shared tty_ioctl_common - master/slave/console are 3
+  drifting copies). Deterministically testable (call pty_*_ioctl with bad ptrs).
+- **ELF e_phoff integer overflow** (`kernel/proc/elf.c:43`): the sole guard
+  `e_phoff + phnum*56 > size` overflows; e_phoff=-56 wraps to 0 (<= size) ->
+  program-header reads land 56 bytes before hdr_buf (OOB heap read driving
+  segment VA/offset decisions). Fix: overflow-safe bounds (pure helper
+  `elf_phtab_in_bounds`, like ext2_dirent_namelen_clamp) + reject phentsize<56;
+  deterministically testable. Secondary: p_vaddr not range-checked + seg_end
+  overflow (elf.c:107).

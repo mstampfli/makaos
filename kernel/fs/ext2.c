@@ -964,6 +964,10 @@ static uint32_t inode_build_run(const ext2_inode_t* ino, uint32_t blk_idx,
 
 // ── Directory lookup ───────────────────────────────────────────────────────
 
+// Defined below (before ext2_readdir); forward-declared so dir_lookup can use
+// the same dirent-name bounds clamp.
+uint32_t ext2_dirent_namelen_clamp(uint32_t off, uint32_t name_len, uint32_t blk_bytes);
+
 // Find a directory entry named `name` (length `name_len`) inside the directory
 // inode `dir_ino`. Returns the inode number or 0 if not found.
 static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32_t name_len) {
@@ -989,8 +993,12 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
         while (off + 8 <= blk_bytes) {
             const ext2_dirent_t* de = (const ext2_dirent_t*)(r.data + off);
             if (de->rec_len == 0) break;
+            // Clamp guard: a corrupt dirent near the block tail could claim a
+            // name that runs past the 4096-byte bcache slot; only compare when
+            // the name actually fits in the block (same boundary as readdir).
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
+                ext2_dirent_namelen_clamp(off, de->name_len, blk_bytes) >= name_len &&
                 kmemeq(de->name, name, name_len)) {
                 found = de->inode;
                 break;

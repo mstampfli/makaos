@@ -835,6 +835,13 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
         case IORING_OP_READ: {
             vfs_file_t* f = sqe_fdget(uring, sqe);
             if (!f) { res = -EBADF; break; }
+            // sqe->addr/len are user-controlled (read straight from the SQE
+            // ring); vfs_read writes DIRECTLY into this buffer, so a kernel
+            // address here would be an arbitrary kernel write.  Validate it.
+            extern int user_buf_check(uint64_t addr, uint64_t len);
+            if (user_buf_check(sqe->addr, sqe->len) != 0) {
+                uring_fdput(f); res = -EFAULT; break;
+            }
             // Use pread-with-offset if the driver supports it (avoids
             // racy seek+read on shared fds); else fall back to
             // sequential read at the fd's current pos.
@@ -849,6 +856,12 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
         case IORING_OP_WRITE: {
             vfs_file_t* f = sqe_fdget(uring, sqe);
             if (!f) { res = -EBADF; break; }
+            // Validate the user-controlled source buffer; vfs_write reads it
+            // directly, so a kernel address here is an arbitrary kernel read.
+            extern int user_buf_check(uint64_t addr, uint64_t len);
+            if (user_buf_check(sqe->addr, sqe->len) != 0) {
+                uring_fdput(f); res = -EFAULT; break;
+            }
             res = (int32_t)vfs_write(f, (const void*)sqe->addr, sqe->len);
             uring_fdput(f);
             break;

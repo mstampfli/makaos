@@ -3038,6 +3038,19 @@ int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     return 0;
 }
 
+// Validate a user buffer that the kernel will read/write DIRECTLY (not via
+// copy_*_user) -- e.g. io_uring OP_READ/OP_WRITE hand sqe->addr straight to
+// vfs_read/vfs_write.  Range-check rejects kernel / non-canonical / overflowing
+// pointers (the arbitrary-kernel-R/W LPE guard, mm-independent); the prefault
+// then rejects unmapped user pointers (which would otherwise #PF + panic in the
+// direct memcpy) -- it is a no-op for kernel threads with no user mm.  Must be
+// called with the submitter's PML4 active.  Returns 0 or -EFAULT.
+int user_buf_check(uint64_t addr, uint64_t len) {
+    if (!_access_ok(addr, len)) return -EFAULT;
+    if (user_buf_prefault((virt_addr_t)addr, (size_t)len) != 0) return -EFAULT;
+    return 0;
+}
+
 #ifdef MAKAOS_BOOT_SELFTESTS
 // Audit fix: sys_readdir/stat/unlink/getcwd/chdir/mkdir used raw
 // __builtin_memcpy on unvalidated user pointers -> kernel-fault DoS, and the
@@ -3067,9 +3080,17 @@ void copy_user_selftest(void) {
                     (unsigned long)bad[i]);
             fails++;
         }
+        // user_buf_check is the validation io_uring OP_READ/OP_WRITE now use on
+        // the user-controlled sqe->addr; it must reject these the same way (the
+        // kernel-address case is the arbitrary-kernel-R/W LPE guard).
+        if (user_buf_check(bad[i], 16) == 0) {
+            kprintf("[copyuser_test] FAIL: user_buf_check accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
     }
     kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
-                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected, no fault)\n");
+                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check)\n");
 }
 #endif
 
