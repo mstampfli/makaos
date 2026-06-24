@@ -1904,8 +1904,10 @@ static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_
         if (copy_from_user(&set, (const void*)set_ptr, sizeof(set)) != 0)
             return (uint64_t)-EFAULT;
         set &= ~(1u << (SIGKILL - 1));  // SIGKILL can never be blocked
-        if (how == SIG_BLOCK)        *blocked |= set;
-        else if (how == SIG_UNBLOCK) *blocked &= ~set;
+        // Atomic RMW: a cross-CPU signal_send (SIGKILL unblock) writes this
+        // same word, so a non-atomic |=/&= here could lose its clear.
+        if (how == SIG_BLOCK)        atomic_or(blocked, set);
+        else if (how == SIG_UNBLOCK) atomic_and(blocked, ~set);
         else if (how == SIG_SETMASK) *blocked = set;
         else return (uint64_t)-EINVAL;
     }

@@ -94,12 +94,18 @@ different CPUs with no per-PCB lock. Torn `snd_nxt` mis-sends; lost-update on
 `txbuf_used` wedges the sender or underflows -> heap OOB write into `txbuf`. Fix:
 a per-PCB lock around the send/ack/retransmit critical sections.
 
-### T5. signal_send non-atomic RMW of sigstate.blocked (`kernel/proc/signal.c:46`)
-`if (sig == SIGKILL) t->sigstate.blocked &= ~bit;` is a non-atomic RMW on the
-*target* task's `blocked` from the sender's CPU, while the target RMWs its own
-`blocked` in `sys_sigprocmask`/`signal_setup_frame`. Lost-update -> SIGKILL
-mis-blocked or a mask bit corrupted. (`pending` is correctly atomic; only
-`blocked` is unprotected.) Fix: `atomic_and` here + atomic mask RMWs.
+### F5. signal_send non-atomic RMW of sigstate.blocked (`kernel/proc/signal.c`) — FIXED, commit pending
+`signal_send`'s `t->sigstate.blocked &= ~bit` (SIGKILL unblock) was a non-atomic
+RMW on the *target* task's `blocked` from the sender's CPU, racing the target's
+own RMWs in `sys_sigprocmask` (`|=`/`&=`) and `signal_setup_frame` (`|=`) ->
+lost update (SIGKILL clear undone, or a mask bit corrupted). `pending` was
+already atomic; only `blocked` RMWs were not. Fixed: `atomic_and`/`atomic_or`
+(smp.h) at all four RMW sites (signal_send, the two sigprocmask RMWs, the two
+setup_frame ORs); the SETMASK full-store and init stores stay plain (aligned
+32-bit stores are atomic on x86 and SIGKILL is masked out of SETMASK). No
+deterministic test: tiny-window cross-CPU data race, and signal_send logs per
+call so a high-iteration faithful test floods the serial. Confirmed by code
+proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
 
 ## TODO — lower priority / near-miss
 

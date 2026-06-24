@@ -41,9 +41,12 @@ void signal_send(task_t* t, int sig) {
 
     uint32_t bit = 1u << (uint32_t)(sig - 1);
 
-    // SIGKILL is unblockable — forcibly clear the blocked bit.
+    // SIGKILL is unblockable — forcibly clear the blocked bit.  This runs on
+    // the SENDER's CPU and writes the TARGET's mask, racing the target's own
+    // mask RMWs (sigprocmask / signal_setup_frame).  Must be atomic, like the
+    // `pending` update below, or a concurrent owner RMW loses this clear.
     if (sig == SIGKILL)
-        t->sigstate.blocked &= ~bit;
+        atomic_and(&t->sigstate.blocked, ~bit);
 
     // Set the pending bit atomically.  Coalesces repeat sends (classic POSIX).
     atomic_or(&t->sigstate.pending, bit);
@@ -254,9 +257,10 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     // Remember where the frame is for sys_sigreturn.
     g_current->sigstate.sigframe_rsp = frame_base;
 
-    // Block the signal itself + sa_mask during handler execution.
-    g_current->sigstate.blocked |= (1u << (uint32_t)(sig - 1));
-    g_current->sigstate.blocked |= ka->sa_mask;
+    // Block the signal itself + sa_mask during handler execution.  Atomic so
+    // a cross-CPU signal_send (SIGKILL unblock) can't lose these via a torn RMW.
+    atomic_or(&g_current->sigstate.blocked, 1u << (uint32_t)(sig - 1));
+    atomic_or(&g_current->sigstate.blocked, ka->sa_mask);
 
     // Push restorer address as the "return address" for the handler.
     uint64_t new_rsp = frame_base - 8;
