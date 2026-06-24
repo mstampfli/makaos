@@ -8,6 +8,10 @@
 #include "wait.h"
 #include "rcu.h"
 
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0x800
+#endif
+
 // ── Pipe VFS callbacks ────────────────────────────────────────────────────
 
 static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
@@ -30,6 +34,14 @@ static int64_t pipe_read(vfs_file_t* self, void* buf, uint64_t len) {
                     wait_queue_wake_all(p->write_file->waitq);
                 return (int64_t)total;
             }
+
+            // O_NONBLOCK: an empty pipe with a live writer must not block.
+            // Return whatever we've drained so far, or -EAGAIN if nothing.
+            // Without this a non-blocking reader (e.g. swaybar's getline on
+            // its status_command pipe, set O_NONBLOCK via F_SETFL) blocks
+            // forever instead of seeing EAGAIN, freezing its event loop.
+            if (self->flags & O_NONBLOCK)
+                return total > 0 ? (int64_t)total : (int64_t)-EAGAIN;
 
             WAIT_EVENT_HOOK(self->waitq,
                             p->count != 0 || p->writer_refs == 0,

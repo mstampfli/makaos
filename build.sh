@@ -954,7 +954,7 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
-        -e 's|^[[:space:]]*status_command .*|    # status_command /bin/makaclock — disabled: a sway layer-shell race makes a live text status destabilize the bars first configure (bar then never commits). Re-enable once that is fixed.|' \
+        -e 's|^[[:space:]]*status_command .*|    status_command /bin/makaclock|' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
