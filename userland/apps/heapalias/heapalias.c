@@ -23,6 +23,13 @@
 #define NWORKER 2
 #define NCHURN  8             // 2x CPUs -> heavy concurrent exec teardown
 #define CITERS  900           // fork+exec cycles per churner
+#define NMMAP   3             // mmap-verify workers (stress pcache shared frames)
+#define MITERS  2500          // mmap re-verify passes
+// A real font file, MAP_SHARED RO - the same page-cache path swaybar mmaps for
+// its fonts/libs.  heapalias' heap path is CLEAN post-kstack-fix, so this
+// exercises the one cross-process frame-sharing path it never touched: if the
+// pcache frees/evicts a shared frame still mapped here, the content changes.
+#define FONT_PATH "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 
 // Serial-visible verdict markers.  heapalias' stdout does NOT reach the serial
 // log, so the PASS/CORRUPT result was invisible to the headless harness.  The
@@ -61,6 +68,35 @@ static int verify_worker(void) {
     return 0;
 }
 
+static int mmap_worker(void) {
+    struct stat st;
+    if (stat(FONT_PATH, &st) != 0 || st.st_size <= 0) { HAMARK("MMAP_NOFILE"); return 2; }
+    size_t len = (size_t)st.st_size;
+    int fd = open(FONT_PATH, O_RDONLY, 0);
+    if (fd < 0) { HAMARK("MMAP_NOOPEN"); return 2; }
+    const volatile unsigned char* m =
+        (const volatile unsigned char*)mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == 0 || m == (void*)-1) { HAMARK("MMAP_NOMAP"); return 2; }
+
+    // Baseline: one byte per page + the last byte (a frame swap changes these).
+    unsigned long base = 0;
+    for (size_t off = 0; off < len; off += 4096) base = base * 131 + m[off];
+    base = base * 131 + m[len - 1];
+
+    for (int it = 0; it < MITERS; it++) {
+        unsigned long sum = 0;
+        for (size_t off = 0; off < len; off += 4096) sum = sum * 131 + m[off];
+        sum = sum * 131 + m[len - 1];
+        if (sum != base) {
+            HAMARK("MMAPCORRUPT");
+            HAMARKN("mc", sum);
+            printf("[heapalias] MMAPCORRUPT sum=%lx base=%lx it=%d\n", sum, base, it);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int churn_exec(void) {
     const char* av[] = { "/bin/heapalias", "x", 0 };
     for (int i = 0; i < CITERS; i++) {
@@ -93,6 +129,11 @@ int main(int argc, char** argv) {
     for (int k = 0; k < NWORKER; k++) {
         pid_t p = fork();
         if (p == 0) _exit(verify_worker());
+        if (p > 0) n++;
+    }
+    for (int k = 0; k < NMMAP; k++) {
+        pid_t p = fork();
+        if (p == 0) _exit(mmap_worker());
         if (p > 0) n++;
     }
     for (int k = 0; k < NCHURN; k++) {
