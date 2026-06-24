@@ -1416,6 +1416,49 @@ vfs_file_t* ext2_open_ino(uint32_t ino, const char* path) {
 
 // ── ext2_readdir ───────────────────────────────────────────────────────────
 
+// Bytes of an on-disk dirent's name that are safe to read: the smaller of the
+// claimed name_len and the bytes left in the block after the 8-byte dirent
+// header.  A corrupt/short on-disk dirent could otherwise claim a name_len that
+// runs past the end of the 4096-byte bcache slot -> out-of-bounds read (leaking
+// adjacent kernel memory into the returned filename).  Pure + bounds-only so it
+// can be unit-tested in isolation (ext2_readdir_clamp_selftest).
+uint32_t ext2_dirent_namelen_clamp(uint32_t off, uint32_t name_len,
+                                   uint32_t blk_bytes) {
+    uint32_t avail = (off + 8u <= blk_bytes) ? (blk_bytes - off - 8u) : 0u;
+    return name_len < avail ? name_len : avail;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the dirent name-length bound (the security boundary
+// that stops a corrupt on-disk dirent over-reading past the 4096-byte bcache
+// slot).  The 4088/4090 tail cases are exactly the over-read scenarios: the
+// header fits but the name would start at / past the slot end -> clamp to 0.
+void ext2_readdir_clamp_selftest(void) {
+    extern void kprintf(const char*, ...);
+    kprintf("[ext2_readdir_test] dirent name_len clamp bounds\n");
+    struct { uint32_t off, nlen, blk, want; } c[] = {
+        { 0,    5,   4096, 5  },   // fits -> unchanged
+        { 4088, 200, 4096, 0  },   // header ends at slot end, name OOB -> 0
+        { 4090, 1,   4096, 0  },   // header itself overruns -> 0
+        { 4078, 200, 4096, 10 },   // only 10 bytes left in block
+        { 4000, 255, 4096, 88 },   // avail = 4096-4000-8
+        { 100,  50,  120,  12 },   // short final block: avail = 120-100-8
+        { 0,    0,   4096, 0  },   // empty name
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = ext2_dirent_namelen_clamp(c[i].off, c[i].nlen, c[i].blk);
+        if (got != c[i].want) {
+            kprintf("[ext2_readdir_test] FAIL off=%u nlen=%u blk=%u got=%u want=%u\n",
+                    c[i].off, c[i].nlen, c[i].blk, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_readdir_test] SELF-TEST FAILED\n"
+                  : "[ext2_readdir_test] SELF-TEST PASSED (name clamped to block bounds)\n");
+}
+#endif
+
 int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
     if (!s_mounted || !entries || max <= 0) return -1;
 
@@ -1451,7 +1494,9 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
             if (de->rec_len == 0) break;
 
             if (de->inode != 0) {
-                uint32_t nlen = de->name_len;
+                // Clamp to what actually fits in this block so a corrupt
+                // dirent's name_len can't over-read past the bcache slot.
+                uint32_t nlen = ext2_dirent_namelen_clamp(off, de->name_len, blk_bytes);
                 // Skip "." and ".."
                 int is_dot = (nlen == 1 && de->name[0] == '.');
                 int is_dotdot = (nlen == 2 && de->name[0] == '.' && de->name[1] == '.');

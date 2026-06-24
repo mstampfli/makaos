@@ -444,6 +444,12 @@ static void init_kthread(void) {
     extern void copy_user_selftest(void);
     copy_user_selftest();
 
+    // Audit fix: ext2_readdir read a dirent's name_len without bounding it to
+    // the block, so a corrupt dirent could over-read past the bcache slot.
+    // Verify the clamp keeps the name within block bounds.
+    extern void ext2_readdir_clamp_selftest(void);
+    ext2_readdir_clamp_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without

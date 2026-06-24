@@ -119,10 +119,14 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
   eventfd for POLLOUT is never woken. Unreachable in practice (full = 2^64-2).
 - **unix_sock_accept** wakes client via `unix_wake` not `unix_poll_wake`
   (line ~612): latent missing-wakeup, harmless until non-blocking connect lands.
-- **ext2_readdir over-read** (`kernel/fs/ext2.c:1462`): guards `off+8<=blk_bytes`
-  then reads up to 254 name bytes; a dirent near the block tail can read past the
-  4096-byte bcache slot. Bounded over-READ, needs a corrupt/concurrently-mutated
-  dir block. Fix: bound `name_len` against the remaining block bytes.
+- **ext2_readdir over-read** (`kernel/fs/ext2.c`) -> FIXED (F6). The walk guarded
+  only `off+8<=blk_bytes` (header) then read up to `name_len` (<=255) name bytes,
+  so a corrupt dirent near the block tail read past the 4096-byte bcache slot
+  (info leak). Fixed: extracted `ext2_dirent_namelen_clamp(off,name_len,blk_bytes)`
+  (min of name_len and bytes-left-after-the-8-byte-header) and use it before the
+  name copy. Deterministic `ext2_readdir_clamp_selftest` (SELFTESTS=1) checks the
+  boundary cases (the 4088/4090 tail dirents clamp to 0) -> PASSES; valid dirs are
+  unaffected (name always fits), confirmed by a clean boot (ls/path walks).
 - **unvalidated user-pointer memcpy in syscalls** -> FIXED, see F4 (the
   sys_readdir near-miss expanded into a 6-syscall sweep).
 - **AF_UNIX data buffers non-atomic** (`unix_sock.h:106`): `buf_count`/`head`/
