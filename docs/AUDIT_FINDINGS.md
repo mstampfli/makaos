@@ -170,7 +170,13 @@ extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
   path was fixed (copy_*_user) but PTY was missed. Fix: copy_from_user/copy_to_user
   each case (ideally hoist a shared tty_ioctl_common - master/slave/console are 3
   drifting copies). Deterministically testable (call pty_*_ioctl with bad ptrs).
-- **ELF e_phoff integer overflow** (`kernel/proc/elf.c:43`): the sole guard
+- **ELF e_phoff integer overflow** -> FIXED (F12): extracted overflow-safe
+  elf_phtab_in_bounds(e_phoff,phnum,size) (offset>size catches the wrap, then a
+  remainder check) + elf_phtab_bounds_selftest (the -56 wrap + boundary cases) ->
+  PASSED; valid ELFs (login/svcmgr) still load. STILL OPEN follow-up (DoS-leaning,
+  not a kernel write): p_vaddr not range-checked + seg_end overflow (elf.c:157)
+  can make seg_end<seg_start -> bogus/empty VMA; harden the PT_LOAD vaddr+memsz
+  range to the user half. (original:) (`kernel/proc/elf.c:43`): the sole guard
   `e_phoff + phnum*56 > size` overflows; e_phoff=-56 wraps to 0 (<= size) ->
   program-header reads land 56 bytes before hdr_buf (OOB heap read driving
   segment VA/offset decisions). Fix: overflow-safe bounds (pure helper

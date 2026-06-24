@@ -455,6 +455,12 @@ static void init_kthread(void) {
     extern void pty_ioctl_selftest(void);
     pty_ioctl_selftest();
 
+    // Audit fix: the ELF phdr-table bounds check `e_phoff + phnum*56 > size`
+    // overflowed (a -56 e_phoff wrapped below size) -> OOB phdr read.  Verify
+    // the overflow-safe replacement rejects the wrap + boundary cases.
+    extern void elf_phtab_bounds_selftest(void);
+    elf_phtab_bounds_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without

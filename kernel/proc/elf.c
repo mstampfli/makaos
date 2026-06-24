@@ -15,6 +15,53 @@
 #include "kprintf.h"
 #include "tsc.h"
 
+// Returns 1 if the program-header table [e_phoff, e_phoff + e_phnum*sizeof
+// (Elf64_Phdr)) lies fully within a file of `size` bytes with NO 64-bit
+// overflow; 0 otherwise.  The old inline check `e_phoff + phnum*56 > size`
+// added unchecked 64-bit values, so an attacker-controlled e_phoff near
+// UINT64_MAX (e.g. -56) wrapped below `size` and passed -> the phdr reads
+// landed BEFORE the header buffer (OOB heap read).  Pure + bounds-only so it
+// can be unit-tested in isolation (elf_phtab_bounds_selftest).  e_phnum is at
+// most 65535, so e_phnum*56 cannot overflow.
+int elf_phtab_in_bounds(uint64_t e_phoff, uint16_t e_phnum, uint64_t size) {
+    if (e_phnum == 0) return 0;
+    uint64_t tab = (uint64_t)e_phnum * sizeof(Elf64_Phdr);
+    if (e_phoff > size) return 0;          // offset alone past EOF (catches the wrap)
+    if (tab > size - e_phoff) return 0;    // overflow-safe remainder check
+    return 1;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the phdr-table bounds.  The 0xFFFF...C8 (-56) row is
+// the exact overflow the old `e_phoff + phnum*56 > size` check got wrong: it
+// wrapped to 0, passed, and read 56 bytes before the buffer.
+void elf_phtab_bounds_selftest(void) {
+    kprintf("[elf_test] program-header table bounds\n");
+    struct { uint64_t off; uint16_t n; uint64_t sz; int want; } c[] = {
+        { 64,                     1,  4096, 1 },  // normal
+        { 0xFFFFFFFFFFFFFFC8ULL,  1,  4096, 0 },  // -56: old check wrapped to 0 (the bug)
+        { 4096,                   1,  4096, 0 },  // off == size, no room
+        { 4040,                   1,  4096, 1 },  // last 56 bytes fit exactly
+        { 4041,                   1,  4096, 0 },  // one past
+        { 0,                      0,  4096, 0 },  // phnum 0
+        { 0,                      73, 4096, 1 },  // 73*56 = 4088 <= 4096
+        { 0,                      74, 4096, 0 },  // 74*56 = 4144 > 4096
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = elf_phtab_in_bounds(c[i].off, c[i].n, c[i].sz);
+        if (got != c[i].want) {
+            kprintf("[elf_test] FAIL off=0x%lx n=%u sz=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].off, (unsigned)c[i].n,
+                    (unsigned long)c[i].sz, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[elf_test] SELF-TEST FAILED\n"
+                  : "[elf_test] SELF-TEST PASSED (phdr table bounds, no overflow)\n");
+}
+#endif
+
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
 // Does NOT create a kstack or fd_table — those are for elf_load only.
@@ -40,7 +87,9 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return 0;
     if (ehdr->e_machine != EM_X86_64) return 0;
     if (ehdr->e_phnum   == 0)        return 0;
-    if (ehdr->e_phoff + (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr) > size) return 0;
+    // Overflow-safe bounds check (see elf_phtab_in_bounds): a malicious e_phoff
+    // near UINT64_MAX would otherwise wrap past this guard -> OOB phdr reads.
+    if (!elf_phtab_in_bounds(ehdr->e_phoff, ehdr->e_phnum, size)) return 0;
 
     // For ET_DYN (static PIE), compute a load bias so the binary does not
     // collide with the kernel or other fixed mappings.
