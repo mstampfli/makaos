@@ -315,15 +315,19 @@ cleanliness one (sys_select) this pass; the other four are the refreshed backlog
   Deterministically testable via a pure ext2_block_size/ok helper. Confidence HIGH.
 
 - **unveil sandbox bypass via /dev|/proc prefix without boundary**
-  (`kernel/syscall/syscall.c:411-413` sys_open got_file) -> OPEN. The unveil
-  exemption tests the literal prefix `/dev`/`/proc` with no next-char `/`-or-`\0`
-  check, so a REAL on-disk file named `/devsecrets` or `/processData` skips
-  unveil_check entirely -> sandbox escape. unveil_check itself is correct; the
-  inline exemption is a drifted duplicate of "is this a virtual mount?". Fix
-  (DRY + security): replace the two hand-rolled tests with the existing
-  boundary-correct `virtfs_is_virtual(path)` (virtfs.h already included).
-  Deterministically testable (assert virtfs_is_virtual("/devsecrets")==0,
-  ("/dev/tty")==1). Confidence HIGH. (Strong candidate for next pass.)
+  (`kernel/syscall/syscall.c:411-413` sys_open got_file) -> FIXED (F20). The
+  unveil exemption tested the literal prefix `/dev`/`/proc` with no next-char
+  `/`-or-`\0` check, so a REAL on-disk file named `/devsecrets` or
+  `/processData` skipped unveil_check entirely -> sandbox escape. unveil_check
+  itself is correct; the inline exemption was a drifted duplicate of "is this a
+  virtual mount?". Fixed (DRY + security): replaced the two hand-rolled prefix
+  tests with the single existing boundary-correct `virtfs_is_virtual(path)`
+  (find_mount requires `path[n]=='/'||'\0'`; the mount table is exactly
+  /proc,/dev, so the exemption set is unchanged but boundary-correct).
+  Deterministic virtfs_is_virtual_selftest: /dev, /dev/, /dev/tty, /proc,
+  /proc/self/status -> virtual; /devsecrets, /processData, /device_keys,
+  /home/user, / -> NOT virtual -> PASSED. Boot still fork-execs /bin/login
+  (every open runs this block) so no regression to normal opens.
 
 - **virtio-net rx desc_id OOB (device-controlled index)**
   (`kernel/net/virtio_net.c:417,434` virtio_net_rx_poll) -> OPEN. `desc_id` is a

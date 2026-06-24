@@ -536,6 +536,10 @@ static void init_kthread(void) {
     extern void tcp_ring_consume_selftest(void);
     tcp_ring_consume_selftest();
 
+    // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
+    extern void virtfs_is_virtual_selftest(void);
+    virtfs_is_virtual_selftest();
+
     // Tier 2.5a (virtio-gpu): pipeline exerciser was overriding the
     // UEFI GOP framebuffer with a self-test banner, hiding the TTY
     // from the SDL window under `-vga none -device virtio-vga`.  The

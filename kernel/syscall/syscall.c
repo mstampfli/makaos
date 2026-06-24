@@ -407,10 +407,12 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 got_file:
     // ── unveil check ─────────────────────────────────────────────────────
     // Paths not in the unveil table return ENOENT (as if they don't exist).
-    // /dev/ and /proc/ are exempt (virtual, always accessible via this path).
-    if (g_current->unveil.count > 0 &&
-        !(path[1]=='d' && path[2]=='e' && path[3]=='v') &&
-        !(path[1]=='p' && path[2]=='r' && path[3]=='o' && path[4]=='c')) {
+    // The virtual mounts (/dev, /proc) are exempt (always accessible via this
+    // path).  Use virtfs_is_virtual -- the single boundary-correct "is virtual"
+    // predicate -- NOT a hand-rolled prefix test: the old `path[1..3]=='dev'`
+    // form matched any real on-disk file named /devsecrets, /processData, etc.,
+    // letting it skip the unveil sandbox entirely (sandbox escape).
+    if (g_current->unveil.count > 0 && !virtfs_is_virtual(path)) {
         uint8_t need_u = UNVEIL_READ;
         int oflags_acc = (int)(flags & 3);
         if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) need_u |= UNVEIL_WRITE;

@@ -224,6 +224,37 @@ int virtfs_is_virtual(const char* path) {
     return find_mount(path) != NULL;
 }
 
+// Deterministic test of the path-boundary matching that sys_open's unveil
+// exemption depends on.  The bug this guards: a bare-prefix test treated any
+// real file named /devsecrets or /processData as virtual, letting it bypass the
+// unveil sandbox.  virtfs_is_virtual must match only a mount root or a child
+// under it (next char '/' or '\0'), never a longer sibling name.
+void virtfs_is_virtual_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { const char* path; int want; } c[] = {
+        { "/dev",              1 },  // exact mount root
+        { "/dev/",             1 },  // root with trailing slash
+        { "/dev/tty",          1 },  // child under mount
+        { "/proc",             1 },
+        { "/proc/self/status", 1 },
+        { "/devsecrets",       0 },  // THE BUG: prefix, no boundary -> NOT virtual
+        { "/processData",      0 },  // THE BUG
+        { "/device_keys",      0 },
+        { "/home/user",        0 },  // unrelated
+        { "/",                 0 },
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (virtfs_is_virtual(c[i].path) != c[i].want) {
+            kprintf("[virtfs_unveil] FAIL \"%s\" got=%d want=%d\n",
+                    c[i].path, virtfs_is_virtual(c[i].path), c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[virtfs_unveil] SELF-TEST FAILED\n"
+                  : "[virtfs_unveil] SELF-TEST PASSED (mount boundary, no prefix bypass)\n");
+}
+
 int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
                   fs_node_t* out) {
     const virtmount_t* m = find_mount(path);
