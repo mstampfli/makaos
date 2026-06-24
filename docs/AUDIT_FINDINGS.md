@@ -86,21 +86,32 @@ at it -> derefs of a freed file. Fixed by deferring the file free into
 (rare) DOUBLE FREE in the `unix_sock_pair` ENOMEM path (`unix_sock_close(a)`
 already owns a's teardown; the trailing `kfree(a)` freed it twice).
 
-(B) the peer-SOCK UAF -> STILL OPEN (careful refactor, dedicated iteration).
-`unix_sock_send_ex` BLOCKS (WAIT_EVENT_HOOK on a full peer buffer), caches
-`peer = s->peer` across iterations, and derefs the cached `peer` directly
-(`cbuf_write(peer)`, `peer->buf_count` in the HOOK condition, `unix_wake(peer)`)
-with NO `rcu_read_lock`; `recv` (line ~786 `unix_wake(s->peer)`) and `connect`
-have the same shape. The peer `unix_sock_t` can be RCU-freed during the block ->
-UAF on the sock object itself. RCU-section discipline alone cannot fix this (the
-deref happens after a sleep, and the HOOK condition runs outside any reader
-section). Correct fix: refcount the `unix_sock_t` (Linux af_unix model) and pin
-the peer with a tryget-under-rcu for the duration of every peer deref, freeing
-only on refcount 0; OR a two-phase RCU free (disconnect in phase 1, free after a
-second grace period) combined with re-reading `s->peer` under `rcu_read_lock`
-per non-blocking critical section. F14 (the file-lifetime invariant) is a clean
-prerequisite: once file-lifetime == sock-lifetime, pinning the sock also pins
-its file, so (B) is now a single well-defined problem.
+(B) the peer-SOCK UAF -> FIXED (F15). `unix_sock_send_ex` BLOCKED
+(WAIT_EVENT_HOOK on a full peer buffer), cached `peer = s->peer` across
+iterations, and dereffed the cached `peer` (`cbuf_write(peer)`, `peer->buf_count`
+in the HOOK condition, `unix_wake(peer)`) with NO `rcu_read_lock`; `recv`
+post-drain `unix_wake(s->peer)`, `poll` `s->peer->buf_count`, `shutdown`, and
+`sendfd` had the same synchronous shape. The peer `unix_sock_t` could be
+RCU-freed during the block/deref -> UAF on the sock object. Fixed with the Linux
+af_unix model: a refcount on `unix_sock_t` (init 1 = owner), a pure CAS-from-
+nonzero `unix_refcount_tryget`, `unix_get`/`unix_put` (RCU-deferred free at 0),
+and `unix_pin_peer` (read `s->peer` + tryget under `rcu_read_lock`). `send_ex`
+pins the peer for the whole call (held across sleeps); the synchronous derefs
+take a brief `rcu_read_lock` (or pin, for sendfd which mutates peer state).
+Prerequisite invariant added: `unix_sock_close` now notifies the connected peer
+SYNCHRONOUSLY (clears the symmetric back-pointer `peer->peer==s`, marks it
+DISCONNECTED, wakes it) under a peer pin BEFORE dropping the owner ref, so a
+reader sees NULL not a dangling pointer; the notify was moved out of
+`unix_sock_free_rcu`. Also added the disconnect terms to the `send_ex` HOOK
+condition so a peer-close during a full-buffer block wakes the sender instead of
+hanging (lost-wakeup). Verified by `unix_refcount-selftest` (pure tryget +
+get/put balance + pin_peer) + clean boot (socketpair/scm_rights still PASS;
+Wayland churns the path). Scoped out (separate, not part B): the SOCK_DGRAM
+default-destination `s->peer = target` (set in connect, line ~716) is a raw
+pointer with no connection ref and target does not point back, so it can dangle
+if the target closes; DGRAM connect is rare (Wayland uses STREAM). The clean fix
+there is to store the target PATH and re-resolve via `ns_find` per `sendto`
+(already the RCU-safe path for by-path sends), or hold a connection ref.
 
 ### T4. TCP PCB fields mutated lock-free from 3 CPUs (`kernel/net/tcp.c`)
 `tcp_timer_tick` retransmit (`snd_nxt = snd_una` rewind), `tcp_send`

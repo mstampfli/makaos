@@ -520,6 +520,10 @@ static void init_kthread(void) {
     extern void scm_rights_selftest(void);
     scm_rights_selftest();
 
+    // AF_UNIX refcount / peer-pin lifetime machinery (T3 part B UAF fix).
+    extern void unix_refcount_selftest(void);
+    unix_refcount_selftest();
+
     // Tier 1 #6 (signalfd): block sig, send, drain via signalfd read.
     extern void signalfd_selftest(void);
     signalfd_selftest();

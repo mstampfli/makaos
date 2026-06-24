@@ -139,6 +139,13 @@ typedef struct unix_sock {
     // Used by the compositor to SIGKILL an unresponsive client after the user
     // force-closes its window. 0 = no peer (unconnected / listener).
     uint32_t peer_pid;
+
+    // Reference count.  Starts at 1 (the owning vfs_file_t).  A peer that
+    // dereferences this socket across a blocking send/recv pins it with an
+    // extra ref (tryget under rcu_read_lock) so a concurrent close cannot
+    // free it mid-operation.  The struct (and its file, per the F14 lifetime
+    // invariant) is freed via call_rcu only when this hits 0.
+    uint32_t refcount;
 } unix_sock_t;
 
 // ── Kernel API ───────────────────────────────────────────────────────────

@@ -232,8 +232,16 @@ static int unix_vfs_poll(vfs_file_t* self, int events) {
         if (s->ancillary.count > 0) return 1;
     }
     if (events & 0x0004 /* POLLOUT */) {
-        if (s->type == SOCK_STREAM && s->peer) {
-            if (s->peer->buf_count < UNIX_BUF_SIZE) return 1;
+        if (s->type == SOCK_STREAM) {
+            // Read the peer once under rcu_read_lock: a concurrent close
+            // defers the peer's free past the grace period, so the pointer
+            // stays valid for this section (and close clears it before free,
+            // so it is never a dangling pointer to freed memory).
+            rcu_read_lock();
+            unix_sock_t* peer = s->peer;
+            int writable = peer && peer->buf_count < UNIX_BUF_SIZE;
+            rcu_read_unlock();
+            if (writable) return 1;
         }
         if (s->type == SOCK_DGRAM) return 1; // dgram always writable
     }
@@ -247,19 +255,62 @@ static int unix_vfs_poll(vfs_file_t* self, int events) {
     return 0;
 }
 
+// ── Reference counting ────────────────────────────────────────────────────
+// The socket is freed via call_rcu only when its refcount reaches 0.  A peer
+// that touches this socket across a blocking operation (unix_sock_send_ex) or
+// in a brief synchronous critical section (recv drain wake, poll, shutdown,
+// sendfd) pins it with an extra ref so a concurrent close cannot free it out
+// from under the operation -> closes the peer-SOCK use-after-free (T3 part B).
+
+// Pure, side-effect-only-on-*rc helper: try to bump a refcount from a NON-ZERO
+// value.  Returns 1 on success (incremented), 0 if it was already 0 (object is
+// dying / freed-pending and must not be resurrected).  Unit-tested below.
+static int unix_refcount_tryget(uint32_t* rc) {
+    uint32_t old = atomic_load_acq(rc);
+    for (;;) {
+        if (old == 0) return 0;                       // dying: cannot resurrect
+        if (atomic_cas(rc, &old, old + 1u)) return 1; // bumped
+        // CAS failed: `old` reloaded with the current value; retry.
+    }
+}
+
+static void unix_sock_free_rcu(void* data);  // forward decl
+
+static inline void unix_get(unix_sock_t* s) {
+    atomic_add(&s->refcount, 1u);
+}
+
+// Drop a reference.  The CPU that observes the 1->0 transition owns the
+// teardown and defers it a full grace period via call_rcu (so any reader still
+// inside an rcu_read_lock that observed this socket has dropped out first).
+static void unix_put(unix_sock_t* s) {
+    if (atomic_sub(&s->refcount, 1u) == 1u)
+        call_rcu_expedited(unix_sock_free_rcu, s);
+}
+
+// Read s->peer and pin it (hold a ref) so it stays valid across a blocking or
+// synchronous critical section.  Returns the pinned peer or NULL (no peer, or
+// peer already dying).  Memory-safe: the peer is RCU-freed, so reading its
+// refcount inside this rcu_read_lock section cannot race the free; and
+// unix_sock_close clears the symmetric back-pointer BEFORE the peer can be
+// freed, so s->peer never dangles to already-freed memory.  Caller unix_put()s.
+static unix_sock_t* unix_pin_peer(unix_sock_t* s) {
+    rcu_read_lock();
+    unix_sock_t* peer = s->peer;
+    if (peer && !unix_refcount_tryget(&peer->refcount))
+        peer = NULL;
+    rcu_read_unlock();
+    return peer;
+}
+
 // Deferred teardown: runs after a full RCU grace period has elapsed, so
 // every concurrent ns_find/connect/sendto that observed the sock has
 // dropped out of its reader section.  Safe to dismantle state and free.
+// The connected-peer disconnect notify is NOT done here -- it runs
+// synchronously in unix_sock_close so the peer's back-pointer is cleared
+// before this socket can be freed (the invariant unix_pin_peer relies on).
 static void unix_sock_free_rcu(void* data) {
     unix_sock_t* s = (unix_sock_t*)data;
-
-    // Notify peer of disconnection.
-    if (s->peer) {
-        s->peer->peer = NULL;
-        s->peer->state = UNIX_STATE_DISCONNECTED;
-        unix_wake(s->peer);
-        unix_poll_wake(s->peer);
-    }
 
     // Free pending connections in backlog.
     unix_pending_t* p = s->backlog_head;
@@ -319,16 +370,34 @@ void unix_sock_close(vfs_file_t* self) {
     // Unpublish from the namespace first so new ns_find() cannot observe
     // the sock after this point.  Readers that observed the sock in a
     // prior rcu_read_lock() are still safe until they drop out — we defer
-    // the actual teardown via call_rcu below.
+    // the actual teardown via call_rcu (in unix_put) below.
     if (s->path[0])
         ns_remove(s->path);
 
-    // Expedited: close() on an AF_UNIX socket — user-syscall latency.
-    // NB: the vfs_file_t `self` is NOT freed here.  Peers hold a raw
-    // back-pointer to it (peer->file) and dereference it for poll wakeups
-    // for as long as this RCU-deferred socket is observable, so its free is
-    // deferred to unix_sock_free_rcu (same grace period as the socket).
-    call_rcu_expedited(unix_sock_free_rcu, s);
+    // Notify the connected peer SYNCHRONOUSLY, before we can be freed.  A peer
+    // that pins us via unix_pin_peer relies on the back-pointer being cleared
+    // before the free, so it observes NULL (not dangling) once we are gone.
+    // Pin the peer so this mutation can't race its own free.  Only clear the
+    // back-pointer for a SYMMETRIC stream connection (peer->peer == s); a
+    // SOCK_DGRAM default-destination peer does not point back at us and must
+    // keep its own linkage.
+    unix_sock_t* peer = unix_pin_peer(s);
+    if (peer) {
+        if (peer->peer == s) {
+            peer->peer  = NULL;
+            peer->state = UNIX_STATE_DISCONNECTED;
+        }
+        unix_wake(peer);
+        unix_poll_wake(peer);
+        unix_put(peer);
+    }
+
+    // Drop the owning reference.  The socket (and its vfs_file_t `self`, per
+    // the F14 lifetime invariant) is freed via call_rcu once the last ref --
+    // including any transient peer pins -- is gone.  `self` is NOT freed here:
+    // peers reach it via peer->file for poll wakeups while the socket is still
+    // observable, so its free is deferred to unix_sock_free_rcu.
+    unix_put(s);
 }
 
 // ── unix_sock_ioctl ──────────────────────────────────────────────────────
@@ -375,6 +444,7 @@ vfs_file_t* unix_sock_open(int type) {
 
     s->type  = (uint8_t)sock_type;
     s->state = UNIX_STATE_UNCONNECTED;
+    s->refcount = 1;   // the owning vfs_file_t holds the first reference
 
     vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
     if (!f) { kfree(s); return NULL; }
@@ -531,6 +601,87 @@ void scm_rights_selftest(void) {
 fail:
     unix_sock_close(pair[0]);
     unix_sock_close(pair[1]);
+}
+
+// ── refcount / peer-pin selftest (T3 part B) ─────────────────────────────
+// Deterministic checks of the lifetime machinery that closes the peer-SOCK
+// use-after-free: the pure CAS-from-nonzero tryget, get/put balance on a live
+// socket, and unix_pin_peer returning the connected peer with a held ref.
+void unix_refcount_selftest(void) {
+    int fails = 0;
+
+    // 1. Pure tryget: bumps from non-zero, refuses to resurrect from zero.
+    uint32_t rc = 1;
+    if (unix_refcount_tryget(&rc) != 1 || rc != 2) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL tryget(1) rc=%lu\n",
+                       (unsigned long)rc);
+        fails++;
+    }
+    if (unix_refcount_tryget(&rc) != 1 || rc != 3) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL tryget(2) rc=%lu\n",
+                       (unsigned long)rc);
+        fails++;
+    }
+    rc = 0;
+    if (unix_refcount_tryget(&rc) != 0 || rc != 0) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL tryget(0) resurrected rc=%lu\n",
+                       (unsigned long)rc);
+        fails++;
+    }
+
+    // 2. get/put balance on a live socket (refcount starts at 1 = owner).
+    vfs_file_t* f = unix_sock_open(SOCK_STREAM);
+    if (!f) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL open\n");
+        kprintf_atomic("[unix_refcount-selftest] SELF-TEST FAILED\n");
+        return;
+    }
+    unix_sock_t* s = (unix_sock_t*)f->ctx;
+    if (s->refcount != 1) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL init rc=%lu\n",
+                       (unsigned long)s->refcount);
+        fails++;
+    }
+    unix_get(s);
+    if (s->refcount != 2) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL get rc=%lu\n",
+                       (unsigned long)s->refcount);
+        fails++;
+    }
+    unix_put(s);                 // back to 1 (owner) -- NOT freed
+    if (s->refcount != 1) {
+        kprintf_atomic("[unix_refcount-selftest] FAIL put rc=%lu\n",
+                       (unsigned long)s->refcount);
+        fails++;
+    }
+    unix_sock_close(f);          // drops the owner ref -> RCU free
+
+    // 3. pin_peer on a connected pair returns the peer with a held ref.
+    vfs_file_t* pair[2];
+    if (unix_sock_pair(SOCK_STREAM, pair) == 0) {
+        unix_sock_t* s0 = (unix_sock_t*)pair[0]->ctx;
+        unix_sock_t* s1 = (unix_sock_t*)pair[1]->ctx;
+        unix_sock_t* pinned = unix_pin_peer(s0);
+        if (pinned != s1 || s1->refcount != 2) {
+            kprintf_atomic("[unix_refcount-selftest] FAIL pin pinned=%p s1=%p rc=%lu\n",
+                           (void*)pinned, (void*)s1, (unsigned long)s1->refcount);
+            fails++;
+        }
+        if (pinned) unix_put(pinned);   // back to 1
+        if (s1->refcount != 1) {
+            kprintf_atomic("[unix_refcount-selftest] FAIL unpin rc=%lu\n",
+                           (unsigned long)s1->refcount);
+            fails++;
+        }
+        unix_sock_close(pair[0]);
+        unix_sock_close(pair[1]);
+    } else {
+        kprintf_atomic("[unix_refcount-selftest] FAIL pair alloc\n");
+        fails++;
+    }
+
+    kprintf_atomic(fails ? "[unix_refcount-selftest] SELF-TEST FAILED\n"
+                         : "[unix_refcount-selftest] PASS (tryget + get/put balance + pin_peer)\n");
 }
 
 // ── unix_sock_bind ───────────────────────────────────────────────────────
@@ -717,17 +868,24 @@ int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
     if (s->shutdown_wr) return -EPIPE;
 
     if (s->type == SOCK_STREAM) {
-        if (!s->peer) return -ENOTCONN;
-        if (s->peer->shutdown_rd) return -EPIPE;
+        // Pin the peer for the WHOLE call.  We cache and dereference `peer`
+        // (cbuf_write, the WAIT_EVENT_HOOK buf_count condition, the wakes)
+        // across a blocking sleep, so it must not be freed by a concurrent
+        // close mid-send.  The pin holds it alive; we still consult our own
+        // s->peer / s->state to detect a disconnect (close clears those).
+        unix_sock_t* peer = unix_pin_peer(s);
+        if (!peer) return -ENOTCONN;
+        if (peer->shutdown_rd) { unix_put(peer); return -EPIPE; }
 
-        // Write into the PEER's receive buffer.
-        unix_sock_t* peer = s->peer;
         uint32_t total = 0;
+        int ret;
 
         while (total < len) {
-            // If peer closed, EPIPE.
-            if (!s->peer || s->state == UNIX_STATE_DISCONNECTED)
-                return total > 0 ? (int)total : -EPIPE;
+            // If peer closed, EPIPE.  (close() clears s->peer + sets state.)
+            if (!s->peer || s->state == UNIX_STATE_DISCONNECTED) {
+                ret = total > 0 ? (int)total : -EPIPE;
+                goto stream_out;
+            }
 
             uint32_t wrote = cbuf_write(peer, (const uint8_t*)buf + total,
                                          len - total);
@@ -745,15 +903,24 @@ int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
             // commit-before-wake on the peer's recv drain side
             // (unix_sock_recv fires unix_wake(s->peer) after cbuf_read).
             if (total < len && peer->buf_count >= UNIX_BUF_SIZE) {
-                if ((f->flags & O_NONBLOCK) || nonblock)
-                    return total > 0 ? (int)total : -EAGAIN;
+                if ((f->flags & O_NONBLOCK) || nonblock) {
+                    ret = total > 0 ? (int)total : -EAGAIN;
+                    goto stream_out;
+                }
                 WAIT_EVENT_HOOK(&s->waitq,
-                                peer->buf_count < UNIX_BUF_SIZE,
-                                if (signal_has_actionable(&g_current->sigstate))
-                                    return total > 0 ? (int)total : -EINTR;);
+                                peer->buf_count < UNIX_BUF_SIZE
+                                    || !s->peer
+                                    || s->state == UNIX_STATE_DISCONNECTED,
+                                if (signal_has_actionable(&g_current->sigstate)) {
+                                    ret = total > 0 ? (int)total : -EINTR;
+                                    goto stream_out;
+                                });
             }
         }
-        return (int)total;
+        ret = (int)total;
+stream_out:
+        unix_put(peer);
+        return ret;
     }
 
     // SOCK_DGRAM: send to connected peer.
@@ -795,7 +962,11 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
         // Drain committed: now wake the peer so a blocked sender
         // observes the newly-freed space.  ACQ_REL on wake_all pairs
         // with the sender's subsequent rq_lock acquire in sched_sleep.
+        // rcu_read_lock keeps the peer alive for the wake against a
+        // concurrent close (RCU-deferred free + clear-before-free).
+        rcu_read_lock();
         if (s->peer) unix_wake(s->peer);
+        rcu_read_unlock();
 
         return (int)got;
     }
@@ -894,10 +1065,14 @@ int unix_sock_shutdown(vfs_file_t* f, int how) {
     if (how == 1 || how == 2) {
         s->shutdown_wr = 1;
         // Notify peer that we won't write anymore → they see EOF on recv.
-        if (s->peer) {
-            unix_wake(s->peer);
-            unix_poll_wake(s->peer);
+        // rcu_read_lock pins the peer against a concurrent close.
+        rcu_read_lock();
+        unix_sock_t* peer = s->peer;
+        if (peer) {
+            unix_wake(peer);
+            unix_poll_wake(peer);
         }
+        rcu_read_unlock();
     }
 
     return 0;
@@ -909,14 +1084,18 @@ int unix_sock_sendfd(vfs_file_t* sock, vfs_file_t* file, uint32_t rights) {
     if (!sock || !file) return -EINVAL;
     unix_sock_t* s = (unix_sock_t*)sock->ctx;
     if (!s) return -EBADF;
-    if (!s->peer) return -ENOTCONN;
 
-    unix_ancillary_t* anc = &s->peer->ancillary;
-    if (anc->count >= UNIX_ANCILLARY_MAX) return -ENOBUFS;
+    // Pin the peer for the whole body: we mutate its ancillary queue across a
+    // vfs_dup, so it must not be freed by a concurrent close mid-enqueue.
+    unix_sock_t* peer = unix_pin_peer(s);
+    if (!peer) return -ENOTCONN;
+
+    unix_ancillary_t* anc = &peer->ancillary;
+    if (anc->count >= UNIX_ANCILLARY_MAX) { unix_put(peer); return -ENOBUFS; }
 
     // Dup the file description and stamp attenuated rights.
     vfs_file_t* dup = vfs_dup(file);
-    if (!dup) return -ENOMEM;
+    if (!dup) { unix_put(peer); return -ENOMEM; }
     dup->rights = rights;
 
     uint8_t idx = anc->tail;
@@ -926,9 +1105,10 @@ int unix_sock_sendfd(vfs_file_t* sock, vfs_file_t* file, uint32_t rights) {
     anc->count++;
 
     // Wake peer in case it's blocked in recvfd or poll.
-    unix_wake(s->peer);
-    unix_poll_wake(s->peer);
+    unix_wake(peer);
+    unix_poll_wake(peer);
 
+    unix_put(peer);
     return 0;
 }
 
