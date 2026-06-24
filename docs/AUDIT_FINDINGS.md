@@ -28,18 +28,23 @@ IRQ side already uses (irqsave also masks the same-CPU IRQ, so no deadlock).
 **Confirmation:** code-level (the single-owner contract is violated); existing
 `chaselev_selftest` still PASSES and SMP boot is healthy post-fix.
 
-## TODO — confirmed, high severity
+### F3. dcache resurrect-from-zero UAF (`kernel/fs/dcache.c`) — commit pending
+`dcache_lookup` bumped `refcount` 0->1 with a bare `__atomic_fetch_add` (no
+tryget) while the shrinker freed `refcount == 0` dentries under `g_dcache_wlock`.
+A lookup resurrecting (0->1) a dentry between the shrinker's refcount read and
+its free left a freed slot referenced / on the LRU -> UAF (and, via
+SLAB_TYPESAFE_BY_RCU slot reuse, a stale `child_ino` read). Here `refcount==0`
+is the *normal alive* state, so the fix is NOT a plain `vfs_tryget`; it is a
+`DCACHE_REF_DYING` sentinel that makes "claim for free" and "resurrect" mutually
+exclusive on the refcount word: the shrinker CAS `0 -> DYING` (skips on fail),
+and `dcache_lookup` CAS-bumps from any non-DYING value (treats DYING as a miss).
+**Test:** `dcache_race_selftest` (`SELFTESTS=1`) stresses lookers + shrinker +
+reinstalls and asserts no looked-up dentry yields a corrupted `child_ino` —
+PASSES post-fix with no fault. The race window is tiny (the bump must slip
+between the shrinker's refcount read and the free), so the stress test is a
+regression guard; the primary confirmation is the TOCTOU code proof.
 
-### T1. dcache resurrect-from-zero UAF (`kernel/fs/dcache.c:236` vs `:467`)
-`dcache_lookup` bumps `refcount` 0->1 with a bare `__atomic_fetch_add`, no
-tryget. The shrinker reads `refcount == 0` under `g_dcache_wlock` and frees
-(RCU-deferred). A lookup that resurrects a dentry the shrinker already committed
-to free returns a pointer that gets freed after the grace period -> UAF +
-refcount underflow in `dcache_put`. NOTE: unlike the fd path, here `refcount==0`
-is the *normal alive* state, so the fix is NOT a plain `vfs_tryget` (which fails
-from 0). Needs a DYING sentinel: shrinker CAS `0 -> DYING` (skip on fail);
-lookup CAS-bumps from any non-DYING value (treat DYING as a miss). Highest
-reachability (refcount-0-while-hashed is every warm cache hit).
+## TODO — confirmed, high severity
 
 ### T2. CoW/fork PTE + refcount race (`kernel/mm/vmm.c` ~543-563 vs ~682-716)
 `vmm_clone_user_ex` writes the parent PTE (drop WRITABLE) + `pmm_ref_inc`

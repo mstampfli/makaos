@@ -467,6 +467,13 @@ static void init_kthread(void) {
     extern void dcache_selftest(void);
     dcache_selftest();
 
+    // Audit fix T1: dcache_lookup resurrected refcount-0 dentries the
+    // shrinker had committed to free (lock-free bump vs free TOCTOU) -> UAF.
+    // Stress lookers + shrinker + reinstalls on a shared key set; asserts no
+    // looked-up dentry yields a corrupted child_ino (freed-slot reuse).
+    extern void dcache_race_selftest(void);
+    dcache_race_selftest();
+
     // Phase 8D: io_uring kernel-side acceptance — NOP pipeline +
     // ns/op steady-state measurement.  Userland test binary lives
     // at /bin/test_io_uring for interactive testing.

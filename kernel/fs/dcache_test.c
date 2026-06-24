@@ -15,6 +15,9 @@
 #include "ext2.h"
 #include "common.h"
 #include "kprintf.h"
+#include "sched.h"
+#include "process.h"
+#include "smp.h"
 
 extern uint64_t tsc_read_ns(void);
 
@@ -125,4 +128,98 @@ void dcache_selftest(void) {
         return;
     }
     kprintf("[dcache_test] SELF-TEST PASSED\n");
+}
+
+// ── Audit T1: dcache resurrect-from-zero race regression test ───────────
+//
+// dcache_lookup bumps refcount lock-free; the shrinker frees refcount-0
+// dentries.  Before the DCACHE_REF_DYING CAS fix, a lookup could resurrect
+// (0 -> 1) a dentry the shrinker had already committed to free from its 0
+// snapshot, leaving a freed slot referenced / on the LRU -> use-after-free,
+// and (via SLAB_TYPESAFE_BY_RCU slot reuse) a looker could read a stale
+// child_ino out of a recycled slot.  This stresses lookers + a shrinker +
+// reinstalls over a small shared key set on live SMP and asserts no looked-up
+// dentry ever yields a child_ino other than the value it was installed with.
+
+#define DRT_KEYS     16u
+#define DRT_ITERS    50000u
+#define DRT_LOOKERS  2u
+#define DRT_PINO     900000u
+
+static char              s_drt_name[DRT_KEYS][8];
+static uint32_t          s_drt_hash[DRT_KEYS];
+static volatile uint32_t s_drt_lookers_done;
+static volatile uint32_t s_drt_corrupt;
+static volatile uint32_t s_drt_stop;
+
+static inline uint32_t drt_cino(uint32_t k) { return 500000u + k; }
+
+static void drt_install_one(uint32_t k) {
+    dentry_t* d = dcache_install(NULL, DRT_PINO, s_drt_name[k], 4,
+                                 s_drt_hash[k], drt_cino(k));
+    if (d) dcache_put(d);
+}
+
+static void drt_looker_thread(void) {
+    uint32_t seed = (uint32_t)(uintptr_t)g_current | 1u;
+    for (uint32_t i = 0; i < DRT_ITERS &&
+             !__atomic_load_n(&s_drt_stop, __ATOMIC_ACQUIRE); i++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;  // xorshift
+        uint32_t k = seed % DRT_KEYS;
+        dentry_t* d = dcache_lookup(DRT_PINO, s_drt_name[k], 4, s_drt_hash[k]);
+        if (d) {
+            uint32_t ci = __atomic_load_n(&d->child_ino, __ATOMIC_RELAXED);
+            if (ci != drt_cino(k))
+                __atomic_fetch_add(&s_drt_corrupt, 1u, __ATOMIC_RELAXED);
+            dcache_put(d);
+        } else {
+            drt_install_one(k);   // keep the key set populated
+        }
+    }
+    __atomic_fetch_add(&s_drt_lookers_done, 1u, __ATOMIC_RELEASE);
+    g_current->state = TASK_DEAD;
+    sched_yield();
+    for (;;) __asm__ volatile("hlt");
+}
+
+void dcache_race_selftest(void) {
+    kprintf("[dcache_race] starting: %u lookers + shrinker, keys=%u iters=%u\n",
+            DRT_LOOKERS, DRT_KEYS, DRT_ITERS);
+    __atomic_store_n(&s_drt_lookers_done, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_drt_corrupt, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_drt_stop, 0u, __ATOMIC_RELEASE);
+
+    for (uint32_t k = 0; k < DRT_KEYS; k++) {
+        s_drt_name[k][0] = 'r'; s_drt_name[k][1] = 't';
+        s_drt_name[k][2] = (char)('0' + (k / 10));
+        s_drt_name[k][3] = (char)('0' + (k % 10));
+        s_drt_name[k][4] = '\0';
+        s_drt_hash[k] = dcache_name_hash(s_drt_name[k], 4);
+        drt_install_one(k);
+    }
+
+    for (uint32_t i = 0; i < DRT_LOOKERS; i++) {
+        task_t* t = task_create_kthread(drt_looker_thread, pid_alloc());
+        if (t) sched_add(t);
+    }
+
+    // This thread hammers the shrinker concurrently with the lookers.
+    for (uint32_t i = 0; i < DRT_ITERS; i++) {
+        dcache_shrink(4);
+        if (__atomic_load_n(&s_drt_lookers_done, __ATOMIC_ACQUIRE) == DRT_LOOKERS)
+            break;
+    }
+    __atomic_store_n(&s_drt_stop, 1u, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&s_drt_lookers_done, __ATOMIC_ACQUIRE) != DRT_LOOKERS)
+        cpu_relax();
+
+    uint32_t corrupt = __atomic_load_n(&s_drt_corrupt, __ATOMIC_ACQUIRE);
+    dcache_shrink(0xFFFFFFFFu);   // final reclaim — must not fault on a freed slot
+    kprintf("[dcache_race] child_ino corruptions observed: %u\n", corrupt);
+    if (corrupt == 0) {
+        kprintf("[dcache_race] SELF-TEST PASSED (no resurrect-from-zero reuse)\n");
+    } else {
+        kprintf("[dcache_race] SELF-TEST FAILED (%u corruptions)\n", corrupt);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 }

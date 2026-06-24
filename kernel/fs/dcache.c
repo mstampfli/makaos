@@ -212,6 +212,11 @@ static inline void lru_push_head_locked(dentry_t* d) {
 
 // ── Lookup (hot path) ───────────────────────────────────────────────
 
+// Sentinel refcount value meaning "the shrinker has claimed this dentry for
+// free; do not resurrect it."  refcount is otherwise a small holder count
+// (0 = reclaimable), so the top of the range is safe to reserve.
+#define DCACHE_REF_DYING 0xFFFFFFFFu
+
 dentry_t* dcache_lookup(uint32_t parent_ino, const char* name,
                          uint32_t name_len, uint32_t name_hash) {
     rcu_read_lock();
@@ -229,11 +234,24 @@ dentry_t* dcache_lookup(uint32_t parent_ino, const char* name,
             d->name_hash  == name_hash  &&
             d->name_len   == name_len   &&
             dname_eq(d, name, name_len)) {
-            // Hit.  Bump refcount so the caller keeps it alive after
-            // rcu_read_unlock.  atomic_fetch_add is cheap; only
-            // contested if many CPUs simultaneously look up the
-            // same path (bash startup etc), and even then no lock.
-            __atomic_fetch_add(&d->refcount, 1u, __ATOMIC_ACQ_REL);
+            // Hit.  Bump refcount via CAS so we never resurrect a dentry
+            // the shrinker has already claimed for free (refcount ==
+            // DCACHE_REF_DYING).  A bare fetch_add could raise 0->1 on a
+            // dentry the shrinker decided to free from its 0 snapshot,
+            // leaving it referenced / on the LRU yet queued for RCU free
+            // -> use-after-free.  The CAS makes "claim for free" (shrinker)
+            // and "resurrect" (here) mutually exclusive on the refcount.
+            uint32_t rc = __atomic_load_n(&d->refcount, __ATOMIC_ACQUIRE);
+            while (rc != DCACHE_REF_DYING &&
+                   !__atomic_compare_exchange_n(&d->refcount, &rc, rc + 1u, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                ;  // cmpxchg reloads rc on failure; retry
+            if (rc == DCACHE_REF_DYING) {
+                // Being reclaimed — skip it and keep walking the chain
+                // (a fresh dentry for the same key may have been installed).
+                d = (dentry_t*)rcu_dereference(d->hash_next);
+                continue;
+            }
 
             // Update LRU age — relaxed store, pure hint.  Not a
             // full LRU bump (which requires g_dcache_wlock); the
@@ -461,10 +479,14 @@ uint32_t dcache_shrink(uint32_t max) {
     dcache_table_t* tbl = g_dcache_table;
     while (evicted < max && g_dcache_lru_head) {
         dentry_t* d = g_dcache_lru_head;
-        // Refcount could have been bumped between put and shrink;
-        // re-check.  If > 0, skip (pull off LRU — it shouldn't
-        // be there if refcount went up, but be defensive).
-        if (__atomic_load_n(&d->refcount, __ATOMIC_ACQUIRE) != 0) {
+        // Claim the dentry for free by CAS'ing refcount 0 -> DYING.  This
+        // is the serialization point with the lock-free dcache_lookup: if a
+        // looker resurrected it (CAS'd 0 -> 1) first, our CAS fails and we
+        // just pull it off the LRU and skip -- never freeing a dentry a
+        // looker holds (which would leave a freed slot on the LRU / hash).
+        uint32_t expect = 0;
+        if (!__atomic_compare_exchange_n(&d->refcount, &expect, DCACHE_REF_DYING,
+                                         0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             lru_unlink_locked(d);
             continue;
         }
