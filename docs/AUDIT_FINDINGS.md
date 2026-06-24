@@ -173,10 +173,13 @@ extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
 - **ELF e_phoff integer overflow** -> FIXED (F12): extracted overflow-safe
   elf_phtab_in_bounds(e_phoff,phnum,size) (offset>size catches the wrap, then a
   remainder check) + elf_phtab_bounds_selftest (the -56 wrap + boundary cases) ->
-  PASSED; valid ELFs (login/svcmgr) still load. STILL OPEN follow-up (DoS-leaning,
-  not a kernel write): p_vaddr not range-checked + seg_end overflow (elf.c:157)
-  can make seg_end<seg_start -> bogus/empty VMA; harden the PT_LOAD vaddr+memsz
-  range to the user half. (original:) (`kernel/proc/elf.c:43`): the sole guard
+  PASSED; valid ELFs (login/svcmgr) still load. Follow-up -> FIXED (F13):
+  p_vaddr not range-checked + seg_end overflow (elf.c:157) could make
+  seg_end<seg_start -> bogus/empty VMA, or a kernel-half/non-canonical base ->
+  an un-faultable mapping; added pure elf_seg_range_ok(vaddr,bias,memsz,user_top)
+  rejecting overflow + base>=user_top + base+memsz past user_top, called per
+  PT_LOAD before seg_start/seg_end; covered by the extended elf self-test.
+  (original:) (`kernel/proc/elf.c:43`): the sole guard
   `e_phoff + phnum*56 > size` overflows; e_phoff=-56 wraps to 0 (<= size) ->
   program-header reads land 56 bytes before hdr_buf (OOB heap read driving
   segment VA/offset decisions). Fix: overflow-safe bounds (pure helper

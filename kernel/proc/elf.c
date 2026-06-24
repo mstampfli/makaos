@@ -31,6 +31,21 @@ int elf_phtab_in_bounds(uint64_t e_phoff, uint16_t e_phnum, uint64_t size) {
     return 1;
 }
 
+// Returns 1 if a PT_LOAD segment [vaddr+load_bias, +memsz) lies fully within
+// [0, user_top) with no 64-bit overflow; 0 otherwise.  The mapping code below
+// computes `(p_vaddr + load_bias + p_memsz + PAGE_MASK)`, which can overflow
+// (seg_end < seg_start -> a bogus/empty VMA), and never range-checked p_vaddr
+// (a kernel-half / non-canonical VA -> an un-faultable mapping).  Pure +
+// bounds-only so it is unit-testable.
+int elf_seg_range_ok(uint64_t vaddr, uint64_t load_bias,
+                     uint64_t memsz, uint64_t user_top) {
+    uint64_t vbase = vaddr + load_bias;
+    if (vbase < vaddr) return 0;             // vaddr + load_bias overflow
+    if (vbase >= user_top) return 0;         // base in kernel / non-canonical half
+    if (memsz > user_top - vbase) return 0;  // base + memsz past user_top (overflow-safe)
+    return 1;
+}
+
 #ifdef MAKAOS_BOOT_SELFTESTS
 // Deterministic test of the phdr-table bounds.  The 0xFFFF...C8 (-56) row is
 // the exact overflow the old `e_phoff + phnum*56 > size` check got wrong: it
@@ -57,8 +72,33 @@ void elf_phtab_bounds_selftest(void) {
             fails++;
         }
     }
+
+    // PT_LOAD segment-range bounds.  The overflow rows are the exact cases the
+    // old un-checked `(p_vaddr + load_bias + p_memsz + PAGE_MASK)` would wrap.
+    const uint64_t TOP = VMM_USER_STACK_TOP;
+    struct { uint64_t va; uint64_t bias; uint64_t msz; int want; } s[] = {
+        { 0x400000,            0,                TOP,        0 },  // memsz spans whole user half -> past top
+        { 0x400000,            0,                0x1000,     1 },  // normal fixed-load segment
+        { 0x1000,              0x555555554000,   0x2000,     1 },  // PIE load_bias, fits
+        { 0xFFFF800000000000,  0,                0x1000,     0 },  // base in the kernel half
+        { 0xFFFFFFFFFFFFF000,  0x2000,           0x1000,     0 },  // vaddr + bias wraps past 2^64
+        { TOP - 0x1000,        0,                0x1000,     1 },  // last user page, exact fit
+        { TOP,                 0,                1,          0 },  // base == top (one past the ceiling)
+        { TOP - 1,             0,                1,          1 },  // one byte below top, fits
+        { TOP - 0x1000,        0,                0x1001,     0 },  // one byte past top
+    };
+    for (unsigned i = 0; i < sizeof(s) / sizeof(s[0]); i++) {
+        int got = elf_seg_range_ok(s[i].va, s[i].bias, s[i].msz, TOP);
+        if (got != s[i].want) {
+            kprintf("[elf_test] FAIL seg va=0x%lx bias=0x%lx msz=0x%lx got=%d want=%d\n",
+                    (unsigned long)s[i].va, (unsigned long)s[i].bias,
+                    (unsigned long)s[i].msz, got, s[i].want);
+            fails++;
+        }
+    }
+
     kprintf(fails ? "[elf_test] SELF-TEST FAILED\n"
-                  : "[elf_test] SELF-TEST PASSED (phdr table bounds, no overflow)\n");
+                  : "[elf_test] SELF-TEST PASSED (phdr table + segment range bounds)\n");
 }
 #endif
 
@@ -146,6 +186,18 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                                                     + (uint64_t)i * sizeof(Elf64_Phdr));
         if (ph->p_type != PT_LOAD) continue;
         if (ph->p_memsz == 0)      continue;
+
+        // Reject a segment whose [vaddr+bias, +memsz) overflows or escapes the
+        // user half BEFORE deriving seg_start/seg_end (whose rounding can wrap
+        // to seg_end < seg_start -> a bogus/empty VMA, or land in the kernel
+        // half -> an un-faultable mapping).
+        if (!elf_seg_range_ok(ph->p_vaddr, load_bias,
+                              ph->p_memsz, VMM_USER_STACK_TOP)) {
+            mm_destroy(mm);
+            vmm_free_user(pml4);
+            pmm_buddy_free(pml4, 0);
+            return 0;
+        }
 
         // Convert ELF flags to VMA flags.
         uint32_t prot_flags = 0;
