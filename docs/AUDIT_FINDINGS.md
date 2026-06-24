@@ -351,11 +351,18 @@ cleanliness one (sys_select) this pass; the other four are the refreshed backlog
   real NIC); QEMU SLIRP is trusted today, so this is robustness/hardening.
 
 - **DRM create_dumb pitch 32-bit overflow** (`kernel/drivers/video/drm.c:486`
-  drm_ioctl_create_dumb) -> OPEN. `pitch = a.width * 4` is a 32-bit multiply
-  (the uint64_t cast on the next line is too late); width=0x40000000 -> pitch
-  wraps to 0 -> tiny backing allocation while resource_create gets the full huge
-  width/height -> undersized buffer, host-side OOB on transfer/flush. Only gate is
-  width/height nonzero; the advertised max_width=8192 is never enforced. Reachable
-  by any process opening /dev/dri/card0 (compositors). Fix: pure
-  drm_dumb_size(w,h,bpp,&pitch,&size) doing 64-bit math + a DRM_MAX_FB_DIM cap,
-  -EINVAL on overflow/oversize. Deterministically testable. Confidence HIGH.
+  drm_ioctl_create_dumb) -> FIXED (F23). `pitch = a.width * 4` was a 32-bit
+  multiply (the uint64_t cast on the next line too late); width=0x40000000 ->
+  pitch wraps to 0 -> tiny backing allocation while resource_create gets the full
+  huge width/height -> undersized buffer, host-side OOB on transfer/flush. Only
+  gate was width/height nonzero; the advertised max_width=8192 was never enforced.
+  Reachable by any process opening /dev/dri/card0 (compositors). Fixed with a pure
+  helper drm_dumb_size(w,h,bpp,&pitch,&size) doing all multiplies in 64-bit +
+  rejecting bpp!=32, zero dims, and dims > DRM_MAX_FB_DIM (16384, above the
+  advertised 8192 so a well-behaved compositor never trips it; keeps pitch<=65536
+  in u32 and size in u64); replaced the inline computation (and the now-redundant
+  nonzero/bpp checks) with it. The cursor path (drm.c) already did the analogous
+  (uint64_t)w*h*4 check correctly (precedent). Deterministic drm_dumb_size_selftest
+  (1920x1080 -> pitch 7680 size 8294400; 1x1; MAX x MAX -> 65536 / 2^30; 0x40000000
+  & 0x40000001 -> -EINVAL [the overflow rows]; zero w/h; bpp 24; MAX+1 -> -EINVAL).
+  Boot still fork-execs /bin/login and the compositor create_dumb path works.

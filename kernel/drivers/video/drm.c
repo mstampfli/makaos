@@ -474,17 +474,43 @@ typedef struct {
     uint64_t size;
 } drm_mode_create_dumb_t;
 
+// Maximum dumb-buffer width/height.  Caps w*(bpp/8) <= 65536 (fits u32 pitch
+// with room) and w*h*(bpp/8) well within u64, so the size math below cannot
+// overflow.  Generous: above the advertised GETRESOURCES max (8192), so a
+// well-behaved compositor never trips it.
+#define DRM_MAX_FB_DIM 16384u
+
+// Compute pitch (bytes/row) and total byte size for a dumb buffer with all
+// multiplies in 64-bit, rejecting unsupported bpp, zero/oversized dimensions,
+// and any overflow.  Returns 0 + fills *pitch/*size on success, -EINVAL else.
+// Pure -> unit-tested (drm_dumb_size_selftest).  Fixes the prior
+// `uint32_t pitch = width * 4` which overflowed in 32-bit BEFORE the cast,
+// yielding a tiny backing buffer for a huge resource (host OOB on transfer).
+static int drm_dumb_size(uint32_t w, uint32_t h, uint32_t bpp,
+                         uint32_t* pitch, uint64_t* size) {
+    if (!w || !h || bpp != 32)                    return -EINVAL;
+    if (w > DRM_MAX_FB_DIM || h > DRM_MAX_FB_DIM)  return -EINVAL;
+    uint64_t p = (uint64_t)w * (bpp / 8u);   // 64-bit: no truncation
+    uint64_t s = p * (uint64_t)h;
+    *pitch = (uint32_t)p;                    // safe: p <= 16384*4 = 65536
+    *size  = s;
+    return 0;
+}
+
 static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
     const drm_backend_ops_t* b = __atomic_load_n(&drm_backend, __ATOMIC_ACQUIRE);
     if (!b) return -ENODEV;
 
     drm_mode_create_dumb_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    if (!a.width || !a.height) return -EINVAL;
-    if (a.bpp != 32)           return -EINVAL;
 
-    uint32_t pitch = a.width * 4;
-    uint64_t size  = (uint64_t)pitch * a.height;
+    // Validate dimensions + compute pitch/size with overflow-safe 64-bit math
+    // (rejects zero/oversized w/h and bpp != 32).  a.width/height come straight
+    // from copy_from_user, so this is the gate that keeps the backing allocation
+    // consistent with the width/height handed to resource_create below.
+    uint32_t pitch;
+    uint64_t size;
+    if (drm_dumb_size(a.width, a.height, a.bpp, &pitch, &size) != 0) return -EINVAL;
     uint64_t pages = (size + 4095) / 4096;
     uint8_t  order = 0;
     while (((uint64_t)1 << order) < pages) order++;
@@ -2599,4 +2625,39 @@ int drm_ring_atomic(vfs_file_t* drm_fd_file, uint64_t atomic_ptr) {
 uint64_t drm_get_charged_bytes(struct task_t* t) {
     if (!t) return 0;
     return __atomic_load_n(&t->drm_bytes_charged, __ATOMIC_ACQUIRE);
+}
+
+// ── drm_dumb_size selftest ────────────────────────────────────────────────
+// Deterministic check of the overflow-safe dumb-buffer size math.  The 0x4000-
+// 0000 / 0x40000001 rows are exactly the 32-bit `width * 4` overflow the old
+// code hit (pitch wrapped to 0 / 4 for a billion-pixel-wide resource).
+void drm_dumb_size_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    uint32_t pitch; uint64_t size;
+    struct { uint32_t w, h, bpp; int eret; uint32_t epitch; uint64_t esize; } c[] = {
+        { 1920, 1080, 32,  0, 7680, 8294400ULL },     // normal: pitch 1920*4, size *1080
+        { 1,    1,    32,  0, 4,    4ULL },            // minimal
+        { DRM_MAX_FB_DIM, DRM_MAX_FB_DIM, 32, 0, 65536u, 1073741824ULL }, // max ok: 16384*4=65536, *16384=2^30
+        { 0x40000000u, 1, 32, -EINVAL, 0, 0 },         // 32-bit width*4 overflow -> reject
+        { 0x40000001u, 1, 32, -EINVAL, 0, 0 },         // pitch would wrap to 4 -> reject
+        { 0,    1080, 32, -EINVAL, 0, 0 },             // zero width
+        { 1920, 0,    32, -EINVAL, 0, 0 },             // zero height
+        { 1920, 1080, 24, -EINVAL, 0, 0 },             // unsupported bpp
+        { DRM_MAX_FB_DIM + 1u, 1, 32, -EINVAL, 0, 0 }, // one past the dim cap
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        pitch = 0xDEADu; size = 0xDEADULL;
+        int r = drm_dumb_size(c[i].w, c[i].h, c[i].bpp, &pitch, &size);
+        int ok = (r == c[i].eret) &&
+                 (r != 0 || (pitch == c[i].epitch && size == c[i].esize));
+        if (!ok) {
+            kprintf("[drm_dumb] FAIL i=%u r=%d pitch=%lu size=%lu\n",
+                    i, r, (unsigned long)pitch, (unsigned long)size);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[drm_dumb] SELF-TEST FAILED\n"
+                  : "[drm_dumb] SELF-TEST PASSED (overflow-safe dumb size)\n");
 }

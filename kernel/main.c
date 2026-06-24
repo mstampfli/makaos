@@ -562,6 +562,10 @@ static void init_kthread(void) {
     // Happy path + two error-path probes.
     extern void drm_mock_selftest(void);
     drm_mock_selftest();
+
+    // DRM create_dumb pitch/size overflow-safe math (32-bit width*4 overflow).
+    extern void drm_dumb_size_selftest(void);
+    drm_dumb_size_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference
