@@ -153,6 +153,28 @@ VERIFIED DESIGN NOTES (from a deep read this pass, to de-risk the dedicated run)
     state-transition races as a smaller separate item; that is the recommended
     first decomposition. Also add an underflow clamp to `txbuf_used -= acked`
     (defense-in-depth; deterministically unit-testable as a pure helper).
+  - NEW CONSTRAINTS found this pass that REVISE the lock design (must be honored
+    by the dedicated run):
+      * `spin_lock` does NOT disable preemption (plain test-and-set, smp.h), so a
+        per-PCB lock taken from BOTH syscall (tcp_send/recv_data) and kthread
+        (net_rx/timer) contexts MUST use `spin_lock_irqsave` (like s_pcb_wlock) or
+        a preempted holder + same-CPU spinner deadlocks.
+      * `virtio_net_tx` (virtio_net.c:387) does a SYNCHRONOUS POLLING WAIT for tx
+        completion (up to 10M `cpu_relax` spins) while holding `s_tx_lock`. So the
+        earlier "the lock CAN wrap tcp_send_segment" note is WRONG for an irqsave
+        lock: holding pcb->lock with IRQs OFF across tcp_send_segment -> ipv4_send
+        -> virtio_net_tx would keep IRQs disabled for a whole tx poll (ms-scale).
+        => the per-PCB lock must guard ONLY the field RMWs; the transmit must
+        happen OUTSIDE the lock. That requires splitting tcp_send_segment into a
+        locked seq-advance (snapshot snd_nxt, advance it, arm rto) + an unlocked
+        build-and-transmit -- a refactor of its ~8 callers. This is why the full
+        lock is a dedicated, careful iteration, not a one-turn change.
+  - DONE this pass (F18, defense-in-depth, NOT the lock): the underflow clamp is
+    landed as a pure shared helper `tcp_ring_consume(head,used,n,mask)` (clamps n
+    to *used) used at the txbuf ACK drain and the rxbuf read drain, with a
+    deterministic tcp_ring_consume_selftest. This bounds the race's WORST outcome
+    (txbuf_used/rxbuf_used underflow -> producer wedge) to a transient
+    mis-account. The per-PCB lock itself remains OPEN.
 
 ### F5. signal_send non-atomic RMW of sigstate.blocked (`kernel/proc/signal.c`) — FIXED, commit pending
 `signal_send`'s `t->sigstate.blocked &= ~bit` (SIGKILL unblock) was a non-atomic

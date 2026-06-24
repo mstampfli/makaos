@@ -532,6 +532,10 @@ static void init_kthread(void) {
     extern void signal_send_pid_selftest(void);
     signal_send_pid_selftest();
 
+    // TCP ring-drain arithmetic + underflow clamp (T4 defense-in-depth).
+    extern void tcp_ring_consume_selftest(void);
+    tcp_ring_consume_selftest();
+
     // Tier 2.5a (virtio-gpu): pipeline exerciser was overriding the
     // UEFI GOP framebuffer with a self-test banner, hiding the TTY
     // from the SDL window under `-vga none -device virtio-vga`.  The

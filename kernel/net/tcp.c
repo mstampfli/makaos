@@ -120,6 +120,23 @@ static uint32_t seq32(void) {
 #define SEQ_GT(a,b)  ((int32_t)((a)-(b)) > 0)
 #define SEQ_GE(a,b)  ((int32_t)((a)-(b)) >= 0)
 
+// Consume `n` bytes from the read side of a tx/rx ring: advance *head (masked)
+// and decrement *used, CLAMPING n to *used so an over-consume can never
+// underflow the count.  Single source of truth for both the txbuf ACK drain
+// and the rxbuf read drain.  Defense-in-depth: a raced ACK accounting update
+// (T4 -- snd_una/txbuf_used RMW'd from another CPU with no per-PCB lock yet) or
+// a malformed segment could otherwise make `n` exceed *used, underflowing it to
+// ~4e9 -- which wedges the producer's `while used >= SIZE` wait or drives a wild
+// length.  Clamping bounds the worst case to a transient mis-account.  Pure ->
+// unit-tested (tcp_ring_consume_selftest).  Returns the bytes actually consumed.
+static uint32_t tcp_ring_consume(uint32_t* head, uint32_t* used,
+                                 uint32_t n, uint32_t mask) {
+    if (n > *used) n = *used;            // clamp: never underflow the count
+    *head = (*head + n) & mask;
+    *used -= n;
+    return n;
+}
+
 // Wake any task blocked on this PCB: the blocking waiter (in recv/send/
 // connect/accept) and any poll()/select() waiter camped on the socket fd.
 // Both are fire-and-forget — a blocking task might be sleeping in recv
@@ -380,8 +397,8 @@ void tcp_recv(skbuff_t* skb) {
         if ((flags & TCP_ACK) && SEQ_GT(ack, pcb->snd_una) &&
             SEQ_LE(ack, pcb->snd_nxt)) {
             uint32_t acked = ack - pcb->snd_una;
-            pcb->txbuf_head  = (pcb->txbuf_head + acked) & TCP_TXBUF_MASK;
-            pcb->txbuf_used -= acked;
+            tcp_ring_consume(&pcb->txbuf_head, &pcb->txbuf_used,
+                             acked, TCP_TXBUF_MASK);
             pcb->snd_una     = ack;
             pcb->snd_wnd     = ntoh16(seg->window);
             if (pcb->snd_una == pcb->snd_nxt) pcb->rto_deadline = 0;
@@ -682,8 +699,8 @@ int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len, int nonblock) {
     uint32_t copy  = len < avail ? len : avail;
     for (uint32_t i = 0; i < copy; i++)
         dst[i] = pcb->rxbuf[(pcb->rxbuf_head + i) & TCP_RXBUF_MASK];
-    pcb->rxbuf_head  = (pcb->rxbuf_head + copy) & TCP_RXBUF_MASK;
-    pcb->rxbuf_used -= copy;
+    // Drain via the shared clamped helper (never underflow rxbuf_used).
+    tcp_ring_consume(&pcb->rxbuf_head, &pcb->rxbuf_used, copy, TCP_RXBUF_MASK);
     pcb->rcv_wnd    += copy;
     // Send window update ACK so the peer can resume sending.
     tcp_send_segment(pcb, TCP_ACK, NULL, 0);
@@ -734,4 +751,33 @@ uint16_t tcp_ephemeral_port(void) {
     uint16_t p = s_eph_port;
     s_eph_port = (uint16_t)(s_eph_port == 65535u ? 49152u : s_eph_port + 1u);
     return p;
+}
+
+// ── tcp_ring_consume selftest ─────────────────────────────────────────────
+// Deterministic check of the tx/rx ring drain arithmetic + the underflow
+// clamp that bounds the worst case of the (still-open) T4 PCB data race.
+void tcp_ring_consume_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t head0, used0, n, mask, ehead, eused, eret; } c[] = {
+        // head, used, n, mask=0xFF (256-byte ring) -> expected head/used/ret
+        {   0, 100,  30, 0xFFu,  30,  70, 30 },  // normal drain
+        { 250, 100,  20, 0xFFu,  14,  80, 20 },  // head wraps: (250+20)&255 = 14
+        {   0,  10,  50, 0xFFu,  10,   0, 10 },  // OVER-consume -> clamp to used, no underflow
+        {   5,   5,   5, 0xFFu,  10,   0,  5 },  // exact drain to empty
+        {  64,   0,  17, 0xFFu,  64,   0,  0 },  // already empty -> consume 0, no underflow
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t head = c[i].head0, used = c[i].used0;
+        uint32_t ret = tcp_ring_consume(&head, &used, c[i].n, c[i].mask);
+        if (head != c[i].ehead || used != c[i].eused || ret != c[i].eret) {
+            kprintf("[tcp_ring] FAIL i=%u head=%lu(want %lu) used=%lu(want %lu) ret=%lu(want %lu)\n",
+                    i, (unsigned long)head, (unsigned long)c[i].ehead,
+                    (unsigned long)used, (unsigned long)c[i].eused,
+                    (unsigned long)ret, (unsigned long)c[i].eret);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[tcp_ring] SELF-TEST FAILED\n"
+                  : "[tcp_ring] SELF-TEST PASSED (ring drain + underflow clamp)\n");
 }
