@@ -74,9 +74,12 @@ build() {
 # glyph lookup through FreeType's cmap (the proven-good path) by attaching
 # hb_ft funcs to the shaping font.  Idempotent (marker-gated).
 patch_pango() {
+    # ── Patch 1: FreeType-backed shaping (pangofc-font.c) ─────────────────
     local f="$PANGO_SRC/pango/pangofc-font.c"
-    grep -q "shape via FreeType cmap" "$f" 2>/dev/null && { log "already patched"; return 0; }
-    python3 - "$f" <<'PY'
+    if grep -q "shape via FreeType cmap" "$f" 2>/dev/null; then
+        log "pangofc-font.c already patched"
+    else
+        python3 - "$f" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
@@ -92,7 +95,42 @@ assert needle in s, "port-pango: hb_font_create anchor not found"
 s = s.replace(needle, ins, 1)
 open(p, 'w').write(s)
 PY
-    log "patched pangofc-font.c → FreeType-backed shaping"
+        log "patched pangofc-font.c → FreeType-backed shaping"
+    fi
+
+    # ── Patch 2: initialize PangoLayoutRun offsets (taskbar height fix) ────
+    # insert_run() does g_slice_new (no zeroing) and only sets ->item/->glyphs;
+    # ->y_offset/->start_x_offset/->end_x_offset are otherwise set ONLY by
+    # apply_baseline_shift(), which runs only for baseline-shifted text.  For
+    # ordinary runs y_offset was read uninitialized (y_offset = run->y_offset),
+    # so the line logical-extent height accumulated a junk value -> swaybar's
+    # bar height blew up to ~10000px and the taskbar never mapped.  Latent
+    # upstream (relies on malloc returning zeroed memory); exposed by MakaOS's
+    # dirty free-list reuse.  Zero them at creation.
+    local g="$PANGO_SRC/pango/pango-layout.c"
+    if grep -q "MakaOS: zero PangoLayoutRun offsets" "$g" 2>/dev/null; then
+        log "pango-layout.c already patched"
+    else
+        python3 - "$g" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = "  PangoLayoutRun *run = g_slice_new (PangoLayoutRun);\n\n  run->item = run_item;\n"
+ins = ("  PangoLayoutRun *run = g_slice_new (PangoLayoutRun);\n\n"
+       "  run->item = run_item;\n"
+       "  /* MakaOS: zero PangoLayoutRun offsets - g_slice_new does not zero and\n"
+       "   * apply_baseline_shift() only sets these for baseline-shifted text, so\n"
+       "   * ordinary runs otherwise read y_offset uninitialized and corrupt the\n"
+       "   * line logical height (taskbar never mapped). */\n"
+       "  run->y_offset = 0;\n"
+       "  run->start_x_offset = 0;\n"
+       "  run->end_x_offset = 0;\n")
+assert needle in s, "port-pango: insert_run anchor not found"
+s = s.replace(needle, ins, 1)
+open(p, 'w').write(s)
+PY
+        log "patched pango-layout.c → zero PangoLayoutRun offsets (taskbar fix)"
+    fi
 }
 
 main() {
