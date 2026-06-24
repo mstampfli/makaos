@@ -44,6 +44,22 @@ PASSES post-fix with no fault. The race window is tiny (the bump must slip
 between the shrinker's refcount read and the free), so the stress test is a
 regression guard; the primary confirmation is the TOCTOU code proof.
 
+### F4. Unvalidated user-pointer memcpy across 6 syscalls (`kernel/syscall/syscall.c`) — commit pending
+`sys_readdir`, `sys_stat`, `sys_unlink`, `sys_getcwd`, `sys_chdir`, `sys_mkdir`
+did raw `__builtin_memcpy` directly on user pointers (the path argument, and
+for readdir/getcwd the output buffer) with no validation. A bad pointer faulted
+the kernel (DoS); worse, the `readdir`/`getcwd` *writes* took a user-supplied
+destination -> passing a kernel address yielded an arbitrary kernel write
+(privilege-escalation primitive). Fixed by routing all 7 sites through the
+existing `copy_from_user`/`copy_to_user` (validate via `_access_ok` + prefault,
+return `-EFAULT`), matching the pattern `sys_poll`/`sys_stat`'s siblings already
+use. The guarded spawn-attr copy (had `_access_ok`) and the getcwd kernel-HHDM
+write (kernel-owned frame) were correctly left alone. **Test:**
+`copy_user_selftest` (`SELFTESTS=1`) asserts `copy_from_user`/`copy_to_user`
+reject kernel / non-canonical / past-ceiling / NULL pointers with `-EFAULT`
+instead of faulting -> PASSES. Boot exercises readdir/stat/chdir heavily, so a
+healthy boot confirms no regression for valid pointers.
+
 ## TODO — confirmed, high severity
 
 ### T2. CoW/fork PTE + refcount race (`kernel/mm/vmm.c` ~543-563 vs ~682-716)
@@ -63,6 +79,12 @@ RCU-deferring the `unix_sock_t`. The peer's `unix_sock_send_ex` (STREAM, no
 derefs the freed `peer->file->waitq` -> UAF. Everyday Wayland disconnect
 pattern. Fix: `rcu_read_lock` around the send/wake, and defer the `vfs_file_t`
 free (or null `s->file` + DISCONNECT the peer synchronously under a lock).
+NOTE (re-scoped): not the quick fix originally assumed. `unix_sock_send_ex`
+BLOCKS (WAIT_EVENT_HOOK on a full peer buffer), caches `peer` across iterations,
+and derefs `peer` directly (cbuf_write), not just `peer->file`. A correct fix
+must keep the peer + its file alive across a blocking send (re-read + re-validate
+under RCU each iteration, or refcount the peer). Treat like T2 - careful
+refactor, give it a dedicated iteration.
 
 ### T4. TCP PCB fields mutated lock-free from 3 CPUs (`kernel/net/tcp.c`)
 `tcp_timer_tick` retransmit (`snd_nxt = snd_una` rewind), `tcp_send`
@@ -95,9 +117,8 @@ mis-blocked or a mask bit corrupted. (`pending` is correctly atomic; only
   then reads up to 254 name bytes; a dirent near the block tail can read past the
   4096-byte bcache slot. Bounded over-READ, needs a corrupt/concurrently-mutated
   dir block. Fix: bound `name_len` against the remaining block bytes.
-- **sys_readdir missing copy_from_user** (`kernel/syscall/syscall.c:1397`):
-  `__builtin_memcpy(raw, upath, pathlen)` straight from a user pointer -> kernel
-  fault on a bad pointer instead of `-EFAULT`.
+- **unvalidated user-pointer memcpy in syscalls** -> FIXED, see F4 (the
+  sys_readdir near-miss expanded into a 6-syscall sweep).
 - **AF_UNIX data buffers non-atomic** (`unix_sock.h:106`): `buf_count`/`head`/
   `tail` plain fields RMW'd by sender+receiver on different CPUs. The lost-wakeup
   interlock is TSO-safe, but the byte-copy loops tear under concurrent r/w.

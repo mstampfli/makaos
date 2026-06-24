@@ -438,6 +438,12 @@ static void init_kthread(void) {
     extern void kheap_overflow_selftest(void);
     kheap_overflow_selftest();
 
+    // Audit fix: several syscalls did raw memcpy on unvalidated user pointers
+    // (kernel-fault DoS + arbitrary kernel write).  They now use copy_*_user;
+    // verify those reject kernel/non-canonical/NULL pointers with -EFAULT.
+    extern void copy_user_selftest(void);
+    copy_user_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without

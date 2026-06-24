@@ -101,6 +101,11 @@ extern volatile uint16_t* g_vga;
 
 // Forward declaration — defined near copy_from/to_user below.
 static inline int _access_ok(uint64_t addr, uint64_t len);
+// Safe user<->kernel copies (validate + prefault, return 0 / -EFAULT).
+// Declared here so every syscall above their definition can use them
+// instead of a raw __builtin_memcpy on an unvalidated user pointer.
+int copy_to_user(void* dst_u, const void* src, uint64_t len);
+int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 // ── MSR helpers ───────────────────────────────────────────────────────────
 #define MSR_EFER    0xC0000080
@@ -1394,7 +1399,9 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (!raw || !path) { kfree(raw); kfree(path); return (uint64_t)-ENOMEM; }
 
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) {
+        kfree(raw); kfree(path); return (uint64_t)-EFAULT;
+    }
     raw[pathlen] = '\0';
 
     if (raw[0] != '/') {
@@ -1457,7 +1464,9 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (count < 0) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
 
     ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
-    __builtin_memcpy(ubuf, kbuf, (uint64_t)count * sizeof(ext2_entry_t));
+    if (copy_to_user(ubuf, kbuf, (uint64_t)count * sizeof(ext2_entry_t)) != 0) {
+        kfree(kbuf); kfree(path); return (uint64_t)-EFAULT;
+    }
 
     kfree(kbuf);
     kfree(path);
@@ -1476,7 +1485,7 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     raw[pathlen] = '\0';
 
     char path[512];
@@ -1535,7 +1544,7 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(path, upath, pathlen);
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
 
     // Check write permission on the file's parent directory.
@@ -1669,7 +1678,7 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
     if (cwdlen > buflen) return (uint64_t)-ERANGE;
 
     char* ubuf = (char*)buf_ptr;
-    __builtin_memcpy(ubuf, cwd, cwdlen);
+    if (copy_to_user(ubuf, cwd, cwdlen) != 0) return (uint64_t)-EFAULT;
     return buf_ptr;
 }
 
@@ -1680,7 +1689,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     raw[pathlen] = '\0';
 
     // Resolve relative paths against cwd.
@@ -1725,7 +1734,7 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(path, upath, pathlen);
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
 
     // Require write+exec on parent directory.
@@ -3026,6 +3035,41 @@ int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     __builtin_memcpy(dst_u, src, len);
     return 0;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Audit fix: sys_readdir/stat/unlink/getcwd/chdir/mkdir used raw
+// __builtin_memcpy on unvalidated user pointers -> kernel-fault DoS, and the
+// readdir/getcwd *writes* were arbitrary kernel writes (pass a kernel address
+// as the output buffer).  They now route through copy_from_user/copy_to_user.
+// Verify those primitives REJECT bad pointers (kernel, non-canonical, past the
+// user ceiling, NULL) with -EFAULT instead of faulting / touching the address.
+void copy_user_selftest(void) {
+    kprintf("[copyuser_test] copy_from/to_user must reject bad pointers\n");
+    char buf[32];
+    __builtin_memset(buf, 0xA5, sizeof buf);
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+        0ULL,                          // NULL
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (copy_from_user(buf, (const void*)bad[i], 16) == 0) {
+            kprintf("[copyuser_test] FAIL: copy_from_user accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+        if (copy_to_user((void*)bad[i], buf, 16) == 0) {
+            kprintf("[copyuser_test] FAIL: copy_to_user accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
+                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected, no fault)\n");
+}
+#endif
 
 // ── sys_fcntl ─────────────────────────────────────────────────────────────
 // fcntl(fd, cmd, arg) → varies
