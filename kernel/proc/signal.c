@@ -4,6 +4,7 @@
 #include "cpu.h"
 #include "common.h"
 #include "fb.h"
+#include "errno.h"   // ESRCH (signal_send_pid)
 
 // ── Saved user context access ────────────────────────────────────────────
 // The authoritative copy of a syscall's saved user registers lives on
@@ -91,6 +92,38 @@ void signal_send_group(uint32_t tgid, int sig) {
 // Same locking invariant as signal_send_group.
 void signal_send_pgrp(uint32_t pgid, int sig) {
     task_idx_pgid_walk(pgid, sig_group_visit, &sig);
+}
+
+// ── signal_send_pid ──────────────────────────────────────────────────────
+// Look up `pid` and deliver `sig`, all inside one rcu_read_lock section.
+// sched_find_pid (pid_ht_find) drops its OWN reader section before returning,
+// so a bare `t = sched_find_pid(pid); signal_send(t,...)` derefs the task
+// outside RCU -> a concurrent exit+task_destroy (which RCU-defers the free via
+// task_free_rcu) can free `t` in the window -> use-after-free.  Holding the
+// reader section across the delivery keeps `t` alive (the grace period cannot
+// complete while we are inside it).  signal_send is rcu/lock-safe (atomic bit
+// + sched_wake -> rq_lock, no sleep).  Zombies are skipped (semantically dead).
+// Returns 0 on delivery, -ESRCH if no such live task.
+int signal_send_pid(uint32_t pid, int sig) {
+    rcu_read_lock();
+    task_t* t = sched_find_pid(pid);
+    int delivered = (t && t->state != TASK_ZOMBIE);
+    if (delivered)
+        signal_send(t, sig);
+    rcu_read_unlock();
+    return delivered ? 0 : -ESRCH;
+}
+
+// Deterministic guard for the rcu-safe lookup helper.  Sending to a pid that
+// cannot exist takes the not-found path (no signal_send, no side effects) and
+// must return -ESRCH; reaching the next line at all proves the rcu_read_lock
+// section is balanced (a leak would leave preempt disabled and wedge the CPU).
+void signal_send_pid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int r = signal_send_pid(0xFFFFFFFEu, 15 /* SIGTERM; unused on this path */);
+    kprintf(r == -ESRCH
+            ? "[signal_send_pid] SELF-TEST PASSED (unknown pid -> ESRCH, rcu balanced)\n"
+            : "[signal_send_pid] SELF-TEST FAILED r=%d\n", r);
 }
 
 // ── signal_setup_frame ────────────────────────────────────────────────────
@@ -424,9 +457,9 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
     // bit (so sys_wait's signal-driven retry runs) AND unconditionally
     // calls sched_wake under the target's rq_lock, which handles every
     // RUNNING/SLEEPING/in-flight transition correctly.
-    task_t* parent = sched_find_pid(g_current->ppid);
-    if (parent && parent->state != TASK_ZOMBIE)
-        signal_send(parent, SIGCHLD);
+    // Deliver SIGCHLD to the parent under rcu_read_lock (signal_send_pid) so
+    // the parent task cannot be freed between the pid lookup and delivery.
+    signal_send_pid(g_current->ppid, SIGCHLD);
 
     sched_yield();
     for (;;) __asm__ volatile("hlt");

@@ -528,6 +528,10 @@ static void init_kthread(void) {
     extern void signalfd_selftest(void);
     signalfd_selftest();
 
+    // signal_send_pid: rcu-safe pid lookup + delivery (sched_find_pid UAF fix).
+    extern void signal_send_pid_selftest(void);
+    signal_send_pid_selftest();
+
     // Tier 2.5a (virtio-gpu): pipeline exerciser was overriding the
     // UEFI GOP framebuffer with a self-test banner, hiding the TTY
     // from the SDL window under `-vga none -device virtio-vga`.  The

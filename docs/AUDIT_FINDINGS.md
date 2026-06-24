@@ -118,8 +118,41 @@ there is to store the target PATH and re-resolve via `ns_find` per `sendto`
 (`txbuf_used += chunk`), and `tcp_recv` ACK (`txbuf_used -= acked`,
 `txbuf_head += acked`, `snd_una = ack`) RMW the same non-atomic PCB fields from
 different CPUs with no per-PCB lock. Torn `snd_nxt` mis-sends; lost-update on
-`txbuf_used` wedges the sender or underflows -> heap OOB write into `txbuf`. Fix:
-a per-PCB lock around the send/ack/retransmit critical sections.
+`txbuf_used` wedges the sender (the `while txbuf_used >= TCP_TXBUF_SIZE` spin
+never clears) or underflows. Fix: a per-PCB lock around the send/ack/retransmit
+critical sections. STILL OPEN -- needs a dedicated iteration WITH a TCP-loopback
+self-test (boot drives no TCP data, so a locking change is NOT verifiable by
+boot alone; a lock-ordering mistake would deadlock only under live concurrent
+TCP load).
+
+VERIFIED DESIGN NOTES (from a deep read this pass, to de-risk the dedicated run):
+  - Contexts: tcp_send = syscall CPU; tcp_recv = net_rx kthread; tcp_timer_tick
+    runs from BOTH net_tcp_timer_thread AND net_rx_thread (net.c:118 and :133),
+    so even two timer ticks can race. Three+ CPUs touch one PCB.
+  - `ipv4_send` does NOT sleep (ARP miss returns -1 + queues a request;
+    `eth_send` queues to virtio tx), so the per-PCB lock CAN be held across
+    `tcp_send_segment` (which RMWs snd_nxt + transmits). It just must be DROPPED
+    around `sched_sleep` in tcp_send / tcp_recv_data (buffer-full / empty waits).
+  - Lock ordering is clean for the data plane: pcb->lock never nests with
+    `s_pcb_wlock` (send/recv/timer walk under rcu_read_lock, only insert/remove
+    take s_pcb_wlock); the tx path takes arp/virtio locks strictly UNDER
+    pcb->lock with no path back into TCP -> no cycle. Move `pcb_wake` (which
+    takes rq_lock) to AFTER the unlock to avoid holding the data lock across a
+    scheduler op.
+  - THE HARD PART: a FULL-correctness lock must also cover the handshake
+    (`snd_nxt`/`snd_una` set in SYN_SENT/SYN_RCVD race the timer's SYN-rewind)
+    and the TCP_LISTEN/SYN_RCVD cases touch TWO PCBs -- the child is linked into
+    `s_pcb_head` by tcp_pcb_alloc the instant it is created (so the timer can
+    retransmit on a half-initialised child) and SYN_RCVD mutates the LISTENER's
+    `accept_queue` while holding the child. That is a child<->listener two-lock
+    ordering hazard (tcp_accept locks the listener) that must be designed (e.g.
+    a separate accept-queue lock, or a fixed listener-before-child order, or
+    lock the child at alloc). A narrower "data-plane-only" lock (txbuf/rxbuf +
+    send-seq, NOT the state machine / accept queue) sidesteps the two-lock
+    hazard and fixes the dangerous txbuf_used corruption, leaving the
+    state-transition races as a smaller separate item; that is the recommended
+    first decomposition. Also add an underflow clamp to `txbuf_used -= acked`
+    (defense-in-depth; deterministically unit-testable as a pure helper).
 
 ### F5. signal_send non-atomic RMW of sigstate.blocked (`kernel/proc/signal.c`) — FIXED, commit pending
 `signal_send`'s `t->sigstate.blocked &= ~bit` (SIGKILL unblock) was a non-atomic
@@ -136,11 +169,23 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
 
 ## TODO — lower priority / near-miss
 
-- **sched_find_pid UAF window** (`sched.c:188`): returns a `task_t*` after
-  `rcu_read_unlock`; callers (`sys_kill`, `sys_exit`'s parent `signal_send`)
-  deref + `sched_wake` outside any RCU section -> UAF if the pid exits+destroys
-  concurrently. Narrow window (zombie stays in `pid_ht` until destroy). Fix:
-  hold the RCU section across the use, or refcount the task.
+- **sched_find_pid UAF window** (`sched.c:188`): `pid_ht_find` drops its OWN
+  rcu_read_lock before returning a bare `task_t*`; callers deref it outside any
+  RCU section -> UAF if the pid exits+task_destroy (RCU-deferred free via
+  task_free_rcu) completes in the window. Narrow (zombie stays in `pid_ht` until
+  destroy). Fix: hold rcu_read_lock across the lookup+use (matches pcb_find /
+  ns_find). PART A -> FIXED (F16): the high-reachability syscall + signal paths.
+  Added DRY helper `signal_send_pid(pid, sig)` (signal.c) = lookup + deliver
+  under one rcu_read_lock; routed `sys_exit`'s SIGCHLD-to-parent, `do_exit`'s
+  (signal.c) SIGCHLD-to-parent, and `sys_kill`'s lookup case through it; wrapped
+  `sys_setpgid`/`sys_getpgid`/`sys_getsid` field reads in rcu_read_lock.
+  signal_send is rcu/lock-safe (atomic bit + sched_wake->rq_lock, no sleep), so
+  holding the section across delivery is sound. Deterministic
+  signal_send_pid_selftest (unknown pid -> -ESRCH, proves the rcu section
+  balances). PART B -> STILL OPEN: the `/proc` (`proc.c` proc_open/proc_readdir
+  x3) and `virtfs.c:171` callers, whose rcu section must span a multi-return
+  `gen()` / `proc_fd_open` use -- mechanical but needs careful unlock-on-every-
+  path; a leaked section (preempt left disabled) would wedge the CPU.
 - **eventfd POLLOUT starvation** (`kernel/io/eventfd.c`) -> FIXED (F7).
   poll/select registered only on `read_wq` (`f->waitq`); the POLLOUT wakeup
   fires on `write_wq` when a reader drains a full eventfd, so a task polling a

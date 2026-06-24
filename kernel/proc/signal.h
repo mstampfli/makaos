@@ -118,6 +118,10 @@ struct task_t;
 void signal_send(struct task_t* t, int sig);
 void signal_send_group(uint32_t tgid, int sig);
 void signal_send_pgrp(uint32_t pgid, int sig);
+// Look up `pid` and deliver `sig` atomically under rcu_read_lock so the task
+// cannot be freed between lookup and delivery (closes a sched_find_pid UAF).
+// Skips zombies.  Returns 0 on delivery, -ESRCH if no such live task.
+int  signal_send_pid(uint32_t pid, int sig);
 void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax);
 
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these

@@ -649,12 +649,11 @@ static uint64_t sys_exit(uint64_t code) {
             sched_add_zombie(g_current);
 
             // Wake parent and deliver SIGCHLD so it can reap background
-            // jobs.  Skip zombie parents (they can't handle anything any
-            // more).  signal_send unconditionally calls sched_wake under
-            // the target rq_lock, so no racy state check is needed.
-            task_t* parent = sched_find_pid(g_current->ppid);
-            if (parent && parent->state != TASK_ZOMBIE)
-                signal_send(parent, SIGCHLD);
+            // jobs.  signal_send_pid looks up + delivers under rcu_read_lock
+            // so the parent cannot be freed in the window, and skips zombie
+            // parents (semantically dead).  signal_send unconditionally calls
+            // sched_wake under the target rq_lock, so no racy state check.
+            signal_send_pid(g_current->ppid, SIGCHLD);
         }
     }
     sched_yield();
@@ -684,14 +683,16 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     if (pid > 0) {
         // O(1) lookup via the pid hash table.  Zombies are kept in
         // pid_ht until fully reaped, but kill() on a zombie is an
-        // error (ESRCH) — the task is semantically dead.
-        task_t* target = ((int64_t)g_current->pid == pid)
-                         ? g_current
-                         : sched_find_pid((uint32_t)pid);
-        if (!target || target->state == TASK_ZOMBIE)
-            return (uint64_t)-ESRCH;
-        signal_send(target, sig);
-        return 0;
+        // error (ESRCH) — the task is semantically dead.  Sending to
+        // another task goes through signal_send_pid, which does the
+        // lookup + delivery under rcu_read_lock so the target cannot be
+        // freed in the window (sched_find_pid alone returns a bare
+        // pointer with no such guarantee).
+        if ((int64_t)g_current->pid == pid) {
+            signal_send(g_current, sig);    // self: cannot be freed
+            return 0;
+        }
+        return (uint64_t)signal_send_pid((uint32_t)pid, sig);  // 0 or -ESRCH
     }
 
     if (pid == 0) {
@@ -3535,24 +3536,36 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     uint32_t pid  = pid_arg  ? (uint32_t)pid_arg  : g_current->pid;
     uint32_t pgid = pgid_arg ? (uint32_t)pgid_arg : pid;
 
+    // Hold rcu_read_lock across the lookup AND the field mutation: a task
+    // found via sched_find_pid is otherwise a bare pointer that a concurrent
+    // exit+task_destroy (RCU-deferred free) could free mid-update.
+    rcu_read_lock();
     task_t* t = (pid == g_current->pid) ? g_current : sched_find_pid(pid);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-
-    // Can't change pgid of a session leader.
-    if (t->pid == t->sid) return (uint64_t)-EPERM;
-
-    // Move between pgid hash buckets atomically w.r.t. signal delivery.
-    task_idx_pgid_changing(t);
-    t->pgid = pgid;
-    task_idx_pgid_changed(t);
-    return 0;
+    uint64_t ret;
+    if (!t || t->state == TASK_ZOMBIE) {
+        ret = (uint64_t)-ESRCH;
+    } else if (t->pid == t->sid) {
+        ret = (uint64_t)-EPERM;          // can't change pgid of a session leader
+    } else {
+        // Move between pgid hash buckets atomically w.r.t. signal delivery.
+        task_idx_pgid_changing(t);
+        t->pgid = pgid;
+        task_idx_pgid_changed(t);
+        ret = 0;
+    }
+    rcu_read_unlock();
+    return ret;
 }
 
 static uint64_t sys_getpgid(uint64_t pid_arg) {
     if (pid_arg == 0) return (uint64_t)g_current->pgid;
+    // rcu_read_lock keeps the looked-up task alive across the field read.
+    rcu_read_lock();
     task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-    return (uint64_t)t->pgid;
+    uint64_t r = (!t || t->state == TASK_ZOMBIE)
+                 ? (uint64_t)-ESRCH : (uint64_t)t->pgid;
+    rcu_read_unlock();
+    return r;
 }
 
 static uint64_t sys_getpgrp(void) {
@@ -3578,9 +3591,13 @@ static uint64_t sys_setsid(void) {
 
 static uint64_t sys_getsid(uint64_t pid_arg) {
     if (pid_arg == 0) return (uint64_t)g_current->sid;
+    // rcu_read_lock keeps the looked-up task alive across the field read.
+    rcu_read_lock();
     task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-    return (uint64_t)t->sid;
+    uint64_t r = (!t || t->state == TASK_ZOMBIE)
+                 ? (uint64_t)-ESRCH : (uint64_t)t->sid;
+    rcu_read_unlock();
+    return r;
 }
 
 // ── tcgetpgrp / tcsetpgrp ─────────────────────────────────────────────────
