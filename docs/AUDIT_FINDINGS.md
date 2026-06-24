@@ -62,7 +62,7 @@ healthy boot confirms no regression for valid pointers.
 
 ## TODO — confirmed, high severity
 
-### T2. CoW/fork PTE + refcount race (`kernel/mm/vmm.c` ~543-563 vs ~682-716)
+### F11 (was T2). CoW/fork PTE + refcount race (`kernel/mm/vmm.c`) - FIXED, commit pending
 `vmm_clone_user_ex` writes the parent PTE (drop WRITABLE) + `pmm_ref_inc`
 WITHOUT `vma_lock`, while the CoW-break fault handler does its read-check-act
 under `vma_lock`. They sync on different things, so a sibling thread faulting a
@@ -70,7 +70,7 @@ page mid-clone can take the `rc==1` "sole owner" no-copy branch -> parent and
 child PTEs alias one frame (cross-address-space corruption) + skewed refcount ->
 later double `pmm_ref_dec` frees a mapped frame (UAF). In-tree comments
 (`process.c:420`, `vmm.c:670`) document the victims. Fix: hold `src_mm->vma_lock`
-across the clone's parent-PTE walk.
+across the clone's parent-PTE walk. FIXED: the clone now takes src_mm->vma_lock per-PTE around the read-decide-write (src_pt[si] read -> VMA lookup -> RO write + pmm_ref_inc), the same lock+decision the fault handler uses, so a sibling fault can no longer interleave. Per-PTE (not whole-walk) so concurrent faults on other pages still progress; callers (task_fork, sys_thread) hold no vma_lock so no self-deadlock; the clone touches only page-table/HHDM memory so it cannot fault under the lock. Tiny-window race so no deterministic test (like F2/F3/F5); confirmed by code proof + a clean boot that fork-execs login/svcmgr (the clone path) with no deadlock/corruption + all 10 selftests pass.
 
 ### T3. AF_UNIX UAF: close frees vfs_file_t while peer sends (`kernel/net/unix_sock.c`)
 `unix_sock_close` `kfree`s the `vfs_file_t` synchronously (line ~321) while only

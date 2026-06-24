@@ -512,6 +512,21 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                 for (int si = 0; si < 512; si++) {
                     if (!(src_pt[si] & PAGE_PRESENT)) continue;
 
+                    // Serialize this PTE's read-decide-write against the
+                    // CoW-break fault handler, which makes the same decision
+                    // (`rc = pmm_ref_get(); if (rc == 1) *pte |= WRITABLE; else
+                    // copy`) under src_mm->vma_lock.  Without this lock, a
+                    // sibling thread of the parent faulting this page after we
+                    // set it read-only (below) but before our pmm_ref_inc reads
+                    // rc==1, takes the "sole owner -> just make writable, no
+                    // copy" branch -> parent + child then share a WRITABLE frame
+                    // (the child sees the parent's writes) with a refcount of 2
+                    // that one side thinks is 1 -> later double pmm_ref_dec frees
+                    // a still-mapped frame (UAF).  Held per-PTE (not across the
+                    // whole walk) so concurrent faults on other pages still make
+                    // progress.  src_mm is NULL only on the legacy no-mm path.
+                    if (src_mm) spin_lock(&src_mm->vma_lock);
+
                     phys_addr_t src_frame = src_pt[si] & PAGE_ADDR_MASK;
                     uint64_t leaf_flags = src_pt[si] & ~PAGE_ADDR_MASK;
 
@@ -523,6 +538,9 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     // shmem frames are refcounted RAM, so the child's
                     // PTE is a new reference — bump it.  MMIO (device
                     // memory) is not buddy RAM and carries no refcount.
+                    // (Already under vma_lock here, so the VMA list is stable;
+                    // the rcu_read_lock is kept, nested + harmless, so the
+                    // lookup's synchronization is unchanged.)
                     int is_shared = 0, is_shmem = 0;
                     if (src_mm) {
                         rcu_read_lock();
@@ -535,6 +553,7 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     if (is_shared) {
                         if (is_shmem) pmm_ref_inc(src_frame);  // child PTE ref
                         dst_pt[si] = src_frame | leaf_flags;
+                        if (src_mm) spin_unlock(&src_mm->vma_lock);
                         continue;
                     }
 
@@ -542,13 +561,17 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     // Pinned frame → deep-copy (DMA in flight, parent keeps exclusive).
                     if (!src_mm || pmm_pin_get(src_frame) > 0) {
                         phys_addr_t dst_frame = pmm_buddy_alloc(0);
-                        if (dst_frame == PMM_INVALID_ADDR) return 0;
+                        if (dst_frame == PMM_INVALID_ADDR) {
+                            if (src_mm) spin_unlock(&src_mm->vma_lock);
+                            return 0;
+                        }
 
                         uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
                         uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
                         __builtin_memcpy(d, s, PAGE_SIZE);
 
                         dst_pt[si] = dst_frame | leaf_flags;
+                        if (src_mm) spin_unlock(&src_mm->vma_lock);
                         continue;
                     }
 
@@ -561,6 +584,7 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     dst_pt[si] = src_frame | cow_flags;   // child:  same frame, read-only
 
                     pmm_ref_inc(src_frame);               // shared: rc 1→2
+                    if (src_mm) spin_unlock(&src_mm->vma_lock);
                 }
             }
         }
