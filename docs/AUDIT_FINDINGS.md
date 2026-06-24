@@ -73,18 +73,34 @@ later double `pmm_ref_dec` frees a mapped frame (UAF). In-tree comments
 across the clone's parent-PTE walk. FIXED: the clone now takes src_mm->vma_lock per-PTE around the read-decide-write (src_pt[si] read -> VMA lookup -> RO write + pmm_ref_inc), the same lock+decision the fault handler uses, so a sibling fault can no longer interleave. Per-PTE (not whole-walk) so concurrent faults on other pages still progress; callers (task_fork, sys_thread) hold no vma_lock so no self-deadlock; the clone touches only page-table/HHDM memory so it cannot fault under the lock. Tiny-window race so no deterministic test (like F2/F3/F5); confirmed by code proof + a clean boot that fork-execs login/svcmgr (the clone path) with no deadlock/corruption + all 10 selftests pass.
 
 ### T3. AF_UNIX UAF: close frees vfs_file_t while peer sends (`kernel/net/unix_sock.c`)
-`unix_sock_close` `kfree`s the `vfs_file_t` synchronously (line ~321) while only
-RCU-deferring the `unix_sock_t`. The peer's `unix_sock_send_ex` (STREAM, no
-`rcu_read_lock`) captures `peer = s->peer` and calls `unix_poll_wake(peer)` ->
-derefs the freed `peer->file->waitq` -> UAF. Everyday Wayland disconnect
-pattern. Fix: `rcu_read_lock` around the send/wake, and defer the `vfs_file_t`
-free (or null `s->file` + DISCONNECT the peer synchronously under a lock).
-NOTE (re-scoped): not the quick fix originally assumed. `unix_sock_send_ex`
-BLOCKS (WAIT_EVENT_HOOK on a full peer buffer), caches `peer` across iterations,
-and derefs `peer` directly (cbuf_write), not just `peer->file`. A correct fix
-must keep the peer + its file alive across a blocking send (re-read + re-validate
-under RCU each iteration, or refcount the peer). Treat like T2 - careful
-refactor, give it a dedicated iteration.
+Split into two distinct UAF classes once verified against the real code:
+
+(A) the `->file` UAF -> FIXED (F14): `unix_sock_close` `kfree`d the `vfs_file_t`
+synchronously (old line ~321) while only RCU-deferring the `unix_sock_t`, even
+though a peer reaches that file via the raw `peer->file` back-pointer
+(`unix_poll_wake` derefs `->file->waitq`; called from `free_rcu`, `send_ex`,
+`recv`, `connect`). So the file had a SHORTER lifetime than the sock that points
+at it -> derefs of a freed file. Fixed by deferring the file free into
+`unix_sock_free_rcu` (freed together with the sock), establishing the invariant
+"the vfs_file_t lives exactly as long as its unix_sock_t". Also fixed a real
+(rare) DOUBLE FREE in the `unix_sock_pair` ENOMEM path (`unix_sock_close(a)`
+already owns a's teardown; the trailing `kfree(a)` freed it twice).
+
+(B) the peer-SOCK UAF -> STILL OPEN (careful refactor, dedicated iteration).
+`unix_sock_send_ex` BLOCKS (WAIT_EVENT_HOOK on a full peer buffer), caches
+`peer = s->peer` across iterations, and derefs the cached `peer` directly
+(`cbuf_write(peer)`, `peer->buf_count` in the HOOK condition, `unix_wake(peer)`)
+with NO `rcu_read_lock`; `recv` (line ~786 `unix_wake(s->peer)`) and `connect`
+have the same shape. The peer `unix_sock_t` can be RCU-freed during the block ->
+UAF on the sock object itself. RCU-section discipline alone cannot fix this (the
+deref happens after a sleep, and the HOOK condition runs outside any reader
+section). Correct fix: refcount the `unix_sock_t` (Linux af_unix model) and pin
+the peer with a tryget-under-rcu for the duration of every peer deref, freeing
+only on refcount 0; OR a two-phase RCU free (disconnect in phase 1, free after a
+second grace period) combined with re-reading `s->peer` under `rcu_read_lock`
+per non-blocking critical section. F14 (the file-lifetime invariant) is a clean
+prerequisite: once file-lifetime == sock-lifetime, pinning the sock also pins
+its file, so (B) is now a single well-defined problem.
 
 ### T4. TCP PCB fields mutated lock-free from 3 CPUs (`kernel/net/tcp.c`)
 `tcp_timer_tick` retransmit (`snd_nxt = snd_una` rewind), `tcp_send`

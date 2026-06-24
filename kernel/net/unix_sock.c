@@ -288,7 +288,14 @@ static void unix_sock_free_rcu(void* data) {
             vfs_close(s->ancillary.files[idx]);
     }
 
+    // The vfs_file_t wrapper shares the socket's lifetime: a peer reaches it
+    // via peer->file for poll wakeups (unix_poll_wake derefs ->file->waitq),
+    // so it must outlive every RCU reader that can still observe this socket.
+    // Freeing it here (not eagerly in unix_sock_close) closes the ->file
+    // use-after-free: the file now lives exactly as long as its unix_sock_t.
+    struct vfs_file_t* file = s->file;
     kfree(s);
+    if (file) kfree(file);
 }
 
 void unix_sock_close(vfs_file_t* self) {
@@ -317,8 +324,11 @@ void unix_sock_close(vfs_file_t* self) {
         ns_remove(s->path);
 
     // Expedited: close() on an AF_UNIX socket — user-syscall latency.
+    // NB: the vfs_file_t `self` is NOT freed here.  Peers hold a raw
+    // back-pointer to it (peer->file) and dereference it for poll wakeups
+    // for as long as this RCU-deferred socket is observable, so its free is
+    // deferred to unix_sock_free_rcu (same grace period as the socket).
     call_rcu_expedited(unix_sock_free_rcu, s);
-    kfree(self);
 }
 
 // ── unix_sock_ioctl ──────────────────────────────────────────────────────
@@ -401,7 +411,9 @@ int unix_sock_pair(int type, vfs_file_t** out) {
     vfs_file_t* a = unix_sock_open(type);
     if (!a) return -ENOMEM;
     vfs_file_t* b = unix_sock_open(type);
-    if (!b) { unix_sock_close(a); kfree(a); return -ENOMEM; }
+    // unix_sock_close owns the full teardown of `a` (including deferring the
+    // vfs_file_t free); do NOT also kfree(a) here -- that was a double free.
+    if (!b) { unix_sock_close(a); return -ENOMEM; }
 
     unix_sock_t* sa = (unix_sock_t*)a->ctx;
     unix_sock_t* sb = (unix_sock_t*)b->ctx;
