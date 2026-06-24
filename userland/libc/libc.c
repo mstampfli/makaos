@@ -1446,12 +1446,24 @@ int vasprintf(char** strp, const char* fmt, __builtin_va_list ap) {
 DIR* opendir(const char* path) {
     if (!path) { errno = EINVAL; return NULL; }
     size_t plen = strnlen(path, 511);
-    k_dirent_t* entries = malloc(4096 * sizeof(k_dirent_t));
-    if (!entries) { errno = ENOMEM; return NULL; }
-    int count = _sys_readdir(path, plen, entries, 4096);
-    if (count < 0) {
-        free(entries);
-        return NULL;
+    // Grow-on-demand: a 4096-entry buffer is ~1.07MB (sizeof(k_dirent_t) is
+    // 268B); a single malloc that large can fail in a port's heap (e.g.
+    // fontconfig's font-dir scan), making opendir return NULL BEFORE the
+    // syscall — the directory then silently looks empty (no fonts -> tofu).
+    // Start modest and double on truncation: sys_readdir re-reads from the
+    // start, so a larger max just re-reads the whole dir.  Memory now tracks
+    // the dir's actual size instead of a fixed 1MB per opendir.
+    int cap = 64;
+    k_dirent_t* entries = NULL;
+    int count = 0;
+    for (;;) {
+        k_dirent_t* grown = realloc(entries, (size_t)cap * sizeof(k_dirent_t));
+        if (!grown) { free(entries); errno = ENOMEM; return NULL; }
+        entries = grown;
+        count = _sys_readdir(path, plen, entries, cap);
+        if (count < 0) { free(entries); return NULL; }
+        if (count < cap || cap >= 65536) break;  // got them all (or sane cap hit)
+        cap *= 2;                                 // truncated — re-read larger
     }
     DIR* dir = malloc(sizeof(DIR));
     if (!dir) { free(entries); errno = ENOMEM; return NULL; }
