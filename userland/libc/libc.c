@@ -374,6 +374,17 @@ void free(void* ptr) {
     hdr->free = 1;
     hdr->next_free = s_free_list;
     s_free_list = hdr;
+    // Zero-on-free hardening.  The kernel hands out zeroed fresh pages, so
+    // zeroing reused blocks too makes malloc() effectively always return zeroed
+    // memory (Linux-like).  This neutralizes the whole class of ported-library
+    // bugs that read an uninitialized struct field after g_slice_new/malloc
+    // (e.g. pango's run->y_offset, which corrupted the swaybar bar height), and
+    // doubles as a security mitigation: freed secrets do not linger in the heap
+    // (cf. OpenBSD malloc, hardened_malloc, MALLOC_PERTURB_).  Only the payload
+    // is cleared — the header (magic/size/free/next_free) sits BELOW it at
+    // offset 0..HDR_SIZE, so the free-list link is untouched.  memset is GB/s
+    // and large frees are rare, so the cost is negligible for the desktop.
+    __builtin_memset((uint8_t*)hdr + HDR_SIZE, 0, hdr->size);
     heap_unlock();
 }
 
