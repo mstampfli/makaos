@@ -354,6 +354,10 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_heapalias.o" \
    -o "$BUILD_DIR/user_heapalias.elf"
 
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/makaclock/makaclock.c" -o "$BUILD_DIR/user_makaclock.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_makaclock.o" \
+   -o "$BUILD_DIR/user_makaclock.elf"
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
@@ -808,6 +812,10 @@ if [ -f "$BUILD_DIR/user_heapalias.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_heapalias.elf" bin/heapalias
     echo "[+] heapalias ELF installed at bin/heapalias (root:root 0755)"
 fi
+if [ -f "$BUILD_DIR/user_makaclock.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_makaclock.elf" bin/makaclock
+    echo "[+] makaclock ELF installed at bin/makaclock (root:root 0755)"
+fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
 fi
@@ -931,18 +939,22 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # $menu through tofi-run → swaymsg exec (no xargs on the image — sh -c
     # evaluates the $(...) at keypress time).
     # The default status_command shells out to `date` and `sleep`, which the
-    # image doesn't ship (no coreutils).  This bash build also lacks a working
-    # `printf '%()T'` (errors → exit 2) and `read -t` timeout, and bash
-    # block-buffers builtin output to a pipe — so a clock loop either exits
-    # (red "[error reading from status command]") or busy-fork-storms (#GP).
-    # Use a robust STATIC line instead: a subshell `( printf ... )` flushes the
-    # text to swaybar's pipe on the subshell's exit, then a blocking `read`
-    # parks forever on the still-open status pipe so the command never exits
-    # (no hangup, no busy loop).  No clock, but a clean non-error status.
+    # image doesn't ship (no coreutils).  A bash clock loop can't substitute:
+    # this bash build has no working `printf '%()T'` (errors → exit 2) and no
+    # `read -t` timeout, and it block-buffers builtin output to a pipe — so the
+    # loop either exits (swaybar then renders red "[error reading from status
+    # command]") or busy-fork-storms a subshell-per-tick (#GP).
+    # A native helper, /bin/makaclock (userland/apps/makaclock), is BUILT and
+    # ready (formats UTC time, one unbuffered write(2)/s, nanosleep, never
+    # exits).  BUT a swaybar bug makes a *text* status it reads destabilize the
+    # bar's first layer commit (~1/4 boots commit, occasional #GP) — distinct
+    # from the bar height fix.  Until that swaybar/present-path issue is fixed,
+    # leave the status_command disabled so the taskbar renders reliably; wire it
+    # to `/bin/makaclock` once the bar commits cleanly with a text status.
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
-        -e 's|^[[:space:]]*status_command .*|    # status_command disabled: this bash build lacks printf %()T and read -t,\n    # and block-buffers builtin output, so no clock loop is viable (a real clock\n    # needs a small C helper or a bash rebuilt with those features). The bar\n    # still shows workspaces; an absent status_command renders no status (no red\n    # "[error reading from status command]").|' \
+        -e 's|^[[:space:]]*status_command .*|    # status_command /bin/makaclock — disabled: text status destabilizes the bar commit (swaybar bug). Re-enable once fixed.|' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
