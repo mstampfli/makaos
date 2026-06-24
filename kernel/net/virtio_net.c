@@ -293,8 +293,16 @@ static uint16_t virtq_alloc_desc(virtq_t* vq) {
     return idx;
 }
 
+// Is a descriptor id a valid index into the VIRTQ_SIZE-entry desc/buffer
+// tables?  Device-supplied ids (read from the used ring) MUST pass this before
+// being used as an index -- an out-of-range id otherwise drives an OOB read of
+// s_rx_bufs[] and an OOB write of s_rxq.desc[] / the free list.  Pure ->
+// unit-tested (virtio_desc_id_valid_selftest).
+static int virtio_desc_id_valid(uint32_t id) { return id < VIRTQ_SIZE; }
+
 // Return a descriptor to the free list.
 static void virtq_free_desc(virtq_t* vq, uint16_t idx) {
+    if (!virtio_desc_id_valid(idx)) return;   // defense-in-depth: never index OOB
     vq->desc[idx].next = vq->free_head;
     vq->free_head      = idx;
 }
@@ -392,7 +400,11 @@ int virtio_net_tx(const void* data, uint16_t len) {
         if (++spins > 10000000u) { spin_unlock(&s_tx_lock); return -1; }  // timeout
     }
     uint16_t used_idx = (uint16_t)(s_txq.last_used_idx & (VIRTQ_SIZE - 1));
-    virtq_free_desc(&s_txq, (uint16_t)s_txq.used->ring[used_idx].id);
+    // Free the descriptor the device reports it completed, but never trust an
+    // out-of-range id (it would OOB-write the desc table / corrupt the free
+    // list): fall back to `idx`, the single descriptor we actually submitted.
+    uint32_t done_id = s_txq.used->ring[used_idx].id;
+    virtq_free_desc(&s_txq, virtio_desc_id_valid(done_id) ? (uint16_t)done_id : idx);
     s_txq.last_used_idx++;
 
     spin_unlock(&s_tx_lock);
@@ -411,7 +423,13 @@ int virtio_net_rx_poll(skbuff_t** skb_out) {
     uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
     uint32_t desc_id   = s_rxq.used->ring[used_slot].id;
     uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
-    s_rxq.last_used_idx++;
+    s_rxq.last_used_idx++;   // advance first so a bad entry can't wedge the ring
+
+    // desc_id is written by the device and indexes s_rx_bufs[] / s_rxq.desc[]
+    // (both VIRTQ_SIZE entries).  An out-of-range id would OOB-read the source
+    // buffer pointer (and memcpy from it) and OOB-write four descriptor fields.
+    // Drop the bogus completion: do not index the tables and do not re-post it.
+    if (!virtio_desc_id_valid(desc_id)) return 0;
 
     // The packet starts after the virtio-net header.
     uint8_t* raw    = s_rx_bufs[desc_id].virt;
@@ -702,4 +720,29 @@ int virtio_net_init(void) {
 
     s_ok = 1;
     return 1;
+}
+
+// ── virtio_desc_id_valid selftest ─────────────────────────────────────────
+// Deterministic check of the device-supplied descriptor-id bounds guard that
+// stops an OOB read of s_rx_bufs[] / OOB write of s_rxq.desc[] from a malicious
+// or buggy device reporting an id >= VIRTQ_SIZE in the used ring.
+void virtio_desc_id_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t id; int want; } c[] = {
+        { 0,            1 },  // first slot
+        { VIRTQ_SIZE-1, 1 },  // last valid slot (255)
+        { VIRTQ_SIZE,   0 },  // == 256, first OOB
+        { 0xFFFFFFFFu,  0 },  // device garbage
+        { 1000u,        0 },  // arbitrary OOB
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (virtio_desc_id_valid(c[i].id) != c[i].want) {
+            kprintf("[virtio_descid] FAIL id=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].id, virtio_desc_id_valid(c[i].id), c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[virtio_descid] SELF-TEST FAILED\n"
+                  : "[virtio_descid] SELF-TEST PASSED (device desc-id bounds)\n");
 }

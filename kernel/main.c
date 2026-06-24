@@ -541,6 +541,10 @@ static void init_kthread(void) {
     extern void tcp_ring_consume_selftest(void);
     tcp_ring_consume_selftest();
 
+    // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
+    extern void virtio_desc_id_valid_selftest(void);
+    virtio_desc_id_valid_selftest();
+
     // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
     extern void virtfs_is_virtual_selftest(void);
     virtfs_is_virtual_selftest();

@@ -334,16 +334,21 @@ cleanliness one (sys_select) this pass; the other four are the refreshed backlog
   (every open runs this block) so no regression to normal opens.
 
 - **virtio-net rx desc_id OOB (device-controlled index)**
-  (`kernel/net/virtio_net.c:417,434` virtio_net_rx_poll) -> OPEN. `desc_id` is a
-  uint32 read verbatim from the device-written used ring and used to index
+  (`kernel/net/virtio_net.c:417,434` virtio_net_rx_poll) -> FIXED (F22). `desc_id`
+  was a uint32 read verbatim from the device-written used ring and used to index
   s_rx_bufs[256] and s_rxq.desc[256] with NO bounds check (adjacent pkt_len IS
   clamped with an "untrusted device" comment) -> OOB read of a buffer pointer +
-  OOB WRITE of 4 descriptor fields. desc_id>=256 from a malicious/buggy device
-  (hypervisor / passthrough / future real NIC). Same unchecked id at the TX free
-  (line 395). Fix: pure `virtio_desc_id_valid(id) = id < VIRTQ_SIZE`, drop the
-  used entry (advance last_used_idx, skip re-post) on a bad id; guard the TX free
-  too. Deterministically testable (elf_phtab_bounds_selftest pattern). HIGH (but
-  threat model is a malicious device; QEMU SLIRP is trusted today).
+  memcpy from it + OOB WRITE of 4 descriptor fields. Same unchecked id at the TX
+  free (line 395) -> virtq_free_desc OOB-writes desc[idx] and corrupts free_head.
+  Fixed with pure `virtio_desc_id_valid(id) = id < VIRTQ_SIZE`: rx-poll advances
+  last_used_idx first then drops a bad-id completion (return 0, no table index, no
+  re-post); TX frees the device id only if valid, else the known-submitted `idx`
+  (no device trust, no descriptor leak); and virtq_free_desc itself now guards
+  (defense-in-depth at the OOB-write primitive). Deterministic
+  virtio_desc_id_valid_selftest (0, 255 valid; 256, 1000, 0xFFFFFFFF invalid).
+  Boot DHCP/rx still works (the guard only drops ids a well-behaved device never
+  sends). Threat model: a malicious/buggy device (hypervisor/passthrough/future
+  real NIC); QEMU SLIRP is trusted today, so this is robustness/hardening.
 
 - **DRM create_dumb pitch 32-bit overflow** (`kernel/drivers/video/drm.c:486`
   drm_ioctl_create_dumb) -> OPEN. `pitch = a.width * 4` is a 32-bit multiply
