@@ -1,5 +1,8 @@
 #include "kheap.h"
 #include "slab_pcpu.h"
+#ifdef MAKAOS_BOOT_SELFTESTS
+#include "kprintf.h"
+#endif
 static kheap_t g_kheap;
 
 // Exposed to slab_pcpu.c — the only consumer that needs the cache
@@ -52,6 +55,14 @@ void kheap_init(void) {
   slab_pcpu_init();
 }
 
+// Bytes reserved before the returned pointer for big (buddy-backed)
+// allocations: the order byte lives at raw[0] and the payload starts at
+// raw + KMALLOC_BIG_HDR (16-byte aligned).  This MUST be the single source of
+// truth for both the size rounding and the pointer math — they previously
+// disagreed (sized for 8, offset by 16), so a request in the band
+// (2^k - 16, 2^k - 8] over-ran the buddy block by up to 8 bytes.
+#define KMALLOC_BIG_HDR 16
+
 void* kmalloc(size_t size) {
   size_t idx = pick_cache_idx(size);
 
@@ -61,13 +72,14 @@ void* kmalloc(size_t size) {
     return slab_pcpu_alloc(idx);
   }
 
-  uint8_t order = size_to_order(size + 8);
+  if (size > (size_t)-1 - KMALLOC_BIG_HDR) return NULL;   // size + header overflow
+  uint8_t order = size_to_order(size + KMALLOC_BIG_HDR);
   phys_addr_t phys = pmm_buddy_alloc(order);
   if (phys == PMM_INVALID_ADDR) return NULL;
 
   uint8_t* raw = (uint8_t*)(phys + HHDM_OFFSET);
   *raw = order;
-  return (void*)(raw + 16);  // 16-byte aligned (raw is page-aligned)
+  return (void*)(raw + KMALLOC_BIG_HDR);  // 16-byte aligned (raw is page-aligned)
 }
 
 void kfree(void* addr) {
@@ -79,12 +91,48 @@ void kfree(void* addr) {
     // hit the page's remote_free Treiber stack.
     slab_pcpu_free(addr);
   } else {
-    uint8_t* raw = (uint8_t*)addr - 16;
+    uint8_t* raw = (uint8_t*)addr - KMALLOC_BIG_HDR;
     uint8_t order = *raw;
     phys_addr_t phys = (phys_addr_t)((virt_addr_t)raw - HHDM_OFFSET);
     pmm_buddy_free(phys, order);
   }
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Regression test for the big-alloc header inconsistency: kmalloc used to
+// size the buddy block for `size + 8` but return `raw + 16`, so a request in
+// the (2^k - 16, 2^k - 8] band over-ran its block by up to 8 bytes.  Verify
+// every big (buddy-backed) allocation's usable span (block - header) covers
+// the request.  Each chosen size also prints what the buggy `size + 8` sizing
+// would have produced, demonstrating the bug and the fix in one run.
+void kheap_overflow_selftest(void) {
+    kprintf("[kheap_test] big-alloc header consistency check\n");
+    static const size_t sizes[] = { 8184, 8185, 16376, 32760 };
+    int failed = 0;
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        size_t req = sizes[i];
+        uint8_t* p = (uint8_t*)kmalloc(req);
+        if (!p) { kprintf("[kheap_test] OOM at size %lu\n", (unsigned long)req); continue; }
+        if (pmm_is_slab_ptr(p)) { kfree(p); continue; }   // not the big path
+        uint8_t order  = *(p - KMALLOC_BIG_HDR);
+        size_t  usable = ((size_t)PAGE_SIZE << order) - KMALLOC_BIG_HDR;
+        uint8_t old_order  = size_to_order(req + 8);       // what the buggy code chose
+        size_t  old_usable = ((size_t)PAGE_SIZE << old_order) - KMALLOC_BIG_HDR;
+        if (old_usable < req)
+            kprintf("[kheap_test]   req=%lu: pre-fix(size+8) usable=%lu < req (was a bug); now usable=%lu\n",
+                    (unsigned long)req, (unsigned long)old_usable, (unsigned long)usable);
+        if (usable < req) {
+            kprintf("[kheap_test] FAIL req=%lu order=%u usable=%lu < req\n",
+                    (unsigned long)req, order, (unsigned long)usable);
+            failed = 1;
+        }
+        for (size_t j = 0; j < req; j++) p[j] = (uint8_t)0xA5;  // exercise the full write
+        kfree(p);
+    }
+    kprintf(failed ? "[kheap_test] SELF-TEST FAILED (usable < requested)\n"
+                   : "[kheap_test] SELF-TEST PASSED (big-alloc usable >= requested)\n");
+}
+#endif
 
 //LEGACY
 /*

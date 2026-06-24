@@ -556,23 +556,27 @@ uint8_t sched_try_steal(cpu_t* self) {
                                      __ATOMIC_RELAXED);
 
                 // Push onto our own deque at the same MLFQ level.
-                // We're the owner here — chaselev_push is lock-free
-                // from our side and doesn't contend with thieves on
-                // OUR queue (there shouldn't be any at this moment
-                // since we just woke from idle).
-                if (!chaselev_push(&self->rq.levels[lvl], t)) {
-                    // Our own queue full — give the task back.
-                    // Pushing to victim again isn't easy from this
-                    // side (we're a thief w.r.t them), so enqueue
-                    // locally once space clears.  For now, re-try by
-                    // popping oldest and re-pushing victim — but at
-                    // 512 slots this is pathological.  Panic for now.
+                // We are the deque OWNER here, but the idle loop runs with
+                // IRQs enabled, and this CPU's sched_tick (timer IRQ) does
+                // owner-side chaselev_push (waking expired sleepers) and
+                // chaselev_pop (priority boost) on this SAME deque under
+                // rq_lock.  An unlocked push here would let a timer IRQ
+                // land mid-push and tear `bottom` -> a task lost or made
+                // dispatchable twice (two CPUs into one kstack).  Take the
+                // local rq_lock (irqsave) so the push is serialized with
+                // sched_tick and no same-CPU IRQ can interleave.
+                uint64_t pf = spin_lock_irqsave(&self->rq_lock);
+                uint8_t pushed = chaselev_push(&self->rq.levels[lvl], t);
+                if (pushed)
+                    __atomic_fetch_add(&self->rq.nr_running, 1,
+                                         __ATOMIC_RELAXED);
+                spin_unlock_irqrestore(&self->rq_lock, pf);
+                if (!pushed) {
+                    // Our own queue full — pathological at 512 slots.
                     extern void kprintf(const char*, ...);
                     kprintf("[sched] PANIC: steal-side rq overflow\n");
                     for (;;) __asm__ volatile("cli; hlt");
                 }
-                __atomic_fetch_add(&self->rq.nr_running, 1,
-                                     __ATOMIC_RELAXED);
                 took_any = 1;
             }
             if (took_any) break;      // stop at first productive level

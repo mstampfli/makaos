@@ -432,6 +432,12 @@ static void init_kthread(void) {
     extern void slab_pcpu_selftest(void);
     slab_pcpu_selftest();
 
+    // Audit fix: big-alloc (buddy-backed) kmalloc header was sized for 8
+    // bytes but offset by 16 -> up to 8-byte heap overflow for sizes in the
+    // (2^k - 16, 2^k - 8] band.  Verify usable span covers the request.
+    extern void kheap_overflow_selftest(void);
+    kheap_overflow_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without
