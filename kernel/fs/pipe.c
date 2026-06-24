@@ -135,11 +135,23 @@ static void pipe_write_close(vfs_file_t* self) {
 }
 
 // poll: check readiness without blocking.
+// poll(2) revents bit (mirrors syscall.h POLLHUP); the vfs poll hook is asked
+// for one condition at a time via f->poll(f, <bit>).
+#define PIPE_POLLHUP 0x0010
+
 static int pipe_read_poll(vfs_file_t* self, int events) {
-    (void)events;
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
-    // Readable if data available OR write end closed (EOF).
-    return (p->count > 0 || p->writer_refs == 0) ? 1 : 0;
+    // POLLHUP probe (fd_has_hup -> f->poll(f, POLLHUP)): a pipe read end has
+    // hung up ONLY once every writer has closed.  A pipe still holding buffered
+    // data with a LIVE writer is not hung up.  The old code ignored `events`
+    // and always answered the readability question (count>0 || writers==0), so
+    // a POLLHUP probe returned true whenever data was queued -> the poll layer
+    // OR'd in a spurious POLLHUP, and swaybar treated its still-running status
+    // command as crashed and rendered "[error reading from status command]".
+    if (events & PIPE_POLLHUP)
+        return (p && p->writer_refs == 0) ? 1 : 0;
+    // POLLIN / default: readable if data is available OR the write end closed.
+    return (p && (p->count > 0 || p->writer_refs == 0)) ? 1 : 0;
 }
 
 static int pipe_write_poll(vfs_file_t* self, int events) {

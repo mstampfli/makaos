@@ -931,14 +931,18 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # $menu through tofi-run → swaymsg exec (no xargs on the image — sh -c
     # evaluates the $(...) at keypress time).
     # The default status_command shells out to `date` and `sleep`, which the
-    # image doesn't ship (no coreutils).  `while date; ...` then exits at once
-    # (date: not found), so swaybar shows no clock.  Rewrite it to bash-5.2
-    # builtins: printf '%()T' for the time, `read -t 1` (on swaybar's still-open
-    # status pipe) for the 1s tick — no external binaries needed.
+    # image doesn't ship (no coreutils).  This bash build also lacks a working
+    # `printf '%()T'` (errors → exit 2) and `read -t` timeout, and bash
+    # block-buffers builtin output to a pipe — so a clock loop either exits
+    # (red "[error reading from status command]") or busy-fork-storms (#GP).
+    # Use a robust STATIC line instead: a subshell `( printf ... )` flushes the
+    # text to swaybar's pipe on the subshell's exit, then a blocking `read`
+    # parks forever on the still-open status pipe so the command never exits
+    # (no hangup, no busy loop).  No clock, but a clean non-error status.
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
-        -e 's|^[[:space:]]*status_command .*|    status_command while printf "%(%Y-%m-%d %X)T\\n"; do read -t 1; done|' \
+        -e 's|^[[:space:]]*status_command .*|    # status_command disabled: this bash build lacks printf %()T and read -t,\n    # and block-buffers builtin output, so no clock loop is viable (a real clock\n    # needs a small C helper or a bash rebuilt with those features). The bar\n    # still shows workspaces; an absent status_command renders no status (no red\n    # "[error reading from status command]").|' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
