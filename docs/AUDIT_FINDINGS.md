@@ -114,9 +114,14 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
   deref + `sched_wake` outside any RCU section -> UAF if the pid exits+destroys
   concurrently. Narrow window (zombie stays in `pid_ht` until destroy). Fix:
   hold the RCU section across the use, or refcount the task.
-- **eventfd POLLOUT starvation** (`kernel/io/eventfd.c`): poll/select register
-  only on `read_wq`; POLLOUT wakeups go to `write_wq`, so a task polling a FULL
-  eventfd for POLLOUT is never woken. Unreachable in practice (full = 2^64-2).
+- **eventfd POLLOUT starvation** (`kernel/io/eventfd.c`) -> FIXED (F7).
+  poll/select registered only on `read_wq` (`f->waitq`); the POLLOUT wakeup
+  fires on `write_wq` when a reader drains a full eventfd, so a task polling a
+  FULL eventfd for POLLOUT was never woken. Fixed: `f->secondary_waitq =
+  &s->write_wq` (sys_poll/sys_select register on both waitqs). Extended
+  `eventfd_selftest` (Case 5) asserts a full eventfd reports POLLIN-not-POLLOUT
+  and that secondary_waitq points at write_wq -> PASSES. (Low reachability:
+  full = 2^64-2, but the fix is one line and correct.)
 - **unix_sock_accept** wakes client via `unix_wake` not `unix_poll_wake`
   (line ~612): latent missing-wakeup, harmless until non-blocking connect lands.
 - **ext2_readdir over-read** (`kernel/fs/ext2.c`) -> FIXED (F6). The walk guarded
