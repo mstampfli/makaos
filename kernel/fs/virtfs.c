@@ -3,6 +3,7 @@
 #include "errno.h"
 #include "ext2.h"
 #include "sched.h"
+#include "rcu.h"     // rcu_read_lock around sched_find_pid
 
 // ── Per-node device table ────────────────────────────────────────────────
 // Single source of truth for all /dev nodes: name, ownership, permissions.
@@ -168,9 +169,14 @@ static int virt_resolve(const char* path, const virtmount_t* m,
         }
 
         if (pid) {
+            // rcu_read_lock keeps the looked-up task alive across the cred
+            // reads: sched_find_pid returns a bare pointer that a concurrent
+            // exit+task_destroy (RCU-deferred free) could otherwise free.
+            rcu_read_lock();
             task_t* t = sched_find_pid(pid);
             uint32_t owner_uid = t ? t->cred.euid : 0;
             uint32_t owner_gid = t ? t->cred.egid : 0;
+            rcu_read_unlock();
 
             if (after[0] == '\0' || (after[0] == '/' && after[1] == '\0')) {
                 // /proc/<pid> directory

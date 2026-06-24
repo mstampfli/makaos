@@ -182,10 +182,16 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
   signal_send is rcu/lock-safe (atomic bit + sched_wake->rq_lock, no sleep), so
   holding the section across delivery is sound. Deterministic
   signal_send_pid_selftest (unknown pid -> -ESRCH, proves the rcu section
-  balances). PART B -> STILL OPEN: the `/proc` (`proc.c` proc_open/proc_readdir
-  x3) and `virtfs.c:171` callers, whose rcu section must span a multi-return
-  `gen()` / `proc_fd_open` use -- mechanical but needs careful unlock-on-every-
-  path; a leaked section (preempt left disabled) would wedge the CPU.
+  balances). PART B -> FIXED (F17): the `/proc` (`proc.c` proc_open /
+  proc_readdir / proc_stat) and `virtfs.c` callers. Confirmed none of the deref
+  helpers sleep (no sched_sleep/WAIT in proc.c) and none store `t` beyond their
+  call (gen_* snapshot into a heap buffer, proc_fd_open takes its own fd ref,
+  readdir fills the caller's out array), and `rcu_read_lock == preempt_disable`
+  is a nestable counter (so proc_fd_open's inner section nests cleanly). Wrapped
+  each call site in rcu_read_lock spanning the lookup + all `t` derefs, with a
+  SINGLE exit (goto open_out/rd_out/stat_out, scoped blocks so the gotos don't
+  cross `sub`'s init) so the section is never leaked; virtfs reads t->cred into
+  locals so it is a tight 3-line wrap.  sched_find_pid UAF now FULLY closed.
 - **eventfd POLLOUT starvation** (`kernel/io/eventfd.c`) -> FIXED (F7).
   poll/select registered only on `read_wq` (`f->waitq`); the POLLOUT wakeup
   fires on `write_wq` when a reader drains a full eventfd, so a task polling a
