@@ -450,6 +450,11 @@ static void init_kthread(void) {
     extern void ext2_readdir_clamp_selftest(void);
     ext2_readdir_clamp_selftest();
 
+    // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
+    // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.
+    extern void pty_ioctl_selftest(void);
+    pty_ioctl_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without

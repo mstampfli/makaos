@@ -7,6 +7,7 @@
 #include "pty.h"
 #include "tty.h"
 #include "vfs.h"
+#include "errno.h"
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
@@ -411,107 +412,43 @@ static void pty_slave_close(vfs_file_t* self) {
 // console-tty fallback that accidentally signals the *console's* fg_pgid —
 // which killed makaterm with SIGWINCH on every resize.
 
-static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
-    pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
-    tty_t* tty = &ctx->pty->slave;
+// Safe user<->kernel copies (validate + prefault, return 0 / -EFAULT).  The
+// ioctl `arg` is a raw user pointer; reading/writing it directly (as the old
+// code did) was an arbitrary kernel read/write from any process that can open
+// /dev/ptmx or /dev/pts/N.  Route every get/set through these.
+extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
+extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
+// Shared termios/winsize/pgrp ioctls.  Master and slave both act on the SAME
+// slave tty, so the get/set logic is identical -- one source of truth here
+// instead of two drifting copies.  Returns 0, -EFAULT (bad user `arg`), or
+// -EINVAL (request not handled here; the caller handles its unique ioctls).
+static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) {
     switch (request) {
-        case 0x5401: { // TCGETS
-            termios_t* out = (termios_t*)arg;
-            *out = tty->termios;
-            return 0;
-        }
+        case 0x5401: // TCGETS
+            return copy_to_user((void*)arg, &tty->termios, sizeof(tty->termios))
+                   ? -EFAULT : 0;
         case 0x5402: // TCSETS
         case 0x5403: // TCSETSW
-        case 0x5404: { // TCSETSF
-            const termios_t* in = (const termios_t*)arg;
-            tty->termios = *in;
+        case 0x5404: // TCSETSF
+            if (copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios)))
+                return -EFAULT;
             if (request == 0x5404) tty_flush_input(tty);
             return 0;
-        }
-        case 0x540F: { // TIOCGPGRP
-            uint32_t* out = (uint32_t*)arg;
-            *out = tty->fg_pgid;
-            return 0;
-        }
-        case 0x5410: { // TIOCSPGRP
-            const uint32_t* in = (const uint32_t*)arg;
-            tty->fg_pgid = *in;
-            return 0;
-        }
-        case 0x5413: { // TIOCGWINSZ
-            winsize_t* out = (winsize_t*)arg;
-            *out = tty->winsize;
-            return 0;
-        }
-        case 0x5414: { // TIOCSWINSZ
-            const winsize_t* in = (const winsize_t*)arg;
-            tty->winsize = *in;
-            // Notify the foreground pgroup on the slave side so the child
-            // shell can reflow. Never signal the master's own pgroup.
-            if (tty->fg_pgid)
-                signal_send_pgrp(tty->fg_pgid, SIGWINCH);
-            return 0;
-        }
-        case 0x5425: // TCSBRK
-        case 0x540B: // TCXONC
-        case 0x540C: // TCFLSH
-        case 0x540D: // TIOCEXCL
-        case 0x540A: // TIOCNXCL
-            return 0;
-        case 0x80045430: { // TIOCGPTN — slave index for ptsname()
-            uint32_t* out = (uint32_t*)arg;
-            *out = (uint32_t)ctx->pty->index;
-            return 0;
-        }
-        default:
-            return -22; // EINVAL
-    }
-}
-
-// ── Slave ioctl ──────────────────────────────────────────────────────────
-
-static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
-    pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
-    tty_t* tty = &ctx->pty->slave;
-
-    switch (request) {
-        case 0x5401: { // TCGETS
-            termios_t* out = (termios_t*)arg;
-            *out = tty->termios;
-            return 0;
-        }
-        case 0x5402: // TCSETS
-        case 0x5403: // TCSETSW
-        case 0x5404: { // TCSETSF
-            const termios_t* in = (const termios_t*)arg;
-            tty->termios = *in;
-            if (request == 0x5404) tty_flush_input(tty);
-            return 0;
-        }
-        case 0x540F: { // TIOCGPGRP
-            uint32_t* out = (uint32_t*)arg;
-            *out = tty->fg_pgid;
-            return 0;
-        }
-        case 0x5410: { // TIOCSPGRP
-            const uint32_t* in = (const uint32_t*)arg;
-            tty->fg_pgid = *in;
-            return 0;
-        }
-        case 0x5413: { // TIOCGWINSZ
-            winsize_t* out = (winsize_t*)arg;
-            *out = tty->winsize;
-            return 0;
-        }
-        case 0x5414: { // TIOCSWINSZ
-            const winsize_t* in = (const winsize_t*)arg;
-            tty->winsize = *in;
-            // TODO: send SIGWINCH to fg_pgid
-            return 0;
-        }
-        case 0x540E: // TIOCSCTTY
-            tty_set_ctty(tty);
+        case 0x540F: // TIOCGPGRP
+            return copy_to_user((void*)arg, &tty->fg_pgid, sizeof(tty->fg_pgid))
+                   ? -EFAULT : 0;
+        case 0x5410: // TIOCSPGRP
+            return copy_from_user(&tty->fg_pgid, (const void*)arg, sizeof(tty->fg_pgid))
+                   ? -EFAULT : 0;
+        case 0x5413: // TIOCGWINSZ
+            return copy_to_user((void*)arg, &tty->winsize, sizeof(tty->winsize))
+                   ? -EFAULT : 0;
+        case 0x5414: // TIOCSWINSZ
+            if (copy_from_user(&tty->winsize, (const void*)arg, sizeof(tty->winsize)))
+                return -EFAULT;
+            // Notify the foreground pgroup so the child shell can reflow.
+            if (tty->fg_pgid) signal_send_pgrp(tty->fg_pgid, SIGWINCH);
             return 0;
         case 0x5425: // TCSBRK
         case 0x540B: // TCXONC
@@ -520,9 +457,63 @@ static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg)
         case 0x540A: // TIOCNXCL
             return 0;  // acknowledged, no-op
         default:
-            return -22; // EINVAL
+            return -EINVAL;
     }
 }
+
+static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
+    if (request == 0x80045430) { // TIOCGPTN -- master-only: slave index for ptsname()
+        uint32_t n = (uint32_t)ctx->pty->index;
+        return copy_to_user((void*)arg, &n, sizeof(n)) ? -EFAULT : 0;
+    }
+    return pty_tty_ioctl_common(&ctx->pty->slave, request, arg);
+}
+
+// ── Slave ioctl ──────────────────────────────────────────────────────────
+
+static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
+    if (request == 0x540E) { // TIOCSCTTY -- slave-only
+        tty_set_ctty(&ctx->pty->slave);
+        return 0;
+    }
+    return pty_tty_ioctl_common(&ctx->pty->slave, request, arg);
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Audit fix: pty ioctls dereferenced the raw user `arg` (arbitrary kernel R/W
+// LPE).  Verify every termios/winsize/pgrp/ptn ioctl now rejects a bad user
+// pointer (kernel / non-canonical / NULL) with -EFAULT instead of touching it.
+void pty_ioctl_selftest(void) {
+    extern void kprintf(const char*, ...);
+    kprintf("[pty_ioctl_test] pty ioctls must reject bad user pointers\n");
+    vfs_file_t* m = pty_open_master();
+    if (!m) { kprintf("[pty_ioctl_test] FAIL: pty_open_master\n"); return; }
+    static const uint64_t bad[] = {
+        0xFFFF800000001000ULL,   // kernel HHDM address (the LPE case)
+        0xDEAD000000000000ULL,   // non-canonical
+        0ULL,                    // NULL
+    };
+    static const uint64_t reqs[] = {
+        0x5401, 0x5402, 0x540F, 0x5410, 0x5413, 0x5414, 0x80045430,
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (unsigned j = 0; j < sizeof(reqs) / sizeof(reqs[0]); j++) {
+            int64_t r = m->ioctl(m, reqs[j], bad[i]);
+            if (r != -EFAULT) {
+                kprintf("[pty_ioctl_test] FAIL req=0x%lx addr=0x%lx -> %d\n",
+                        (unsigned long)reqs[j], (unsigned long)bad[i], (int)r);
+                fails++;
+            }
+        }
+    }
+    if (m->close) m->close(m);
+    kprintf(fails ? "[pty_ioctl_test] SELF-TEST FAILED\n"
+                  : "[pty_ioctl_test] SELF-TEST PASSED (ioctls reject bad user pointers)\n");
+}
+#endif
 
 // ── pty_alloc — create a new PTY pair ────────────────────────────────────
 

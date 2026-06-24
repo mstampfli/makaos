@@ -159,7 +159,10 @@ for unmapped-user-ptr panic-prevention) called before both ops. `copy_user_selft
 extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
 
 ### TODO (from second pass) - careful but high value:
-- **PTY ioctl arbitrary kernel R/W** (`kernel/drivers/tty/pty.c` pty_master_ioctl
+- **PTY ioctl arbitrary kernel R/W** -> FIXED (F10): routed pty_master/slave_ioctl
+  through a shared pty_tty_ioctl_common using copy_*_user (also fixed the slave's
+  missing-SIGWINCH TODO); pty_ioctl_selftest asserts -EFAULT for bad pointers.
+  (original:) (`kernel/drivers/tty/pty.c` pty_master_ioctl
   ~414, pty_slave_ioctl ~474): TCGETS/TIOCGWINSZ/TIOCGPGRP/TIOCGPTN do
   `*(user_ptr) = tty->field` (arbitrary kernel WRITE) and TCSETS/TIOCSWINSZ/
   TIOCSPGRP do `tty->field = *(user_ptr)` (arbitrary kernel READ) on the raw
