@@ -305,14 +305,18 @@ cleanliness one (sys_select) this pass; the other four are the refreshed backlog
   copy_user_selftest extended to assert sys_select(1, bad_ptr, 0,0,0) == -EFAULT.
 
 - **ext2 block size unbounded from on-disk superblock** (`kernel/fs/ext2.c:767`
-  ext2_init) -> OPEN. `s_block_size = 1024u << sb->s_log_block_size` with no clamp;
-  the bcache slots + DMA scratch are hard-fixed at 4096. A crafted/corrupt image
-  with s_log_block_size >= 3 -> block size > 4096 -> ahci_read DMAs past the 4096
-  scratch (heap overflow) and bcache_fill_way memcpy overruns the 4096 BSS slot;
-  s_log_block_size >= 32 is also shift UB. Reachable at mount (boot disk trusted,
-  but any future removable/secondary ext2 volume). Fix: one-line clamp
-  `if (sb->s_log_block_size > 2u) return 0;` (only 1024/2048/4096; slots are 4096).
-  Deterministically testable via a pure ext2_block_size/ok helper. Confidence HIGH.
+  ext2_init) -> FIXED (F21). `s_block_size = 1024u << sb->s_log_block_size` with
+  no clamp; the bcache slots + DMA scratch are hard-fixed at 4096. A
+  crafted/corrupt image with s_log_block_size >= 3 -> block size > 4096 ->
+  ahci_read DMAs past the 4096 scratch (heap overflow) and bcache_fill_way memcpy
+  overruns the 4096 BSS slot; s_log_block_size >= 32 is also shift UB. Fixed by a
+  pure validated helper `ext2_block_size_checked(log)` (returns 1024/2048/4096
+  for log 0/1/2, else 0) used at mount, which refuses the mount on an unsupported
+  size; also introduced the named constant EXT2_BLOCK_SIZE_MAX=4096 as the single
+  source of truth for the bcache slot dimension + the three EXT2_SCRATCH kmalloc
+  sizes + the helper's bound (DRY). Deterministic ext2_block_size_selftest
+  (0/1/2 -> 1024/2048/4096 all <=MAX; 3/10/31/32 -> 0). Boot still mounts the
+  real disk + fork-execs /bin/login (mount runs before login) so no regression.
 
 - **unveil sandbox bypass via /dev|/proc prefix without boundary**
   (`kernel/syscall/syscall.c:411-413` sys_open got_file) -> FIXED (F20). The

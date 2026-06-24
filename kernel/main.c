@@ -450,6 +450,11 @@ static void init_kthread(void) {
     extern void ext2_readdir_clamp_selftest(void);
     ext2_readdir_clamp_selftest();
 
+    // Audit fix: ext2 block size from an untrusted superblock was unbounded
+    // (could exceed the fixed 4096 bcache slots).  Verify the mount-time clamp.
+    extern void ext2_block_size_selftest(void);
+    ext2_block_size_selftest();
+
     // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
     // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.
     extern void pty_ioctl_selftest(void);

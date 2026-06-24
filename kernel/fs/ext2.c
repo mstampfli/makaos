@@ -40,14 +40,20 @@
 static inline void ext2_scratch_free_(uint8_t** p) {
     if (*p) kfree(*p);
 }
+// The single fixed size of every block buffer: the bcache slots and all
+// EXT2_SCRATCH allocations.  This is also the MAXIMUM ext2 block size the FS
+// supports -- ext2_block_size_checked() rejects any superblock whose block
+// size would exceed it, so a DMA read or memcpy of a full block can never
+// overrun these buffers.  Keep the bcache slot dimension below in lockstep.
+#define EXT2_BLOCK_SIZE_MAX 4096u
 #define EXT2_SCRATCH_DECL(name) \
     uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = NULL
 #define EXT2_SCRATCH_ALLOC(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return 0; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return 0; } while (0)
 #define EXT2_SCRATCH_ALLOC_NEG1(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return -1; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return -1; } while (0)
 #define EXT2_SCRATCH_ALLOC_VOID(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return; } while (0)
 // Convenience: declare + alloc in one step for cases where the function
 // has already passed all early-error checks before the scratch is needed.
 #define EXT2_SCRATCH(name)       EXT2_SCRATCH_DECL(name); EXT2_SCRATCH_ALLOC(name)
@@ -59,6 +65,18 @@ static inline void ext2_scratch_free_(uint8_t** p) {
 static uint32_t s_part_lba        = 0;
 static uint32_t s_block_size      = 0;   // bytes per block (1024, 2048, or 4096)
 static uint32_t s_sectors_per_blk = 0;   // block_size / 512
+
+// Map an on-disk s_log_block_size to the block size in bytes, or 0 if the
+// value is unsupported.  `log` comes straight from an untrusted superblock, so
+// this is the validation gate: only 1024/2048/4096 (log 0/1/2) are accepted --
+// every one of which is <= EXT2_BLOCK_SIZE_MAX (the fixed bcache slot / scratch
+// size), so a full-block DMA read or memcpy can never overrun those buffers.
+// log >= 3 would yield a block > 4096 (buffer overflow); log >= 32 is also a
+// shift past the operand width (UB).  Pure -> unit-tested below.
+static uint32_t ext2_block_size_checked(uint32_t log) {
+    if (log > 2u) return 0;          // > 4096 unsupported; rejects the mount
+    return 1024u << log;             // 1024 / 2048 / 4096
+}
 static uint32_t s_inodes_per_grp  = 0;
 static uint32_t s_blocks_per_grp  = 0;
 static uint32_t s_inode_size      = 128; // bytes per inode on disk
@@ -140,7 +158,7 @@ typedef struct {
     uint64_t   last_use;       // LRU counter — bumped on each hit
 } bcache_way_t;
 
-static uint8_t      s_bcache_data[BCACHE_NSETS][BCACHE_WAYS][4096];
+static uint8_t      s_bcache_data[BCACHE_NSETS][BCACHE_WAYS][EXT2_BLOCK_SIZE_MAX];
 static bcache_way_t s_bcache_meta[BCACHE_NSETS][BCACHE_WAYS];
 // Global monotonic LRU clock — bumped on every hit.  Atomic because many
 // readers may tick it concurrently.  Overflow is safe (we compare by
@@ -764,7 +782,11 @@ uint8_t ext2_init(uint32_t part_lba) {
     ext2_superblock_t* sb = (ext2_superblock_t*)sb_buf;
     if (sb->s_magic != EXT2_MAGIC) return 0;
 
-    s_block_size      = 1024u << sb->s_log_block_size;
+    // Validate the block size from the untrusted superblock before any block
+    // read: an out-of-range s_log_block_size would make s_block_size exceed the
+    // fixed 4096-byte bcache slots / DMA scratch (heap+BSS overflow) or shift UB.
+    s_block_size      = ext2_block_size_checked(sb->s_log_block_size);
+    if (s_block_size == 0) return 0;   // unsupported block size -> refuse mount
     s_sectors_per_blk = s_block_size / 512;
     s_inodes_per_grp  = sb->s_inodes_per_group;
     s_blocks_per_grp  = sb->s_blocks_per_group;
@@ -1464,6 +1486,33 @@ void ext2_readdir_clamp_selftest(void) {
     }
     kprintf(fails ? "[ext2_readdir_test] SELF-TEST FAILED\n"
                   : "[ext2_readdir_test] SELF-TEST PASSED (name clamped to block bounds)\n");
+}
+
+// Deterministic test of the mount-time block-size validation: only log 0/1/2
+// (1024/2048/4096) are accepted, and every accepted size is <= the fixed
+// buffer max.  log 3 (8192) is the first overflow; 31/32 are the shift-UB edge.
+void ext2_block_size_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t log, want; } c[] = {
+        { 0,  1024 },   // 1024
+        { 1,  2048 },   // 2048
+        { 2,  4096 },   // 4096 == EXT2_BLOCK_SIZE_MAX
+        { 3,  0    },   // 8192 -> rejected (would overrun the 4096 buffers)
+        { 10, 0    },   // huge -> rejected
+        { 31, 0    },   // rejected
+        { 32, 0    },   // shift-UB region -> rejected
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = ext2_block_size_checked(c[i].log);
+        if (got != c[i].want || (got != 0 && got > EXT2_BLOCK_SIZE_MAX)) {
+            kprintf("[ext2_blksz_test] FAIL log=%u got=%u want=%u\n",
+                    c[i].log, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_blksz_test] SELF-TEST FAILED\n"
+                  : "[ext2_blksz_test] SELF-TEST PASSED (block size validated <= 4096)\n");
 }
 #endif
 
