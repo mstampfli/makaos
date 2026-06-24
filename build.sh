@@ -944,17 +944,19 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # `read -t` timeout, and it block-buffers builtin output to a pipe — so the
     # loop either exits (swaybar then renders red "[error reading from status
     # command]") or busy-fork-storms a subshell-per-tick (#GP).
-    # A native helper, /bin/makaclock (userland/apps/makaclock), is BUILT and
-    # ready (formats UTC time, one unbuffered write(2)/s, nanosleep, never
-    # exits).  BUT a swaybar bug makes a *text* status it reads destabilize the
-    # bar's first layer commit (~1/4 boots commit, occasional #GP) — distinct
-    # from the bar height fix.  Until that swaybar/present-path issue is fixed,
-    # leave the status_command disabled so the taskbar renders reliably; wire it
-    # to `/bin/makaclock` once the bar commits cleanly with a text status.
+    # A native helper, /bin/makaclock (userland/apps/makaclock), formats UTC
+    # time, one unbuffered write(2)/s, nanosleep, never exits.  status_command
+    # is wired to it.  The earlier "text status destabilizes the bar" was the
+    # kernel pipe_read O_NONBLOCK bug (swaybar's getline blocked forever on the
+    # status pipe) — fixed in kernel/fs/pipe.c, so a live text status is safe.
+    # The explicit `font pango:DejaVu Sans Mono` below avoids the unreliable
+    # generic "monospace" fontconfig match (which renders the bar text as tofu).
     sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
         -e 's|^[[:space:]]*status_command .*|    status_command /bin/makaclock|' \
+        -e 's|^[[:space:]]*font .*|    font pango:DejaVu Sans Mono 11|' \
+        -e '/^bar {/a\    font pango:DejaVu Sans Mono 11' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
