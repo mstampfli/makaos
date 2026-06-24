@@ -3059,6 +3059,9 @@ int user_buf_check(uint64_t addr, uint64_t len) {
 // as the output buffer).  They now route through copy_from_user/copy_to_user.
 // Verify those primitives REJECT bad pointers (kernel, non-canonical, past the
 // user ceiling, NULL) with -EFAULT instead of faulting / touching the address.
+static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
+                            uint64_t eset_ptr, uint64_t tv_ptr);  // fwd: selftest below
+
 void copy_user_selftest(void) {
     kprintf("[copyuser_test] copy_from/to_user must reject bad pointers\n");
     char buf[32];
@@ -3089,9 +3092,18 @@ void copy_user_selftest(void) {
                     (unsigned long)bad[i]);
             fails++;
         }
+        // sys_select must reject a bad (non-NULL) readfds pointer with -EFAULT
+        // instead of dereferencing it (the arbitrary-kernel-read it used to do).
+        // Skip bad[3] == NULL, which legitimately means "empty readfds".
+        if (bad[i] != 0ULL &&
+            sys_select(1, bad[i], 0, 0, 0) != (uint64_t)-EFAULT) {
+            kprintf("[copyuser_test] FAIL: sys_select accepted readfds 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
     }
     kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
-                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check)\n");
+                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
 }
 #endif
 
@@ -3726,21 +3738,30 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     if (!g_current) return (uint64_t)-EINVAL;
     if (nfds > FD_SETSIZE) return (uint64_t)-EINVAL;
 
+    // Read the input fd_sets through copy_from_user (== _access_ok + prefault).
+    // A raw deref of rset_ptr/wset_ptr/eset_ptr would be an arbitrary kernel
+    // read (a kernel address makes the selected bits observable in the returned
+    // output sets) and a kernel-fault DoS on a bad pointer -- the input twin of
+    // sys_poll's already-hardened copy_from_user path.  NULL = empty set.
     fd_set_t rset, wset, eset;
     fd_set_t rout, wout, eout;
-    for (int i = 0; i < (int)(FD_SETSIZE/64); i++) {
-        rset.bits[i] = rset_ptr ? ((fd_set_t*)rset_ptr)->bits[i] : 0;
-        wset.bits[i] = wset_ptr ? ((fd_set_t*)wset_ptr)->bits[i] : 0;
-        eset.bits[i] = eset_ptr ? ((fd_set_t*)eset_ptr)->bits[i] : 0;
-        rout.bits[i] = wout.bits[i] = eout.bits[i] = 0;
-    }
+    if (rset_ptr) { if (copy_from_user(&rset, (const void*)rset_ptr, sizeof(rset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&rset, 0, sizeof(rset));
+    if (wset_ptr) { if (copy_from_user(&wset, (const void*)wset_ptr, sizeof(wset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&wset, 0, sizeof(wset));
+    if (eset_ptr) { if (copy_from_user(&eset, (const void*)eset_ptr, sizeof(eset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&eset, 0, sizeof(eset));
+    __builtin_memset(&rout, 0, sizeof(rout));
+    __builtin_memset(&wout, 0, sizeof(wout));
+    __builtin_memset(&eout, 0, sizeof(eout));
 
     // Determine timeout in nanoseconds (NULL = infinite).
     int sel_infinite = 1;
     uint64_t timeout_ns = 0;
     if (tv_ptr) {
         k_timeval_t tv;
-        copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv));
+        if (copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv)) != 0)
+            return (uint64_t)-EFAULT;   // was: ignored -> used uninitialized tv
         timeout_ns = (uint64_t)tv.tv_sec * 1000000000ULL
                    + (uint64_t)tv.tv_usec * 1000ULL;
         sel_infinite = 0;

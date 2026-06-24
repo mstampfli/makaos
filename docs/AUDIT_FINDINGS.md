@@ -286,3 +286,63 @@ extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
   `elf_phtab_in_bounds`, like ext2_dirent_namelen_clamp) + reject phentsize<56;
   deterministically testable. Secondary: p_vaddr not range-checked + seg_end
   overflow (elf.c:107).
+
+## THIRD AUDIT PASS (5-agent fan-out, 2026-06-25) — backlog refill
+
+Five HIGH-confidence, clean, deterministically-testable findings from a fan-out
+over still-un-audited subsystems. Fixed the highest reachability x severity x
+cleanliness one (sys_select) this pass; the other four are the refreshed backlog.
+
+- **sys_select unvalidated user fd_set read** (`kernel/syscall/syscall.c` sys_select)
+  -> FIXED (F19). The input fd_sets were read by RAW DEREF of the user pointers
+  (`((fd_set_t*)rset_ptr)->bits[i]`) with no _access_ok/copy_from_user, while the
+  timeout and the writeback already used copy_*_user. A kernel pointer -> arbitrary
+  kernel read (the selected bits surface in the returned output sets); a bad
+  pointer -> kernel-fault DoS. Reachable from ANY select() call (no opt-in). The
+  input twin of sys_poll's hardened path (F4/F9 class). Fixed: copy_from_user each
+  non-NULL fd_set (-EFAULT on failure), memset NULL ones; also checked the
+  previously-ignored timeout copy_from_user return (was an uninitialized-tv read).
+  copy_user_selftest extended to assert sys_select(1, bad_ptr, 0,0,0) == -EFAULT.
+
+- **ext2 block size unbounded from on-disk superblock** (`kernel/fs/ext2.c:767`
+  ext2_init) -> OPEN. `s_block_size = 1024u << sb->s_log_block_size` with no clamp;
+  the bcache slots + DMA scratch are hard-fixed at 4096. A crafted/corrupt image
+  with s_log_block_size >= 3 -> block size > 4096 -> ahci_read DMAs past the 4096
+  scratch (heap overflow) and bcache_fill_way memcpy overruns the 4096 BSS slot;
+  s_log_block_size >= 32 is also shift UB. Reachable at mount (boot disk trusted,
+  but any future removable/secondary ext2 volume). Fix: one-line clamp
+  `if (sb->s_log_block_size > 2u) return 0;` (only 1024/2048/4096; slots are 4096).
+  Deterministically testable via a pure ext2_block_size/ok helper. Confidence HIGH.
+
+- **unveil sandbox bypass via /dev|/proc prefix without boundary**
+  (`kernel/syscall/syscall.c:411-413` sys_open got_file) -> OPEN. The unveil
+  exemption tests the literal prefix `/dev`/`/proc` with no next-char `/`-or-`\0`
+  check, so a REAL on-disk file named `/devsecrets` or `/processData` skips
+  unveil_check entirely -> sandbox escape. unveil_check itself is correct; the
+  inline exemption is a drifted duplicate of "is this a virtual mount?". Fix
+  (DRY + security): replace the two hand-rolled tests with the existing
+  boundary-correct `virtfs_is_virtual(path)` (virtfs.h already included).
+  Deterministically testable (assert virtfs_is_virtual("/devsecrets")==0,
+  ("/dev/tty")==1). Confidence HIGH. (Strong candidate for next pass.)
+
+- **virtio-net rx desc_id OOB (device-controlled index)**
+  (`kernel/net/virtio_net.c:417,434` virtio_net_rx_poll) -> OPEN. `desc_id` is a
+  uint32 read verbatim from the device-written used ring and used to index
+  s_rx_bufs[256] and s_rxq.desc[256] with NO bounds check (adjacent pkt_len IS
+  clamped with an "untrusted device" comment) -> OOB read of a buffer pointer +
+  OOB WRITE of 4 descriptor fields. desc_id>=256 from a malicious/buggy device
+  (hypervisor / passthrough / future real NIC). Same unchecked id at the TX free
+  (line 395). Fix: pure `virtio_desc_id_valid(id) = id < VIRTQ_SIZE`, drop the
+  used entry (advance last_used_idx, skip re-post) on a bad id; guard the TX free
+  too. Deterministically testable (elf_phtab_bounds_selftest pattern). HIGH (but
+  threat model is a malicious device; QEMU SLIRP is trusted today).
+
+- **DRM create_dumb pitch 32-bit overflow** (`kernel/drivers/video/drm.c:486`
+  drm_ioctl_create_dumb) -> OPEN. `pitch = a.width * 4` is a 32-bit multiply
+  (the uint64_t cast on the next line is too late); width=0x40000000 -> pitch
+  wraps to 0 -> tiny backing allocation while resource_create gets the full huge
+  width/height -> undersized buffer, host-side OOB on transfer/flush. Only gate is
+  width/height nonzero; the advertised max_width=8192 is never enforced. Reachable
+  by any process opening /dev/dri/card0 (compositors). Fix: pure
+  drm_dumb_size(w,h,bpp,&pitch,&size) doing 64-bit math + a DRM_MAX_FB_DIM cap,
+  -EINVAL on overflow/oversize. Deterministically testable. Confidence HIGH.
