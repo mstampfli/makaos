@@ -11,6 +11,7 @@
 #include "smp.h"
 #include "preempt.h"
 #include "cpu.h"
+#include "checked.h"   // mul_within_u32: overflow-safe bounded multiply
 
 // ── PCI class codes ────────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
@@ -588,18 +589,15 @@ static void slot_wait(uint32_t slot) {
 }
 
 // PRIMITIVE (DMA transfer sizing): byte length of `sectors` sectors, overflow-safe
-// and bounded.  Computes the length in 64-bit so `sectors * sector_size` can never
-// wrap a u32 and slip past a byte-based transfer guard -- the wrap would make a huge
-// request look tiny, so the PRDT/page bound passes while the HBA is still told to
-// move the huge sector count -> DMA overrun.  Returns false (reject) if sectors == 0
-// or the length exceeds max_bytes; on true, *out_bytes holds the length and is
-// <= max_bytes so it fits u32 losslessly.  Pure -> unit-tested (xfer_bytes_ok_selftest).
+// and bounded -- a zero-sector transfer is rejected, and the length is formed in
+// 64-bit (via the generic mul_within_u32) so `sectors * sector_size` can never wrap
+// a u32 and slip past a byte-based transfer guard (the wrap would make a huge request
+// look tiny, so the PRDT/page bound passes while the HBA still moves the huge sector
+// count -> DMA overrun).  On true, *out_bytes <= max_bytes (fits u32 losslessly).
+// Thin domain wrapper over checked.h's mul_within_u32; unit-tested (xfer_bytes_ok_selftest).
 static inline bool xfer_bytes_ok(uint32_t sectors, uint32_t sector_size,
                                  uint32_t max_bytes, uint32_t* out_bytes) {
-    uint64_t b = (uint64_t)sectors * sector_size;   // 64-bit: cannot wrap
-    if (sectors == 0 || b > max_bytes) return false;
-    *out_bytes = (uint32_t)b;                        // safe: b <= max_bytes <= UINT32_MAX
-    return true;
+    return sectors != 0 && mul_within_u32(sectors, sector_size, max_bytes, out_bytes);
 }
 
 // ── Pre-scheduler polling path ────────────────────────────────────────────

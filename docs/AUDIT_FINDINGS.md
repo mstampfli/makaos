@@ -844,5 +844,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the new pure primitive xfer_bytes_ok(sectors, sector_size, max_bytes, *out) forming
   the length in u64 + a bound; applied at all three sites (read_user's max is the exact
   npages<=130 equivalent, so the redundant check was deleted). do_rw_direct left as-is
-  (n capped at 65535). xfer_bytes_ok_selftest drives the 2^32 wrap. SAME-CLASS sibling
-  recorded, not fixed (nvme not boot-verifiable): nvme_rw `nlb * s_ns_lba_size`.
+  (n capped at 65535). xfer_bytes_ok_selftest drives the 2^32 wrap.
+- nvme transfer-size wrap -> FIXED (F48, the F47 nvme sibling): nvme_rw `nlb *
+  s_ns_lba_size` (u32) gated the 1-vs-2-PRP (<=8KB) layout while cdw12 sent a 16-bit
+  MASKED sector count; a huge nlb wraps the byte length small (single PRP) but cdw12
+  carries a large count -> 32 MB DMA into a 4 KB PRP -> OOB. Latent (only the nlb=8
+  stress caller). Extracted the cross-cutting generic mul_within_u32(a,b,max,*out) into
+  checked.h (form a*b in u64, accept iff <= max); ahci xfer_bytes_ok now wraps it
+  (single source) and nvme_rw uses it (max 8192) keeping its pg_off-aware glue. Covered
+  by the mul_within cases in checked_selftest; nvme path not boot-exercised.

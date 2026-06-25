@@ -535,7 +535,14 @@ static inline phys_addr_t kva_to_phys(const void* va) {
 // lists for larger I/Os.
 static uint8_t nvme_rw(uint64_t lba, void* buf, uint32_t nlb, uint8_t write) {
     if (!nlb) return 1;
-    uint32_t bytes = nlb * s_ns_lba_size;
+    // The 2-PRP path supports <= 8 KiB.  Form the byte length in u64 (mul_within_u32)
+    // so a huge nlb cannot wrap u32 and slip past this bound while cdw12 still carries
+    // a (16-bit-masked) large sector count -> the device DMAs far past the PRPs.
+    uint32_t bytes;
+    if (!mul_within_u32(nlb, s_ns_lba_size, 8192u, &bytes)) {
+        kprintf("[nvme] nvme_rw: >8KB transfers not yet supported\n");
+        return 0;
+    }
     phys_addr_t pa = kva_to_phys(buf);
     uint32_t pg_off = (uint32_t)(pa & 0xFFFu);
     phys_addr_t prp1 = pa;

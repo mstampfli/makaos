@@ -45,7 +45,22 @@ void checked_selftest(void) {
     if (in_range_u64(0, 1, 10) || in_range_u64(11, 1, 10)) {
         kprintf("[checked] FAIL in_range outside\n"); fails++; }
 
+    // ── mul_within_u32: product <= max, formed in u64 so it cannot wrap ───
+    uint32_t mw = 0xDEADBEEFu;
+    if (!mul_within_u32(8u, 512u, 1u << 20, &mw) || mw != 4096u) {
+        kprintf("[checked] FAIL mul_within normal\n"); fails++; }
+    if (!mul_within_u32(2u, 512u, 1024u, &mw) || mw != 1024u) {        // exact bound (== max)
+        kprintf("[checked] FAIL mul_within exact\n"); fails++; }
+    if (mul_within_u32(3u, 512u, 1024u, &mw)) {                        // 1536 > 1024 -> reject
+        kprintf("[checked] FAIL mul_within over\n"); fails++; }
+    if (mul_within_u32(0x800000u, 512u, 0xFFFFFFFFu, &mw)) {           // 2^32: u32 would wrap to 0
+        kprintf("[checked] FAIL mul_within wrap\n"); fails++; }
+    if (!mul_within_u32(0x7FFFFFu, 512u, 0xFFFFFFFFu, &mw) || mw != 0xFFFFFE00u) {  // just under wrap
+        kprintf("[checked] FAIL mul_within max\n"); fails++; }
+    if (!mul_within_u32(0u, 512u, 1024u, &mw) || mw != 0u) {           // 0*b = 0 <= max -> true
+        kprintf("[checked] FAIL mul_within zero\n"); fails++; }
+
     kprintf(fails ? "[checked] SELF-TEST FAILED\n"
-                  : "[checked] SELF-TEST PASSED (ckd_mul/add overflow + index_ok + in_range)\n");
+                  : "[checked] SELF-TEST PASSED (ckd_mul/add overflow + index_ok + in_range + mul_within)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */

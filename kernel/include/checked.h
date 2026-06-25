@@ -74,3 +74,21 @@ static inline bool ckd_add_u32(uint32_t a, uint32_t b, uint32_t* out) {
 static inline bool ckd_add_u64(uint64_t a, uint64_t b, uint64_t* out) {
     return !__builtin_add_overflow(a, b, out);
 }
+
+// mul_within_u32(a, b, max, out): set *out = a*b and return true IFF the product
+// is <= max.  The product is formed in 64-bit, so two u32 operands can NEVER wrap
+// a u32 -- this defeats the `size = count * elem; if (size > limit) reject` failure
+// where the multiply wraps and a huge request masquerades as a small one (the F47
+// AHCI / nvme DMA-sizing class).  On false, *out is unspecified (do NOT use it).
+//   USE for "size = a * b must fit within a known limit" on untrusted a/b -- a
+//   sector count * sector size, a pixel count * bpp, a descriptor count * stride.
+//   Passing max == UINT32_MAX reduces this to a pure no-u32-wrap check (a valid use
+//   when the real cap is enforced downstream, e.g. an AHCI PRDT fragmentation check).
+//   DO NOT use the 32-bit form when the product can legitimately exceed 4 GiB --
+//   keep the value 64-bit end to end (use ckd_mul_u64 + a u64 compare) instead.
+static inline bool mul_within_u32(uint32_t a, uint32_t b, uint32_t max, uint32_t* out) {
+    uint64_t p = (uint64_t)a * b;     // 64-bit: two u32 operands cannot overflow
+    if (p > max) return false;
+    *out = (uint32_t)p;               // safe: p <= max <= UINT32_MAX
+    return true;
+}

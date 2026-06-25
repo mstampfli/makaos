@@ -55,6 +55,10 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
 - `index_ok(i, count)` -- half-open array index check `i < count` (count 0 -> false).
 - `ckd_mul_u32/u64(a, b, *out)` -- a*b, returns false on overflow (check before use).
 - `ckd_add_u32/u64(a, b, *out)` -- a+b, returns false on overflow.
+- `mul_within_u32(a, b, max, *out)` -- a*b formed in u64 (two u32s cannot wrap),
+  accept iff `<= max`. The `size = count*elem; if (size > limit) reject` pattern
+  done safely (the F47 AHCI / nvme DMA-sizing class). max == UINT32_MAX is a pure
+  no-u32-wrap check. Reused by ahci `xfer_bytes_ok` + nvme_rw (single source).
 - Test: `checked_selftest` (kernel/main/checked.c), wired in kernel/main.c.
 
 ### B. User memory (the syscall boundary) -- `kernel/syscall/syscall.c`
@@ -104,16 +108,17 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   bulk-read fast path) -- the latter two were a second pair of the same bug, caught
   on the verify-all-angles "same class elsewhere" sweep after the first F46 commit.
 - `xfer_bytes_ok(sectors, sector_size, max_bytes, *out)` (kernel/drivers/storage/ahci.c,
-  F47) -- byte length of a sector transfer, formed in u64 and bounded, so
-  `sectors*sector_size` cannot wrap a u32 and slip past a byte-based DMA guard (the
-  wrap makes a huge request look tiny -> PRDT/page bound passes -> HBA moves the huge
-  count -> overrun). Returns false on 0 sectors / over-bound. Used at all three AHCI
-  count*512 sites (ahci_submit_hhdm, ahci_submit_sg, ahci_read_user, replacing the
-  bare `count*512` + the now-redundant `npages>130` check). `xfer_bytes_ok_selftest`
-  drives the `sectors*512 == 2^32` wrap. (Latent: current callers cap count <= 1024;
-  this hardens the guards against a future unbounded caller.) SAME-CLASS sibling
-  recorded, not yet fixed: nvme_rw `nlb * s_ns_lba_size` (kernel/drivers/storage/nvme.c)
-  -- separate driver, not boot-verifiable (nvme is not the boot device).
+  F47) -- thin domain wrapper over `mul_within_u32`: rejects a zero-sector transfer,
+  else forms the byte length in u64 and bounds it, so `sectors*sector_size` cannot wrap
+  a u32 and slip past a byte-based DMA guard (the wrap makes a huge request look tiny ->
+  PRDT/page bound passes -> HBA moves the huge count -> overrun). Used at all three AHCI
+  count*512 sites (ahci_submit_hhdm, ahci_submit_sg, ahci_read_user, replacing the bare
+  `count*512` + the now-redundant `npages>130` check). `xfer_bytes_ok_selftest` drives
+  the `sectors*512 == 2^32` wrap. (Latent: current callers cap count <= 1024.) The
+  SAME-CLASS nvme sibling is now FIXED (F48): nvme_rw `nlb * s_ns_lba_size` (which wraps
+  while cdw12 carries a 16-bit-masked sector count -> a 32 MB DMA into a 4 KB PRP) now
+  uses `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)`; covered by the mul_within
+  cases in checked_selftest (nvme itself is not the boot device).
 
 ## Status
 
