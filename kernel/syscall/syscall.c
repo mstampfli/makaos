@@ -106,6 +106,9 @@ static inline int _access_ok(uint64_t addr, uint64_t len);
 // instead of a raw __builtin_memcpy on an unvalidated user pointer.
 int copy_to_user(void* dst_u, const void* src, uint64_t len);
 int copy_from_user(void* dst, const void* src_u, uint64_t len);
+// Safe NUL-terminated path copy from user space (built on copy_from_user, no
+// raw deref).  Returns length, -EFAULT (bad pointer), or -ENAMETOOLONG.
+static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
 
 // ── mmap_round_len / mmap_range_ok ────────────────────────────────────────
 // Overflow-safe primitives for the user-controlled (addr, len) of the VMA
@@ -304,10 +307,9 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     // Copy null-terminated path from user space (max 511 to leave room for cwd prefix).
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
+    int64_t rl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (rl < 0) return (uint64_t)rl;
+    uint64_t i = (uint64_t)rl;
     if (i == 0) return (uint64_t)-EINVAL;
 
     /* Log the path for traced comms — the generic syscall_dispatch
@@ -820,10 +822,9 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
 
     // ── Copy path from user space ─────────────────────────────────────────
     char path[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t plen = 0;
-    while (plen < 511 && upath[plen]) { path[plen] = upath[plen]; plen++; }
-    path[plen] = '\0';
+    int64_t epl = copy_path_from_user(path, (const void*)path_ptr, sizeof(path));
+    if (epl < 0) return (uint64_t)epl;
+    uint64_t plen = (uint64_t)epl;
     if (plen == 0) return (uint64_t)-EINVAL;
 
     // Resolve relative path using cwd.
@@ -1136,10 +1137,9 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
 
     // ── Copy path ─────────────────────────────────────────────────────────
     char path[256];
-    const char* upath = (const char*)path_ptr;
-    uint64_t plen = 0;
-    while (plen < 255 && upath[plen]) { path[plen] = upath[plen]; plen++; }
-    path[plen] = '\0';
+    int64_t spl = copy_path_from_user(path, (const void*)path_ptr, sizeof(path));
+    if (spl < 0) return (uint64_t)spl;
+    uint64_t plen = (uint64_t)spl;
     if (plen == 0) return (uint64_t)-EINVAL;
 
     // ── Copy argv (up to 64 args) ─────────────────────────────────────────
@@ -3216,6 +3216,36 @@ int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     return 0;
 }
 
+// ── Safe NUL-terminated path copy ─────────────────────────────────────────
+// Copies a user path into dst (size dstsz) up to dstsz-1 chars + a NUL.  Unlike
+// the old raw `while (upath[i]) ...` deref -- which #PF-panicked the kernel on a
+// kernel/non-canonical/unmapped path pointer (a trivial DoS) -- every byte is
+// read through copy_from_user (_access_ok + VMA-checked prefault).  The string
+// length is unknown up front, so it copies one page-bounded chunk at a time and
+// stops at the NUL; a chunk never straddles into the next page, so a path that
+// ends in a mapped page never forces a read of an unmapped following page.
+// Returns the length (>= 0), -EFAULT for a bad pointer, or -ENAMETOOLONG if no
+// NUL appears within dstsz-1 bytes (no silent truncation onto a wrong file).
+static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz) {
+    if (!dst || dstsz == 0) return -EINVAL;
+    if (!uptr) return -EFAULT;
+    uint64_t max = dstsz - 1;          // reserve the last byte for the NUL
+    uint64_t off = 0;
+    while (off < max) {
+        uint64_t addr      = (uint64_t)uptr + off;
+        uint64_t page_left = PAGE_SIZE - (addr & (PAGE_SIZE - 1));
+        uint64_t chunk     = max - off;
+        if (chunk > page_left) chunk = page_left;
+        if (copy_from_user(dst + off, (const void*)addr, chunk) != 0)
+            return -EFAULT;
+        for (uint64_t k = 0; k < chunk; k++)
+            if (dst[off + k] == '\0') return (int64_t)(off + k);  // length
+        off += chunk;
+    }
+    dst[max] = '\0';
+    return -ENAMETOOLONG;
+}
+
 int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
     if (user_buf_prefault((virt_addr_t)dst_u, len) != 0) return -EFAULT;
@@ -3288,6 +3318,32 @@ void copy_user_selftest(void) {
     }
     kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
                   : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
+}
+
+// copy_path_from_user replaced the raw `while (upath[i])` path derefs in
+// open/exec/spawn/access/truncate.  The old loops #PF-panicked the kernel on a
+// kernel/non-canonical/unmapped path pointer; the helper must REJECT those with
+// -EFAULT instead.  (The valid-copy path is exercised by every exec/open/stat
+// at boot, so a clean boot to login proves correct copy + NUL + length.)
+void copy_path_user_selftest(void) {
+    char buf[64];
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+        0ULL,                          // NULL
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        int64_t r = copy_path_from_user(buf, (const void*)bad[i], sizeof(buf));
+        if (r != -EFAULT) {
+            kprintf("[copypath_test] FAIL: accepted 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[copypath_test] SELF-TEST FAILED\n"
+                  : "[copypath_test] SELF-TEST PASSED (bad path pointers rejected, no fault)\n");
 }
 
 // Audit fix: sys_mmap/sys_munmap page-rounded a user `len` with a wrapping
@@ -3464,10 +3520,9 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
+    int64_t arl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (arl < 0) return (uint64_t)arl;
+    uint64_t i = (uint64_t)arl;
 
     char path[512];
     if (raw[0] != '/') {
@@ -4794,11 +4849,9 @@ static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
     // For now: if setuid bit is being set and caller is root, notify ksec.
     if ((mode & S_ISUID_BIT) && cred_is_root(&g_current->cred) &&
         ksec_agent_present()) {
-        char raw[512]; const char* upath = (const char*)path_ptr;
-        uint64_t i = 0;
-        while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-        raw[i] = '\0';
-
+        // (No path copy here: the ksec SETUID_BIT request sends inode/dev, not
+        // the path string -- the old raw user-pointer copy was dead code AND a
+        // #PF-panic-on-bad-pointer hazard, so it is removed.)
         ksec_request_t req = {0};
         req.seq        = ksec_next_seq();
         req.op         = KSEC_OP_SETUID_BIT;
@@ -4839,10 +4892,9 @@ static uint64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid) {
 static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
+    int64_t trl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (trl < 0) return (uint64_t)trl;
+    uint64_t i = (uint64_t)trl;
     char path[512];
     if (raw[0] != '/') {
         const char* cwd = g_current->cwd;

@@ -749,10 +749,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   raw __builtin_memcpy of the user path was also replaced with copy_from_user.
   Not gated (recorded): chmod/chown are no-op stubs; chdir is navigation-only
   (its resolved file ops are gated on the absolute path, so no bypass).
-  REMAINING MED (separate pass): sys_open/exec/truncate/access still copy the
-  path via a raw `while (upath[i])` deref (bounded to 511 but no _access_ok ->
-  a kernel/non-canonical path pointer faults the kernel = DoS); needs a shared
-  strncpy_from_user-style helper (sys_rename is already converted).
+  Raw path-copy deref -> FIXED (F39). sys_open/exec/spawn/access/truncate copied
+  the path with a raw `while (upath[i])` deref (no _access_ok -> a kernel/non-
+  canonical/unmapped path pointer #PF-panicked the kernel = DoS, or read kernel
+  memory into the path buffer). Added one shared copy_path_from_user(dst,uptr,
+  dstsz) built on copy_from_user (_access_ok + VMA-checked prefault), page-
+  granular so it stops at the NUL without over-reading into an unmapped next
+  page; returns length / -EFAULT / -ENAMETOOLONG (no silent truncation). All 5
+  sites converted (sys_chmod's path copy was dead code -> removed). Deterministic
+  copy_path_user_selftest (rejects kernel/non-canonical/NULL pointers) + clean
+  boot (every exec/open/stat copies a real path through it).
 - ELF loader (beyond F13) -> SAFE as reached. phdr table + PT_LOAD range are
   overflow-checked (elf_phtab_in_bounds / elf_seg_range_ok), argv/envp stack is
   capped (MAX_ARGS/MAX_ENVS + VMM_USER_STACK_PAGES), no PT_INTERP/dynamic loader
