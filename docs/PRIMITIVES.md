@@ -154,3 +154,11 @@ before the u64 size multiplies, same cap pattern as drm). Remaining: unify C int
 ring primitive (check spsc.h), then sweep remaining untrusted `a*b`/`a+b` call sites --
 one subsystem per commit, each with a test. Beyond data, extract any other recurring
 pattern (locking idioms, alloc/free pairs, retry loops) the same way.
+
+PLANNED FINAL phase -- primitive uniformity sweep. Once the bug hunt + the remaining
+system / bug-type / security audits are done, scan the WHOLE codebase for WHERE these
+primitives should be applied EVEN IN CORRECT, bug-free code, and retrofit them so the
+safe handling is uniform and future-proof (new code lands on the safe rails by
+default). Robustness + consistency, not bug-finding: each conversion must be a TRUE
+behavioral match (skip + record correct-by-construction sites), tagged, tested or
+clean-boot-proven, one subsystem per commit.
