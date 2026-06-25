@@ -1036,3 +1036,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   spin_lock -- process-context only; lock order shm->lock > heap/pmm, never nested with
   vma_lock). Code-proof (realloc and read now serialise) + clean boot (0 fault, 49 selftests
   pass, no WD; wayland exercises ftruncate-grow + faults).
+- AHCI submit serialization gap -> FIXED (F62, follow-up (h)): s_submit_busy (the single-
+  submitter lock that protects the shared slot-0 s_slot_done/s_slot_result at s_nslots=1) was
+  taken only in ahci_submit_hhdm. ahci_submit_sg (ext2 user-buffer reads via ahci_read_user)
+  and ahci_read_multi (read-ahead) skipped it, so a concurrent kernel-buffer + user-buffer
+  read collide on slot 0's completion state -> spurious retry + PRDT rebuild misdirects
+  in-flight DMA (data corruption / wrong-buffer read). The _sg path bypasses the bcache, so
+  no higher lock serializes it; s_submit_busy's existence proves there is no higher serializer.
+  Fix (DRY): extract submit_busy_acquire/release and bracket the slot lifecycle in all 3
+  submit paths (read s_slot_result under the lock; read_multi brackets the whole batch). No
+  new deadlock (IRQ completion never takes s_submit_busy; lock order s_submit_busy > s_ci_lock
+  unchanged). Code-proof + clean boot (0 fault, 49 selftests, no WD; boot does disk I/O via
+  all 3 paths). First verify boot hit the flaky chaselev-class stall; re-boot reached DHCP.

@@ -718,6 +718,28 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
 static volatile uint32_t s_submit_busy = 0;
 static wait_queue_t      s_submit_busy_wq = { NULL, SPINLOCK_INIT };
 
+// Acquire/release the single-submitter serializer.  EVERY submit entry point
+// (ahci_submit_hhdm, ahci_submit_sg, ahci_read_multi) must bracket its
+// slot_alloc + s_slot_done/result reset + issue + slot_wait + result read with
+// these: at s_nslots=1 all submitters share slot 0's s_slot_done[0]/
+// s_slot_result[0], so a second submitter that resets them while the first is
+// still reading drives a spurious retry whose PRDT rebuild misdirects in-flight
+// DMA.  One named serializer used everywhere (was inline in only one path).
+static void submit_busy_acquire(void) {
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&s_submit_busy, &expected, 1u, 0,
+                                           __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+        WAIT_EVENT(&s_submit_busy_wq,
+                   __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0);
+    }
+}
+static void submit_busy_release(void) {
+    __atomic_store_n(&s_submit_busy, 0u, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&s_submit_busy_wq);
+}
+
 static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
                                   uint8_t write) {
     if (!buf || !count) return 0;
@@ -727,15 +749,7 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
     uint32_t bytes;
     if (!xfer_bytes_ok(count, 512u, 0xFFFFFFFFu, &bytes)) return 0;
 
-    // Acquire exclusive submit: spin-CAS with sleep-fallback.
-    for (;;) {
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(&s_submit_busy, &expected, 1u, 0,
-                                           __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-            break;
-        WAIT_EVENT(&s_submit_busy_wq,
-                   __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0);
-    }
+    submit_busy_acquire();
 
     uint8_t rc = 0;
 
@@ -802,8 +816,7 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
         break;
     }
 
-    __atomic_store_n(&s_submit_busy, 0u, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&s_submit_busy_wq);
+    submit_busy_release();
     return rc;
 }
 
@@ -825,6 +838,11 @@ static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
 
     uint32_t bytes;
     if (!xfer_bytes_ok(count, 512u, 130u * PAGE_SIZE, &bytes)) return 0;  // <= npages cap
+
+    // Serialize against every other submitter: at s_nslots=1 this path shares
+    // slot 0's s_slot_done/result with ahci_submit_hhdm / ahci_read_multi, so
+    // it must hold the same single-submitter lock around the slot lifecycle.
+    submit_busy_acquire();
     uint32_t slot  = slot_alloc();
 
     cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
@@ -835,7 +853,9 @@ static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
     s_slot_result[slot] = 0;
     issue_cmd(slot, lba, count, write, nprdt);
     slot_wait(slot);
-    return s_slot_result[slot];
+    uint8_t rc = s_slot_result[slot];   // read under the lock before release
+    submit_busy_release();
+    return rc;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -906,6 +926,12 @@ uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
     if (!s_port || !s_irq_ready || !nframes) return 0;
     if (nframes > MAX_NCQ_SLOTS) nframes = MAX_NCQ_SLOTS;
 
+    // Serialize the whole batch against every other submitter (hhdm/sg): at
+    // s_nslots=1 they share slot 0's s_slot_done/result.  Holding the
+    // single-submitter lock across the batch keeps any intra-batch NCQ
+    // parallelism (distinct slots) while excluding concurrent submitters.
+    submit_busy_acquire();
+
     uint32_t slots[MAX_NCQ_SLOTS];
     uint32_t submitted_mask = 0;
 
@@ -940,6 +966,7 @@ uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
         if (*p == AHCI_READ_POISON) continue;  // zero-data DMA — skip
         result_mask |= (1u << i);
     }
+    submit_busy_release();
     return result_mask;
 }
 
