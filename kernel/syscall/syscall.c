@@ -4093,6 +4093,13 @@ typedef struct {
     // the next wake walks into our RCU-freed w → #GP.
     wait_queue_t* wq1;
     wait_queue_t* wq2;
+    // Pinned reference to the watched vfs_file_t (vfs_tryget at register,
+    // vfs_close at unregister).  Without it, closing the watched fd before
+    // the epoll fd freed an fd whose waitq is EMBEDDED in the object (pipe
+    // f->_waitq, eventfd s->read_wq, unix sock, pty master_waitq) -- so wq1/wq2
+    // dangled into freed memory and epoll_we_remove walked it (UAF).  Holding
+    // the ref keeps the file (and its embedded waitq) alive until we unlink.
+    struct vfs_file_t* file;
 } epoll_watch_t;
 
 typedef struct {
@@ -4165,6 +4172,12 @@ static int ep_grow(epoll_state_t* st, uint32_t new_cap) {
 // Register/unregister persistent epoll_we_t entries on the watched fd's queues.
 static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
                                   vfs_file_t* f) {
+    // Pin the watched file for the watch's lifetime so its (possibly embedded)
+    // waitq cannot be freed while our entries are linked on it.  vfs_tryget
+    // CAS-bumps from non-zero; if the file is concurrently being closed it
+    // returns NULL and we register nothing (the watch stays inert until DEL).
+    w->file = vfs_tryget(f);
+    if (!w->file) { w->wq1 = NULL; w->wq2 = NULL; w->has_entry2 = 0; return; }
     epoll_we_init(&w->entry, &state->wq, &state->has_ready, state->file_wq);
     epoll_we_add(f->waitq, &w->entry);
     w->wq1 = f->waitq;
@@ -4179,17 +4192,16 @@ static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
     }
 }
 
-static void epoll_watch_unregister(epoll_watch_t* w, vfs_file_t* f) {
-    // Use the saved waitq pointers, not f->waitq — f may already be
-    // freed if the target fd was closed before the epoll fd.  Without
-    // this, our entries stay linked on global waitqs (g_mouse_waitq,
-    // pty master_waitq, …) and the next wake walks freed-w memory.
-    (void)f;
+static void epoll_watch_unregister(epoll_watch_t* w) {
+    // Use the saved waitq pointers (wq1/wq2), which are valid because the
+    // pinned file (w->file) kept the embedded waitq alive.  Then drop the pin
+    // -- freeing the file only now, after our entries are unlinked.
     if (w->wq1)                  epoll_we_remove(w->wq1, &w->entry);
     if (w->has_entry2 && w->wq2) epoll_we_remove(w->wq2, &w->entry2);
     w->wq1 = NULL;
     w->wq2 = NULL;
     w->has_entry2 = 0;
+    if (w->file) { vfs_close(w->file); w->file = NULL; }
 }
 
 // RCU free helper for epoll_watch_t.  An epoll_watch_t's entry/entry2
@@ -4274,13 +4286,10 @@ static int epoll_poll(vfs_file_t* self, int events) {
 static void epoll_close(vfs_file_t* self) {
     if (self->ctx) {
         epoll_state_t* state = (epoll_state_t*)self->ctx;
-        task_files_t* files = g_current ? g_current->files_shared : NULL;
         for (uint32_t i = 0; i < state->cap; i++) {
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
-            vfs_file_t* f = (files && (uint32_t)w->fd < files->ft->cap)
-                            ? files->ft->fd_table[w->fd] : NULL;
-            epoll_watch_unregister(w, f);
+            epoll_watch_unregister(w);   // uses w->file pin, not a fresh lookup
             call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
         }
         kfree(state->slots);
@@ -4371,7 +4380,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         w->has_entry2 = 0;
         w->wq1        = NULL;
         w->wq2        = NULL;
-        epoll_watch_register(state, w, wf);
+        w->file       = NULL;
+        epoll_watch_register(state, w, wf);   // pins wf into w->file
         ep_ht_insert_raw(state->slots, state->cap, w);
         state->count++;
         ret = 0;
@@ -4381,9 +4391,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
-        epoll_watch_unregister(w, wf);
+        epoll_watch_unregister(w);   // uses w->file pin, drops it
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
         call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
@@ -4396,10 +4404,10 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         epoll_watch_t* w = state->slots[idx];
         vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
                          ? files->ft->fd_table[tfd] : NULL;
-        epoll_watch_unregister(w, wf);
+        epoll_watch_unregister(w);   // drops the old pin + entries
         w->events = ev.events;
         w->data   = ev.data;
-        if (wf) epoll_watch_register(state, w, wf);
+        if (wf) epoll_watch_register(state, w, wf);   // re-pins wf
         ret = 0;
         break;
     }
@@ -4410,6 +4418,63 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     spin_unlock(&state->lock);
     return ret;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the epoll watched-file pin (the UAF fix): a watched
+// file whose waitq is EMBEDDED in the object (like eventfd/pipe) must survive
+// the user's close() while an epoll watch is registered, so unregister's
+// epoll_we_remove operates on valid memory.  Mirrors pipe/unix refcount tests.
+static void ep_test_file_close(vfs_file_t* self) { kfree(self); }
+
+void epoll_watch_refcount_selftest(void) {
+    int fails = 0;
+
+    // A heap vfs_file_t with an embedded waitq + refcount 1 -- the UAF-prone
+    // shape (its waitq memory would be freed on the last vfs_close).
+    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    if (!f) { kprintf("[epoll_pin] FAIL alloc\n");
+              kprintf("[epoll_pin] SELF-TEST FAILED\n"); return; }
+    __builtin_memset(f, 0, sizeof(*f));
+    f->waitq = &f->_waitq; wait_queue_init(f->waitq);
+    f->secondary_waitq = NULL;
+    f->close    = ep_test_file_close;
+    f->refcount = 1;
+
+    epoll_state_t st;
+    __builtin_memset(&st, 0, sizeof(st));
+    wait_queue_init(&st.wq);
+    st.file_wq  = &st.wq;
+    st.has_ready = 0;
+
+    epoll_watch_t w;
+    __builtin_memset(&w, 0, sizeof(w));
+    w.fd = 7; w.events = 0; w.wq1 = NULL; w.wq2 = NULL; w.has_entry2 = 0; w.file = NULL;
+
+    epoll_watch_register(&st, &w, f);          // pins f
+    if (w.file != f || f->refcount != 2u) {
+        kprintf("[epoll_pin] FAIL register: file=%p rc=%lu\n",
+                (void*)w.file, (unsigned long)f->refcount);
+        fails++;
+    }
+
+    // The user closes the watched fd while the watch is live.  The pin must
+    // keep f (and its embedded waitq) alive -- pre-fix this freed f and left
+    // w.wq1 dangling for the unregister below.
+    vfs_close(f);                              // 2 -> 1, NOT freed
+    if (f->refcount != 1u) {
+        kprintf("[epoll_pin] FAIL post-close rc=%lu (file freed under us)\n",
+                (unsigned long)f->refcount);
+        fails++;
+    }
+
+    // Unregister unlinks our entry from the still-valid waitq, then drops the
+    // pin -> 1 -> 0 -> ep_test_file_close frees f.  (Do NOT touch f after.)
+    epoll_watch_unregister(&w);
+
+    kprintf(fails ? "[epoll_pin] SELF-TEST FAILED\n"
+                  : "[epoll_pin] SELF-TEST PASSED (watched file pinned across close)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
 
 // epoll_wait(epfd, events_ptr, maxevents, timeout_ms) → count or -errno
 static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,

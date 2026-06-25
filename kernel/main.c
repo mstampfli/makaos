@@ -541,6 +541,10 @@ static void init_kthread(void) {
     extern void pipe_refcount_selftest(void);
     pipe_refcount_selftest();
 
+    // epoll watched-file pin: file survives close while a watch is registered.
+    extern void epoll_watch_refcount_selftest(void);
+    epoll_watch_refcount_selftest();
+
     // Tier 1 #6 (signalfd): block sig, send, drain via signalfd read.
     extern void signalfd_selftest(void);
     signalfd_selftest();

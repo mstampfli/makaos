@@ -462,3 +462,51 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   minimal continue that does not touch the valid path. Confidence HIGH. Threat
   model: malicious/buggy NVMe controller or CQ-page DMA corruption (the repo
   treats this device-echo-index class as a real bug worth a guard, per F22).
+
+## FIFTH AUDIT PASS (2-agent fan-out, 2026-06-25) — backlog refill
+
+- **epoll watched-file UAF (close-before-epoll-close)**
+  (`kernel/syscall/syscall.c` epoll_watch_register/unregister) -> FIXED (F28).
+  epoll registered persistent epoll_we_t entries on a watched fd's waitq and
+  saved raw wq1/wq2 pointers, but took NO reference on the watched vfs_file_t.
+  The authors' "save the waitq pointers so we can unregister after the file is
+  freed" mitigation only works for LONG-LIVED GLOBAL queues (g_mouse_waitq); for
+  every fd whose waitq is EMBEDDED in the freed object (pipe f->_waitq, eventfd
+  s->read_wq/write_wq, unix sock f->_waitq, pty master_waitq), closing the
+  watched fd before the epoll fd freed that memory, so wq1/wq2 dangled and the
+  later epoll_ctl(DEL/MOD) or epoll_close -> epoll_we_remove(wq1, &w->entry)
+  walked freed memory (UAF). Reachable from pure userland, NO race (deterministic
+  ordering: ADD a pipe/eventfd, close it, close epfd) -- the ordinary wlroots/
+  libinput event-source teardown. Fixed with the Linux model: epoll_watch_register
+  now vfs_tryget()s the watched file into w->file (pinning it + its embedded
+  waitq for the watch's lifetime) and epoll_watch_unregister vfs_close()s it
+  AFTER epoll_we_remove unlinks our entries; w->file freed exactly once, never
+  before the entries are unlinked. unregister no longer needs a fresh fd lookup
+  (uses w->file/wq1/wq2), so DEL/close/MOD drop the stale-lookup arg; MOD
+  re-pins. Deterministic epoll_watch_refcount_selftest: register a watch on a
+  heap vfs_file_t (embedded waitq, refcount 1) -> refcount 2; vfs_close the file
+  -> refcount 1 (survives, pre-fix would free it); unregister -> freed. Same
+  lifetime class as F14/F15/F25. (Found by the fan-out subagent; independently
+  verified the register/unregister/ADD/DEL/MOD/close flow + that free_rcu does
+  not touch w->file + full SELFTESTS build + clean boot.) Confidence HIGH.
+
+- **TTY canonical ring framing + unlocked flush race**
+  (`kernel/drivers/tty/tty.c` ldisc_flush_line / tty_flush_input) -> OPEN
+  (lower priority). (a) The cooked read_buf ring usable capacity is
+  TTY_READ_BUF_SIZE-1 = 4095, exactly the max cooked line (4094 data + '\n'), so
+  if the ring holds even one un-drained byte ldisc_flush_line's per-byte rd_push
+  silently DROPS the line tail including the terminating '\n' -> canonical line
+  framing corruption (reader merges lines / blocks for a dropped '\n'). NOT
+  memory-unsafe (line_len <= 4095 is enforced; no over-read of line_buf). Fix:
+  make the ring strictly larger than a max line (e.g. TTY_READ_BUF_SIZE =
+  2*TTY_LINE_BUF_SIZE) and make ldisc_flush_line all-or-nothing via a pure
+  rb_free(head,tail,size) helper (unit-testable). (b) tty_flush_input (reachable
+  from ioctl TCFLSH/TCSETSF) resets rd_head/rd_tail/line_len with NO lock while
+  the keyboard thread / a concurrent pty_master_write run rd_push / line_buf
+  accumulation on another CPU -> torn ring indices; PTY slave fds are explicitly
+  dup-shared (refcount), so multi-consumer is real. Fix: a per-tty ldisc lock
+  around rd_push/rd_pop/line_buf accumulation/tty_flush_input. The line buffer
+  bounds themselves are clean (every line_buf[line_len++] guarded by
+  < TTY_LINE_BUF_SIZE-1; c_cc indices constant in [0,18]; VMIN/winsize not used
+  for sizing). Framing bug confidence HIGH; the unlocked-flush race MED. Careful
+  (the race fix needs a lock); good for a dedicated iteration.
