@@ -903,3 +903,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   caught by a revert-test, not assumed flaky). Boot DHCP over read/write+sockets still
   gets its lease. Residual: a raw-deref write_op on an absent valid page relies on the
   demand-fault path; bounce-buffer is the fuller hardening.
+- ioctl TIOCGSERIAL raw user-pointer write -> FIXED (F53, HIGH/LPE): the tty0 ioctl
+  fallback zeroed a 60-byte serial_struct stub via `memset((uint8_t*)arg, 0, 60)` on the
+  raw user `arg` (only !NULL-checked), while every sibling case (TIOCGWINSZ/TCGETS/...)
+  uses copy_*_user. ioctl(fd, TIOCGSERIAL, KADDR) -> 60-byte zero-write to ANY kernel
+  address (zero a cred=root / funcptr / lock = LPE) or #PF panic (unmapped = DoS);
+  reachable unprivileged on fd 0/1/2 (tty0 fds have ioctl==NULL -> this fallback). Found
+  by fan-out audit, confirmed + kernel-wide grep showed it was the ONLY raw-arg deref in
+  any ioctl handler. Fix: copy_to_user the zero struct (validates via _access_ok +
+  prefault) like the siblings. Boot reaches DHCP lease, no regression.

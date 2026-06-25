@@ -4145,12 +4145,19 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TIOCSCTTY:
         tty_set_ctty(tty);
         return 0;
-    case TIOCGSERIAL:
+    case TIOCGSERIAL: {
+        // Stub: report an all-zero serial_struct (60 bytes).  arg is a raw user
+        // pointer -- a raw memset here was an arbitrary-kernel-address 60-byte
+        // zero-write (LPE: zero a cred/funcptr/lock) and a #PF panic on an unmapped
+        // target.  Route through copy_to_user (_access_ok + prefault) like every
+        // sibling case above, so a kernel/non-canonical/unmapped arg fails -EFAULT.
         if (arg) {
-            uint8_t* p = (uint8_t*)arg;
-            __builtin_memset(p, 0, 60);
+            uint8_t zero[60] = {0};
+            if (copy_to_user((void*)arg, zero, sizeof(zero)) != 0)
+                return (uint64_t)-EFAULT;
         }
         return 0;
+    }
     default:
         return (uint64_t)-EINVAL;
     }
