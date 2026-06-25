@@ -661,3 +661,42 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   do the KSEC_OP round-trip on the escalation case like sys_setuid does. Adds a
   grant path -- careful. (KSEC_OP_SETUID_BIT (5) IS wired: sys_chmod notifies
   ksec on u+s, though chmod's persistence is a separate TODO.)
+
+## SEVENTH AUDIT PASS (5-agent read-only fan-out, 2026-06-25)
+
+- **ext2 unbounded physical block number -> wild device LBA** -> FIXED (F36).
+  Block numbers taken from untrusted on-disk data (inode i_block[], single/double
+  indirect-block entries, BGD bg_inode_table) were turned into device LBAs
+  (lba = s_part_lba + blk*spb) with NO upper bound: s_blocks_count was read at
+  mount but only used to derive s_num_groups, never stored or compared, and no
+  block_valid() helper existed. A crafted/corrupt ext2 image (or on-disk
+  corruption) with a wild i_block[] or indirect entry made the kernel DMA a
+  sector OUTSIDE the filesystem -- cross-partition read / off-device access on
+  read(), and an OOB WRITE on inode/bitmap writeback. Fixed: store s_blocks_count
+  at mount; add pure, unit-tested helpers ext2_block_in_range / ext2_run_in_range
+  (overflow-safe) behind ext2_block_valid / ext2_run_valid; gate EVERY block ->
+  LBA sink -- bcache_get (read), write_block (write), and both fast-path run DMAs
+  (ext2_vfs_read / pread) validate the whole consecutive run. Also rejected a
+  degenerate superblock (s_blocks_per_grp / s_inodes_per_grp / s_blocks_count == 0
+  -- the first two were a div-by-zero DoS at mount). Deterministic
+  ext2_block_valid_selftest (boundary + overflow-safe run) + clean boot to login
+  (all userland is read from ext2 through the gated sinks -> no over-rejection).
+- mremap / mprotect / madvise / msync -> SAFE (NOT IMPLEMENTED; no syscall nrs).
+  If added later they MUST route addr/old_size/new_size through mmap_range_ok
+  before any vmm_* call, like sys_munmap, or they reintroduce the F24 class.
+- ptrace -> SAFE (NOT IMPLEMENTED; no cross-process peek/poke/getregs surface).
+- AHCI / NVMe DMA descriptor construction -> SAFE as reached. PRDT bounded by
+  nprdt < 248; ext2 pre-clamps transfers to AHCI_DMA_SECTORS; NVMe rejects >8KB;
+  AHCI slots are derived from the hardware SACT/CI ctz (never device-echoed);
+  NVMe cid is F26-guarded. Latent MED (not user-reachable): ahci_submit_hhdm /
+  ahci_submit_sg do not re-check leftover rem after the 248-entry build loop, so
+  a future >992KB caller would silently truncate (do_rw_direct already guards
+  this with `if (rem) return 0;`). Defense-in-depth only; no current caller.
+- virtio-gpu / DRM transfer/scanout/backing -> SAFE. The kernel sends fixed
+  x=y=offset=0 full-surface (w,h) from each resource's own create dims; all three
+  resource-creating paths (CREATE_DUMB F23, ADDFB2 subset-clamp, CURSOR 64-bit
+  footprint check) tie the declared footprint to a backing that covers it. LOW:
+  DRM MODE_ATOMIC does not bound per-object counts[i] before the prop-copy loop
+  (DoS / long syscall; memory-safety relies on copy_from_user's range check).
+- shm/shmem -> SAFE (string-named, RCU + tryget + per-frame refcount + size cap).
+  VFS mount table -> SAFE (no sys_mount/umount; static const mount array).

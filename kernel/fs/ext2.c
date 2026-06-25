@@ -94,6 +94,7 @@ static spinlock_t* s_group_locks  = NULL;
 // lock acquisition ordering complexity of dual-parent locking.
 static spinlock_t  s_rename_lock  = SPINLOCK_INIT;
 static uint32_t s_first_data_blk  = 0;   // superblock's s_first_data_block
+static uint32_t s_blocks_count    = 0;   // superblock's s_blocks_count (total FS blocks)
 static uint8_t  s_mounted         = 0;
 
 // ── Block cache ───────────────────────────────────────────────────────────
@@ -270,8 +271,38 @@ static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
 //
 // Returns `ref.data == NULL` on I/O error.  Caller must `bcache_put(&ref)`
 // on success to drop any held pin.
+// ── Physical block-number validation ──────────────────────────────────────
+// Every block number that becomes a device LBA (lba = s_part_lba + blk*spb)
+// must be proven in-range FIRST.  i_block[] entries, indirect-block entries and
+// BGD fields are all untrusted on-disk data; a wild value would DMA a sector
+// outside the filesystem -- a cross-partition / off-device read, or an OOB
+// write on inode writeback.  Valid physical blocks are [s_first_data_blk,
+// s_blocks_count).  The math is factored into pure helpers so it is unit-tested
+// (ext2_block_valid_selftest) independent of any mounted image.
+static inline int ext2_block_in_range(uint32_t blk, uint32_t first, uint32_t count) {
+    return blk >= first && blk < count;
+}
+// Are blocks [start, start+run) ALL valid?  Overflow-safe: start+run can wrap.
+static inline int ext2_run_in_range(uint32_t start, uint32_t run,
+                                    uint32_t first, uint32_t count) {
+    if (run == 0)      return 1;
+    if (start < first) return 0;
+    if (run > count)   return 0;           // run alone exceeds the FS -> reject
+    return start <= count - run;            // start + run <= count, no wrap
+}
+static inline int ext2_block_valid(uint32_t blk) {
+    return ext2_block_in_range(blk, s_first_data_blk, s_blocks_count);
+}
+static inline int ext2_run_valid(uint32_t start, uint32_t run) {
+    return ext2_run_in_range(start, run, s_first_data_blk, s_blocks_count);
+}
+
 static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
     bcache_ref_t r = { NULL, blk, 0, 0, 0 };
+    // Reject any block outside the filesystem before it can become an LBA or
+    // pollute the cache (untrusted i_block[]/indirect/BGD source).  r.data stays
+    // NULL, which every caller already treats as an I/O error.
+    if (!ext2_block_valid(blk)) return r;
     uint32_t set = bcache_set_of(blk);
 
     // Fast path — walk the 4 ways, optimistic pin + verify tag.
@@ -626,6 +657,7 @@ static uint8_t read_block(uint32_t blk, uint8_t* buf) {
 // publishes the new contents into the block cache (skipped on slot
 // conflict — harmless, the next read will re-fetch).
 static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
+    if (!ext2_block_valid(blk)) return 0;   // never write outside the filesystem
     uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
     if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
     bcache_fill(blk, buf, s_block_size);
@@ -791,11 +823,19 @@ uint8_t ext2_init(uint32_t part_lba) {
     s_inodes_per_grp  = sb->s_inodes_per_group;
     s_blocks_per_grp  = sb->s_blocks_per_group;
     s_first_data_blk  = sb->s_first_data_block;
+    s_blocks_count    = sb->s_blocks_count;
     s_inode_size      = (sb->s_rev_level >= 1 && sb->s_inode_size > 0)
                         ? sb->s_inode_size : 128;
 
+    // Reject a degenerate superblock (all fields untrusted on-disk data): zero
+    // blocks/inodes per group would divide by zero here and in inode-location
+    // math, and a zero total block count would make every block-range check
+    // fail.  s_block_size was already validated by ext2_block_size_checked.
+    if (s_blocks_per_grp == 0 || s_inodes_per_grp == 0 || s_blocks_count == 0)
+        return 0;
+
     // Number of block groups.
-    s_num_groups = (sb->s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
+    s_num_groups = (s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
 
     // One spinlock per group for bitmap RMW + BGD counter updates.
     // Two CPUs allocating in different groups never contend.  Allocated
@@ -1141,6 +1181,9 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                 // Sparse block(s): zero-fill without any disk I/O.
                 __builtin_memset(dst + total, 0, bytes);
             } else {
+                // Untrusted block ptr from inode/indirect -> never DMA a run
+                // that escapes the filesystem.
+                if (!ext2_run_valid(phys_blk, run)) return -1;
                 uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
@@ -1236,6 +1279,8 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
             if (!phys_blk) {
                 __builtin_memset(dst + total, 0, bytes);
             } else {
+                // Untrusted block ptr -> bound the run to the filesystem.
+                if (!ext2_run_valid(phys_blk, run)) return -1;
                 uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
@@ -2069,6 +2114,48 @@ static const char* path_split(const char* path, char* parent_out, uint32_t cap) 
 }
 
 #ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the physical block-number range checks that stop an
+// untrusted on-disk block pointer from becoming a wild device LBA.  Drives the
+// pure helpers with a fixed filesystem shape (first-data-block 1, 100 blocks)
+// so no mounted image is needed; covers the boundary + the overflow-safe run.
+void ext2_block_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // Single block in [1,100): 0 and >=100 (and 0xFFFFFFFF) are out of range.
+    struct { uint32_t blk; int want; } b[] = {
+        { 0, 0 }, { 1, 1 }, { 50, 1 }, { 99, 1 }, { 100, 0 }, { 0xFFFFFFFFu, 0 },
+    };
+    for (unsigned i = 0; i < sizeof(b)/sizeof(b[0]); i++) {
+        int got = ext2_block_in_range(b[i].blk, 1u, 100u);
+        if (got != b[i].want) {
+            kprintf("[ext2_blkvalid] FAIL blk=%u got=%d want=%d\n",
+                    b[i].blk, got, b[i].want);
+            fails++;
+        }
+    }
+    // Run [start, start+run) within [1,100), including a uint32 wrap case.
+    struct { uint32_t start, run; int want; } r[] = {
+        { 1, 99, 1 },                 // 1..99 fits exactly
+        { 1, 100, 0 },                // would reach block 100 -> reject
+        { 50, 50, 1 },                // 50..99 fits
+        { 50, 51, 0 },                // reaches 100 -> reject
+        { 99, 1, 1 },                 // just block 99
+        { 99, 2, 0 },                 // reaches 100 -> reject
+        { 1, 0, 1 },                  // empty run is vacuously ok
+        { 0xFFFFFF00u, 0x200u, 0 },   // start+run wraps uint32 -> reject
+    };
+    for (unsigned i = 0; i < sizeof(r)/sizeof(r[0]); i++) {
+        int got = ext2_run_in_range(r[i].start, r[i].run, 1u, 100u);
+        if (got != r[i].want) {
+            kprintf("[ext2_blkvalid] FAIL run start=%u run=%u got=%d want=%d\n",
+                    r[i].start, r[i].run, got, r[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_blkvalid] SELF-TEST FAILED\n"
+                  : "[ext2_blkvalid] SELF-TEST PASSED (block + run range, overflow-safe)\n");
+}
+
 // Deterministic test of path_split's bound: a parent longer than the
 // destination buffer must be REJECTED (return NULL), never copied (the kernel
 // stack overflow this fixes).  Also checks normal splits + the exact boundary.
