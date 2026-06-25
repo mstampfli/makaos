@@ -1248,3 +1248,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   across a BLOCKING op -> a THREAD_SHARE_FILES sibling close() RCU-frees the socket under the blocked
   caller = UAF (same class as F73; fix = fdget/fdput per site, like sys_read). (t) LOW -- sys_thread's
   private-fd-table clone path copies fd_table[] but not fd_flags[], dropping FD_CLOEXEC (correctness).
+- socket syscalls deref the un-refcounted fd_to_file across a (blocking) op -> sibling-close UAF -> FIXED
+  (F77, fan-out finding (s), partial): bare fd_to_file(fd) holds no ref and no rcu pin; accept/connect/
+  recvfrom additionally BLOCK in the socket op, derefing the file across sched_sleep, so a THREAD_SHARE_FILES
+  sibling close(fd) RCU-frees it under the caller = UAF (F73 class). Fix (F73 pattern, one mechanism): fdget
+  pin + fdput on every return path via single-exit goto out, at sys_bind/listen/accept/connect/sendto/
+  recvfrom/setsockopt/getpeerpid/shutdown. DHCP exercises sendto/recvfrom (UDP) so the lease proves those
+  balance; socketpair/scm_rights/unix_refcount selftests cover the pin primitive; rest code-proof. 58 PASSED,
+  clean boot. REMAINING (s2, recorded): w_sys_sendmsg/recvmsg + the SCM_RIGHTS tf loop (~13 returns each +
+  unix_sock_sendfd ownership semantics + a bounce[4096] kstack hazard) and epoll/timerfd/signalfd fd_to_file
+  -- a dedicated effort, not boot-validatable pre-login.

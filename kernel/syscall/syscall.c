@@ -3121,125 +3121,144 @@ static inline int is_unix_sock(vfs_file_t* f) {
 // bind(fd, sockaddr*, addrlen) → 0 or -errno
 static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close() on
+    // the shared fd table cannot free it under us mid-op.  fdput on every exit.
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
-    if (!addr_ptr) return (uint64_t)-EINVAL;
+    uint64_t ret;
+    if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
+        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
+        if (sa->sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
         serial_puts_dbg("[bind] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
         int r = unix_sock_bind(f, sa->sun_path);
         serial_puts_dbg("[bind] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
-    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
+    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
-    if (!sa) return (uint64_t)-EINVAL;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
-    int r = socket_bind(f, port);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_bind(f, port);
+out:
+    fdput(f);
+    return ret;
 }
 
 // listen(fd, backlog) → 0 or -errno
 static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     if (is_unix_sock(f)) {
         serial_puts_dbg("[listen] unix backlog="); serial_hex_dbg(backlog);
         int r = unix_sock_listen(f, (int)backlog);
         serial_puts_dbg("[listen] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
     (void)backlog;
-    int r = socket_listen(f);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_listen(f);
+out:
+    fdput(f);
+    return ret;
 }
 
 // accept(fd, sockaddr*, addrlen*) → new fd or -errno
 uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)addrlen_ptr;
-    vfs_file_t* f = fd_to_file(fd);
+    // fdget pins the LISTENER across the blocking accept: a sibling thread's
+    // close(fd) on the shared table would otherwise free it under our sleep
+    // (the accept loop derefs the listener across sched_sleep).  fdput on exit.
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     if (is_unix_sock(f)) {
         serial_puts_dbg("[accept] unix waiting...\n");
         vfs_file_t* cf = unix_sock_accept(f);
-        if (!cf) { serial_puts_dbg("[accept] failed\n"); return (uint64_t)-ECONNABORTED; }
+        if (!cf) { serial_puts_dbg("[accept] failed\n"); ret = (uint64_t)-ECONNABORTED; goto out; }
         int64_t nfd = fd_install(cf);
-        if (nfd < 0) { vfs_close(cf); return (uint64_t)nfd; }   // we own cf on failure
+        if (nfd < 0) { vfs_close(cf); ret = (uint64_t)nfd; goto out; }   // we own cf on failure
         serial_puts_dbg("[accept] new fd="); serial_hex_dbg((uint64_t)nfd);
-        return (uint64_t)nfd;
+        ret = (uint64_t)nfd; goto out;
     }
 
-    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
     vfs_file_t* cf = socket_accept(f, peer);
     if (!cf) {
         // Non-blocking accept: no ready child. Otherwise a real failure.
-        if (f->flags & O_NONBLOCK) return (uint64_t)-EAGAIN;
-        return (uint64_t)-ECONNABORTED;
+        ret = (f->flags & O_NONBLOCK) ? (uint64_t)-EAGAIN : (uint64_t)-ECONNABORTED;
+        goto out;
     }
     if (peer) {
         // Convert port back to network byte order for userspace.
         peer->sin_port = (uint16_t)((peer->sin_port >> 8) | (peer->sin_port << 8));
     }
     int64_t nfd = fd_install(cf);
-    if (nfd < 0) { vfs_close(cf); return (uint64_t)nfd; }   // we own cf on failure
-    return (uint64_t)nfd;
+    if (nfd < 0) { vfs_close(cf); ret = (uint64_t)nfd; goto out; }   // we own cf on failure
+    ret = (uint64_t)nfd;
+out:
+    fdput(f);
+    return ret;
 }
 
 // connect(fd, sockaddr*, addrlen) → 0 or -errno
 uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin across the blocking connect (sibling close)
     if (!f) return (uint64_t)-EBADF;
-    if (!addr_ptr) return (uint64_t)-EINVAL;
+    uint64_t ret;
+    if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
+        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
+        if (sa->sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
         serial_puts_dbg("[connect] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
         int r = unix_sock_connect(f, sa->sun_path);
         serial_puts_dbg("[connect] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
-    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
+    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
-    int r = socket_connect(f, sa->sin_addr, port);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_connect(f, sa->sin_addr, port);
+out:
+    fdput(f);
+    return ret;
 }
 
 // sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
 uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                              uint64_t flags, uint64_t addr_ptr, uint64_t addrlen) {
     (void)flags; (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fdget(fd);   // pin across the (possibly blocking) send
+    if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
+    if (!buf_ptr || !len) { ret = (uint64_t)-EINVAL; goto out; }
     // buf_ptr + the sockaddr are deref'd DIRECTLY below; validate them like the
     // rest of the kernel (an unchecked buf_ptr is an arbitrary-kernel-read leak).
-    if (user_buf_check(buf_ptr, len) != 0) return (uint64_t)-EFAULT;
+    if (user_buf_check(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
 
     if (is_unix_sock(f)) {
         if (addr_ptr) {
-            if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
+            if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
             const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
             int r = unix_sock_sendto(f, (const void*)buf_ptr, (uint32_t)len,
                                       sa->sun_path);
-            return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+            ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
         }
         int r = unix_sock_send(f, (const void*)buf_ptr, (uint32_t)len);
-        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+        ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
     }
 
-    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -3249,25 +3268,30 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     } else {
         r = socket_send(f, (const void*)buf_ptr, (uint32_t)len);
     }
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)r;
+out:
+    fdput(f);
+    return ret;
 }
 
 // recvfrom(fd, buf, len, flags, addr, addrlen*) → bytes or -errno
 uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                                uint64_t flags, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)flags; (void)addrlen_ptr;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fdget(fd);   // pin across the blocking recv (sibling close)
+    if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
+    if (!buf_ptr || !len) { ret = (uint64_t)-EINVAL; goto out; }
     // The recv data is written DIRECTLY into buf_ptr (tcp_recv_data: dst[i]=...);
     // an unchecked buf_ptr is an arbitrary-kernel-WRITE LPE.  Validate + prefault.
-    if (user_buf_check(buf_ptr, len) != 0) return (uint64_t)-EFAULT;
+    if (user_buf_check(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
 
     if (is_unix_sock(f)) {
         int r = unix_sock_recv(f, (void*)buf_ptr, (uint32_t)len);
-        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+        ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
     }
 
-    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -3276,35 +3300,47 @@ uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     } else {
         r = socket_recv(f, (void*)buf_ptr, (uint32_t)len);
     }
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)r;
+out:
+    fdput(f);
+    return ret;
 }
 
 // setsockopt(fd, level, optname, optval*, optlen) → 0 or -errno
 static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                                 uint64_t val_ptr, uint64_t vallen) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
     if (is_unix_sock(f)) {
         // Unix sockets: accept everything silently (no options honoured yet).
-        return 0;
+        ret = 0; goto out;
     }
-    int r = socket_setsockopt(f, (int)level, (int)opt,
-                               (const void*)val_ptr, (uint32_t)vallen);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_setsockopt(f, (int)level, (int)opt,
+                                               (const void*)val_ptr, (uint32_t)vallen);
+out:
+    fdput(f);
+    return ret;
 }
 
 // getpeerpid(fd) → pid of peer on AF_UNIX SOCK_STREAM conn, or -errno.
 // Kernel-trusted — stamped at accept()/connect(). The compositor uses this
 // to SIGKILL an unresponsive client after the user force-closes its window.
 static uint64_t sys_getpeerpid(uint64_t fd) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the deref (sibling close)
     if (!f) return (uint64_t)-EBADF;
-    if (!is_unix_sock(f)) return (uint64_t)-ENOTSOCK;
-    unix_sock_t* s = (unix_sock_t*)f->ctx;
-    if (!s) return (uint64_t)-EBADF;
-    if (s->state != UNIX_STATE_CONNECTED) return (uint64_t)-ENOTCONN;
-    if (s->peer_pid == 0) return (uint64_t)-ENOTCONN;
-    return (uint64_t)s->peer_pid;
+    uint64_t ret;
+    if (!is_unix_sock(f)) { ret = (uint64_t)-ENOTSOCK; goto out; }
+    {
+        unix_sock_t* s = (unix_sock_t*)f->ctx;
+        if (!s) { ret = (uint64_t)-EBADF; goto out; }
+        else if (s->state != UNIX_STATE_CONNECTED) ret = (uint64_t)-ENOTCONN;
+        else if (s->peer_pid == 0) ret = (uint64_t)-ENOTCONN;
+        else ret = (uint64_t)s->peer_pid;
+    }
+out:
+    fdput(f);
+    return ret;
 }
 
 // net_ifconfig(ifcfg_t*, len) → 0 or -errno
@@ -3348,14 +3384,15 @@ static uint64_t sys_net_mac(uint64_t out_ptr) {
 
 // shutdown(fd, how) → 0 or -errno
 static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
-
+    uint64_t ret;
     if (is_unix_sock(f))
-        return (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
-
-    int r = socket_shutdown(f, (int)how);
-    return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
+    else
+        ret = (uint64_t)(int64_t)socket_shutdown(f, (int)how);
+    fdput(f);
+    return ret;
 }
 
 // Top of the canonical low (user) half.  User pointers may ONLY live here.
