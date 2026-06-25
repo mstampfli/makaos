@@ -423,6 +423,10 @@ static void init_kthread(void) {
     // shipping boot is fast and deterministic.  Re-enable for validation
     // with `-DMAKAOS_BOOT_SELFTESTS` (e.g. SELFTESTS=1 bash build.sh).
 #ifdef MAKAOS_BOOT_SELFTESTS
+    // Foundation primitives (checked.h): overflow-safe arithmetic + bounds.
+    extern void checked_selftest(void);
+    checked_selftest();
+
     extern void chaselev_selftest(void);
     chaselev_selftest();
 
