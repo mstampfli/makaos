@@ -700,3 +700,59 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (DoS / long syscall; memory-safety relies on copy_from_user's range check).
 - shm/shmem -> SAFE (string-named, RCU + tryget + per-frame refcount + size cap).
   VFS mount table -> SAFE (no sys_mount/umount; static const mount array).
+
+## EIGHTH AUDIT PASS (5-agent read-only fan-out, 2026-06-25)
+
+- **fd_install inconsistent failure-ownership -> double-free / fd leak** -> FIXED
+  (F37). fd_install closed `f` on its table-grow failure path but NOT on its
+  !g_current path, so callers couldn't tell who owned `f`. ~10 of the 14 callers
+  closed `f` on failure (openpty, io_uring x2, eventfd, timerfd, recvmsg(SCM),
+  epoll, socketpair x2) -> DOUBLE-FREE / UAF with the grow path; 4 (socket,
+  accept x2, recvfd) relied on fd_install closing -> would LEAK on the !g_current
+  path. Reachable when fd_table_grow fails (fd-table exhaustion / OOM) during any
+  fd-returning syscall. Root-cause fix (one consistent contract): fd_install
+  NEVER closes `f`; on ANY negative return the CALLER owns and closes it. Removed
+  the grow-path vfs_close; added the missing close to the 4 non-closers; the 10
+  closers are now correct unchanged. Also fixed two pre-existing socketpair leaks
+  (the fd0 slot on fd1-install failure, and both fds on copyout failure -- the
+  comment claimed "close both" but didn't). Verified by an exhaustive code-proof
+  (every one of the 14 sites closes `f` on its failure branch; fd_install on
+  none) + clean boot (the success path -- every fd at boot, sockets/accept via
+  wayland -- is unregressed). The OOM failure path is not reproducible at boot,
+  so no bespoke selftest (F34 precedent).
+- signal sigframe / sigreturn -> SAFE. The classic ring-0 LPE is closed: CS/SS
+  are hardcoded RPL-3 selectors on every iretq (never sourced from the sigframe),
+  RFLAGS is masked to condition codes + forced IF (`& 0xCD5 | 0x202`), RIP/RSP
+  are canonical-checked, the frame copy is bounds-checked copy_from_user, the
+  frame-setup write validates the user rsp range + VMA coverage, and FXRSTOR
+  MXCSR is sanitized. No finding.
+- network RX (eth/arp/ipv4/udp/tcp/icmp + virtio-net) -> SAFE. The RX skb is
+  allocated at the clamped real frame length, so every wire length field
+  (ihl/tot_len/udplen/tcp doff) is validated against the true buffer; no IP
+  reassembly, TCP is in-order-only with a masked+clamped ring; virtio descid is
+  F22-guarded. LOW: no ICMP echo rate-limit (DoS pressure). DHCP is parsed in
+  userland, not the kernel.
+- fork/clone/wait/zombie -> SAFE (memory-safety). Double-reap closed by the
+  XCHG-drain of children (one winner) + RCU-deferred task free; F34 holds. MED
+  (POSIX-correctness, NOT memory-unsafe): wait() is per-thread not per-process
+  (a thread loses a sibling-thread's forked child; reparented to init, no
+  leak/UAF). LOW: sys_thread does not zero the task_t (slab-drift risk).
+- VFS path resolution -> no symlink support (no ELOOP surface). **HIGH (BACKLOG,
+  dedicated turn): unveil() is enforced ONLY in sys_open** (unveil.c is correct,
+  but unveil_check has one call site, syscall.c). Every other path syscall
+  (unlink/rename/mkdir/truncate/stat/chdir/access/exec/chmod/chown) escapes the
+  sandbox -- a process that unveil()'d itself can still mutate paths outside its
+  view. Fix = ONE shared normalize+cwd-resolve+unveil_check gate across all path
+  syscalls (needs a userland test to verify the security property, so it warrants
+  its own turn). Also MED: several path syscalls (sys_rename memcpy, sys_open/
+  exec/truncate path copy, exec argv) deref the user pointer with no _access_ok
+  -> #PF-panic DoS / kernel read; route through copy_from_user.
+- ELF loader (beyond F13) -> SAFE as reached. phdr table + PT_LOAD range are
+  overflow-checked (elf_phtab_in_bounds / elf_seg_range_ok), argv/envp stack is
+  capped (MAX_ARGS/MAX_ENVS + VMM_USER_STACK_PAGES), no PT_INTERP/dynamic loader
+  exists. LOW/latent: no p_filesz<=p_memsz check; the eager-path `data+file_off`
+  overflow guard is dead code (every caller uses the lazy backing-file path).
+- AF_UNIX SCM_RIGHTS -> fd-array counts bounded (SCM_MAX_FD), sender refcount and
+  queue-vs-teardown ownership correct. The recvmsg double-close it flagged is
+  subsumed by the F37 fd_install fix (fd_install no longer closes, so recvmsg's
+  vfs_close is now the single correct close).

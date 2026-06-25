@@ -2803,6 +2803,17 @@ static uint64_t sys_openpty(uint64_t user_fds) {
 // ── Socket syscalls ───────────────────────────────────────────────────────
 
 // Helper: allocate the lowest available fd ≥ 3 and assign f to it.
+// Install `f` into the lowest free fd (>= 3) of the current task.
+//
+// OWNERSHIP CONTRACT (single, consistent rule -- do not deviate per caller):
+//   success (>= 0): fd_install takes ownership of `f` (it lives in the table).
+//   failure (< 0):  ownership STAYS WITH THE CALLER, which MUST close `f`.
+// fd_install NEVER closes `f` itself.  Previously it closed `f` on the
+// table-grow path but not the !g_current path, so callers couldn't tell who
+// owned `f`: ~10 of them closed on failure (double-free with the grow path)
+// while 4 relied on fd_install closing (leak on the !g_current path).  One rule
+// kills both bug classes -- every call site now closes `f` on the negative
+// branch, and fd_install closes it on none.
 static int64_t fd_install(vfs_file_t* f) {
     if (!g_current) return -EBADF;
     task_files_t* tf = g_current->files_shared;
@@ -2811,8 +2822,7 @@ static int64_t fd_install(vfs_file_t* f) {
         if (fd >= tf->ft->cap) {
             if (!fd_table_grow(tf)) {
                 spin_unlock(&tf->lock);
-                vfs_close(f);
-                return -ENFILE;
+                return -ENFILE;          // caller still owns f and will close it
             }
         }
         if (!tf->ft->fd_table[fd]) {
@@ -2909,13 +2919,14 @@ static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto)
     if (type & MK_SOCK_NONBLOCK)
         f->flags |= O_NONBLOCK;
     int64_t fd = fd_install(f);
-    if (fd >= 0 && (type & MK_SOCK_CLOEXEC)) {
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }   // fd_install failed -> we own f
+    if (type & MK_SOCK_CLOEXEC) {
         task_files_t* tf = g_current->files_shared;
         if (tf && tf->ft && (uint64_t)fd < tf->ft->cap)
             tf->ft->fd_flags[fd] = FD_CLOEXEC;
     }
     serial_puts_dbg("[socket] fd="); serial_hex_dbg((uint64_t)fd);
-    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
+    return (uint64_t)fd;
 }
 
 // Helper: is this vfs_file_t a unix socket?
@@ -2974,8 +2985,9 @@ uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
         vfs_file_t* cf = unix_sock_accept(f);
         if (!cf) { serial_puts_dbg("[accept] failed\n"); return (uint64_t)-ECONNABORTED; }
         int64_t nfd = fd_install(cf);
+        if (nfd < 0) { vfs_close(cf); return (uint64_t)nfd; }   // we own cf on failure
         serial_puts_dbg("[accept] new fd="); serial_hex_dbg((uint64_t)nfd);
-        return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+        return (uint64_t)nfd;
     }
 
     sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
@@ -2990,7 +3002,8 @@ uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
         peer->sin_port = (uint16_t)((peer->sin_port >> 8) | (peer->sin_port << 8));
     }
     int64_t nfd = fd_install(cf);
-    return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+    if (nfd < 0) { vfs_close(cf); return (uint64_t)nfd; }   // we own cf on failure
+    return (uint64_t)nfd;
 }
 
 // connect(fd, sockaddr*, addrlen) → 0 or -errno
@@ -3698,8 +3711,9 @@ static uint64_t sys_recvfd(uint64_t sock_fd) {
     if (!received) { serial_puts_dbg("[recvfd] NULL\n"); return (uint64_t)-EAGAIN; }
 
     int64_t fd = fd_install(received);
+    if (fd < 0) { vfs_close(received); return (uint64_t)fd; }   // we own received on failure
     serial_puts_dbg("[recvfd] fd="); serial_hex_dbg((uint64_t)fd);
-    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
+    return (uint64_t)fd;
 }
 
 // ── sys_register_policy_agent ─────────────────────────────────────────────
@@ -5738,13 +5752,19 @@ static uint64_t w_sys_socketpair(uint64_t domain, uint64_t type,
     if (rc != 0) return (uint64_t)rc;
 
     int64_t fd0 = fd_install(pair[0]);
+    // fd_install never closes on failure -> we still own pair[0]/pair[1].
     if (fd0 < 0) { vfs_close(pair[0]); vfs_close(pair[1]); return (uint64_t)fd0; }
     int64_t fd1 = fd_install(pair[1]);
-    if (fd1 < 0) { vfs_close(pair[1]); /* leak fd0 table slot */ return (uint64_t)fd1; }
+    // pair[0] is installed at fd0 now -> close it via its fd so its slot frees;
+    // pair[1] never installed -> close it directly.
+    if (fd1 < 0) { sys_close((uint64_t)fd0); vfs_close(pair[1]); return (uint64_t)fd1; }
 
     int kfds[2] = { (int)fd0, (int)fd1 };
     if (copy_to_user((void*)fds_ptr, kfds, sizeof(kfds)) != 0) {
-        // Best-effort: close both if copyout fails.
+        // Both fds are installed; close both so the copyout failure doesn't leak
+        // them (the slots and the underlying socket refs).
+        sys_close((uint64_t)fd0);
+        sys_close((uint64_t)fd1);
         return (uint64_t)-EFAULT;
     }
     return 0;
