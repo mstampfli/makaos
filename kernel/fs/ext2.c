@@ -2362,21 +2362,36 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     EXT2_SCRATCH_DECL(wr_buf);
 
     if (existing_ino) {
-        // Overwrite: free all old blocks.
-        ext2_inode_t old_inode;
-        if (!read_inode(existing_ino, &old_inode)) return 0;
-
-        // Free all data blocks.
-        free_inode_blocks(&old_inode);
-
-        // Now write new data into existing inode.
+        // Overwrite.  Hold the per-inode lock across the ENTIRE free -> realloc
+        // -> writeback.  Previously this ran on a read_inode SNAPSHOT with the
+        // lock taken only for the final writeback, so two concurrent writers to
+        // the same file (two O_TRUNC opens, or ftruncate+write) both snapshotted
+        // the same i_block[] and both ran free_inode_blocks -- the second freed
+        // blocks the first had already freed AND re-allocated, handing a live
+        // block back to the bitmap to be re-allocated to ANOTHER file (cross-file
+        // corruption).  inode_lock is the per-inode write_lock (serialises
+        // writers) + seqlock; the bitmap/bcache ops below never take inode_lock
+        // (the same lock order the final writeback already used), so no cycle.
         uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
-        uint32_t written = 0;
 
+        // Alloc the scratch BEFORE the lock: EXT2_SCRATCH_ALLOC has an embedded
+        // `return 0` on OOM, which under the lock would leak it.
         if (n_blocks > 0) EXT2_SCRATCH_ALLOC(wr_buf);
+
+        irtree_leaf_t* leaf = inode_lock(existing_ino);
+        if (!leaf) return 0;
+
+        // Work on a LOCAL copy of the (now lock-stable) inode so an error mid-way
+        // discards cleanly, exactly as the read_inode snapshot did before; the
+        // single inode_unlock + `return ok` below is the only exit under the lock.
+        ext2_inode_t work = leaf->inode;
+        free_inode_blocks(&work);
+
+        uint32_t written = 0;
+        int ok = 1;
         for (uint32_t bi = 0; bi < n_blocks; bi++) {
             uint32_t blk = alloc_block();
-            if (!blk) return 0;
+            if (!blk) { ok = 0; break; }
 
             uint32_t to_write = size - written;
             if (to_write > s_block_size) to_write = s_block_size;
@@ -2384,25 +2399,22 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
             __builtin_memcpy(wr_buf, data + written, to_write);
             __builtin_memset(wr_buf + to_write, 0, s_block_size - to_write);
 
-            if (!write_block(blk, wr_buf)) { free_block(blk); return 0; }
-            if (!inode_set_block(&old_inode, bi, blk)) { free_block(blk); return 0; }
+            if (!write_block(blk, wr_buf))        { free_block(blk); ok = 0; break; }
+            if (!inode_set_block(&work, bi, blk)) { free_block(blk); ok = 0; break; }
 
             written += to_write;
         }
 
-        old_inode.i_size   = size;
-        old_inode.i_blocks = n_blocks * (s_block_size / 512);
-        old_inode.i_mode   = EXT2_S_IFREG | 0644;
-        old_inode.i_links_count = 1;
-        {
-            irtree_leaf_t* leaf = inode_lock(existing_ino);
-            if (leaf) {
-                leaf->inode = old_inode;
-                inode_writeback(leaf);
-                inode_unlock(leaf);
-            }
+        if (ok) {
+            work.i_size        = size;
+            work.i_blocks      = n_blocks * (s_block_size / 512);
+            work.i_mode        = EXT2_S_IFREG | 0644;
+            work.i_links_count = 1;
+            leaf->inode = work;          // commit to the cache only on success
+            inode_writeback(leaf);
         }
-        return 1;
+        inode_unlock(leaf);
+        return ok;
     }
 
     // File doesn't exist — allocate a new inode.

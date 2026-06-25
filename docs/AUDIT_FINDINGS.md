@@ -937,3 +937,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   gate is a no-op for un-unveiled processes). NOTE: a 1-sample revert-test misleadingly
   pointed at this change during a flaky-boot stall; a denial-tracing debug (zero denials)
   was the decisive check -- confirm the mechanism, not just one revert sample.
+- ext2_write_file overwrite race -> FIXED (F56): the overwrite branch read the inode as a
+  read_inode SNAPSHOT (lock released), then ran free_inode_blocks + alloc/write/set-block
+  with NO inode lock held, taking inode_lock only for the final writeback. Two concurrent
+  writers to the SAME file (two O_TRUNC opens, ftruncate+write) both snapshot the same
+  i_block[], both free_inode_blocks: the second frees a block the first already freed AND
+  re-allocated -> a live block returns to the bitmap and is handed to another file = two
+  inodes sharing a physical block (cross-file corruption; bitmap_test stops a pure double-
+  free, not free-of-a-reallocated-block). Fix: hold inode_lock(existing_ino) across the
+  whole free->realloc->writeback on a LOCAL copy (error-safe, commit on success only).
+  Verified (no-assumptions) that inode_lock = seq_write_begin which takes the per-leaf
+  write_lock spinlock (serialises writers), same lock order as the existing writeback (no
+  cycle); scratch alloc'd before the lock (EXT2_SCRATCH_ALLOC's embedded return-on-OOM
+  would leak it); single unlock+return. Boot DHCP + 0 fault, no deadlock; the race is not
+  boot-reproducible -> code-proof (serialisation) + clean-boot. Closes recorded follow-up (a).
