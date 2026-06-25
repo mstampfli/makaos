@@ -311,6 +311,22 @@ static inline int ext2_block_valid(uint32_t blk) {
 static inline int ext2_run_valid(uint32_t start, uint32_t run) {
     return ext2_run_in_range(start, run, s_first_data_blk, s_blocks_count);
 }
+// PRIMITIVE (on-disk directory entry bounds).  A dirent at byte `off` carries an
+// untrusted on-disk rec_len (uint16) + name_len (uint8).  Before reusing/splitting
+// it (dir_add_entry) or comparing its name (dir_remove_entry), require it to be
+// well-formed within the blk_bytes-sized block: rec_len keeps the WHOLE entry in
+// the block (off + rec_len <= blk_bytes), and the aligned header+name fits the
+// entry (align4(8 + name_len) <= rec_len).  Without this a corrupt rec_len/name_len
+// makes `rec_len - actual_len` UNDERFLOW (huge slack) so the split writes
+// `dae_buf + off + actual_len` PAST the 4096-byte heap block = heap OOB write.
+// Pure -> unit-tested (ext2_dirent_in_block_selftest).
+static inline int ext2_dirent_in_block(uint32_t off, uint32_t rec_len,
+                                       uint32_t name_len, uint32_t blk_bytes) {
+    uint32_t actual = 8u + name_len;
+    if (actual & 3u) actual = (actual | 3u) + 1u;      // align to 4 (same as the walk)
+    if ((uint64_t)off + rec_len > blk_bytes) return 0; // entry runs past the block
+    return actual <= rec_len;                          // header+name fits its rec_len
+}
 // PRIMITIVE (on-disk block number -> 64-bit device LBA).  blk is validated by
 // ext2_block_valid, but the LBA MUST be formed in 64-bit: blk*spb can exceed
 // 2^32 for a large filesystem or a crafted s_blocks_count, and a 32-bit product
@@ -1995,6 +2011,10 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
         while (off + 8 <= blk_bytes) {
             ext2_dirent_t* de = (ext2_dirent_t*)(dae_buf + off);
             if (de->rec_len == 0) break;
+            // Untrusted on-disk rec_len/name_len: a corrupt entry would underflow the
+            // slack below and write the split entry past dae_buf (heap OOB).  A
+            // malformed entry stops the walk (we append to a fresh block instead).
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
 
             // Check if this entry has slack space we can use.
             uint32_t actual_len = 8 + de->name_len;
@@ -2082,6 +2102,9 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
         while (off + 8 <= blk_bytes) {
             ext2_dirent_t* de = (ext2_dirent_t*)(dre_buf + off);
             if (de->rec_len == 0) break;
+            // Untrusted on-disk rec_len/name_len: bound the entry to the block so the
+            // kmemeq name compare below cannot read past dre_buf (heap OOB read).
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
 
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
@@ -2244,6 +2267,34 @@ void ext2_inode_size_valid_selftest(void) {
     }
     kprintf(fails ? "[ext2_isz] SELF-TEST FAILED\n"
                   : "[ext2_isz] SELF-TEST PASSED (inode-size pow2 + range validation)\n");
+}
+
+// ext2_dirent_in_block gates the untrusted on-disk rec_len/name_len so dir_add_entry's
+// slack split (and dir_remove_entry's name compare) stay inside the 4096-byte block.
+// Drive the underflow + past-block reject cases a bare walk would have written/read OOB.
+void ext2_dirent_in_block_selftest(void) {
+    kprintf("[ext2_dirent] ext2_dirent_in_block must reject corrupt rec_len/name_len\n");
+    int fails = 0;
+    struct { uint32_t off, rec, nlen, blk, want; } c[] = {
+        { 0,    16,     5,   4096, 1 },   // valid: actual align(13)=16 == rec, in-block
+        { 0,    12,     4,   4096, 1 },   // valid: actual 12 == rec
+        { 4080, 16,     5,   4096, 1 },   // valid: exact fit, off+rec == blk
+        { 2048, 2048,   200, 4096, 1 },   // valid: large entry filling half the block
+        { 0,    16,     255, 4096, 0 },   // actual align(263)=264 > rec 16 -> slack underflow
+        { 4088, 16,     0,   4096, 0 },   // off+rec 4104 > blk -> runs past the block
+        { 0,    4,      0,   4096, 0 },   // rec_len 4 < 8 header -> reject
+        { 0,    0xFFFF, 10,  4096, 0 },   // huge rec_len past the block
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_dirent_in_block(c[i].off, c[i].rec, c[i].nlen, c[i].blk);
+        if (got != (int)c[i].want) {
+            kprintf("[ext2_dirent] FAIL off=%u rec=%u nlen=%u got=%d want=%u\n",
+                    c[i].off, c[i].rec, c[i].nlen, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_dirent] SELF-TEST FAILED\n"
+                  : "[ext2_dirent] SELF-TEST PASSED (dirent rec_len/name_len bounds)\n");
 }
 
 // Deterministic test of path_split's bound: a parent longer than the

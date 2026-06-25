@@ -146,6 +146,14 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   closing the OOB bcache-slot read (inode_load_into) + scratch write (inode_disk_write)
   a crafted s_inode_size (only `> 0`-checked before) caused. Sibling of ext2_block_size_checked.
   `ext2_inode_size_valid_selftest` drives the non-pow2 / too-small / too-big / straddle rejects.
+- `ext2_dirent_in_block(off, rec_len, name_len, blk_bytes)` (kernel/fs/ext2.c, F54) --
+  validates an on-disk directory entry's untrusted rec_len/name_len: the entry stays
+  in the block (off + rec_len <= blk_bytes) and holds its aligned header+name
+  (align4(8+name_len) <= rec_len). Guards both write-side walks (dir_add_entry slack
+  split, dir_remove_entry name compare); without it a corrupt rec_len/name_len
+  underflowed `rec_len - actual_len` and split-wrote past the 4096-byte heap block
+  (heap OOB write). Mirrors the read-side ext2_dirent_namelen_clamp.
+  `ext2_dirent_in_block_selftest` drives the underflow / past-block / rec<8 rejects.
 
 ## Status
 

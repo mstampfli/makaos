@@ -912,3 +912,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   by fan-out audit, confirmed + kernel-wide grep showed it was the ONLY raw-arg deref in
   any ioctl handler. Fix: copy_to_user the zero struct (validates via _access_ok +
   prefault) like the siblings. Boot reaches DHCP lease, no regression.
+- ext2 dir_add_entry slack underflow -> heap OOB write -> FIXED (F54, HIGH): the dirent
+  walk computed `slack = de->rec_len - actual_len` (u32) on an UNTRUSTED on-disk
+  rec_len/name_len, bounding only `off+8<=blk_bytes`. A corrupt entry with actual_len >
+  rec_len (e.g. name_len=255 -> actual_len=264, rec_len=16) underflows slack to ~4.29e9
+  so the split always fires and writes new_de = dae_buf + off + actual_len (off up to
+  ~4088) PAST the 4096-byte heap block = heap OOB write of the new filename/inode ->
+  slab corruption / LPE. Reached by any create (O_CREAT/mkdir/rename/link) in a crafted/
+  corrupt directory block (read-side dir_lookup/readdir already clamp via
+  ext2_dirent_namelen_clamp; write-side had no guard). dir_remove_entry is the OOB-read
+  sibling (kmemeq past the buffer). Fix: tagged primitive ext2_dirent_in_block(off,
+  rec_len, name_len, blk_bytes) = off+rec_len<=blk_bytes && align4(8+name_len)<=rec_len,
+  break the walk on a malformed entry in both (dir_add appends a fresh block, dir_remove
+  fails-to-find). Valid dirs unaffected. ext2_dirent_in_block_selftest drives the rejects.

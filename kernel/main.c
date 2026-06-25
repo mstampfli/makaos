@@ -502,6 +502,8 @@ static void init_kthread(void) {
     ext2_blk_lba_selftest();
     extern void ext2_inode_size_valid_selftest(void);
     ext2_inode_size_valid_selftest();
+    extern void ext2_dirent_in_block_selftest(void);
+    ext2_dirent_in_block_selftest();
     extern void xfer_bytes_ok_selftest(void);
     xfer_bytes_ok_selftest();
 
