@@ -1384,6 +1384,13 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
 
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return (uint64_t)-ENOMEM;
+    // Zero-then-init, matching task_fork / task_create_user / task_create_kthread
+    // (process.c:252/286/417).  sys_thread sets its fields individually below;
+    // without this, any task_t field NOT explicitly set here inherits slab
+    // garbage -- a pointer field (e.g. a list head added later) would then be a
+    // wild pointer.  This is the single constructor that diverged from the
+    // invariant; the memset restores it.
+    __builtin_memset(t, 0, sizeof(*t));
 
     t->pid = pid_alloc();
     if (!t->pid) { kfree(t); return (uint64_t)-ENOMEM; }

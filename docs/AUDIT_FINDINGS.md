@@ -752,7 +752,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   is reaped) is closed by a safety-net reparent-to-init in task_destroy (a
   no-op for normal reaps). Deterministic tg_leader_selftest (fake leader+thread
   +zombie-child: a child "forked by the thread" is reaped via tg_leader). LOW:
-  sys_thread does not zero the task_t (slab-drift risk) -- still open.
+  sys_thread does not zero the task_t (slab-drift risk) -> FIXED (F42): sys_thread
+  was the one task constructor that kmalloc'd a task_t and set fields one by one
+  with NO `__builtin_memset(t, 0, sizeof(*t))`, unlike task_fork / task_create_user
+  / task_create_kthread (process.c:252/286/417) -- so any field not explicitly set
+  inherited slab garbage (a pointer field added later would be wild). Added the
+  memset right after the kmalloc, restoring the zero-then-init invariant. Code-
+  proof (matches the 3 siblings) + clean boot.
 - VFS path resolution -> no symlink support (no ELOOP surface). **HIGH: unveil()
   was enforced ONLY in sys_open** -> FIXED (F38). unveil_check had one call site;
   every other path syscall escaped the sandbox. Fixed with ONE shared gate
