@@ -1234,3 +1234,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   selftest (tcp_listener_orphan_selftest: listener free clears child->listener, unrelated free does not) +
   code-proof + clean boot (58 selftests; TCP listeners not boot-exercised). ALL FOUR fan-out findings
   (n, o, p, q) now fixed. Minor: the walk makes tcp_pcb_free O(live PCBs) -- fine at MakaOS scale.
+- io_uring dispatch double-fetches sqe->addr/len from the user-writable SQE ring -> TOCTOU arbitrary
+  kernel R/W -> FIXED (F76, 2nd fan-out): uring->sqes[] is mapped VMA_R|W|USER; the sync and SQPOLL
+  dispatch paths pass dispatch_exec a LIVE pointer; for OP_READ/WRITE it validates sqe->addr/len with
+  user_buf_check then RE-READS them for vfs_read/write, so a concurrent user write (trivial via SQPOLL)
+  redirects the buffer to a kernel address between check and use = arbitrary kernel read/write (LPE).
+  The async io_wq path was safe because it snapshots (w->sqe). Fix: snapshot the SQE once at the top of
+  dispatch_exec (io_sqe_t snap = *sqe; sqe = &snap) so every read is from the immutable copy -- the
+  validate and the use are the same value. Code-proof + io_uring_selftest (NOP dispatch through
+  io_uring_enter_impl) still passes + clean boot. Found by a fresh fan-out (futex/scheduler/fork-CoW
+  came back SAFE). RECORDED follow-ups from the same fan-out (verify-before-fix): (s) HIGH -- socket
+  syscalls (accept/connect/bind/listen/sendmsg/recvmsg + SCM_RIGHTS) use the un-refcounted fd_to_file
+  across a BLOCKING op -> a THREAD_SHARE_FILES sibling close() RCU-frees the socket under the blocked
+  caller = UAF (same class as F73; fix = fdget/fdput per site, like sys_read). (t) LOW -- sys_thread's
+  private-fd-table clone path copies fd_table[] but not fd_flags[], dropping FD_CLOEXEC (correctness).

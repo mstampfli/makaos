@@ -854,6 +854,16 @@ static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
 // Split from dispatch_one so linked-chain logic can decide whether
 // to cancel the rest of the chain based on res < 0 + IO_LINK flag.
 static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
+    // The SQE lives in the user-WRITABLE mmap'd ring (uring->sqes[], mapped
+    // VMA_R|W|USER); the sync and SQPOLL dispatch paths pass a LIVE pointer into
+    // it.  Snapshot it ONCE into a kernel-local copy and read only that, so a
+    // concurrent user write cannot change addr/len/fd between user_buf_check
+    // (validation) and vfs_read/vfs_write (use) -- a double-fetch TOCTOU that is
+    // otherwise an arbitrary kernel read/write (LPE), trivially reachable via
+    // SQPOLL.  The async io_wq path already snapshots into w->sqe; this makes
+    // every dispatch path single-fetch.  io_sqe_t is 64 bytes -- safe on stack.
+    io_sqe_t snap = *sqe;
+    sqe = &snap;
     int32_t res = -EINVAL;
     switch (sqe->opcode) {
         case IORING_OP_NOP:
