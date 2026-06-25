@@ -73,6 +73,13 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   (io_uring OP_READ/WRITE, and now the socket recv/send/accept/connect/bind handlers
   -- F51, which previously passed buf_ptr/addr_ptr raw to tcp_recv_data `dst[i]=` /
   socket_accept / sa->sin_*, an arbitrary-kernel-R/W LPE).
+  Direction matters (F52): a READ syscall (kernel WRITES the buffer) prefaults so
+  absent pages are backed before the direct memcpy; a WRITE syscall (kernel READS
+  the buffer) must only range-check (`_access_ok`) -- prefaulting a read-from-user
+  buffer would allocate ZERO pages for absent pages (wrong direction) and wedges
+  userspace.  `user_buf_prefault` itself is now overflow-safe (F52): it iterates by
+  page COUNT, so a huge len can no longer wrap its bound, skip the loop, and return
+  "ok" without validating anything (which defeated sys_read -> read(sockfd, KADDR, ~0)).
   `_access_ok` and `mmap_round_len` now fold their addr+len / len+PAGE_MASK wrap
   guards onto `ckd_add_u64` (category A) -- the F19/F24 overflow class, exactly the
   use ckd_add documents. Direct `access_ok_selftest` covers the wrap branch that

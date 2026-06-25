@@ -195,6 +195,13 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE)) {
         fdput(f); return (uint64_t)-EACCES;
     }
+    // A direct-deref write_op (sock_write -> tcp_send reads buf raw) would read
+    // from a KERNEL address if buf is unvalidated -- write(sockfd, KADDR, n) leaks
+    // kernel memory onto the wire.  Range-check buf (rejects kernel/non-canonical/
+    // overflowing pointers, overflow-safe via _access_ok's ckd_add_u64).  We do NOT
+    // prefault here: a write READS the buffer, so allocating zero pages for absent
+    // pages is wrong; an absent valid page is demand-paged by the normal fault path.
+    if (len && !_access_ok(buf, len)) { fdput(f); return (uint64_t)-EFAULT; }
     int64_t r = vfs_write(f, (const void*)buf, len);
     fdput(f);
     if (r < 0) return (uint64_t)r;
@@ -219,11 +226,20 @@ static int user_buf_prefault(virt_addr_t addr, size_t len) {
     mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
     if (!mm) return 0;
 
-    virt_addr_t page = addr & ~(virt_addr_t)0xFFF;
-    virt_addr_t end  = (addr + len + 0xFFF) & ~(virt_addr_t)0xFFF;
-    phys_addr_t pml4 = vmm_current_pml4();  // current CR3 = this process's PML4
+    // Page span [addr, addr+len), computed WITHOUT overflow.  A huge len would
+    // wrap the old `end = addr+len+0xFFF` below `page`, so the loop ran zero times
+    // and returned 0 ("ok") while validating NOTHING -- letting a prefault-only
+    // caller (sys_read, the blit path) deref an unvalidated kernel pointer, e.g.
+    // read(sockfd, KADDR, ~0ull) wrote a datagram to KADDR (write-what-where).
+    // Reject a wrapping addr+len, then iterate by PAGE COUNT so the bound can
+    // never overflow.  For a valid range this covers the identical page set.
+    uint64_t addr_end;
+    if (!ckd_add_u64(addr, len, &addr_end)) return -1;            // addr+len wraps
+    virt_addr_t page   = addr & ~(virt_addr_t)0xFFF;
+    uint64_t    npages = ((addr_end - 1) >> 12) - (addr >> 12) + 1;
+    phys_addr_t pml4   = vmm_current_pml4();  // current CR3 = this process's PML4
 
-    for (; page < end; page += 0x1000) {
+    for (uint64_t i = 0; i < npages; i++, page += 0x1000) {
         // Walk VMA list under RCU — snapshot the flags we need, then
         // drop the reader before touching page tables.
         uint32_t vma_flags;

@@ -890,3 +890,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   gets its lease (10.0.2.15) -> valid path unbroken. Residual (pre-existing, kernel-
   wide like sys_read): recv copy is post-block -> TOCTOU munmap could #PF; the range
   check still blocks the kernel-write; bounce-buffer is the fuller later hardening.
+- user_buf_prefault overflow + sys_write raw deref -> FIXED (F52): (1) user_buf_prefault
+  (the chokepoint for prefault-only callers) computed `end = (addr+len+0xFFF)&~0xFFF`; a
+  huge len wraps it below `page`, the loop runs 0 times, returns 0 ("ok") validating
+  nothing. sys_read (prefault-only, no _access_ok) -> read(sockfd, KADDR, ~0ull) ->
+  tcp_recv_data writes the datagram to KADDR = arbitrary-kernel-WRITE LPE (F51 via read()).
+  copy_*_user are safe (they _access_ok first). Root fix: reject wrapping addr+len
+  (ckd_add_u64), iterate by PAGE COUNT -> overflow-proof, identical page set for valid
+  ranges. (2) sys_write deref'd buf raw (sock_write->tcp_send) = write(sockfd,KADDR,n)
+  kernel-READ leak; fixed with _access_ok range-check (NOT prefault: a write READS the
+  buffer, so prefault zeroing absent pages is the wrong direction + wedged userspace --
+  caught by a revert-test, not assumed flaky). Boot DHCP over read/write+sockets still
+  gets its lease. Residual: a raw-deref write_op on an absent valid page relies on the
+  demand-fault path; bounce-buffer is the fuller hardening.
