@@ -385,6 +385,22 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         return (uint64_t)-ENOENT;
     }
 
+    // ── unveil gate -- BEFORE any open or create ─────────────────────────
+    // A path outside the unveil set is "as if it does not exist", like every
+    // other path syscall (which all gate right after fs_lookup).  This MUST run
+    // before ext2_create below: checking only at got_file (after the create) let
+    // a confined process CREATE a file outside its unveiled subtree -- the create
+    // ran, then the late check denied + closed the fd but left the file on disk
+    // (sandbox escape on the create side).  path is normalized by fs_lookup;
+    // virtual mounts (/dev,/proc) and the no-rules case are exempt inside unveil_ok.
+    {
+        uint8_t need_u = UNVEIL_READ;
+        int oacc = (int)(flags & 3);
+        if (oacc == O_WRONLY || oacc == O_RDWR) need_u |= UNVEIL_WRITE;
+        if (flags & O_CREAT)                    need_u |= UNVEIL_CREATE;
+        if (!unveil_ok(path, need_u)) return (uint64_t)-ENOENT;
+    }
+
     // Virtual path — dispatch to backend; permission already checked by fs_lookup.
     if (fsr == 0 && fsn.is_virtual) {
         if (path[0]=='/' && path[1]=='p') {
@@ -485,23 +501,10 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     if (!f) return (uint64_t)-ENOENT;
 
 got_file:
-    // ── unveil check ─────────────────────────────────────────────────────
-    // Paths not in the unveil table return ENOENT (as if they don't exist).
-    // The virtual mounts (/dev, /proc) are exempt (always accessible via this
-    // path).  Use virtfs_is_virtual -- the single boundary-correct "is virtual"
-    // predicate -- NOT a hand-rolled prefix test: the old `path[1..3]=='dev'`
-    // form matched any real on-disk file named /devsecrets, /processData, etc.,
-    // letting it skip the unveil sandbox entirely (sandbox escape).
-    {
-        uint8_t need_u = UNVEIL_READ;
-        int oflags_acc = (int)(flags & 3);
-        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) need_u |= UNVEIL_WRITE;
-        if (flags & O_CREAT)                                 need_u |= UNVEIL_CREATE;
-        if (!unveil_ok(path, need_u)) {   // shared gate (was inline; now DRY)
-            vfs_close(f);
-            return (uint64_t)-ENOENT;
-        }
-    }
+    // unveil was gated BEFORE any open/create above (see the note there).  The
+    // single boundary-correct unveil_ok (uses virtfs_is_virtual, not a hand-rolled
+    // prefix test) hid the path if it was outside the visible set, so a confined
+    // process can neither read nor CREATE outside its unveiled subtree.
 
     // ── Stamp fd rights from open flags ───────────────────────────────────
     f->rights = rights_from_oflags((int)(flags & 3), 0 /* exec_ok: not checked here */);

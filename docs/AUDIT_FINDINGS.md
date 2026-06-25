@@ -925,3 +925,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   rec_len, name_len, blk_bytes) = off+rec_len<=blk_bytes && align4(8+name_len)<=rec_len,
   break the walk on a malformed entry in both (dir_add appends a fresh block, dir_remove
   fails-to-find). Valid dirs unaffected. ext2_dirent_in_block_selftest drives the rejects.
+- unveil sandbox escape (create before check) -> FIXED (F55): sys_open gated unveil_ok
+  only at got_file -- AFTER ext2_create -- while every other path syscall gates right
+  after fs_lookup. So a confined (unveil'd) process could open("/outside", O_CREAT): the
+  create ran, then the late check denied + vfs_close'd the fd but left the file on disk =
+  filesystem-confinement escape on the create side (deny-by-side-effect; caller gets
+  ENOENT yet the file exists). Unprivileged, single syscall. Fix: move the gate to right
+  after fs_lookup, before any open/create (path is normalized by fs_lookup; /dev,/proc +
+  no-rules exempt inside unveil_ok); removed the redundant got_file check (the early gate
+  dominates all got_file paths). Boot reaches DHCP, no regression (zero boot denials -- the
+  gate is a no-op for un-unveiled processes). NOTE: a 1-sample revert-test misleadingly
+  pointed at this change during a flaky-boot stall; a denial-tracing debug (zero denials)
+  was the decisive check -- confirm the mechanism, not just one revert sample.
