@@ -182,7 +182,6 @@ static inline uint64_t rdmsr(uint32_t msr) {
 // Forward declarations for the fd-lookup fast path (defined further down).
 static vfs_file_t* fdget(uint64_t fd);
 static void        fdput(vfs_file_t* f);
-static vfs_file_t* fd_to_file(uint64_t fd);
 
 // ── syscall_init ──────────────────────────────────────────────────────────
 void syscall_init(void) {
@@ -3051,17 +3050,6 @@ static vfs_file_t* fdget(uint64_t fd) {
 // close-on-last-ref runs the driver teardown; safe to pass NULL.
 static void fdput(vfs_file_t* f) { vfs_close(f); }
 
-// Compat wrapper for a handful of callers that still want the old,
-// un-ref-bumped semantics — used only inside writer-lock critical
-// sections where the task_files_t.lock already prevents a concurrent
-// teardown.  New code should use fdget/fdput.
-static vfs_file_t* fd_to_file(uint64_t fd) {
-    if (!g_current || !g_current->files_shared) return NULL;
-    fdtable_t* ft = __atomic_load_n(&g_current->files_shared->ft, __ATOMIC_ACQUIRE);
-    if (!ft || fd >= ft->cap) return NULL;
-    return ft->fd_table[fd];
-}
-
 // socket(domain, type, proto) → fd or -errno
 static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto);
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
@@ -5899,16 +5887,27 @@ static uint64_t w_sys_timerfd_create(uint64_t clockid, uint64_t flags,
 static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
                                        uint64_t new_ptr, uint64_t old_ptr) {
     if (!new_ptr) return (uint64_t)-EINVAL;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the timerfd so a sibling close(fd) cannot
+    // kfree its state under timerfd_settime (timerfd_close_op frees the
+    // state and file immediately, no RCU).  fdput on every exit via goto out.
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (!timerfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
+    uint64_t ret;
+    int rc;
     k_itimerspec_t kn, ko;
-    if (copy_from_user(&kn, (void*)new_ptr, sizeof(kn)) != 0)
-        return (uint64_t)-EFAULT;
-    int rc = timerfd_settime(f, (int)flags, &kn, old_ptr ? &ko : NULL);
-    if (rc != 0) return (uint64_t)rc;
-    if (old_ptr && copy_to_user((void*)old_ptr, &ko, sizeof(ko)) != 0)
-        return (uint64_t)-EFAULT;
-    return 0;
+    if (copy_from_user(&kn, (void*)new_ptr, sizeof(kn)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    rc = timerfd_settime(f, (int)flags, &kn, old_ptr ? &ko : NULL);
+    if (rc != 0) { ret = (uint64_t)rc; goto out; }
+    if (old_ptr && copy_to_user((void*)old_ptr, &ko, sizeof(ko)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = 0;
+out:
+    fdput(f);
+    return ret;
 }
 
 // ── sys_signalfd ─────────────────────────────────────────────────────
@@ -5978,9 +5977,14 @@ static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
     uint32_t mask = (uint32_t)(mask64 & 0xFFFFFFFFu);
 
     if ((int64_t)fd_u >= 0) {
-        vfs_file_t* f = fd_to_file(fd_u);
-        if (!f || !signalfd_is(f)) return (uint64_t)-EBADF;
+        // fdget (not fd_to_file): pin the signalfd so a sibling close(fd_u)
+        // cannot kfree its state under signalfd_update (signalfd_close_op
+        // frees the state and file immediately, no RCU).
+        vfs_file_t* f = fdget(fd_u);
+        if (!f) return (uint64_t)-EBADF;
+        if (!signalfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
         int rc = signalfd_update(f, mask);
+        fdput(f);
         return rc < 0 ? (uint64_t)rc : (uint64_t)fd_u;
     }
     vfs_file_t* f = signalfd_new(mask, (uint32_t)flags);
@@ -6319,14 +6323,23 @@ static uint64_t w_sys_timerfd_gettime(uint64_t fd, uint64_t out_ptr,
                                        uint64_t c, uint64_t d) {
     (void)c; (void)d;
     if (!out_ptr) return (uint64_t)-EINVAL;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the timerfd so a sibling close(fd) cannot
+    // kfree its state under timerfd_gettime (close frees immediately, no RCU).
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (!timerfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
+    uint64_t ret;
+    int rc;
     k_itimerspec_t ks;
-    int rc = timerfd_gettime(f, &ks);
-    if (rc != 0) return (uint64_t)rc;
-    if (copy_to_user((void*)out_ptr, &ks, sizeof(ks)) != 0)
-        return (uint64_t)-EFAULT;
-    return 0;
+    rc = timerfd_gettime(f, &ks);
+    if (rc != 0) { ret = (uint64_t)rc; goto out; }
+    if (copy_to_user((void*)out_ptr, &ks, sizeof(ks)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = 0;
+out:
+    fdput(f);
+    return ret;
 }
 
 // 4-arg handlers that already match the uniform signature — used directly.

@@ -1285,3 +1285,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   compile + clean boot (58 PASSED incl. epoll_pin). RECORDS (u): epoll_ctl ADD/MOD read the WATCHED fd raw
   (fd_table[tfd]) then vfs_tryget it in register -- a sibling close(tfd) racing the gap can free+reuse wf
   before the tryget; mitigated (tryget) and narrower, but real; fix = fdget(tfd) across register, fdput after.
+- timerfd_settime/gettime + signalfd mask-update deref the un-refcounted fd_to_file across the op -> sibling-
+  close UAF -> FIXED (F81, closes the fd_to_file class): timerfd_close_op/signalfd_close_op kfree the state +
+  file IMMEDIATELY (no RCU), so a sibling close(fd) frees the backing state in the window between the bare read
+  and the deref (narrower SMP variant -- these ops do not block; the blocking read goes via sys_read, fdget-safe
+  since F73). Fix: fdget/fdput on every path (timerfd via single-exit goto out with locals before the goto;
+  signalfd straight-line). Code-proof + timerfd/signalfd selftests pass + clean boot (re-boot reached DHCP after
+  a flaky F55 stall). CAPSTONE: fd_to_file then had ZERO callers -- the unsafe file-static compat primitive was
+  REMOVED (decl + def), eliminating the footgun (safe-primitives). The whole fd_to_file-across-an-op UAF sweep
+  is closed: F73 poll/select, F77 socket syscalls, F78 sendmsg/recvmsg, F80 epoll, F81 timerfd/signalfd.
