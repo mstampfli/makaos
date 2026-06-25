@@ -216,14 +216,29 @@ void slab_typesafe_selftest(void) {
     // (including our pmm_slab_rcu_free_cb) has completed.
     rcu_barrier();
 
-    // After the callback runs, the page is back in the buddy and
-    // g_slab_trackers for its frames is NULL.
-    uint8_t after_gp = pmm_is_slab_ptr(objs[0]);
-    if (after_gp) {
-        kprintf("[typesafe_test] FAILED: is_slab_ptr=1 after rcu_barrier "
-                "(RCU callback didn't run?)\n");
+    // After the grace period our cache's page MUST be freed, i.e. the frame is
+    // no longer owned by `tc`.  Check the OWNING CACHE, not pmm_is_slab_ptr:
+    // once the page is returned to the buddy it can be (and under concurrent
+    // allocation load frequently IS) immediately re-handed to a DIFFERENT
+    // cache, which legitimately re-sets is_slab_ptr to 1.  The typesafe
+    // guarantee is only that OUR page stays typed-as-ours until the grace
+    // period -- after it, the frame is free game.  The old is_slab_ptr==0
+    // check therefore flaked (a benign reallocation looked like a failure);
+    // checking cache identity is the correct, race-free assertion.
+    slab_cache_t* owner   = pmm_slab_cache_of(objs[0]);
+    uint8_t       slabptr = pmm_is_slab_ptr(objs[0]);
+    if (owner == &tc) {
+        kprintf("[typesafe_test] FAILED: frame still owned by tc after the grace "
+                "period (callback did not free our page)\n");
         return;
     }
-
-    kprintf("[typesafe_test] SELF-TEST PASSED (defer → grace → reclaim)\n");
+    if (slabptr) {
+        // Proof of the reallocation race: freed (no longer tc) yet is_slab_ptr=1
+        // because another cache already took the frame.  Benign.
+        extern void kprintf_atomic(const char* fmt, ...);
+        kprintf_atomic("[typesafe_test] note: frame freed then reused by another "
+                       "cache (owner=%p tc=%p) -- benign reallocation\n",
+                       (void*)owner, (void*)&tc);
+    }
+    kprintf("[typesafe_test] SELF-TEST PASSED (defer -> grace -> reclaim)\n");
 }
