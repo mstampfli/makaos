@@ -1127,3 +1127,19 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   between the check and the raw read still panics; the robust fix is a fault-fixup/exception table so
   any kernel-mode fault on a user address returns -EFAULT (would also let copy_*_user/user_buf_check
   drop their file-corrupting prefault for read sources).
+- directory rename across parents left ".." and links_count stale -> fs corruption / path-escape ->
+  FIXED (F68, follow-up (b)): ext2_rename moved a dir (dir_add_entry dst + dir_remove_entry src) but
+  for a directory never repointed its ".." (in block 0) at the new parent -- so /b/d/.. still resolved
+  to /a after `mv /a/d /b/d` (path escape) -- and never adjusted links_count: the old parent stayed
+  too high (un-rmdir-able), the new parent too low (an over-decrement could free it while this dir's
+  ".." still references it -> cross-link onto a freed inode). mkdir already sets ".." + increments the
+  parent's links_count, the convention this mirrors. Fix: dirent_repoint_dotdot (no-I/O, rewrites only
+  the ".." inode under the ext2_dirent_in_block bound) + dir_set_dotdot (inode-locked block RMW) +,
+  in ext2_rename for is_dir && src_parent != dst_parent, repoint ".." and RMW src_parent-- /
+  dst_parent++ under each parent's inode lock. Deterministic selftest (ext2_dotdot_repoint_selftest:
+  ".." repointed, siblings + rec_len/name_len intact, no-".." -> not-found) + code-proof (links_count
+  mirrors mkdir) + clean boot (54 selftests). NOTE: the verify boots hit the flaky F55 userspace-start
+  stall (A/B-confirmed pre-existing, 2/3 reach DHCP), and the selftest's 4KiB stack buffer was moved to
+  kmalloc (the kstack is only 8KiB). RESIDUAL follow-up (m): ext2_rename does not reject renaming a dir
+  into its own subtree (`mv /a /a/b`, POSIX EINVAL) -- creates a detached cycle; needs a normalized-path
+  ancestor check.

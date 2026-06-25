@@ -2127,6 +2127,57 @@ out:
     return ok;
 }
 
+// Find the ".." entry in a directory block and repoint it at new_ino.  The
+// untrusted on-disk rec_len/name_len are bounded to the block (the same
+// ext2_dirent_in_block discipline dir_remove_entry uses) so the scan cannot read
+// past `block`.  Only the inode field is touched -- rec_len/name_len/name are
+// left intact so the entry stays valid.  Returns 1 if ".." was found+updated,
+// 0 otherwise.  Pure (no I/O) -> unit-tested by ext2_dotdot_repoint_selftest.
+static uint8_t dirent_repoint_dotdot(uint8_t* block, uint32_t blk_bytes,
+                                     uint32_t new_ino) {
+    uint32_t off = 0;
+    while (off + 8 <= blk_bytes) {
+        ext2_dirent_t* de = (ext2_dirent_t*)(block + off);
+        if (de->rec_len == 0) break;
+        if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
+        if (de->inode != 0 && de->name_len == 2 &&
+            de->name[0] == '.' && de->name[1] == '.') {
+            de->inode = new_ino;
+            return 1;
+        }
+        off += de->rec_len;
+    }
+    return 0;
+}
+
+// Repoint a directory's ".." entry at new_parent_ino.  Used by rename when a
+// directory moves to a different parent: ".." lives in the directory's first
+// data block.  Returns 1 on success.  Caller holds s_rename_lock; this takes the
+// directory's own inode lock for the read-modify-write of its data block.
+static uint8_t dir_set_dotdot(uint32_t dir_ino_num, uint32_t new_parent_ino) {
+    irtree_leaf_t* dir_leaf = inode_lock(dir_ino_num);
+    if (!dir_leaf) return 0;
+    ext2_inode_t dir_inode = dir_leaf->inode;
+    uint8_t ok = 0;
+    uint32_t blk = inode_get_block(&dir_inode, 0);   // ".." is in block 0
+    if (blk) {
+        uint8_t* buf = (uint8_t*)kmalloc(4096);
+        if (buf) {
+            if (read_block(blk, buf)) {
+                uint32_t blk_bytes = (dir_inode.i_size < s_block_size)
+                                     ? dir_inode.i_size : s_block_size;
+                if (dirent_repoint_dotdot(buf, blk_bytes, new_parent_ino)) {
+                    write_block(blk, buf);
+                    ok = 1;
+                }
+            }
+            kfree(buf);
+        }
+    }
+    inode_unlock(dir_leaf);
+    return ok;
+}
+
 // ── Path utilities ─────────────────────────────────────────────────────────
 
 // Split path into parent path and basename.
@@ -2295,6 +2346,58 @@ void ext2_dirent_in_block_selftest(void) {
     }
     kprintf(fails ? "[ext2_dirent] SELF-TEST FAILED\n"
                   : "[ext2_dirent] SELF-TEST PASSED (dirent rec_len/name_len bounds)\n");
+}
+
+// Deterministic test of dirent_repoint_dotdot (the F68 cross-parent dir-rename
+// fix core): in a constructed dir block it must repoint ONLY the ".." entry's
+// inode, leaving "."/sibling entries and all rec_len/name_len metadata intact,
+// and report not-found when there is no "..".
+void ext2_dotdot_repoint_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    const uint32_t bb = 1024;            // block_size-independent: pass blk_bytes
+    // Heap-allocate the block buffer: the kernel stack is only 8KiB (KSTACK_PAGES
+    // = 2), so a 4096-byte stack array would gut it -- every dir-block buffer in
+    // this file is kmalloc'd for exactly this reason.
+    uint8_t* blk = (uint8_t*)kmalloc(4096);
+    if (!blk) { kprintf_atomic("[ext2_dotdot] SELF-TEST FAILED (alloc)\n"); return; }
+
+    // Block: "." (ino 10), ".." (ino 20), "file" (ino 30, fills the rest).
+    __builtin_memset(blk, 0, 4096);
+    ext2_dirent_t* d  = (ext2_dirent_t*)(blk + 0);
+    d->inode = 10; d->rec_len = 12; d->name_len = 1; d->file_type = EXT2_FT_DIR;
+    d->name[0] = '.';
+    ext2_dirent_t* dd = (ext2_dirent_t*)(blk + 12);
+    dd->inode = 20; dd->rec_len = 12; dd->name_len = 2; dd->file_type = EXT2_FT_DIR;
+    dd->name[0] = '.'; dd->name[1] = '.';
+    ext2_dirent_t* f  = (ext2_dirent_t*)(blk + 24);
+    f->inode = 30; f->rec_len = (uint16_t)(bb - 24); f->name_len = 4;
+    f->file_type = EXT2_FT_REG_FILE;
+    f->name[0]='f'; f->name[1]='i'; f->name[2]='l'; f->name[3]='e';
+
+    if (!dirent_repoint_dotdot(blk, bb, 99)) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. not found\n"); }
+    if (dd->inode != 99) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. inode=%u (want 99)\n", dd->inode); }
+    if (dd->name_len != 2 || dd->rec_len != 12 || dd->name[0] != '.' || dd->name[1] != '.') {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. metadata clobbered\n"); }
+    if (d->inode != 10) { fails++; kprintf_atomic("[ext2_dotdot] FAIL . clobbered\n"); }
+    if (f->inode != 30) { fails++; kprintf_atomic("[ext2_dotdot] FAIL sibling clobbered\n"); }
+
+    // Block with NO ".." (only "." and a sibling) -> not found, nothing changes.
+    __builtin_memset(blk, 0, 4096);
+    d = (ext2_dirent_t*)(blk + 0);
+    d->inode = 10; d->rec_len = 12; d->name_len = 1; d->name[0] = '.';
+    f = (ext2_dirent_t*)(blk + 12);
+    f->inode = 30; f->rec_len = (uint16_t)(bb - 12); f->name_len = 1; f->name[0] = 'x';
+    if (dirent_repoint_dotdot(blk, bb, 99) != 0) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL spurious match (no ..)\n"); }
+    if (f->inode != 30 || d->inode != 10) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL touched entries with no ..\n"); }
+
+    kfree(blk);
+    kprintf_atomic(fails ? "[ext2_dotdot] SELF-TEST FAILED\n"
+                         : "[ext2_dotdot] PASS (.. repointed, siblings + metadata intact)\n");
 }
 
 // Deterministic test of path_split's bound: a parent longer than the
@@ -2919,6 +3022,32 @@ int ext2_rename(const char* src, const char* dst) {
 
     // Remove old directory entry.
     dir_remove_entry(src_parent_ino, src_base);
+
+    // Moving a DIRECTORY to a different parent: its ".." backlink moves from the
+    // old parent to the new one.  Repoint ".." (else it escapes to the old
+    // parent -- /b/dir/.. would resolve to /a) and fix both parents' link
+    // counts (each subdirectory contributes one ".." link to its parent).
+    // Without this the old parent's count stays too high (it can never be
+    // rmdir'd) and the new parent's too low (an over-decrement elsewhere could
+    // free it while this dir's ".." still references it -- a cross-link).  A
+    // same-parent rename touches neither.  RMW each parent under its own inode
+    // lock, taken one at a time (no nesting) to match the existing lock order.
+    if (is_dir && src_parent_ino != dst_parent_ino) {
+        dir_set_dotdot(src_ino, dst_parent_ino);
+
+        irtree_leaf_t* spleaf = inode_lock(src_parent_ino);
+        if (spleaf) {
+            if (spleaf->inode.i_links_count > 0) spleaf->inode.i_links_count--;
+            inode_writeback(spleaf);
+            inode_unlock(spleaf);
+        }
+        irtree_leaf_t* dpleaf = inode_lock(dst_parent_ino);
+        if (dpleaf) {
+            dpleaf->inode.i_links_count++;
+            inode_writeback(dpleaf);
+            inode_unlock(dpleaf);
+        }
+    }
 
     // Phase 7C: invalidate both the src dentry (moved away) and any
     // cached negative dentry at the dst (which may previously have

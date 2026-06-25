@@ -516,6 +516,10 @@ static void init_kthread(void) {
     ext2_inode_size_valid_selftest();
     extern void ext2_dirent_in_block_selftest(void);
     ext2_dirent_in_block_selftest();
+    // Cross-parent directory rename must repoint the moved dir's ".." entry
+    // (else it escapes to the old parent) without clobbering siblings.
+    extern void ext2_dotdot_repoint_selftest(void);
+    ext2_dotdot_repoint_selftest();
     extern void xfer_bytes_ok_selftest(void);
     xfer_bytes_ok_selftest();
 
