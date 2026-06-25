@@ -1268,3 +1268,11 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   independent). Code-proof (not boot-exercised pre-login) + scm_rights/unix_refcount selftests + clean boot.
   Next: the bounce[4096] and fds_buf/inst_fds[253] (~1KB) buffers in these two functions are still on the
   8KiB kstack (F68 class).
+- sendmsg/recvmsg put ~5KiB of buffers on the 8KiB kstack before a blocking call -> kstack-overflow hazard
+  -> FIXED (F79, F68 class): bounce[4096] + fds_buf[253]/inst_fds[253] (1012 bytes each, SCM_MAX_FD=253) all
+  moved to kmalloc, freed at the single goto-out chokepoint. Named MSG_BOUNCE_SZ; every sizeof(bounce) (would
+  silently become 8 on a pointer) replaced. bounce alloc'd once per call on first iov chunk; fds_buf once on
+  first SCM cmsg; inst_fds LAZILY on the first arriving fd so the common no-fd recvmsg pays zero alloc. All
+  pointers declared NULL before the first goto out (so out's kfree never reads garbage); kmalloc-fail paths
+  leave the pointer NULL and -- for inst_fds -- vfs_close the dequeued payload. Per-CPU bounce rejected (held
+  across the blocking sleep). Code-proof + no-jump-crosses-init compile + clean boot (58 PASSED).

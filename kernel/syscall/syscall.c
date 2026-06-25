@@ -6011,6 +6011,13 @@ typedef struct k_cmsghdr {
 // Maximum fds in a single SCM_RIGHTS cmsg.  Matches Linux SCM_MAX_FD.
 #define SCM_MAX_FD 253
 
+// Per-chunk size for the sendmsg/recvmsg iov bounce buffer.  The buffer
+// is kmalloc'd, never placed on the kernel stack: KSTACK is 8 KiB and a
+// 4 KiB stack buffer plus the blocking send/recv call chain risks an
+// overflow (F68 class).  The per-CPU slab makes the per-call alloc cheap,
+// and the buffer cannot be per-CPU because it is held across a sleep.
+#define MSG_BOUNCE_SZ 4096
+
 // Per-call nonblocking I/O (Linux value).  libwayland leaves its fds
 // BLOCKING and passes MSG_DONTWAIT on every sendmsg/recvmsg — ignoring
 // it blocked compositors inside the kernel on the first empty read.
@@ -6036,6 +6043,11 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
     uint64_t ret;
+    // Large scratch buffers are kmalloc'd (freed at out), never on the
+    // 8 KiB kstack.  Declared before the first goto out so out's kfree
+    // never sees an indeterminate pointer.  fds_buf is ~1 KiB, bounce 4 KiB.
+    int32_t* fds_buf = NULL;
+    uint8_t* bounce  = NULL;
 
     k_msghdr_t mh;
     if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
@@ -6063,8 +6075,12 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                 uint64_t n_fds     = data_len / sizeof(int32_t);
                 if (n_fds > SCM_MAX_FD) { ret = (uint64_t)-EINVAL; goto out; }
                 // Pull all fds out atomically -- if any lookup fails we
-                // abort before queuing any.
-                int32_t fds_buf[SCM_MAX_FD];
+                // abort before queuing any.  fds_buf is kmalloc'd once
+                // (reused across cmsgs), freed at out.
+                if (!fds_buf) {
+                    fds_buf = kmalloc(SCM_MAX_FD * sizeof(int32_t));
+                    if (!fds_buf) { ret = (uint64_t)-ENOMEM; goto out; }
+                }
                 if (copy_from_user(fds_buf, (void*)(mh.msg_control + data_off),
                                     n_fds * sizeof(int32_t)) != 0) {
                     ret = (uint64_t)-EFAULT; goto out;
@@ -6096,14 +6112,17 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             ret = (uint64_t)-EFAULT; goto out;
         }
         if (!iv.iov_len) continue;
-        // Bounce via a small stack buffer -- avoids pinning the user page
-        // and avoids any kmalloc in the hot path for typical wayland
-        // message sizes (<4 KiB).
-        uint8_t bounce[4096];
+        // Bounce through a kmalloc'd buffer (off the 8 KiB kstack -- see
+        // MSG_BOUNCE_SZ).  Allocated once per call on the first non-empty
+        // iov chunk, reused for the rest of the gather, freed at out.
+        if (!bounce) {
+            bounce = kmalloc(MSG_BOUNCE_SZ);
+            if (!bounce) { ret = (uint64_t)-ENOMEM; goto out; }
+        }
         uint64_t done = 0;
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
-            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
+            if (chunk > MSG_BOUNCE_SZ) chunk = MSG_BOUNCE_SZ;
             if (copy_from_user(bounce, (void*)(iv.iov_base + done),
                                 chunk) != 0) {
                 ret = (uint64_t)-EFAULT; goto out;
@@ -6121,6 +6140,8 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     }
     ret = total;
 out:
+    if (bounce) kfree(bounce);
+    if (fds_buf) kfree(fds_buf);
     fdput(sock);
     return ret;
 }
@@ -6136,6 +6157,11 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
     uint64_t ret;
+    // Large scratch buffers are kmalloc'd (freed at out), never on the
+    // 8 KiB kstack.  Declared before the first goto out so out's kfree
+    // never sees an indeterminate pointer.  inst_fds ~1 KiB, bounce 4 KiB.
+    int32_t* inst_fds = NULL;
+    uint8_t* bounce   = NULL;
 
     k_msghdr_t mh;
     if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
@@ -6146,7 +6172,6 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     // We dequeue up to the userland-sized control buffer.  Any fd
     // installed here must be closed if we later fault on copyout.
     uint64_t cmsg_written = 0;
-    int32_t  inst_fds[SCM_MAX_FD];
     uint64_t n_inst = 0;
     if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
         && is_unix_sock(sock)) {
@@ -6156,10 +6181,18 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         while (n_inst < max_fds) {
             // Non-blocking drain: take only what is already queued.
             // The blocking recvfd here parked the caller until an fd
-            // ARRIVED — on a connection that never passes fds, that
+            // ARRIVED -- on a connection that never passes fds, that
             // is forever, with payload sitting unread.
             vfs_file_t* rf = unix_sock_recvfd_nb(sock);
             if (!rf) break;
+            // Allocate inst_fds lazily on the first arriving fd, so the
+            // common no-fd recvmsg never pays for this ~1 KiB buffer.
+            if (!inst_fds) {
+                inst_fds = kmalloc(SCM_MAX_FD * sizeof(int32_t));
+                if (!inst_fds) {
+                    vfs_close(rf); ret = (uint64_t)-ENOMEM; goto out;
+                }
+            }
             int64_t new_fd = fd_install(rf);
             if (new_fd < 0) { vfs_close(rf); break; }
             inst_fds[n_inst++] = (int32_t)new_fd;
@@ -6191,11 +6224,14 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             ret = (uint64_t)-EFAULT; goto out;
         }
         if (!iv.iov_len) continue;
-        uint8_t bounce[4096];
+        if (!bounce) {
+            bounce = kmalloc(MSG_BOUNCE_SZ);
+            if (!bounce) { ret = (uint64_t)-ENOMEM; goto out; }
+        }
         uint64_t done = 0;
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
-            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
+            if (chunk > MSG_BOUNCE_SZ) chunk = MSG_BOUNCE_SZ;
             int r = is_unix_sock(sock)
                     ? unix_sock_recv_ex(sock, bounce, chunk, nonblock)
                     : (int)sock->read(sock, bounce, chunk);
@@ -6226,6 +6262,8 @@ done_gather:
     }
     ret = total;
 out:
+    if (bounce) kfree(bounce);
+    if (inst_fds) kfree(inst_fds);
     fdput(sock);
     return ret;
 }
