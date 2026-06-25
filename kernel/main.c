@@ -532,6 +532,11 @@ static void init_kthread(void) {
     extern void io_uring_selftest(void);
     io_uring_selftest();
 
+    // Audit fix: io_uring indexed sqes[]/cqes[] with the USER-WRITABLE
+    // ring_mask -> OOB read/write.  Verify the trusted-mask index stays in bounds.
+    extern void io_uring_index_selftest(void);
+    io_uring_index_selftest();
+
     // Tier 1 #2 (eventfd): counter + semaphore + nonblocking semantics.
     extern void eventfd_selftest(void);
     eventfd_selftest();

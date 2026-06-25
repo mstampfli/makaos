@@ -50,6 +50,22 @@ static uint32_t round_pow2_u32(uint32_t v) {
     return v + 1;
 }
 
+// Pure: mask a raw ring counter to a valid index.  For power-of-two `entries`
+// the result is always in [0, entries) regardless of the raw value.  Unit-tested.
+static inline uint32_t io_ring_index(uint32_t raw, uint32_t entries) {
+    return raw & (entries - 1u);
+}
+
+// Kernel-TRUSTED ring index masks.  sq_entries/cq_entries are set by setup from
+// round_pow2_u32(...) clamped to IO_URING_MAX_ENTRIES -- powers of two, stored
+// in the kernel io_uring_t, NEVER user-writable.  Index sqes[]/cqes[] with
+// these.  NEVER use sq_hdr->ring_mask / cq_hdr->ring_mask for indexing: those
+// live in the user-mapped ring header (vmm_map_physical_user, VMA_R|W|USER) and
+// a malicious process can overwrite them to 0xFFFFFFFF, turning `idx & mask`
+// into an unmasked OOB sqe read / attacker-controlled OOB cqe write.
+static inline uint32_t io_sq_mask(const io_uring_t* u) { return u->sq_entries - 1u; }
+static inline uint32_t io_cq_mask(const io_uring_t* u) { return u->cq_entries - 1u; }
+
 // Compute total backing bytes for given entries.  Page-aligned.
 static uint64_t compute_layout(uint32_t sq_entries, uint32_t cq_entries,
                                 uint64_t* out_sqes_off,
@@ -306,7 +322,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
 void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
                         int32_t res, uint32_t cqe_flags) {
     uint64_t f = spin_lock_irqsave(&uring->cq_lock);
-    uint32_t mask = uring->cq_hdr->ring_mask;
+    uint32_t mask = io_cq_mask(uring);   // TRUSTED count, not the user-writable header
 
     // Drain any pending overflow entries that now fit.
     if (uring->overflow_head) {
@@ -540,7 +556,7 @@ static void io_sqp_kthread_entry(void) {
             return;
         }
 
-        uint32_t mask = uring->sq_hdr->ring_mask;
+        uint32_t mask = io_sq_mask(uring);   // TRUSTED count, not the user header
         uint32_t user_tail = __atomic_load_n(&uring->sq_hdr->tail, __ATOMIC_ACQUIRE);
         uint32_t head      = uring->sq_hdr->head;
 
@@ -1002,7 +1018,7 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
     }
 
     uint32_t submitted = 0;
-    uint32_t mask = uring->sq_hdr->ring_mask;
+    uint32_t mask = io_sq_mask(uring);   // TRUSTED count, not the user-writable header
 
     // Snapshot user's sq_tail with acquire — pairs with the user's
     // release store after filling the SQE.
@@ -1083,3 +1099,34 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
 
     return (int)submitted;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic check of the ring index masking that replaced the
+// user-writable ring_mask (the OOB fix): for power-of-two `entries`, a masked
+// index is ALWAYS in [0, entries) regardless of the raw counter -- so a
+// malicious 0xFFFFFFFF can no longer drive an out-of-bounds sqe/cqe access.
+void io_uring_index_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t raw, entries, want; } c[] = {
+        { 0,          4,    0    },
+        { 3,          4,    3    },
+        { 4,          4,    0    },   // wraps within the ring
+        { 0xFFFFFFFFu,4,    3    },   // adversarial counter -> still in [0,4)
+        { 0x12345u,   256,  0x45 },   // 0x12345 & 0xFF
+        { 0xFFFFFFFFu,256,  255  },
+        { 0xFFFFFFFFu,4096, 4095 },
+        { 0xFFFFFFFFu,1,    0    },   // single-entry ring (mask 0)
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t got = io_ring_index(c[i].raw, c[i].entries);
+        if (got != c[i].want || got >= c[i].entries) {
+            kprintf("[io_ring_idx] FAIL raw=0x%lx entries=%u got=%u want=%u\n",
+                    (unsigned long)c[i].raw, c[i].entries, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[io_ring_idx] SELF-TEST FAILED\n"
+                  : "[io_ring_idx] SELF-TEST PASSED (trusted ring index, no user-mask OOB)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */

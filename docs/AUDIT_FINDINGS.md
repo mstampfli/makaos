@@ -535,7 +535,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
 
 - **io_uring user-writable ring_mask OOB read+write**
   (`kernel/io/io_uring.c` io_uring_post_cqe / io_uring_enter_impl / SQPOLL) ->
-  OPEN (HIGH, top backlog item). io_uring indexes the sqes[]/cqes[] arrays with
+  FIXED (F33), was CRITICAL. io_uring indexes the sqes[]/cqes[] arrays with
   the ring `mask` read from the USER-MAPPED, USER-WRITABLE ring header
   (sq_hdr->ring_mask / cq_hdr->ring_mask, mapped VMA_R|VMA_W|VMA_USER) instead of
   the kernel-trusted sq_entries/cq_entries.  A process that overwrites
