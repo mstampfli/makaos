@@ -828,6 +828,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   blk*spb (spb<=8) overflows u32 and WRAPS to a valid wrong sector (crafted-image
   info leak/corruption; also breaks >2 TB-class FS). Fixed by the new pure primitive
   ext2_blk_lba(part_lba,blk,spb) forming the LBA in u64 (product < 2^35 < u64, no
-  ckd_mul needed -- correct WIDTH not a check), used by both sites + ext2_blk_to_lba
-  wrapper; deterministic ext2_blk_lba_selftest drives the wrap boundary. Separate
-  layer (recorded, not this fix): ahci_read/write do not bound lba vs device size.
+  ckd_mul needed -- correct WIDTH not a check) + ext2_blk_to_lba wrapper; deterministic
+  ext2_blk_lba_selftest drives the wrap boundary. COMPLETED in a follow-up: a
+  verify-all-angles "same class elsewhere" sweep found two MORE sites of the identical
+  bug (the inode_build_run DMA read paths, ~1202/1299, using `phys_blk`) that the first
+  grep missed; all FOUR ext2 LBA sites now go through ext2_blk_to_lba (zero `uint32_t
+  lba` remain). Separate layer (recorded, not this fix): ahci_read/write do not bound
+  lba vs device size.

@@ -98,8 +98,11 @@ Each verified a true behavioral match; covered by the existing
 New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive needed):
 - `ext2_blk_lba(part_lba, blk, spb)` (kernel/fs/ext2.c, F46) -- block number -> 64-bit
   device LBA, formed in u64 so `blk*spb` cannot wrap a u32 to a wrong sector. Pure;
-  `ext2_blk_lba_selftest` drives the `blk*spb == 2^32` wrap boundary. Used by
-  bcache_get + write_block via the `ext2_blk_to_lba(blk)` static wrapper.
+  `ext2_blk_lba_selftest` drives the `blk*spb == 2^32` wrap boundary. Used at ALL
+  four LBA sites via the `ext2_blk_to_lba(blk)` static wrapper: bcache_get,
+  write_block, and the two inode_build_run DMA read paths (the ELF-loader /
+  bulk-read fast path) -- the latter two were a second pair of the same bug, caught
+  on the verify-all-angles "same class elsewhere" sweep after the first F46 commit.
 
 ## Status
 

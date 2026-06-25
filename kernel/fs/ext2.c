@@ -1199,7 +1199,7 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                 // Untrusted block ptr from inode/indirect -> never DMA a run
                 // that escapes the filesystem.
                 if (!ext2_run_valid(phys_blk, run)) return -1;
-                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                uint64_t lba     = ext2_blk_to_lba(phys_blk);   // 64-bit LBA: must not wrap
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
                 // User-space buffer → scatter-gather zero-copy via HHDM page
@@ -1296,7 +1296,7 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
             } else {
                 // Untrusted block ptr -> bound the run to the filesystem.
                 if (!ext2_run_valid(phys_blk, run)) return -1;
-                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                uint64_t lba     = ext2_blk_to_lba(phys_blk);   // 64-bit LBA: must not wrap
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
                 uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
