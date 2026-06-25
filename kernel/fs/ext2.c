@@ -5,6 +5,7 @@
 #include "smp.h"
 #include "seqlock.h"
 #include "rcu.h"
+#include "checked.h"   // index_ok / ckd_add_u32: bounded-index + overflow-safe add
 #include "dcache.h"    // Phase 7: cached path-component lookups +
                        // invalidation hooks at every mutation site
 
@@ -279,16 +280,18 @@ static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
 // write on inode writeback.  Valid physical blocks are [s_first_data_blk,
 // s_blocks_count).  The math is factored into pure helpers so it is unit-tested
 // (ext2_block_valid_selftest) independent of any mounted image.
+// PRIMITIVE (on-disk block index + run, category D -> index_ok / ckd_add_u32).
 static inline int ext2_block_in_range(uint32_t blk, uint32_t first, uint32_t count) {
-    return blk >= first && blk < count;
+    return blk >= first && index_ok(blk, count);   // [first, count), half-open upper
 }
 // Are blocks [start, start+run) ALL valid?  Overflow-safe: start+run can wrap.
 static inline int ext2_run_in_range(uint32_t start, uint32_t run,
                                     uint32_t first, uint32_t count) {
-    if (run == 0)      return 1;
-    if (start < first) return 0;
-    if (run > count)   return 0;           // run alone exceeds the FS -> reject
-    return start <= count - run;            // start + run <= count, no wrap
+    if (run == 0)      return 1;           // empty run is vacuously valid
+    if (start < first) return 0;           // below the first data block
+    uint32_t end;                          // end = start + run, overflow-safe
+    if (!ckd_add_u32(start, run, &end)) return 0;   // wrap -> reject
+    return end <= count;                   // [start, start+run) within the FS
 }
 static inline int ext2_block_valid(uint32_t blk) {
     return ext2_block_in_range(blk, s_first_data_blk, s_blocks_count);

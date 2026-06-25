@@ -22,6 +22,7 @@
 #include "preempt.h"
 #include "cpu.h"
 #include "acpi.h"
+#include "checked.h"   // index_ok: single source of truth for bounded indices
 
 // ── PCI class codes ─────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE    0x01
@@ -403,13 +404,14 @@ static void cid_push(nvme_ioq_t* q, uint16_t cid) {
     __atomic_fetch_or(&q->cid_free_bitmap, 1ULL << cid, __ATOMIC_RELEASE);
 }
 
+// PRIMITIVE (device-supplied index, category D -> delegates to index_ok).
 // Is a completion's command id a valid index into the NVME_IOQ_DEPTH-entry
 // req[] table?  The submit side draws cids from the 64-bit cid_free_bitmap so
 // it is always in range, but the COMPLETION cid is echoed by the device and
 // MUST be validated before indexing req[] -- an out-of-range cid otherwise
 // drives an OOB write of req->status/->done and a wait_queue_wake_all through
 // a fabricated wait_queue_t.  Pure -> unit-tested (nvme_cid_valid_selftest).
-static int nvme_cid_valid(uint16_t cid) { return cid < NVME_IOQ_DEPTH; }
+static int nvme_cid_valid(uint16_t cid) { return index_ok(cid, NVME_IOQ_DEPTH); }
 
 // ── Async I/O submit — per-CPU queue, wakeup via that CPU's MSI-X ────
 static uint8_t io_submit_async(nvme_sqe_t* cmd) {

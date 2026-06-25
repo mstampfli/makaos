@@ -15,6 +15,14 @@
 // construction: the ckd_* functions delegate to the compiler's overflow
 // builtins (no UB, no hand-rolled high-bit math to get wrong).
 //
+// PLACEMENT: these are the cross-cutting generics -- no single domain (fs,
+// drivers, net, mm, syscall all use them), so this one small focused header is
+// where they belong.  It is capped to the checked-arith + bounds family; a
+// primitive that belongs to a subsystem (a device-id validator, a ring, a copy
+// helper) lives in THAT subsystem's file, tagged `// PRIMITIVE`, and delegates
+// the generic check to one of these.  This is NOT a catch-all header.
+//
+// PRIMITIVE (checked arithmetic + bounds, category A).
 // Catalog + the full rules / forbidden patterns: docs/PRIMITIVES.md.
 
 // in_range_u64(x, lo, hi): is lo <= x <= hi (INCLUSIVE both ends)?

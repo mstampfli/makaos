@@ -18,6 +18,24 @@ the same everywhere.
 4. **Every primitive has a deterministic test.** Any change adds/extends a test.
 5. **Catalog it here** with the single canonical implementation location.
 
+## Where primitives live (placement + marking)
+
+There is NO single catch-all primitives header. A primitive lives next to what it
+serves, and every primitive is tagged so it is greppable (`grep -rn PRIMITIVE`):
+
+- **Cross-cutting generics with no single domain** (checked arithmetic + bounds:
+  `ckd_mul`/`ckd_add`, `index_ok`, `in_range`) live in one small focused header,
+  `kernel/include/checked.h` -- fs, drivers, net, mm and syscall all use them, so
+  the shared generic layer IS their home. That header is capped to this one family;
+  unrelated primitives never get funnelled into it.
+- **Domain-specific primitives** (a device-id validator, an on-disk-value check, a
+  ring, a copy helper, a locking idiom) live in THAT subsystem's `.c`/`.h`, marked
+  with a `// PRIMITIVE ...` comment, and DELEGATE the generic part to category A
+  (e.g. `virtio_desc_id_valid` -> `index_ok`). The named domain wrapper documents
+  the source of the value; the generic primitive does the actual check, once.
+- When a new primitive replaces a hand-rolled helper, the old helper is removed in
+  the same commit -- never two ways to do the same thing.
+
 ## Forbidden patterns (replace with the primitive)
 
 - A raw `*uptr` / `while (uptr[i])` / `memcpy(.., uptr, ..)` on a user pointer
@@ -56,14 +74,25 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
 
 ### D. On-disk / device values
 Validate every value read from disk or a device against a trusted bound before
-using it as an index/length/LBA, via the category-A primitives. Examples already
-in tree: `ext2_block_valid` (F36), `virtio_desc_id_valid` (F22), `nvme_cid_valid`
-(F26), `drm_atomic_count_ok` (F40). The sweep folds these onto `index_ok`/`in_range`.
+using it as an index/length/LBA, via the category-A primitives. The per-domain
+validators stay (they document the domain + the source of the value) but their
+BODY delegates to category A, so the bounds/overflow logic lives in one place.
+
+Folded onto category A (single source of truth for the check):
+- `virtio_desc_id_valid(id)` -> `index_ok(id, VIRTQ_SIZE)`  (kernel/net/virtio_net.c)
+- `nvme_cid_valid(cid)` -> `index_ok(cid, NVME_IOQ_DEPTH)`  (kernel/drivers/storage/nvme.c)
+- `ext2_block_in_range` upper bound -> `index_ok(blk, count)`  (kernel/fs/ext2.c)
+- `ext2_run_in_range` overflow-safe `start+run<=count` -> `ckd_add_u32`  (kernel/fs/ext2.c)
+Each verified a true behavioral match; covered by the existing
+`virtio_desc_id_valid_selftest` / `nvme_cid_valid_selftest` / `ext2_block_valid_selftest`
+(the latter exercises the `ckd_add` wrap boundary `{0xFFFFFF00, 0x200}`).
+Still to fold: `drm_atomic_count_ok` (F40, `<=` bound), `drm_dumb_size` (F23, size mul).
 
 ## Status
 
-Phase 2 (the primitive-extraction phase): category A landed (this commit).
-Remaining: generalize B (copy_str_from_user), unify C into one ring primitive,
-fold D's per-domain validators onto A, then sweep every call site -- one
-subsystem per commit, each with a test. Beyond data, extract any other recurring
-pattern (locking idioms, alloc/free pairs, retry loops) the same way.
+Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
++ on-disk index/run validators folded onto A (this commit). Remaining: generalize
+B (copy_str_from_user), unify C into one ring primitive, fold the remaining D
+validators (drm), then sweep every call site -- one subsystem per commit, each
+with a test. Beyond data, extract any other recurring pattern (locking idioms,
+alloc/free pairs, retry loops) the same way.

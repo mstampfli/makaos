@@ -8,6 +8,7 @@
 #include "lapic.h"
 #include "irq_wait.h"
 #include "common.h"
+#include "checked.h"   // index_ok: single source of truth for bounded indices
 
 extern void virtio_net_irq_entry(void);
 
@@ -293,12 +294,13 @@ static uint16_t virtq_alloc_desc(virtq_t* vq) {
     return idx;
 }
 
+// PRIMITIVE (device-supplied index, category D -> delegates to index_ok).
 // Is a descriptor id a valid index into the VIRTQ_SIZE-entry desc/buffer
 // tables?  Device-supplied ids (read from the used ring) MUST pass this before
 // being used as an index -- an out-of-range id otherwise drives an OOB read of
 // s_rx_bufs[] and an OOB write of s_rxq.desc[] / the free list.  Pure ->
 // unit-tested (virtio_desc_id_valid_selftest).
-static int virtio_desc_id_valid(uint32_t id) { return id < VIRTQ_SIZE; }
+static int virtio_desc_id_valid(uint32_t id) { return index_ok(id, VIRTQ_SIZE); }
 
 // Return a descriptor to the free list.
 static void virtq_free_desc(virtq_t* vq, uint16_t idx) {
