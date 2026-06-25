@@ -40,6 +40,18 @@ typedef struct unix_ns_table {
 static unix_ns_table_t* s_unix_ns       = NULL;  // RCU-protected
 static spinlock_t       s_unix_ns_wlock = SPINLOCK_INIT;
 
+// Serializes the STREAM pairing state machine: accept()'s claim+peer-link, the
+// connect()/close() bail of a still-CONNECTING client, and close()'s symmetric
+// peer back-pointer clear.  These all mutate a backlog client's `state` and the
+// `peer` pointers; without one lock, accept linking server->peer = client races
+// a concurrent close() on the client (the fd is shared, connect uses fd_to_file)
+// that reads client->peer == NULL before the link and so never clears
+// server->peer -> server->peer dangles once the client is freed.  Holding this
+// across [claim + link] and [state-read + peer-clear] makes "state == CONNECTED"
+// imply "peers fully linked", so close always observes a consistent pair.  Leaf
+// lock: every alloc and wake happens OUTSIDE it, so no nesting / deadlock.
+static spinlock_t       s_unix_pair_lock = SPINLOCK_INIT;
+
 static int ns_streq(const char* a, const char* b) {
     while (*a && *b && *a == *b) { a++; b++; }
     return *a == '\0' && *b == '\0';
@@ -319,7 +331,14 @@ static void unix_sock_free_rcu(void* data) {
     while (p) {
         unix_pending_t* next = p->next;
         if (p->client) {
-            p->client->state = UNIX_STATE_UNCONNECTED;
+            // Transition the queued client UNDER s_unix_pair_lock (same lock the
+            // connect() bail / accept() claim use) so this state write does not
+            // race them; only move it if it is still CONNECTING (a client that
+            // already bailed/closed keeps its DISCONNECTED state).
+            spin_lock(&s_unix_pair_lock);
+            if (p->client->state == UNIX_STATE_CONNECTING)
+                p->client->state = UNIX_STATE_UNCONNECTED;
+            spin_unlock(&s_unix_pair_lock);
             unix_wake(p->client);
             unix_put(p->client);
         }
@@ -371,16 +390,20 @@ void unix_sock_close(vfs_file_t* self) {
             s->path[0] ? "evicting from ns" : "not in ns");
 
     // If this socket is still CONNECTING (queued on a listener's backlog and
-    // not yet accepted), atomically mark it dead so a concurrent accept() skips
-    // it (its CAS CONNECTING->CONNECTED fails) rather than pairing a socket
-    // whose fd just closed.  Wake the connector so it returns instead of waiting
-    // forever.  The backlog still holds a ref (unix_get in connect), so `s`
-    // stays alive until accept/the listener-close drain reaps it.
+    // not yet accepted), mark it dead UNDER s_unix_pair_lock so a concurrent
+    // accept() (which claims under the same lock) skips it rather than pairing a
+    // socket whose fd just closed.  Wake the connector so it returns instead of
+    // waiting forever.  The backlog still holds a ref (unix_get in connect), so
+    // `s` stays alive until accept/the listener-close drain reaps it.
     {
-        uint8_t exp = UNIX_STATE_CONNECTING;
-        if (__atomic_compare_exchange_n(&s->state, &exp, UNIX_STATE_DISCONNECTED,
-                                        0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            unix_wake(s);
+        int was_connecting = 0;
+        spin_lock(&s_unix_pair_lock);
+        if (s->state == UNIX_STATE_CONNECTING) {
+            s->state = UNIX_STATE_DISCONNECTED;
+            was_connecting = 1;
+        }
+        spin_unlock(&s_unix_pair_lock);
+        if (was_connecting) unix_wake(s);
     }
 
     // Unpublish from the namespace first so new ns_find() cannot observe
@@ -397,12 +420,19 @@ void unix_sock_close(vfs_file_t* self) {
     // back-pointer for a SYMMETRIC stream connection (peer->peer == s); a
     // SOCK_DGRAM default-destination peer does not point back at us and must
     // keep its own linkage.
+    // Clear the symmetric back-pointer UNDER s_unix_pair_lock so it cannot race
+    // accept() linking the pair: with the lock, accept's claim+link is atomic,
+    // so if we observe s->peer set we observe a fully-linked pair (and clear the
+    // peer's side); if we observe NULL the pair was never linked.  pin the peer
+    // (refcount, lockless CAS) so it survives the wake we do AFTER unlocking.
+    spin_lock(&s_unix_pair_lock);
     unix_sock_t* peer = unix_pin_peer(s);
+    if (peer && peer->peer == s) {
+        peer->peer  = NULL;
+        peer->state = UNIX_STATE_DISCONNECTED;
+    }
+    spin_unlock(&s_unix_pair_lock);
     if (peer) {
-        if (peer->peer == s) {
-            peer->peer  = NULL;
-            peer->state = UNIX_STATE_DISCONNECTED;
-        }
         unix_wake(peer);
         unix_poll_wake(peer);
         unix_put(peer);
@@ -982,23 +1012,24 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
         kfree(pend);
         if (!client) continue;
 
-        // Claim the client: CONNECTING -> CONNECTED.  A client that bailed
-        // (connect's -EINTR CAS) already moved it out of CONNECTING, so our CAS
-        // fails -> it is dead, drop the backlog ref (reaping it) and try the
-        // next pending.  On success the client is provably still blocked in
-        // connect() (it has not bailed), so it cannot close before we wake it.
-        uint8_t exp = UNIX_STATE_CONNECTING;
-        if (!__atomic_compare_exchange_n(&client->state, &exp,
-                UNIX_STATE_CONNECTED, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            unix_put(client);
+        // Lockless pre-check: skip a client that already bailed/closed so we do
+        // not allocate a server for it.  The authoritative claim is under the
+        // lock below; this only avoids wasted work in the common bailed case.
+        if (__atomic_load_n(&client->state, __ATOMIC_ACQUIRE)
+                != UNIX_STATE_CONNECTING) {
+            unix_put(client);   // drop the backlog ref (reaping it)
             continue;
         }
 
-        // Create the server-side socket that pairs with the client.
+        // Create the server-side socket that pairs with the client (outside the
+        // pair lock -- unix_sock_open allocates).
         vfs_file_t* server_f = unix_sock_open(SOCK_STREAM);
         if (!server_f) {
-            // Reject the client.
-            client->state = UNIX_STATE_UNCONNECTED;
+            // Reject the client: wake the connector so it returns -ECONNREFUSED.
+            spin_lock(&s_unix_pair_lock);
+            if (client->state == UNIX_STATE_CONNECTING)
+                client->state = UNIX_STATE_UNCONNECTED;
+            spin_unlock(&s_unix_pair_lock);
             unix_wake(client);
             unix_put(client);   // drop the backlog ref
             return NULL;
@@ -1006,16 +1037,35 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
 
         unix_sock_t* server = (unix_sock_t*)server_f->ctx;
 
-        // Link the pair (client->state already CONNECTED from the CAS).
-        server->peer  = client;
-        client->peer  = server;
-        server->state = UNIX_STATE_CONNECTED;
+        // Claim + link ATOMICALLY under s_unix_pair_lock.  If the client is
+        // still CONNECTING we win: publish CONNECTED and link both peer pointers
+        // as one indivisible unit, so a concurrent close() on the client (which
+        // takes the same lock) observes either an unlinked CONNECTING client (it
+        // bails, we fail the claim) or a fully-linked CONNECTED pair (it clears
+        // server->peer) -- never the half-linked state that dangled server->peer.
+        int claimed = 0;
+        spin_lock(&s_unix_pair_lock);
+        if (client->state == UNIX_STATE_CONNECTING) {
+            client->state    = UNIX_STATE_CONNECTED;
+            server->peer     = client;
+            client->peer     = server;
+            server->state    = UNIX_STATE_CONNECTED;
+            // Trusted peer pids: the server's peer is the connecting process
+            // (recorded on the client during connect()); the client's peer is
+            // the accepting process (g_current).
+            server->peer_pid = client->peer_pid;
+            client->peer_pid = g_current->pid;
+            claimed = 1;
+        }
+        spin_unlock(&s_unix_pair_lock);
 
-        // Stamp trusted peer pids. The server side's peer is the connecting
-        // process (whose pid was recorded on the client sock during connect()).
-        // The client side's peer is the accepting process (g_current).
-        server->peer_pid = client->peer_pid;   // connector pid (set in connect())
-        client->peer_pid = g_current->pid;     // acceptor pid
+        if (!claimed) {
+            // The client bailed/closed while we allocated the server -> tear the
+            // unused server down and try the next pending entry.
+            unix_sock_close(server_f);
+            unix_put(client);   // drop the backlog ref (reaping it)
+            continue;
+        }
 
         // Wake the client blocked in connect().
         unix_wake(client);
@@ -1114,16 +1164,20 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     WAIT_EVENT_HOOK(&s->waitq,
                     s->state != UNIX_STATE_CONNECTING,
                     if (signal_has_actionable(&g_current->sigstate)) {
-                        // Atomically claim the bail: CONNECTING -> DISCONNECTED.
-                        // If we win, accept() will skip our queued entry (its CAS
-                        // CONNECTING->CONNECTED fails) and reap it via unix_put.
-                        // If we LOSE, accept connected us in the race -> fall
-                        // through; the loop re-checks state == CONNECTED below.
-                        uint8_t exp = UNIX_STATE_CONNECTING;
-                        if (__atomic_compare_exchange_n(&s->state, &exp,
-                                UNIX_STATE_DISCONNECTED, 0,
-                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-                            return -EINTR;
+                        // Claim the bail UNDER s_unix_pair_lock (same lock accept
+                        // claims with, so the two cannot interleave).  If we are
+                        // still CONNECTING we win -> mark DISCONNECTED and return
+                        // -EINTR; accept's locked claim then fails and reaps us.
+                        // If accept already connected us, we are CONNECTED here ->
+                        // fall through; the loop re-checks state == CONNECTED.
+                        int bailed = 0;
+                        spin_lock(&s_unix_pair_lock);
+                        if (s->state == UNIX_STATE_CONNECTING) {
+                            s->state = UNIX_STATE_DISCONNECTED;
+                            bailed = 1;
+                        }
+                        spin_unlock(&s_unix_pair_lock);
+                        if (bailed) return -EINTR;
                     });
 
     if (s->state != UNIX_STATE_CONNECTED) {

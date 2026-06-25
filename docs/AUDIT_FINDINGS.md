@@ -1154,3 +1154,19 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   two checks are disjoint (subtree has dst_ino==0). Deterministic selftest (rename_under_selftest:
   child/grandchild -> under; equal/sibling/ancestor/unrelated -> not) + code-proof + clean boot (55
   selftests). Completes the F68 dir-rename hardening.
+- AF_UNIX accept()/close() peer-link race -> dangling server->peer UAF -> FIXED (F70, follow-up (k)):
+  F65's CAS-claim closed the SEQUENTIAL backlog-client UAF but not a DIFFERENT thread closing the
+  shared client fd (connect uses fd_to_file, no vfs ref). accept CAS-claims CONNECTED, THEN allocs the
+  server and sets server->peer/client->peer; a concurrent close() that reads client->peer == NULL
+  before the link never clears server->peer, so once the client's refs drop it is RCU-freed while
+  server->peer still points at it -> later send/recv/poll unix_pin_peer's freed slab. Root flaw: the
+  state-claim and the peer-link were not atomic, so "CONNECTED" did not imply "linked". Fix: one leaf
+  spinlock s_unix_pair_lock serializes the whole pairing state machine -- accept's [claim+link] as one
+  unit, close's CONNECTING-bail + CONNECTED peer-clear, connect's -EINTR bail, the listener-close
+  drain -- so a close observing CONNECTED observes a fully-linked pair (and clears it), and a close
+  that wins sees CONNECTING and bails (accept's locked claim then fails+reaps). The CAS became a plain
+  locked check-and-set (mixing lockless CAS with a locked claim reopens the window); server alloc and
+  all wakes/puts stay OUTSIDE the lock (true leaf, no nesting -> no deadlock). Code-proof + clean boot
+  (5 AF_UNIX selftests incl. the two-kthread unix_stream_accept rendezvous PASS under the new lock;
+  wayland's heavy concurrent connect/accept/close at userspace-start would hang on a deadlock, and 2/3
+  boots reach DHCP -- the 1 stall is the flaky F55 one, re-boot-confirmed).
