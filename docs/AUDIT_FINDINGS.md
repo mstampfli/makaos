@@ -688,10 +688,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
 - AHCI / NVMe DMA descriptor construction -> SAFE as reached. PRDT bounded by
   nprdt < 248; ext2 pre-clamps transfers to AHCI_DMA_SECTORS; NVMe rejects >8KB;
   AHCI slots are derived from the hardware SACT/CI ctz (never device-echoed);
-  NVMe cid is F26-guarded. Latent MED (not user-reachable): ahci_submit_hhdm /
-  ahci_submit_sg do not re-check leftover rem after the 248-entry build loop, so
-  a future >992KB caller would silently truncate (do_rw_direct already guards
-  this with `if (rem) return 0;`). Defense-in-depth only; no current caller.
+  NVMe cid is F26-guarded. Latent AHCI submit self-guards -> FIXED (F43):
+  ahci_submit_hhdm issued the command even when the PRDT build loop exited with
+  leftover rem (transfer > 248 PRD entries) -> silent truncation; now `if (rem)`
+  frees the un-issued slot (OR back into s_free_mask + wake s_slot_avail_wq) and
+  returns 0, mirroring do_rw_direct. ahci_submit_sg filled a phys_pages[130]
+  stack array with `for (i < npages)` trusting the caller -> a stack overflow if
+  npages > 130; now self-guards `if (npages > 130) return 0` up front. Both
+  callers already clamp (ext2 -> <=1024 sectors, ahci_read_user -> npages<=130),
+  so latent, but the submit functions no longer trust their inputs. Code-proof +
+  clean boot (every ext2 read at boot exercises both submit paths).
 - virtio-gpu / DRM transfer/scanout/backing -> SAFE. The kernel sends fixed
   x=y=offset=0 full-surface (w,h) from each resource's own create dims; all three
   resource-creating paths (CREATE_DUMB F23, ADDFB2 subset-clamp, CURSOR 64-bit

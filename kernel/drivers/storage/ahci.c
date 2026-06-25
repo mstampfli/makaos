@@ -755,6 +755,16 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
             rem -= chunk;
             nprdt++;
         }
+        if (rem) {
+            // Transfer too fragmented for the 248-entry PRDT: free the slot we
+            // reserved (it was never issued, so the IRQ completion will never
+            // OR it back into s_free_mask) and fail cleanly rather than issue a
+            // truncated command (mirrors do_rw_direct's `if (rem) return 0`).
+            __atomic_fetch_or(&s_free_mask, (1u << slot), __ATOMIC_RELEASE);
+            wait_queue_wake_all(&s_slot_avail_wq);
+            rc = 0;
+            break;
+        }
 
         volatile uint64_t* sentinel = (volatile uint64_t*)buf;
         if (!write && bytes >= 8)
@@ -788,6 +798,11 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
 static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
                                 uint32_t first_off, uint32_t count,
                                 uint8_t write) {
+    // Self-guard: the phys_pages[130] stack array below (and the 248-entry
+    // PRDT) must not be overrun by an over-large page count.  Callers already
+    // clamp (ahci_read_user rejects npages > 130), but the function must not
+    // trust its input -- fail cleanly instead of smashing the stack.
+    if (npages > 130u) return 0;
     phys_addr_t phys_pages[130];
     for (uint32_t i = 0; i < npages; i++)
         phys_pages[i] = (phys_addr_t)((uint64_t)pages[i] - HHDM_OFFSET);
