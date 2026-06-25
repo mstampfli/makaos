@@ -316,10 +316,6 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* out = (uint8_t*)buf;
     uint64_t got = 0;
 
-    uint32_t vmin = (tty->termios.c_lflag & ICANON) ? 1
-                  : tty->termios.c_cc[VMIN];
-    if (vmin == 0) vmin = 1;
-
     if (tty->rd_head == tty->rd_tail && !ctx->pty->master_open) return 0; // EOF
     WAIT_EVENT_HOOK(&tty->waitq,
                     tty->rd_head != tty->rd_tail || !ctx->pty->master_open,
@@ -327,14 +323,10 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
                         return -4 /*EINTR*/;);
     if (tty->rd_head == tty->rd_tail) return 0;  // woke on EOF
 
-    while (got < len) {
-        if (tty->rd_head == tty->rd_tail) break;
-        uint8_t c = tty->read_buf[tty->rd_head];
-        tty->rd_head = (tty->rd_head + 1) & (TTY_READ_BUF_SIZE - 1);
-        out[got++] = c;
-        if ((tty->termios.c_lflag & ICANON) && c == '\n') break;
-        if (!(tty->termios.c_lflag & ICANON) && got >= vmin) break;
-    }
+    // Drain under the slave tty's lock via the shared cooked-byte path -- the
+    // same locked drain /dev/tty uses, so the ring is never popped lock-free
+    // from two places (dup-shared slave fds can have concurrent readers).
+    got = tty_ldisc_drain(tty, out, len);
 
     PTT1("slave_read.return", "got", got);
     return (int64_t)got;
@@ -629,6 +621,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     slave->ctx         = sctx;
     slave->waitq           = &slave->_waitq; wait_queue_init(slave->waitq);
     wait_queue_init(&pty->slave.waitq);
+    spin_lock_init(&pty->slave.lock);  // ldisc lock for the slave's ring + line buf
     slave->secondary_waitq = &pty->slave.waitq;  // woken by ldisc when data arrives
     slave->flags       = 0;
     slave->refcount    = 1;

@@ -47,6 +47,19 @@ typedef struct tty_t {
     // ── Session this tty is the controlling terminal of ──────────────────
     uint32_t session;
 
+    // ── Line-discipline lock ─────────────────────────────────────────────
+    // Serializes every mutation of the read ring (read_buf/rd_head/rd_tail)
+    // and the canonical accumulation (line_buf/line_len).  These are touched
+    // from multiple PROCESS-context CPUs: the producer (console keyboard
+    // thread, or pty_master_write in a syscall), one or more consumers
+    // (tty/pty-slave readers -- slave fds are dup-shared, so multi-consumer
+    // is real), and tty_flush_input (ioctl TCFLSH + the ^C/^Z/^\ path).  No
+    // IRQ handler touches these, so a plain spinlock under preempt_disable is
+    // sufficient -- NO irqsave (mirrors the fb.c console-lock pattern).  Leaf
+    // lock: only the tty's own ring/line fields are touched under it; echo
+    // (fb I/O), wait_queue_wake_all, and blocking sleeps stay OUTSIDE it.
+    spinlock_t lock;
+
     // ── Read buffer: data ready for userland read() ───────────────────────
     // Ring buffer: [rd_head, rd_tail)
     uint8_t  read_buf[TTY_READ_BUF_SIZE];
@@ -120,3 +133,10 @@ void tty_set_ctty(tty_t* tty);
 
 // Flush the read buffer and line buffer (e.g. on TCSETSF).
 void tty_flush_input(tty_t* tty);
+
+// Drain up to `len` cooked bytes from the tty's read ring into `out`,
+// honouring canonical ('\n'-terminated) and raw VMIN semantics.  Takes the
+// per-tty lock internally; the caller must have already done the blocking
+// wait and must NOT hold tty->lock.  Returns the number of bytes copied.
+// Shared by /dev/tty and pty-slave reads so both go through one locked path.
+uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len);

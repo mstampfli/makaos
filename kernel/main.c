@@ -612,6 +612,9 @@ static void init_kthread(void) {
     // flush so a partial push can never drop a cooked line's terminating '\n').
     extern void tty_rb_free_selftest(void);
     tty_rb_free_selftest();
+
+    extern void tty_ldisc_selftest(void);
+    tty_ldisc_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference

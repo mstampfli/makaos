@@ -505,13 +505,25 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   tty_rb_free_selftest (rb_free cases on a size-8 ring + the "empty ring holds a
   max line" invariant). The line-buffer bounds were already clean (line_buf
   guarded by < TTY_LINE_BUF_SIZE-1; c_cc indices constant in [0,18]).
-- **TTY unlocked flush-vs-producer race** (part b) -> STILL OPEN (careful,
-  needs a lock). tty_flush_input (reachable from ioctl TCFLSH/TCSETSF) resets
-  rd_head/rd_tail/line_len with NO lock while the keyboard thread / a concurrent
-  pty_master_write run rd_push / line_buf accumulation on another CPU -> torn
-  ring indices; PTY slave fds are dup-shared (refcount) so multi-consumer is
-  real. Fix: a per-tty ldisc spinlock around rd_push/rd_pop/line_buf
-  accumulation/tty_flush_input. Confidence MED. Good for a dedicated iteration.
+- **TTY unlocked flush-vs-producer race** (part b) -> FIXED (F35). tty_flush_input
+  (ioctl TCFLSH/TCSETSF + the ^C/^Z/^\ path) reset rd_head/rd_tail/line_len with
+  NO lock while the keyboard thread / a concurrent pty_master_write ran rd_push /
+  line_buf accumulation on another CPU, and dup-shared PTY slave fds let two
+  consumers pop the ring at once -> lost/duplicated bytes and stale-content
+  delivery (NOT OOB: indices are aligned uint32 always masked < bufsize).
+  Fixed: added a per-tty `spinlock_t lock` (a plain spinlock under
+  preempt_disable -- the producer is a kernel thread/syscall, never an IRQ, so no
+  irqsave; mirrors fb.c). It is a LEAF lock serializing EVERY mutation of the
+  ring + canonical line; echo (fb I/O), wait_queue_wake_all, and the blocking
+  sleep stay OUTSIDE it. rd_push/rd_pop are pure (caller holds the lock); the
+  ldisc line ops (append/erase/kill/flush) and tty_flush_input take it; a shared
+  tty_ldisc_drain() (used by BOTH tty_vfs_read and pty_slave_read -- DRY, removed
+  the duplicated inline pop) does the locked drain. Verified: cross-CPU-race
+  code-proof (every ring/line MUTATION under tty->lock) + a deterministic
+  tty_ldisc_selftest that drives the locked push/drain/flush path and asserts
+  byte-correct output (proves the lock is balanced and cannot self-deadlock --
+  a missing unlock would freeze the boot at the test) + clean boot to login.
+  35 selftests PASS (was 34).
 
 ## SIXTH AUDIT PASS (read-only fan-out, 2026-06-25) — backlog refill
 

@@ -13,6 +13,8 @@
 #include "rcu.h"
 #include "signal.h"
 #include "fb.h"
+#include "preempt.h"
+#include "smp.h"
 
 // ── Physical console TTY ─────────────────────────────────────────────────
 tty_t g_tty0;
@@ -39,6 +41,19 @@ static inline uint32_t rb_free(uint32_t head, uint32_t tail, uint32_t size) {
     return (head - tail - 1u) & (size - 1u);
 }
 
+// ── Line-discipline lock ──────────────────────────────────────────────────
+// preempt_disable + plain spinlock.  The producer is a kernel thread (console)
+// or a syscall (pty), never an IRQ handler, so no irqsave is needed -- see the
+// lock comment in tty.h.  Mirrors the fb.c console-lock pattern: spin_lock is a
+// bare test-and-set and the kernel is preemptible, so preempt_disable is
+// required to stop this CPU switching away while holding it.
+static inline void tty_lock(tty_t* tty)   { preempt_disable(); spin_lock(&tty->lock); }
+static inline void tty_unlock(tty_t* tty) { spin_unlock(&tty->lock); preempt_enable(); }
+
+// ── Ring-buffer push/pop ──────────────────────────────────────────────────
+// PURE ring ops: the CALLER must hold tty->lock.  The ring is mutated from
+// several CPUs (producer, consumer(s), and tty_flush_input), so every access
+// goes through the lock -- there is no lock-free fast path here.
 static void rd_push(tty_t* tty, uint8_t c) {
     if (rb_full(tty->rd_head, tty->rd_tail, TTY_READ_BUF_SIZE)) return; // drop
     tty->read_buf[tty->rd_tail] = c;
@@ -53,14 +68,13 @@ static int rd_pop(tty_t* tty, uint8_t* out) {
 }
 
 // ── Echo a character to the terminal output ───────────────────────────────
+// write_char is fb I/O (takes the fb lock) -- NEVER call this under tty->lock.
 static void tty_echo(tty_t* tty, uint8_t c) {
     if (tty->write_char) tty->write_char(tty, c);
 }
 
-// ── Erase one character from the canonical line buffer ───────────────────
-static void ldisc_erase_char(tty_t* tty) {
-    if (tty->line_len == 0) return;
-    tty->line_len--;
+// Echo the visual erase of one character: backspace, space, backspace.
+static void tty_echo_erase(tty_t* tty) {
     if (tty->termios.c_lflag & ECHO) {
         tty_echo(tty, '\b');
         tty_echo(tty, ' ');
@@ -68,27 +82,61 @@ static void ldisc_erase_char(tty_t* tty) {
     }
 }
 
+// ── Canonical line-buffer mutations ────────────────────────────────────────
+// Each takes tty->lock around the state change only; the caller does any echo
+// AFTER the call (echo is fb I/O and must stay outside the lock).
+
+// Append one byte to the canonical line if there is room; returns 1 if stored.
+static int ldisc_line_append(tty_t* tty, uint8_t c) {
+    int stored = 0;
+    tty_lock(tty);
+    if (tty->line_len < TTY_LINE_BUF_SIZE - 1) {
+        tty->line_buf[tty->line_len++] = c;
+        stored = 1;
+    }
+    tty_unlock(tty);
+    return stored;
+}
+
+// Remove one byte from the canonical line; returns 1 if a byte was erased.
+static int ldisc_line_erase(tty_t* tty) {
+    int erased = 0;
+    tty_lock(tty);
+    if (tty->line_len > 0) { tty->line_len--; erased = 1; }
+    tty_unlock(tty);
+    return erased;
+}
+
+// Zero the canonical line; returns the prior length (for the ^U echo count).
+static uint32_t ldisc_line_kill(tty_t* tty) {
+    tty_lock(tty);
+    uint32_t n = tty->line_len;
+    tty->line_len = 0;
+    tty_unlock(tty);
+    return n;
+}
+
 // ── Flush canonical line buffer to read_buf, then wake readers ──────────
 static void ldisc_flush_line(tty_t* tty) {
-    // All-or-nothing: only commit the line if the WHOLE line fits in the ring's
-    // current free space.  A per-byte push that ran out of room mid-line would
-    // drop the trailing bytes -- including the terminating '\n' -- so the reader
-    // would get a '\n'-less partial line that merges with the next one (or hangs
-    // a canonical read waiting for a '\n' that was discarded).  If it doesn't
-    // fit (reader far behind / input queue full), drop the WHOLE line: that is
-    // POSIX-acceptable input loss, not framing corruption.
+    // All-or-nothing commit, under the lock: only commit the line if the WHOLE
+    // line fits in the ring's current free space.  A per-byte push that ran out
+    // of room mid-line would drop the trailing bytes -- including the
+    // terminating '\n' -- so the reader would get a '\n'-less partial line that
+    // merges with the next one (or hangs a canonical read waiting for a '\n'
+    // that was discarded).  If it doesn't fit (reader far behind / input queue
+    // full), drop the WHOLE line: POSIX-acceptable input loss, not framing
+    // corruption.
+    tty_lock(tty);
     if (rb_free(tty->rd_head, tty->rd_tail, TTY_READ_BUF_SIZE) >= tty->line_len) {
         for (uint32_t i = 0; i < tty->line_len; i++)
             rd_push(tty, tty->line_buf[i]);
     }
     tty->line_len = 0;
-    // Wake every waiter on the tty's queue — blocking readers register
+    tty_unlock(tty);
+    // Wake every waiter on the tty's queue -- blocking readers register
     // task_we_t nodes, poll/epoll registers epoll_we_t nodes.  A single
-    // wake_all drains them all.
-#if PTY_TRACE
-    serial_puts_dbg("[pty-trace] ldisc_flush_line len=");
-    serial_hex_dbg((uint64_t)tty->line_len);
-#endif
+    // wake_all drains them all.  Done OUTSIDE the lock (it touches the
+    // scheduler's rq_lock, which must never nest under tty->lock).
     wait_queue_wake_all(&tty->waitq);
 }
 
@@ -143,15 +191,21 @@ void tty_input_char(tty_t* tty, char c) {
             return;
         }
 
-        // Erase character (backspace / DEL).
+        // Erase character (backspace / DEL).  Mutate under the lock, echo after.
         if ((uint8_t)c == cc[VERASE] || c == '\b') {
-            ldisc_erase_char(tty);
+            if (ldisc_line_erase(tty)) tty_echo_erase(tty);
             return;
         }
-        // Kill line (^U): erase entire current line.
+        // Kill line (^U): erase entire current line in one locked step, then
+        // echo the visual erase for each removed char plus a trailing newline.
         if ((uint8_t)c == cc[VKILL]) {
-            while (tty->line_len > 0) ldisc_erase_char(tty);
-            if (lflag & ECHO) tty_echo(tty, '\n');
+            uint32_t n = ldisc_line_kill(tty);
+            if (lflag & ECHO) {
+                for (uint32_t i = 0; i < n; i++) {
+                    tty_echo(tty, '\b'); tty_echo(tty, ' '); tty_echo(tty, '\b');
+                }
+                tty_echo(tty, '\n');
+            }
             return;
         }
         // EOF (^D): flush line (even if empty — empty flush signals EOF).
@@ -159,12 +213,11 @@ void tty_input_char(tty_t* tty, char c) {
             ldisc_flush_line(tty);
             return;
         }
-        // Newline: accumulate then flush.
+        // Newline: accumulate then flush.  Echo the '\n' (outside the lock)
+        // only if it was actually stored.
         if (c == '\n' || (uint8_t)c == cc[VEOL] || (uint8_t)c == cc[VEOL2]) {
-            if (tty->line_len < TTY_LINE_BUF_SIZE - 1) {
-                if (lflag & ECHO) tty_echo(tty, '\n');
-                tty->line_buf[tty->line_len++] = '\n';
-            }
+            if (ldisc_line_append(tty, '\n') && (lflag & ECHO))
+                tty_echo(tty, '\n');
             ldisc_flush_line(tty);
             return;
         }
@@ -173,11 +226,9 @@ void tty_input_char(tty_t* tty, char c) {
             tty_input_char(tty, '\n');
             return;
         }
-        // Regular character: accumulate.
-        if (tty->line_len < TTY_LINE_BUF_SIZE - 1) {
-            if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
-            tty->line_buf[tty->line_len++] = (uint8_t)c;
-        }
+        // Regular character: accumulate under the lock, echo after if stored.
+        if (ldisc_line_append(tty, (uint8_t)c) && (lflag & ECHO))
+            tty_echo(tty, (uint8_t)c);
         return;
     }
 
@@ -185,19 +236,46 @@ void tty_input_char(tty_t* tty, char c) {
     // CR→NL conversion even in raw mode if ICRNL is set.
     if (c == '\r' && (tty->termios.c_iflag & ICRNL)) c = '\n';
 
-    if (lflag & ECHO) tty_echo(tty, (uint8_t)c);
+    if (lflag & ECHO) tty_echo(tty, (uint8_t)c);     // echo before push (fb I/O, no lock)
+    tty_lock(tty);
     rd_push(tty, (uint8_t)c);
-#if PTY_TRACE
-    serial_puts_dbg("[pty-trace] raw_push c=");
-    serial_hex_dbg((uint64_t)(uint8_t)c);
-#endif
-    wait_queue_wake_all(&tty->waitq);
+    tty_unlock(tty);
+    wait_queue_wake_all(&tty->waitq);                // wake outside the lock
 }
 
 // ── Flush input buffers ───────────────────────────────────────────────────
+// Resets the ring + canonical line under the lock so it cannot tear a
+// concurrent producer's rd_push / line accumulation or a consumer's rd_pop.
+// Callers (the ^C/^Z/^\ path in tty_input_char, and ioctl TCFLSH/TCSETSF) must
+// NOT already hold tty->lock -- the lock is non-recursive.
 void tty_flush_input(tty_t* tty) {
+    tty_lock(tty);
     tty->rd_head = tty->rd_tail = 0;
     tty->line_len = 0;
+    tty_unlock(tty);
+}
+
+// ── Shared cooked-byte drain ──────────────────────────────────────────────
+// Single locked drain path used by BOTH /dev/tty reads and pty-slave reads,
+// so the ring is never popped lock-free from two places.  Pops up to `len`
+// bytes, honouring canonical mode (stop after '\n', one line per read) and
+// raw VMIN.  Never blocks -- the caller does the wait first -- and must be
+// called WITHOUT holding tty->lock.  Returns the number of bytes copied.
+uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len) {
+    int canon = (tty->termios.c_lflag & ICANON) != 0;
+    uint32_t vmin = canon ? 1 : tty->termios.c_cc[VMIN];
+    if (vmin == 0) vmin = 1;  // always read at least 1
+    uint64_t got = 0;
+    tty_lock(tty);
+    while (got < len) {
+        uint8_t ch;
+        if (!rd_pop(tty, &ch)) break;
+        out[got++] = ch;
+        if (canon && ch == '\n') break;     // one line per canonical read
+        if (!canon && got >= vmin) break;    // raw VMIN satisfied
+    }
+    tty_unlock(tty);
+    return got;
 }
 
 // ── VFS operations for /dev/ttyN ─────────────────────────────────────────
@@ -219,14 +297,6 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         signal_send(g_current, SIGTTIN);
         return -4; // -EINTR
     }
-
-    uint8_t* out = (uint8_t*)buf;
-    uint64_t got = 0;
-
-    // In raw mode with VMIN/VTIME: we implement VMIN here.
-    uint32_t vmin = (tty->termios.c_lflag & ICANON) ? 1
-                  : tty->termios.c_cc[VMIN];
-    if (vmin == 0) vmin = 1; // always read at least 1
 
     // Block until at least one byte is available, using the canonical
     // Phase 9-6 wait-queue pattern:
@@ -253,17 +323,8 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                     if (signal_has_actionable(&g_current->sigstate))
                         return -4 /*EINTR*/;);
 
-    // Drain up to len bytes.
-    while (got < len) {
-        uint8_t c;
-        if (!rd_pop(tty, &c)) break;
-        out[got++] = c;
-        // In canonical mode, stop at newline (one line per read).
-        if ((tty->termios.c_lflag & ICANON) && c == '\n') break;
-        // In raw mode, stop at VMIN.
-        if (!(tty->termios.c_lflag & ICANON) && got >= vmin) break;
-    }
-    return (int64_t)got;
+    // Drain under the per-tty lock via the shared cooked-byte path.
+    return (int64_t)tty_ldisc_drain(tty, (uint8_t*)buf, len);
 }
 
 static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
@@ -466,6 +527,7 @@ void tty_init(void) {
     tty->rd_head   = 0;
     tty->rd_tail   = 0;
     tty->line_len  = 0;
+    spin_lock_init(&tty->lock);
     wait_queue_init(&tty->waitq);
     tty->write_char = console_write_char;
     tty->write_buf  = console_write_buf;
@@ -570,4 +632,65 @@ void tty_rb_free_selftest(void) {
     }
     kprintf(fails ? "[tty_rbfree] SELF-TEST FAILED\n"
                   : "[tty_rbfree] SELF-TEST PASSED (ring free-slots + line fits)\n");
+}
+
+// ── ldisc lock selftest ────────────────────────────────────────────────────
+// Drives the EXACT locked line-discipline path -- tty_input_char (producer),
+// tty_ldisc_drain (consumer), tty_flush_input -- and asserts byte-correct
+// output.  Single-threaded, so it does not reproduce the cross-CPU race (that
+// is a code-proof), but it proves the lock path is BALANCED and cannot HANG: a
+// missing unlock or a recursive re-acquire of the non-recursive leaf lock would
+// spin forever on this CPU (preempt disabled) -> the boot would freeze here and
+// never print PASSED -- and that the locked push/drain/flush move bytes
+// correctly.  Uses kmalloc (no permanent BSS in the shipping kernel).
+void tty_ldisc_selftest(void) {
+    extern void kprintf(const char*, ...);
+    tty_t* t = (tty_t*)kmalloc(sizeof(tty_t));
+    if (!t) { kprintf("[tty_ldisc] SELF-TEST SKIP (no mem)\n"); return; }
+    __builtin_memset(t, 0, sizeof(*t));
+    spin_lock_init(&t->lock);
+    wait_queue_init(&t->waitq);
+    t->write_char = NULL;   // no echo -> no fb dependency
+    t->fg_pgid    = 0;      // no job-control signals
+    int fails = 0;
+    uint8_t buf[16];
+    uint64_t n;
+
+    // (A) Canonical: a completed line flushes intact; drain stops at '\n'.
+    t->termios.c_iflag = 0;
+    t->termios.c_lflag = ICANON;
+    tty_input_char(t, 'h'); tty_input_char(t, 'e');
+    tty_input_char(t, 'y'); tty_input_char(t, '\n');
+    n = tty_ldisc_drain(t, buf, sizeof(buf));
+    if (n != 4 || buf[0] != 'h' || buf[1] != 'e' || buf[2] != 'y' || buf[3] != '\n') {
+        kprintf("[tty_ldisc] FAIL canon n=%lu\n", (unsigned long)n); fails++;
+    }
+
+    // (B) tty_flush_input discards a pending (un-flushed) canonical line.
+    tty_input_char(t, 'x'); tty_input_char(t, 'y');   // accumulating, not flushed
+    tty_flush_input(t);                                // discard line + ring
+    tty_input_char(t, 'z'); tty_input_char(t, '\n');   // fresh line "z\n"
+    n = tty_ldisc_drain(t, buf, sizeof(buf));
+    if (n != 2 || buf[0] != 'z' || buf[1] != '\n') {
+        kprintf("[tty_ldisc] FAIL flush-pending n=%lu\n", (unsigned long)n); fails++;
+    }
+
+    // (C) Raw push lands in the ring; tty_flush_input then clears the ring.
+    t->termios.c_lflag    = 0;
+    t->termios.c_cc[VMIN] = 1;
+    tty_input_char(t, 'Q');
+    n = tty_ldisc_drain(t, buf, sizeof(buf));          // raw VMIN=1 -> 1 byte
+    if (n != 1 || buf[0] != 'Q') {
+        kprintf("[tty_ldisc] FAIL raw n=%lu\n", (unsigned long)n); fails++;
+    }
+    tty_input_char(t, 'R'); tty_input_char(t, 'S');    // two bytes queued
+    tty_flush_input(t);                                // clear the ring
+    n = tty_ldisc_drain(t, buf, sizeof(buf));          // ring empty -> 0
+    if (n != 0) {
+        kprintf("[tty_ldisc] FAIL flush-ring n=%lu\n", (unsigned long)n); fails++;
+    }
+
+    kfree(t);
+    kprintf(fails ? "[tty_ldisc] SELF-TEST FAILED\n"
+                  : "[tty_ldisc] SELF-TEST PASSED (locked push/drain/flush, no self-deadlock)\n");
 }
