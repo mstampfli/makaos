@@ -4,6 +4,7 @@
 #include "rcu.h"
 #include "pipe.h"
 #include "common.h"
+#include "checked.h"   // ckd_add_u64: overflow-safe add for the user-range guards
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
@@ -124,10 +125,12 @@ static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
 // wrapping add.  Returns the rounded length, or 0 if zero/overflowing (callers
 // treat 0 as EINVAL).  Single source of truth for the rounding — both the
 // addr==0 "kernel picks" mmap path and the addr-present path round through it.
+// PRIMITIVE (user length page-rounding, category B -> ckd_add_u64 overflow guard).
 static inline uint64_t mmap_round_len(uint64_t len_in) {
     if (!len_in) return 0;
-    if (len_in > UINT64_MAX - PAGE_MASK) return 0;   // guard before the wrap
-    return (len_in + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+    uint64_t rounded;
+    if (!ckd_add_u64(len_in, PAGE_MASK, &rounded)) return 0;   // reject before the wrap
+    return rounded & ~(uint64_t)PAGE_MASK;
 }
 
 // mmap_range_ok: validate that an EXPLICIT user range [addr, addr+rounded_len)
@@ -3282,11 +3285,15 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
 // the kernel: reject everything above the user ceiling (kernel AND the
 // non-canonical gap).
 #define USER_ADDR_MAX 0x00007FFFFFFFFFFFULL
+// PRIMITIVE (user (addr,len) range validation, category B -> ckd_add_u64 wrap guard).
 static inline int _access_ok(uint64_t addr, uint64_t len) {
     if (!addr) return 0;
     if (addr > USER_ADDR_MAX) return 0;                      // kernel or non-canonical
-    if (len && (addr + len) < addr) return 0;                // overflow
-    if (len && (addr + len - 1) > USER_ADDR_MAX) return 0;   // end past user ceiling
+    if (len) {
+        uint64_t end;
+        if (!ckd_add_u64(addr, len, &end)) return 0;         // addr+len wraps u64
+        if (end - 1 > USER_ADDR_MAX) return 0;               // end past user ceiling
+    }
     return 1;
 }
 
@@ -3482,6 +3489,32 @@ void mmap_range_selftest(void) {
 
     kprintf(fails ? "[mmap_range_test] SELF-TEST FAILED\n"
                   : "[mmap_range_test] SELF-TEST PASSED (mmap/munmap range overflow + higher-half escape rejected)\n");
+}
+
+// _access_ok now folds its addr+len wrap guard onto ckd_add_u64.  The mmap test
+// reaches _access_ok only INDIRECTLY (mmap_round_len pre-filters huge lengths),
+// so it never hits the wrap branch -- exercise every branch directly here.
+void access_ok_selftest(void) {
+    kprintf("[access_ok_test] _access_ok must reject null/kernel/wrap/end-escape\n");
+    int fails = 0;
+    struct { uint64_t addr, len; int want; } c[] = {
+        { 0,                         PAGE_SIZE,     0 },  // NULL addr
+        { 1,                         0,             1 },  // valid ptr, zero len
+        { USER_ADDR_MAX + 1,         PAGE_SIZE,     0 },  // first kernel/non-canon byte
+        { USER_ADDR_MAX,             UINT64_MAX,    0 },  // addr+len WRAPS u64 (wrap branch)
+        { USER_ADDR_MAX - PAGE_SIZE, 2 * PAGE_SIZE, 0 },  // end-1 past ceiling, no wrap
+        { 0x0000000040000000ULL,     PAGE_SIZE,     1 },  // a legal user range
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = _access_ok(c[i].addr, c[i].len);
+        if (got != c[i].want) {
+            kprintf("[access_ok_test] FAIL addr=0x%lx len=0x%lx got=%d want=%d\n",
+                    (unsigned long)c[i].addr, (unsigned long)c[i].len, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[access_ok_test] SELF-TEST FAILED\n"
+                  : "[access_ok_test] SELF-TEST PASSED (null/kernel/wrap/end-escape rejected)\n");
 }
 #endif
 

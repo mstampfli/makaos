@@ -476,6 +476,8 @@ static void init_kthread(void) {
     // the overflow-safe range helpers reject the wrap + escape cases.
     extern void mmap_range_selftest(void);
     mmap_range_selftest();
+    extern void access_ok_selftest(void);
+    access_ok_selftest();
 
     // Audit fix: ext2_readdir read a dirent's name_len without bounding it to
     // the block, so a corrupt dirent could over-read past the bcache slot.

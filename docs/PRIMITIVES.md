@@ -64,6 +64,14 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   no over-read; returns length / -EFAULT / -ENAMETOOLONG (F39). To be generalized
   to `copy_str_from_user` during the sweep.
 - `_access_ok(addr, len)` / `user_buf_check` -- validate a user range w/o copying.
+  `_access_ok` and `mmap_round_len` now fold their addr+len / len+PAGE_MASK wrap
+  guards onto `ckd_add_u64` (category A) -- the F19/F24 overflow class, exactly the
+  use ckd_add documents. Direct `access_ok_selftest` covers the wrap branch that
+  `mmap_range_selftest` reaches only indirectly. `copy_path_from_user` (F39) is
+  already the general bounded NUL-terminated user-string copy; verified there are
+  no raw user-string reads bypassing it (the dev[]/comm[] per-char loops read
+  post-copy KERNEL buffers, not user pointers), so no copy_str_from_user rename is
+  warranted -- it stays the named path wrapper.
 
 ### C. Rings (producer/consumer accounting)
 - `tcp_ring_consume(head, used, n, mask)` -- clamped drain, never underflows (F18).
@@ -91,8 +99,12 @@ Still to fold: `drm_atomic_count_ok` (F40, `<=` bound), `drm_dumb_size` (F23, si
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
-+ on-disk index/run validators folded onto A (this commit). Remaining: generalize
-B (copy_str_from_user), unify C into one ring primitive, fold the remaining D
-validators (drm), then sweep every call site -- one subsystem per commit, each
-with a test. Beyond data, extract any other recurring pattern (locking idioms,
-alloc/free pairs, retry loops) the same way.
++ on-disk index/run validators folded onto A (a1509ff); B's user-range overflow
+guards (`_access_ok` / `mmap_round_len`) folded onto `ckd_add_u64` + direct
+`access_ok_selftest` (this commit). Verified NOT foldable (kept as-is): `drm_dumb_size`
+(F23) is correct-by-construction via the DRM_MAX_FB_DIM policy cap + u64 math, not a
+hand-rolled overflow check; `drm_atomic_count_ok` (F40) is an inclusive `<= MAX`
+(index_ok would be off-by-one). Remaining: unify C into one ring primitive (check
+spsc.h), then sweep remaining untrusted `a*b`/`a+b` call sites -- one subsystem per
+commit, each with a test. Beyond data, extract any other recurring pattern (locking
+idioms, alloc/free pairs, retry loops) the same way.
