@@ -595,7 +595,26 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   shared task_children_clear() helper so the two exit paths can't drift (DRY).
   Race-class -> code-proof (grep shows no remaining plain ->children stores
   except pre-publication inits) + clean boot. Confidence HIGH.
-  NOTE: the setuid-on-exec gap (vfs_check_exec computes setuid_uid but both exec
-  callers discard it) was confirmed a LOW-severity FAIL-CLOSED feature gap (no
-  escalation -- setuid binaries just run with euid unchanged); not worth a fix
-  beyond noting it.
+- **setuid-on-exec not implemented (ksec escalation unwired)**
+  (`kernel/security/perm.c` vfs_check_exec + `kernel/syscall/syscall.c` sys_exec
+  + `kernel/proc/elf.c` elf_exec_from_ext2) -> OPEN, real item (per explicit
+  user direction: every gap is worth fixing). Currently FAIL-CLOSED (a setuid
+  binary runs with euid UNCHANGED -- no escalation, no vulnerability today; the
+  system is over-restrictive). Two parts: (1) BUG: both exec callers build
+  inode_perm_t with `.mode = i_mode & 0x1FF`, which strips the setuid bit
+  (S_ISUID=04000, above 0x1FF), so vfs_check_exec's `(ip->mode & S_ISUID)` test
+  can never fire -> setuid_uid is always 0xFFFFFFFF (detection is dead code).
+  (2) FEATURE: even with detection working, both callers DISCARD setuid_uid and
+  never apply the escalation. Fixing = implementing privilege ESCALATION, so do
+  it CAREFULLY in a dedicated turn (a botched escalation IS the F31 bug class).
+  Plan, per the system's own design (cred.h: escalation requires ksec; the
+  mechanism already works for sys_setuid at syscall.c:3492 via ksec_agent_present
+  + KSEC_OP_SETUID): (a) pass the full mode (include 04000/02000) to
+  inode_perm_t; (b) when vfs_check_exec returns setuid_uid != 0xFFFFFFFF, do the
+  SAME ksec round-trip sys_setuid does and, only if ksec AUTHORIZES, set the
+  child's euid (and suid) to setuid_uid (keep ruid) -- applied to g_current in
+  sys_exec (current process) / to the new child in elf_exec_from_ext2; if ksec
+  denies or is absent, exec WITHOUT escalation (preserve today's fail-closed
+  behaviour, do NOT fail the exec). Deterministically test the pure decision
+  (apply-iff-authorized) helper. Do this as a focused turn -- it is the kind of
+  code that must NOT be rushed.
