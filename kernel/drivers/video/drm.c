@@ -973,6 +973,16 @@ typedef struct {
 #define DRM_MODE_PROP_CRTC_FB   1
 #define DRM_MODE_PROP_CRTC_MODE 2
 
+// Max per-object property count an atomic commit may carry.  A real CRTC/plane
+// has well under 32 properties; 256 is generous headroom for any compositor
+// while bounding the per-object prop loop so an attacker-supplied counts[i]
+// cannot drive a multi-billion-iteration syscall (DoS) or overflow props_off /
+// values_off.  Pure -> unit-tested (drm_atomic_count_selftest).
+#define DRM_MAX_PROPS_PER_OBJ 256u
+static inline int drm_atomic_count_ok(uint32_t count) {
+    return count <= DRM_MAX_PROPS_PER_OBJ;
+}
+
 static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
     drm_mode_atomic_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
@@ -991,6 +1001,10 @@ static int drm_ioctl_atomic(vfs_file_t* f, uint64_t arg) {
     uint32_t counts[DRM_MAX_SCANOUTS];
     if (copy_from_user(counts, (void*)a.count_props_ptr,
                         a.count_objs * sizeof(uint32_t)) != 0) return -EFAULT;
+    // Bound each per-object property count: an unbounded counts[i] would drive
+    // the inner prop loop up to 2^32 iterations (DoS) and overflow props_off.
+    for (uint32_t i = 0; i < a.count_objs; i++)
+        if (!drm_atomic_count_ok(counts[i])) return -EINVAL;
 
     // For each CRTC object, pull its properties and extract the fb id.
     drm_commit_t commit = { .n = 0 };
@@ -2660,4 +2674,30 @@ void drm_dumb_size_selftest(void) {
     }
     kprintf(fails ? "[drm_dumb] SELF-TEST FAILED\n"
                   : "[drm_dumb] SELF-TEST PASSED (overflow-safe dumb size)\n");
+}
+
+// ── drm_atomic per-object prop-count bound selftest ───────────────────────
+// Deterministic check that an atomic commit's per-object property count is
+// bounded, so a hostile counts[i] cannot drive the prop loop up to 2^32
+// iterations (DoS) or overflow props_off / values_off.
+void drm_atomic_count_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t count; int want; } c[] = {
+        { 0,                          1 },   // zero props -> ok
+        { 1,                          1 },
+        { DRM_MAX_PROPS_PER_OBJ,      1 },   // exactly at the cap -> ok
+        { DRM_MAX_PROPS_PER_OBJ + 1u, 0 },   // one past the cap -> reject
+        { 0xFFFFFFFFu,                0 },   // the DoS value -> reject
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        int got = drm_atomic_count_ok(c[i].count);
+        if (got != c[i].want) {
+            kprintf("[drm_atomic] FAIL count=%u got=%d want=%d\n",
+                    c[i].count, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[drm_atomic] SELF-TEST FAILED\n"
+                  : "[drm_atomic] SELF-TEST PASSED (per-object prop count bounded)\n");
 }

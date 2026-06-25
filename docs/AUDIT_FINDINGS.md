@@ -695,9 +695,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
 - virtio-gpu / DRM transfer/scanout/backing -> SAFE. The kernel sends fixed
   x=y=offset=0 full-surface (w,h) from each resource's own create dims; all three
   resource-creating paths (CREATE_DUMB F23, ADDFB2 subset-clamp, CURSOR 64-bit
-  footprint check) tie the declared footprint to a backing that covers it. LOW:
-  DRM MODE_ATOMIC does not bound per-object counts[i] before the prop-copy loop
-  (DoS / long syscall; memory-safety relies on copy_from_user's range check).
+  footprint check) tie the declared footprint to a backing that covers it. DRM
+  MODE_ATOMIC unbounded per-object counts[i] -> FIXED (F40): the inner prop loop
+  `for (j < counts[i])` (drm.c) ran with an attacker-supplied per-object count,
+  so counts[i]=0xFFFFFFFF drove up to 2^32 copy_from_user iterations (DoS) and
+  props_off/values_off `+= counts[i]*4/8` could overflow. Fixed: bound each
+  counts[i] to DRM_MAX_PROPS_PER_OBJ (256, generous vs the <32 a real CRTC/plane
+  carries) right after the counts[] copy -> -EINVAL otherwise. Pure
+  drm_atomic_count_ok helper + deterministic drm_atomic_count_selftest.
 - shm/shmem -> SAFE (string-named, RCU + tryget + per-frame refcount + size cap).
   VFS mount table -> SAFE (no sys_mount/umount; static const mount array).
 
@@ -734,9 +739,18 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   userland, not the kernel.
 - fork/clone/wait/zombie -> SAFE (memory-safety). Double-reap closed by the
   XCHG-drain of children (one winner) + RCU-deferred task free; F34 holds. MED
-  (POSIX-correctness, NOT memory-unsafe): wait() is per-thread not per-process
-  (a thread loses a sibling-thread's forked child; reparented to init, no
-  leak/UAF). LOW: sys_thread does not zero the task_t (slab-drift risk).
+  (POSIX-correctness, NOT memory-unsafe) -> DEFERRED (too invasive for one clean
+  turn): wait() is per-thread not per-process -- the children Treiber stack is
+  anchored on g_current, so a child forked by thread T1 is unreapable by T2's
+  wait() (reparented to init on T1 exit, so no leak/UAF). The clean fix (anchor
+  children on the tgid LEADER, found via pid_ht_find(tgid)) is blocked by leader
+  lifetime: sys_exit reparents EVERY exiting task's own children to init (no
+  leader-stays-zombie-until-group-exit semantics), so leader-anchoring would
+  also need the leader kept alive until the last thread exits + reparent only on
+  last-thread exit -- a multi-part thread-lifecycle change that cannot be
+  completed AND verified (needs real multithreaded fork/wait tests) in one turn.
+  Revisit as a dedicated thread-model task. LOW: sys_thread does not zero the
+  task_t (slab-drift risk) -- still open.
 - VFS path resolution -> no symlink support (no ELOOP surface). **HIGH: unveil()
   was enforced ONLY in sys_open** -> FIXED (F38). unveil_check had one call site;
   every other path syscall escaped the sandbox. Fixed with ONE shared gate
