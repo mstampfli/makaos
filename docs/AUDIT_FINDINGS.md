@@ -1048,3 +1048,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   new deadlock (IRQ completion never takes s_submit_busy; lock order s_submit_busy > s_ci_lock
   unchanged). Code-proof + clean boot (0 fault, 49 selftests, no WD; boot does disk I/O via
   all 3 paths). First verify boot hit the flaky chaselev-class stall; re-boot reached DHCP.
+- io_uring fixed-files unlocked read -> FIXED (F63): sqe_fdget read fixed_files_nr/[idx] + vfs_tryget
+  with no fixed_files_lock, on the io_wq worker kthread, racing IORING_UNREGISTER_FILES (swaps
+  NULL under the lock, then vfs_close's files + kfree's the array outside it) -> freed-array read /
+  freed-file tryget (freed-fnptr via vtable) / torn nr-vs-array. Fix: hold fixed_files_lock across
+  the (nr,array[idx]) read + tryget so the read is consistent and the file is pinned before
+  unregister's vfs_close. Code-proof + clean boot (io_uring selftests run, 0 fault, no WD).
+  RECORDED follow-ups (verified-real, NOT yet fixed): (i) signalfd OWNER UAF -- raw task_t* owner
+  outlives the owner via fork/SCM_RIGHTS; task_free_rcu frees the task but never NULLs s->owner ->
+  child read/poll/close derefs freed task (signalfd.c:79/114/131/145). Fix: signalfd_disown_all in
+  task_free_rcu (NULL owner under s_sfd_lock) + read owner under s_sfd_lock in claim/poll/close +
+  EOF on owner-gone. (j) AF_UNIX backlog client UAF -- connect enqueues pend->client with no
+  unix_get; client closed-while-CONNECTING is freed but left on the listener backlog; accept derefs
+  freed pend->client (unix_sock.c:851-863). Fix: unix_get at enqueue, unix_put + tryget/state-check
+  at accept/drain (mirror F58).

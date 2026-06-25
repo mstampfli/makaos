@@ -517,11 +517,23 @@ int io_uring_register_impl(io_uring_t* uring, uint32_t op,
 static vfs_file_t* sqe_fdget(io_uring_t* uring, const io_sqe_t* sqe) {
     if (sqe->flags & IOSQE_FIXED_FILE) {
         uint32_t idx = (uint32_t)sqe->fd;
-        if (idx >= uring->fixed_files_nr) return NULL;
-        vfs_file_t* f = uring->fixed_files[idx];
-        return vfs_tryget(f);       // bump ref; fixed_files holds a
-                                    // stable ref, so tryget always
-                                    // succeeds unless under teardown
+        // Hold fixed_files_lock across the (nr, array[idx]) read AND the
+        // tryget.  This runs on the io_wq worker kthread concurrently with the
+        // owner task's IORING_UNREGISTER_FILES, which swaps fixed_files->NULL /
+        // nr->0 under this lock and THEN (outside it) vfs_close's each file and
+        // kfree's the array.  Without the lock the worker can read a freed
+        // array, see a torn nr-vs-array, or tryget a file whose backing object
+        // unregister already freed (a UAF / freed-function-pointer call via the
+        // file's vtable).  Under the lock we read a consistent table and
+        // vfs_tryget pins the file (its own ref) BEFORE unregister can drop the
+        // ring's ref, so the file cannot be freed under us; and we never index
+        // the array after unregister NULLed it (nr is 0 then -> return NULL).
+        uint64_t fl = spin_lock_irqsave(&uring->fixed_files_lock);
+        vfs_file_t* f = (idx < uring->fixed_files_nr) ? uring->fixed_files[idx]
+                                                      : (vfs_file_t*)NULL;
+        f = f ? vfs_tryget(f) : NULL;
+        spin_unlock_irqrestore(&uring->fixed_files_lock, fl);
+        return f;
     }
     return uring_fdget(sqe->fd);
 }
