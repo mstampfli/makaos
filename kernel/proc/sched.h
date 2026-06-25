@@ -78,6 +78,10 @@ task_t* task_children_reap(task_t* parent, uint32_t target_pid,
 // Move every child of `from` onto `to`'s list, updating ppid to
 // `to->pid` in the process.  Used by the exit / fatal-signal paths.
 void task_children_reparent(task_t* from, task_t* to);
+// Atomically clear a task's children list (no reparent target: the task is
+// init, or init is absent).  Must be atomic -- init->children is concurrently
+// CAS-prepended by other exiting tasks reparenting orphans.
+void task_children_clear(task_t* t);
 
 // Called on every timer tick (by timer_irq_handler via timer_register_tick).
 // Picks the next PROC_READY process and context-switches into it.

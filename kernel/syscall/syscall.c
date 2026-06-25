@@ -652,7 +652,10 @@ static uint64_t sys_exit(uint64_t code) {
         if (g_init_task && g_init_task != g_current) {
             task_children_reparent(g_current, g_init_task);
         } else {
-            g_current->children = NULL;
+            // We ARE init (or init is absent): init->children is concurrently
+            // CAS-prepended from other CPUs, so drain it ATOMICALLY -- a plain
+            // store would tear the lock-free Treiber stack.
+            task_children_clear(g_current);
         }
 
         // Drop the fd table now so peers (pipes, sockets, ttys) see EOF

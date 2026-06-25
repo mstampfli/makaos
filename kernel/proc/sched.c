@@ -1035,6 +1035,23 @@ void task_children_reparent(task_t* from, task_t* to) {
     task_child_add_chain(to, head, tail);
 }
 
+// Atomically clear a task's children list (the drained chain is discarded).
+// Used by the exit paths when there is no reparent target -- i.e. the dying
+// task IS init, or init is absent.  When the task is init, init->children is
+// the universal reparent target: other exiting tasks CAS-prepend their orphan
+// chains onto it from any CPU (task_child_add_chain).  A plain
+// `children = NULL` store would race those CAS prepends and tear the Treiber
+// stack -- dropping a just-reparented orphan chain (unreapable task_t + pid
+// leak) and leaving a dangling children pointer in a task about to be
+// RCU-freed.  The XCHG-drain (the same primitive task_children_reap uses) is
+// the single atomic claim the invariant requires.  (For a non-init task the
+// plain drain in task_children_reparent is correct -- only the dying task
+// touches its own list -- so this is only for the no-target / init case.)
+void task_children_clear(task_t* t) {
+    if (!t) return;
+    (void)__atomic_exchange_n(&t->children, (task_t*)NULL, __ATOMIC_ACQ_REL);
+}
+
 // ── sched_tick ────────────────────────────────────────────────────────────
 // Called from timer IRQ — only sets flags/counters, never touches the stack.
 

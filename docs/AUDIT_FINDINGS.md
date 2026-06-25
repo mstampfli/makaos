@@ -578,7 +578,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   {1000,..} requesting uid 0 = deny, requesting uid 1000 = allow, root = allow
   any. Confidence HIGH. (FIX THIS NEXT.)
 
-- **init->children plain-store vs cross-CPU CAS race**
+- **init->children plain-store vs cross-CPU CAS race** -> FIXED (F34)
   (`kernel/syscall/syscall.c:~655` sys_exit + `kernel/proc/signal.c:~427`
   signal_terminate, the `g_init_task == g_current` branch) -> OPEN (HIGH, but
   init-exit is rare). init->children is a lock-free Treiber stack whose contract

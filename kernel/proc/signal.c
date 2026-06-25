@@ -424,7 +424,10 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
     if (g_init_task && g_init_task != g_current) {
         task_children_reparent(g_current, g_init_task);
     } else {
-        g_current->children = NULL;
+        // We ARE init (or init is absent): drain init->children ATOMICALLY --
+        // it is concurrently CAS-prepended by other exiting tasks reparenting
+        // their orphans, so a plain store would tear the Treiber stack.
+        task_children_clear(g_current);
     }
 
     // Drop the fd table now so peers see EOF immediately (matching sys_exit).
