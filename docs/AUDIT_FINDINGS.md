@@ -1294,3 +1294,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   a flaky F55 stall). CAPSTONE: fd_to_file then had ZERO callers -- the unsafe file-static compat primitive was
   REMOVED (decl + def), eliminating the footgun (safe-primitives). The whole fd_to_file-across-an-op UAF sweep
   is closed: F73 poll/select, F77 socket syscalls, F78 sendmsg/recvmsg, F80 epoll, F81 timerfd/signalfd.
+- epoll_ctl ADD/MOD read the WATCHED fd raw (fd_table[tfd]) then vfs_tryget in register -> free+reuse UAF ->
+  FIXED (F82, follow-up (u), found during F80): the raw read + register's tryget is NOT under rcu_read_lock,
+  so a sibling close(tfd) on another CPU can free + reuse the slab slot (ADD: across ep_grow/kmalloc) before
+  the tryget bumps it. Mitigated (tryget) and narrower than the epfd bug, but real. Fix: fdget(tfd) (read +
+  tryget under rcu, cannot be freed/reused) instead of the raw read, fdput after register on every path (ADD:
+  all 3 exits; MOD: inside if(wf)). The pin makes register's tryget reliably succeed (no inert watch); ADD on
+  a concurrently-dying fd now returns -EBADF instead of inserting an inert watch (more correct, race-only).
+  Code-proof + epoll_pin selftest passes + clean boot (DHCP, 58 PASSED). Completes epoll fd safety (F80 epfd
+  + F82 watched fd).

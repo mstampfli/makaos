@@ -4911,15 +4911,19 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
     switch (op) {
     case EPOLL_CTL_ADD: {
         if (ep_find(state, tfd) < state->cap) { ret = (uint64_t)-EEXIST; break; }
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
+        // fdget pins the watched fd so a sibling close(tfd) cannot free+reuse
+        // it in the window before epoll_watch_register's vfs_tryget; fdput
+        // after register, which takes its own independent w->file ref.
+        vfs_file_t* wf = fdget(tfd);
         if (!wf) { ret = (uint64_t)-EBADF; break; }
         // Grow if at 75% load.
         if (state->count * 4u >= state->cap * 3u) {
-            if (ep_grow(state, state->cap * 2u) < 0) { ret = (uint64_t)-ENOMEM; break; }
+            if (ep_grow(state, state->cap * 2u) < 0) {
+                fdput(wf); ret = (uint64_t)-ENOMEM; break;
+            }
         }
         epoll_watch_t* w = (epoll_watch_t*)kmalloc(sizeof(epoll_watch_t));
-        if (!w) { ret = (uint64_t)-ENOMEM; break; }
+        if (!w) { fdput(wf); ret = (uint64_t)-ENOMEM; break; }
         w->fd         = tfd;
         w->events     = ev.events;
         w->data       = ev.data;
@@ -4927,7 +4931,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         w->wq1        = NULL;
         w->wq2        = NULL;
         w->file       = NULL;
-        epoll_watch_register(state, w, wf);   // pins wf into w->file
+        epoll_watch_register(state, w, wf);   // takes its own w->file ref
+        fdput(wf);                            // drop our pin; the watch holds its own
         ep_ht_insert_raw(state->slots, state->cap, w);
         state->count++;
         ret = 0;
@@ -4948,12 +4953,16 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
+        // fdget pins the watched fd across the re-register (same reason as ADD);
+        // NULL (tfd closed/dying) just leaves the watch unregistered, as before.
+        vfs_file_t* wf = fdget(tfd);
         epoll_watch_unregister(w);   // drops the old pin + entries
         w->events = ev.events;
         w->data   = ev.data;
-        if (wf) epoll_watch_register(state, w, wf);   // re-pins wf
+        if (wf) {
+            epoll_watch_register(state, w, wf);   // takes its own w->file ref
+            fdput(wf);                            // drop our pin
+        }
         ret = 0;
         break;
     }
