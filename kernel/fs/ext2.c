@@ -2031,7 +2031,19 @@ out:
 // Split path into parent path and basename.
 // parent_out must be >= str_len(path)+1 bytes.
 // Returns the basename pointer within `path`.
-static const char* path_split(const char* path, char* parent_out) {
+// Max path length the FS handles (matches sys_open's char[512] user-path copy).
+// Every path_split parent buffer is sized to this so a path sys_open accepts is
+// never spuriously rejected, while the explicit `cap` argument keeps the copy
+// in bounds REGARDLESS of buffer size (defense in depth).
+#define EXT2_PATH_MAX 512
+
+// Split `path` into its parent directory (written to parent_out, a `cap`-byte
+// buffer) and basename (the returned suffix).  Returns NULL if the parent does
+// not fit in `cap` bytes -- previously the copy had NO bound, so a path longer
+// than the caller's fixed buffer (reachable via open(O_CREAT) with a ~511-byte
+// path) overran the kernel stack and smashed the saved return address.
+static const char* path_split(const char* path, char* parent_out, uint32_t cap) {
+    if (cap < 2) return NULL;            // need room for at least "/" + NUL
     uint32_t len = str_len(path);
     // Find last '/'.
     int last_slash = -1;
@@ -2047,11 +2059,56 @@ static const char* path_split(const char* path, char* parent_out) {
         return (last_slash == 0) ? path + 1 : path;
     }
 
-    // Copy up to last_slash.
+    // Bound the copy: we write parent_out[0..last_slash-1] + a NUL at
+    // [last_slash], so we need last_slash < cap.  Reject (NULL) otherwise;
+    // every caller already treats a NULL return as an error.
+    if ((uint32_t)last_slash >= cap) return NULL;
     for (int i = 0; i < last_slash; i++) parent_out[i] = path[i];
     parent_out[last_slash] = '\0';
     return path + last_slash + 1;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of path_split's bound: a parent longer than the
+// destination buffer must be REJECTED (return NULL), never copied (the kernel
+// stack overflow this fixes).  Also checks normal splits + the exact boundary.
+void ext2_path_split_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    char buf[EXT2_PATH_MAX];
+
+    // Tiny inline compare (no str_eq in this TU).
+    #define EQ(a,b) ({ const char* _x=(a); const char* _y=(b); \
+                       while (*_x && *_x==*_y) { _x++; _y++; } *_x==*_y; })
+
+    const char* b;
+    b = path_split("/foo/bar", buf, sizeof(buf));        // normal split
+    if (!b || !EQ(b,"bar") || !EQ(buf,"/foo")) {
+        kprintf("[ext2_pathsplit] FAIL normal b=%p\n", (void*)b); fails++; }
+
+    b = path_split("/a", buf, sizeof(buf));              // root parent
+    if (!b || !EQ(b,"a") || !EQ(buf,"/")) {
+        kprintf("[ext2_pathsplit] FAIL root b=%p\n", (void*)b); fails++; }
+
+    // "/abcdefg/x": last '/' at index 8, parent "/abcdefg" is 8 chars -> needs
+    // 9 bytes (8 + NUL).  cap 9 fits exactly; cap 8 must reject.
+    b = path_split("/abcdefg/x", buf, 9u);
+    if (!b || !EQ(buf,"/abcdefg")) {
+        kprintf("[ext2_pathsplit] FAIL fit-9 b=%p\n", (void*)b); fails++; }
+    b = path_split("/abcdefg/x", buf, 8u);
+    if (b != (const char*)0) {                            // MUST reject, not overflow
+        kprintf("[ext2_pathsplit] FAIL overflow-8 not rejected\n"); fails++; }
+
+    // The bug case: a parent far larger than cap must reject with no copy.
+    b = path_split("/aaaaaaaaaaaaaaaaaaaa/x", buf, 8u);   // parent 20+ chars, cap 8
+    if (b != (const char*)0) {
+        kprintf("[ext2_pathsplit] FAIL long-parent not rejected\n"); fails++; }
+
+    #undef EQ
+    kprintf(fails ? "[ext2_pathsplit] SELF-TEST FAILED\n"
+                  : "[ext2_pathsplit] SELF-TEST PASSED (parent bound, no stack overflow)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
 
 // ── ext2_write_file ────────────────────────────────────────────────────────
 
@@ -2059,8 +2116,8 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     if (!s_mounted) return 0;
 
     // Split into parent dir and basename.
-    char parent_path[256];
-    const char* basename = path_split(path, parent_path);
+    char parent_path[EXT2_PATH_MAX];
+    const char* basename = path_split(path, parent_path, sizeof(parent_path));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(parent_path);
@@ -2189,8 +2246,8 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 // Create an empty file.  Returns 0 if the file already exists.
 int ext2_create(const char* path) {
     if (!s_mounted) return 0;
-    char parent_path[256];
-    const char* basename = path_split(path, parent_path);
+    char parent_path[EXT2_PATH_MAX];
+    const char* basename = path_split(path, parent_path, sizeof(parent_path));
     if (!basename || basename[0] == '\0') return 0;
     uint32_t parent_ino = path_to_inode(parent_path);
     if (!parent_ino) return 0;
@@ -2387,8 +2444,8 @@ int ext2_mkdir(const char* path) {
     // Check it doesn't already exist.
     if (path_to_inode(path)) return 0; // already exists
 
-    char md_parent[256];
-    const char* basename = path_split(path, md_parent);
+    char md_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, md_parent, sizeof(md_parent));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(md_parent);
@@ -2503,8 +2560,8 @@ int ext2_unlink(const char* path) {
     uint32_t ino = path_to_inode(path);
     if (!ino) return 0;
 
-    char ul_parent[256];
-    const char* basename = path_split(path, ul_parent);
+    char ul_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, ul_parent, sizeof(ul_parent));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(ul_parent);
@@ -2574,15 +2631,15 @@ int ext2_rename(const char* src, const char* dst) {
     uint8_t is_dir = ((src_inode.i_mode & 0xF000) == EXT2_S_IFDIR);
 
     // Resolve src parent/basename.
-    char rn_src_parent[256];
-    const char* src_base = path_split(src, rn_src_parent);
+    char rn_src_parent[EXT2_PATH_MAX];
+    const char* src_base = path_split(src, rn_src_parent, sizeof(rn_src_parent));
     if (!src_base || src_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t src_parent_ino = path_to_inode(rn_src_parent);
     if (!src_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
 
     // Resolve dst parent/basename.
-    char rn_dst_parent[256];
-    const char* dst_base = path_split(dst, rn_dst_parent);
+    char rn_dst_parent[EXT2_PATH_MAX];
+    const char* dst_base = path_split(dst, rn_dst_parent, sizeof(rn_dst_parent));
     if (!dst_base || dst_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
     if (!dst_parent_ino) { spin_unlock(&s_rename_lock); return 0; }

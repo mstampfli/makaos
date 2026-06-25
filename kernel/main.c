@@ -463,6 +463,12 @@ static void init_kthread(void) {
     extern void ext2_block_size_selftest(void);
     ext2_block_size_selftest();
 
+    // Audit fix: path_split copied the parent path into a fixed stack buffer
+    // with no bound -> kernel stack overflow on a long path.  Verify the bound
+    // rejects an over-long parent instead of overflowing.
+    extern void ext2_path_split_selftest(void);
+    ext2_path_split_selftest();
+
     // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
     // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.
     extern void pty_ioctl_selftest(void);

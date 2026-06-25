@@ -512,3 +512,45 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   ring indices; PTY slave fds are dup-shared (refcount) so multi-consumer is
   real. Fix: a per-tty ldisc spinlock around rd_push/rd_pop/line_buf
   accumulation/tty_flush_input. Confidence MED. Good for a dedicated iteration.
+
+## SIXTH AUDIT PASS (read-only fan-out, 2026-06-25) — backlog refill
+
+- **ext2 path_split kernel stack overflow** (`kernel/fs/ext2.c` path_split)
+  -> FIXED (F30). path_split copied the parent portion of a path into a
+  caller-supplied fixed stack buffer (`char[256]` at all 6 call sites:
+  ext2_write_file/create/mkdir/unlink/rename x2) with NO length bound
+  (`for (i=0; i<last_slash; i++) parent_out[i]=path[i]`).  sys_open copies the
+  user path into `char[512]` and, on O_CREAT, calls ext2_create -> path_split,
+  so an unprivileged `open("/<~480 chars>/x", O_CREAT)` wrote ~480 bytes into the
+  256-byte stack buffer, smashing the saved return address (RCE-class kernel
+  stack overflow). Fixed: added a `cap` (dest size) argument; path_split returns
+  NULL if the parent does not fit (last_slash >= cap) -- every caller already
+  treats NULL as an error; bumped all 6 buffers to EXT2_PATH_MAX (512) so a path
+  sys_open accepts is never spuriously rejected, and pass sizeof(buf) as cap (so
+  the copy is bounded regardless of buffer size). Deterministic
+  ext2_path_split_selftest (normal split, root parent, exact-fit cap 9 vs
+  reject cap 8, long-parent reject). HIGH confidence. (Found by a read-only
+  subagent; independently verified all 6 caller buffer sizes, the NULL-return
+  handling, the sys_open 512-byte path reaching ext2_create, + full build/boot.)
+
+- **io_uring user-writable ring_mask OOB read+write**
+  (`kernel/io/io_uring.c` io_uring_post_cqe / io_uring_enter_impl / SQPOLL) ->
+  OPEN (HIGH, top backlog item). io_uring indexes the sqes[]/cqes[] arrays with
+  the ring `mask` read from the USER-MAPPED, USER-WRITABLE ring header
+  (sq_hdr->ring_mask / cq_hdr->ring_mask, mapped VMA_R|VMA_W|VMA_USER) instead of
+  the kernel-trusted sq_entries/cq_entries.  A process that overwrites
+  ring_mask=0xFFFFFFFF in its mapped ring gets an arbitrary OOB read of an SQE
+  and an attacker-controlled OOB WRITE of a CQE past the allocation (CRITICAL).
+  The adjacent fullness check correctly uses the TRUSTED count
+  (`(tail-head) >= cq_entries`), proving the mask used for the subscript is the
+  wrong source.  Sites: the mask read at ~:309 (cq) / ~:1005 (sq) / ~:543
+  (SQPOLL) feeding `cqes[tail & mask]` (~:366), the overflow-drain (~:321),
+  `sqes[head & mask]` (~:1013/:1057), io_wq_enqueue_chain (~:785).  Fix: never
+  trust the user mask for kernel indexing -- derive the masks from the
+  kernel-set, power-of-two sq_entries/cq_entries (io_sq_mask = sq_entries-1,
+  io_cq_mask = cq_entries-1) and use those at every sqes[]/cqes[] subscript;
+  setup already clamps entries to a power of 2 <= IO_URING_MAX_ENTRIES=4096.
+  Deterministically testable (a pure index-in-bounds helper + assert overwriting
+  ring_mask no longer changes the computed slot). Touches ~8 index sites --
+  careful but contained; VERIFY each site against real code before editing.
+  Good NEXT item (CRITICAL severity, clean fix once verified).
