@@ -392,6 +392,17 @@ void unix_sock_close(vfs_file_t* self) {
         unix_put(peer);
     }
 
+    // Release the OWNED ref on a SOCK_DGRAM connect() default destination, if
+    // any.  This is the asymmetric counterpart to the symmetric back-pointer
+    // clear above: the destination never referenced us, so it could not clear
+    // (or release) this link on its own close -- we took the ref in connect()
+    // and must drop it here (and on reconnect).  Independent of `peer`, so a
+    // socket that is both socketpair'd and connect()'d releases each correctly.
+    if (s->dgram_dest) {
+        unix_put(s->dgram_dest);
+        s->dgram_dest = NULL;
+    }
+
     // Drop the owning reference.  The socket (and its vfs_file_t `self`, per
     // the F14 lifetime invariant) is freed via call_rcu once the last ref --
     // including any transient peer pins -- is gone.  `self` is NOT freed here:
@@ -548,6 +559,83 @@ void socketpair_selftest(void) {
 fail:
     unix_sock_close(pair[0]);
     unix_sock_close(pair[1]);
+}
+
+// ── SOCK_DGRAM connect() peer-lifetime selftest ──────────────────────
+// Proves the owned-ref fix for the asymmetric connect() default destination:
+// the destination must survive its OWN close as long as a connected sender
+// still references it, so a later sendto cannot use-after-free it.  Also
+// exercises the reconnect path's drop of the previous destination's ref.
+// (unix_sock_bind/connect/sendto are the same primitives sys_bind/connect/
+// sendto drive, so this mirrors the real userland reach.)
+void unix_dgram_peer_selftest(void) {
+    vfs_file_t* fb = unix_sock_open(SOCK_DGRAM);   // destination 1
+    vfs_file_t* fc = unix_sock_open(SOCK_DGRAM);   // destination 2 (reconnect)
+    vfs_file_t* fa = unix_sock_open(SOCK_DGRAM);   // sender
+    if (!fb || !fc || !fa) {
+        kprintf_atomic("[unix_dgram_peer] FAIL open\n");
+        goto fail;
+    }
+    unix_sock_t* sb = (unix_sock_t*)fb->ctx;
+    unix_sock_t* sc = (unix_sock_t*)fc->ctx;
+    unix_sock_t* sa = (unix_sock_t*)fa->ctx;
+
+    if (unix_sock_bind(fb, "/dgram-peer-test-a") != 0 ||
+        unix_sock_bind(fc, "/dgram-peer-test-b") != 0) {
+        kprintf_atomic("[unix_dgram_peer] FAIL bind\n");
+        goto fail;
+    }
+
+    // connect A -> B: B gains the sender's owned ref (1 -> 2).
+    if (unix_sock_connect(fa, "/dgram-peer-test-a") != 0 ||
+        sa->dgram_dest != sb || sb->refcount != 2) {
+        kprintf_atomic("[unix_dgram_peer] FAIL connect dest=%p refB=%lu\n",
+                       (void*)sa->dgram_dest, (unsigned long)sb->refcount);
+        goto fail;
+    }
+
+    // reconnect A -> C: C gains the ref (1 -> 2), B's owned ref is dropped
+    // (2 -> 1, back to just its owner).
+    if (unix_sock_connect(fa, "/dgram-peer-test-b") != 0 ||
+        sa->dgram_dest != sc || sc->refcount != 2 || sb->refcount != 1) {
+        kprintf_atomic("[unix_dgram_peer] FAIL reconnect dest=%p refB=%lu refC=%lu\n",
+                       (void*)sa->dgram_dest,
+                       (unsigned long)sb->refcount, (unsigned long)sc->refcount);
+        goto fail;
+    }
+
+    // B is now unreferenced (only its owner): closing it frees it cleanly.
+    unix_sock_close(fb); fb = NULL;
+
+    // THE INVARIANT: close C (the live destination) while A still points at it.
+    // The owner ref drops (2 -> 1) but the sender's owned ref keeps C ALIVE --
+    // with the old code C would be freed here and sa->dgram_dest would dangle.
+    // (fc is nulled so the fail path cannot double-close it; sc stays valid
+    // because the sender's ref keeps C alive.)
+    unix_sock_close(fc); fc = NULL;
+    if (sc->refcount != 1) {
+        kprintf_atomic("[unix_dgram_peer] FAIL dest freed under sender refC=%lu\n",
+                       (unsigned long)sc->refcount);
+        goto fail;
+    }
+
+    // A sendto the closed-but-referenced destination must NOT fault (no UAF);
+    // the datagram queues into C and is reclaimed when C is finally freed.
+    int r = unix_sock_sendto(fa, "hi", 2, NULL);
+    if (r != 2) {
+        kprintf_atomic("[unix_dgram_peer] FAIL sendto closed dest r=%d\n", r);
+        goto fail;
+    }
+
+    // Closing A drops the last ref on C -> both freed, balanced.
+    unix_sock_close(fa);
+    kprintf_atomic("[unix_dgram_peer] SELF-TEST PASSED (owned dgram dest survives its close)\n");
+    return;
+fail:
+    if (fa) unix_sock_close(fa);
+    if (fb) unix_sock_close(fb);
+    if (fc) unix_sock_close(fc);
+    kprintf_atomic("[unix_dgram_peer] SELF-TEST FAILED\n");
 }
 
 // ── SCM_RIGHTS ancillary selftest ────────────────────────────────────
@@ -793,10 +881,24 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     if (!target) { rcu_read_unlock(); return -ECONNREFUSED; }
 
     if (s->type == SOCK_DGRAM) {
-        // SOCK_DGRAM: just remember the default destination.
-        s->peer = target;
-        s->state = UNIX_STATE_CONNECTED;
+        // SOCK_DGRAM: remember the default destination.  This is an ASYMMETRIC
+        // link -- `target` has no back-pointer to us, so its close() cannot
+        // clear our cached pointer (unlike a symmetric stream/socketpair peer).
+        // Hold an OWNED strong ref so `target` cannot be freed out from under a
+        // later send; without it dgram_dest would dangle to freed memory the
+        // moment the destination closes (a use-after-free reachable by a plain
+        // sendto after the peer's close).  `target` is alive here (we are in
+        // the ns_find reader section), and unix_get publishes a ref that keeps
+        // it alive past rcu_read_unlock.  A re-connect drops the PREVIOUS
+        // destination's ref; publish the new pointer BEFORE dropping the old so
+        // a concurrent send observes either the ref-held new dest or the old
+        // one still kept alive for that send's own grace period.
+        unix_sock_t* old = s->dgram_dest;
+        unix_get(target);
+        s->dgram_dest = target;
+        s->state      = UNIX_STATE_CONNECTED;
         rcu_read_unlock();
+        if (old) unix_put(old);
         return 0;
     }
 
@@ -1021,7 +1123,12 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     if (path && path[0]) {
         target = ns_find(path);
     } else {
-        target = s->peer; // default peer from connect()
+        // No explicit destination: use the connect() default if set (owned
+        // strong ref -> never dangling), else the symmetric socketpair peer
+        // (kept alive by its back-pointer clear).  Both are memory-safe to
+        // deref within this rcu_read_lock section; the cached-but-unreferenced
+        // dangling case that used to live here is gone (see dgram_dest).
+        target = s->dgram_dest ? s->dgram_dest : s->peer;
     }
     if (!target) { rcu_read_unlock(); return -ECONNREFUSED; }
     if (target->type != SOCK_DGRAM) { rcu_read_unlock(); return -ECONNREFUSED; }

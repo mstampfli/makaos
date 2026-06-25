@@ -586,6 +586,12 @@ static void init_kthread(void) {
     extern void unix_refcount_selftest(void);
     unix_refcount_selftest();
 
+    // SOCK_DGRAM connect() default-destination owned-ref lifetime (the
+    // asymmetric-peer UAF fix): the destination survives its own close while
+    // a connected sender still references it.
+    extern void unix_dgram_peer_selftest(void);
+    unix_dgram_peer_selftest();
+
     // Pipe last-end-release: single atomic owner of the teardown (double-free fix).
     extern void pipe_refcount_selftest(void);
     pipe_refcount_selftest();

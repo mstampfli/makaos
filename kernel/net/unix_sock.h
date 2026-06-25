@@ -115,7 +115,23 @@ typedef struct unix_sock {
     uint32_t      dgram_count;
 
     // ── Peer (SOCK_STREAM connected pair) ────────────────────────────────
+    // SYMMETRIC link: both ends point at each other (stream connect/accept and
+    // socketpair).  Lifetime is managed by the back-pointer clear in
+    // unix_sock_close (peer->peer == s -> NULL before the free), so `peer`
+    // never dangles -- NO owned reference is held on it.
     struct unix_sock* peer;
+
+    // ── SOCK_DGRAM connect() default destination ─────────────────────────
+    // ASYMMETRIC link: connect() on a datagram socket caches its default send
+    // target, but that target has NO back-pointer to us, so its close() cannot
+    // clear this pointer the way a symmetric peer's does.  We therefore hold an
+    // OWNED strong ref (unix_get at connect, unix_put at close/reconnect) so the
+    // destination cannot be freed out from under a later send -- without it,
+    // dgram_dest would dangle to freed memory the moment the destination
+    // closed.  Kept separate from `peer` so a socket can be both socketpair'd
+    // (symmetric `peer`) and connect()'d (owned `dgram_dest`) without the two
+    // lifetimes interfering.  NULL = no connected default destination.
+    struct unix_sock* dgram_dest;
 
     // ── Listener backlog (SOCK_STREAM only) ──────────────────────────────
     unix_pending_t* backlog_head;

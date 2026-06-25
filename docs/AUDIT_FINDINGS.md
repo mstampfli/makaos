@@ -973,3 +973,28 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   follow-up (e): the fatal-signal path (signal.c:451-454) zombifies a THREAD instead of
   self-reaping it as TASK_DEAD -- a per-thread task-struct/pid LEAK (the very thing the
   sys_exit thread branch avoids), not a memory-safety bug; investigate separately.
+- SOCK_DGRAM connect() default destination not refcounted -> FIXED (F58): the DGRAM connect
+  branch cached `s->peer = target` with no unix_get and no back-pointer (asymmetric: target
+  does not point back, so its close cannot clear the senders' cached pointers like a
+  symmetric stream/socketpair peer's close does). So connect A->B, close B (RCU-freed,
+  A->peer left dangling), then sendto(A,...,NULL) derefs freed B (type, dgram_tail enqueue,
+  wake walking B's freed waitq/->file) = DETERMINISTIC unprivileged UAF -> arbitrary kernel
+  corruption via a reused slab. RCU does not help: the pointer is cached at connect and
+  survives grace periods, so a fresh rcu section in sendto cannot resurrect long-freed
+  memory. Fix (reuse the refcount machinery): a SEPARATE owned-ref field `dgram_dest` (not
+  the symmetric `peer`) -- connect unix_get()s it (drops the old on reconnect, publish-then-
+  put), close unix_put()s it, send uses `dgram_dest ? dgram_dest : peer`. A separate field
+  (not a flag on `peer`) avoids a new UAF in the socketpair-then-connect and mutual-connect
+  cases (verify-all-angles). Behavior-changing -> a deterministic selftest
+  (unix_dgram_peer_selftest) asserts the lifecycle: connect ref+1, reconnect drops old/takes
+  new, THE INVARIANT (destination survives its own close while a sender references it ->
+  refcount==1, not freed), sendto-after-dest-close returns 2, final close balances. Boot:
+  `[unix_dgram_peer] SELF-TEST PASSED`, socketpair + refcount selftests still pass, 0 fault.
+  RECORDED follow-ups (verified-real, NOT yet fixed): (f) epoll readiness scan re-resolves
+  the watched file by raw `fd_table[w->fd]` + `f->poll(f,...)` with no ref/RCU (wrong lock)
+  while the watch already pins `w->file` -> close+reuse on another thread of the same files
+  table = UAF / freed-fnptr call; fix: poll through the pinned `w->file` (or fdget/fdput).
+  (g) futex_wake (futex.c:158-159) sets w->woken (RELEASE) then derefs w->task; a waiter
+  woken by a concurrent timeout/signal returns via the no-lock rc==0 path and can reclaim its
+  on-stack node between the two lines -> sched_wake(garbage); fix: capture w->task before the
+  RELEASE store.
