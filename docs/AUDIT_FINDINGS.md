@@ -136,11 +136,20 @@ lock. Pure helper tcp_ring_reserve + deterministic tcp_ring_reserve_selftest
 (pairs with tcp_ring_consume_selftest); code-proof of the lock placement + clean
 boot (the locked paths are not boot-exercised -- no TCP data at boot -- so the
 arithmetic is unit-tested and the placement code-proven).
+accept-queue child<->listener ordering -> FIXED (F45): the listener's
+accept_queue (accept_head/tail/count) was RMW'd by the RX thread's enqueue
+(SYN_RCVD->ESTABLISHED) and accept()'s dequeue with no lock -- torn uint8_t
+count, lost/double-dequeued child. Fixed by extracting the ring into pure
+accept_q_push/accept_q_pop helpers (single source of truth) taken under the
+LISTENER's own pcb->lock at both sites -- one lock, NO child<->listener two-lock
+cycle (the queue belongs to the listener); pcb_wake stays outside the lock.
+Deterministic tcp_accept_q_selftest (FIFO, full-reject, empty, wrap).
 REMAINING (smaller, separate item, recorded): `snd_nxt` (advanced inside
 tcp_send_segment, which also transmits -> needs the seq-advance/transmit split
-described below before it can be locked), the state-machine transitions, and the
-handshake / accept-queue two-PCB ordering. These are single-writer-dominant or
-benign-read races, NOT the dangerous txbuf_used corruption, which F44 closes.
+before it can be locked) and the connection state-machine transitions
+(state/snd_una/rcv_nxt set in SYN_SENT/SYN_RCVD/FIN paths). Single-writer-
+dominant or benign-read races, NOT the dangerous txbuf_used corruption (F44) or
+the accept-queue tear (F45).
 
 VERIFIED DESIGN NOTES (from a deep read this pass, to de-risk the dedicated run):
   - Contexts: tcp_send = syscall CPU; tcp_recv = net_rx kthread; tcp_timer_tick

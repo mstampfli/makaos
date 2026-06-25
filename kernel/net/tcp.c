@@ -175,6 +175,30 @@ static uint32_t tcp_ring_reserve(uint32_t* tail, uint32_t* used, uint32_t want,
 static inline void tcp_pcb_lock(tcp_pcb_t* pcb)   { preempt_disable(); spin_lock(&pcb->lock); }
 static inline void tcp_pcb_unlock(tcp_pcb_t* pcb) { spin_unlock(&pcb->lock); preempt_enable(); }
 
+// ── Listener accept-queue ring (single source of truth) ────────────────────
+// The completed-connection FIFO on a LISTEN pcb: the RX kernel thread enqueues
+// a child that finished its handshake (SYN_RCVD -> ESTABLISHED) while accept()
+// on a user CPU dequeues -- so accept_head/accept_tail/accept_count race and
+// the uint8_t count can tear (lost child, double-dequeue).  These two helpers
+// are the ONLY mutators of the ring; the CALLER must hold the LISTENER's
+// pcb->lock around them (the queue belongs to the listener, so it is a single
+// lock -- no child<->listener two-lock cycle).  accept_q_push returns false if
+// the backlog is full (the child is dropped, as before).
+static bool accept_q_push(tcp_pcb_t* lst, tcp_pcb_t* child) {
+    if (lst->accept_count >= TCP_BACKLOG) return false;     // full -> drop
+    lst->accept_queue[lst->accept_tail] = child;
+    lst->accept_tail = (uint8_t)((lst->accept_tail + 1u) % TCP_BACKLOG);
+    lst->accept_count++;
+    return true;
+}
+static tcp_pcb_t* accept_q_pop(tcp_pcb_t* lst) {
+    if (lst->accept_count == 0) return NULL;                 // empty
+    tcp_pcb_t* child = lst->accept_queue[lst->accept_head];
+    lst->accept_head = (uint8_t)((lst->accept_head + 1u) % TCP_BACKLOG);
+    lst->accept_count--;
+    return child;
+}
+
 // Wake any task blocked on this PCB: the blocking waiter (in recv/send/
 // connect/accept) and any poll()/select() waiter camped on the socket fd.
 // Both are fire-and-forget — a blocking task might be sleeping in recv
@@ -398,13 +422,14 @@ void tcp_recv(skbuff_t* skb) {
         if ((flags & TCP_ACK) && ntoh32(seg->ack) == pcb->snd_nxt) {
             pcb->snd_una = ntoh32(seg->ack);
             pcb->state   = TCP_ESTABLISHED;
-            // Move to listener's accept queue.
+            // Move to listener's accept queue under the LISTENER's lock (it
+            // races accept()'s dequeue); wake accept() OUTSIDE the lock.
             tcp_pcb_t* lst = pcb->listener;
-            if (lst && lst->accept_count < TCP_BACKLOG) {
-                lst->accept_queue[lst->accept_tail] = pcb;
-                lst->accept_tail = (uint8_t)((lst->accept_tail + 1u) % TCP_BACKLOG);
-                lst->accept_count++;
-                pcb_wake(lst);
+            if (lst) {
+                tcp_pcb_lock(lst);
+                bool queued = accept_q_push(lst, pcb);
+                tcp_pcb_unlock(lst);
+                if (queued) pcb_wake(lst);
             }
         }
         break;
@@ -666,10 +691,10 @@ int tcp_listen(tcp_pcb_t* pcb) {
 }
 
 tcp_pcb_t* tcp_accept(tcp_pcb_t* listener) {
-    if (listener->accept_count == 0) return NULL;
-    tcp_pcb_t* child = listener->accept_queue[listener->accept_head];
-    listener->accept_head = (uint8_t)((listener->accept_head + 1u) % TCP_BACKLOG);
-    listener->accept_count--;
+    // Dequeue under the listener's lock (races the RX thread's accept_q_push).
+    tcp_pcb_lock(listener);
+    tcp_pcb_t* child = accept_q_pop(listener);
+    tcp_pcb_unlock(listener);
     return child;
 }
 
@@ -873,4 +898,47 @@ void tcp_ring_reserve_selftest(void) {
     }
     kprintf(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
                   : "[tcp_reserve] SELF-TEST PASSED (ring reserve, clamp + wrap)\n");
+}
+
+// ── accept-queue ring selftest ────────────────────────────────────────────
+// Deterministic check of the listener accept-queue push/pop ring (now taken
+// under the listener's pcb->lock at both the RX enqueue and accept() dequeue):
+// FIFO order, full-rejects, empty->NULL, and wrap-around across the modulo.
+// Uses a kmalloc'd fake listener and distinct non-NULL marker pointers (never
+// dereferenced -- only compared for identity).
+void tcp_accept_q_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst = (tcp_pcb_t*)kmalloc(sizeof(tcp_pcb_t));
+    if (!lst) { kprintf("[tcp_accept] SELF-TEST SKIP (no mem)\n"); return; }
+    __builtin_memset(lst, 0, sizeof(*lst));     // head = tail = count = 0
+    tcp_pcb_t* mark[TCP_BACKLOG];
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        mark[i] = (tcp_pcb_t*)(uintptr_t)(0x1000u + i);  // identity-only markers
+
+    if (accept_q_pop(lst) != NULL) { kprintf("[tcp_accept] FAIL pop empty\n"); fails++; }
+
+    // Fill to the backlog; one more must be rejected.
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        if (!accept_q_push(lst, mark[i])) { kprintf("[tcp_accept] FAIL push %u\n", i); fails++; }
+    if (lst->accept_count != TCP_BACKLOG) { kprintf("[tcp_accept] FAIL count\n"); fails++; }
+    if (accept_q_push(lst, mark[0]))      { kprintf("[tcp_accept] FAIL push full\n"); fails++; }
+
+    // Drain in FIFO order to empty.
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        if (accept_q_pop(lst) != mark[i]) { kprintf("[tcp_accept] FAIL FIFO %u\n", i); fails++; }
+    if (lst->accept_count != 0 || accept_q_pop(lst) != NULL) {
+        kprintf("[tcp_accept] FAIL drained\n"); fails++; }
+
+    // Wrap-around: push+pop many times past the modulo boundary, stays FIFO.
+    for (unsigned r = 0; r < TCP_BACKLOG * 3u; r++) {
+        if (!accept_q_push(lst, mark[r % TCP_BACKLOG]) ||
+            accept_q_pop(lst) != mark[r % TCP_BACKLOG]) {
+            kprintf("[tcp_accept] FAIL wrap r=%u\n", r); fails++; }
+    }
+    if (lst->accept_count != 0) { kprintf("[tcp_accept] FAIL wrap count\n"); fails++; }
+
+    kfree(lst);
+    kprintf(fails ? "[tcp_accept] SELF-TEST FAILED\n"
+                  : "[tcp_accept] SELF-TEST PASSED (accept-queue ring: FIFO, full, empty, wrap)\n");
 }
