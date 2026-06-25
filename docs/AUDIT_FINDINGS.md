@@ -737,16 +737,22 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (POSIX-correctness, NOT memory-unsafe): wait() is per-thread not per-process
   (a thread loses a sibling-thread's forked child; reparented to init, no
   leak/UAF). LOW: sys_thread does not zero the task_t (slab-drift risk).
-- VFS path resolution -> no symlink support (no ELOOP surface). **HIGH (BACKLOG,
-  dedicated turn): unveil() is enforced ONLY in sys_open** (unveil.c is correct,
-  but unveil_check has one call site, syscall.c). Every other path syscall
-  (unlink/rename/mkdir/truncate/stat/chdir/access/exec/chmod/chown) escapes the
-  sandbox -- a process that unveil()'d itself can still mutate paths outside its
-  view. Fix = ONE shared normalize+cwd-resolve+unveil_check gate across all path
-  syscalls (needs a userland test to verify the security property, so it warrants
-  its own turn). Also MED: several path syscalls (sys_rename memcpy, sys_open/
-  exec/truncate path copy, exec argv) deref the user pointer with no _access_ok
-  -> #PF-panic DoS / kernel read; route through copy_from_user.
+- VFS path resolution -> no symlink support (no ELOOP surface). **HIGH: unveil()
+  was enforced ONLY in sys_open** -> FIXED (F38). unveil_check had one call site;
+  every other path syscall escaped the sandbox. Fixed with ONE shared gate
+  (unveil_ok, syscall.c) wired into open (refactored), unlink, rename (both
+  endpoints), mkdir, truncate, exec, stat, access -- each normalizes the path
+  (the mutating ones call normalize_path; stat/access/open via fs_lookup's
+  in-place normalize) BEFORE the gate so a `..` cannot escape the visible prefix,
+  with correct bits (CREATE for entry create/remove, WRITE for truncate, EXEC for
+  exec, READ for stat/access). Deterministic unveil_gate_selftest. sys_rename's
+  raw __builtin_memcpy of the user path was also replaced with copy_from_user.
+  Not gated (recorded): chmod/chown are no-op stubs; chdir is navigation-only
+  (its resolved file ops are gated on the absolute path, so no bypass).
+  REMAINING MED (separate pass): sys_open/exec/truncate/access still copy the
+  path via a raw `while (upath[i])` deref (bounded to 511 but no _access_ok ->
+  a kernel/non-canonical path pointer faults the kernel = DoS); needs a shared
+  strncpy_from_user-style helper (sys_rename is already converted).
 - ELF loader (beyond F13) -> SAFE as reached. phdr table + PT_LOAD range are
   overflow-checked (elf_phtab_in_bounds / elf_seg_range_ok), argv/envp stack is
   capped (MAX_ARGS/MAX_ENVS + VMM_USER_STACK_PAGES), no PT_INTERP/dynamic loader

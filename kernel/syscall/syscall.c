@@ -278,6 +278,22 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     return (uint64_t)r;
 }
 
+// ── unveil gate (shared by every path syscall) ────────────────────────────
+// OpenBSD-style: once a process has unveil()'d anything, a path outside its
+// visible set is treated as if it does not exist.  `path` MUST already be
+// absolute AND normalized (normalize_path) so a trailing `..` cannot escape the
+// visible prefix.  Returns 1 = allowed, 0 = denied (the caller returns -ENOENT,
+// like sys_open, so a hidden path is indistinguishable from a missing one).
+// No rules (count == 0) -> full visibility; the virtual mounts (/dev,/proc) are
+// exempt.  ONE helper so every path syscall enforces unveil identically --
+// previously only sys_open did, so unlink/rename/mkdir/rmdir/truncate/exec
+// bypassed the sandbox entirely.
+static int unveil_ok(const char* path, uint8_t need) {
+    if (!g_current || g_current->unveil.count == 0) return 1;
+    if (virtfs_is_virtual(path)) return 1;
+    return unveil_check(&g_current->unveil, path, need);
+}
+
 // ── sys_open ──────────────────────────────────────────────────────────────
 // open(path_ptr, flags, mode) → fd or -errno
 // flags: O_RDONLY/O_WRONLY/O_RDWR/O_CREAT/O_EXCL/O_TRUNC/O_APPEND/O_NONBLOCK/O_CLOEXEC
@@ -450,12 +466,12 @@ got_file:
     // predicate -- NOT a hand-rolled prefix test: the old `path[1..3]=='dev'`
     // form matched any real on-disk file named /devsecrets, /processData, etc.,
     // letting it skip the unveil sandbox entirely (sandbox escape).
-    if (g_current->unveil.count > 0 && !virtfs_is_virtual(path)) {
+    {
         uint8_t need_u = UNVEIL_READ;
         int oflags_acc = (int)(flags & 3);
         if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) need_u |= UNVEIL_WRITE;
         if (flags & O_CREAT)                                 need_u |= UNVEIL_CREATE;
-        if (!unveil_check(&g_current->unveil, path, need_u)) {
+        if (!unveil_ok(path, need_u)) {   // shared gate (was inline; now DRY)
             vfs_close(f);
             return (uint64_t)-ENOENT;
         }
@@ -823,6 +839,8 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     } else {
         for (uint64_t k = 0; k <= plen; k++) resolved[k] = path[k];
     }
+    normalize_path(resolved);
+    if (!unveil_ok(resolved, UNVEIL_EXEC)) return (uint64_t)-ENOENT;   // sandbox
 
     // ── Copy argv from user space (up to 256 args, 4KiB each) ────────────
     #define MAX_ARGS  256
@@ -1631,7 +1649,8 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     fs_node_t fsn;
     // stat needs no permission on the file itself — only parent dir traversal,
     // which ext2_lookup_path already checks on every component.
-    int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);
+    int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);   // normalizes path in place
+    if (!unveil_ok(path, UNVEIL_READ)) return (uint64_t)-ENOENT;   // sandbox: hide
     if (fsr != 0) {
         // TEMP: trace xkb lookup failures so we can see why dwl's keymap init fails.
         if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r')
@@ -1670,11 +1689,13 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     const char* upath = (const char*)path_ptr;
     if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
+    normalize_path(path);   // collapse .. before the unveil check + the op
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;  // sandbox
 
     // Check write permission on the file's parent directory.
-    // Find parent path.
+    // Find parent path (iterate to NUL -- normalize_path may have shortened it).
     uint64_t last = 0;
-    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
+    for (uint64_t i = 0; path[i]; i++) if (path[i] == '/') last = i;
     char parent[256];
     if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
     else { __builtin_memcpy(parent, path, last); parent[last] = '\0'; }
@@ -1705,14 +1726,21 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     char src[256], dst[256];
     const char* usrc = (const char*)src_ptr;
     const char* udst = (const char*)dst_ptr;
-    __builtin_memcpy(src, usrc, srclen);
+    // copy_from_user (not a raw memcpy) so a bad/kernel user pointer can't fault
+    // the kernel or read kernel memory into the path buffer.
+    if (copy_from_user(src, usrc, srclen) != 0) return (uint64_t)-EFAULT;
     src[srclen] = '\0';
-    __builtin_memcpy(dst, udst, dstlen);
+    if (copy_from_user(dst, udst, dstlen) != 0) return (uint64_t)-EFAULT;
     dst[dstlen] = '\0';
+    normalize_path(src);
+    normalize_path(dst);
+    // Sandbox: both endpoints must be unveiled for directory-entry change.
+    if (!unveil_ok(src, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
+    if (!unveil_ok(dst, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
 
     // Require write+exec on src parent directory.
     uint64_t src_last = 0;
-    for (uint64_t i = 0; i < srclen; i++) if (src[i] == '/') src_last = i;
+    for (uint64_t i = 0; src[i]; i++) if (src[i] == '/') src_last = i;
     char src_parent[256];
     if (src_last == 0) { src_parent[0] = '/'; src_parent[1] = '\0'; }
     else { __builtin_memcpy(src_parent, src, src_last); src_parent[src_last] = '\0'; }
@@ -1860,10 +1888,12 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     const char* upath = (const char*)path_ptr;
     if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;   // sandbox
 
     // Require write+exec on parent directory.
     uint64_t mk_last = 0;
-    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') mk_last = i;
+    for (uint64_t i = 0; path[i]; i++) if (path[i] == '/') mk_last = i;
     char mk_parent[256];
     if (mk_last == 0) { mk_parent[0] = '/'; mk_parent[1] = '\0'; }
     else { __builtin_memcpy(mk_parent, path, mk_last); mk_parent[mk_last] = '\0'; }
@@ -3461,7 +3491,8 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
         // F_OK (amode==0): existence check only — no permission needed on the file itself.
         // The path walk in ext2_lookup_path checks exec on parent dirs, which is correct.
         fs_node_t fsn;
-        int fsr = fs_lookup(path, &g_current->cred, ac_need, &fsn);
+        int fsr = fs_lookup(path, &g_current->cred, ac_need, &fsn);   // normalizes path
+        if (!unveil_ok(path, UNVEIL_READ)) return (uint64_t)-ENOENT;   // sandbox: hide
         if (fsr != 0) return (uint64_t)(int64_t)fsr;
         if (fsn.is_virtual) return 0; // already fully checked
     }
@@ -4824,6 +4855,8 @@ static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     } else {
         for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
     }
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_WRITE)) return (uint64_t)-ENOENT;   // sandbox
     // Require write permission on the file itself.
     int tr_err = 0;
     uint32_t tr_ino = ext2_lookup_path(path, &g_current->cred, &tr_err);
