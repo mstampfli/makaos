@@ -72,3 +72,8 @@ void pty_master_push(pty_t* pty, uint8_t c);
 // Head of the singly-linked list of live (not-yet-fully-closed) PTYs.
 // Used by tty_get_ctty to find PTY slaves by session.
 pty_t* pty_list_head(void);
+
+// Controlling-tty lookup: the slave tty whose session == sid, walked under the
+// PTY lock (race-free against a concurrent close unlinking the node).  Use this
+// instead of an open-coded pty_list_head() walk.
+tty_t* pty_find_ctty_slave(uint32_t sid);

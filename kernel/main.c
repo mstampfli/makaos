@@ -692,6 +692,11 @@ static void init_kthread(void) {
 
     extern void tty_ldisc_selftest(void);
     tty_ldisc_selftest();
+
+    // PTY pair lifetime: the pair is freed exactly once (both ends closed) and
+    // unlinked, under s_pty_lock (no concurrent master/slave double-free).
+    extern void pty_lifetime_selftest(void);
+    pty_lifetime_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference

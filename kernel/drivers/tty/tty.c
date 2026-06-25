@@ -418,11 +418,9 @@ tty_t* tty_get_ctty(void) {
     if (!g_current) return NULL;
     // Physical console TTY.
     if (g_tty0.session == g_current->sid) return &g_tty0;
-    // PTY slaves — walk the live PTY list (maintained in pty.c).
-    for (pty_t* p = pty_list_head(); p; p = p->next) {
-        if (p->slave.session == g_current->sid) return &p->slave;
-    }
-    return NULL;
+    // PTY slaves -- locked lookup in pty.c (race-free vs a concurrent close that
+    // unlinks/frees a node; an open-coded pty_list_head() walk could deref it).
+    return pty_find_ctty_slave(g_current->sid);
 }
 
 void tty_set_ctty(tty_t* tty) {

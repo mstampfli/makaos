@@ -1208,3 +1208,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   spans register->sleep->cleanup) + clean boot (2/2 DHCP; wayland polls constantly; copy_user_selftest
   still passes). Three of four fan-out findings now fixed (n, q); remaining: (o) pty double-free,
   (p) TCP child->listener UAF.
+- PTY pair lifetime unlocked -> concurrent master+slave close double-frees the pty_t -> FIXED (F74,
+  fan-out finding (o)): pty_master_close/pty_slave_close each did flip-flag/count + test-peer + maybe
+  kfree(pty) with no lock, so two CPUs closing the two ends (CLONE_FILES) both free; the unlocked
+  s_pty_head insert/unlink/walk could also deref a node being unlinked. Fix (one global s_pty_lock,
+  mirrors F70/F25): both close ops flip + wake + decide + unlink under the lock, free after; exactly
+  one closer frees (the second to lock), and the wakes under the lock complete before the freer frees
+  (closes the wake-vs-free race the stale RCU comment flagged). pty_free_locked split into
+  unlink-locked + free-struct; pty_alloc links the pair LAST (built first); open-by-index and a new
+  locked pty_find_ctty_slave (replacing tty_get_ctty's open-coded walk) are locked. Deterministic
+  selftest (pty_lifetime_selftest: claim, close master -> not freed, close slave -> freed+unlinked) +
+  code-proof (lock makes the free atomic) + clean boot (57 selftests; PTYs not boot-exercised, console
+  ctty path intact). All four fan-out findings (n, o, q, ...) now fixed except (p) TCP child->listener.
+  Recorded follow-up (r): the pty master ring (m_head/m_tail) is mutated unlocked producer-vs-consumer
+  -> data race / lost wakeup (masked indices keep it in-bounds, not OOB), lower severity.

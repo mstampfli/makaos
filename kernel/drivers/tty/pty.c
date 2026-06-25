@@ -55,15 +55,24 @@
 static pty_t* s_pty_head = NULL;
 static uint32_t s_next_pty_index = 0;  // monotonically increasing /dev/pts/N
 
+// Serializes the PTY pair lifetime: the s_pty_head list (insert/unlink/walk),
+// s_next_pty_index, and the open-count decision in pty_master_close /
+// pty_slave_close.  Without it two concurrent closes (master on one CPU, slave
+// on another, fd table shared via CLONE_FILES) both observe "the peer's count
+// is 0" and both kfree(pty) -> double-free / UAF; and a concurrent
+// open-by-index / ctty walk could deref a node being unlinked.  The close wakes
+// run UNDER this lock so a non-freer closer's wake of the peer's embedded waitq
+// cannot race the freer's free (the freer is always the SECOND closer to take
+// the lock, so the first's wake completes before the second frees).
+static spinlock_t s_pty_lock = SPINLOCK_INIT;
+
 pty_t* pty_list_head(void) { return s_pty_head; }
 
-// Remove pty from s_pty_head and free it.  Called when both master_open==0
-// and slave_open_count==0.
-// pty_t contains multiple wait_queue_t heads (master_waitq,
-// slave_drain_waitq, slave.waitq) that may still be referenced by
-// a concurrent wait_queue_wake_all drainer on another CPU — kfree is
-// RCU-deferred so the real free happens after every drainer completes.
-static void pty_free_locked(pty_t* pty) {
+// Unlink pty from s_pty_head.  Caller MUST hold s_pty_lock.  Pairs with the
+// locked insert in pty_alloc; once unlinked no walker (open-by-index / ctty
+// lookup, also under the lock) can observe it, so the caller can free it after
+// releasing the lock.
+static void pty_unlink_locked(pty_t* pty) {
     if (s_pty_head == pty) {
         s_pty_head = pty->next;
     } else {
@@ -71,6 +80,12 @@ static void pty_free_locked(pty_t* pty) {
             if (p->next == pty) { p->next = pty->next; break; }
         }
     }
+    pty->next = NULL;
+}
+
+// Free a pty struct (already unlinked, or never linked -- alloc error path).
+// No lock needed: the object is unreachable from s_pty_head.
+static void pty_free_struct(pty_t* pty) {
     serial_puts_dbg("[pty] free idx=");
     serial_hex_dbg((uint64_t)(uint32_t)pty->index);
     if (pty->master_buf) kfree(pty->master_buf);
@@ -272,22 +287,22 @@ static void pty_master_close(vfs_file_t* self) {
         pty_slave_close(sf);
     }
 
+    // Flip master_open, wake the slave-side waiters (blocking readers/writers,
+    // poll/epoll), and decide the free -- all UNDER s_pty_lock so a concurrent
+    // pty_slave_close cannot double-free, and so this wake of the slave waitqs
+    // cannot race that closer's free of the pty (the freer is whichever closer
+    // takes the lock SECOND, so the other's wake has already completed).
+    spin_lock(&s_pty_lock);
     pty->master_open = 0;
-
-    // Wake any slave reader (they'll get EOF / EIO).  Blocking readers
-    // sleep on slave.waitq, poll/epoll waiters too — one wake_all
-    // fires both.
     wait_queue_wake_all(&pty->slave.waitq);
-    // Also wake any slave writer blocked on a full ring — they'll
-    // notice master_open == 0 and bail out.
     wait_queue_wake_all(&pty->slave_drain_waitq);
+    int do_free = (pty->slave_open_count == 0);
+    if (do_free) pty_unlink_locked(pty);
+    spin_unlock(&s_pty_lock);
 
     kfree(ctx);
     kfree(self);
-
-    // If both sides are now closed, free the pty struct.
-    if (pty->slave_open_count == 0)
-        pty_free_locked(pty);
+    if (do_free) pty_free_struct(pty);
 }
 
 // ── Slave fd VFS operations ─────────────────────────────────────────────
@@ -384,17 +399,19 @@ static void pty_slave_close(vfs_file_t* self) {
     pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
     pty_t* pty = ctx->pty;
 
+    // Decrement, wake master-side waiters (EOF), and decide the free, all under
+    // s_pty_lock (see pty_master_close): serialises the free decision against a
+    // concurrent master close and orders this wake before any free.
+    spin_lock(&s_pty_lock);
     pty->slave_open_count--;
-
-    // Wake every master-side waiter so they observe EOF.
     wait_queue_wake_all(&pty->master_waitq);
+    int do_free = (pty->slave_open_count == 0 && !pty->master_open);
+    if (do_free) pty_unlink_locked(pty);
+    spin_unlock(&s_pty_lock);
 
     kfree(ctx);
     kfree(self);
-
-    // If both sides are now closed, free the pty struct.
-    if (pty->slave_open_count == 0 && !pty->master_open)
-        pty_free_locked(pty);
+    if (do_free) pty_free_struct(pty);
 }
 
 // ── Master ioctl ─────────────────────────────────────────────────────────
@@ -522,12 +539,14 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     pty->master_open = 1;
     pty->slave_open_count = 1;
+    // Allocate the /dev/pts index under the lock (advances a global counter).
+    // The pty is linked into s_pty_head at the END of alloc, once fully built,
+    // so a concurrent open-by-index / ctty walk never observes a half-built node
+    // and an alloc-error path just frees it (it was never linked).
+    spin_lock(&s_pty_lock);
     pty->index = (int)(s_next_pty_index++);
+    spin_unlock(&s_pty_lock);
     int idx = pty->index;
-
-    // Link into the live PTY list (head insert).
-    pty->next = s_pty_head;
-    s_pty_head = pty;
 
     serial_puts_dbg("[pty] alloc idx=");
     serial_hex_dbg((uint64_t)(uint32_t)idx);
@@ -578,11 +597,11 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     // Create master vfs_file_t
     pty_master_ctx_t* mctx = kmalloc(sizeof(pty_master_ctx_t));
-    if (!mctx) { pty_free_locked(pty); return -12; } // ENOMEM
+    if (!mctx) { pty_free_struct(pty); return -12; } // ENOMEM
     mctx->pty = pty;
 
     vfs_file_t* master = kmalloc(sizeof(vfs_file_t));
-    if (!master) { kfree(mctx); pty_free_locked(pty); return -12; }
+    if (!master) { kfree(mctx); pty_free_struct(pty); return -12; }
     __builtin_memset(master, 0, sizeof(*master));
 
     master->read        = pty_master_read;
@@ -605,11 +624,11 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     // Create slave vfs_file_t
     pty_slave_ctx_t* sctx = kmalloc(sizeof(pty_slave_ctx_t));
-    if (!sctx) { kfree(mctx); kfree(master); pty_free_locked(pty); return -12; }
+    if (!sctx) { kfree(mctx); kfree(master); pty_free_struct(pty); return -12; }
     sctx->pty = pty;
 
     vfs_file_t* slave = kmalloc(sizeof(vfs_file_t));
-    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_locked(pty); return -12; }
+    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_struct(pty); return -12; }
     __builtin_memset(slave, 0, sizeof(*slave));
 
     slave->read     = pty_slave_read;
@@ -627,6 +646,13 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     slave->refcount    = 1;
     slave->rights      = 0;
     slave->path[0]     = '\0';
+
+    // Publish into the live PTY list now that the pair is fully built (head
+    // insert under the lock; pairs with pty_unlink_locked on the close path).
+    spin_lock(&s_pty_lock);
+    pty->next = s_pty_head;
+    s_pty_head = pty;
+    spin_unlock(&s_pty_lock);
 
     *master_out = master;
     *slave_out = slave;
@@ -650,18 +676,92 @@ vfs_file_t* pty_open_master(void) {
 }
 
 vfs_file_t* pty_open_slave_by_index(int n) {
+    // Walk + claim under s_pty_lock so the lookup cannot race a concurrent
+    // close that unlinks/frees the node, and the slave_claimed flip / refcount
+    // bump is atomic w.r.t. the close-side open-count decision.
+    vfs_file_t* result = NULL;
+    spin_lock(&s_pty_lock);
     for (pty_t* p = s_pty_head; p; p = p->next) {
         if (p->index != n) continue;
-        if (!p->slave_file) return NULL;
+        if (!p->slave_file) break;          // pair not fully built yet -> NULL
         if (!p->slave_claimed) {
             // First open consumes the initial reference taken by
             // pty_alloc (slave_open_count is already 1).
             p->slave_claimed = 1;
-            return p->slave_file;
+            result = p->slave_file;
+        } else {
+            // Additional opens share the same vfs_file -- dup semantics.
+            __atomic_fetch_add(&p->slave_file->refcount, 1, __ATOMIC_RELAXED);
+            result = p->slave_file;
         }
-        // Additional opens share the same vfs_file — dup semantics.
-        __atomic_fetch_add(&p->slave_file->refcount, 1, __ATOMIC_RELAXED);
-        return p->slave_file;
+        break;
     }
-    return NULL;
+    spin_unlock(&s_pty_lock);
+    return result;
+}
+
+// Controlling-tty lookup: return the slave tty whose session == sid, walked
+// under s_pty_lock so it cannot deref a node a concurrent close is unlinking.
+tty_t* pty_find_ctty_slave(uint32_t sid) {
+    tty_t* result = NULL;
+    spin_lock(&s_pty_lock);
+    for (pty_t* p = s_pty_head; p; p = p->next) {
+        if (p->slave.session == sid) { result = &p->slave; break; }
+    }
+    spin_unlock(&s_pty_lock);
+    return result;
+}
+
+// Deterministic PTY pair-lifetime selftest (the s_pty_lock fix): a pair is
+// freed exactly once -- only after BOTH ends close -- and unlinked from the
+// live list.  Single-threaded here (the concurrent master-vs-slave double-free
+// is closed by s_pty_lock -> code-proof); runs in a kthread, driving the close
+// hooks directly on the vfs_file_t pair.
+void pty_lifetime_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf("[pty_life] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+    int idx = pty->index;
+
+    // Fresh pair: master open, one slave ref.
+    if (pty->master_open != 1 || pty->slave_open_count != 1) {
+        fails++;
+        kprintf("[pty_life] FAIL fresh m=%d s=%d\n",
+                pty->master_open, pty->slave_open_count);
+    }
+
+    // Park + claim the slave (the /dev/pts-open path) so it is a real open slave
+    // rather than an unclaimed handle the master would release on its own.
+    pty->slave_file = s;
+    vfs_file_t* claimed = pty_open_slave_by_index(idx);
+    if (claimed != s || !pty->slave_claimed) {
+        fails++;
+        kprintf("[pty_life] FAIL claim\n");
+    }
+
+    // Close the master: master_open -> 0, but the slave is still open, so the
+    // pty must NOT be freed yet (deref below is safe).
+    m->close(m);
+    if (pty->master_open != 0 || pty->slave_open_count != 1) {
+        fails++;
+        kprintf("[pty_life] FAIL after master close m=%d s=%d\n",
+                pty->master_open, pty->slave_open_count);
+    }
+
+    // Close the slave: slave_open_count -> 0 with the master already closed ->
+    // the pty is freed and unlinked.  Do NOT deref pty after this; verify it is
+    // gone from the live list by index lookup.
+    s->close(s);
+    if (pty_open_slave_by_index(idx) != NULL) {
+        fails++;
+        kprintf("[pty_life] FAIL pty not unlinked after both ends closed\n");
+    }
+
+    kprintf(fails ? "[pty_life] SELF-TEST FAILED\n"
+                  : "[pty_life] SELF-TEST PASSED (pair freed once, unlinked)\n");
 }
