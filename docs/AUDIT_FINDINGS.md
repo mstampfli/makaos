@@ -554,3 +554,48 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   ring_mask no longer changes the computed slot). Touches ~8 index sites --
   careful but contained; VERIFY each site against real code before editing.
   Good NEXT item (CRITICAL severity, clean fix once verified).
+
+## SIXTH AUDIT PASS continued (2 re-run agents) — 2 more findings
+
+- **sys_spawn SPAWN_ATTR_CRED root privilege escalation**
+  (`kernel/syscall/syscall.c:~1145` sys_spawn) -> OPEN, CRITICAL, TOP PRIORITY.
+  The SPAWN_ATTR_CRED block sets the child's uid/gid to attacker-chosen values
+  with NO caller-privilege check: `child->cred.ruid=euid=suid=a.uid;
+  child->cred.r/e/sgid=a.gid;` where `a` is copied verbatim from the user attr
+  pointer. So ANY unprivileged process calls
+  spawn("/bin/x", argv, envp, stdio, {flags=SPAWN_ATTR_CRED, uid=0, gid=0}) and
+  the child runs with euid=ruid=suid=0 = full effective root (vfs_check_perm
+  root-bypasses DAC; every cred.euid==0 / cred_is_root gate opens). Trivial local
+  privilege escalation, no preconditions. The intended caller is the uid=0
+  svcmgr dropping privilege DOWN; the kernel never verifies the caller is
+  entitled to the requested creds, so it works UP. Contrast: the pledge/unveil
+  fields in the same attr block ARE tighten-only (down-only is the documented
+  intent for those), but cred has no gate. Fix: before applying SPAWN_ATTR_CRED,
+  require cred_is_root(caller) OR (a.uid in {ruid,euid,suid} AND a.gid in
+  {rgid,egid,sgid} / supplementary) -- the same down-only rule as cred_setuid /
+  sys_setreuid; on failure tear down the child and return -EPERM (do NOT silently
+  continue). Pure-helper testable: spawn_cred_allowed(caller, uid, gid) -> caller
+  {1000,..} requesting uid 0 = deny, requesting uid 1000 = allow, root = allow
+  any. Confidence HIGH. (FIX THIS NEXT.)
+
+- **init->children plain-store vs cross-CPU CAS race**
+  (`kernel/syscall/syscall.c:~655` sys_exit + `kernel/proc/signal.c:~427`
+  signal_terminate, the `g_init_task == g_current` branch) -> OPEN (HIGH, but
+  init-exit is rare). init->children is a lock-free Treiber stack whose contract
+  (documented at sched.c:879-882) requires EVERY mutation to be an atomic CAS,
+  because exiting tasks on other CPUs CAS-prepend their orphan chains onto
+  init->children (task_child_add_chain) to reparent. But when init (= /bin/login,
+  the first non-kthread sched_add, which is exitable / fatal-signalable) itself
+  exits, both exit paths clear init->children with a PLAIN non-atomic store
+  (`g_current->children = NULL;`), racing those CAS-prepends -> torn list / a
+  reparented orphan chain dropped (unreapable task_t + pid leak) + dangling
+  children pointer in a task_t about to be RCU-freed. Fix: replace the plain
+  store with `__atomic_exchange_n(&g_current->children, NULL, __ATOMIC_ACQ_REL)`
+  (the same XCHG-drain task_children_reap already uses), ideally hoisted into one
+  shared task_children_clear() helper so the two exit paths can't drift (DRY).
+  Race-class -> code-proof (grep shows no remaining plain ->children stores
+  except pre-publication inits) + clean boot. Confidence HIGH.
+  NOTE: the setuid-on-exec gap (vfs_check_exec computes setuid_uid but both exec
+  callers discard it) was confirmed a LOW-severity FAIL-CLOSED feature gap (no
+  escalation -- setuid binaries just run with euid unchanged); not worth a fix
+  beyond noting it.
