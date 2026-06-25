@@ -618,3 +618,34 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   behaviour, do NOT fail the exec). Deterministically test the pure decision
   (apply-iff-authorized) helper. Do this as a focused turn -- it is the kind of
   code that must NOT be rushed.
+
+## ksec wiring audit (2026-06-25, prompted by user) — NOT vulnerabilities
+
+Verified every credential-changing path is fail-closed: sys_setuid/seteuid
+escalate ONLY via ksec (KSEC_OP_SETUID/SETEUID); sys_setgid/setegid return
+-EPERM on escalation (no path offered); sys_setreuid/setregid restrict non-root
+to the POSIX in-set {ruid,euid,suid}; sys_setgroups is root-only; exec setuid is
+now ksec-gated (F32). No ungated escalation remains (SPAWN_ATTR_CRED was the one
+hole, fixed in F31). The following ksec opcodes are DEFINED but UNWIRED -- they
+are OVER-RESTRICTIVE (fail-closed/safe) FEATURE gaps, NOT security holes; wiring
+them would EXPAND what policy can grant and must be done very carefully (a
+botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
+
+- **KSEC_OP_RESOURCE_FD (4) unwired** -> OPEN (feature, fail-closed). Privileged
+  resources (framebuffer map, sys_register_policy_agent, sys_setgroups, the root
+  gates at syscall.c:3023/2524) use direct cred_is_root checks; the ksec
+  resource-fd grant path is never used, so ONLY root can obtain them. Wiring it
+  would let policy grant a specific resource fd (with attenuated rights, the
+  ksec_response_t.granted_rights field) to a specific non-root process. Adds a
+  grant path -- careful.
+- **KSEC_OP_CLRUID_BIT (6) unhandled** -> OPEN (feature, fail-closed). ksec can
+  request the kernel clear a setuid bit on an inode (anti-tamper after policy
+  revokes a binary); no kernel handler exists, so the request is a no-op. Also
+  blocked today because sys_chmod can't persist a setuid bit (TODO stub,
+  syscall.c:~4665). Wiring needs ext2 setuid-bit persistence first.
+- **setgid/setegid have no ksec escalation path** -> OPEN (feature, fail-closed).
+  Asymmetric with setuid/seteuid (which ask ksec): a non-root process can never
+  gain a gid via policy (returns -EPERM). For symmetry, sys_setgid/setegid could
+  do the KSEC_OP round-trip on the escalation case like sys_setuid does. Adds a
+  grant path -- careful. (KSEC_OP_SETUID_BIT (5) IS wired: sys_chmod notifies
+  ksec on u+s, though chmod's persistence is a separate TODO.)
