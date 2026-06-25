@@ -644,6 +644,19 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
     // s_pcb_wlock; the ->next pointer updates are plain stores because
     // readers walk via rcu_dereference which on x86 is a plain load.
     uint64_t flags = spin_lock_irqsave(&s_pcb_wlock);
+    // Orphan any SYN_RCVD child that still points back at `pcb` as its listener.
+    // Once `pcb` is freed below, a child's late handshake-completing ACK would
+    // otherwise read the dangling child->listener and lock + push the accept
+    // queue of freed memory (a remote-timed heap UAF write, tcp_recv's
+    // TCP_SYN_RCVD case).  NULLing the backpointer makes that path skip the dead
+    // listener (its `if (lst)` guard).  No-op when `pcb` is not a listener (no
+    // child references it).  Under s_pcb_wlock (held for the unlink) so it
+    // cannot race a concurrent list alloc/free; a concurrent RX reader that
+    // already loaded the old child->listener is safe because `pcb`'s own free is
+    // RCU-deferred and keeps it alive until that reader drops its rcu section.
+    for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+        if (p->listener == pcb) p->listener = NULL;
+    }
     if (s_pcb_head == pcb) {
         rcu_assign_pointer(s_pcb_head, pcb->next);
     } else {
@@ -941,4 +954,58 @@ void tcp_accept_q_selftest(void) {
     kfree(lst);
     kprintf(fails ? "[tcp_accept] SELF-TEST FAILED\n"
                   : "[tcp_accept] SELF-TEST PASSED (accept-queue ring: FIFO, full, empty, wrap)\n");
+}
+
+// Deterministic test of the listener->child orphaning (the child->listener UAF
+// fix): freeing a listener PCB must NULL the ->listener backpointer of every
+// SYN_RCVD child on the live list (so the child's later handshake ACK skips the
+// freed listener), and freeing an UNRELATED pcb must NOT disturb a child.  Uses
+// the real alloc/free path on high test ports; the concurrent late-ACK race is
+// covered by code-proof (RCU keeps a concurrent reader's listener alive).
+void tcp_listener_orphan_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst   = tcp_pcb_alloc(0xFFFE);
+    tcp_pcb_t* child = tcp_pcb_alloc(0xFFFE);
+    if (!lst || !child) {
+        if (lst)   tcp_pcb_free(lst);
+        if (child) tcp_pcb_free(child);
+        kprintf("[tcp_orphan] SELF-TEST SKIP (no mem)\n");
+        return;
+    }
+    lst->state      = TCP_LISTEN;
+    child->state    = TCP_SYN_RCVD;
+    child->listener = lst;
+
+    // 1. Freeing the listener clears the child's backpointer.
+    tcp_pcb_free(lst);
+    if (child->listener != NULL) {
+        fails++;
+        kprintf("[tcp_orphan] FAIL child->listener not cleared on listener free\n");
+    }
+
+    // 2. Freeing an UNRELATED pcb must NOT clear a child's backpointer, and the
+    //    matching listener free must.
+    tcp_pcb_t* lst2  = tcp_pcb_alloc(0xFFFD);
+    tcp_pcb_t* other = tcp_pcb_alloc(0xFFFC);
+    if (lst2 && other) {
+        child->listener = lst2;
+        tcp_pcb_free(other);                    // unrelated -> must not touch child
+        if (child->listener != lst2) {
+            fails++;
+            kprintf("[tcp_orphan] FAIL unrelated free cleared child->listener\n");
+        }
+        tcp_pcb_free(lst2);                      // matching -> must clear
+        if (child->listener != NULL) {
+            fails++;
+            kprintf("[tcp_orphan] FAIL second listener free did not clear\n");
+        }
+    } else {
+        if (lst2)  tcp_pcb_free(lst2);
+        if (other) tcp_pcb_free(other);
+    }
+
+    tcp_pcb_free(child);   // cleanup
+    kprintf(fails ? "[tcp_orphan] SELF-TEST FAILED\n"
+                  : "[tcp_orphan] SELF-TEST PASSED (listener free orphans SYN_RCVD children)\n");
 }

@@ -650,6 +650,11 @@ static void init_kthread(void) {
     extern void tcp_accept_q_selftest(void);
     tcp_accept_q_selftest();
 
+    // Freeing a TCP listener PCB must orphan (NULL the ->listener of) its
+    // SYN_RCVD children so a late handshake ACK cannot deref the freed listener.
+    extern void tcp_listener_orphan_selftest(void);
+    tcp_listener_orphan_selftest();
+
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();

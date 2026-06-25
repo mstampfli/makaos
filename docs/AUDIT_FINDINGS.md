@@ -1222,3 +1222,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ctty path intact). All four fan-out findings (n, o, q, ...) now fixed except (p) TCP child->listener.
   Recorded follow-up (r): the pty master ring (m_head/m_tail) is mutated unlocked producer-vs-consumer
   -> data race / lost wakeup (masked indices keep it in-bounds, not OOB), lower severity.
+- TCP child PCB raw ->listener backpointer not cleared on listener free -> late-ACK heap UAF -> FIXED
+  (F75, fan-out finding (p)): a SYN_RCVD child stores child->listener = listener (raw); tcp_pcb_free of
+  the listener unlinks + RCU-frees it but never touches the children, so a later handshake ACK in
+  tcp_recv's SYN_RCVD case (lst = child->listener; tcp_pcb_lock(lst); accept_q_push(lst); pcb_wake(lst))
+  writes through the freed listener -- RCU does not help (the backpointer is read in a later, separate
+  reader section, after the listener's grace period). Same class as F65. Fix (universal free chokepoint,
+  mirrors F64): in tcp_pcb_free, under the held s_pcb_wlock and before unlinking, NULL the ->listener of
+  every pcb pointing at the one being freed; the SYN_RCVD ACK path's `if (lst)` then skips the dead
+  listener. No-op for non-listeners; a concurrent reader is safe via the RCU-deferred free. Deterministic
+  selftest (tcp_listener_orphan_selftest: listener free clears child->listener, unrelated free does not) +
+  code-proof + clean boot (58 selftests; TCP listeners not boot-exercised). ALL FOUR fan-out findings
+  (n, o, p, q) now fixed. Minor: the walk makes tcp_pcb_free O(live PCBs) -- fine at MakaOS scale.
