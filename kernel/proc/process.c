@@ -389,6 +389,24 @@ void task_destroy(task_t* t) {
     pid_ht_remove(t);
     pid_free(t->pid);
 
+    // Unlink from the pgid/tgid/sid signal-routing tables BEFORE the
+    // RCU-deferred free, so signal_send_pgrp / signal_send_group can
+    // never walk a freed node.  sched_add_zombie also calls this at
+    // zombie time (a prompt-removal optimization), but the pthread
+    // exit path (TASK_FLAG_THREAD -> TASK_DEAD, reaped here without
+    // ever becoming a zombie) skips sched_add_zombie entirely, so
+    // task_idx_remove MUST run at this universal final-destroy
+    // chokepoint or the dead thread stays linked in those lists with
+    // its storage freed underneath it.  task_idx_remove is idempotent
+    // (a node already unlinked has NULL prev/next and is not the bucket
+    // head, so the second call is a no-op), so the zombie path that
+    // removed early is unaffected.  Lock order is safe: task_destroy
+    // holds no rq_lock at either call site (the do_switch reaper
+    // releases rq_lock before context_switch; sys_wait reaps after
+    // sched_reap_zombie has released it), and the table lock sorts
+    // ABOVE rq_lock, so taking it here cannot invert.
+    task_idx_remove(t);
+
     // Defer the rest of the free via RCU.  Concurrent readers in
     // pid_ht_find / signal_send_pgrp / sched_for_each etc. may hold
     // a task_t pointer from a recent lookup — they must be allowed

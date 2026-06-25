@@ -951,3 +951,25 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   cycle); scratch alloc'd before the lock (EXT2_SCRATCH_ALLOC's embedded return-on-OOM
   would leak it); single unlock+return. Boot DHCP + 0 fault, no deadlock; the race is not
   boot-reproducible -> code-proof (serialisation) + clean-boot. Closes recorded follow-up (a).
+- exited pthread freed while still linked in signal-routing tables -> FIXED (F57): every
+  task is linked into the pgid/tgid/sid intrusive lists by task_idx_insert (sched_add), but
+  the ONLY remover task_idx_remove was called solely from sched_add_zombie. A pthread
+  (TASK_FLAG_THREAD) exiting via sys_exit sets TASK_DEAD and skips sched_add_zombie (by
+  design -- a thread is futex-joined, not wait()ed), so the reaper -> task_destroy ->
+  RCU kfree frees the task_t while it is STILL linked in those lists. task_destroy unlinked
+  pid_ht but not the routing tables, so the freed node stays permanently reachable;
+  signal_send_pgrp / signal_send_group walk it and deref t->next/t->state from freed memory
+  (once the slab is reused, the state guard passes and signal_send runs on a corrupted
+  task_t = arbitrary kernel write). RCU does not help: it only defers the free of an
+  UNLINKED node; this node is never unlinked. Reachable by any >=2-thread process where a
+  thread exits, then any tty job-control signal / kill(0) / kill(-pgid) to it -- exactly the
+  threaded-compositor pattern. Fix: move task_idx_remove(t) into task_destroy's synchronous
+  phase beside pid_ht_remove -- the universal final-free chokepoint both exit paths reach --
+  so a task_t is never freed while linked, for every current and future exit path.
+  task_idx_remove is idempotent (zombie path already removed early; second call is a no-op);
+  lock-safe (table lock > rq_lock, and task_destroy holds no rq_lock at either site). Boot
+  DHCP + 0 fault, all selftests pass, no deadlock; UAF race not boot-reproducible -> code-
+  proof (single-source idempotent unlink before the deferred free) + clean-boot. RECORDED
+  follow-up (e): the fatal-signal path (signal.c:451-454) zombifies a THREAD instead of
+  self-reaping it as TASK_DEAD -- a per-thread task-struct/pid LEAK (the very thing the
+  sys_exit thread branch avoids), not a memory-safety bug; investigate separately.
