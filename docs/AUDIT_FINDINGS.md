@@ -739,18 +739,20 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   userland, not the kernel.
 - fork/clone/wait/zombie -> SAFE (memory-safety). Double-reap closed by the
   XCHG-drain of children (one winner) + RCU-deferred task free; F34 holds. MED
-  (POSIX-correctness, NOT memory-unsafe) -> DEFERRED (too invasive for one clean
-  turn): wait() is per-thread not per-process -- the children Treiber stack is
-  anchored on g_current, so a child forked by thread T1 is unreapable by T2's
-  wait() (reparented to init on T1 exit, so no leak/UAF). The clean fix (anchor
-  children on the tgid LEADER, found via pid_ht_find(tgid)) is blocked by leader
-  lifetime: sys_exit reparents EVERY exiting task's own children to init (no
-  leader-stays-zombie-until-group-exit semantics), so leader-anchoring would
-  also need the leader kept alive until the last thread exits + reparent only on
-  last-thread exit -- a multi-part thread-lifecycle change that cannot be
-  completed AND verified (needs real multithreaded fork/wait tests) in one turn.
-  Revisit as a dedicated thread-model task. LOW: sys_thread does not zero the
-  task_t (slab-drift risk) -- still open.
+  (POSIX-correctness) -> FIXED (F41): wait() was per-thread not per-process --
+  the children Treiber stack was anchored on g_current, so a child forked by
+  thread T1 was unreapable by T2's wait(). Fixed by anchoring children on the
+  thread-group LEADER (pid == tgid): a tg_leader(t) helper resolves any thread
+  to its leader via pid_ht_find(tgid) under rcu_read_lock (pins it, no UAF, the
+  F16/F17 pattern; g_current fallback so never NULL/dangling), used at fork +
+  spawn (task_child_add) and wait (task_children_reap). task_children_reparent's
+  drain was made atomic (XCHG) since threads can now CAS-add to the leader's
+  list during its exit-reparent (restores the F34 all-atomic invariant). The
+  rare straggler-leak (a thread forking onto an already-exited leader before it
+  is reaped) is closed by a safety-net reparent-to-init in task_destroy (a
+  no-op for normal reaps). Deterministic tg_leader_selftest (fake leader+thread
+  +zombie-child: a child "forked by the thread" is reaped via tg_leader). LOW:
+  sys_thread does not zero the task_t (slab-drift risk) -- still open.
 - VFS path resolution -> no symlink support (no ELOOP surface). **HIGH: unveil()
   was enforced ONLY in sys_open** -> FIXED (F38). unveil_check had one call site;
   every other path syscall escaped the sandbox. Fixed with ONE shared gate

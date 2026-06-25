@@ -374,6 +374,15 @@ static void task_free_rcu(void* data) {
 
 void task_destroy(task_t* t) {
     if (!t) return;
+    // Safety net: children are normally drained onto init at exit, so a task
+    // being reaped has an empty children list and this is a no-op (atomic XCHG
+    // of NULL).  But with children anchored on the thread-group leader, a
+    // surviving thread could fork onto an already-exited leader in the window
+    // before that leader is reaped; reparent any such stragglers to init rather
+    // than leak them.  Skip if t IS init (reparent-to-self is a no-op anyway).
+    if (g_init_task && g_init_task != t)
+        task_children_reparent(t, g_init_task);
+
     // Remove from pid_ht first.  Zombies STAY in pid_ht until this
     // final destroy, so every specific-pid lookup is O(1) for
     // zombies AND living tasks.

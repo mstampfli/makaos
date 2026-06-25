@@ -1008,14 +1008,18 @@ task_t* task_children_reap(task_t* parent, uint32_t target_pid,
 // splice, updating each child's ppid in-flight.  Used by the exit
 // paths (sys_exit + signal.c fatal kill) to reparent orphans to init.
 //
-// Only the dying task walks its own children list here, so the drain
-// is a plain load — no race with itself.  The publish onto `to` is
-// the canonical CAS-prepend via task_child_add_chain.
+// The drain is an ATOMIC exchange, not a plain store: children are now
+// anchored on the thread-group LEADER (see tg_leader in syscall.c), so when a
+// leader exits, OTHER threads of the group can concurrently CAS-prepend onto
+// from->children (fork) -- a plain store would tear the lock-free Treiber
+// stack.  This restores the all-atomic invariant (every mutation of a children
+// list is a CAS/XCHG), matching task_child_add and task_children_clear.  The
+// publish onto `to` is the canonical CAS-prepend via task_child_add_chain.
 void task_children_reparent(task_t* from, task_t* to) {
     if (!from || !to || from == to) return;
 
-    task_t* chain = from->children;
-    from->children = NULL;
+    task_t* chain = __atomic_exchange_n(&from->children, (task_t*)NULL,
+                                        __ATOMIC_ACQ_REL);
     if (!chain) return;
 
     task_t* head = NULL;

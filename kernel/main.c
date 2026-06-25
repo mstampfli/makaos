@@ -452,6 +452,10 @@ static void init_kthread(void) {
     extern void spawn_cred_allowed_selftest(void);
     spawn_cred_allowed_selftest();
 
+    // Thread-group children anchoring: any thread reaps any process-child.
+    extern void tg_leader_selftest(void);
+    tg_leader_selftest();
+
     // setuid-on-exec escalation gate (now wired via ksec).  Verify it fails
     // closed: only an explicit ksec ALLOW (with an agent present) escalates.
     extern void ksec_exec_setuid_selftest(void);

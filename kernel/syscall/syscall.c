@@ -781,6 +781,21 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     return 0;
 }
 
+// Resolve the thread-group LEADER (the task whose pid == tgid) for child-list
+// anchoring.  A process's children live on ONE list -- the leader's -- so a
+// child forked by ANY thread is reapable by wait() in ANY thread of the group
+// (POSIX), instead of being stranded on the forking thread's private list.
+// MUST be called inside rcu_read_lock: pid_ht_find is RCU-protected, and the
+// caller's read section is what keeps the returned leader pinned across the
+// subsequent task_child_add / task_children_reap (no use-after-free, the
+// F16/F17 pattern).  Single-threaded (tgid == pid) or a missing leader falls
+// back to `t` itself, so it can never return a dangling pointer.
+static task_t* tg_leader(task_t* t) {
+    if (t->tgid == t->pid) return t;
+    task_t* l = pid_ht_find(t->tgid);
+    return l ? l : t;
+}
+
 // ── sys_fork ──────────────────────────────────────────────────────────────
 static uint64_t sys_fork(void) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
@@ -799,7 +814,9 @@ static uint64_t sys_fork(void) {
                               kf->r14,
                               kf->r15);
     if (!child) return (uint64_t)-ENOMEM;
-    task_child_add(g_current, child);
+    rcu_read_lock();
+    task_child_add(tg_leader(g_current), child);   // anchor on the thread-group leader
+    rcu_read_unlock();
     sched_add(child);
     return (uint64_t)child->pid;
 }
@@ -1087,6 +1104,59 @@ static int spawn_cred_allowed(const cred_t* c, uint32_t uid, uint32_t gid) {
 }
 
 #ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic check that a child forked by one thread is reapable by another
+// thread of the SAME process: tg_leader resolves any thread to the group leader
+// (pid == tgid) via the pid hash, so task_child_add (fork) and
+// task_children_reap (wait) both target ONE shared children list.  Builds fake
+// task_t's (a leader, a second thread, a zombie child), registers the leader so
+// pid_ht_find resolves it, and asserts the child "thread T forked" is reaped
+// when "thread T waits".  Synthetic high pids -- no other code references them,
+// so pid_ht_remove + kfree has no concurrent RCU reader.
+void tg_leader_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    task_t* L = (task_t*)kmalloc(sizeof(task_t));   // thread-group leader
+    task_t* T = (task_t*)kmalloc(sizeof(task_t));   // a second thread of L's group
+    task_t* C = (task_t*)kmalloc(sizeof(task_t));   // a child forked by a thread
+    if (!L || !T || !C) {
+        if (L) kfree(L); if (T) kfree(T); if (C) kfree(C);
+        kprintf("[tgleader] SELF-TEST SKIP (no mem)\n"); return;
+    }
+    __builtin_memset(L, 0, sizeof(*L));
+    __builtin_memset(T, 0, sizeof(*T));
+    __builtin_memset(C, 0, sizeof(*C));
+    L->pid = 0x7F100u; L->tgid = 0x7F100u;          // leader: pid == tgid
+    T->pid = 0x7F101u; T->tgid = 0x7F100u;          // thread in L's group
+    C->pid = 0x7F200u; C->tgid = 0x7F200u; C->state = TASK_ZOMBIE; C->child_next = NULL;
+    pid_ht_insert(L);                               // so pid_ht_find(tgid) -> L
+
+    rcu_read_lock();
+    int lead_ok = (tg_leader(T) == L) && (tg_leader(L) == L);
+    rcu_read_unlock();
+    if (!lead_ok) { kprintf("[tgleader] FAIL leader resolution\n"); fails++; }
+
+    // "Thread T forks child C" -> anchored on the leader, not on T.
+    rcu_read_lock();
+    task_child_add(tg_leader(T), C);
+    rcu_read_unlock();
+
+    // "Thread T (any group thread) waits" -> reaps from the leader's list.
+    uint8_t found = 0;
+    rcu_read_lock();
+    task_t* z = task_children_reap(tg_leader(T), C->pid, &found);
+    rcu_read_unlock();
+    if (z != C || !found) {
+        kprintf("[tgleader] FAIL cross-thread reap z=%p found=%u\n",
+                (void*)z, (unsigned)found);
+        fails++;
+    }
+
+    pid_ht_remove(L);
+    kfree(L); kfree(T); kfree(C);
+    kprintf(fails ? "[tgleader] SELF-TEST FAILED\n"
+                  : "[tgleader] SELF-TEST PASSED (any thread reaps any process-child)\n");
+}
+
 void spawn_cred_allowed_selftest(void) {
     extern void kprintf(const char*, ...);
     int fails = 0;
@@ -1281,7 +1351,9 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
         tty->fg_pgid = child->pgid;
     }
 
-    task_child_add(g_current, child);
+    rcu_read_lock();
+    task_child_add(tg_leader(g_current), child);   // anchor on the thread-group leader
+    rcu_read_unlock();
     sched_add(child);
 
     for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
@@ -1462,7 +1534,11 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
         // (x86 TSO plus the lock-chain through sched_wake/sched_sleep
         // gives us sequential consistency on every wake cycle).
         uint8_t  found = 0;
-        task_t*  zombie = task_children_reap(g_current, target_pid, &found);
+        // Reap from the thread-group leader's list so ANY thread can reap a
+        // child forked by ANY thread.  RCU pins the leader across the drain.
+        rcu_read_lock();
+        task_t*  zombie = task_children_reap(tg_leader(g_current), target_pid, &found);
+        rcu_read_unlock();
 
         if (zombie) {
             // Also remove from the home CPU's zombie list (locked
