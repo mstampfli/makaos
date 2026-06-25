@@ -484,6 +484,11 @@ static void init_kthread(void) {
     extern void access_ok_selftest(void);
     access_ok_selftest();
 
+    // rename(2) must reject moving a directory into its own subtree (mv /a /a/b)
+    // -- it would detach the subtree into an unreachable cycle.
+    extern void rename_under_selftest(void);
+    rename_under_selftest();
+
     // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
     // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
     // per-page VMA-backing validator (no prefault, so file-backed sources keep

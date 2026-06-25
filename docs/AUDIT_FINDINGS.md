@@ -1143,3 +1143,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   kmalloc (the kstack is only 8KiB). RESIDUAL follow-up (m): ext2_rename does not reject renaming a dir
   into its own subtree (`mv /a /a/b`, POSIX EINVAL) -- creates a detached cycle; needs a normalized-path
   ancestor check.
+- rename() of overlapping src/dst corrupts the fs -> FIXED (F69, follow-up (m)): two cases. (1) dir
+  into its own subtree (`mv /a /a/b`): with F68 repointing ".." this detaches /a's subtree into an
+  unreachable cycle, leaking inodes and looping path walks; POSIX EINVAL. (2) rename onto self or a
+  hard-link sibling (`mv /a/f /a/f`, dst_ino == src_ino): ext2_rename's dst-exists branch frees the
+  inode + its blocks, then re-adds the dirent pointing at the freed inode -> data loss + dangling
+  entry. Fix: pure path_dst_under_src(src,dst) (prefix walk, trailing-'/' boundary, equal != under)
+  gates sys_rename -> -EINVAL for the subtree case; ext2_rename returns success-noop when
+  dst_ino == src_ino BEFORE the destructive unlink (POSIX same-file no-op, covers hard links). The
+  two checks are disjoint (subtree has dst_ino==0). Deterministic selftest (rename_under_selftest:
+  child/grandchild -> under; equal/sibling/ancestor/unrelated -> not) + code-proof + clean boot (55
+  selftests). Completes the F68 dir-rename hardening.

@@ -1820,6 +1820,20 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     return ext2_unlink(path) ? 0 : (uint64_t)-ENOENT;
 }
 
+// Is `dst` a path strictly INSIDE `src` (a proper descendant)?  Both must be
+// normalized absolute paths.  rename(src, dst) is then forbidden (POSIX EINVAL):
+// moving a directory into its own subtree detaches that subtree into an
+// unreachable cycle (mv /a /a/b -> /a/b -> /a -> /a/b ...).  The trailing '/'
+// guard keeps siblings apart: "/abc" is NOT under "/ab".  An exact match (dst ==
+// src) is NOT "under" -- a self / hard-link rename is a no-op handled by the
+// same-inode check in ext2_rename.  Pure -> unit-tested.
+static int path_dst_under_src(const char* src, const char* dst) {
+    uint64_t i = 0;
+    while (src[i] && dst[i] && src[i] == dst[i]) i++;
+    // src fully consumed (a prefix of dst) and dst continues with "/..." -> under
+    return src[i] == '\0' && dst[i] == '/';
+}
+
 // ── sys_rename ────────────────────────────────────────────────────────────
 // rename(src_ptr, srclen, dst_ptr, dstlen) → 0 or -1
 static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
@@ -1838,6 +1852,9 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     dst[dstlen] = '\0';
     normalize_path(src);
     normalize_path(dst);
+    // Refuse to move a directory into its own subtree (mv /a /a/b): it would
+    // detach the subtree into an unreachable cycle.  POSIX EINVAL.
+    if (path_dst_under_src(src, dst)) return (uint64_t)-EINVAL;
     // Sandbox: both endpoints must be unveiled for directory-entry change.
     if (!unveil_ok(src, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
     if (!unveil_ok(dst, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
@@ -3566,6 +3583,35 @@ void access_ok_selftest(void) {
     }
     kprintf(fails ? "[access_ok_test] SELF-TEST FAILED\n"
                   : "[access_ok_test] SELF-TEST PASSED (null/kernel/wrap/end-escape rejected)\n");
+}
+
+// path_dst_under_src gates rename: a directory may not be moved into its own
+// subtree.  Verify the descendant cases match and siblings / equal / ancestor /
+// unrelated do NOT (the '/' boundary must keep "/abc" out of "/ab").
+void rename_under_selftest(void) {
+    int fails = 0;
+    struct { const char* src; const char* dst; int want; const char* d; } c[] = {
+        { "/a",     "/a/b",    1, "child" },
+        { "/a",     "/a/b/c",  1, "grandchild" },
+        { "/ab",    "/ab/c",   1, "child (longer name)" },
+        { "/a",     "/a",      0, "equal -> not under" },
+        { "/ab",    "/abc",    0, "sibling sharing a prefix" },
+        { "/a/b",   "/a/bc",   0, "sibling sharing a prefix (deep)" },
+        { "/a/b",   "/a",      0, "dst is the ancestor" },
+        { "/a",     "/b",      0, "unrelated" },
+        { "/a/b/c", "/a/b/c2", 0, "sibling at depth" },
+        { "/foo",   "/foo/foo",1, "name repeated under itself" },
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = path_dst_under_src(c[i].src, c[i].dst);
+        if (got != c[i].want) {
+            kprintf("[rename_under] FAIL %s: src=%s dst=%s got=%d want=%d\n",
+                    c[i].d, c[i].src, c[i].dst, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[rename_under] SELF-TEST FAILED\n"
+                  : "[rename_under] SELF-TEST PASSED (dir-into-own-subtree rejected)\n");
 }
 #endif
 

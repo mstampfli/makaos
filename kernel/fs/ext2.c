@@ -2989,6 +2989,13 @@ int ext2_rename(const char* src, const char* dst) {
 
     // If dst exists as a regular file, unlink it under its inode lock.
     uint32_t dst_ino = path_to_inode(dst);
+    // rename(2): if src and dst resolve to the SAME file (same inode, including
+    // two hard links to it), do nothing and succeed.  Without this guard the
+    // dst-removal below frees the inode and its blocks, then dir_add_entry
+    // re-adds a dirent pointing at the now-freed inode -- data loss + a dangling
+    // directory entry.  (The dir-into-own-subtree case is rejected earlier in
+    // sys_rename; here dst_ino is 0 for that case, so this does not mask it.)
+    if (dst_ino && dst_ino == src_ino) { spin_unlock(&s_rename_lock); return 1; }
     if (dst_ino) {
         irtree_leaf_t* dleaf = inode_lock(dst_ino);
         if (!dleaf) { spin_unlock(&s_rename_lock); return 0; }
