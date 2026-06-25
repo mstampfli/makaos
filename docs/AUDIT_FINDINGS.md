@@ -1276,3 +1276,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pointers declared NULL before the first goto out (so out's kfree never reads garbage); kmalloc-fail paths
   leave the pointer NULL and -- for inst_fds -- vfs_close the dequeued payload. Per-CPU bounce rejected (held
   across the blocking sleep). Code-proof + no-jump-crosses-init compile + clean boot (58 PASSED).
+- epoll_wait/epoll_ctl deref the un-refcounted fd_to_file(epfd) across an op -> sibling-close UAF -> FIXED
+  (F80, recorded fd_to_file follow-up): epoll_close kfrees state/self with NO RCU; epoll_wait sleeps on
+  state->wq (the sharp sleep-UAF: post-wake task_we_remove + the next spin_lock deref freed state), epoll_ctl
+  holds state across spin_lock+kmalloc+register (narrower SMP-concurrent free). Fix: fdget(epfd)/fdput on
+  every return path (single-exit goto out, all locals before the first goto so no jump-crosses-init, inline
+  fdput for the not-an-epoll case). Watched-fd polling already safe (pinned w->file, F60). Code-proof + clean
+  compile + clean boot (58 PASSED incl. epoll_pin). RECORDS (u): epoll_ctl ADD/MOD read the WATCHED fd raw
+  (fd_table[tfd]) then vfs_tryget it in register -- a sibling close(tfd) racing the gap can free+reuse wf
+  before the tryget; mitigated (tryget) and narrower, but real; fix = fdget(tfd) across register, fdput after.

@@ -4899,22 +4899,27 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
                                uint64_t event_ptr) {
     if (!g_current) return (uint64_t)-EINVAL;
 
-    vfs_file_t* ef = fd_to_file(epfd);
-    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the epoll file so a sibling thread's
+    // close(epfd) cannot epoll_close()->kfree the eventpoll struct under
+    // us mid-op (the switch holds state across kmalloc and registration).
+    // fdput on every exit via the single goto out.
+    vfs_file_t* ef = fdget(epfd);
+    if (!ef) return (uint64_t)-EBADF;
+    if (ef->close != epoll_close) { fdput(ef); return (uint64_t)-EBADF; }
     epoll_state_t* state = (epoll_state_t*)ef->ctx;
+    int32_t tfd = (int32_t)fd;
+    task_files_t* files = g_current->files_shared;
+    uint64_t ret;
 
     epoll_event_t ev;
     if (op != EPOLL_CTL_DEL) {
-        if (!event_ptr) return (uint64_t)-EINVAL;
-        if (copy_from_user(&ev, (const void*)event_ptr, sizeof(ev)) != 0)
-            return (uint64_t)-EFAULT;
+        if (!event_ptr) { ret = (uint64_t)-EINVAL; goto out; }
+        if (copy_from_user(&ev, (const void*)event_ptr, sizeof(ev)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
     }
 
-    int32_t tfd = (int32_t)fd;
-    task_files_t* files = g_current->files_shared;
-
     spin_lock(&state->lock);
-    uint64_t ret;
     switch (op) {
     case EPOLL_CTL_ADD: {
         if (ep_find(state, tfd) < state->cap) { ret = (uint64_t)-EEXIST; break; }
@@ -4969,6 +4974,8 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         break;
     }
     spin_unlock(&state->lock);
+out:
+    fdput(ef);
     return ret;
 }
 
@@ -5035,12 +5042,17 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     if (!g_current) return (uint64_t)-EINVAL;
     if (!events_ptr || maxevents == 0 || maxevents > 1024) return (uint64_t)-EINVAL;
 
-    vfs_file_t* ef = fd_to_file(epfd);
-    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the epoll file so a sibling thread's
+    // close(epfd) cannot epoll_close()->kfree the eventpoll struct while
+    // we sleep on state->wq below.  fdput on every exit via goto out.
+    vfs_file_t* ef = fdget(epfd);
+    if (!ef) return (uint64_t)-EBADF;
+    if (ef->close != epoll_close) { fdput(ef); return (uint64_t)-EBADF; }
     epoll_state_t* state = (epoll_state_t*)ef->ctx;
 
     task_files_t* files = g_current->files_shared;
     epoll_event_t* uevents = (epoll_event_t*)events_ptr;
+    uint64_t ret;
 
     int infinite = (timeout_ms == (uint64_t)-1);
     extern uint64_t tsc_read_ns(void);
@@ -5055,7 +5067,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     // above, so the allocation is at most 16 KiB.
     epoll_event_t* kevents = (epoll_event_t*)kmalloc(
         (uint64_t)maxevents * sizeof(epoll_event_t));
-    if (!kevents) return (uint64_t)-ENOMEM;
+    if (!kevents) { ret = (uint64_t)-ENOMEM; goto out; }
 
     // One task_we_t on the epoll's own wq — stack allocated, zero per-wakeup alloc.
     task_we_t task_we;
@@ -5170,12 +5182,14 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     if (count > 0) {
         if (copy_to_user(uevents, kevents,
                           (uint64_t)count * sizeof(epoll_event_t)) != 0) {
-            kfree(kevents);
-            return (uint64_t)-EFAULT;
+            ret = (uint64_t)-EFAULT; goto out;
         }
     }
-    kfree(kevents);
-    return (uint64_t)(int64_t)count;
+    ret = (uint64_t)(int64_t)count;
+out:
+    if (kevents) kfree(kevents);
+    fdput(ef);
+    return ret;
 }
 
 // ── sys_readlink ──────────────────────────────────────────────────────────
