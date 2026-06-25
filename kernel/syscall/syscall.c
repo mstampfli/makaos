@@ -1034,6 +1034,49 @@ enoexec:
 }
 
 // ── sys_spawn ─────────────────────────────────────────────────────────────
+// May the caller spawn a child running as (uid, gid)?  Root may set any creds;
+// a non-root caller may only request uids/gids it ALREADY holds -- the same
+// down-only rule cred_setuid/cred_setgid enforce, so the single permission
+// model can't be bypassed by routing a privilege change through spawn().
+// Without this gate SPAWN_ATTR_CRED applied the attacker-supplied uid/gid
+// verbatim, letting any process spawn a euid==0 (root) child -- a trivial LPE.
+// Pure -> unit-tested (spawn_cred_allowed_selftest).
+static int spawn_cred_allowed(const cred_t* c, uint32_t uid, uint32_t gid) {
+    if (cred_is_root(c)) return 1;                       // root: any creds
+    int uid_ok = (uid == c->ruid || uid == c->euid || uid == c->suid);
+    int gid_ok = (gid == c->rgid || gid == c->egid || gid == c->sgid ||
+                  cred_in_group(c, gid));
+    return uid_ok && gid_ok;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+void spawn_cred_allowed_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // Non-root caller holding only uid/gid 1000.
+    cred_t u; __builtin_memset(&u, 0, sizeof(u));
+    u.ruid = u.euid = u.suid = 1000; u.rgid = u.egid = u.sgid = 1000;
+    if (spawn_cred_allowed(&u, 0, 0))      { kprintf("[spawn_cred] FAIL u->0\n"); fails++; }   // deny escalation
+    if (spawn_cred_allowed(&u, 0, 1000))   { kprintf("[spawn_cred] FAIL u->uid0\n"); fails++; } // deny uid0 even if gid ok
+    if (spawn_cred_allowed(&u, 1000, 0))   { kprintf("[spawn_cred] FAIL u->gid0\n"); fails++; } // deny gid0
+    if (!spawn_cred_allowed(&u, 1000, 1000)){ kprintf("[spawn_cred] FAIL u->self\n"); fails++; }// allow own
+    // suid==0 (a setuid program that dropped euid) may spawn a uid0 child.
+    cred_t s; __builtin_memset(&s, 0, sizeof(s));
+    s.ruid = s.euid = 1000; s.suid = 0; s.rgid = s.egid = s.sgid = 1000;
+    if (!spawn_cred_allowed(&s, 0, 1000))  { kprintf("[spawn_cred] FAIL suid0->uid0\n"); fails++; }
+    // Supplemental group membership allows that gid.
+    cred_t g; __builtin_memset(&g, 0, sizeof(g));
+    g.ruid = g.euid = g.suid = 1000; g.rgid = g.egid = g.sgid = 1000;
+    g.supplemental[0] = 50; g.ngroups = 1;
+    if (!spawn_cred_allowed(&g, 1000, 50)) { kprintf("[spawn_cred] FAIL suppgrp\n"); fails++; }
+    // Root caller may set anything.
+    cred_t r; __builtin_memset(&r, 0, sizeof(r));   // all-zero = euid 0 = root
+    if (!spawn_cred_allowed(&r, 1234, 5678)){ kprintf("[spawn_cred] FAIL root->any\n"); fails++; }
+    kprintf(fails ? "[spawn_cred] SELF-TEST FAILED\n"
+                  : "[spawn_cred] SELF-TEST PASSED (no spawn credential escalation)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
+
 // spawn(path_ptr, argv_ptr, envp_ptr, stdio_ptr, attr_ptr) → child pid, -errno.
 //
 // Loads an ELF from the given absolute ext2 path into a brand-new address
@@ -1117,6 +1160,24 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
         stdio[0] = us[0]; stdio[1] = us[1]; stdio[2] = us[2];
     }
 
+    // ── Read + pre-validate spawn_attr BEFORE creating the child ──────────
+    // Read the attr ONCE here (so the credential check and its later
+    // application use the SAME copy -- no TOCTOU where the user flips a.uid
+    // between check and apply) and reject an unentitled SPAWN_ATTR_CRED request
+    // before any child resources are allocated (so a denial needs no teardown).
+    // A malformed attr pointer is ignored (have_attr stays 0), matching the
+    // prior lenient behaviour for the non-cred attrs.
+    spawn_attr_t a;
+    __builtin_memset(&a, 0, sizeof(a));
+    int have_attr = 0;
+    if (attr_ptr && _access_ok(attr_ptr, sizeof(spawn_attr_t))) {
+        __builtin_memcpy(&a, (const void*)attr_ptr, sizeof(spawn_attr_t));
+        have_attr = 1;
+        if ((a.flags & SPAWN_ATTR_CRED) &&
+            !spawn_cred_allowed(&g_current->cred, a.uid, a.gid))
+            goto bad_cred;   // unprivileged request for creds it does not hold
+    }
+
     // ── Launch ────────────────────────────────────────────────────────────
     uint32_t pid = pid_alloc();
     if (!pid) goto oom_envp;
@@ -1135,14 +1196,11 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     child->ppid = g_current->pid;
 
     // ── Apply spawn_attr if provided ──────────────────────────────────────
-    // spawn_attr_t is now ~32 bytes (unveil is a separate pointer), so it's
-    // safe to copy directly onto the kernel stack.
-    if (attr_ptr) {
-        if (!_access_ok(attr_ptr, sizeof(spawn_attr_t))) goto bad_attr;
-        spawn_attr_t a;
-        __builtin_memcpy(&a, (const void*)attr_ptr, sizeof(spawn_attr_t));
-
+    // `a` was read + pre-validated above (single read -> no TOCTOU); apply it
+    // here now that the child exists.
+    if (have_attr) {
         if (a.flags & SPAWN_ATTR_CRED) {
+            // Pre-validated by spawn_cred_allowed before the child was created.
             child->cred.ruid = a.uid;
             child->cred.euid = a.uid;
             child->cred.suid = a.uid;
@@ -1199,6 +1257,13 @@ oom_envp:
 oom_argv:
     if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
     return (uint64_t)-ENOMEM;
+
+bad_cred:
+    // SPAWN_ATTR_CRED requested creds the caller is not entitled to.  No child
+    // was created yet, so just free the arg/env copies and fail.
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    return (uint64_t)-EPERM;
 }
 
 // ── sys_thread ────────────────────────────────────────────────────────────

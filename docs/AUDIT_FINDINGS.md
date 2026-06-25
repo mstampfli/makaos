@@ -558,7 +558,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
 ## SIXTH AUDIT PASS continued (2 re-run agents) — 2 more findings
 
 - **sys_spawn SPAWN_ATTR_CRED root privilege escalation**
-  (`kernel/syscall/syscall.c:~1145` sys_spawn) -> OPEN, CRITICAL, TOP PRIORITY.
+  (`kernel/syscall/syscall.c` sys_spawn) -> FIXED (F31), was CRITICAL.
   The SPAWN_ATTR_CRED block sets the child's uid/gid to attacker-chosen values
   with NO caller-privilege check: `child->cred.ruid=euid=suid=a.uid;
   child->cred.r/e/sgid=a.gid;` where `a` is copied verbatim from the user attr

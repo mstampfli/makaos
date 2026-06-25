@@ -444,6 +444,11 @@ static void init_kthread(void) {
     extern void copy_user_selftest(void);
     copy_user_selftest();
 
+    // Audit fix: sys_spawn SPAWN_ATTR_CRED applied attacker-chosen uid/gid with
+    // no caller check (root LPE).  Verify the down-only credential gate.
+    extern void spawn_cred_allowed_selftest(void);
+    spawn_cred_allowed_selftest();
+
     // Audit fix: sys_mmap/sys_munmap page-rounded user len with a wrapping add
     // and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
     // munmap) at a higher-half address drove the unmap+free path through the
