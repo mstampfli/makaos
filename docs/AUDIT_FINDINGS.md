@@ -401,19 +401,27 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   free) so it is a separate lower-severity concern if it lacks a user-half bound.
 
 - **futex_wait raw user deref under the bucket spinlock**
-  (`kernel/proc/futex.c:77` futex_wait) -> OPEN. The authoritative post-enqueue
-  compare is `cur = *(volatile uint32_t*)uaddr;` done UNDER b->lock; a concurrent
-  munmap/mprotect(PROT_NONE) of that page (same address space, another CPU,
-  unserialized vs the futex bucket) faults the read -> the page-fault handler
-  takes mm->vma_lock and may alloc/sleep while a raw spinlock is held
-  (fault-under-spinlock + lock-nest -> panic/DoS, attacker-controlled). The
-  "stays mapped, cannot fault" comment is false (no swap != no munmap). Fix:
-  do the compare with a fault-safe read (copy_from_user / get_user) OUTSIDE
-  b->lock, keeping enqueue-before-recheck for the lost-wake fence; on -EFAULT
-  unlink + return -EFAULT (the timeout path already implements the unlink).
-  Verify: code-proof + a boot-selftest that FUTEX_WAITs on an unmapped addr and
-  asserts -EFAULT instead of panic. Confidence MED-HIGH (race-class). Reachable
-  via every pthread mutex. Good NEXT item (clean, high-value).
+  (`kernel/proc/futex.c` futex_wait) -> FIXED (F27). The authoritative
+  post-enqueue compare was `cur = *(volatile uint32_t*)uaddr;` done UNDER
+  b->lock; a concurrent munmap/mprotect(PROT_NONE) of that page (same address
+  space, another CPU, unserialized vs the futex bucket) faulted the read -> the
+  page-fault handler takes mm->vma_lock and may alloc/sleep while a raw spinlock
+  is held (fault-under-spinlock + lock-nest -> panic/DoS, attacker-controlled).
+  The "stays mapped, cannot fault" comment was false (no swap != no munmap).
+  Fixed: restructured to enqueue under b->lock, UNLOCK, then do the authoritative
+  re-read with a fault-safe copy_from_user OUTSIDE the lock. The lost-wake fence
+  still holds: the spin_lock ACQUIRE barrier (not the enqueue store) orders the
+  re-read after any waker's prior bucket-unlock, so a concurrent FUTEX_WAKE
+  either already saw our enqueue (and set w.woken) or wrote the new value we now
+  read. On fault/mismatch: re-take b->lock, consume the wake if w.woken (return
+  0) else unlink + return -EFAULT/-EAGAIN (mirrors the existing timeout-path
+  unlink). Added an early `cur != val -> -EAGAIN` fast-path (no enqueue needed).
+  Verified: code-proof (no raw user deref remains under b->lock; copy_from_user
+  -> user_buf_prefault uses RCU + returns -EFAULT for a no-VMA page, and is
+  called with the lock dropped so no nest) + the copy_from_user safety is already
+  covered by copy_user_selftest + clean boot (qemu healthy through userland, no
+  panic/hang; a futex lock bug would deadlock the desktop's pthread mutexes).
+  Race-class (F2/F3/F5/F11 precedent) so no bespoke deterministic test.
 
 - **pipe double-free / UAF on concurrent last-close**
   (`kernel/fs/pipe.c` pipe_read_close/pipe_write_close) -> FIXED (F25). The

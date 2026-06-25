@@ -56,11 +56,12 @@ int64_t futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout_ns) {
     void* mm = g_current->mm_shared->mm;
     futex_bucket_t* b = bucket_of(mm, (uint64_t)uaddr);
 
-    // Prefault the user word OUTSIDE the bucket lock — the first touch
-    // can demand-page (which may sleep); once present it stays mapped
-    // (no swap), so the locked re-read below cannot fault.
+    // Fast reject of a bad/unmapped pointer before we enqueue.  copy_from_user
+    // validates (_access_ok) + prefaults; it is fault-safe (returns -EFAULT,
+    // never a kernel #PF) and is NOT under any lock here.
     uint32_t cur;
     if (copy_from_user(&cur, uaddr, sizeof(cur)) != 0) return -EFAULT;
+    if (cur != val) return -EAGAIN;   // already changed: no need to enqueue
 
     futex_waiter_t w = {
         .next  = (futex_waiter_t*)0,
@@ -73,14 +74,37 @@ int64_t futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout_ns) {
     spin_lock(&b->lock);
     w.next  = b->head;
     b->head = &w;
-    // Authoritative check AFTER enqueue (lost-wake fence: see header).
-    cur = *(volatile uint32_t*)uaddr;
-    if (cur != val) {
-        b->head = w.next;          // we are still the head — just pushed
-        spin_unlock(&b->lock);
-        return -EAGAIN;
-    }
     spin_unlock(&b->lock);
+
+    // Authoritative re-read AFTER publishing the enqueue, done with a fault-safe
+    // copy_from_user OUTSIDE b->lock.  The old code re-read with a raw
+    // `*(volatile uint32_t*)uaddr` while HOLDING b->lock: a concurrent
+    // munmap/mprotect(PROT_NONE) of the page (another thread of this process,
+    // unserialised against the futex bucket) faulted that read -> the #PF
+    // handler takes mm->vma_lock and may alloc/sleep while a raw spinlock is
+    // held (fault-under-spinlock + lock nest -> panic/DoS).  Doing it via
+    // copy_from_user with the lock dropped returns -EFAULT instead.
+    //
+    // Lost-wake fence still holds: the spin_lock acquire above orders this read
+    // after any waker's prior bucket-unlock, so a concurrent FUTEX_WAKE either
+    // already observed our enqueue (and unlinked + woke us -> w.woken) or wrote
+    // the new value that we now read (cur != val).
+    uint32_t cur2;
+    int fault = copy_from_user(&cur2, uaddr, sizeof(cur2));
+    if (fault != 0 || cur2 != val) {
+        spin_lock(&b->lock);
+        if (w.woken) {
+            // A waker unlinked + woke us between the enqueue and this re-read;
+            // consume the wake as a successful wait.
+            spin_unlock(&b->lock);
+            return 0;
+        }
+        for (futex_waiter_t** pp = &b->head; *pp; pp = &(*pp)->next) {
+            if (*pp == &w) { *pp = w.next; break; }
+        }
+        spin_unlock(&b->lock);
+        return fault ? -EFAULT : -EAGAIN;
+    }
 
     uint64_t deadline = timeout_ns ? tsc_read_ns() + timeout_ns : 0;
     int64_t rc = 0;
