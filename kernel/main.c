@@ -500,6 +500,8 @@ static void init_kthread(void) {
     ext2_block_valid_selftest();
     extern void ext2_blk_lba_selftest(void);
     ext2_blk_lba_selftest();
+    extern void xfer_bytes_ok_selftest(void);
+    xfer_bytes_ok_selftest();
 
     // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
     // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.

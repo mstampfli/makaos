@@ -835,3 +835,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   grep missed; all FOUR ext2 LBA sites now go through ext2_blk_to_lba (zero `uint32_t
   lba` remain). Separate layer (recorded, not this fix): ahci_read/write do not bound
   lba vs device size.
+- AHCI sector->byte size wrap -> FIXED (F47): ahci_submit_hhdm / ahci_submit_sg /
+  ahci_read_user formed `uint32_t bytes = count * 512` then bounded the DMA by a
+  byte-derived guard (npages<=130 / 248-PRDT rem-check) while issue_cmd got the raw
+  count. A count >= 2^23 wraps count*512 to a small value -> the byte guard passes but
+  the HBA moves the huge count -> DMA overrun. LATENT (every caller today caps count
+  <= AHCI_DMA_SECTORS=1024; F40-class defense-in-depth on an exported API). Fixed by
+  the new pure primitive xfer_bytes_ok(sectors, sector_size, max_bytes, *out) forming
+  the length in u64 + a bound; applied at all three sites (read_user's max is the exact
+  npages<=130 equivalent, so the redundant check was deleted). do_rw_direct left as-is
+  (n capped at 65535). xfer_bytes_ok_selftest drives the 2^32 wrap. SAME-CLASS sibling
+  recorded, not fixed (nvme not boot-verifiable): nvme_rw `nlb * s_ns_lba_size`.

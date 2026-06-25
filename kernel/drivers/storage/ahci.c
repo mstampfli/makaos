@@ -587,6 +587,21 @@ static void slot_wait(uint32_t slot) {
                     ahci_rescan_completions());
 }
 
+// PRIMITIVE (DMA transfer sizing): byte length of `sectors` sectors, overflow-safe
+// and bounded.  Computes the length in 64-bit so `sectors * sector_size` can never
+// wrap a u32 and slip past a byte-based transfer guard -- the wrap would make a huge
+// request look tiny, so the PRDT/page bound passes while the HBA is still told to
+// move the huge sector count -> DMA overrun.  Returns false (reject) if sectors == 0
+// or the length exceeds max_bytes; on true, *out_bytes holds the length and is
+// <= max_bytes so it fits u32 losslessly.  Pure -> unit-tested (xfer_bytes_ok_selftest).
+static inline bool xfer_bytes_ok(uint32_t sectors, uint32_t sector_size,
+                                 uint32_t max_bytes, uint32_t* out_bytes) {
+    uint64_t b = (uint64_t)sectors * sector_size;   // 64-bit: cannot wrap
+    if (sectors == 0 || b > max_bytes) return false;
+    *out_bytes = (uint32_t)b;                        // safe: b <= max_bytes <= UINT32_MAX
+    return true;
+}
+
 // ── Pre-scheduler polling path ────────────────────────────────────────────
 // Slot 0, per-slot command table, direct zero-copy DMA to destination.
 // Runs single-threaded (BSP only, interrupts off) before sched_init().
@@ -709,7 +724,10 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
                                   uint8_t write) {
     if (!buf || !count) return 0;
 
-    uint32_t bytes = count * 512u;
+    // 64-bit length so a huge count cannot wrap u32 and slip past the 248-entry
+    // PRDT bound below while issue_cmd is still handed the raw sector count.
+    uint32_t bytes;
+    if (!xfer_bytes_ok(count, 512u, 0xFFFFFFFFu, &bytes)) return 0;
 
     // Acquire exclusive submit: spin-CAS with sleep-fallback.
     for (;;) {
@@ -807,7 +825,8 @@ static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
     for (uint32_t i = 0; i < npages; i++)
         phys_pages[i] = (phys_addr_t)((uint64_t)pages[i] - HHDM_OFFSET);
 
-    uint32_t bytes = count * 512u;
+    uint32_t bytes;
+    if (!xfer_bytes_ok(count, 512u, 130u * PAGE_SIZE, &bytes)) return 0;  // <= npages cap
     uint32_t slot  = slot_alloc();
 
     cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
@@ -843,11 +862,13 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
     if (!s_irq_ready) return do_rw_direct(lba, user_buf, count, 0);
 
     uint64_t va        = (uint64_t)user_buf;
-    uint32_t total_bytes = count * 512u;
     uint32_t first_off = (uint32_t)(va & 0xFFFu);
+    // npages <= 130  <=>  first_off + count*512 <= 130*PAGE_SIZE.  Form the length
+    // in u64 (xfer_bytes_ok) so a huge count cannot wrap u32 and fake a small npages
+    // that passes this bound while the DMA still moves the huge count -> overrun.
+    uint32_t total_bytes;
+    if (!xfer_bytes_ok(count, 512u, 130u * PAGE_SIZE - first_off, &total_bytes)) return 0;
     uint32_t npages    = (first_off + total_bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
-
-    if (npages > 130u) return 0;
 
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
     void* page_ptrs[130];
@@ -1099,3 +1120,36 @@ uint8_t ahci_init(void) {
 
     return 0;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+#include "kprintf.h"
+// xfer_bytes_ok forms a sector->byte length in 64-bit so the transfer-size guards
+// (PRDT capacity, npages<=130) cannot be bypassed by a u32 wrap.  Drive the WRAP
+// boundary explicitly: a naive u32 `sectors*512` would truncate the 2^23 case to 0
+// and pass; the primitive rejects it.
+void xfer_bytes_ok_selftest(void) {
+    kprintf("[ahci_xfer] xfer_bytes_ok must size sector transfers in u64, no wrap\n");
+    int fails = 0;
+    struct { uint32_t sectors, ssz, max; uint8_t want_ok; uint32_t want_bytes; } c[] = {
+        { 0,         512, 1u << 20,    0, 0 },            // zero sectors -> reject
+        { 8,         512, 1u << 20,    1, 4096 },          // normal
+        { 2,         512, 1024,        1, 1024 },          // exact boundary (bytes == max)
+        { 3,         512, 1024,        0, 0 },             // one sector over the bound
+        { 0x800000u, 512, 0xFFFFFFFFu, 0, 0 },            // sectors*512 == 2^32: u32 wraps to 0
+        { 0x7FFFFFu, 512, 0xFFFFFFFFu, 1, 0xFFFFFE00u },   // just under the u32 wrap
+        { 0x200000u, 512, 0xFFFFFFFFu, 1, 0x40000000u },   // 2^30, large no-wrap
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = 0xDEADBEEFu;
+        bool ok = xfer_bytes_ok(c[i].sectors, c[i].ssz, c[i].max, &got);
+        if (ok != (c[i].want_ok != 0) || (ok && got != c[i].want_bytes)) {
+            kprintf("[ahci_xfer] FAIL sectors=0x%lx max=0x%lx ok=%d want=%d bytes=0x%lx want=0x%lx\n",
+                    (unsigned long)c[i].sectors, (unsigned long)c[i].max, ok, c[i].want_ok,
+                    (unsigned long)got, (unsigned long)c[i].want_bytes);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ahci_xfer] SELF-TEST FAILED\n"
+                  : "[ahci_xfer] SELF-TEST PASSED (sector-bytes u64, no wrap, bounded)\n");
+}
+#endif

@@ -103,6 +103,17 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   write_block, and the two inode_build_run DMA read paths (the ELF-loader /
   bulk-read fast path) -- the latter two were a second pair of the same bug, caught
   on the verify-all-angles "same class elsewhere" sweep after the first F46 commit.
+- `xfer_bytes_ok(sectors, sector_size, max_bytes, *out)` (kernel/drivers/storage/ahci.c,
+  F47) -- byte length of a sector transfer, formed in u64 and bounded, so
+  `sectors*sector_size` cannot wrap a u32 and slip past a byte-based DMA guard (the
+  wrap makes a huge request look tiny -> PRDT/page bound passes -> HBA moves the huge
+  count -> overrun). Returns false on 0 sectors / over-bound. Used at all three AHCI
+  count*512 sites (ahci_submit_hhdm, ahci_submit_sg, ahci_read_user, replacing the
+  bare `count*512` + the now-redundant `npages>130` check). `xfer_bytes_ok_selftest`
+  drives the `sectors*512 == 2^32` wrap. (Latent: current callers cap count <= 1024;
+  this hardens the guards against a future unbounded caller.) SAME-CLASS sibling
+  recorded, not yet fixed: nvme_rw `nlb * s_ns_lba_size` (kernel/drivers/storage/nvme.c)
+  -- separate driver, not boot-verifiable (nvme is not the boot device).
 
 ## Status
 
