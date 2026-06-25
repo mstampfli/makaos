@@ -369,6 +369,12 @@ static void task_free_rcu(void* data) {
     task_files_release(t->files_shared);
     kfree(t->cwd);
     unveil_free(&t->unveil);
+    // Disown any signalfd that still references this task (an inherited or
+    // SCM_RIGHTS-passed signalfd outlives its owner): NULL its raw owner
+    // pointer before we free the task_t, or a later read/poll/close on the
+    // surviving fd would dereference freed memory.  Must precede kfree(t).
+    extern void signalfd_disown_all(task_t* t);
+    signalfd_disown_all(t);
     kfree(t);
 }
 

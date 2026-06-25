@@ -1062,3 +1062,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   unix_get; client closed-while-CONNECTING is freed but left on the listener backlog; accept derefs
   freed pend->client (unix_sock.c:851-863). Fix: unix_get at enqueue, unix_put + tryget/state-check
   at accept/drain (mirror F58).
+- signalfd owner UAF -> FIXED (F64, follow-up (i)): signalfd_state_t.owner is a raw
+  non-refcounted task_t*; an inherited (fork vfs_dup) or SCM_RIGHTS-passed signalfd outlives
+  the owner, and task_free_rcu frees the task without NULLing s->owner -> child read/poll/close
+  derefs the freed task (signalfd.c:79/114/131/145), deterministic on fork+parent-exit+child-
+  read. Fix: signalfd_disown_all(t) in task_free_rcu (NULL owner + clear head + wake waitqs
+  under s_sfd_lock, before kfree(t)); read every owner deref into a local UNDER s_sfd_lock in
+  claim/poll/close (TOCTOU + lifetime: disown needs the same lock, so a reader keeps the owner
+  alive); owner-gone -> read EOF / poll POLLHUP (no hang). Deterministic selftest (Case 6:
+  disown then read=0 EOF + poll POLLHUP) + code-proof + clean boot (49 selftests, 0 fault, no WD).

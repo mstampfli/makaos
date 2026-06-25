@@ -74,21 +74,35 @@ _Static_assert(sizeof(signalfd_siginfo_t) == 128,
 //    signal number (1-NSIG) or 0 if nothing available.  Atomically
 //    clears the pending bit so two readers don't return the same
 //    signal. ────────────────────────────────────────────────────
-static int sfd_claim_one(signalfd_state_t* s) {
-    if (!s->owner) return 0;
-    sigstate_t* ss = &s->owner->sigstate;
-    uint32_t eligible;
+// Returns: >0 = the claimed signal (and *out_pid = owner pid, read under the
+// lock); 0 = nothing eligible right now; -1 = the owner task has exited
+// (disowned) -> the reader treats it as EOF.
+static int sfd_claim_one(signalfd_state_t* s, uint32_t* out_pid) {
+    // Hold s_sfd_lock across EVERY owner deref (sigstate AND pid):
+    // signalfd_disown_all NULLs s->owner under this SAME lock right before
+    // task_free_rcu frees the owner task_t.  Reading owner into a local under
+    // the lock kills both the use-after-free (the owner cannot be freed while
+    // we hold the lock, since disown needs it) and the check-vs-use TOCTOU.
+    // The CAS loop is bounded (each iteration clears a bit or returns); no
+    // wait/wake here, so no preempt_disable needed.
+    uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
+    task_t* owner = s->owner;
+    if (!owner) { spin_unlock_irqrestore(&s_sfd_lock, fl); return -1; }
+    sigstate_t* ss = &owner->sigstate;
+    int ret = 0;
     for (;;) {
-        uint32_t pending = __atomic_load_n(&ss->pending, __ATOMIC_ACQUIRE);
-        eligible = pending & ss->blocked & s->mask;
-        if (!eligible) return 0;
+        uint32_t pending  = __atomic_load_n(&ss->pending, __ATOMIC_ACQUIRE);
+        uint32_t eligible = pending & ss->blocked & s->mask;
+        if (!eligible) break;
         int sig = __builtin_ctz(eligible) + 1;
         uint32_t bit = 1u << (sig - 1);
-        uint32_t prev = __atomic_fetch_and(&ss->pending, ~bit,
-                                             __ATOMIC_ACQ_REL);
-        if (prev & bit) return sig;
+        uint32_t prev = __atomic_fetch_and(&ss->pending, ~bit, __ATOMIC_ACQ_REL);
+        if (prev & bit) { ret = sig; break; }
         // Lost the race — another reader/delivery got this one; retry.
     }
+    if (ret > 0 && out_pid) *out_pid = owner->pid;   // owner pid, still under the lock
+    spin_unlock_irqrestore(&s_sfd_lock, fl);
+    return ret;
 }
 
 // ── vfs ops ─────────────────────────────────────────────────────────
@@ -101,17 +115,20 @@ static int64_t signalfd_read_op(vfs_file_t* self, void* buf, uint64_t len) {
     uint64_t written = 0;
     uint64_t room = len / sizeof(signalfd_siginfo_t);
     for (uint64_t i = 0; i < room; i++) {
-        int sig = sfd_claim_one(s);
-        while (!sig && written == 0) {
+        uint32_t pid = 0;
+        int sig = sfd_claim_one(s, &pid);   // >0 signal, 0 none, -1 owner exited
+        while (sig == 0 && written == 0) {
             if (nonblock) return -EAGAIN;
+            // Wakes on a newly-eligible signal (sig>0) OR the owner exiting
+            // (sig=-1, signalfd_disown_all woke us) -- never blocks forever.
             WAIT_EVENT(&s->wq,
-                (sig = sfd_claim_one(s)) != 0);
+                (sig = sfd_claim_one(s, &pid)) != 0);
             break;
         }
-        if (!sig) break;   // drained what we had, room remaining
+        if (sig <= 0) break;   // 0 = drained, -1 = owner gone -> EOF (return what we have)
         signalfd_siginfo_t info = {0};
         info.ssi_signo = (uint32_t)sig;
-        info.ssi_pid   = s->owner->pid;
+        info.ssi_pid   = pid;   // captured under s_sfd_lock in sfd_claim_one
         __builtin_memcpy(out + written * sizeof(info), &info, sizeof(info));
         written++;
     }
@@ -127,28 +144,40 @@ static int64_t signalfd_write_op(vfs_file_t* self, const void* buf,
 static int signalfd_poll_op(vfs_file_t* self, int events) {
     signalfd_state_t* s = (signalfd_state_t*)self->ctx;
     int ready = 0;
-    if ((events & POLLIN) && s->owner) {
-        sigstate_t* ss = &s->owner->sigstate;
+    // Deref s->owner under s_sfd_lock (see sfd_claim_one): disown can't free
+    // the owner while we hold it.  Owner gone -> report POLLHUP (the fd is dead).
+    uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
+    task_t* owner = s->owner;
+    if (!owner) {
+        ready |= POLLHUP;
+    } else if (events & POLLIN) {
+        sigstate_t* ss = &owner->sigstate;
         uint32_t eligible = __atomic_load_n(&ss->pending, __ATOMIC_ACQUIRE)
                           & ss->blocked & s->mask;
         if (eligible) ready |= POLLIN;
     }
+    spin_unlock_irqrestore(&s_sfd_lock, fl);
     return ready;
 }
 
 static void signalfd_close_op(vfs_file_t* self) {
     signalfd_state_t* s = (signalfd_state_t*)self->ctx;
     if (s) {
-        // Unlink from owner's subscriber list.
-        if (s->owner) {
-            uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
-            signalfd_state_t** pp = (signalfd_state_t**)&s->owner->signalfd_head;
+        // Unlink from the owner's subscriber list.  Capture s->owner UNDER the
+        // lock (not the old check-then-deref): signalfd_disown_all may NULL it
+        // concurrently, and the deref of owner->signalfd_head must see a stable
+        // owner that disown (same lock) cannot free mid-walk.  Owner gone
+        // (already disowned) -> the node is no longer on any list, just free it.
+        uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
+        task_t* owner = s->owner;
+        if (owner) {
+            signalfd_state_t** pp = (signalfd_state_t**)&owner->signalfd_head;
             while (*pp) {
                 if (*pp == s) { *pp = s->next; break; }
                 pp = &(*pp)->next;
             }
-            spin_unlock_irqrestore(&s_sfd_lock, fl);
         }
+        spin_unlock_irqrestore(&s_sfd_lock, fl);
         kfree(s);
         self->ctx = NULL;
     }
@@ -225,6 +254,37 @@ void signalfd_notify(task_t* t, int sig) {
     this_cpu()->preempt_depth--;
 }
 
+// ── Called from task_free_rcu when the owner task is about to be freed ──
+// A signalfd_state can OUTLIVE its owner: an inherited fd (fork: vfs_dup, and
+// the child is NOT relinked onto its own signalfd_head) or one passed via
+// SCM_RIGHTS keeps the state alive past the owner's exit, while s->owner is a
+// raw task_t*.  Without this hook, a later read/poll/close from the holder
+// dereferences the freed owner task (its sigstate / pid / signalfd_head) = UAF.
+// Walk the exiting task's subscriber list under s_sfd_lock and NULL each owner
+// (every owner-deref path -- sfd_claim_one, poll, close -- runs under the SAME
+// lock and skips a NULL owner, so once this completes none can touch the
+// freed task), then wake each waitq so a blocked reader observes the hangup
+// and returns EOF instead of waiting for a signal that can never arrive.
+// Same preempt_disable + s_sfd_lock discipline as signalfd_notify because we
+// wake under the lock.  Called from task_free_rcu (process.c) BEFORE kfree(t):
+// holding s_sfd_lock here serialises against the reader paths, so a reader
+// mid-deref keeps the task alive (disown blocks on the lock) until it is done.
+void signalfd_disown_all(task_t* t) {
+    if (!t) return;
+    preempt_disable();
+    uint64_t fl = spin_lock_irqsave(&s_sfd_lock);
+    signalfd_state_t* s = (signalfd_state_t*)t->signalfd_head;
+    while (s) {
+        signalfd_state_t* next = s->next;
+        s->owner = NULL;
+        wait_queue_wake_all(&s->wq);
+        s = next;
+    }
+    t->signalfd_head = NULL;
+    spin_unlock_irqrestore(&s_sfd_lock, fl);
+    this_cpu()->preempt_depth--;
+}
+
 // ── Boot-time selftest ───────────────────────────────────────────────
 // Works on g_current's sigstate.  Sets a signal as blocked, posts it,
 // reads through a signalfd, verifies we got the expected siginfo.
@@ -287,7 +347,21 @@ void signalfd_selftest(void) {
         goto cleanup;
     }
 
-    kprintf_atomic("[signalfd-selftest] PASS (EAGAIN + signo + drain + no-write)\n");
+    // Case 6: owner-exit disown (the UAF fix).  Simulates the task_free_rcu
+    // hook NULLing s->owner.  An owner-gone signalfd must read EOF (0) -- not
+    // hang and not dereference the owner -- and poll POLLHUP.
+    signalfd_disown_all(g_current);
+    r = f->read(f, &info, sizeof(info));   // O_NONBLOCK; owner gone -> EOF
+    if (r != 0) {
+        kprintf_atomic("[signalfd-selftest] FAIL post-disown read r=%ld (want 0)\n", r);
+        goto cleanup;
+    }
+    if (!(f->poll(f, POLLIN) & POLLHUP)) {
+        kprintf_atomic("[signalfd-selftest] FAIL post-disown poll no POLLHUP\n");
+        goto cleanup;
+    }
+
+    kprintf_atomic("[signalfd-selftest] PASS (EAGAIN + signo + drain + no-write + owner-gone EOF)\n");
 cleanup:
     f->close(f);
     ss->blocked = saved_blocked;
