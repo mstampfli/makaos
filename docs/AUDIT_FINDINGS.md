@@ -416,18 +416,25 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   via every pthread mutex. Good NEXT item (clean, high-value).
 
 - **pipe double-free / UAF on concurrent last-close**
-  (`kernel/fs/pipe.c:127,138` pipe_read_close/pipe_write_close) -> OPEN. The
-  shared pipe_buf_t is freed by a NON-ATOMIC decrement-and-test
+  (`kernel/fs/pipe.c` pipe_read_close/pipe_write_close) -> FIXED (F25). The
+  shared pipe_buf_t was freed by a NON-ATOMIC decrement-and-test
   (`if (reader_refs==0 && writer_refs==0) kfree(p)`) with zero locking; the read
   end and write end are distinct vfs_file_t sharing one pipe_buf_t, so a
-  simultaneous last-close of both ends on two CPUs can have both observe
-  refs==0 and both kfree(p) -> double free (and concurrent pipe_read/write/poll
-  deref the freed p -> UAF). Same CLASS as F14/F15 AF_UNIX, missed in pipes. Fix:
-  a single atomic last-ref transition like vfs_close/unix_put -- add
-  `uint32_t open_ends` (init 2) and free only on
-  `__atomic_sub_fetch(&p->open_ends,1,ACQ_REL)==0`; extract a pure
-  pipe_last_end_release helper + unit-test it (mirrors unix_refcount_tryget).
-  Confidence HIGH. Clean, deterministically testable.
+  simultaneous last-close of both ends on two CPUs both observed refs==0 and both
+  kfree(p) -> double free. TWO further UAFs from the same root (each hook freed
+  its own vfs_file_t with kfree(self)): (a) each close hook wakes the PEER end's
+  waitq (p->write_file / p->read_file) which the peer hook frees -> wake-vs-free
+  UAF; (b) pipe_read/pipe_write deref p->write_file/p->read_file while their end
+  stays open but the peer closed+freed its file -> UAF. Same CLASS as F14/F15.
+  Fixed by tying p + both end files to ONE lifetime (the F14 invariant): added
+  `uint32_t open_ends` (init 2), a pure `pipe_last_end_release(uint32_t*)` =
+  `__atomic_sub_fetch(open_ends,1,ACQ_REL)==0`, and `pipe_destroy(p)` that frees
+  read_file + write_file + p together; both hooks now wake the peer then call
+  pipe_destroy ONLY on the last release (no bare kfree(self)). The ACQ_REL makes
+  every prior hook's peer-wake happen-before the last closer's free, so the free
+  can't race a concurrent wake. Deterministic pipe_refcount_selftest (two
+  releases from open_ends=2: exactly one returns "last" -> exactly one free).
+  Boot exercises pipes (shell pipelines, swaybar status_command) -> no regression.
 
 - **NVMe completion CID OOB (device-controlled index)**
   (`kernel/drivers/storage/nvme.c:484` nvme_irq_handler) -> OPEN. `cqe.cid`

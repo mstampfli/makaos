@@ -124,26 +124,48 @@ static int64_t pipe_write(vfs_file_t* self, const void* buf, uint64_t len) {
     return (int64_t)total;
 }
 
+// Drop one of the pipe's two open ends.  Returns 1 ONLY for the close that
+// drives open_ends to 0 (the last end) -- that caller owns the teardown.  The
+// ACQ_REL ordering makes every prior close hook's peer-wake happen-before this
+// caller's free, so the free can never race a concurrent wake_all of a peer
+// waitq.  Pure (operates on *open_ends) -> unit-tested below.
+static int pipe_last_end_release(uint32_t* open_ends) {
+    return __atomic_sub_fetch(open_ends, 1u, __ATOMIC_ACQ_REL) == 0;
+}
+
+// Free the whole pipe -- both end vfs_file_t and the shared buffer -- in one
+// place, so the read and write files share the buffer's lifetime (like the
+// F14 AF_UNIX file<->sock invariant) and a close hook can always wake the peer
+// end's waitq without it having been freed underneath us.
+static void pipe_destroy(pipe_buf_t* p) {
+    if (p->read_file)  kfree(p->read_file);
+    if (p->write_file) kfree(p->write_file);
+    kfree(p);
+}
+
 static void pipe_read_close(vfs_file_t* self) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     if (p->reader_refs > 0) p->reader_refs--;
-    // Wake any blocked writers so they can return -EPIPE.
+    // Wake any blocked writers so they can return -EPIPE.  p->write_file is
+    // alive: it is only freed by the last-end close (pipe_destroy) below.
     if (p->reader_refs == 0 && p->write_file) {
         wait_queue_wake_all(p->write_file->waitq);
     }
-    if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
-    kfree(self);
+    // Drop this end; the last end to close frees p + both files (NOT a bare
+    // kfree(self) -- that would double-free p and leave the peer file dangling
+    // for the other hook's wake).
+    if (pipe_last_end_release(&p->open_ends)) pipe_destroy(p);
 }
 
 static void pipe_write_close(vfs_file_t* self) {
     pipe_buf_t* p = (pipe_buf_t*)self->ctx;
     if (p->writer_refs > 0) p->writer_refs--;
-    // Wake any sleeping reader so they see EOF immediately.
+    // Wake any sleeping reader so they see EOF immediately.  p->read_file is
+    // alive until the last-end close frees it.
     if (p->writer_refs == 0 && p->read_file) {
         wait_queue_wake_all(p->read_file->waitq);
     }
-    if (p->reader_refs == 0 && p->writer_refs == 0) kfree(p);
-    kfree(self);
+    if (pipe_last_end_release(&p->open_ends)) pipe_destroy(p);
 }
 
 // poll: check readiness without blocking.
@@ -207,6 +229,7 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     p->head = p->tail = p->count = 0;
     p->writer_refs = 1;
     p->reader_refs = 1;
+    p->open_ends   = 2;   // read end + write end; last close frees p + both files
 
     vfs_file_t* r = kmalloc(sizeof(vfs_file_t));
     vfs_file_t* w = kmalloc(sizeof(vfs_file_t));
@@ -253,4 +276,32 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     *read_end  = r;
     *write_end = w;
     return 0;
+}
+
+// ── pipe_last_end_release selftest ────────────────────────────────────────
+// Deterministic check that the two pipe-end closes yield EXACTLY ONE "last"
+// release -> exactly one free, never two (the double-free this fixes).  Mirrors
+// the unix_refcount_tryget single-owner-transition test (F15).
+void pipe_refcount_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    uint32_t oe = 2;                          // both ends open
+
+    int r1 = pipe_last_end_release(&oe);      // first close: 2 -> 1, NOT last
+    if (r1 != 0 || oe != 1) {
+        kprintf("[pipe_refcount] FAIL first r=%d oe=%lu\n", r1, (unsigned long)oe);
+        fails++;
+    }
+    int r2 = pipe_last_end_release(&oe);      // second close: 1 -> 0, IS last
+    if (r2 != 1 || oe != 0) {
+        kprintf("[pipe_refcount] FAIL second r=%d oe=%lu\n", r2, (unsigned long)oe);
+        fails++;
+    }
+    // Exactly one of the two returned "last" (r2 only) -> exactly one free.
+    if (r1 + r2 != 1) {
+        kprintf("[pipe_refcount] FAIL not-exactly-one-last r1=%d r2=%d\n", r1, r2);
+        fails++;
+    }
+    kprintf(fails ? "[pipe_refcount] SELF-TEST FAILED\n"
+                  : "[pipe_refcount] SELF-TEST PASSED (single last-end release, no double free)\n");
 }

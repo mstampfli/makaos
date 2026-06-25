@@ -23,8 +23,16 @@ typedef struct {
     uint32_t head;          // read index
     uint32_t tail;          // write index
     uint32_t count;         // bytes currently in buffer
-    uint8_t  writer_refs;   // number of open write-end fds
-    uint8_t  reader_refs;   // number of open read-end fds
+    uint8_t  writer_refs;   // 1 while the write end is open (EOF signal to reader)
+    uint8_t  reader_refs;   // 1 while the read end is open (EPIPE signal to writer)
+    // Lifetime: the two ends (read_file/write_file) and this buffer all share a
+    // single lifetime.  open_ends starts at 2 (both ends open) and is decremented
+    // once by each end's close hook; the close that drives it to 0 frees all
+    // three together.  This makes the free a single atomic last-ref transition
+    // (no double-free of two CPUs both seeing refs==0) AND lets each close hook
+    // safely wake the PEER end's waitq -- the peer vfs_file_t is not freed until
+    // this hits 0, so the wake never derefs a freed peer.
+    uint32_t open_ends;
     struct vfs_file_t* read_file;   // back-pointer — its waitq handles
                                     // blocking readers + poll/epoll
     struct vfs_file_t* write_file;  // back-pointer — its waitq handles

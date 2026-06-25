@@ -537,6 +537,10 @@ static void init_kthread(void) {
     extern void unix_refcount_selftest(void);
     unix_refcount_selftest();
 
+    // Pipe last-end-release: single atomic owner of the teardown (double-free fix).
+    extern void pipe_refcount_selftest(void);
+    pipe_refcount_selftest();
+
     // Tier 1 #6 (signalfd): block sig, send, drain via signalfd read.
     extern void signalfd_selftest(void);
     signalfd_selftest();
