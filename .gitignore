@@ -13,10 +13,6 @@ toolchain/
 build/binutils-2.42-build/
 build/gcc-14.2.0-build/
 
-# Claude Code local state (session settings, scheduled task locks).
-# Never commit — contains absolute paths and tool-internal state.
-.claude/
-
 # Build scratch logs.  Regenerated each invocation; not worth tracking.
 build.log
 build/build.log
