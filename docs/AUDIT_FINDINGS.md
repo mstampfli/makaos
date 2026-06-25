@@ -490,23 +490,25 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   verified the register/unregister/ADD/DEL/MOD/close flow + that free_rcu does
   not touch w->file + full SELFTESTS build + clean boot.) Confidence HIGH.
 
-- **TTY canonical ring framing + unlocked flush race**
-  (`kernel/drivers/tty/tty.c` ldisc_flush_line / tty_flush_input) -> OPEN
-  (lower priority). (a) The cooked read_buf ring usable capacity is
-  TTY_READ_BUF_SIZE-1 = 4095, exactly the max cooked line (4094 data + '\n'), so
-  if the ring holds even one un-drained byte ldisc_flush_line's per-byte rd_push
-  silently DROPS the line tail including the terminating '\n' -> canonical line
-  framing corruption (reader merges lines / blocks for a dropped '\n'). NOT
-  memory-unsafe (line_len <= 4095 is enforced; no over-read of line_buf). Fix:
-  make the ring strictly larger than a max line (e.g. TTY_READ_BUF_SIZE =
-  2*TTY_LINE_BUF_SIZE) and make ldisc_flush_line all-or-nothing via a pure
-  rb_free(head,tail,size) helper (unit-testable). (b) tty_flush_input (reachable
-  from ioctl TCFLSH/TCSETSF) resets rd_head/rd_tail/line_len with NO lock while
-  the keyboard thread / a concurrent pty_master_write run rd_push / line_buf
-  accumulation on another CPU -> torn ring indices; PTY slave fds are explicitly
-  dup-shared (refcount), so multi-consumer is real. Fix: a per-tty ldisc lock
-  around rd_push/rd_pop/line_buf accumulation/tty_flush_input. The line buffer
-  bounds themselves are clean (every line_buf[line_len++] guarded by
-  < TTY_LINE_BUF_SIZE-1; c_cc indices constant in [0,18]; VMIN/winsize not used
-  for sizing). Framing bug confidence HIGH; the unlocked-flush race MED. Careful
-  (the race fix needs a lock); good for a dedicated iteration.
+- **TTY canonical ring framing** (part a) -> FIXED (F29). The cooked read_buf
+  ring usable capacity was TTY_READ_BUF_SIZE-1 = 4095, exactly the max cooked
+  line (4094 data + '\n'), so if the ring held even one un-drained byte
+  ldisc_flush_line's per-byte rd_push silently DROPPED the line tail including
+  the terminating '\n' -> canonical line framing corruption (reader merges lines
+  / blocks for a dropped '\n'). NOT memory-unsafe (line_len <= 4095 enforced).
+  Fixed: bumped TTY_READ_BUF_SIZE to 8192 (strictly > the max line, so a line
+  fits even with backlog), added a pure rb_free(head,tail,size) helper, and made
+  ldisc_flush_line ALL-OR-NOTHING -- commit the whole line only if it fits in the
+  ring's free space, else drop the WHOLE line (POSIX-acceptable input loss, not a
+  '\n'-less partial line). EOF (empty-line ^D) unchanged (rb_free >= 0 always, so
+  the empty flush still wakes the reader -> 0-byte EOF read). Deterministic
+  tty_rb_free_selftest (rb_free cases on a size-8 ring + the "empty ring holds a
+  max line" invariant). The line-buffer bounds were already clean (line_buf
+  guarded by < TTY_LINE_BUF_SIZE-1; c_cc indices constant in [0,18]).
+- **TTY unlocked flush-vs-producer race** (part b) -> STILL OPEN (careful,
+  needs a lock). tty_flush_input (reachable from ioctl TCFLSH/TCSETSF) resets
+  rd_head/rd_tail/line_len with NO lock while the keyboard thread / a concurrent
+  pty_master_write run rd_push / line_buf accumulation on another CPU -> torn
+  ring indices; PTY slave fds are dup-shared (refcount) so multi-consumer is
+  real. Fix: a per-tty ldisc spinlock around rd_push/rd_pop/line_buf
+  accumulation/tty_flush_input. Confidence MED. Good for a dedicated iteration.

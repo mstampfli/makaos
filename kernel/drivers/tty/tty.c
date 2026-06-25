@@ -31,6 +31,14 @@ static inline int rb_full(uint32_t head, uint32_t tail, uint32_t size) {
     return rb_next(tail, size) == head;
 }
 
+// Number of free (writable) slots in the ring.  Usable capacity is size-1
+// (one slot reserved so full != empty).  Pure -> unit-tested
+// (tty_rb_free_selftest); used by ldisc_flush_line for an all-or-nothing
+// commit so a partial flush can never drop a cooked line's terminating '\n'.
+static inline uint32_t rb_free(uint32_t head, uint32_t tail, uint32_t size) {
+    return (head - tail - 1u) & (size - 1u);
+}
+
 static void rd_push(tty_t* tty, uint8_t c) {
     if (rb_full(tty->rd_head, tty->rd_tail, TTY_READ_BUF_SIZE)) return; // drop
     tty->read_buf[tty->rd_tail] = c;
@@ -62,8 +70,17 @@ static void ldisc_erase_char(tty_t* tty) {
 
 // ── Flush canonical line buffer to read_buf, then wake readers ──────────
 static void ldisc_flush_line(tty_t* tty) {
-    for (uint32_t i = 0; i < tty->line_len; i++)
-        rd_push(tty, tty->line_buf[i]);
+    // All-or-nothing: only commit the line if the WHOLE line fits in the ring's
+    // current free space.  A per-byte push that ran out of room mid-line would
+    // drop the trailing bytes -- including the terminating '\n' -- so the reader
+    // would get a '\n'-less partial line that merges with the next one (or hangs
+    // a canonical read waiting for a '\n' that was discarded).  If it doesn't
+    // fit (reader far behind / input queue full), drop the WHOLE line: that is
+    // POSIX-acceptable input loss, not framing corruption.
+    if (rb_free(tty->rd_head, tty->rd_tail, TTY_READ_BUF_SIZE) >= tty->line_len) {
+        for (uint32_t i = 0; i < tty->line_len; i++)
+            rd_push(tty, tty->line_buf[i]);
+    }
     tty->line_len = 0;
     // Wake every waiter on the tty's queue — blocking readers register
     // task_we_t nodes, poll/epoll registers epoll_we_t nodes.  A single
@@ -516,4 +533,41 @@ static void tty_on_kbd_event(const kbd_event_t* ev, void* data) {
 
     // Printable / control character.
     if (ev->ascii) tty_input_char(tty, (char)ev->ascii);
+}
+
+// ── rb_free selftest ──────────────────────────────────────────────────────
+// Deterministic check of the ring free-slot arithmetic that makes
+// ldisc_flush_line all-or-nothing (so a cooked line's terminating '\n' is
+// never dropped by a partial flush), plus the invariant that the read ring is
+// strictly larger than a maximum cooked line.
+void tty_rb_free_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // size=8 ring (usable capacity 7): head, tail -> expected free slots.
+    struct { uint32_t head, tail, want; } c[] = {
+        { 0, 0, 7 },   // empty -> all usable slots free
+        { 0, 1, 6 },   // 1 byte used
+        { 0, 7, 0 },   // full (rb_next(7)=0=head)
+        { 3, 3, 7 },   // empty at an offset
+        { 5, 2, 2 },   // head=5,tail=2: 5 used -> 2 free
+        { 2, 5, 4 },   // head=2,tail=5: 3 used -> 4 free
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t got = rb_free(c[i].head, c[i].tail, 8u);
+        if (got != c[i].want) {
+            kprintf("[tty_rbfree] FAIL head=%u tail=%u got=%u want=%u\n",
+                    c[i].head, c[i].tail, got, c[i].want);
+            fails++;
+        }
+    }
+    // Framing invariant: an empty read ring must hold a whole maximum cooked
+    // line (TTY_LINE_BUF_SIZE-1 bytes incl. '\n') -- the size bump guarantees it.
+    uint32_t empty_free = rb_free(0u, 0u, TTY_READ_BUF_SIZE);
+    if (empty_free < (TTY_LINE_BUF_SIZE - 1u)) {
+        kprintf("[tty_rbfree] FAIL ring too small: free=%u < maxline=%u\n",
+                empty_free, (unsigned)(TTY_LINE_BUF_SIZE - 1u));
+        fails++;
+    }
+    kprintf(fails ? "[tty_rbfree] SELF-TEST FAILED\n"
+                  : "[tty_rbfree] SELF-TEST PASSED (ring free-slots + line fits)\n");
 }

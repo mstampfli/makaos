@@ -586,6 +586,11 @@ static void init_kthread(void) {
     // DRM create_dumb pitch/size overflow-safe math (32-bit width*4 overflow).
     extern void drm_dumb_size_selftest(void);
     drm_dumb_size_selftest();
+
+    // TTY ring free-slot arithmetic (canonical line-framing: all-or-nothing
+    // flush so a partial push can never drop a cooked line's terminating '\n').
+    extern void tty_rb_free_selftest(void);
+    tty_rb_free_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference

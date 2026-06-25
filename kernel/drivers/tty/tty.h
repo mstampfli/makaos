@@ -27,7 +27,12 @@
 // Future: serial ttys, ptys — all use the same struct and ops.
 
 // ── Buffer sizes ──────────────────────────────────────────────────────────
-#define TTY_READ_BUF_SIZE  4096   // power of 2; cooked output to readers
+// READ must be strictly larger than LINE so a full cooked line (up to
+// TTY_LINE_BUF_SIZE-1 bytes incl. its '\n') always fits in the ring with room
+// to spare even when a reader is behind -- otherwise ldisc_flush_line's
+// per-byte push could drop the line's tail (incl. the terminating '\n') and
+// corrupt canonical line framing.  Keep both powers of 2 (rb_* mask with -1).
+#define TTY_READ_BUF_SIZE  8192   // power of 2; cooked output to readers (> LINE)
 #define TTY_LINE_BUF_SIZE  4096   // canonical line accumulation buffer
 
 // ── tty_t ─────────────────────────────────────────────────────────────────
