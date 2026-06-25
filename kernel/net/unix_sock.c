@@ -312,13 +312,16 @@ static unix_sock_t* unix_pin_peer(unix_sock_t* s) {
 static void unix_sock_free_rcu(void* data) {
     unix_sock_t* s = (unix_sock_t*)data;
 
-    // Free pending connections in backlog.
+    // Free pending connections in backlog.  Each entry owns a ref on its
+    // client (unix_get in connect); wake the blocked connector with an error,
+    // then drop that ref (the listener never accepted it).
     unix_pending_t* p = s->backlog_head;
     while (p) {
         unix_pending_t* next = p->next;
         if (p->client) {
             p->client->state = UNIX_STATE_UNCONNECTED;
             unix_wake(p->client);
+            unix_put(p->client);
         }
         kfree(p);
         p = next;
@@ -366,6 +369,19 @@ void unix_sock_close(vfs_file_t* self) {
             s->path[0] ? s->path : "(unbound)",
             (unsigned)s->state, (int)s->type,
             s->path[0] ? "evicting from ns" : "not in ns");
+
+    // If this socket is still CONNECTING (queued on a listener's backlog and
+    // not yet accepted), atomically mark it dead so a concurrent accept() skips
+    // it (its CAS CONNECTING->CONNECTED fails) rather than pairing a socket
+    // whose fd just closed.  Wake the connector so it returns instead of waiting
+    // forever.  The backlog still holds a ref (unix_get in connect), so `s`
+    // stays alive until accept/the listener-close drain reaps it.
+    {
+        uint8_t exp = UNIX_STATE_CONNECTING;
+        if (__atomic_compare_exchange_n(&s->state, &exp, UNIX_STATE_DISCONNECTED,
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            unix_wake(s);
+    }
 
     // Unpublish from the namespace first so new ns_find() cannot observe
     // the sock after this point.  Readers that observed the sock in a
@@ -772,6 +788,134 @@ void unix_refcount_selftest(void) {
                          : "[unix_refcount-selftest] PASS (tryget + get/put balance + pin_peer)\n");
 }
 
+// ── stream listen/accept backlog selftest (backlog client UAF fix) ───────
+// Drives a real STREAM connect()/accept() rendezvous across two threads to
+// exercise the queued-client lifetime: connect() enqueues the client on the
+// listener backlog taking an OWNED ref (so a queued client that closes/bails
+// cannot dangle for accept to dereference), and accept() atomically CLAIMS it
+// (CONNECTING -> CONNECTED) before pairing, then drops that backlog ref.
+// connect() blocks until paired, so the connector runs in its own kthread
+// while the main thread accepts.  SMP/preemption is up here (smp_boot_aps ran
+// before the selftest block) and the spin-waits yield, so the connector makes
+// progress even were it scheduled on this CPU.
+static vfs_file_t*       s_uas_client_f;     // client file, published before spawn
+static volatile int      s_uas_connect_rc;   // connect() return value
+static volatile uint32_t s_uas_done;         // set when the connector returns
+
+static void uas_connector_thread(void) {
+        int rc = unix_sock_connect(s_uas_client_f, "/unixtest-accept");
+        s_uas_connect_rc = rc;
+        __atomic_store_n(&s_uas_done, 1u, __ATOMIC_RELEASE);
+}
+
+void unix_stream_accept_selftest(void) {
+        vfs_file_t* lf = unix_sock_open(SOCK_STREAM);   // listener
+        vfs_file_t* cf = unix_sock_open(SOCK_STREAM);   // client
+        if (!lf || !cf) {
+                kprintf_atomic("[unix_stream_accept] FAIL open\n");
+                if (lf) unix_sock_close(lf);
+                if (cf) unix_sock_close(cf);
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED\n");
+                return;
+        }
+        unix_sock_t* ls = (unix_sock_t*)lf->ctx;
+        unix_sock_t* cs = (unix_sock_t*)cf->ctx;
+
+        if (unix_sock_bind(lf, "/unixtest-accept") != 0 ||
+            unix_sock_listen(lf, 4) != 0) {
+                kprintf_atomic("[unix_stream_accept] FAIL bind/listen\n");
+                unix_sock_close(lf);
+                unix_sock_close(cf);
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED\n");
+                return;
+        }
+
+        // Spawn the connector.  It enqueues `cf` on the listener (cs->refcount
+        // 1 -> 2, the owned backlog ref), then sets cs->state = CONNECTING last,
+        // wakes the listener, and blocks until cs->state changes.
+        s_uas_client_f   = cf;
+        s_uas_connect_rc = 0x7fffffff;
+        __atomic_store_n(&s_uas_done, 0u, __ATOMIC_RELEASE);
+        task_t* t = task_create_kthread(uas_connector_thread, pid_alloc());
+        if (!t) {
+                kprintf_atomic("[unix_stream_accept] FAIL spawn\n");
+                unix_sock_close(lf);
+                unix_sock_close(cf);
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED\n");
+                return;
+        }
+        sched_add(t);
+
+        // Wait (bounded, yielding) for the enqueue to fully complete.  cs->state
+        // is set to CONNECTING LAST in connect() -- after unix_get and the
+        // backlog link/count -- so observing it guarantees refcount==2 and
+        // backlog_count==1 are already visible (x86 TSO: stores in order).
+        // From here the connector may block holding the backlog ref, so a
+        // failure prints and returns WITHOUT closing (avoids racing it); the
+        // bug is the regression we are catching.
+        uint64_t spins = 0;
+        while (__atomic_load_n(&cs->state, __ATOMIC_ACQUIRE) != UNIX_STATE_CONNECTING) {
+                if (++spins > 50000000ull) {
+                        kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED (no enqueue)\n");
+                        return;
+                }
+                sched_yield();
+        }
+        if (cs->refcount != 2 ||
+            __atomic_load_n(&ls->backlog_count, __ATOMIC_ACQUIRE) != 1) {
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED (enqueue ref=%lu bk=%lu)\n",
+                               (unsigned long)cs->refcount,
+                               (unsigned long)__atomic_load_n(&ls->backlog_count, __ATOMIC_ACQUIRE));
+                return;
+        }
+
+        // Accept: claims the client (CONNECTING -> CONNECTED), builds the server
+        // side, links the symmetric peers, wakes the connector, and drops the
+        // backlog ref (2 -> 1).
+        vfs_file_t* sf = unix_sock_accept(lf);
+        if (!sf) {
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED (accept NULL)\n");
+                return;
+        }
+        unix_sock_t* ss = (unix_sock_t*)sf->ctx;
+
+        // Wait (bounded) for the connector to observe the pairing and return.
+        spins = 0;
+        while (__atomic_load_n(&s_uas_done, __ATOMIC_ACQUIRE) == 0) {
+                if (++spins > 50000000ull) {
+                        kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED (connector stuck)\n");
+                        unix_sock_close(sf);
+                        return;
+                }
+                sched_yield();
+        }
+
+        // Verify: connect() succeeded, both ends CONNECTED, symmetric peers
+        // linked, backlog drained, and the owned ref dropped back to the owner.
+        if (s_uas_connect_rc != 0 ||
+            cs->state != UNIX_STATE_CONNECTED || ss->state != UNIX_STATE_CONNECTED ||
+            ss->peer != cs || cs->peer != ss ||
+            cs->refcount != 1 ||
+            __atomic_load_n(&ls->backlog_count, __ATOMIC_ACQUIRE) != 0) {
+                kprintf_atomic("[unix_stream_accept] SELF-TEST FAILED (pair rc=%d cstate=%u "
+                               "sstate=%u peers %d/%d ref=%lu bk=%lu)\n",
+                               s_uas_connect_rc, (unsigned)cs->state, (unsigned)ss->state,
+                               ss->peer == cs, cs->peer == ss,
+                               (unsigned long)cs->refcount,
+                               (unsigned long)__atomic_load_n(&ls->backlog_count, __ATOMIC_ACQUIRE));
+                unix_sock_close(sf);
+                return;
+        }
+
+        // Teardown: the connector has returned (it never touches cf after
+        // setting s_uas_done).  Server close clears the client's symmetric
+        // back-pointer; all three free without fault and the refcounts balance.
+        unix_sock_close(sf);
+        unix_sock_close(cf);
+        unix_sock_close(lf);
+        kprintf_atomic("[unix_stream_accept] PASS (backlog owned-ref + atomic accept claim)\n");
+}
+
 // ── unix_sock_bind ───────────────────────────────────────────────────────
 
 int unix_sock_bind(vfs_file_t* f, const char* path) {
@@ -817,52 +961,70 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
     // Phase 9-6 pattern: task_we_add BEFORE the re-check, remove on
     // every exit path (including EINTR), commit-before-wake on the
     // connect() side (which calls unix_wake(target) after installing
-    // pend in backlog_head).
-    WAIT_EVENT_HOOK(&listener->waitq,
-                    listener->backlog_head != NULL
-                        || listener->state != UNIX_STATE_LISTENING,
-                    if (signal_has_actionable(&g_current->sigstate))
-                        return NULL;);
-    if (listener->state != UNIX_STATE_LISTENING) return NULL;
+    // pend in backlog_head).  Loop so we can skip+reap a queued client
+    // that already closed/bailed (its CAS claim below fails).
+    for (;;) {
+        WAIT_EVENT_HOOK(&listener->waitq,
+                        listener->backlog_head != NULL
+                            || listener->state != UNIX_STATE_LISTENING,
+                        if (signal_has_actionable(&g_current->sigstate))
+                            return NULL;);
+        if (listener->state != UNIX_STATE_LISTENING) return NULL;
+        if (!listener->backlog_head) continue;   // spurious wake, re-wait
 
-    // Dequeue the first pending connection.
-    unix_pending_t* pend = listener->backlog_head;
-    listener->backlog_head = pend->next;
-    if (!listener->backlog_head) listener->backlog_tail = NULL;
-    listener->backlog_count--;
+        // Dequeue the first pending connection.
+        unix_pending_t* pend = listener->backlog_head;
+        listener->backlog_head = pend->next;
+        if (!listener->backlog_head) listener->backlog_tail = NULL;
+        listener->backlog_count--;
 
-    unix_sock_t* client = pend->client;
-    kfree(pend);
+        unix_sock_t* client = pend->client;   // owns one ref (unix_get in connect)
+        kfree(pend);
+        if (!client) continue;
 
-    if (!client) return NULL;
+        // Claim the client: CONNECTING -> CONNECTED.  A client that bailed
+        // (connect's -EINTR CAS) already moved it out of CONNECTING, so our CAS
+        // fails -> it is dead, drop the backlog ref (reaping it) and try the
+        // next pending.  On success the client is provably still blocked in
+        // connect() (it has not bailed), so it cannot close before we wake it.
+        uint8_t exp = UNIX_STATE_CONNECTING;
+        if (!__atomic_compare_exchange_n(&client->state, &exp,
+                UNIX_STATE_CONNECTED, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            unix_put(client);
+            continue;
+        }
 
-    // Create the server-side socket that pairs with the client.
-    vfs_file_t* server_f = unix_sock_open(SOCK_STREAM);
-    if (!server_f) {
-        // Reject the client.
-        client->state = UNIX_STATE_UNCONNECTED;
+        // Create the server-side socket that pairs with the client.
+        vfs_file_t* server_f = unix_sock_open(SOCK_STREAM);
+        if (!server_f) {
+            // Reject the client.
+            client->state = UNIX_STATE_UNCONNECTED;
+            unix_wake(client);
+            unix_put(client);   // drop the backlog ref
+            return NULL;
+        }
+
+        unix_sock_t* server = (unix_sock_t*)server_f->ctx;
+
+        // Link the pair (client->state already CONNECTED from the CAS).
+        server->peer  = client;
+        client->peer  = server;
+        server->state = UNIX_STATE_CONNECTED;
+
+        // Stamp trusted peer pids. The server side's peer is the connecting
+        // process (whose pid was recorded on the client sock during connect()).
+        // The client side's peer is the accepting process (g_current).
+        server->peer_pid = client->peer_pid;   // connector pid (set in connect())
+        client->peer_pid = g_current->pid;     // acceptor pid
+
+        // Wake the client blocked in connect().
         unix_wake(client);
-        return NULL;
+        // Drop the backlog ref: the client is now kept alive by its own fd, and
+        // the symmetric peer relationship (cleared on either side's close).
+        unix_put(client);
+
+        return server_f;
     }
-
-    unix_sock_t* server = (unix_sock_t*)server_f->ctx;
-
-    // Link the pair.
-    server->peer  = client;
-    client->peer  = server;
-    server->state = UNIX_STATE_CONNECTED;
-    client->state = UNIX_STATE_CONNECTED;
-
-    // Stamp trusted peer pids. The server side's peer is the connecting
-    // process (whose pid was recorded on the client sock during connect()).
-    // The client side's peer is the accepting process (g_current).
-    server->peer_pid = client->peer_pid;   // connector pid (set in connect())
-    client->peer_pid = g_current->pid;     // acceptor pid
-
-    // Wake the client blocked in connect().
-    unix_wake(client);
-
-    return server_f;
 }
 
 // ── unix_sock_connect ────────────────────────────────────────────────────
@@ -915,10 +1077,15 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // with the acceptor's pid right after).
     s->peer_pid = g_current->pid;
 
-    // Enqueue ourselves.
+    // Enqueue ourselves.  Take an OWNED ref so the backlog entry keeps `s`
+    // alive even if our fd closes while we sit queued (the listener's
+    // accept()/close-drain drops this ref).  Without it, a client that bails
+    // (-EINTR below) and closes leaves pend->client dangling for accept to
+    // dereference -- a use-after-free.  Mirrors the F58 dgram_dest owned ref.
     unix_pending_t* pend = kmalloc(sizeof(unix_pending_t));
     if (!pend) { rcu_read_unlock(); return -ENOMEM; }
     pend->next   = NULL;
+    unix_get(s);
     pend->client = s;
 
     if (target->backlog_tail) {
@@ -946,8 +1113,18 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // EINTR path below.
     WAIT_EVENT_HOOK(&s->waitq,
                     s->state != UNIX_STATE_CONNECTING,
-                    if (signal_has_actionable(&g_current->sigstate))
-                        return -EINTR;);
+                    if (signal_has_actionable(&g_current->sigstate)) {
+                        // Atomically claim the bail: CONNECTING -> DISCONNECTED.
+                        // If we win, accept() will skip our queued entry (its CAS
+                        // CONNECTING->CONNECTED fails) and reap it via unix_put.
+                        // If we LOSE, accept connected us in the race -> fall
+                        // through; the loop re-checks state == CONNECTED below.
+                        uint8_t exp = UNIX_STATE_CONNECTING;
+                        if (__atomic_compare_exchange_n(&s->state, &exp,
+                                UNIX_STATE_DISCONNECTED, 0,
+                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                            return -EINTR;
+                    });
 
     if (s->state != UNIX_STATE_CONNECTED) {
         // Listener closed or rejected us.

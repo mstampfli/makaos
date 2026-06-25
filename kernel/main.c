@@ -586,6 +586,12 @@ static void init_kthread(void) {
     extern void unix_refcount_selftest(void);
     unix_refcount_selftest();
 
+    // AF_UNIX stream listen/accept backlog: a queued connect() client holds an
+    // owned ref so it cannot dangle, and accept() atomically claims it before
+    // pairing (the backlog client UAF fix).
+    extern void unix_stream_accept_selftest(void);
+    unix_stream_accept_selftest();
+
     // SOCK_DGRAM connect() default-destination owned-ref lifetime (the
     // asymmetric-peer UAF fix): the destination survives its own close while
     // a connected sender still references it.

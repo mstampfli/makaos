@@ -1071,3 +1071,23 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   claim/poll/close (TOCTOU + lifetime: disown needs the same lock, so a reader keeps the owner
   alive); owner-gone -> read EOF / poll POLLHUP (no hang). Deterministic selftest (Case 6:
   disown then read=0 EOF + poll POLLHUP) + code-proof + clean boot (49 selftests, 0 fault, no WD).
+- AF_UNIX listen/accept backlog client UAF -> FIXED (F65, follow-up (j)): unix_sock_connect
+  (STREAM) enqueued a backlog unix_pending_t with pend->client = s taking NO ref, then blocked;
+  a client that bailed while CONNECTING (WAIT_EVENT_HOOK -EINTR on a signal) and close()d was
+  RCU-freed but never unlinked from the listener backlog, so a later accept() dereferenced the
+  freed pend->client (client->state/peer writes + unix_wake) -> UAF write, and could publish a
+  dangling server->peer the raw poll/send/recv peer derefs would chase. The simple owned-ref
+  alone is insufficient (peer derefs are mixed raw, so pairing a DEAD client dangles server->peer
+  = a new UAF). Fix (owned ref + atomic claim): connect unix_get(s) before pend->client = s;
+  accept restructured into a for(;;) that CAS-claims client CONNECTING->CONNECTED (win = client
+  provably still blocked, safe to pair+wake; lose = bailed/closed, unix_put-reap and try next);
+  connect's -EINTR hook CASes CONNECTING->DISCONNECTED and returns -EINTR only if it wins; the
+  free_rcu backlog drain unix_put()s each client; unix_sock_close CASes a still-CONNECTING closing
+  socket dead + wakes it (multi-threaded close-wins -> accept skips it). Refcount: one unix_get
+  matched by exactly one unix_put across four mutually-exclusive paths. Deterministic selftest
+  (unix_stream_accept_selftest: connector kthread + main accept, asserts owned-ref enqueue +
+  atomic-claim pairing + drained backlog + balanced teardown) + code-proof + clean boot (51
+  selftests, all 5 AF_UNIX tests PASS, 0 fault, no WD, login prompt renders). RESIDUAL follow-up
+  (k): the multi-threaded accept-WINS window (accept links server->peer then a concurrent close
+  on another thread clears the symmetric back-pointer) needs a per-listener pairing lock; rarer
+  than the sequential case fixed here.
