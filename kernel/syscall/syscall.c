@@ -4363,23 +4363,39 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     uint64_t deadline = sel_infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // Pin buffer: one vfs_file_t* slot per fd, reused each iteration.  fdget
+    // bumps each polled file's refcount (or returns NULL if closed/dying), so
+    // neither the readiness scan nor the wait-queue registration below can
+    // deref/register on a file a sibling thread (THREAD_SHARE_FILES) frees via
+    // close() -- close synchronously kfree's the eventfd/timerfd/pipe state
+    // INCLUDING its embedded waitq, which our wait_group_cleanup would otherwise
+    // walk after the free (use-after-free).  epoll pins its watched file the
+    // same way (F60); poll/select did not.
+    vfs_file_t** sel_pin =
+        (vfs_file_t**)kmalloc((nfds ? nfds : 1) * sizeof(vfs_file_t*));
+    if (!sel_pin) return (uint64_t)-ENOMEM;
+
     do {
+        // Pin every fd referenced by the set for this iteration.
+        for (uint32_t fd = 0; fd < nfds; fd++)
+            sel_pin[fd] = (FD_ISSET(fd, &rset) || FD_ISSET(fd, &wset) ||
+                           FD_ISSET(fd, &eset)) ? fdget(fd) : NULL;
+
         count = 0;
-        task_files_t* files = g_current->files_shared;
         for (uint32_t fd = 0; fd < nfds; fd++) {
-            vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+            vfs_file_t* f = sel_pin[fd];   // pinned (NULL if closed)
             if (FD_ISSET(fd, &rset) && fd_is_readable(f)) {
                 rout.bits[fd/64] |= (1ULL << (fd%64)); count++;
             }
             if (FD_ISSET(fd, &wset) && fd_is_writable(f)) {
                 wout.bits[fd/64] |= (1ULL << (fd%64)); count++;
             }
-            if (FD_ISSET(fd, &eset)) {
-                // No exceptional conditions in our model.
-            }
+            // eset: no exceptional conditions in our model.
         }
-        if (count > 0) break;
-        if (!sel_infinite && timeout_ns == 0) break;
+        if (count > 0 || (!sel_infinite && timeout_ns == 0)) {
+            for (uint32_t fd = 0; fd < nfds; fd++) fdput(sel_pin[fd]);
+            break;
+        }
 
         // 2*nfds worst case (primary + secondary waitq per fd).  Allocate
         // both the task_we_t[] and wait_queue_t*[] in one buffer.
@@ -4394,9 +4410,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             wait_group_init(&wg, wes, wqs, sel_nslots);
 
             for (uint32_t fd = 0; fd < nfds; fd++) {
-                if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
-                    !FD_ISSET(fd, &eset)) continue;
-                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+                vfs_file_t* f = sel_pin[fd];
                 if (!f) continue;
                 wait_group_add(&wg, f->waitq, g_current);
                 wait_group_add(&wg, f->secondary_waitq, g_current);
@@ -4405,8 +4419,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             // Re-check after registering — close race between first check and add.
             int sel_recheck = 0;
             for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
-                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-                if (!f) continue;
+                vfs_file_t* f = sel_pin[fd];
                 if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
                     (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
             }
@@ -4418,7 +4431,11 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             wait_group_cleanup(&wg);
             kfree(sel_buf);
         }
+        // Unpin every file pinned this iteration (fdput(NULL) is safe).
+        for (uint32_t fd = 0; fd < nfds; fd++) fdput(sel_pin[fd]);
     } while (sel_infinite || tsc_read_ns() < deadline);
+
+    kfree(sel_pin);
 
     // Write back output sets.
     if (rset_ptr) copy_to_user((void*)rset_ptr, &rout, sizeof(rout));
@@ -4433,8 +4450,6 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
 static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
     if (nfds > 1024) return (uint64_t)-EINVAL;
-
-    task_files_t* files = g_current->files_shared;
 
     int infinite = (timeout_ms == (uint64_t)-1);
     uint64_t timeout_ns = infinite ? 0 : (timeout_ms * 1000000ULL);
@@ -4459,13 +4474,25 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
         }
     }
 
+    // Pin buffer: one vfs_file_t* slot per pollfd entry, reused each iteration.
+    // fdget keeps each polled file alive across the readiness scan + waitq
+    // registration so a sibling close() cannot free the embedded waitq under our
+    // wait_group_cleanup (use-after-free).  See sys_select / epoll (F60).
+    vfs_file_t** p_pin =
+        (vfs_file_t**)kmalloc((nfds ? nfds : 1) * sizeof(vfs_file_t*));
+    if (!p_pin) { if (kfds) kfree(kfds); return (uint64_t)-ENOMEM; }
+
     do {
+        // Pin every polled fd for this iteration (NULL = closed/dying -> POLLNVAL).
+        for (uint64_t i = 0; i < nfds; i++)
+            p_pin[i] = (kfds[i].fd >= 0) ? fdget((uint64_t)kfds[i].fd) : NULL;
+
         count = 0;
         for (uint64_t i = 0; i < nfds; i++) {
             kfds[i].revents = 0;
             int fd = kfds[i].fd;
             if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+            vfs_file_t* f = p_pin[i];
             if (!f) { kfds[i].revents = POLLNVAL; count++; continue; }
 
             uint16_t rev = 0;
@@ -4476,8 +4503,10 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             if (fd_has_hup(f)) rev |= POLLHUP;
             if (rev) { kfds[i].revents = rev; count++; }
         }
-        if (count > 0) break;
-        if (timeout_ms == 0) break;
+        if (count > 0 || timeout_ms == 0) {
+            for (uint64_t i = 0; i < nfds; i++) fdput(p_pin[i]);
+            break;
+        }
 
         uint32_t p_nslots = (uint32_t)nfds * 2;
         size_t   p_bytes  = p_nslots * (sizeof(task_we_t) + sizeof(wait_queue_t*));
@@ -4490,10 +4519,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             wait_group_init(&wg, wes, wqs, p_nslots);
 
             for (uint64_t i = 0; i < nfds; i++) {
-                int fd = kfds[i].fd;
-                if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
-                                ? files->ft->fd_table[fd] : NULL;
+                vfs_file_t* f = p_pin[i];
                 if (!f) continue;
                 wait_group_add(&wg, f->waitq, g_current);
                 wait_group_add(&wg, f->secondary_waitq, g_current);
@@ -4501,14 +4527,12 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
 
             // Re-check after registering — close race between first check and add.
             int recheck = 0;
-            for (uint64_t i = 0; i < nfds; i++) {
-                int fd = kfds[i].fd;
-                if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+            for (uint64_t i = 0; i < nfds && !recheck; i++) {
+                vfs_file_t* f = p_pin[i];
                 if (!f) continue;
                 if (((kfds[i].events & POLLIN)  && fd_is_readable(f)) ||
                     ((kfds[i].events & POLLOUT) && fd_is_writable(f)) ||
-                    fd_has_hup(f)) { recheck = 1; break; }
+                    fd_has_hup(f)) recheck = 1;
             }
             if (!recheck) {
                 g_current->sleep_until_ns = infinite ? 0 : deadline;
@@ -4518,7 +4542,11 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             wait_group_cleanup(&wg);
             kfree(p_buf);
         }
+        // Unpin every file pinned this iteration (fdput(NULL) is safe).
+        for (uint64_t i = 0; i < nfds; i++) fdput(p_pin[i]);
     } while (infinite || tsc_read_ns() < deadline);
+
+    kfree(p_pin);
 
     // Publish the resulting revents back to user space (best-effort: the array
     // was already validated on the way in via copy_from_user).

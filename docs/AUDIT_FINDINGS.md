@@ -1198,3 +1198,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   fault in the torn-down range SIGSEGVs instead of repopulating a frame about to be freed. Code-proof
   (documented flush-before-free primitive) + clean boot (brk exercised by every heap alloc; 56
   selftests, DHCP, login renders). Closes one of the four fan-out findings.
+- sys_poll/sys_select register a waiter on a polled file's embedded waitq without pinning the file ->
+  sibling-close UAF -> FIXED (F73, fan-out finding (q)): both read fd_table[fd] raw and
+  wait_group_add(f->waitq) across sched_sleep + wait_group_cleanup; a THREAD_SHARE_FILES sibling
+  close() kfree's the eventfd/timerfd/pipe state (incl. the embedded waitq) synchronously, so the
+  woken poller's wq_remove writes/walks freed memory. epoll pins w->file (F60); poll/select did not.
+  Fix: fdget-pin every referenced fd into a per-call array at the top of each iteration, use the pinned
+  file for the scan + registration + recheck, fdput after cleanup (mirrors epoll). Code-proof (pin
+  spans register->sleep->cleanup) + clean boot (2/2 DHCP; wayland polls constantly; copy_user_selftest
+  still passes). Three of four fan-out findings now fixed (n, q); remaining: (o) pty double-free,
+  (p) TCP child->listener UAF.
