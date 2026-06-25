@@ -853,3 +853,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   checked.h (form a*b in u64, accept iff <= max); ahci xfer_bytes_ok now wraps it
   (single source) and nvme_rw uses it (max 8192) keeping its pg_off-aware glue. Covered
   by the mul_within cases in checked_selftest; nvme path not boot-exercised.
+- virtio-gpu scanout backing under-allocation -> FIXED (F49): vgpu_setup_scanout_buffer
+  sized the framebuffer `uint32_t bytes = w * h * 4` (u32) then told the GPU the resource
+  is the full w*h (+ the present paint loop writes w*h pixels). w/h are the DEVICE-reported
+  scanout mode (s_scanouts[0], untrusted); a large/crafted mode wraps w*h*4 -> tiny backing
+  but full-size GPU access -> host OOB read/write. Fixed via the new tagged primitive
+  vgpu_fb_bytes(w,h,*out) -> mul_within_u32 (u64) capped at 256 MiB, rejecting 0-dim /
+  over-cap (setup returns 0; both callers + the paint loop gate on it). drm.c size math
+  already u64 (not in scope); fb.c glyph offset is kernel-controlled (out of class).
+  vgpu_fb_bytes_selftest drives the 2^32 wrap + over-cap rejects; boot inits GPU at
+  1280x800 unchanged.

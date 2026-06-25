@@ -640,6 +640,8 @@ static void init_kthread(void) {
 
     extern void drm_atomic_count_selftest(void);
     drm_atomic_count_selftest();
+    extern void vgpu_fb_bytes_selftest(void);
+    vgpu_fb_bytes_selftest();
 
     // TTY ring free-slot arithmetic (canonical line-framing: all-or-nothing
     // flush so a partial push can never drop a cooked line's terminating '\n').

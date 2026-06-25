@@ -21,6 +21,7 @@
 #include "trace.h"
 #include "smp.h"
 #include "common.h"
+#include "checked.h"   // mul_within_u32: overflow-safe bounded multiply
 
 // ── PCI IDs ─────────────────────────────────────────────────────────
 #define VIRTIO_VENDOR            0x1AF4u
@@ -735,11 +736,33 @@ static phys_addr_t  s_fb_phys     = 0;
 static uint8_t*     s_fb_virt     = NULL;
 static uint32_t     s_fb_bytes    = 0;
 
+// Maximum scanout backing we will allocate (256 MiB).  The scanout w/h come from
+// the device-reported mode (untrusted); a mode whose w*h*4 exceeds this -- or would
+// wrap a u32 -- is rejected rather than under-allocated.
+#define VGPU_MAX_FB_BYTES (256u * 1024u * 1024u)
+
+// PRIMITIVE (scanout backing size): the w*h*4 bytes (B8G8R8X8) a w*h scanout
+// resource needs, formed without a u32 wrap and capped to VGPU_MAX_FB_BYTES.  An
+// undersized backing for a w*h resource lets the GPU (and the paint loop) read/write
+// past it -> host OOB.  Returns false (reject the mode) on a 0 dimension or over-cap.
+// Pure -> unit-tested (vgpu_fb_bytes_selftest).
+static inline bool vgpu_fb_bytes(uint32_t w, uint32_t h, uint32_t* out_bytes) {
+    uint32_t wh;
+    if (w == 0 || h == 0) return false;
+    if (!mul_within_u32(w, h, VGPU_MAX_FB_BYTES / 4u, &wh)) return false;
+    *out_bytes = wh * 4u;   // safe: wh <= MAX/4 so wh*4 <= VGPU_MAX_FB_BYTES < 2^32
+    return true;
+}
+
 // Allocate a buffer large enough for w*h*4 bytes, attach it, hand to
-// scanout 0.  Idempotent — calling again re-creates (destroys old).
+// scanout 0.  Idempotent -- calling again re-creates (destroys old).
 // Page-aligned + order-aligned so virtio-gpu sees one contiguous range.
 static int vgpu_setup_scanout_buffer(uint32_t w, uint32_t h) {
-    uint32_t bytes = w * h * 4;
+    uint32_t bytes;
+    if (!vgpu_fb_bytes(w, h, &bytes)) {
+        kprintf("[virtio-gpu] scanout %ux%u exceeds max framebuffer size\n", w, h);
+        return 0;
+    }
     // Round up to a power-of-two page count.
     uint32_t pages = (bytes + 4095) / 4096;
     uint8_t  order = 0;
@@ -975,3 +998,34 @@ void drm_backend_register(const drm_backend_ops_t* ops) {
 void virtio_gpu_register_backend(void) {
     if (s_ok) drm_backend_register(&vgpu_backend_ops);
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// vgpu_fb_bytes forms w*h*4 without a u32 wrap and caps it, so a device-reported
+// mode cannot under-allocate the scanout backing (-> GPU / paint-loop OOB).  Drive
+// the wrap + over-cap reject paths that a naive `w*h*4` would slip through.
+void vgpu_fb_bytes_selftest(void) {
+    kprintf("[vgpu_fbsz] vgpu_fb_bytes must size w*h*4 without u32 wrap, capped\n");
+    int fails = 0;
+    struct { uint32_t w, h; uint8_t want_ok; uint32_t want_bytes; } c[] = {
+        { 1280,    800,     1, 4096000u },       // normal mode
+        { 7680,    4320,    1, 132710400u },     // 8K, large but valid
+        { 8192,    8192,    1, 0x10000000u },    // exactly VGPU_MAX_FB_BYTES (256 MiB)
+        { 8193,    8192,    0, 0 },              // one row over the cap -> reject
+        { 0x10000, 0x10000, 0, 0 },              // w*h == 2^32: a u32 product wraps to 0
+        { 0,       800,     0, 0 },              // zero width -> reject
+        { 1280,    0,       0, 0 },              // zero height -> reject
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = 0xDEADBEEFu;
+        bool ok = vgpu_fb_bytes(c[i].w, c[i].h, &got);
+        if (ok != (c[i].want_ok != 0) || (ok && got != c[i].want_bytes)) {
+            kprintf("[vgpu_fbsz] FAIL %ux%u ok=%d want=%d bytes=0x%lx want=0x%lx\n",
+                    c[i].w, c[i].h, ok, c[i].want_ok,
+                    (unsigned long)got, (unsigned long)c[i].want_bytes);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[vgpu_fbsz] SELF-TEST FAILED\n"
+                  : "[vgpu_fbsz] SELF-TEST PASSED (w*h*4 u64, no wrap, capped)\n");
+}
+#endif

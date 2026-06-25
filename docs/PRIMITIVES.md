@@ -119,6 +119,14 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   while cdw12 carries a 16-bit-masked sector count -> a 32 MB DMA into a 4 KB PRP) now
   uses `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)`; covered by the mul_within
   cases in checked_selftest (nvme itself is not the boot device).
+- `vgpu_fb_bytes(w, h, *out)` (kernel/drivers/video/virtio_gpu.c, F49) -- the w*h*4
+  bytes a w*h B8G8R8X8 scanout needs, via `mul_within_u32` (u64, no wrap) capped at
+  VGPU_MAX_FB_BYTES (256 MiB). w/h are the device-reported scanout mode (untrusted);
+  the old `uint32_t bytes = w*h*4` wrapped for a large/crafted mode -> undersized
+  backing while the GPU + paint loop access the full w*h -> host OOB. Rejects a 0
+  dimension / over-cap mode (vgpu_setup_scanout_buffer then returns 0; both callers
+  handle it). `vgpu_fb_bytes_selftest` drives the 2^32 wrap + over-cap rejects. The
+  drm.c size math (drm_dumb_size F23, addfb/atomic) already uses u64 -> not in scope.
 
 ## Status
 
