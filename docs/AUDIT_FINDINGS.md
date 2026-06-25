@@ -1011,3 +1011,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   verify boot stalled at the slab-pcpu stress test (kthread/RCU, no futex); a re-boot of the
   same build passed -> the known flaky early stall, not a regression (F55 lesson: deterministic
   regressions recur, flakiness does not).
+- epoll readiness scan derefs raw fd_table[w->fd] -> FIXED (F60, follow-up (f)): all 3
+  epoll scans (epoll_poll ~4609, epoll_wait primary ~4857, post-sleep recheck ~4930) read
+  f = fd_table[w->fd] raw and called f->poll(f,...) under only state->lock (not the files
+  table tf->lock). A concurrent close() on another thread of a shared files table
+  (THREAD_SHARE_FILES) frees that file -> f->poll on freed memory = UAF / freed-fnptr call;
+  fd reuse adds a wrong-file poll. The watch already pins the registered file (w->file =
+  vfs_tryget at register, vfs_close at unregister; unregister runs under state->lock so the
+  pin is alive for the whole scan). Fix: poll the pinned w->file (UAF-safe), and read
+  fd_table[w->fd] only as a POINTER VALUE (never dereferenced) to detect close/reuse and keep
+  the existing EPOLLERR|EPOLLHUP dangling-fd semantic (cur==w->file -> identical result via
+  the pinned ref; cur!=w->file -> HUP instead of a freed/wrong-file poll). Code-proof (poll
+  the pinned file, never deref the racy fd_table entry; lock keeps w->file alive) + clean
+  boot ([epoll_pin] PASS, 0 fault, no WD, DHCP; sway/wayland exercise epoll). Closes (f).

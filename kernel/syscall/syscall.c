@@ -4609,9 +4609,18 @@ static int epoll_poll(vfs_file_t* self, int events) {
     for (uint32_t i = 0; i < st->cap && !ready; i++) {
         epoll_watch_t* w = st->slots[i];
         if (!w || w == EPOLL_DELETED) continue;
-        vfs_file_t* f = ((uint32_t)w->fd < files->ft->cap)
-                        ? files->ft->fd_table[w->fd] : NULL;
-        if (!f) { ready = 1; break; }   // dangling fd → EPOLLERR|EPOLLHUP pending
+        // Poll the PINNED watched file (w->file), never the raw fd_table entry:
+        // a concurrent close() on another thread of a shared files table could
+        // free the fd_table file under f->poll() (a UAF / freed-fnptr call).
+        // w->file is held by a vfs_tryget pin and cannot be freed during this
+        // scan (epoll_watch_unregister, which drops the pin, runs under
+        // state->lock).  fd_table[w->fd] is read only as a POINTER VALUE (never
+        // dereferenced) to detect that the fd no longer maps to our file
+        // (closed/reused) -> dangling fd.
+        vfs_file_t* cur = ((uint32_t)w->fd < files->ft->cap)
+                          ? files->ft->fd_table[w->fd] : NULL;
+        vfs_file_t* f = w->file;
+        if (!f || cur != f) { ready = 1; break; }   // dangling fd → EPOLLERR|EPOLLHUP pending
         if (f->poll) {
             if (((w->events & EPOLLIN)  && f->poll(f, POLLIN))  ||
                 ((w->events & EPOLLOUT) && f->poll(f, POLLOUT)) ||
@@ -4858,10 +4867,14 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
             int32_t wfd = w->fd;
-
-            vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
-                            ? files->ft->fd_table[wfd] : NULL;
-            if (!f) {
+            // Poll the PINNED w->file (UAF-safe under state->lock), never the
+            // raw fd_table entry which a concurrent close could free under
+            // f->poll().  fd_table[wfd] is read only as a pointer value to
+            // detect that the fd was closed/reused (no longer maps to our file).
+            vfs_file_t* cur = ((uint32_t)wfd < files->ft->cap)
+                              ? files->ft->fd_table[wfd] : NULL;
+            vfs_file_t* f = w->file;
+            if (!f || cur != f) {
                 kevents[count].events = EPOLLERR | EPOLLHUP;
                 kevents[count].data   = w->data;
                 count++;
@@ -4931,9 +4944,12 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
                 epoll_watch_t* w = state->slots[i];
                 if (!w || w == EPOLL_DELETED) continue;
                 int32_t wfd = w->fd;
-                vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
-                                ? files->ft->fd_table[wfd] : NULL;
-                if (!f || !f->poll) continue;
+                // Poll the pinned w->file (UAF-safe); fd_table[wfd] read only as
+                // a pointer value to detect close/reuse (see the primary scan).
+                vfs_file_t* cur = ((uint32_t)wfd < files->ft->cap)
+                                  ? files->ft->fd_table[wfd] : NULL;
+                vfs_file_t* f = w->file;
+                if (!f || cur != f || !f->poll) continue;
                 uint32_t mask = w->events;
                 if ((mask & EPOLLIN)  && f->poll(f, POLLIN))  ep_recheck = 1;
                 if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) ep_recheck = 1;
