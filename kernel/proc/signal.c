@@ -448,21 +448,16 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
                 (unsigned)g_current->pid, g_current->comm);
     }
 
-    // Zombie instead of TASK_DEAD so the parent can reap via waitpid.
-    g_current->exit_code = -(int32_t)sig;
-    g_current->state = TASK_ZOMBIE;
-    sched_add_zombie(g_current);
-
-    // Notify the parent — exactly the same path sys_exit takes.  This
-    // was previously only `sched_wake(parent)` and only when state was
-    // SLEEPING, which dropped SIGCHLD entirely AND was a textbook
-    // lost-wakeup race.  Mirror sys_exit: signal_send sets the pending
-    // bit (so sys_wait's signal-driven retry runs) AND unconditionally
-    // calls sched_wake under the target's rq_lock, which handles every
-    // RUNNING/SLEEPING/in-flight transition correctly.
-    // Deliver SIGCHLD to the parent under rcu_read_lock (signal_send_pid) so
-    // the parent task cannot be freed between the pid lookup and delivery.
-    signal_send_pid(g_current->ppid, SIGCHLD);
+    // Set exit code (-signo) + disposition via the one shared mechanism (the
+    // same task_set_exit_state sys_exit uses, so the two paths cannot drift).
+    // Previously this UNCONDITIONALLY zombified -- correct for a process leader
+    // (the parent reaps via waitpid and is woken by SIGCHLD), but a wrong leak
+    // for a TASK_FLAG_THREAD: a thread is futex-joined, never wait()ed, so it
+    // lingered as an unreapable zombie (task-struct + pid leak per thread) and
+    // spuriously SIGCHLD'd the process parent.  The shifted thread case now
+    // self-reaps as TASK_DEAD (idle reaper frees it); the leader case is
+    // unchanged (zombie + SIGCHLD under rcu_read_lock).
+    task_set_exit_state(g_current, -(int32_t)sig);
 
     sched_yield();
     for (;;) __asm__ volatile("hlt");

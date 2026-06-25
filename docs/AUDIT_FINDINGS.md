@@ -1091,3 +1091,20 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (k): the multi-threaded accept-WINS window (accept links server->peer then a concurrent close
   on another thread clears the symmetric back-pointer) needs a per-listener pairing lock; rarer
   than the sequential case fixed here.
+- fatal-signal terminate path zombifies a user THREAD -> per-thread task/pid LEAK -> FIXED (F66,
+  follow-up (e)): signal_deliver_pending's SIG_DFL/fatal-hw terminate block unconditionally did
+  state=TASK_ZOMBIE + sched_add_zombie + SIGCHLD(parent) with no thread-vs-leader check. Correct
+  for a process leader (parent waitpid-reaps it), but a TASK_FLAG_THREAD is futex-joined (CLEARTID),
+  never wait()ed -- so zombifying it means nothing ever reaps it: the task_t + pid leak forever, and
+  the spurious SIGCHLD wrongly wakes the process parent's child reaper. sys_exit ALREADY had the
+  right branch (thread -> TASK_DEAD self-reap, reaped at the next do_switch; leader -> zombie), so a
+  thread that exit()s was fine but a thread that died by SIGSEGV/SIGKILL leaked -- a drift between
+  two paths deciding the same thing. Fix (DRY, one shared mechanism): extracted
+  task_set_exit_state(task_t*, exit_code) (+ pure task_exit_self_reaps(flags)) and routed BOTH
+  sys_exit and the signal terminate path through it, so they cannot drift again; the leader branch is
+  byte-identical to before, only the thread case in the signal path changes. Deterministic selftest
+  (task_exit_state_selftest: the decision for every flag combo + a constructed thread task lands in
+  TASK_DEAD with no side effects) + code-proof + clean boot (52 selftests, the leader zombify/reap
+  path is exercised constantly by login/svcmgr/sway exits, 0 fault, login prompt renders). Separate
+  out-of-scope NOTE: MakaOS kills only the faulting thread on a fatal signal, not the whole thread
+  group (a POSIX semantic/feature gap, not this leak).

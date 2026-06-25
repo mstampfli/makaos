@@ -5,6 +5,7 @@
 #include "kheap.h"
 #include "vfs.h"
 #include "sched.h"
+#include "signal.h"
 #include "rcu.h"
 
 // ── task_mm_t helpers ─────────────────────────────────────────────────────
@@ -376,6 +377,78 @@ static void task_free_rcu(void* data) {
     extern void signalfd_disown_all(task_t* t);
     signalfd_disown_all(t);
     kfree(t);
+}
+
+// Does this task self-reap as TASK_DEAD (vs become a wait()-able zombie) on
+// exit?  A user thread (TASK_FLAG_THREAD) is joined via the CLEARTID futex, not
+// wait()ed, so it MUST NOT linger as a zombie -- nobody reaps it, leaking its
+// task-struct + pid forever.  A process leader (no THREAD flag) becomes a
+// zombie its parent collects with waitpid().  Pure: the single decision both
+// exit paths consult.
+int task_exit_self_reaps(uint32_t flags) {
+    return (flags & TASK_FLAG_THREAD) != 0;
+}
+
+// The ONE exit-disposition mechanism, shared by sys_exit and the fatal-signal
+// terminate path so the two cannot drift.  (The bug this unifies: the signal
+// path zombified a TASK_FLAG_THREAD exactly like a leader, leaking the dead
+// thread's task-struct + pid and spuriously SIGCHLD-ing the process parent --
+// sys_exit had the thread check, the signal path did not.)
+//
+//   - A user thread self-reaps as TASK_DEAD: the idle reaper collects it the
+//     moment we switch away (do_switch) and releases the shared mm/files via
+//     task_free_rcu.  No zombie linger, no SIGCHLD to the process parent (which
+//     would spuriously wake its child reaper).
+//   - A process leader becomes TASK_ZOMBIE its parent can waitpid(), and
+//     SIGCHLD wakes that parent.
+//
+// The caller owns the surrounding teardown (cleartid, child reparent, files
+// release) and chooses exit_code's meaning (normal code vs -signo).
+void task_set_exit_state(task_t* t, int32_t exit_code) {
+    t->exit_code = exit_code;
+    if (task_exit_self_reaps(t->flags)) {
+        t->state = TASK_DEAD;            // idle reaper frees it
+    } else {
+        t->state = TASK_ZOMBIE;
+        sched_add_zombie(t);
+        signal_send_pid(t->ppid, SIGCHLD);
+    }
+}
+
+// Deterministic selftest for the exit-disposition mechanism (the F66 fix).
+void task_exit_state_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+
+    // 1. The pure decision, every flag combination.
+    if (task_exit_self_reaps(TASK_FLAG_THREAD) != 1) { fails++;
+        kprintf_atomic("[task_exit_state] FAIL thread !self-reap\n"); }
+    if (task_exit_self_reaps(0) != 0) { fails++;
+        kprintf_atomic("[task_exit_state] FAIL leader self-reaps\n"); }
+    if (task_exit_self_reaps(TASK_FLAG_KTHREAD) != 0) { fails++;
+        kprintf_atomic("[task_exit_state] FAIL kthread self-reaps\n"); }
+    if (task_exit_self_reaps(TASK_FLAG_THREAD | TASK_FLAG_KTHREAD) != 1) { fails++;
+        kprintf_atomic("[task_exit_state] FAIL thread+kthread !self-reap\n"); }
+
+    // 2. Integration: a THREAD task self-reaps as TASK_DEAD with no side
+    //    effects (the FIXED path -- previously it was zombified and leaked).
+    //    The task is never scheduled/listed, so no reaper observes it; the
+    //    thread branch makes no list/signal calls, so a plain kfree is safe.
+    task_t* th = kmalloc(sizeof(task_t));
+    if (th) {
+        __builtin_memset(th, 0, sizeof(*th));
+        th->flags = TASK_FLAG_THREAD;
+        th->state = TASK_RUNNING;
+        th->ppid  = 0;
+        task_set_exit_state(th, -11 /* -SIGSEGV */);
+        if (th->state != TASK_DEAD || th->exit_code != -11) { fails++;
+            kprintf_atomic("[task_exit_state] FAIL thread disposition state=%u code=%d\n",
+                           (unsigned)th->state, (int)th->exit_code); }
+        kfree(th);
+    } else { fails++; kprintf_atomic("[task_exit_state] FAIL alloc\n"); }
+
+    kprintf_atomic(fails ? "[task_exit_state] SELF-TEST FAILED\n"
+                         : "[task_exit_state] PASS (thread self-reaps TASK_DEAD, leader zombifies)\n");
 }
 
 void task_destroy(task_t* t) {

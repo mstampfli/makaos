@@ -460,6 +460,11 @@ static void init_kthread(void) {
     extern void tg_leader_selftest(void);
     tg_leader_selftest();
 
+    // Exit disposition shared by sys_exit + the fatal-signal path: a thread
+    // self-reaps as TASK_DEAD (no zombie-linger leak), a leader zombifies.
+    extern void task_exit_state_selftest(void);
+    task_exit_state_selftest();
+
     // setuid-on-exec escalation gate (now wired via ksec).  Verify it fails
     // closed: only an explicit ksec ALLOW (with an agent present) escalates.
     extern void ksec_exec_setuid_selftest(void);

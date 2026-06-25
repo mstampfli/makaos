@@ -346,6 +346,12 @@ static inline task_t* process_create_user(phys_addr_t cp, uint32_t cn, uint32_t 
 void    task_destroy(task_t* t);
 static inline void process_destroy(task_t* t) { task_destroy(t); }
 
+// Exit disposition (shared by sys_exit + the fatal-signal terminate path so
+// they cannot drift): a TASK_FLAG_THREAD self-reaps as TASK_DEAD, a leader
+// becomes a wait()-able TASK_ZOMBIE + SIGCHLDs its parent.
+int     task_exit_self_reaps(uint32_t flags);
+void    task_set_exit_state(task_t* t, int32_t exit_code);
+
 mm_t*   task_get_mm(void* task);
 
 void context_switch(cpu_ctx_t* from, cpu_ctx_t* to, phys_addr_t new_pml4);

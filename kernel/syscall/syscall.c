@@ -719,30 +719,13 @@ static uint64_t sys_exit(uint64_t code) {
                     g_current->pf_disk, g_current->pf_cache, pct);
         }
 
-        g_current->exit_code = (int32_t)(int)code;
-
-        // A pthread (TASK_FLAG_THREAD) is NOT a child anyone wait()s on —
-        // userland joins via the futex 'done' word (SYS_SET_CLEARTID,
-        // already signalled above), not sys_wait.  So a thread must NOT
-        // become a wait()-able zombie (it would linger forever — a kernel
-        // task-struct + pid leak per thread) and must NOT send SIGCHLD to
-        // the PROCESS's parent (a font thread exiting would spuriously
-        // wake dwl's child reaper).  Self-reap instead: TASK_DEAD is
-        // collected by the idle reaper right after we switch away, which
-        // refcount-releases the shared mm/files (task_free_rcu).
-        if (g_current->flags & TASK_FLAG_THREAD) {
-            g_current->state = TASK_DEAD;     // idle reaper frees it
-        } else {
-            g_current->state = TASK_ZOMBIE;
-            sched_add_zombie(g_current);
-
-            // Wake parent and deliver SIGCHLD so it can reap background
-            // jobs.  signal_send_pid looks up + delivers under rcu_read_lock
-            // so the parent cannot be freed in the window, and skips zombie
-            // parents (semantically dead).  signal_send unconditionally calls
-            // sched_wake under the target rq_lock, so no racy state check.
-            signal_send_pid(g_current->ppid, SIGCHLD);
-        }
+        // Set exit code + disposition via the one shared mechanism (also used
+        // by the fatal-signal terminate path): a pthread (TASK_FLAG_THREAD) is
+        // joined via the CLEARTID futex (already signalled above), not
+        // wait()ed, so it self-reaps as TASK_DEAD instead of lingering as a
+        // zombie (a per-thread task-struct + pid leak) and does NOT SIGCHLD the
+        // process parent; a leader becomes a wait()-able zombie + SIGCHLDs it.
+        task_set_exit_state(g_current, (int32_t)(int)code);
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
