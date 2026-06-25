@@ -69,6 +69,7 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
 
     shmem_t* shm = kmalloc(sizeof(shmem_t));
     if (!shm) return NULL;
+    shm->lock = (spinlock_t)SPINLOCK_INIT;
 
     // Allocate page array.  Start with capacity = npages (or minimum 1
     // so we always have a valid pointer even for zero-size objects).
@@ -152,8 +153,24 @@ void shmem_unref(shmem_t* shm) {
 // ── shmem_get_page ───────────────────────────────────────────────────────
 
 phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
-    if (!shm || pg_idx >= shm->npages)
+    if (!shm) return PMM_INVALID_ADDR;
+
+    // Hold shm->lock across the whole check-then-set: it serialises against a
+    // concurrent shmem_resize (which kfree's/reallocs `pages` and mutates
+    // npages) and against another faulter touching the same index.  Without it,
+    // reading shm->pages[pg_idx] here could dereference an array a concurrent
+    // grow kfree'd (UAF), and two first-touches of one index would double-
+    // allocate the frame (leak + incoherent shared page).  Per-object lock, so
+    // faults on different objects never contend; the hold spans one
+    // pmm_buddy_alloc + a page zero, bounded.  Plain spin_lock (NOT irqsave):
+    // get_page and shmem_resize run only in process context (#PF / ftruncate),
+    // never from an IRQ handler, so no IRQ can take this lock, and we avoid
+    // holding IRQs off across the page zero.
+    spin_lock(&shm->lock);
+    if (pg_idx >= shm->npages) {
+        spin_unlock(&shm->lock);
         return PMM_INVALID_ADDR;
+    }
 
     // Caller installs a PTE for the returned frame, so it gets one
     // reference.  The shmem object also holds one reference per
@@ -162,19 +179,24 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
     // every mapping PTE (munmap/teardown) have released it — so a
     // shrink or destroy can never recycle a frame a process still maps.
     if (shm->pages[pg_idx]) {
-        pmm_ref_inc(shm->pages[pg_idx]);   // ref for the caller's PTE
-        return shm->pages[pg_idx];
+        phys_addr_t f = shm->pages[pg_idx];
+        pmm_ref_inc(f);   // ref for the caller's PTE
+        spin_unlock(&shm->lock);
+        return f;
     }
 
     // First touch: allocate a zeroed physical frame (rc=1 = object ref).
     phys_addr_t frame = pmm_buddy_alloc(0);
-    if (frame == PMM_INVALID_ADDR)
+    if (frame == PMM_INVALID_ADDR) {
+        spin_unlock(&shm->lock);
         return PMM_INVALID_ADDR;
+    }
 
     __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
     shm->pages[pg_idx] = frame;
     pmm_ref_inc(frame);    // +1 for the caller's PTE (object keeps rc=1)
+    spin_unlock(&shm->lock);
     return frame;
 }
 
@@ -183,7 +205,14 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
 int shmem_resize(shmem_t* shm, uint32_t new_npages) {
     if (!shm) return -EINVAL;
     if (new_npages > SHMEM_MAX_PAGES) return -EINVAL;
-    if (new_npages == shm->npages) return 0;
+
+    // Serialise the whole resize against shmem_get_page (the #PF handler): the
+    // grow path kfree's and reallocates `pages`, and both paths mutate npages
+    // and the slots.  Same per-object lock get_page takes (process-context
+    // only, so plain spin_lock).  Without it a concurrent fault dereferences a
+    // kfree'd `pages` array (UAF).
+    spin_lock(&shm->lock);
+    if (new_npages == shm->npages) { spin_unlock(&shm->lock); return 0; }
 
     if (new_npages < shm->npages) {
         // Shrinking: drop the OBJECT's ref on pages beyond the new
@@ -200,6 +229,7 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
             }
         }
         shm->npages = new_npages;
+        spin_unlock(&shm->lock);
         return 0;
     }
 
@@ -212,10 +242,10 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
             else              new_cap *= 2;
         }
         if (new_cap > SHMEM_MAX_PAGES) new_cap = SHMEM_MAX_PAGES;
-        if (new_cap < new_npages) return -EINVAL;
+        if (new_cap < new_npages) { spin_unlock(&shm->lock); return -EINVAL; }
 
         phys_addr_t* new_arr = kmalloc(new_cap * sizeof(phys_addr_t));
-        if (!new_arr) return -ENOMEM;
+        if (!new_arr) { spin_unlock(&shm->lock); return -ENOMEM; }
 
         // Copy existing entries.
         for (uint32_t i = 0; i < shm->npages; i++)
@@ -234,6 +264,7 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
     }
 
     shm->npages = new_npages;
+    spin_unlock(&shm->lock);
     return 0;
 }
 

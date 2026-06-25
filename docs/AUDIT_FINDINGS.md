@@ -1024,3 +1024,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the pinned ref; cur!=w->file -> HUP instead of a freed/wrong-file poll). Code-proof (poll
   the pinned file, never deref the racy fd_table entry; lock keeps w->file alive) + clean
   boot ([epoll_pin] PASS, 0 fault, no WD, DHCP; sway/wayland exercise epoll). Closes (f).
+- shmem pages[] array unsynchronised -> FIXED (F61): shmem_t (MAP_SHARED / POSIX shm
+  backing) had no lock on pages/npages/max_pages. shmem_get_page (lock-free from the #PF
+  handler; peers hold different per-mm vma_locks) races shmem_resize (ftruncate). The grow
+  path does kfree(shm->pages)+realloc, so a concurrent fault dereferences the freed array =
+  cross-CPU heap UAF -> reused phys_addr_t -> user PTE to an arbitrary frame (LPE/disclosure).
+  Hit by the foot/wayland ftruncate-grow-while-mapped workload. (Per-frame refcounts only
+  protected mapped FRAMES from recycle, not the ARRAY realloc.) Secondary: two first-touches
+  of one index double-alloc + give two mappers different frames (coherence break). Fix: a
+  per-shmem_t spinlock held across all of shmem_get_page and all of shmem_resize (plain
+  spin_lock -- process-context only; lock order shm->lock > heap/pmm, never nested with
+  vma_lock). Code-proof (realloc and read now serialise) + clean boot (0 fault, 49 selftests
+  pass, no WD; wayland exercises ftruncate-grow + faults).

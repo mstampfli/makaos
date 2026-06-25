@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vmm.h"
+#include "smp.h"   // spinlock_t (common.h is too low in the tree to define it)
 
 // ── Shared Memory Objects ────────────────────────────────────────────────
 //
@@ -35,6 +36,15 @@
 #define SHMEM_NAME_MAX   63
 
 typedef struct shmem {
+    // Serialises the page array against concurrent access.  shmem_get_page
+    // (run lock-free from the #PF handler on every CPU -- peers mapping the
+    // same object hold DIFFERENT per-mm vma_locks, so that gives no mutual
+    // exclusion) and shmem_resize (ftruncate, which kfree's and reallocates
+    // `pages`) both touch pages/npages; without this a faulting CPU could
+    // dereference a `pages` array kfree'd by a concurrent grow (UAF), or two
+    // first-touches of one index could double-allocate.  Per-object so faults
+    // on different objects never contend.
+    spinlock_t   lock;
     phys_addr_t* pages;       // array of physical frame addresses (0 = not yet faulted)
     uint32_t     npages;      // current capacity (set by ftruncate / create)
     uint32_t     max_pages;   // allocated length of pages[] array
