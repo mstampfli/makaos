@@ -998,3 +998,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   woken by a concurrent timeout/signal returns via the no-lock rc==0 path and can reclaim its
   on-stack node between the two lines -> sched_wake(garbage); fix: capture w->task before the
   RELEASE store.
+- futex_wake derefs the waiter node after authorizing return -> FIXED (F59, follow-up (g)):
+  the on-stack futex_waiter_t is reclaimable the instant futex_wake stores w->woken=1 (RELEASE)
+  -- a waiter made runnable by a concurrent timeout/signal sees it via the lock-free ACQUIRE
+  load (futex.c:112) and returns through the rc==0 path, which takes no b->lock. But line 159
+  read w->task AFTER that store, so sched_wake could read a reused stack frame -> wild task
+  pointer into the scheduler. Reachable on SMP via a wake-all (thread-exit task_notify_cleartid
+  -> futex_wake(addr,0x7fffffff)) racing a woken waiter's timeout/signal. Fix: capture
+  task_t* wtask = w->task BEFORE the RELEASE store, sched_wake(wtask) -- after the store the
+  waker touches only the local, never w->*. Behavior-identical on the normal path (no lost
+  wake). Code-proof + clean-boot (boot exercises futexes via pthread mutex/cond). NOTE: first
+  verify boot stalled at the slab-pcpu stress test (kthread/RCU, no futex); a re-boot of the
+  same build passed -> the known flaky early stall, not a regression (F55 lesson: deterministic
+  regressions recur, flakiness does not).

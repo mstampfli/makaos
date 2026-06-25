@@ -154,9 +154,20 @@ int64_t futex_wake(uint32_t* uaddr, uint32_t nwake) {
     while (*pp && (uint64_t)count < nwake) {
         futex_waiter_t* w = *pp;
         if (w->mm == mm && w->uaddr == (uint64_t)uaddr) {
+            // Read EVERY field of the waiter node BEFORE publishing woken.
+            // Once the RELEASE store lands, the waiter may be running on
+            // another CPU: if it was already made runnable by a concurrent
+            // timeout or signal, its wait loop (futex.c:112) sees woken==1 and
+            // returns via the rc==0 path -- which does NOT take b->lock -- so
+            // it can pop its stack-resident `w` while we are still in this
+            // critical section.  Dereferencing w->task at sched_wake AFTER the
+            // store would then read a reclaimed/reused stack frame -> a wild
+            // sched_wake(garbage).  Capture w->task (and w->next) first; touch
+            // only the local copy past the store.
+            task_t* wtask = w->task;
             *pp = w->next;                                  // unlink first
             __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
-            sched_wake(w->task);
+            sched_wake(wtask);                              // local copy, never w->*
             count++;
         } else {
             pp = &w->next;
