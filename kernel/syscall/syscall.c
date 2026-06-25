@@ -579,6 +579,10 @@ uint64_t sys_close(uint64_t fd) {
 //   - new_brk < brk: shrink heap — remove VMA pages above new_brk
 //     and unmap+free them.
 // Returns new brk on success, (uint64_t)-1 on error.
+// Forward decl: the shared unmap -> cross-CPU flush -> free primitive (defined
+// with sys_munmap below) -- brk shrink must use it, not free-before-flush.
+static void mm_unmap_range_flush_free(task_mm_t* mm_shared, phys_addr_t pml4,
+                                      mm_t* mm, virt_addr_t addr, virt_addr_t end);
 static uint64_t sys_brk(uint64_t new_brk_raw) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
 
@@ -629,18 +633,14 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     }
 
     // ── Shrink heap ───────────────────────────────────────────────────────
-    // Unmap and free physical frames in [new_brk, old_brk).
-    // Use pmm_ref_dec (CoW-aware): frame only freed when refcount→0.
     phys_addr_t pml4 = vmm_current_pml4();
-    for (virt_addr_t page = new_brk; page < old_brk; page += PAGE_SIZE) {
-        phys_addr_t frame;
-        if (vmm_page_unmap(pml4, page, &frame))
-            pmm_ref_dec(frame);
-    }
-
-    // Shrink or remove the heap VMA.  Under mm->vma_lock so mutation
-    // is serialised with concurrent mmap/munmap on the same address space.
     virt_addr_t heap_vma_start = mm->brk_start;
+
+    // 1. Shrink/remove the heap VMA FIRST, under mm->vma_lock (serialised with
+    //    concurrent mmap/munmap).  Doing the metadata first means a concurrent
+    //    fault from a sibling thread in [new_brk, old_brk) finds no VMA and
+    //    SIGSEGVs (correct -- it is past the new brk) instead of demand-paging a
+    //    fresh frame into a range we are about to tear down.
     spin_lock(&mm->vma_lock);
     vma_t** pp = &mm->vmas;
     while (*pp) {
@@ -661,11 +661,15 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 
     mm->brk = new_brk;
 
-    // Remote CPUs running other threads of this process may still hold
-    // TLB entries for pages we just freed.  Flush them before returning
-    // so a stale translation doesn't allow a racing thread to read/write
-    // memory that's already been handed back to the buddy allocator.
-    tlb_flush_range(g_current->mm_shared, new_brk, old_brk);
+    // 2. Unmap + free the physical frames with the CORRECT ordering: unmap
+    //    (local invlpg) -> cross-CPU TLB shootdown -> free, via the shared
+    //    primitive sys_munmap / MAP_FIXED use.  The previous code freed each
+    //    frame (pmm_ref_dec) inside the loop and only flushed AFTER -- so a
+    //    sibling THREAD_SHARE_MM thread on another CPU kept a stale WRITABLE TLB
+    //    entry and could write into a frame already handed back to the buddy
+    //    allocator and reused/zero-filled for a new owner (cross-owner UAF write
+    //    / LPE).  flush-before-free closes that window.
+    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, new_brk, old_brk);
     return new_brk;
 }
 

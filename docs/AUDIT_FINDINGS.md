@@ -1188,3 +1188,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   listener (remote-timed heap UAF); (q) sys_poll/sys_select register a waiter on f->waitq without
   pinning f (epoll pins, F60) -> a sibling close frees the embedded waitq -> wq_remove UAF. Same
   lifetime/ordering classes as F57-F70, in un-swept subsystems.
+- sys_brk heap-shrink frees frames before the cross-CPU TLB shootdown -> stale-TLB UAF write -> FIXED
+  (F72, follow-up (n)): the shrink loop did vmm_page_unmap (local invlpg only) + pmm_ref_dec (immediate
+  buddy free) per page, with tlb_flush_range only AFTER the loop. A sibling THREAD_SHARE_MM thread on
+  another CPU keeps a stale writable TLB entry and writes into the freed+reused frame (cross-owner
+  corruption / LPE) -- the exact hazard mm_unmap_range_flush_free was built to forbid and which munmap/
+  MAP_FIXED already use, but brk open-coded free-then-flush. Fix (DRY): route brk shrink through
+  mm_unmap_range_flush_free (unmap -> cross-CPU flush -> free), and shrink the VMA FIRST so a sibling
+  fault in the torn-down range SIGSEGVs instead of repopulating a frame about to be freed. Code-proof
+  (documented flush-before-free primitive) + clean boot (brk exercised by every heap alloc; 56
+  selftests, DHCP, login renders). Closes one of the four fan-out findings.
