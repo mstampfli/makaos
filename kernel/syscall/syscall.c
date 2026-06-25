@@ -107,6 +107,11 @@ static inline int _access_ok(uint64_t addr, uint64_t len);
 // instead of a raw __builtin_memcpy on an unvalidated user pointer.
 int copy_to_user(void* dst_u, const void* src, uint64_t len);
 int copy_from_user(void* dst, const void* src_u, uint64_t len);
+// Validate a user buffer the kernel will deref DIRECTLY (range-check rejects the
+// arbitrary-kernel-R/W LPE, then prefault rejects unmapped pointers).  Returns
+// 0 / -EFAULT.  Used by the socket recv/send/accept/connect/bind handlers, whose
+// data + sockaddr pointers were deref'd raw (defined near user_buf_prefault).
+int user_buf_check(uint64_t addr, uint64_t len);
 // Safe NUL-terminated path copy from user space (built on copy_from_user, no
 // raw deref).  Returns length, -EFAULT (bad pointer), or -ENAMETOOLONG.
 static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
@@ -3058,6 +3063,7 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr) return (uint64_t)-EINVAL;
 
     if (is_unix_sock(f)) {
+        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
         if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
         serial_puts_dbg("[bind] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
@@ -3066,6 +3072,7 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
         return (uint64_t)(int64_t)r;
     }
 
+    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     if (!sa) return (uint64_t)-EINVAL;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
@@ -3106,6 +3113,7 @@ uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
         return (uint64_t)nfd;
     }
 
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
     sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
     vfs_file_t* cf = socket_accept(f, peer);
     if (!cf) {
@@ -3130,6 +3138,7 @@ uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr) return (uint64_t)-EINVAL;
 
     if (is_unix_sock(f)) {
+        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
         const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
         if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
         serial_puts_dbg("[connect] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
@@ -3138,6 +3147,7 @@ uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
         return (uint64_t)(int64_t)r;
     }
 
+    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     int r = socket_connect(f, sa->sin_addr, port);
@@ -3150,9 +3160,13 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     (void)flags; (void)addrlen;
     vfs_file_t* f = fd_to_file(fd);
     if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    // buf_ptr + the sockaddr are deref'd DIRECTLY below; validate them like the
+    // rest of the kernel (an unchecked buf_ptr is an arbitrary-kernel-read leak).
+    if (user_buf_check(buf_ptr, len) != 0) return (uint64_t)-EFAULT;
 
     if (is_unix_sock(f)) {
         if (addr_ptr) {
+            if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) return (uint64_t)-EFAULT;
             const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
             int r = unix_sock_sendto(f, (const void*)buf_ptr, (uint32_t)len,
                                       sa->sun_path);
@@ -3162,6 +3176,7 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
         return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
     }
 
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -3180,12 +3195,16 @@ uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     (void)flags; (void)addrlen_ptr;
     vfs_file_t* f = fd_to_file(fd);
     if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    // The recv data is written DIRECTLY into buf_ptr (tcp_recv_data: dst[i]=...);
+    // an unchecked buf_ptr is an arbitrary-kernel-WRITE LPE.  Validate + prefault.
+    if (user_buf_check(buf_ptr, len) != 0) return (uint64_t)-EFAULT;
 
     if (is_unix_sock(f)) {
         int r = unix_sock_recv(f, (void*)buf_ptr, (uint32_t)len);
         return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
     }
 
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) return (uint64_t)-EFAULT;
     sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {

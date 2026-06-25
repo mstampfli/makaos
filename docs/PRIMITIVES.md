@@ -67,7 +67,12 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
 - `copy_path_from_user(dst, uptr, dstsz)` -- NUL-terminated path, page-granular,
   no over-read; returns length / -EFAULT / -ENAMETOOLONG (F39). To be generalized
   to `copy_str_from_user` during the sweep.
-- `_access_ok(addr, len)` / `user_buf_check` -- validate a user range w/o copying.
+- `_access_ok(addr, len)` / `user_buf_check(addr, len)` -- validate a user range
+  the kernel will deref DIRECTLY (range-check + prefault), w/o copying. USE this for
+  any syscall arg the kernel reads/writes through a raw pointer instead of copy_*_user
+  (io_uring OP_READ/WRITE, and now the socket recv/send/accept/connect/bind handlers
+  -- F51, which previously passed buf_ptr/addr_ptr raw to tcp_recv_data `dst[i]=` /
+  socket_accept / sa->sin_*, an arbitrary-kernel-R/W LPE).
   `_access_ok` and `mmap_round_len` now fold their addr+len / len+PAGE_MASK wrap
   guards onto `ckd_add_u64` (category A) -- the F19/F24 overflow class, exactly the
   use ckd_add documents. Direct `access_ok_selftest` covers the wrap branch that

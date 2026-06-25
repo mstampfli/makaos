@@ -875,3 +875,18 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   Other r.data+off memcpys are fixed-stride (bgd) or already clamped (dirent/file).
   ext2_inode_size_valid_selftest drives the reject cases; boot still mounts + loads
   /bin/login (real s_inode_size valid).
+- socket syscalls deref raw user pointer -> FIXED (F51, HIGH/LPE): sys_recvfrom /
+  sendto / accept / connect / bind passed the raw user buf_ptr / addr_ptr (only
+  !NULL-checked) to code that derefs them DIRECTLY -- tcp_recv_data `dst[i]=` into
+  buf_ptr, UDP/unix recv memcpy into buf_ptr, socket_accept writes peer sockaddr,
+  connect/bind read sa->sin_*/sun_path -- none via _access_ok / user_buf_check /
+  copy_*_user (the rest of the kernel does: sys_read prefaults, io_uring uses
+  user_buf_check). `recvfrom(s,(void*)KADDR,n)` = arbitrary-kernel-WRITE of n
+  attacker-chosen bytes (LPE: cred/funcptr/PTE); send/sendto buf_ptr=KADDR = kernel
+  READ leak; the clamps only bound the count, not the destination. Fix (whole class,
+  all 5 handlers): user_buf_check(buf_ptr,len) + user_buf_check(addr_ptr, sizeof
+  sockaddr_un/in per the is_unix_sock branch) before each deref. Also covers the
+  io_uring socket opcodes (they forward here). Boot DHCP over sendto/recvfrom still
+  gets its lease (10.0.2.15) -> valid path unbroken. Residual (pre-existing, kernel-
+  wide like sys_read): recv copy is post-block -> TOCTOU munmap could #PF; the range
+  check still blocks the kernel-write; bounce-buffer is the fuller later hardening.
