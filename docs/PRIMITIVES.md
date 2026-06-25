@@ -94,17 +94,24 @@ Folded onto category A (single source of truth for the check):
 Each verified a true behavioral match; covered by the existing
 `virtio_desc_id_valid_selftest` / `nvme_cid_valid_selftest` / `ext2_block_valid_selftest`
 (the latter exercises the `ckd_add` wrap boundary `{0xFFFFFF00, 0x200}`).
-Still to fold: `drm_atomic_count_ok` (F40, `<=` bound), `drm_dumb_size` (F23, size mul).
+
+New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive needed):
+- `ext2_blk_lba(part_lba, blk, spb)` (kernel/fs/ext2.c, F46) -- block number -> 64-bit
+  device LBA, formed in u64 so `blk*spb` cannot wrap a u32 to a wrong sector. Pure;
+  `ext2_blk_lba_selftest` drives the `blk*spb == 2^32` wrap boundary. Used by
+  bcache_get + write_block via the `ext2_blk_to_lba(blk)` static wrapper.
 
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
 + on-disk index/run validators folded onto A (a1509ff); B's user-range overflow
 guards (`_access_ok` / `mmap_round_len`) folded onto `ckd_add_u64` + direct
-`access_ok_selftest` (this commit). Verified NOT foldable (kept as-is): `drm_dumb_size`
-(F23) is correct-by-construction via the DRM_MAX_FB_DIM policy cap + u64 math, not a
-hand-rolled overflow check; `drm_atomic_count_ok` (F40) is an inclusive `<= MAX`
-(index_ok would be off-by-one). Remaining: unify C into one ring primitive (check
-spsc.h), then sweep remaining untrusted `a*b`/`a+b` call sites -- one subsystem per
-commit, each with a test. Beyond data, extract any other recurring pattern (locking
-idioms, alloc/free pairs, retry loops) the same way.
+`access_ok_selftest` (89c3fb2); F46 added `ext2_blk_lba` (u64 LBA, fixed a real u32
+wrap bug) (this commit). Verified NOT foldable / correct-by-construction (kept as-is,
+do not retry): `drm_dumb_size` (F23, DRM_MAX_FB_DIM policy cap + u64 math, not a
+hand-rolled overflow check); `drm_atomic_count_ok` (F40, inclusive `<= MAX`, index_ok
+would be off-by-one); `io_uring compute_layout` (clamps entries to IO_URING_MAX_ENTRIES
+before the u64 size multiplies, same cap pattern as drm). Remaining: unify C into one
+ring primitive (check spsc.h), then sweep remaining untrusted `a*b`/`a+b` call sites --
+one subsystem per commit, each with a test. Beyond data, extract any other recurring
+pattern (locking idioms, alloc/free pairs, retry loops) the same way.

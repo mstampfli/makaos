@@ -822,3 +822,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   queue-vs-teardown ownership correct. The recvmsg double-close it flagged is
   subsumed by the F37 fd_install fix (fd_install no longer closes, so recvmsg's
   vfs_close is now the single correct close).
+- ext2 device-LBA wrap -> FIXED (F46): bcache_get/write_block formed `uint32_t lba
+  = s_part_lba + blk * s_sectors_per_blk` (u32) before passing it to the uint64_t
+  ahci_read/write. blk is bounded only by the untrusted on-disk s_blocks_count, so
+  blk*spb (spb<=8) overflows u32 and WRAPS to a valid wrong sector (crafted-image
+  info leak/corruption; also breaks >2 TB-class FS). Fixed by the new pure primitive
+  ext2_blk_lba(part_lba,blk,spb) forming the LBA in u64 (product < 2^35 < u64, no
+  ckd_mul needed -- correct WIDTH not a check), used by both sites + ext2_blk_to_lba
+  wrapper; deterministic ext2_blk_lba_selftest drives the wrap boundary. Separate
+  layer (recorded, not this fix): ahci_read/write do not bound lba vs device size.

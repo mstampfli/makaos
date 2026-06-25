@@ -299,6 +299,18 @@ static inline int ext2_block_valid(uint32_t blk) {
 static inline int ext2_run_valid(uint32_t start, uint32_t run) {
     return ext2_run_in_range(start, run, s_first_data_blk, s_blocks_count);
 }
+// PRIMITIVE (on-disk block number -> 64-bit device LBA).  blk is validated by
+// ext2_block_valid, but the LBA MUST be formed in 64-bit: blk*spb can exceed
+// 2^32 for a large filesystem or a crafted s_blocks_count, and a 32-bit product
+// WRAPS to a wrong sector (silent OOB read/write within the device).  No
+// overflow check is needed -- blk < 2^32 and spb <= 8, so the product is < 2^35
+// and the +part_lba sum < 2^36, all within u64.  Factored pure for unit testing.
+static inline uint64_t ext2_blk_lba(uint32_t part_lba, uint32_t blk, uint32_t spb) {
+    return (uint64_t)part_lba + (uint64_t)blk * spb;
+}
+static inline uint64_t ext2_blk_to_lba(uint32_t blk) {
+    return ext2_blk_lba(s_part_lba, blk, s_sectors_per_blk);
+}
 
 static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
     bcache_ref_t r = { NULL, blk, 0, 0, 0 };
@@ -327,7 +339,7 @@ static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
     }
 
     // Slow path — go to disk.
-    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+    uint64_t lba = ext2_blk_to_lba(blk);   // 64-bit LBA: blk*spb must not wrap
     if (!ahci_read(lba, scratch, s_sectors_per_blk)) return r;
     bcache_fill(blk, scratch, s_block_size);
     r.data = scratch;
@@ -661,7 +673,7 @@ static uint8_t read_block(uint32_t blk, uint8_t* buf) {
 // conflict — harmless, the next read will re-fetch).
 static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
     if (!ext2_block_valid(blk)) return 0;   // never write outside the filesystem
-    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+    uint64_t lba = ext2_blk_to_lba(blk);   // 64-bit LBA: blk*spb must not wrap
     if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
     bcache_fill(blk, buf, s_block_size);
     return 1;
@@ -2157,6 +2169,33 @@ void ext2_block_valid_selftest(void) {
     }
     kprintf(fails ? "[ext2_blkvalid] SELF-TEST FAILED\n"
                   : "[ext2_blkvalid] SELF-TEST PASSED (block + run range, overflow-safe)\n");
+}
+
+// ext2_blk_lba forms the device LBA in 64-bit so blk*spb cannot wrap a u32 and
+// hit a wrong sector.  Drive the WRAP boundary explicitly: a 32-bit product
+// would truncate these, a correct 64-bit one does not.
+void ext2_blk_lba_selftest(void) {
+    kprintf("[ext2_blklba] ext2_blk_lba must form a 64-bit LBA without u32 wrap\n");
+    int fails = 0;
+    struct { uint32_t part, blk, spb; uint64_t want; } c[] = {
+        { 2,       0,           8, 2ULL },            // blk 0 -> just the partition base
+        { 2,       100,         8, 802ULL },          // normal small block
+        { 0,       0x20000000u, 8, 0x100000000ULL },  // blk*spb == 2^32: u32 would wrap to 0
+        { 0x1000,  0x20000000u, 8, 0x100001000ULL },  // + part base, still past 2^32
+        { 0,       0xFFFFFFFFu, 8, 0x7FFFFFFF8ULL },   // max block number, no wrap
+        { 7,       0x10000000u, 4, 0x40000007ULL },    // mixed spb=4
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint64_t got = ext2_blk_lba(c[i].part, c[i].blk, c[i].spb);
+        if (got != c[i].want) {
+            kprintf("[ext2_blklba] FAIL part=0x%lx blk=0x%lx spb=%u got=0x%lx want=0x%lx\n",
+                    (unsigned long)c[i].part, (unsigned long)c[i].blk, c[i].spb,
+                    (unsigned long)got, (unsigned long)c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_blklba] SELF-TEST FAILED\n"
+                  : "[ext2_blklba] SELF-TEST PASSED (64-bit LBA, no u32 wrap)\n");
 }
 
 // Deterministic test of path_split's bound: a parent longer than the
