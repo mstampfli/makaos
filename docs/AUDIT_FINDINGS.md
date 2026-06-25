@@ -1170,3 +1170,21 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (5 AF_UNIX selftests incl. the two-kthread unix_stream_accept rendezvous PASS under the new lock;
   wayland's heavy concurrent connect/accept/close at userspace-start would hang on a deadlock, and 2/3
   boots reach DHCP -- the 1 stall is the flaky F55 one, re-boot-confirmed).
+- execve/spawn raw-deref user argv/envp arrays + element strings -> kernel panic + kernel-mem leak ->
+  FIXED (F71): sys_exec/sys_spawn read uargv[i] and s[l]/memcpy(ks,s,l) on fully attacker-controlled
+  pointers with no _access_ok/copy_from_user. A KADDR argv (or argv[i]) copies kernel memory into the
+  child's argv (unprivileged info-leak/LPE); an unmapped-in-range argv panics the kernel (#PF no-VMA,
+  F67 class, DoS). spawn also raw-deref'd stdio_ptr and _access_ok+memcpy'd spawn_attr. Fix (DRY, one
+  shared primitive): copy_user_strv reads each array slot via copy_from_user and each string via
+  copy_path_from_user (bad ptr -> -EFAULT, never a raw deref), kstack-off scratch (F68 lesson); both
+  syscalls route argv+envp through it, stdio+attr use copy_from_user. Deterministic selftest
+  (copy_user_strv_selftest: kernel/non-canonical/past-ceiling vector ptr -> -EFAULT; NULL -> empty) +
+  code-proof + clean boot (56 selftests; every boot exec/spawn copies a real argv through it).
+- RECORDED (read-only fan-out, HIGH confidence, NOT yet self-verified -- verify before fixing): (n)
+  sys_brk heap-shrink frees frames before the cross-CPU TLB shootdown (vs munmap's flush-then-free) ->
+  sibling-thread stale-TLB UAF write; (o) pty pair lifetime (master_open/slave_open_count/s_pty_head)
+  unlocked -> concurrent master+slave close double-frees the pty_t; (p) AF_INET TCP child PCB's raw
+  ->listener backpointer not cleared on listener free -> a late handshake ACK writes through the freed
+  listener (remote-timed heap UAF); (q) sys_poll/sys_select register a waiter on f->waitq without
+  pinning f (epoll pins, F60) -> a sibling close frees the embedded waitq -> wq_remove UAF. Same
+  lifetime/ordering classes as F57-F70, in un-swept subsystems.

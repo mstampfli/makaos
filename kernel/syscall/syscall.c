@@ -842,6 +842,51 @@ static uint64_t sys_fork(void) {
     return (uint64_t)child->pid;
 }
 
+// Safely copy a user NULL-terminated vector of string pointers (argv/envp) into
+// freshly kmalloc'd kernel strings.  The vector pointer AND every element string
+// pointer are validated through copy_from_user / copy_path_from_user (which
+// range-check via _access_ok and VMA-back the read), so a kernel, non-canonical,
+// unmapped, or wrapping pointer returns -EFAULT instead of being raw-derefed --
+// a raw deref of an unmapped element would take an unresolvable kernel-mode #PF
+// and PANIC the kernel, and a kernel-address element would copy KERNEL memory
+// into the child's argv (an unprivileged info leak / LPE).  On success fills
+// out[0..*count-1] (each kmalloc'd, caller frees) and out[*count] = NULL; on ANY
+// error frees what it allocated, leaves out empty + NULL-terminated, and returns
+// -errno.  `max` elements, `arglen` bytes/string incl NUL, `scratch` a
+// caller-provided arglen-byte buffer (kept OFF the 8KiB kernel stack).
+static int copy_user_strv(uint64_t uvec, char** out, uint32_t max,
+                          uint32_t arglen, uint8_t* scratch, uint32_t* count) {
+    *count = 0;
+    out[0] = NULL;
+    if (!uvec) return 0;                          // no argv/envp: empty vector
+    int rc = 0;
+    for (uint32_t i = 0; i < max; i++) {
+        uint64_t ustr = 0;
+        // Read element i of the pointer array (validated 8-byte copy).
+        if (copy_from_user(&ustr, (const void*)(uvec + (uint64_t)i * 8), 8) != 0) {
+            rc = -EFAULT; goto fail;
+        }
+        if (!ustr) break;                         // NULL terminator
+        // Bounded NUL-terminated copy of the string the element points at
+        // (validates ustr; -EFAULT for a bad pointer, -ENAMETOOLONG if too long).
+        int64_t n = copy_path_from_user((char*)scratch, (const void*)ustr, arglen);
+        if (n < 0) { rc = (int)n; goto fail; }    // -EFAULT or -ENAMETOOLONG
+        char* ks = kmalloc((uint64_t)n + 1);
+        if (!ks) { rc = -ENOMEM; goto fail; }
+        __builtin_memcpy(ks, scratch, (uint64_t)n);
+        ks[n] = '\0';
+        out[*count] = ks;
+        (*count)++;
+        out[*count] = NULL;                       // keep the vector NULL-terminated
+    }
+    return 0;
+fail:
+    for (uint32_t i = 0; i < *count; i++) kfree(out[i]);
+    *count = 0;
+    out[0] = NULL;
+    return rc;
+}
+
 // ── sys_exec (execve) ─────────────────────────────────────────────────────
 // execve(path_ptr, argv_ptr, envp_ptr)
 //
@@ -884,43 +929,32 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // ── Copy argv from user space (up to 256 args, 4KiB each) ────────────
     #define MAX_ARGS  256
     #define MAX_ARG_LEN 4096
-    char* k_argv[MAX_ARGS + 1];
-    uint32_t argc = 0;
-    if (argv_ptr) {
-        const uint64_t* uargv = (const uint64_t*)argv_ptr;
-        while (argc < MAX_ARGS) {
-            uint64_t ustr = uargv[argc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_argv[argc++] = ks;
-        }
-    }
-    k_argv[argc] = NULL;
-
-    // ── Copy envp from user space (up to 512 vars) ────────────────────────
     #define MAX_ENVS 512
+    char* k_argv[MAX_ARGS + 1];
     char* k_envp[MAX_ENVS + 1];
-    uint32_t envc = 0;
-    if (envp_ptr) {
-        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
-        while (envc < MAX_ENVS) {
-            uint64_t ustr = uenvp[envc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_envp[envc++] = ks;
+    uint32_t argc = 0, envc = 0;
+    // Validate + copy argv/envp through the shared safe primitive: it rejects a
+    // kernel/unmapped/non-canonical array or element pointer with -EFAULT rather
+    // than raw-dereferencing it (which would PANIC the kernel on an unmapped
+    // page or copy KERNEL memory into the child's argv).  One arglen-byte
+    // scratch, kmalloc'd off the 8KiB kernel stack, reused for every string.
+    {
+        uint8_t* strv_scratch = (uint8_t*)kmalloc(MAX_ARG_LEN);
+        if (!strv_scratch) goto oom;
+        int srv = copy_user_strv(argv_ptr, k_argv, MAX_ARGS, MAX_ARG_LEN,
+                                 strv_scratch, &argc);
+        if (srv == 0)
+            srv = copy_user_strv(envp_ptr, k_envp, MAX_ENVS, MAX_ARG_LEN,
+                                 strv_scratch, &envc);
+        kfree(strv_scratch);
+        if (srv != 0) {
+            // copy_user_strv freed its own partial vector (and reset its count);
+            // free the other one (argv may be fully built if envp failed).
+            for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            return (uint64_t)(int64_t)srv;
         }
     }
-    k_envp[envc] = NULL;
 
     // ── Execute permission check (path-aware walk + exec bit) ────────────
     int exec_err = 0;
@@ -1236,45 +1270,31 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // ── Copy argv (up to 64 args) ─────────────────────────────────────────
     #define SPAWN_MAX_ARGS 64
     #define SPAWN_MAX_ARG_LEN 512
-    char* k_argv[SPAWN_MAX_ARGS + 1];
-    uint32_t argc = 0;
-    if (argv_ptr) {
-        const uint64_t* uargv = (const uint64_t*)argv_ptr;
-        while (argc < SPAWN_MAX_ARGS) {
-            uint64_t ustr = uargv[argc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom_argv;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_argv[argc++] = ks;
-        }
-    }
-    k_argv[argc] = NULL;
-    // If caller passed no argv, synthesise {path, NULL}.
-    if (argc == 0) { k_argv[0] = path; k_argv[1] = NULL; argc = 1; }
-
-    // ── Copy envp (up to 64 vars) ─────────────────────────────────────────
     #define SPAWN_MAX_ENVS 64
+    char* k_argv[SPAWN_MAX_ARGS + 1];
     char* k_envp[SPAWN_MAX_ENVS + 1];
-    uint32_t envc = 0;
-    if (envp_ptr) {
-        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
-        while (envc < SPAWN_MAX_ENVS) {
-            uint64_t ustr = uenvp[envc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom_envp;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_envp[envc++] = ks;
+    uint32_t argc = 0, envc = 0;
+    // Validate + copy argv/envp through the shared safe primitive (same as
+    // sys_exec): a kernel/unmapped/non-canonical array or element pointer is
+    // rejected with -EFAULT, never raw-dereferenced.  One scratch off the kstack.
+    {
+        uint8_t* strv_scratch = (uint8_t*)kmalloc(SPAWN_MAX_ARG_LEN);
+        if (!strv_scratch) return (uint64_t)-ENOMEM;
+        int srv = copy_user_strv(argv_ptr, k_argv, SPAWN_MAX_ARGS,
+                                 SPAWN_MAX_ARG_LEN, strv_scratch, &argc);
+        if (srv == 0)
+            srv = copy_user_strv(envp_ptr, k_envp, SPAWN_MAX_ENVS,
+                                 SPAWN_MAX_ARG_LEN, strv_scratch, &envc);
+        kfree(strv_scratch);
+        if (srv != 0) {
+            for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            return (uint64_t)(int64_t)srv;
         }
     }
-    k_envp[envc] = NULL;
+    // If caller passed no argv, synthesise {path, NULL}.  k_argv[0] is then NOT
+    // a kmalloc'd copy, so the oom_argv cleanup is guarded by `if (argv_ptr)`.
+    if (argc == 0) { k_argv[0] = path; k_argv[1] = NULL; argc = 1; }
     // Default env if caller passed nothing.
     const char* def_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", "PWD=/", NULL };
     const char* const* final_envp = envc ? (const char* const*)k_envp : def_envp;
@@ -1283,8 +1303,14 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // stdio_ptr points to int[3]; 0 = open tty0 for all.
     int stdio[3] = { -1, -1, -1 }; // default: inherit
     if (stdio_ptr) {
-        const int* us = (const int*)stdio_ptr;
-        stdio[0] = us[0]; stdio[1] = us[1]; stdio[2] = us[2];
+        // copy_from_user, not a raw us[i] deref: a kernel/non-canonical/unmapped
+        // stdio_ptr would otherwise read kernel ints or panic the kernel.  Free
+        // the arg/env copies on a bad pointer (argv synth -> guarded like oom_argv).
+        if (copy_from_user(stdio, (const void*)stdio_ptr, sizeof(stdio)) != 0) {
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            return (uint64_t)-EFAULT;
+        }
     }
 
     // ── Read + pre-validate spawn_attr BEFORE creating the child ──────────
@@ -1297,8 +1323,11 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     spawn_attr_t a;
     __builtin_memset(&a, 0, sizeof(a));
     int have_attr = 0;
-    if (attr_ptr && _access_ok(attr_ptr, sizeof(spawn_attr_t))) {
-        __builtin_memcpy(&a, (const void*)attr_ptr, sizeof(spawn_attr_t));
+    // copy_from_user (validate + VMA-back), not _access_ok + raw memcpy: an
+    // in-range but UNMAPPED attr_ptr passes a range check then #PF-panics in the
+    // memcpy.  A bad pointer leaves have_attr=0 (attr ignored), as before.
+    if (attr_ptr && copy_from_user(&a, (const void*)attr_ptr,
+                                   sizeof(spawn_attr_t)) == 0) {
         have_attr = 1;
         if ((a.flags & SPAWN_ATTR_CRED) &&
             !spawn_cred_allowed(&g_current->cred, a.uid, a.gid))
@@ -3476,6 +3505,49 @@ void copy_user_selftest(void) {
     }
     kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
                   : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
+}
+
+// copy_user_strv (the exec/spawn argv/envp vector copier) must reject a
+// kernel/non-canonical/past-ceiling vector pointer with -EFAULT and count 0,
+// before dereferencing it -- not raw-read it (which would leak kernel memory
+// into the child or panic on an unmapped page).  A NULL vector is the
+// legitimate "no argv" case -> empty + NULL-terminated.  (The success path and
+// per-element string validation need a live user mm, so they are code-proof via
+// copy_from_user/copy_path_from_user + clean boot, where every exec copies a
+// real argv.)
+void copy_user_strv_selftest(void) {
+    int fails = 0;
+    char* out[4];
+    uint32_t count = 99;
+    uint8_t* scratch = (uint8_t*)kmalloc(64);
+    if (!scratch) { kprintf("[strv_test] SELF-TEST FAILED (alloc)\n"); return; }
+
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        count = 99;
+        out[0] = (char*)0x1;
+        int rc = copy_user_strv(bad[i], out, 4, 16, scratch, &count);
+        if (rc != -EFAULT || count != 0 || out[0] != NULL) {
+            kprintf("[strv_test] FAIL accepted bad vec 0x%lx rc=%d count=%u\n",
+                    (unsigned long)bad[i], rc, count);
+            fails++;
+        }
+    }
+    // NULL vector: the legitimate "no argv/envp" case.
+    count = 99;
+    if (copy_user_strv(0, out, 4, 16, scratch, &count) != 0 ||
+        count != 0 || out[0] != NULL) {
+        kprintf("[strv_test] FAIL null vec not empty-ok\n");
+        fails++;
+    }
+
+    kfree(scratch);
+    kprintf(fails ? "[strv_test] SELF-TEST FAILED\n"
+                  : "[strv_test] SELF-TEST PASSED (argv/envp vector rejects bad pointers)\n");
 }
 
 // copy_path_from_user replaced the raw `while (upath[i])` path derefs in

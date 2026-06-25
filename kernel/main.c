@@ -451,6 +451,11 @@ static void init_kthread(void) {
     extern void copy_path_user_selftest(void);
     copy_path_user_selftest();
 
+    // exec/spawn argv+envp vector copier must reject bad array/element pointers
+    // with -EFAULT instead of raw-dereferencing them (kernel leak / panic).
+    extern void copy_user_strv_selftest(void);
+    copy_user_strv_selftest();
+
     // Audit fix: sys_spawn SPAWN_ATTR_CRED applied attacker-chosen uid/gid with
     // no caller check (root LPE).  Verify the down-only credential gate.
     extern void spawn_cred_allowed_selftest(void);
