@@ -1258,3 +1258,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   clean boot. REMAINING (s2, recorded): w_sys_sendmsg/recvmsg + the SCM_RIGHTS tf loop (~13 returns each +
   unix_sock_sendfd ownership semantics + a bounce[4096] kstack hazard) and epoll/timerfd/signalfd fd_to_file
   -- a dedicated effort, not boot-validatable pre-login.
+- sendmsg/recvmsg + the SCM_RIGHTS fd loop deref the un-refcounted fd_to_file across a blocking op -> sibling-
+  close UAF -> FIXED (F78, completes finding (s)): same class as F77 on the two msghdr syscalls. Verified the
+  SCM entanglement first: unix_sock_sendfd does vfs_dup(file) (vfs.h: bumps refcount only if already > 0, same
+  pointer) into the peer ancillary, and vfs_dup's contract requires the caller to hold a ref (else the dup
+  races a last-close) -- so the bare tf = fd_to_file(fds_buf[i]) fed to vfs_dup is itself a UAF. Fix: fdget/
+  fdput the socket on every return path (single-exit goto out) in both functions, AND fdget/fdput each SCM fd
+  around the non-blocking sendfd (the pin makes vfs_dup's precondition true; the ancillary's dup ref is
+  independent). Code-proof (not boot-exercised pre-login) + scm_rights/unix_refcount selftests + clean boot.
+  Next: the bounce[4096] and fds_buf/inst_fds[253] (~1KB) buffers in these two functions are still on the
+  8KiB kstack (F68 class).

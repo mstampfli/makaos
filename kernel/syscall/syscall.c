@@ -6030,42 +6030,57 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     (void)d;
     int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
-    vfs_file_t* sock = fd_to_file(fd_u);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close()
+    // on the shared fd table cannot free it while we block in the send.
+    // fdput on every exit via the single goto out.
+    vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     k_msghdr_t mh;
-    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
 
     // ── Pass fds in any SCM_RIGHTS cmsg before sending payload so the
     //    receiver sees them in correct order (Linux semantics). ─────
     if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)) {
-        if (!is_unix_sock(sock)) return (uint64_t)-EINVAL;
+        if (!is_unix_sock(sock)) { ret = (uint64_t)-EINVAL; goto out; }
         uint64_t off = 0;
         while (off + sizeof(k_cmsghdr_t) <= mh.msg_controllen) {
             k_cmsghdr_t ch;
             if (copy_from_user(&ch, (void*)(mh.msg_control + off),
-                                sizeof(ch)) != 0)
-                return (uint64_t)-EFAULT;
+                                sizeof(ch)) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
             if (ch.cmsg_len < sizeof(k_cmsghdr_t) ||
-                off + ch.cmsg_len > mh.msg_controllen)
-                return (uint64_t)-EINVAL;
+                off + ch.cmsg_len > mh.msg_controllen) {
+                ret = (uint64_t)-EINVAL; goto out;
+            }
             if (ch.cmsg_level == SOL_SOCKET && ch.cmsg_type == SCM_RIGHTS) {
                 uint64_t data_off  = off + K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
                 uint64_t data_len  = ch.cmsg_len - K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
                 uint64_t n_fds     = data_len / sizeof(int32_t);
-                if (n_fds > SCM_MAX_FD) return (uint64_t)-EINVAL;
-                // Pull all fds out atomically — if any lookup fails we
+                if (n_fds > SCM_MAX_FD) { ret = (uint64_t)-EINVAL; goto out; }
+                // Pull all fds out atomically -- if any lookup fails we
                 // abort before queuing any.
                 int32_t fds_buf[SCM_MAX_FD];
                 if (copy_from_user(fds_buf, (void*)(mh.msg_control + data_off),
-                                    n_fds * sizeof(int32_t)) != 0)
-                    return (uint64_t)-EFAULT;
+                                    n_fds * sizeof(int32_t)) != 0) {
+                    ret = (uint64_t)-EFAULT; goto out;
+                }
                 for (uint64_t i = 0; i < n_fds; i++) {
-                    vfs_file_t* tf = fd_to_file(fds_buf[i]);
-                    if (!tf) return (uint64_t)-EBADF;
+                    // fdget pins the passed fd so unix_sock_sendfd's vfs_dup
+                    // cannot race a sibling close(fds_buf[i]): vfs_dup bumps
+                    // refcount only if it is already > 0, so an unpinned file
+                    // mid-teardown would resurrect freed memory or queue a
+                    // dangling ancillary pointer. The ancillary holds its own
+                    // independent dup ref; fdput drops only our transient pin.
+                    vfs_file_t* tf = fdget(fds_buf[i]);
+                    if (!tf) { ret = (uint64_t)-EBADF; goto out; }
                     int r = unix_sock_sendfd(sock, tf, tf->rights);
-                    if (r < 0) return (uint64_t)(int64_t)r;
+                    fdput(tf);
+                    if (r < 0) { ret = (uint64_t)(int64_t)r; goto out; }
                 }
             }
             off += K_CMSG_ALIGN(ch.cmsg_len);
@@ -6077,10 +6092,11 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
         k_iovec_t iv;
         if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
-                            sizeof(iv)) != 0)
-            return (uint64_t)-EFAULT;
+                            sizeof(iv)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
         if (!iv.iov_len) continue;
-        // Bounce via a small stack buffer — avoids pinning the user page
+        // Bounce via a small stack buffer -- avoids pinning the user page
         // and avoids any kmalloc in the hot path for typical wayland
         // message sizes (<4 KiB).
         uint8_t bounce[4096];
@@ -6089,12 +6105,13 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             uint64_t chunk = iv.iov_len - done;
             if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
             if (copy_from_user(bounce, (void*)(iv.iov_base + done),
-                                chunk) != 0)
-                return (uint64_t)-EFAULT;
+                                chunk) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
             int w = unix_sock_send_ex(sock, bounce, (uint32_t)chunk, nonblock);
             if (w < 0) {
-                if (total > 0) return total;   // partial send wins
-                return (uint64_t)(int64_t)w;
+                if (total > 0) { ret = total; goto out; }   // partial send wins
+                ret = (uint64_t)(int64_t)w; goto out;
             }
             if (w == 0) break;
             done  += (uint64_t)w;
@@ -6102,7 +6119,10 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if ((uint64_t)w < chunk) break;
         }
     }
-    return total;
+    ret = total;
+out:
+    fdput(sock);
+    return ret;
 }
 
 static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
@@ -6110,12 +6130,17 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     (void)d;
     int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
-    vfs_file_t* sock = fd_to_file(fd_u);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close()
+    // on the shared fd table cannot free it while we block in the recv.
+    // fdput on every exit via the single goto out.
+    vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     k_msghdr_t mh;
-    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
 
     // ── Drain any pending fds into a single SCM_RIGHTS cmsg ────────
     // We dequeue up to the userland-sized control buffer.  Any fd
@@ -6147,11 +6172,11 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if (copy_to_user((void*)mh.msg_control, &ch, sizeof(ch)) != 0
                 || copy_to_user((void*)(mh.msg_control + hdr_pad),
                                  inst_fds, n_inst * sizeof(int32_t)) != 0) {
-                // Faulted mid-write → close everything we installed
+                // Faulted mid-write -> close everything we installed
                 // so the fd table isn't leaked.
                 for (uint64_t i = 0; i < n_inst; i++)
                     (void)sys_close((uint64_t)(int)inst_fds[i]);
-                return (uint64_t)-EFAULT;
+                ret = (uint64_t)-EFAULT; goto out;
             }
             cmsg_written = ch.cmsg_len;
         }
@@ -6162,8 +6187,9 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
         k_iovec_t iv;
         if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
-                            sizeof(iv)) != 0)
-            return (uint64_t)-EFAULT;
+                            sizeof(iv)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
         if (!iv.iov_len) continue;
         uint8_t bounce[4096];
         uint64_t done = 0;
@@ -6176,15 +6202,16 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if (r < 0) {
                 // First read returning an error propagates; a later
                 // partial read returns bytes already gathered.  A
-                // drained SCM_RIGHTS cmsg counts as progress — return
+                // drained SCM_RIGHTS cmsg counts as progress -- return
                 // it with 0 payload rather than erroring it away.
-                if (total == 0 && n_inst == 0) return (uint64_t)(int64_t)r;
+                if (total == 0 && n_inst == 0) { ret = (uint64_t)(int64_t)r; goto out; }
                 goto done_gather;
             }
             if (r == 0) goto done_gather;
             if (copy_to_user((void*)(iv.iov_base + done), bounce,
-                              (uint64_t)r) != 0)
-                return (uint64_t)-EFAULT;
+                              (uint64_t)r) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
             done  += (uint64_t)r;
             total += (uint64_t)r;
             if ((uint64_t)r < chunk) goto done_gather;
@@ -6194,9 +6221,13 @@ done_gather:
     // Write back msg_controllen so caller knows how much we used.
     mh.msg_controllen = cmsg_written;
     mh.msg_flags      = 0;
-    if (copy_to_user((void*)mhdr_ptr, &mh, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
-    return total;
+    if (copy_to_user((void*)mhdr_ptr, &mh, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = total;
+out:
+    fdput(sock);
+    return ret;
 }
 
 // ── sys_socketpair ──────────────────────────────────────────────────
