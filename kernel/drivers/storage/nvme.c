@@ -403,6 +403,14 @@ static void cid_push(nvme_ioq_t* q, uint16_t cid) {
     __atomic_fetch_or(&q->cid_free_bitmap, 1ULL << cid, __ATOMIC_RELEASE);
 }
 
+// Is a completion's command id a valid index into the NVME_IOQ_DEPTH-entry
+// req[] table?  The submit side draws cids from the 64-bit cid_free_bitmap so
+// it is always in range, but the COMPLETION cid is echoed by the device and
+// MUST be validated before indexing req[] -- an out-of-range cid otherwise
+// drives an OOB write of req->status/->done and a wait_queue_wake_all through
+// a fabricated wait_queue_t.  Pure -> unit-tested (nvme_cid_valid_selftest).
+static int nvme_cid_valid(uint16_t cid) { return cid < NVME_IOQ_DEPTH; }
+
 // ── Async I/O submit — per-CPU queue, wakeup via that CPU's MSI-X ────
 static uint8_t io_submit_async(nvme_sqe_t* cmd) {
     // Pin to the current CPU for the duration of queue selection +
@@ -480,6 +488,12 @@ void nvme_irq_handler(void) {
         nvme_cqe_t cqe = q->cq[q->cq_head];
         q->cq_head = (q->cq_head + 1) % NVME_IOQ_DEPTH;
         if (q->cq_head == 0) q->cq_phase ^= 1;
+
+        // cqe.cid is echoed by the device; reject an out-of-range id before it
+        // indexes req[] (OOB write + wake through a garbage wait_queue_t).  The
+        // CQE is already consumed (cq_head/phase advanced), so the doorbell
+        // below still credits it -- we just drop the corrupt completion.
+        if (!nvme_cid_valid(cqe.cid)) continue;
 
         nvme_request_t* req = &q->req[cqe.cid];
         req->status = cqe.status_phase;
@@ -810,4 +824,29 @@ uint8_t nvme_init(void) {
 
     kprintf("[nvme] init complete — per-CPU I/O queues live\n");
     return 1;
+}
+
+// ── nvme_cid_valid selftest ───────────────────────────────────────────────
+// Deterministic check of the device-echoed completion-id bounds guard that
+// stops an OOB write of req[]/a wake through a fabricated wait_queue_t from a
+// malicious/buggy controller (or CQ-page DMA corruption) reporting cid >= 64.
+void nvme_cid_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint16_t cid; int want; } c[] = {
+        { 0,                 1 },  // first slot
+        { NVME_IOQ_DEPTH-1,  1 },  // last valid slot (63)
+        { NVME_IOQ_DEPTH,    0 },  // == 64, first OOB
+        { 1000,              0 },  // arbitrary OOB
+        { 0xFFFF,            0 },  // device garbage (uint16 max)
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (nvme_cid_valid(c[i].cid) != c[i].want) {
+            kprintf("[nvme_cid] FAIL cid=%u got=%d want=%d\n",
+                    (unsigned)c[i].cid, nvme_cid_valid(c[i].cid), c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[nvme_cid] SELF-TEST FAILED\n"
+                  : "[nvme_cid] SELF-TEST PASSED (device completion-id bounds)\n");
 }

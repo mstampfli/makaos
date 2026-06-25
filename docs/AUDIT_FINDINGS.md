@@ -437,15 +437,20 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   Boot exercises pipes (shell pipelines, swaybar status_command) -> no regression.
 
 - **NVMe completion CID OOB (device-controlled index)**
-  (`kernel/drivers/storage/nvme.c:484` nvme_irq_handler) -> OPEN. `cqe.cid`
-  (uint16, device-written into the completion queue) indexes the 64-entry
+  (`kernel/drivers/storage/nvme.c` nvme_irq_handler) -> FIXED (F26). `cqe.cid`
+  (uint16, device-written into the completion queue) indexed the 64-entry
   q->req[] with NO bounds check -> OOB write of req->status/->done + a
   wait_queue_wake_all on a fabricated wait_queue_t (walks/writes a wake-list
   through garbage pointers). Exact F22 class for NVMe (the submit side IS bounded
-  by a 64-bit bitmap; only the device-echoed completion CID is trusted). AHCI is
-  unaffected (slots derived via ctz of the hardware mask into a 32-entry array).
-  Fix: pure nvme_cid_valid(cid)=cid<NVME_IOQ_DEPTH, `continue` on a bad cid (the
-  CQE is already consumed). Deterministic selftest (verbatim F22 shape).
-  Confidence HIGH. Threat model: malicious/buggy NVMe controller or CQ-page DMA
-  corruption (the repo already treats this device-echo-index class as a real bug
-  worth a guard, per F22).
+  by the 64-bit cid_free_bitmap via cid_pop; only the device-echoed completion
+  CID was trusted). AHCI is unaffected (slots derived via ctz of the hardware
+  mask into a 32-entry array). Fixed with pure
+  nvme_cid_valid(cid)=cid<NVME_IOQ_DEPTH and `if (!nvme_cid_valid(cqe.cid))
+  continue;` after the CQE is consumed (cq_head/phase advanced) and before
+  indexing req[] -- drops the corrupt completion while the doorbell still credits
+  it. Deterministic nvme_cid_valid_selftest (cid 0, 63 valid; 64, 1000, 0xFFFF
+  invalid). Boot uses AHCI (no NVMe device in the QEMU config) so the completion
+  path is not live-exercised, but the helper is unit-tested and the guard is a
+  minimal continue that does not touch the valid path. Confidence HIGH. Threat
+  model: malicious/buggy NVMe controller or CQ-page DMA corruption (the repo
+  treats this device-echo-index class as a real bug worth a guard, per F22).

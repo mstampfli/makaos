@@ -557,6 +557,10 @@ static void init_kthread(void) {
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();
 
+    // NVMe device completion-id bounds (req[] OOB from a malicious/buggy NVMe).
+    extern void nvme_cid_valid_selftest(void);
+    nvme_cid_valid_selftest();
+
     // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
     extern void virtfs_is_virtual_selftest(void);
     virtfs_is_virtual_selftest();
