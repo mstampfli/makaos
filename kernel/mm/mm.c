@@ -198,6 +198,61 @@ vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr) {
     return NULL;
 }
 
+// Every page in [addr, addr+len) backed by a VMA?  See the header comment: this
+// is the no-map, file-safe alternative to a prefault for validating a user
+// buffer the kernel will raw-deref for READING.  It does NOT close the TOCTOU
+// vs a concurrent munmap between this check and the caller's raw read -- that
+// residual needs a fault-fixup table (recorded follow-up).
+int mm_range_has_vmas(mm_t* mm, uint64_t addr, uint64_t len) {
+    if (!len) return 1;                          // empty range is trivially ok
+    if (!mm)  return 0;
+    uint64_t addr_end = addr + len;
+    if (addr_end < addr) return 0;               // addr+len wraps u64
+    virt_addr_t page   = addr & ~(virt_addr_t)0xFFF;
+    uint64_t    npages = ((addr_end - 1) >> 12) - (addr >> 12) + 1;
+    for (uint64_t i = 0; i < npages; i++, page += 0x1000) {
+        rcu_read_lock();
+        int have = (mm_vma_find(mm, page) != NULL);
+        rcu_read_unlock();
+        if (!have) return 0;                     // a page with no VMA -> -EFAULT
+    }
+    return 1;
+}
+
+// Deterministic selftest for mm_range_has_vmas (the F67 fix core): two VMAs with
+// a gap, exercising fully-inside, straddle-into-gap, in-gap, mid-page, len==0,
+// NULL mm, and the addr+len wrap.  Pure -- a constructed mm, no real faults.
+void mm_range_has_vmas_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    vma_t v2 = { .start = 0x20000, .end = 0x21000, .next = NULL };
+    vma_t v1 = { .start = 0x10000, .end = 0x12000, .next = &v2 };
+    mm_t m; __builtin_memset(&m, 0, sizeof(m)); m.vmas = &v1;
+
+    struct { uint64_t a, l; int want; const char* d; } cs[] = {
+        { 0x10000, 0x1000, 1, "page fully in v1" },
+        { 0x10000, 0x2000, 1, "both pages of v1" },
+        { 0x10800, 0x800,  1, "mid-page within v1" },
+        { 0x11FFF, 0x2,    0, "straddles v1 end into gap" },
+        { 0x12000, 0x8,    0, "in the gap (no VMA)" },
+        { 0x1F000, 0x8,    0, "in the gap before v2" },
+        { 0x20000, 0x1000, 1, "page fully in v2" },
+        { 0x10000, 0,      1, "len 0 trivially ok" },
+        { 0xFFFFFFFFFFFFF000ULL, 0x2000, 0, "addr+len wraps" },
+    };
+    for (unsigned i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+        int got = mm_range_has_vmas(&m, cs[i].a, cs[i].l);
+        if (got != cs[i].want) { fails++;
+            kprintf_atomic("[mm_range_vmas] FAIL %s: got %d want %d\n",
+                           cs[i].d, got, cs[i].want); }
+    }
+    if (mm_range_has_vmas(NULL, 0x10000, 0x1000) != 0) { fails++;
+        kprintf_atomic("[mm_range_vmas] FAIL null mm\n"); }
+
+    kprintf_atomic(fails ? "[mm_range_vmas] SELF-TEST FAILED\n"
+                         : "[mm_range_vmas] PASS (per-page VMA backing for raw-deref user reads)\n");
+}
+
 // ── mm_destroy ────────────────────────────────────────────────────────────
 // Frees all VMA descriptors and the mm_t itself.
 // Called at last task_mm_t unref — by that point there are no threads

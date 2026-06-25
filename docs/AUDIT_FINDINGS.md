@@ -1108,3 +1108,22 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   path is exercised constantly by login/svcmgr/sway exits, 0 fault, login prompt renders). Separate
   out-of-scope NOTE: MakaOS kills only the faulting thread on a fatal signal, not the whole thread
   group (a POSIX semantic/feature gap, not this leak).
+- write(2) raw-deref of an unmapped-but-in-range buffer -> kernel #PF PANIC (DoS) -> FIXED (F67,
+  follow-up (c)): sys_write validated buf with _access_ok ONLY (range/LPE guard), then vfs_write ->
+  the write_op reads buf with a raw memcpy. A buf in valid user range with NO VMA (p=mmap; munmap(p);
+  write(1,p,16)) takes a kernel-mode #PF; isr14_page_fault treats kernel-mode user-address faults as
+  legit (vmm.c:669) but on no-VMA does `goto kernel_panic` (vmm.c:791) -> halts the whole kernel. A
+  trivial unprivileged DoS. The recorded (c) (absent-but-VALID page) is benign -- the handler
+  demand-pages it correctly; the no-VMA case is the reachable bug. F52 used _access_ok-only here on
+  purpose (user_buf_prefault maps+ZEROS absent pages, corrupting a file-backed read source -- login's
+  .rodata strings -> blank/hang), so the existing prefault could not close the gap. Fix (new
+  no-map primitive): mm_range_has_vmas(mm, addr, len) checks every page has a VMA WITHOUT mapping (so
+  a valid-but-absent page still demand-faults its real content); user_buf_readable_ok = _access_ok +
+  mm_range_has_vmas; sys_write uses it, returning -EFAULT for an unmapped buf before any write_op lock
+  (no panic). Deterministic selftest (mm_range_has_vmas_selftest: two VMAs + a gap, fully-inside /
+  straddle / in-gap / mid-page / len0 / null-mm / wrap) + code-proof + clean boot (53 selftests; the
+  login prompt is a write() of a file-backed .rodata string and renders correctly, proving valid +
+  file-backed writes still work and are not zero-filled). RESIDUAL follow-up (l): a concurrent munmap
+  between the check and the raw read still panics; the robust fix is a fault-fixup/exception table so
+  any kernel-mode fault on a user address returns -EFAULT (would also let copy_*_user/user_buf_check
+  drop their file-corrupting prefault for read sources).

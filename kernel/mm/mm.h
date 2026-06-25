@@ -102,6 +102,15 @@ uint8_t mm_vma_add_file(mm_t* mm, virt_addr_t start, virt_addr_t end,
 // the pointer must not be touched again.
 vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr);
 
+// Is every page in [addr, addr+len) backed by a VMA?  Used to validate a user
+// buffer the kernel will raw-dereference for READING (e.g. write(2)'s data
+// buffer): an unbacked page would take an unresolvable kernel-mode #PF and
+// panic, so the caller must reject it with -EFAULT up front.  Unlike a prefault
+// it does NOT map or zero absent-but-valid pages, so a file-backed source page
+// keeps its real content (a prefault would zero-fill it).  Returns 1 if fully
+// backed (or len==0), 0 if any page is unbacked, addr+len wraps, or mm is NULL.
+int mm_range_has_vmas(mm_t* mm, uint64_t addr, uint64_t len);
+
 // Remove and free all VMAs and the mm_t itself.
 // Does NOT unmap or free physical frames — caller must walk the page tables
 // via vmm_free_user() first.

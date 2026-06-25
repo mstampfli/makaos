@@ -112,6 +112,11 @@ int copy_from_user(void* dst, const void* src_u, uint64_t len);
 // 0 / -EFAULT.  Used by the socket recv/send/accept/connect/bind handlers, whose
 // data + sockaddr pointers were deref'd raw (defined near user_buf_prefault).
 int user_buf_check(uint64_t addr, uint64_t len);
+// Like user_buf_check but does NOT prefault (map+zero) absent pages -- it only
+// requires every page to have a VMA, so the caller's raw read demand-faults the
+// real content.  For READ-from-user direct-deref paths whose source may be
+// file-backed (write(2)'s data buffer), where prefault would zero-fill it.
+int user_buf_readable_ok(uint64_t addr, uint64_t len);
 // Safe NUL-terminated path copy from user space (built on copy_from_user, no
 // raw deref).  Returns length, -EFAULT (bad pointer), or -ENAMETOOLONG.
 static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
@@ -197,11 +202,17 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     }
     // A direct-deref write_op (sock_write -> tcp_send reads buf raw) would read
     // from a KERNEL address if buf is unvalidated -- write(sockfd, KADDR, n) leaks
-    // kernel memory onto the wire.  Range-check buf (rejects kernel/non-canonical/
-    // overflowing pointers, overflow-safe via _access_ok's ckd_add_u64).  We do NOT
-    // prefault here: a write READS the buffer, so allocating zero pages for absent
-    // pages is wrong; an absent valid page is demand-paged by the normal fault path.
-    if (len && !_access_ok(buf, len)) { fdput(f); return (uint64_t)-EFAULT; }
+    // kernel memory onto the wire.  Validate buf: the range is user (rejects
+    // kernel/non-canonical/overflowing pointers, the arbitrary-read LPE guard)
+    // AND every page has a VMA, so a raw read of an unmapped-but-in-range pointer
+    // (p=mmap(...); munmap(p); write(1,p,16)) returns -EFAULT here instead of
+    // taking an unresolvable kernel-mode #PF that panics the kernel.  We do NOT
+    // prefault: a write READS the buffer, so mapping+zeroing absent pages would
+    // corrupt a file-backed source (a .rodata string would read as zeros); an
+    // absent valid page (VMA present) is demand-paged correctly by the raw read.
+    if (len && user_buf_readable_ok(buf, len) != 0) {
+        fdput(f); return (uint64_t)-EFAULT;
+    }
     int64_t r = vfs_write(f, (const void*)buf, len);
     fdput(f);
     if (r < 0) return (uint64_t)r;
@@ -3375,6 +3386,25 @@ int user_buf_check(uint64_t addr, uint64_t len) {
     if (!_access_ok(addr, len)) return -EFAULT;
     if (user_buf_prefault((virt_addr_t)addr, (size_t)len) != 0) return -EFAULT;
     return 0;
+}
+
+// Validate a user buffer the kernel will raw-deref for READING (write(2)'s data
+// buffer).  _access_ok rejects kernel/non-canonical/overflowing pointers (the
+// arbitrary-kernel-read LPE guard); then EVERY page must have a VMA so the raw
+// read demand-faults cleanly instead of taking an unresolvable kernel-mode #PF
+// that panics the whole kernel ("kernel #PF unrecoverable") on an unmapped-but-
+// in-range pointer -- e.g. p=mmap(...); munmap(p); write(1,p,16).  Unlike
+// user_buf_check / copy_from_user it does NOT prefault: a prefault MAPS+ZEROS
+// absent pages, which for a READ source corrupts a file-backed page (a .rodata
+// string literal would read as zeros) -- the exact reason write() could not just
+// adopt the prefault.  Returns 0 or -EFAULT.  Residual: a concurrent munmap
+// between this check and the raw read still faults (needs a fault-fixup table).
+int user_buf_readable_ok(uint64_t addr, uint64_t len) {
+    if (!_access_ok(addr, len)) return -EFAULT;
+    if (!len || !g_current) return 0;
+    mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
+    if (!mm) return 0;                           // kernel thread: no user mm
+    return mm_range_has_vmas(mm, addr, len) ? 0 : -EFAULT;
 }
 
 #ifdef MAKAOS_BOOT_SELFTESTS

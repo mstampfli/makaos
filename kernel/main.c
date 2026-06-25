@@ -484,6 +484,13 @@ static void init_kthread(void) {
     extern void access_ok_selftest(void);
     access_ok_selftest();
 
+    // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
+    // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
+    // per-page VMA-backing validator (no prefault, so file-backed sources keep
+    // their content) accepts fully-backed ranges and rejects gaps/wraps.
+    extern void mm_range_has_vmas_selftest(void);
+    mm_range_has_vmas_selftest();
+
     // Audit fix: ext2_readdir read a dirent's name_len without bounding it to
     // the block, so a corrupt dirent could over-read past the bcache slot.
     // Verify the clamp keeps the name within block bounds.
