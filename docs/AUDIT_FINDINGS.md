@@ -595,9 +595,9 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   shared task_children_clear() helper so the two exit paths can't drift (DRY).
   Race-class -> code-proof (grep shows no remaining plain ->children stores
   except pre-publication inits) + clean boot. Confidence HIGH.
-- **setuid-on-exec not implemented (ksec escalation unwired)**
+- **setuid-on-exec not implemented (ksec escalation unwired)** -> FIXED (F32)
   (`kernel/security/perm.c` vfs_check_exec + `kernel/syscall/syscall.c` sys_exec
-  + `kernel/proc/elf.c` elf_exec_from_ext2) -> OPEN, real item (per explicit
+  + `kernel/proc/elf.c` elf_exec_from_ext2). was a real fail-closed item (per explicit
   user direction: every gap is worth fixing). Currently FAIL-CLOSED (a setuid
   binary runs with euid UNCHANGED -- no escalation, no vulnerability today; the
   system is over-restrictive). Two parts: (1) BUG: both exec callers build

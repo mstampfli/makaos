@@ -12,6 +12,7 @@
 #include "sched.h"
 #include "perm.h"
 #include "cred.h"
+#include "ksec.h"
 #include "kprintf.h"
 #include "tsc.h"
 
@@ -875,10 +876,17 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
     // exec_ino is declared outside the block so it survives into the open
     // call below — eliminating the redundant second path walk.
     uint32_t exec_ino;
+    // Hoisted so the setuid escalation can be applied to the child after it is
+    // built (and the requester's identity captured for the ksec request).
+    uint32_t setuid_uid   = 0xFFFFFFFFu;   // 0xFFFFFFFF = no escalation
+    uint32_t caller_uid   = 0;
+    uint32_t caller_gid   = 0;
     {
         cred_t root_cred; cred_init_root(&root_cred);
         const cred_t* c = (g_current && g_current->files_shared)
                           ? &g_current->cred : &root_cred;
+        caller_uid = c->euid;
+        caller_gid = c->egid;
         int exec_err = 0;
         exec_ino = ext2_lookup_path(path, c, &exec_err);
         if (!exec_ino) return NULL;
@@ -886,10 +894,11 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
         if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
         inode_perm_t ip = {
             .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
-            .mode = exec_inode.i_mode & 0x1FF,
+            // Full low-12 mode so vfs_check_exec sees the setuid bit (04000);
+            // acl_from_mode only reads the low 9, so the perm check is unaffected.
+            .mode = exec_inode.i_mode & 0xFFF,
             .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
         };
-        uint32_t setuid_uid = 0xFFFFFFFFu;
         if (vfs_check_exec(&ip, c, &setuid_uid) != 0) return NULL;
     }
 
@@ -899,6 +908,11 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
 
     task_t* t = elf_load_vfs_with_argv(f, pid, argv, envp, stdio);
     vfs_close(f);
+    // setuid-on-exec: apply any escalation to the new (not-yet-scheduled) child,
+    // ksec-mediated and fail-closed (no agent / deny -> no change).
+    if (t) ksec_exec_setuid(&t->cred, setuid_uid, exec_ino,
+                            (g_current ? g_current->pid : 0),
+                            caller_uid, caller_gid);
     return t;
 }
 

@@ -98,6 +98,32 @@ void ksec_notify(const ksec_request_t* req);
 // Monotonic sequence number allocator.
 uint32_t ksec_next_seq(void);
 
+// ── setuid-on-exec ─────────────────────────────────────────────────────────
+
+// Pure decision: should a setuid-on-exec escalation be applied?  FAIL-CLOSED --
+// it requires a real escalation request (setuid_uid != 0xFFFFFFFF, set by
+// vfs_check_exec), a registered policy agent, a successful round-trip, and an
+// explicit ALLOW verdict.  Anything else -> 0 (exec keeps the inherited euid).
+// Pure -> unit-tested (ksec_exec_setuid_selftest).
+static inline int ksec_exec_setuid_should_apply(uint32_t setuid_uid,
+                                                int agent_present,
+                                                int ksec_rc, uint8_t verdict) {
+    if (setuid_uid == 0xFFFFFFFFu) return 0;   // no setuid bit / no escalation
+    if (!agent_present)            return 0;   // no policy agent -> fail closed
+    if (ksec_rc != 0)              return 0;   // round-trip failed
+    return verdict == KSEC_VERDICT_ALLOW;       // only on explicit ALLOW
+}
+
+// Apply a setuid-on-exec escalation to `target`, mediated by the policy agent.
+// Called from the exec paths after a setuid binary passed its exec check.
+// `setuid_uid` is vfs_check_exec's out value (file owner uid, or 0xFFFFFFFF =
+// no escalation).  The kernel NEVER escalates on its own: only an explicit ksec
+// ALLOW raises privilege, to the euid/egid ksec grants.  No agent / deny /
+// failure -> no change (preserves the fail-closed default).
+void ksec_exec_setuid(cred_t* target, uint32_t setuid_uid, uint32_t inode,
+                      uint32_t caller_pid, uint32_t caller_uid,
+                      uint32_t caller_gid);
+
 // Called from ksec's sys_read loop in kernel — reads response from agent
 // pipe and wakes the waiting task.  Called via a dedicated kernel thread
 // that sits in a read loop on the agent read_pipe.

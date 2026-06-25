@@ -144,3 +144,62 @@ void ksec_reader_thread(void) {
         // Unmatched response: stale, discard silently.
     }
 }
+
+// ── setuid-on-exec escalation ──────────────────────────────────────────────
+
+void ksec_exec_setuid(cred_t* target, uint32_t setuid_uid, uint32_t inode,
+                      uint32_t caller_pid, uint32_t caller_uid,
+                      uint32_t caller_gid) {
+    int agent = ksec_agent_present();
+    // Fast path: no escalation requested, or no agent -> fail closed (no change).
+    if (setuid_uid == 0xFFFFFFFFu || !agent) return;
+
+    ksec_request_t req;  __builtin_memset(&req, 0, sizeof(req));
+    ksec_response_t resp; __builtin_memset(&resp, 0, sizeof(resp));
+    req.seq        = ksec_next_seq();
+    req.op         = KSEC_OP_EXEC_SETUID;
+    req.caller_pid = caller_pid;
+    req.caller_uid = caller_uid;
+    req.caller_gid = caller_gid;
+    req.inode      = inode;
+    req.dev        = 0;
+
+    int rc = ksec_request(&req, &resp);
+    if (!ksec_exec_setuid_should_apply(setuid_uid, agent, rc, resp.verdict))
+        return;   // denied / failed -> keep inherited euid
+
+    // ksec authorised: it is the authority on the resulting creds.  exec sets
+    // both effective and saved set-IDs; the real uid/gid are unchanged.
+    target->euid = resp.granted_euid;
+    target->suid = resp.granted_euid;
+    if (resp.granted_egid) {
+        target->egid = resp.granted_egid;
+        target->sgid = resp.granted_egid;
+    }
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the fail-closed setuid-on-exec decision gate.
+void ksec_exec_setuid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // (setuid_uid, agent_present, ksec_rc, verdict) -> expected apply?
+    struct { uint32_t su; int agent; int rc; uint8_t v; int want; } c[] = {
+        { 0xFFFFFFFFu, 1, 0, KSEC_VERDICT_ALLOW, 0 },  // no setuid bit -> never
+        { 0,           0, 0, KSEC_VERDICT_ALLOW, 0 },  // no agent -> fail closed
+        { 0,           1, -1, KSEC_VERDICT_ALLOW, 0 }, // round-trip failed -> no
+        { 0,           1, 0, KSEC_VERDICT_DENY,  0 },  // explicit deny -> no
+        { 0,           1, 0, KSEC_VERDICT_CHALLENGE, 0 }, // challenge != allow -> no
+        { 1234,        1, 0, KSEC_VERDICT_ALLOW, 1 },  // the ONLY apply case
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        int got = ksec_exec_setuid_should_apply(c[i].su, c[i].agent, c[i].rc, c[i].v);
+        if (got != c[i].want) {
+            kprintf("[ksec_setuid] FAIL i=%u got=%d want=%d\n", i, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ksec_setuid] SELF-TEST FAILED\n"
+                  : "[ksec_setuid] SELF-TEST PASSED (setuid-exec escalation fails closed)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */

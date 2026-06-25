@@ -866,15 +866,19 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     int exec_err = 0;
     uint32_t exec_ino = ext2_lookup_path(resolved, &g_current->cred, &exec_err);
     if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
+    // Hoisted: carried to the post-commit point where the setuid escalation is
+    // applied (so a failed load never escalates).  0xFFFFFFFF = no escalation.
+    uint32_t setuid_uid = 0xFFFFFFFFu;
     {
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
         inode_perm_t exec_ip = {
             .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
-            .mode = exec_inode.i_mode & 0x1FF,
+            // Full low-12 mode so vfs_check_exec sees the setuid bit (04000);
+            // acl_from_mode only reads the low 9, so the perm check is unaffected.
+            .mode = exec_inode.i_mode & 0xFFF,
             .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
         };
-        uint32_t setuid_uid = 0xFFFFFFFFu;
         if (vfs_check_exec(&exec_ip, &g_current->cred, &setuid_uid) != 0)
             goto enoent;
     }
@@ -972,6 +976,17 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     vmm_free_user_ex(old_pml4, old_mm);   // safe: no CPU walks old_pml4 now
     pmm_buddy_free(old_pml4, 0);
     mm_destroy(old_mm);
+
+    // ── setuid-on-exec ────────────────────────────────────────────────────
+    // The exec is now COMMITTED (new address space installed, old freed), so a
+    // failed load can no longer leave an escalated process.  Apply any setuid
+    // escalation -- ksec-mediated and fail-closed (no agent / deny -> no
+    // change).  Capture the requester's identity from the PRE-escalation cred.
+    {
+        uint32_t cuid = g_current->cred.euid, cgid = g_current->cred.egid;
+        ksec_exec_setuid(&g_current->cred, setuid_uid, exec_ino,
+                         g_current->pid, cuid, cgid);
+    }
 
     // Reset signal handlers to SIG_DFL (POSIX: exec clears custom handlers).
     for (int si = 0; si < NSIG; si++) {

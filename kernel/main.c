@@ -449,6 +449,11 @@ static void init_kthread(void) {
     extern void spawn_cred_allowed_selftest(void);
     spawn_cred_allowed_selftest();
 
+    // setuid-on-exec escalation gate (now wired via ksec).  Verify it fails
+    // closed: only an explicit ksec ALLOW (with an agent present) escalates.
+    extern void ksec_exec_setuid_selftest(void);
+    ksec_exec_setuid_selftest();
+
     // Audit fix: sys_mmap/sys_munmap page-rounded user len with a wrapping add
     // and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
     // munmap) at a higher-half address drove the unmap+free path through the
