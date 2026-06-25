@@ -78,6 +78,18 @@ static uint32_t ext2_block_size_checked(uint32_t log) {
     if (log > 2u) return 0;          // > 4096 unsupported; rejects the mount
     return 1024u << log;             // 1024 / 2048 / 4096
 }
+// PRIMITIVE (on-disk inode size validation): is `inode_size` (the untrusted
+// superblock s_inode_size) usable for this block_size?  Require a power of two,
+// at least the inode struct we copy (sizeof ext2_inode_t), and no larger than the
+// block.  power-of-2 + <= block_size means inode_size DIVIDES block_size, so inodes
+// tile a block without straddling: (local*inode_size) % block_size <= block_size -
+// inode_size, hence off + sizeof(ext2_inode_t) <= block_size -- no OOB bcache-slot
+// read (inode_load_into) or scratch write (inode_disk_write).  Pure -> unit-tested.
+static inline int ext2_inode_size_valid(uint32_t inode_size, uint32_t block_size) {
+    return inode_size >= sizeof(ext2_inode_t)
+        && inode_size <= block_size
+        && (inode_size & (inode_size - 1u)) == 0u;   // power of two
+}
 static uint32_t s_inodes_per_grp  = 0;
 static uint32_t s_blocks_per_grp  = 0;
 static uint32_t s_inode_size      = 128; // bytes per inode on disk
@@ -848,6 +860,12 @@ uint8_t ext2_init(uint32_t part_lba) {
     // fail.  s_block_size was already validated by ext2_block_size_checked.
     if (s_blocks_per_grp == 0 || s_inodes_per_grp == 0 || s_blocks_count == 0)
         return 0;
+
+    // s_inode_size is untrusted (u16 on disk): a value that is not a power of two,
+    // smaller than the inode struct we copy, or larger than the block makes an inode
+    // straddle the bcache slot -> OOB read in inode_load_into / OOB write in
+    // inode_disk_write.  Refuse the mount.
+    if (!ext2_inode_size_valid(s_inode_size, s_block_size)) return 0;
 
     // Number of block groups.
     s_num_groups = (s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
@@ -2196,6 +2214,36 @@ void ext2_blk_lba_selftest(void) {
     }
     kprintf(fails ? "[ext2_blklba] SELF-TEST FAILED\n"
                   : "[ext2_blklba] SELF-TEST PASSED (64-bit LBA, no u32 wrap)\n");
+}
+
+// ext2_inode_size_valid gates the untrusted s_inode_size at mount so an inode can
+// never straddle the bcache slot (the OOB read/write at inode_load_into /
+// inode_disk_write).  Drive the reject cases a `> 0` check would have let through.
+void ext2_inode_size_valid_selftest(void) {
+    kprintf("[ext2_isz] ext2_inode_size_valid must reject non-pow2 / too-small / too-big\n");
+    int fails = 0;
+    struct { uint32_t isz, bsz; int want; } c[] = {
+        { 128,  4096, 1 },   // standard inode
+        { 256,  4096, 1 },   // large inode, power of 2
+        { 4096, 4096, 1 },   // inode == block (1 per block)
+        { 128,  1024, 1 },   // smallest supported block
+        { 0,    4096, 0 },   // zero
+        { 64,   4096, 0 },   // power of 2 but < sizeof(ext2_inode_t)
+        { 192,  4096, 0 },   // in range but NOT a power of two
+        { 4032, 4096, 0 },   // the crafted-straddle case (not a power of two)
+        { 8192, 4096, 0 },   // larger than the block
+        { 130,  4096, 0 },   // not a power of two
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_inode_size_valid(c[i].isz, c[i].bsz);
+        if (got != c[i].want) {
+            kprintf("[ext2_isz] FAIL isz=%u bsz=%u got=%d want=%d\n",
+                    c[i].isz, c[i].bsz, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_isz] SELF-TEST FAILED\n"
+                  : "[ext2_isz] SELF-TEST PASSED (inode-size pow2 + range validation)\n");
 }
 
 // Deterministic test of path_split's bound: a parent longer than the

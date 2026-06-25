@@ -127,6 +127,13 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   dimension / over-cap mode (vgpu_setup_scanout_buffer then returns 0; both callers
   handle it). `vgpu_fb_bytes_selftest` drives the 2^32 wrap + over-cap rejects. The
   drm.c size math (drm_dumb_size F23, addfb/atomic) already uses u64 -> not in scope.
+- `ext2_inode_size_valid(inode_size, block_size)` (kernel/fs/ext2.c, F50) -- gates
+  the untrusted superblock s_inode_size at mount: power of two, >= sizeof(ext2_inode_t),
+  <= block_size. That makes inode_size divide block_size, so an inode tiles a block
+  without straddling -> (local*inode_size) % block_size + sizeof(inode) <= block_size,
+  closing the OOB bcache-slot read (inode_load_into) + scratch write (inode_disk_write)
+  a crafted s_inode_size (only `> 0`-checked before) caused. Sibling of ext2_block_size_checked.
+  `ext2_inode_size_valid_selftest` drives the non-pow2 / too-small / too-big / straddle rejects.
 
 ## Status
 

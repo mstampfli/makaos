@@ -863,3 +863,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   already u64 (not in scope); fb.c glyph offset is kernel-controlled (out of class).
   vgpu_fb_bytes_selftest drives the 2^32 wrap + over-cap rejects; boot inits GPU at
   1280x800 unchanged.
+- ext2 inode straddles bcache slot -> FIXED (F50): inode_load_into memcpy's
+  sizeof(ext2_inode_t)=128 bytes from `r.data + off` and inode_disk_write to
+  `scratch + off`, off = (local*s_inode_size) % s_block_size. s_inode_size is the
+  untrusted superblock field taken with only a `> 0` check; a crafted value (not a
+  power of two / < 128 / > block, e.g. 4032) makes off land near the slot tail so
+  off+128 > block_size -> OOB read (info leak into the inode) + OOB write (heap
+  corruption on writeback). Root fix: new pure tagged primitive ext2_inode_size_valid
+  (power-of-2, >= sizeof(inode), <= block_size -> inode divides block, off+128 <=
+  block) gates the mount (ext2_init returns 0). Sibling of ext2_block_size_checked.
+  Other r.data+off memcpys are fixed-stride (bgd) or already clamped (dirent/file).
+  ext2_inode_size_valid_selftest drives the reject cases; boot still mounts + loads
+  /bin/login (real s_inode_size valid).
