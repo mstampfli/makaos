@@ -118,12 +118,29 @@ there is to store the target PATH and re-resolve via `ns_find` per `sendto`
 (`txbuf_used += chunk`), and `tcp_recv` ACK (`txbuf_used -= acked`,
 `txbuf_head += acked`, `snd_una = ack`) RMW the same non-atomic PCB fields from
 different CPUs with no per-PCB lock. Torn `snd_nxt` mis-sends; lost-update on
-`txbuf_used` wedges the sender (the `while txbuf_used >= TCP_TXBUF_SIZE` spin
-never clears) or underflows. Fix: a per-PCB lock around the send/ack/retransmit
-critical sections. STILL OPEN -- needs a dedicated iteration WITH a TCP-loopback
-self-test (boot drives no TCP data, so a locking change is NOT verifiable by
-boot alone; a lock-ordering mistake would deadlock only under live concurrent
-TCP load).
+`txbuf_used` wedges the sender or underflows.
+
+DATA-PLANE LOCK -> FIXED (F44, the recommended first decomposition below). Added
+a per-PCB `spinlock_t lock` (taken via tcp_pcb_lock = preempt_disable + spin_lock
+-- the F35/fb.c pattern: RX runs in the net kernel thread, never an IRQ handler,
+so preempt_disable prevents the same-CPU-preempt deadlock without irqsave, and
+because the lock guards ONLY the field RMWs the transmit stays OUTSIDE it,
+sidestepping the irqsave-across-virtio-tx hazard noted below). It serializes the
+ring accounting -- txbuf_used/txbuf_head + snd_una (RX ACK drain vs tcp_send),
+rxbuf_used/rxbuf_tail/rcv_nxt (RX data write vs tcp_recv_data) -- between the RX
+thread and the socket syscall path. tcp_send / tcp_recv_data use a RESERVE
+pattern (reserve the ring index range under the lock, copy the user payload
+OUTSIDE the lock -> no user-memory fault under a spinlock, multi-producer/
+consumer-safe); pcb_wake, tcp_send_segment, and sched_sleep all stay outside the
+lock. Pure helper tcp_ring_reserve + deterministic tcp_ring_reserve_selftest
+(pairs with tcp_ring_consume_selftest); code-proof of the lock placement + clean
+boot (the locked paths are not boot-exercised -- no TCP data at boot -- so the
+arithmetic is unit-tested and the placement code-proven).
+REMAINING (smaller, separate item, recorded): `snd_nxt` (advanced inside
+tcp_send_segment, which also transmits -> needs the seq-advance/transmit split
+described below before it can be locked), the state-machine transitions, and the
+handshake / accept-queue two-PCB ordering. These are single-writer-dominant or
+benign-read races, NOT the dangerous txbuf_used corruption, which F44 closes.
 
 VERIFIED DESIGN NOTES (from a deep read this pass, to de-risk the dedicated run):
   - Contexts: tcp_send = syscall CPU; tcp_recv = net_rx kthread; tcp_timer_tick

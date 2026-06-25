@@ -11,6 +11,7 @@
 #include "vfs.h"
 #include "syscall.h"  // POLLIN / POLLOUT / POLLHUP / POLLERR
 #include "smp.h"
+#include "preempt.h"
 #include "rcu.h"
 
 // ── TCP constants ─────────────────────────────────────────────────────────
@@ -84,6 +85,10 @@ struct tcp_pcb {
     uint8_t  reset;      // 1 if the connection was aborted by RST
     uint64_t timewait_start; // when TIME_WAIT was entered
 
+    // Serializes the ring accounting (tx/rx used + indices + snd_una) between
+    // the RX kernel thread and the socket syscall path.  See tcp_pcb_lock.
+    spinlock_t lock;
+
     // Intrusive singly-linked list node for s_pcb_head.
     struct tcp_pcb* next;
 };
@@ -136,6 +141,39 @@ static uint32_t tcp_ring_consume(uint32_t* head, uint32_t* used,
     *used -= n;
     return n;
 }
+
+// Reserve up to `want` bytes on the WRITE side of a tx/rx ring: clamp to the
+// free space (size - *used), set *out_start to the old tail, advance *tail
+// (masked) and *used by the reserved amount, return the amount reserved.  The
+// producer mirror of tcp_ring_consume.  Reserving the index range UNDER the
+// per-PCB lock and copying the payload into [out_start, +n) OUTSIDE the lock
+// keeps a user-memory copy out of the critical section (no fault under a
+// spinlock) and is multi-producer-safe (disjoint reserved ranges).  Pure ->
+// unit-tested (tcp_ring_reserve_selftest).
+static uint32_t tcp_ring_reserve(uint32_t* tail, uint32_t* used, uint32_t want,
+                                 uint32_t size, uint32_t mask, uint32_t* out_start) {
+    uint32_t space = size - *used;       // invariant: *used <= size
+    uint32_t n     = want < space ? want : space;
+    *out_start = *tail;
+    *tail = (*tail + n) & mask;
+    *used += n;
+    return n;
+}
+
+// ── Per-PCB lock ───────────────────────────────────────────────────────────
+// Serializes the send/receive ring accounting (txbuf_used / rxbuf_used + the
+// head/tail indices + snd_una) between the RX path (the net RX kernel thread)
+// and the socket syscall path (send/recv on user CPUs).  RX runs in a kernel
+// thread (the virtio_net IRQ only irq_notify's; it is never an IRQ handler),
+// so a plain spinlock under preempt_disable is sufficient -- NO irqsave (the
+// F35 pattern).  LEAF lock: held ONLY around the field mutations; pcb_wake
+// (rq_lock), tcp_send_segment (I/O), the user payload copy, and sched_sleep all
+// stay OUTSIDE it.  NOTE (T4 remaining): snd_nxt (advanced by tcp_send_segment
+// while it also does I/O) and the state-machine transitions are NOT yet under
+// this lock -- those are single-writer-dominant and benign-read races, a
+// separate follow-up; this lock closes the documented ring-accounting race.
+static inline void tcp_pcb_lock(tcp_pcb_t* pcb)   { preempt_disable(); spin_lock(&pcb->lock); }
+static inline void tcp_pcb_unlock(tcp_pcb_t* pcb) { spin_unlock(&pcb->lock); preempt_enable(); }
 
 // Wake any task blocked on this PCB: the blocking waiter (in recv/send/
 // connect/accept) and any poll()/select() waiter camped on the socket fd.
@@ -396,17 +434,22 @@ void tcp_recv(skbuff_t* skb) {
         // Process ACK — advance snd_una.
         if ((flags & TCP_ACK) && SEQ_GT(ack, pcb->snd_una) &&
             SEQ_LE(ack, pcb->snd_nxt)) {
+            tcp_pcb_lock(pcb);               // serialize txbuf_used + snd_una vs send()
             uint32_t acked = ack - pcb->snd_una;
             tcp_ring_consume(&pcb->txbuf_head, &pcb->txbuf_used,
                              acked, TCP_TXBUF_MASK);
             pcb->snd_una     = ack;
             pcb->snd_wnd     = ntoh16(seg->window);
             if (pcb->snd_una == pcb->snd_nxt) pcb->rto_deadline = 0;
-            pcb_wake(pcb);
+            tcp_pcb_unlock(pcb);
+            pcb_wake(pcb);                   // wake OUTSIDE the lock (takes rq_lock)
         }
 
         // Receive in-order data.
         if (dlen > 0 && seq == pcb->rcv_nxt) {
+            // The payload copy is kernel skbuff -> kernel rxbuf, so it is safe
+            // under the lock; serialize rxbuf_used/tail vs recv().
+            tcp_pcb_lock(pcb);
             uint32_t space = TCP_RXBUF_SIZE - pcb->rxbuf_used;
             uint32_t copy  = dlen < space ? dlen : space;
             for (uint32_t i = 0; i < copy; i++)
@@ -414,7 +457,8 @@ void tcp_recv(skbuff_t* skb) {
             pcb->rxbuf_tail  = (pcb->rxbuf_tail + copy) & TCP_RXBUF_MASK;
             pcb->rxbuf_used += copy;
             pcb->rcv_nxt    += copy;
-            pcb_wake(pcb);
+            tcp_pcb_unlock(pcb);
+            pcb_wake(pcb);                   // wake + ACK OUTSIDE the lock (rq_lock / I/O)
             // Send ACK.
             tcp_send_segment(pcb, TCP_ACK, NULL, 0);
         }
@@ -529,6 +573,7 @@ tcp_pcb_t* tcp_pcb_alloc(uint16_t lport) {
 
     // Zero the PCB.
     __builtin_memset(p, 0, sizeof(tcp_pcb_t));
+    spin_lock_init(&p->lock);
     p->local_ip   = net_our_ip();
     p->local_port = lport;
     p->rcv_wnd    = TCP_WINDOW;
@@ -656,16 +701,23 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock) {
                 return -ENOTCONN;
         }
 
-        uint32_t space = TCP_TXBUF_SIZE - pcb->txbuf_used;
-        uint32_t chunk = len - done;
-        if (chunk > space) chunk = space;
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
-
+        // Reserve a chunk of tx-ring space UNDER the lock (clamps to free
+        // space), then copy the user payload into the reserved range OUTSIDE
+        // the lock: src may be user memory (so the copy must not run under a
+        // spinlock), and the RX ACK path only advances txbuf_head, never the
+        // reserved tail range, so this is safe and multi-producer-correct.
+        uint32_t want = len - done;
+        if (want > TCP_MSS) want = TCP_MSS;
+        uint32_t tail0;
+        tcp_pcb_lock(pcb);
+        uint32_t chunk = tcp_ring_reserve(&pcb->txbuf_tail, &pcb->txbuf_used,
+                                          want, TCP_TXBUF_SIZE, TCP_TXBUF_MASK,
+                                          &tail0);
+        tcp_pcb_unlock(pcb);
+        if (chunk == 0) continue;          // raced full -> re-enter the wait loop
         for (uint32_t i = 0; i < chunk; i++)
-            pcb->txbuf[(pcb->txbuf_tail + i) & TCP_TXBUF_MASK] = src[done + i];
-        pcb->txbuf_tail  = (pcb->txbuf_tail + chunk) & TCP_TXBUF_MASK;
-        pcb->txbuf_used += chunk;
-        done            += chunk;
+            pcb->txbuf[(tail0 + i) & TCP_TXBUF_MASK] = src[done + i];
+        done += chunk;
 
         // Send what we just buffered if the send window allows.
         uint32_t sendable = pcb->snd_wnd - (pcb->snd_nxt - pcb->snd_una);
@@ -685,26 +737,36 @@ int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len, int nonblock) {
     if (len == 0) return 0;
     uint8_t* dst = (uint8_t*)buf;
 
-    while (pcb->rxbuf_used == 0) {
-        // Already at EOF — return 0 bytes so the caller sees end-of-stream.
-        if (pcb->fin_rcvd) return 0;
-        if (pcb->reset)    return -ECONNRESET;
-        if (pcb->state == TCP_CLOSED) return -ENOTCONN;
-        if (nonblock)      return -EAGAIN;
-        pcb->waiter = g_current;
-        sched_sleep();
-    }
+    for (;;) {
+        while (pcb->rxbuf_used == 0) {
+            // Already at EOF — return 0 bytes so the caller sees end-of-stream.
+            if (pcb->fin_rcvd) return 0;
+            if (pcb->reset)    return -ECONNRESET;
+            if (pcb->state == TCP_CLOSED) return -ENOTCONN;
+            if (nonblock)      return -EAGAIN;
+            pcb->waiter = g_current;
+            sched_sleep();
+        }
 
-    uint32_t avail = pcb->rxbuf_used;
-    uint32_t copy  = len < avail ? len : avail;
-    for (uint32_t i = 0; i < copy; i++)
-        dst[i] = pcb->rxbuf[(pcb->rxbuf_head + i) & TCP_RXBUF_MASK];
-    // Drain via the shared clamped helper (never underflow rxbuf_used).
-    tcp_ring_consume(&pcb->rxbuf_head, &pcb->rxbuf_used, copy, TCP_RXBUF_MASK);
-    pcb->rcv_wnd    += copy;
-    // Send window update ACK so the peer can resume sending.
-    tcp_send_segment(pcb, TCP_ACK, NULL, 0);
-    return (int)copy;
+        // Reserve the read range UNDER the lock (snapshot head, advance
+        // head/used via the clamped helper), then copy out to the (possibly
+        // user) dst OUTSIDE the lock.  Multi-consumer-safe: concurrent recv()s
+        // reserve disjoint ranges; the clamp keeps copy <= used.
+        tcp_pcb_lock(pcb);
+        uint32_t avail = pcb->rxbuf_used;
+        if (avail == 0) { tcp_pcb_unlock(pcb); continue; }  // raced empty -> re-wait
+        uint32_t copy  = len < avail ? len : avail;
+        uint32_t head0 = pcb->rxbuf_head;
+        tcp_ring_consume(&pcb->rxbuf_head, &pcb->rxbuf_used, copy, TCP_RXBUF_MASK);
+        pcb->rcv_wnd += copy;
+        tcp_pcb_unlock(pcb);
+
+        for (uint32_t i = 0; i < copy; i++)
+            dst[i] = pcb->rxbuf[(head0 + i) & TCP_RXBUF_MASK];
+        // Send window update ACK so the peer can resume sending.
+        tcp_send_segment(pcb, TCP_ACK, NULL, 0);
+        return (int)copy;
+    }
 }
 
 void tcp_close(tcp_pcb_t* pcb) {
@@ -780,4 +842,35 @@ void tcp_ring_consume_selftest(void) {
     }
     kprintf(fails ? "[tcp_ring] SELF-TEST FAILED\n"
                   : "[tcp_ring] SELF-TEST PASSED (ring drain + underflow clamp)\n");
+}
+
+// ── tcp_ring_reserve selftest ─────────────────────────────────────────────
+// Deterministic check of the producer-side ring reserve arithmetic that the
+// per-PCB-lock send/rx-write paths use: the reserved range starts at the old
+// tail, is clamped to the free space (size - used), and advances tail (masked)
+// and used by the reserved amount.  Pairs with tcp_ring_consume_selftest.
+void tcp_ring_reserve_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t tail0, used0, want, size, mask, estart, etail, eused, eret; } c[] = {
+        {   0,   0,  30, 256, 0xFFu,   0,  30,  30, 30 },  // normal reserve
+        { 250,   0,  20, 256, 0xFFu, 250,  14,  20, 20 },  // tail wraps: (250+20)&255 = 14
+        {   0, 250,  50, 256, 0xFFu,   0,   6, 256,  6 },  // clamp to free space (6)
+        { 100, 256,  10, 256, 0xFFu, 100, 100, 256,  0 },  // full -> reserve 0
+        { 200, 200, 100, 256, 0xFFu, 200,   0, 256, 56 },  // wrap + clamp: free = 56
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t tail = c[i].tail0, used = c[i].used0, start = 0xDEADu;
+        uint32_t ret = tcp_ring_reserve(&tail, &used, c[i].want, c[i].size,
+                                        c[i].mask, &start);
+        if (start != c[i].estart || tail != c[i].etail ||
+            used != c[i].eused || ret != c[i].eret) {
+            kprintf("[tcp_reserve] FAIL i=%u start=%lu tail=%lu used=%lu ret=%lu\n",
+                    i, (unsigned long)start, (unsigned long)tail,
+                    (unsigned long)used, (unsigned long)ret);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
+                  : "[tcp_reserve] SELF-TEST PASSED (ring reserve, clamp + wrap)\n");
 }
