@@ -1056,6 +1056,94 @@ void task_children_clear(task_t* t) {
     (void)__atomic_exchange_n(&t->children, (task_t*)NULL, __ATOMIC_ACQ_REL);
 }
 
+#ifdef MAKAOS_BOOT_SELFTESTS
+// ── Scheduler liveness watchdog (SELFTESTS only) ───────────────────────────
+// Catches a scheduler STALL: a task is runnable (some CPU's nr_running > 0)
+// yet NO context switch has happened on ANY CPU for ~8 seconds.  In correct
+// operation that is impossible -- a runnable task is always picked within a
+// tick (sched_tick sets reschedule_pending on idle CPUs every tick) -- so it
+// fires only on the real "chaselev-class" freeze (a spawned kthread that never
+// runs while its waiter spins forever).  Driven from the timer IRQ, so it runs
+// even when task scheduling itself is wedged.
+//
+// LOW PERTURBATION by design: the body runs on exactly ONE CPU per ~1s cadence
+// (whichever CPU advances the shared tick counter through the gate), reads a
+// handful of per-CPU counters with no lock, and does NOTHING unless a genuine
+// permanent stall is present.  This is what lets it observe the heisenbug that
+// a gdbstub / heavyweight instrumentation suppresses.  On a stall it dumps every
+// CPU's scheduler state (current task, runqueue depth, reschedule/preempt flags,
+// sleep list) -- enough to localize the wedge: "cur=idle nr>0" is an enqueued-
+// but-never-picked task; "cur=<task> RUNNING" stuck is a wedged task; etc.
+#define SCHED_WD_GATE        0xFFFu   // act once per 4096 global ticks (~1s)
+#define SCHED_WD_STALL_HITS  8u       // ~8 consecutive stalled checks (~8s)
+static uint64_t s_wd_last_cs = 0;
+static uint32_t s_wd_stall    = 0;
+static uint32_t s_wd_dumped   = 0;
+
+static void sched_watchdog(uint64_t tick) {
+    if ((tick & SCHED_WD_GATE) != 0) return;
+
+    unsigned n = num_cpus();
+    uint64_t cs = 0, nr = 0;
+    unsigned busy = 0;   // a non-idle task is runnable OR currently running
+    for (unsigned i = 0; i < n; i++) {
+        // nonidle_switches (NOT context_switches): an idle CPU bumps
+        // context_switches on every idle-loop yield, so it never goes stable.
+        cs += __atomic_load_n(&g_cpus[i].nonidle_switches, __ATOMIC_RELAXED);
+        nr += __atomic_load_n(&g_cpus[i].rq.nr_running,     __ATOMIC_RELAXED);
+        // "busy" also covers a task STUCK RUNNING (wedged in a loop): it is a
+        // CPU's `current` (non-idle) but not on a runqueue, so nr_running can
+        // be 0.  Counting it here lets the watchdog catch that freeze too, not
+        // just the queued-but-never-scheduled kind.
+        task_t* cur = g_cpus[i].current;
+        if (cur && cur != g_cpus[i].idle) busy = 1;
+    }
+    if (nr > 0) busy = 1;
+    // Progress (a real task was scheduled) OR genuinely idle (all CPUs on the
+    // idle task with nothing runnable, e.g. the login prompt) -> not stalled.
+    if (cs != s_wd_last_cs || !busy) {
+        s_wd_last_cs = cs;
+        __atomic_store_n(&s_wd_stall, 0, __ATOMIC_RELAXED);
+        return;
+    }
+    if (__atomic_add_fetch(&s_wd_stall, 1, __ATOMIC_RELAXED) < SCHED_WD_STALL_HITS)
+        return;
+
+    // Single dumper (first CPU to cross the threshold wins the CAS).
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&s_wd_dumped, &expected, 1u, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
+
+    {
+    // kprintf_atomic (NOT serial_puts_dbg, which is a no-op unless
+    // KERNEL_DEBUG_SERIAL): whole-line-locked, IRQ-safe via serial_lock_irqsave.
+    extern void kprintf_atomic(const char* fmt, ...);
+    kprintf_atomic("\n[WD] SCHEDULER STALL: no forward progress ~8s (nonidle_cs=%lu nr_running=%lu)\n",
+                   cs, nr);
+    for (unsigned i = 0; i < n; i++) {
+        cpu_t*  ci  = &g_cpus[i];
+        task_t* cur = ci->current;
+        kprintf_atomic("[WD] cpu%u cur_pid=%u state=%u %s nr=%u resched=%u preempt=%u\n",
+                       i,
+                       cur ? cur->pid : 0xFFFFFFFFu,
+                       cur ? (unsigned)cur->state : 0xFFu,
+                       (cur == ci->idle) ? "IDLE" : "BUSY",
+                       (unsigned)__atomic_load_n(&ci->rq.nr_running, __ATOMIC_RELAXED),
+                       (unsigned)ci->reschedule_pending,
+                       (unsigned)ci->preempt_depth);
+        task_t* sp = ci->rq.sleep_head;
+        for (unsigned k = 0; sp && k < 16; k++, sp = sp->next)
+            kprintf_atomic("[WD]   sleep pid=%u state=%u wake_pending=%u home=%u last_ran=%u\n",
+                           sp->pid, (unsigned)sp->state, (unsigned)sp->wake_pending,
+                           (unsigned)sp->home_cpu, (unsigned)sp->last_ran_cpu);
+    }
+    kprintf_atomic("[WD] halting for capture\n");
+    }
+    for (;;) __asm__ volatile("cli; hlt");
+}
+#endif // MAKAOS_BOOT_SELFTESTS
+
 // ── sched_tick ────────────────────────────────────────────────────────────
 // Called from timer IRQ — only sets flags/counters, never touches the stack.
 
@@ -1089,6 +1177,11 @@ void sched_tick(void) {
     // the MLFQ-boost modulo test below fires on exactly one CPU per
     // interval instead of racing/skipping.
     uint64_t tick = __atomic_add_fetch(&s_tick_count, 1, __ATOMIC_RELAXED);
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+    // Liveness watchdog (no-op unless a real scheduler stall is present).
+    sched_watchdog(tick);
+#endif
 
     // Fallback for lost MSI-X: rescan AHCI completions every tick.
     // If an IRQ was swallowed, this catches it within ~1ms.
@@ -1346,6 +1439,7 @@ static void do_switch(uint8_t preempted) {
     // load, races are benign (stale ≤ one context switch window).
     next->last_ran_cpu = c->id;
     c->context_switches++;
+    if (next != c->idle) c->nonidle_switches++;   // forward-progress signal (watchdog)
 
     // Release the rq_lock BEFORE context_switch — holding it across
     // the switch deadlocks: the new task might try to take the same

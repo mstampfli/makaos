@@ -187,6 +187,11 @@ typedef struct cpu_t {
     // Statistics — non-atomic, owner-only.
     uint64_t        sched_ticks;
     uint64_t        context_switches;
+    // Switches INTO a non-idle task only.  Unlike context_switches (which an
+    // idle CPU bumps every idle-loop sched_yield, even idle->idle), this only
+    // advances when a real task is scheduled -- a clean "the scheduler made
+    // forward progress" signal for the liveness watchdog.
+    uint64_t        nonidle_switches;
 
     // Per-CPU Task State Segment.  The CPU reads this on every ring-3 → 0
     // transition (rsp[0]) and on exception delivery via IST (ist[0..6]).
