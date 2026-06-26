@@ -1597,3 +1597,73 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 64 selftests PASSED incl. [mm_vma_trim], 0 FAILED/PANIC, no
   [WD], `More login:` renders. This closes fan-out #4 candidate (cc) -- and with (bb)/(dd)/(ee)/(cc) all fixed,
   ALL of fan-out #4 is now resolved.
+- 2026-06-26 FAN-OUT #5 (5 read-only Explore agents over un-swept subsystems: vmm/page-table teardown, tcp
+  reassembly/retransmit, virtio-net rx/tx ring, futex/robust-list, ext2 dir rename/link/unlink; reported HIGH
+  confidence each, NOT yet independently verified -- VERIFY against the real code before fixing, the (bb)/(dd)/
+  (ee)/(cc) prescriptions ALL needed refinement). One SAFE: futex (kernel/proc/futex.c, 179 lines) -- the
+  waiter-UAF class is correctly defended (futex.c:167-170 captures task_t* wtask = w->task and unlinks BEFORE
+  the __ATOMIC_RELEASE store to w->woken, never derefs the stack waiter after; every wait exit re-acquires the
+  bucket lock and self-unlinks; user addr validated via _access_ok + copy_from_user + 4-byte alignment; bucket
+  index masked to a power-of-2 table; bucket lock never taken in IRQ context / always dropped before sleep); NO
+  robust-list and NO REQUEUE/CMP_REQUEUE implemented, so those bug classes are absent. FOUR CANDIDATE bugs:
+  (ff) HIGH, unprivileged LPE -- sys_exec frees the old PML4 hierarchy while sibling threads still run on it:
+  sys_exec (kernel/syscall/syscall.c ~1072-1081) does pml4_phys = new_pml4 / vmm_switch(new_pml4) (current CPU's
+  CR3 only) / vmm_free_user_ex(old_pml4) + pmm_buddy_free(old_pml4) with the comment "safe: no CPU walks
+  old_pml4 now" -- but a sibling thread created via SYS_THREAD + THREAD_SHARE_MM (syscall.c ~1458, shares the
+  same task_mm_t -> same pml4_phys, mm_shared->refs==2) is concurrently running user code on another CPU with
+  CR3==old_pml4. exec issues NO sibling-termination and NO tlb_flush_mm/shootdown, so after vmm_free_user_ex the
+  sibling's page-table walker walks FREED PT/PD/PDPT pages and its TLB caches WRITABLE entries for freed leaf
+  frames the buddy allocator immediately recycles -> cross-domain write / disclosure (the "cross-owner UAF write
+  / LPE" class). fork and the THREAD_SHARE_MM=false clone path DO tlb_flush_mm; exec is the unique mm-teardown
+  path that frees page tables without quiescing other CPUs. Fix = before the commit block, quiesce + terminate
+  every sibling sharing g_current->mm_shared and spin until mm_shared->refs==1 (reusing the refcount-as-
+  quiescence contract task_mm_release relies on) BEFORE overwriting pml4_phys / vmm_switch / vmm_free_user_ex;
+  tlb_flush_mm as defense-in-depth (but insufficient alone -- the sibling's CR3 still points at the freed PML4,
+  so the threads must actually be gone). agent CONFIDENCE HIGH (read sys_exec 911-1138, no refs==1 gate / no
+  shootdown / no thread-kill).
+  (gg) HIGH, remote-triggerable -- pcb_wake UAF write of the socket's vfs_file_t: pcb_wake (kernel/net/tcp.c
+  ~213-215) loads f = pcb->sock_file then wait_queue_wake_all(f->waitq) which does __atomic_exchange_n(&wq->head,
+  ...) = a WRITE; it runs from the net RX thread / TCP timer thread on any segment/timer for the pcb. sock_close
+  (kernel/net/socket.c ~234 tcp_pcb_set_file(NULL) then ~248 kfree(self)) frees the vfs_file_t with a PLAIN
+  synchronous kfree -- only s and the pcb are call_rcu-deferred (tcp_pcb_free_rcu / sock_free_rcu), NOT the
+  file. If the RX thread loads pcb->sock_file (non-NULL) just before sock_close's NULL store, it holds a dangling
+  f and after kfree(self) writes through f->waitq into freed heap. RCU keeps the PCB alive but NOT the file.
+  tcp_pcb_set_file is an unlocked store; pcb_wake takes no lock -- no serialization. Fix = RCU-defer the
+  vfs_file_t free too (fold self into an RCU callback / call_rcu) so a reader that already loaded sock_file
+  finishes inside its RCU section before the file is reclaimed (pcb_wake already runs inside the tcp_recv/
+  tcp_timer_tick RCU reader section); or refcount the file across the pcb backpointer. Same family as F88
+  (/proc fdtable freed synchronously while an RCU reader holds it) and F89 (io_uring). agent CONFIDENCE HIGH
+  (the four facts -- plain kfree at socket.c:248, unlocked deref+write in pcb_wake, unlocked set_file, wake_all
+  writes wq->head -- all confirmed; RX/close are separate SMP threads); ruled out the txbuf/rxbuf ring overread
+  (kmalloc(65536) rounds to a 128KiB buddy block, indices masked, copies clamped).
+  (hh) HIGH, malicious/buggy device -- virtio-net RX desc_id bounded against the wrong count: virtio_net_rx_poll
+  (kernel/net/virtio_net.c ~434) validates the device-supplied used->ring[].id with virtio_desc_id_valid (~303,
+  index_ok(id, VIRTQ_SIZE=256)), but only VIRTQ_SIZE/2=128 RX buffers are ever allocated (~583, i<VIRTQ_SIZE/2)
+  and posted (~336). A device-written id in [128,255] passes the check, reaches an uninitialized s_rx_bufs[id]
+  ({.phys=0,.virt=NULL}) -> raw=NULL, memcpy(dst, NULL+VIRTIO_NET_HDR_LEN, device-controlled eth_len) (~450) =
+  NULL-source read of attacker-length, AND re-posts a descriptor with addr=s_rx_bufs[id].phys=0 (~454) letting
+  the device DMA-clobber physical frame 0; the desc-table writes also corrupt unused slots 128..255. The
+  virtio_descid/nvme_cid hardening pattern was applied with the WRONG bound (ring capacity, not buffer count).
+  Fix = bound RX ids against the real buffer count: a single source of truth VIRTQ_NUM_RX_BUFS=VIRTQ_SIZE/2 used
+  by the alloc loop, the refill loop, the rx_poll check (index_ok(id, VIRTQ_NUM_RX_BUFS)) and the selftest; or
+  allocate+post all VIRTQ_SIZE buffers so the capacity bound becomes correct. TX path (~409) unaffected (uses
+  the locally-submitted idx; single TX desc 0 always valid). NOTE: this is a malicious-DEVICE threat so it is
+  NOT boot-exercised by QEMU's benign NIC model -- the fix is a hardening/selftest, provably inert at boot.
+  agent CONFIDENCE HIGH (grep-confirmed s_rx_bufs written only for [0,127]; validation admits [0,255]).
+  (ii) HIGH, crafted-image / SMP race -- ext2_rename frees a dst inode ignoring i_links_count: the dst-removal
+  branch of ext2_rename (kernel/fs/ext2.c ~3061-3068) removes ONE dirent then UNCONDITIONALLY free_inode_blocks
+  + sets i_links_count=0 + free_inode_num(dst_ino), never reading i_links_count -- diverging from ext2_unlink's
+  correct count-aware logic (~2980-2991). On a multi-link regular dst (i_links_count>=2) it frees the inode +
+  blocks while another name still references it -> the surviving dirent points at a freed/reissued inode (cross-
+  link disclosure / on-disk-inode UAF). sys_link returns -EPERM (can't create a 2-link file at runtime), so the
+  multi-link state comes from a crafted/corrupt image (the stated threat model). Secondary: ext2_unlink does NOT
+  take s_rename_lock, so a concurrent unlink(dst) racing rename(*,dst) on the same single-link file double-frees
+  the inode bit + blocks. Fix = mirror ext2_unlink (decrement i_links_count under the dst inode lock, free only
+  when it hits 0) and factor the "remove one name + drop a link + maybe free" sequence into ONE helper called by
+  both rename and unlink so the decrement-and-conditional-free is atomic and the paths cannot double-free. agent
+  CONFIDENCE HIGH (3062-3068 sets links_count=0 with no count read, vs the correct ext2_unlink pattern same file).
+  PRIORITY (to verify+fix, sharpest first): (gg) tcp pcb_wake UAF first -- HIGH, remote-reachable UAF WRITE,
+  cleanest root-cause fix (RCU-defer the file free, mirroring F88/F89); then (ii) ext2 rename link-count (clean,
+  mirrors ext2_unlink); then (ff) exec-vs-threads PML4 free (most severe/unprivileged but the biggest, most
+  careful fix -- deserves its own deep turn); then (hh) virtio-net RX bound (trivial surgical fix but malicious-
+  device-only, not boot-exercised).
