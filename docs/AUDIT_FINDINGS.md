@@ -1320,3 +1320,28 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   tty_ldisc_drain), released before every wake and the blocking WAIT_EVENT (no nest, no sleep-under-lock). Drain
   copies under the lock safely (sys_read prefaults the user buffer). Added pty_master_ring_selftest (round-trips
   "hithere" through the locked push/drain). Clean boot 59 PASSED incl. pty_mring + pty_life.
+- AHCI LBA-vs-capacity bound (follow-up (d)) -> ASSESSED SAFE, NOT a memory-safety bug, no fix (2026-06-26):
+  the AHCI read/write paths do not reject an LBA+count past the device's sector capacity. Verified skeptically:
+  (1) the MEMORY side of every submit path is bounded by count, INDEPENDENT of lba -- ahci_submit_hhdm/sg/
+  read_user all call xfer_bytes_ok(count,512,..) (the F47 wrap+PRDT guard) and cap the PRDT (130/248 entries),
+  so an out-of-range lba cannot enlarge or misdirect the memory transfer (lba selects disk sectors; the PRDT
+  built from buf/count fixes the memory region); (2) the lba is NOT attacker-controlled -- there is NO raw
+  user block-device path (no /dev/sd, blkdev, or AHCI ioctl; grep-confirmed), the only callers are the trusted
+  ext2 fs (ext2_blk_to_lba = part_lba + blk*spb, F46-wrap-guarded) and the boot stress harness; (3) AHCI does
+  not even store a device capacity from IDENTIFY, so adding lba+count<=capacity is a new FEATURE, not a bound
+  that was dropped; and the ATA drive itself aborts an out-of-range LBA (command abort, no transfer), so the
+  worst case is a failed read/write the fs handles -- never an OOB memory access. A partition-end bound (reject
+  lba outside [part_lba, part_lba+part_size)) would be defense-in-depth against a corrupt/malicious fs image,
+  but that is a trusted-fs/feature concern, not a reachable memory-safety bug. Recorded SAFE; not fixed.
+- raw-deref-vs-munmap TOCTOU (follow-up (l)) -> RECORDED, design noted, DEFERRED (big mechanism), no fix this
+  pass (2026-06-26): a syscall that user_buf_check/prefaults a user buffer then dereferences it RAW (not via
+  copy_*_user) has a TOCTOU window -- a THREAD_SHARE_MM sibling munmap()/mprotect() between the check and the
+  raw deref unmaps the page, so the kernel deref takes a #PF in kernel mode. The robust fix is a kernel
+  exception-fixup table (extable): tag the raw user-deref instructions so the page-fault handler, on a fault
+  at a tagged RIP, jumps to a fixup that returns -EFAULT instead of panicking (the Linux __ex_table model).
+  copy_from_user/copy_to_user already have this fault handling (copyuser_test passes), and the DMA paths
+  already PIN the user frames (ahci_read_user -> vmm_get_user_pages pins, closing the recycle window), so the
+  exposure is the remaining non-pinned prefault-then-raw-deref sites. No clean per-site sub-fix exists short of
+  routing each through copy_*_user (which the performance-sensitive sites avoid by design) or building the
+  extable; the extable is a cross-cutting mechanism too large for one audit step. Deferred as a dedicated
+  effort; design recorded here so it is known debt, not a buried landmine.
