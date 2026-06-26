@@ -1764,3 +1764,47 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   mirrors ext2_unlink); then (ff) exec-vs-threads PML4 free (most severe/unprivileged but the biggest, most
   careful fix -- deserves its own deep turn); then (hh) virtio-net RX bound (trivial surgical fix but malicious-
   device-only, not boot-exercised).
+- 2026-06-26 FAN-OUT #6 (3 read-only Explore agents over un-swept subsystems: AHCI/NVMe DMA scatter-gather,
+  shmem/CoW fault path, vfs path resolution/symlinks; reported confidence as noted, NOT yet independently
+  verified -- VERIFY against the real code before fixing, EVERY fan-out #4/#5 prescription needed refinement).
+  AHCI/NVMe SG came back essentially SAFE for the reachable threat model (every reachable PRDT/PRP builder bounds
+  its entry count -- ahci_submit_hhdm/do_rw_direct use nprdt<248 + fail-on-remainder, ahci_submit_sg rejects
+  npages>130, nvme_rw rejects >8KiB; sectors*size funneled through xfer_bytes_ok/mul_within_u32; the only device
+  index cqe.cid is nvme_cid_valid-gated; slot/DMA-buffer lifetimes serialized) -- with ONE LATENT-only defect.
+  THREE findings:
+  (jj) HIGH, unprivileged -- CoW break in vmm_get_user_pages does a frame-swap PTE write with only a LOCAL invlpg
+  and NO cross-CPU TLB shootdown (kernel/mm/vmm.c ~302-315, the local flush at ~313): all threads of a process
+  share one page table (THREAD_SHARE_MM), so `*pte = nf` (swap to the freshly-copied frame) changes the
+  translation for every sibling, but only the syscalling CPU's TLB is invalidated. A sibling on another CPU keeps
+  a stale (old_phys, RO) TLB entry; after pmm_ref_dec drops old_phys to rc 1 and the CoW co-owner (fork peer)
+  later frees it (rc 1->0 -> buddy free + recycle), the sibling reads old_phys through its stale TLB = cross-
+  process use-after-free READ / info leak (benign variant: stale pre-DMA bytes = silent corruption). This is the
+  GUP/DMA-pin CoW-break site; the OTHER two CoW-break sites DO shoot down -- isr14_page_fault's rc>1 break
+  (vmm.c ~750) and fork (tlb_flush_mm, process.c ~551) -- so this one was left unflushed (same sibling-stale-TLB
+  class as F97/brk/munmap, at a new site). REACHABLE: any multithreaded process that fork()s (CoW pages) then
+  does an AHCI-backed read/pread/write/pwrite whose user buffer overlaps a CoW page while a sibling touches it.
+  Fix = after the swap, once lock_mm->vma_lock is RELEASED (never while holding it -- IPI-ack deadlock, see
+  vmm.c ~744-747), tlb_flush_range(task_get_mm_shared(g_current), va, va+PAGE_SIZE) (batch all swapped VAs into
+  one flush after the loop for scale); the rc==1 RO->RW widen-only branch needs no shootdown. agent CONFIDENCE
+  HIGH on the defect (the lone frame-swapping CoW break with only a local invlpg), MEDIUM on worst-case freed-
+  frame leak (needs the co-owner to free within the stale window) / HIGH on the stale-read corruption variant.
+  (kk) MEDIUM, unprivileged sandbox bypass -- sys_readdir is missing the unveil_ok gate (kernel/syscall/syscall.c
+  ~1740, the check belongs after fs_lookup ~1775 before the dispatch ~1779): unveil_ok (syscall.c ~328) is the
+  single unveil enforcement point and EVERY other path syscall calls it (open 411, exec 961, stat 1860, unlink
+  1900, rename 1962, mkdir 2116, access 3935, truncate 5370) but sys_readdir's body (1740-1823) has no unveil
+  reference, and fs_lookup/ext2_lookup_path only do ACL checks -- so a process confined with unveil() can
+  readdir() any directory outside its unveiled set and enumerate names + inode#/size/is_dir (open/stat on those
+  names are still blocked, so it is metadata enumeration, not memory corruption). Distinct from F38 (which fixed
+  the prefix math + added the gate to unlink/rename/mkdir/rmdir/truncate/exec -- readdir was simply never added).
+  Fix = after `fs_lookup(path, ...)` add `if (!unveil_ok(path, UNVEIL_READ)) { kfree(kbuf); kfree(path); return
+  -ENOENT; }` (free both buffers on the deny path), mirroring sys_stat. agent CONFIDENCE HIGH the gate is absent.
+  (ll) LOW, latent/unreachable -- build_prdt (kernel/drivers/storage/ahci.c ~402-418) writes prdt[n++] with NO
+  n<248 bound (unlike its three siblings), so a bytes value > 248*page_span would OOB-write past prdt[248] off
+  the 4KiB cmd_table_t; but its ONLY caller ahci_read_multi (~946) always passes bytes=PAGE_SIZE (1 entry) and
+  ahci_read_multi itself has ZERO callers (dead code), so it is NOT currently reachable. Fix (defense-in-depth,
+  mirror the siblings) = `while (bytes > 0 && n < 248u)` + caller fails on unconsumed remainder. agent
+  CONFIDENCE HIGH it is a real latent defect AND HIGH it is unreachable today.
+  PRIORITY (to verify+fix, sharpest first): (jj) CoW GUP missing-shootdown first -- HIGH, reachable, cross-
+  process UAF-read, clean fix mirroring the isr14/fork shootdown; then (kk) unveil readdir gap (clean, mirrors
+  the sibling syscalls); then (ll) build_prdt bound (trivial defense-in-depth on dead code). NOTE: this fan-out
+  ran 3 agents (not the usual ~5); bcache/buffer eviction + tty ldisc deeper remain un-swept for a later round.
