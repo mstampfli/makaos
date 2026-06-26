@@ -425,7 +425,16 @@ static void pty_slave_close(vfs_file_t* self) {
     pty->slave_open_count--;
     wait_queue_wake_all(&pty->master_waitq);
     int do_free = (pty->slave_open_count == 0 && !pty->master_open);
-    if (do_free) pty_unlink_locked(pty);
+    if (do_free) {
+        pty_unlink_locked(pty);
+    } else if (pty->slave_file == self) {
+        // Master is still open, but the SHARED slave vfs_file_t (self) is freed
+        // just below.  Clear the cached pointer + claim flag under the lock so a
+        // later /dev/pts/N open sees NULL and does NOT resurrect this freed file
+        // via a raw refcount bump -- the reopen-after-slave-close use-after-free.
+        pty->slave_file    = NULL;
+        pty->slave_claimed = 0;
+    }
     spin_unlock(&s_pty_lock);
 
     kfree(ctx);
@@ -703,7 +712,10 @@ vfs_file_t* pty_open_slave_by_index(int n) {
     spin_lock(&s_pty_lock);
     for (pty_t* p = s_pty_head; p; p = p->next) {
         if (p->index != n) continue;
-        if (!p->slave_file) break;          // pair not fully built yet -> NULL
+        // slave_file is NULL when the pair is not fully built yet OR when the
+        // slave was closed while the master stayed open (pty_slave_close clears
+        // it now).  Either way there is no live slave file to hand out -> NULL.
+        if (!p->slave_file) break;
         if (!p->slave_claimed) {
             // First open consumes the initial reference taken by
             // pty_alloc (slave_open_count is already 1).
@@ -711,8 +723,10 @@ vfs_file_t* pty_open_slave_by_index(int n) {
             result = p->slave_file;
         } else {
             // Additional opens share the same vfs_file -- dup semantics.
-            __atomic_fetch_add(&p->slave_file->refcount, 1, __ATOMIC_RELAXED);
-            result = p->slave_file;
+            // vfs_tryget (not a raw refcount bump) fails -> NULL if the file is
+            // mid-teardown (refcount already 0), closing the last-close-vs-open
+            // race instead of resurrecting a dying object.
+            result = vfs_tryget(p->slave_file);
         }
         break;
     }
@@ -784,6 +798,43 @@ void pty_lifetime_selftest(void) {
 
     kprintf(fails ? "[pty_life] SELF-TEST FAILED\n"
                   : "[pty_life] SELF-TEST PASSED (pair freed once, unlinked)\n");
+}
+
+// Deterministic check of the reopen-after-slave-close UAF fix: when the slave
+// is closed while the master stays OPEN, the shared slave vfs_file_t is freed,
+// so pty->slave_file must be CLEARED (not left dangling at the freed file) and a
+// subsequent /dev/pts/N reopen must return NULL -- never resurrect the freed
+// object with a raw refcount bump (the old __atomic_fetch_add UAF).
+void pty_reopen_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf("[pty_reopen] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+    int idx = pty->index;
+
+    // Park + claim the slave (the /dev/pts-open path).
+    pty->slave_file = s;
+    if (pty_open_slave_by_index(idx) != s || !pty->slave_claimed) fails++;
+
+    // Close the slave with the master STILL open: the pty survives, but the
+    // shared slave vfs_file_t is freed.  Do NOT deref `s` after this.
+    s->close(s);
+    if (pty->slave_file != NULL)     fails++;   // dangling pointer cleared (the fix)
+    if (pty->slave_claimed != 0)     fails++;
+    if (pty->slave_open_count != 0)  fails++;
+
+    // Reopen must return NULL, never a resurrected freed file.
+    if (pty_open_slave_by_index(idx) != NULL) fails++;
+
+    // Tear down: with the slave gone, closing the master frees the pty.
+    m->close(m);
+
+    kprintf(fails ? "[pty_reopen] SELF-TEST FAILED\n"
+                  : "[pty_reopen] SELF-TEST PASSED (slave_file cleared on close, no reopen UAF)\n");
 }
 
 // Deterministic master-ring selftest (the master_lock fix): drive the producer

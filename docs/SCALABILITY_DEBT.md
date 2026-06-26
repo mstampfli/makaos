@@ -386,3 +386,28 @@ leader identity.  The proper fix needs the tgid-index re-key + child-list /
 waitpid reparenting (a de_thread).  This path is INERT at boot (every boot exec
 is single-threaded, refs == 1), so it is untestable by the boot battery; the
 [exec_mm] selftest covers the sole-owner-vs-shared decision threshold.
+
+---
+
+## pty: reopen /dev/pts/N after slave close while master open returns NULL (F104)
+
+F104 closed the reopen-after-slave-close use-after-free: pty_slave_close now
+clears pty->slave_file (and slave_claimed) when the master is still open, and
+pty_open_slave_by_index uses vfs_tryget instead of a raw refcount bump.  So a
+reopen of /dev/pts/N after the slave was fully closed (while the master stays
+open) now returns NULL (a clean ENXIO-style failure) instead of resurrecting
+the freed slave vfs_file_t.
+
+REMAINING (functionality, not safety -- the UAF is fully closed): Linux devpts
+lets a process reopen /dev/pts/N while the master is alive and get a fresh
+slave handle.  MakaOS now rejects that reopen.  This does NOT affect the normal
+terminal flow (the shell opens its slave once and keeps it open; dup/fork share
+the same file via the refcount and an open-while-already-open succeeds through
+vfs_tryget -- only a reopen AFTER a full close is rejected).  The proper fix is
+to BUILD A FRESH slave vfs_file_t on demand in pty_open_slave_by_index when
+slave_file==NULL && master_open (decoupling the slave file's lifetime from
+per-open): extract a pty_make_slave_file(pty) helper used by both pty_alloc and
+the reopen path, and set pty->slave_file before the s_pty_head insert in
+pty_alloc so slave_file==NULL unambiguously means "closed" (no not-fully-built
+window).  Deferred to keep this fix surgical on the boot-critical pty path; the
+[pty_reopen] selftest pins the safety invariant (slave_file cleared, no UAF).

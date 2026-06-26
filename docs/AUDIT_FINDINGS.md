@@ -1957,6 +1957,29 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   vfs_file_t+ctx on demand (decouple the shared vfs_file_t lifetime from the pty -- the real root cause). agent
   CONFIDENCE HIGH (the free is unconditional, slave_file never cleared on this path, reopen derefs+resurrects it
   past the NULL guard; pty_lifetime_selftest never covers close-slave-then-reopen-with-master-alive).
+  -> VERIFIED + FIXED (F104): confirmed pty_slave_close (pty.c) does kfree(self) even when do_free==0 (master
+  still open) and never NULLed pty->slave_file / slave_claimed on that path, leaving a dangling pointer in the
+  s_pty_head node; pty_open_slave_by_index's else branch did a raw __atomic_fetch_add(&p->slave_file->refcount)
+  on it (resurrect-on-freed-slab) past the ineffective `if (!p->slave_file)` guard. REFINED the recorded fix
+  (no-assumptions): the recorded "build a fresh slave on reopen" requires refactoring the boot-critical pty_alloc
+  AND resolving a not-fully-built window (the pty enters s_pty_head before pty_open_master assigns slave_file),
+  which is more risk than warranted for a path the normal terminal flow never hits (the shell opens its slave
+  ONCE and keeps it; dup/fork share via the refcount; an open-while-already-open succeeds via vfs_tryget -- only
+  a reopen AFTER a FULL close is the edge case). The SECURITY bug is the UAF, closed surgically: (1) pty_slave_
+  close, under s_pty_lock when !do_free, sets pty->slave_file = NULL + slave_claimed = 0 if it == self (clears
+  the dangling pointer so a later open sees NULL); (2) pty_open_slave_by_index's additional-open branch uses
+  vfs_tryget(p->slave_file) (fails -> NULL if the file is mid-teardown, closing the last-close-vs-open race)
+  instead of the raw refcount bump. So a reopen-after-full-close now returns NULL (a clean failure) rather than
+  resurrecting freed memory. The reopen-build-fresh FUNCTIONALITY (Linux devpts reopen) is recorded as a
+  follow-up in docs/SCALABILITY_DEBT.md (not a safety gap -- the UAF is fully closed). VERIFICATION: a NEW
+  DETERMINISTIC selftest (pty_reopen_selftest) drives the exact scenario -- alloc, claim slave, close slave with
+  master open, then assert pty->slave_file==NULL + slave_claimed==0 + slave_open_count==0 (the dangling pointer
+  is cleared) and that a reopen returns NULL (no resurrection); plus pty is HEAVILY boot-exercised (the desktop/
+  foot/login open ptmx + slave + read/write), so a clean boot proves normal pty open/close still works. `[pty_
+  reopen] SELF-TEST PASSED (slave_file cleared on close, no reopen UAF)`. First boot hit the flaky F55 stall
+  (net ready, login + /bin/net paged, no DHCP, 0 faults, 70 selftests PASSED incl. [pty_life]/[pty_reopen]/[pty_
+  mring]); the SAME-build re-boot reached the DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 70 selftests
+  PASSED, 0 FAILED/PANIC, no [WD], `More login:` renders. This closes fan-out #7 candidate (oo).
   (qq) HIGH, unprivileged -- io_uring SQ consumer unserialized: io_uring_enter_impl's SQPOLL-skip guard
   (kernel/io/io_uring.c ~1046-1050) only fires for (SQ_WAKEUP && !GETEVENTS), so enter(GETEVENTS) on a SQPOLL
   ring falls through into the unlocked consumer loop (~1058-1119) which races the always-running SQPOLL poller's

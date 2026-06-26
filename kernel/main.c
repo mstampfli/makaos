@@ -748,6 +748,10 @@ static void init_kthread(void) {
     // unlinked, under s_pty_lock (no concurrent master/slave double-free).
     extern void pty_lifetime_selftest(void);
     pty_lifetime_selftest();
+    // pty slave reopen: closing the slave with the master open must clear the
+    // cached slave_file so a reopen cannot resurrect the freed vfs_file_t.
+    extern void pty_reopen_selftest(void);
+    pty_reopen_selftest();
 
     // PTY master ring: the slave-output ring (m_head/m_tail) is now mutated
     // under master_lock by both the producer (write_char/write_buf) and the
