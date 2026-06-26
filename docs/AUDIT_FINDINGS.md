@@ -1459,3 +1459,50 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   spawn site that races close. Fix: io_uring_close_file now stops+JOINS SQPOLL FIRST, then reads/stops/joins
   the worker; the worker publish is a release store and every uring->worker read (close join + ensure_worker
   fast-path) an acquire load. io_uring_test still PASSES + clean boot (DHCP, 61 PASSED).
+- 2026-06-26 FAN-OUT #4 (5 read-only Explore agents over un-swept subsystems; reported HIGH confidence each,
+  NOT yet independently verified -- VERIFY against the real code before fixing). One SAFE: AHCI NCQ completion
+  (the device-written completed-slot set is done = active_mask & ~sact/~ci, so the device can only CLEAR bits,
+  never inject an out-of-range slot index; slots bounded to MAX_NCQ_SLOTS=32; the completer atomically claims
+  done out of active_mask before any state write; result published release / read acquire; slot reuse + waiter
+  wake safe; beyond F47/F62). Four CANDIDATE bugs:
+  (bb) HIGH, unprivileged SMP -- dcache_install resurrect-a-DYING-dentry UAF: dcache_install's `if (existing)`
+  branch (kernel/fs/dcache.c ~398-406) drops g_dcache_wlock at ~399 then bumps existing->refcount with a BARE
+  __atomic_fetch_add at ~405, OUTSIDE the lock. bucket_find_locked matches by key, so a refcount-0 dentry still
+  on the LRU is a normal find; meanwhile the shrinker kthread (dcache_shrink) can CAS that dentry refcount
+  0 -> DCACHE_REF_DYING, unlink it, and call_rcu its free. The bare fetch_add then turns DYING (0xFFFFFFFF) ->
+  0, returns the dentry to ext2_lookup_path as live, and (no rcu_read_lock held across this) the grace period
+  frees the slot under the returned pointer = UAF + refcount wrap + (via SLAB_TYPESAFE_BY_RCU reuse) a stale
+  child_ino -> wrong inode resolved. The lookup path (audit fix T1, dcache.c ~244-254) already closed this with
+  a DYING-aware CAS under the lock; the install-hits-existing path was left bare. Reachable by any open/stat/
+  exec on SMP + the concurrent shrinker. Fix = acquire existing's ref with the SAME DYING-refusing CAS, UNDER
+  g_dcache_wlock (the shrinker also holds it), and on DYING fall through to install the fresh candidate instead.
+  (dd) HIGH, unprivileged -- timerfd concurrent-settime per-CPU-list corruption UAF: timerfd_settime
+  (kernel/io/timerfd.c ~256-310) detaches the node from its old home-CPU list under old_pc->lock, drops the
+  lock (no preempt_disable across the gap), then attaches to the current CPU's list under pc->lock, writing
+  t->home_cpu -- with NO node-level mutual exclusion, and tfd_list_insert (~87) has NO already-linked guard.
+  Two threads sharing the fd table (THREAD_SHARE_FILES) calling settime on the same timerfd on different CPUs
+  both see home_cpu==~0, each insert the node into a DIFFERENT per-CPU list -> one node on two lists / t->next
+  cross-linked; then timerfd_close_op removes from home_cpu's list and kfrees while the node is still in the
+  other CPU's list -> that CPU's timerfd_tick derefs + fires a freed node = UAF. Distinct from F81 (which
+  pinned the file but did NOT serialise two settime callers). eventfd (CAS counter), signalfd (s_sfd_lock), and
+  timerfd close-vs-tick (pc->lock + preempt_disable) are SAFE. Fix = a per-node spinlock in timerfd_state_t
+  held across the WHOLE settime detach+attach (and close remove), so the two per-CPU list ops on one node are
+  atomic; the tick still takes only pc->lock.
+  (ee) MEDIUM, F84/F85 class -- pipe ring data race: pipe head/tail/count (kernel/fs/pipe.h ~22-26, plain
+  uint32_t, no lock in pipe_buf_t) are RMW'd by pipe_read (~54-56) and pipe_write (~111-113) on different CPUs
+  with no lock/atomics -> torn count (a count--/count++ interleave loses an update), unreliable empty/full
+  gating, torn/stale payload bytes. In-bounds (indices masked to the power-of-2 ring) so NOT OOB -- a data
+  race / corruption, same class as F84 (pty ring) / F85 (evdev ring). Reachable: pipe() + sibling threads
+  (THREAD_SHARE_FILES) read/write concurrently. Close-time lifetime, bounds, refcount/EOF are SAFE. Fix = a
+  per-pipe spinlock around the head/tail/count/refs RMWs (mirror pty master_lock / evdev d->lock; drop before
+  sched_sleep/wake). NOTE: PT_INTERP does NOT exist (static-only ELF loader), so the interp angle is moot.
+  (cc) MEDIUM, data corruption not OOB -- file-backed mmap left-trim wrong-page: mm_vma_remove Case 3 (left
+  edge overlap, kernel/mm/mm.c ~434-436) advances v->start = end but does NOT advance v->file_off / v->file_len
+  (the split Case 4 ~413-415 and the ELF split both DO), so after a front munmap of a file-backed VMA every
+  subsequent demand fault computes src_off = file_off + (page - start) shifted back by (end - old_start) and
+  installs the WRONG file page. The read stays bounded (vmm.c ~847 clamps pg_off < file_len; ext2 pread clamps
+  to fd->file_size) so it is NOT an OOB/UAF -- intra-file disclosure / silent data corruption + a wrong-keyed
+  page-cache entry. (Same family as the shmem-pgoff aliasing noted SAFE-ish in fan-out #3, now for the file
+  backing.) Fix = in Case 3 compute delta = end - v->start, then v->file_off += delta, v->file_len -= delta
+  (clamp), before overwriting v->start (mirror Case 4). PRIORITY: (bb) dcache UAF first (sharpest -- HIGH,
+  most reachable, clean fix mirroring T1), then (dd) timerfd UAF, then (ee) pipe ring, then (cc) mmap left-trim.
