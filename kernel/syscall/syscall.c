@@ -1682,12 +1682,18 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
             if (tty && tty->fg_pgid == child_pgid)
                 tty->fg_pgid = g_current->pgid;
 
-            if (status_ptr) {
-                int* sp = (int*)(uintptr_t)status_ptr;
-                *sp = (int)((code & 0xFF) << 8);
-            }
-
+            // Write the exit status through copy_to_user, never a raw store to
+            // the user-supplied pointer: a kernel/non-canonical status_ptr was
+            // an arbitrary-kernel-WRITE (LPE) of an attacker-influenced byte, or
+            // a #PF panic.  `code` is already a kernel local, and the zombie is
+            // committed-reaped (sched_reap_zombie ran), so destroy it first --
+            // a bad pointer must not leave it unreaped+leaked -- then copy out.
+            int kstatus = (int)((code & 0xFF) << 8);
             process_destroy(zombie);
+            if (status_ptr &&
+                copy_to_user((void*)(uintptr_t)status_ptr, &kstatus,
+                             sizeof(kstatus)) != 0)
+                return (uint64_t)-EFAULT;
             return (uint64_t)child_pid;
         }
 
@@ -2187,7 +2193,6 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
 // ── sys_pipe ──────────────────────────────────────────────────────────────
 static uint64_t sys_pipe(uint64_t fds_ptr) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
-    int* fds = (int*)(uintptr_t)fds_ptr;
 
     vfs_file_t* r;
     vfs_file_t* w;
@@ -2206,8 +2211,16 @@ static uint64_t sys_pipe(uint64_t fds_ptr) {
         }
     }
     spin_unlock(&tf->lock);
-    fds[0] = rfd;
-    fds[1] = wfd;
+    // Copy the fd pair out via copy_to_user, never a raw store to fds_ptr: a
+    // kernel/non-canonical pointer was an arbitrary-kernel-WRITE / #PF.  Mirror
+    // socketpair -- both ends are installed, so close them via their fds on a
+    // copyout failure rather than leaking the slots + pipe refs.
+    int kfds[2] = { rfd, wfd };
+    if (copy_to_user((void*)(uintptr_t)fds_ptr, kfds, sizeof(kfds)) != 0) {
+        sys_close((uint64_t)rfd);
+        sys_close((uint64_t)wfd);
+        return (uint64_t)-EFAULT;
+    }
     return 0;
 fail:
     vfs_close(r);
@@ -2734,10 +2747,12 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
     if (!g_current || !name_ptr) { serial_puts_dbg("[shm_open] EINVAL\n"); return (uint64_t)-EINVAL; }
     if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
 
-    // Copy name from userspace.
+    // Copy name from userspace via copy_from_user, never a raw memcpy of an
+    // unvalidated pointer (a kernel/non-canonical name_ptr was a kernel READ +
+    // a #PF panic).  namelen is already bounded to SHMEM_NAME_MAX above.
     char name[SHMEM_NAME_MAX + 1];
-    const char* uname = (const char*)name_ptr;
-    __builtin_memcpy(name, uname, namelen);
+    if (copy_from_user(name, (const void*)(uintptr_t)name_ptr, namelen) != 0)
+        return (uint64_t)-EFAULT;
     name[namelen] = '\0';
 
     // POSIX: name must start with '/' and contain no embedded slashes.
@@ -2847,9 +2862,11 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
     if (!g_current || !name_ptr) return (uint64_t)-EINVAL;
     if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
 
+    // copy_from_user, never a raw memcpy of an unvalidated pointer (kernel READ
+    // + #PF).  namelen is bounded to SHMEM_NAME_MAX above.
     char name[SHMEM_NAME_MAX + 1];
-    const char* uname = (const char*)name_ptr;
-    __builtin_memcpy(name, uname, namelen);
+    if (copy_from_user(name, (const void*)(uintptr_t)name_ptr, namelen) != 0)
+        return (uint64_t)-EFAULT;
     name[namelen] = '\0';
 
     if (name[0] != '/') return (uint64_t)-EINVAL;
@@ -2886,10 +2903,14 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
 static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     (void)rem_ptr;
     if (!req_ptr) return (uint64_t)-EINVAL;
-    k_timespec_t* req = (k_timespec_t*)req_ptr;
-    if (req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return (uint64_t)-EINVAL;
+    // Copy the timespec in via copy_from_user, never a raw deref: a kernel/
+    // non-canonical req_ptr was a kernel READ oracle and a #PF panic (DoS).
+    k_timespec_t req;
+    if (copy_from_user(&req, (const void*)(uintptr_t)req_ptr, sizeof(req)) != 0)
+        return (uint64_t)-EFAULT;
+    if (req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL) return (uint64_t)-EINVAL;
 
-    uint64_t sleep_ns = req->tv_sec * 1000000000ULL + req->tv_nsec;
+    uint64_t sleep_ns = req.tv_sec * 1000000000ULL + req.tv_nsec;
     if (!sleep_ns) return 0;
 
     uint64_t wake_ns = tsc_read_ns() + sleep_ns;
@@ -2974,13 +2995,19 @@ typedef struct {
 static uint64_t sys_fb_info(uint64_t ptr) {
     if (!ptr) return (uint64_t)-EINVAL;
     if (!g_fb.base_virt) return (uint64_t)-EIO;
-    user_fb_info_t* info = (user_fb_info_t*)ptr;
-    info->phys   = g_fb.base_virt - HHDM_OFFSET;
-    info->width  = g_fb.width;
-    info->height = g_fb.height;
-    info->pitch  = g_fb.pitch;
-    info->bpp    = g_fb.bpp;
-    return 0;
+    // Fill a kernel-local struct and copy_to_user it, never a raw store through
+    // the user pointer (a kernel/non-canonical `ptr` was an arbitrary 24-byte
+    // kernel WRITE incl. a phys addr, or a #PF).  memset first so no
+    // uninitialized stack padding leaks to userland.
+    user_fb_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
+    info.phys   = g_fb.base_virt - HHDM_OFFSET;
+    info.width  = g_fb.width;
+    info.height = g_fb.height;
+    info.pitch  = g_fb.pitch;
+    info.bpp    = g_fb.bpp;
+    return copy_to_user((void*)(uintptr_t)ptr, &info, sizeof(info)) == 0
+           ? 0 : (uint64_t)-EFAULT;
 }
 
 // ── sys_fb_map ────────────────────────────────────────────────────────────
@@ -3678,6 +3705,48 @@ void copy_path_user_selftest(void) {
     }
     kprintf(fails ? "[copypath_test] SELF-TEST FAILED\n"
                   : "[copypath_test] SELF-TEST PASSED (bad path pointers rejected, no fault)\n");
+}
+
+// Audit fix (BUG-TYPE SCAN #3): sys_wait/sys_pipe/sys_fb_info/sys_nanosleep/
+// sys_shm_open/sys_shm_unlink dereferenced the user-supplied pointer DIRECTLY
+// (raw `*(T*)uptr` store/read) -- an arbitrary-kernel-WRITE LPE (wait/pipe/
+// fb_info), a kernel-read oracle, or a #PF panic on a kernel/non-canonical
+// pointer.  Each now routes through copy_from_user/copy_to_user.  Verify the
+// side-effect-free handlers reject a kernel/non-canonical pointer with -EFAULT
+// instead of touching it.  (sys_wait needs a zombie and sys_pipe installs fds,
+// so both are covered by the heavy boot exercise -- every shell pipeline calls
+// pipe(), every waitpid hits the status path -- plus the code-proof, rather
+// than driven here where they would churn fd/zombie state.)
+void syscall_user_ptr_selftest(void) {
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address (the LPE case)
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        int64_t r;
+        // fb_info writes a struct out; a kernel ptr must yield -EFAULT (or -EIO
+        // if the fb is not up -- either way the bad pointer is never written).
+        r = (int64_t)sys_fb_info(bad[i]);
+        if (r != -EFAULT && r != -EIO) {
+            kprintf("[user_ptr_test] FAIL fb_info 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_nanosleep(bad[i], 0);
+        if (r != -EFAULT) {
+            kprintf("[user_ptr_test] FAIL nanosleep 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_shm_open(bad[i], 4, 0, 0);
+        if (r != -EFAULT) {
+            kprintf("[user_ptr_test] FAIL shm_open 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_shm_unlink(bad[i], 4);
+        if (r != -EFAULT) {
+            kprintf("[user_ptr_test] FAIL shm_unlink 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+    }
+    kprintf(fails ? "[user_ptr_test] SELF-TEST FAILED\n"
+                  : "[user_ptr_test] SELF-TEST PASSED (raw user-ptr syscalls reject bad pointers)\n");
 }
 
 // Audit fix: sys_mmap/sys_munmap page-rounded a user `len` with a wrapping

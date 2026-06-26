@@ -2155,3 +2155,55 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   VERDICT: the sibling-stale-TLB class is already hardened (flush-before-free + no-sibling preconditions +
   refcounted frames); the shootdown is already primitised (tlb_flush_range/tlb_flush_mm/tlb_flush_kernel_range),
   so nothing new to extract. F108 removed the one latent landmine. SCAN #2 COMPLETE. Next: BUG-TYPE SCAN #3.
+
+- 2026-06-26 BUG-TYPE SCAN #3 (unvalidated-user-pointer / arbitrary-kernel-RW): the highest-severity class -- a
+  syscall/ioctl dereferences a user-supplied pointer DIRECTLY (raw *(T*)uptr store/read, memcpy/memset, cast-to-
+  struct) instead of routing through copy_from_user/copy_to_user/_access_ok (which validate canonical + user-half
+  + prefault, return -EFAULT). A raw deref of a kernel/non-canonical pointer = arbitrary kernel WRITE (LPE),
+  arbitrary kernel READ (info leak), or a #PF panic (DoS). Swept the WHOLE user->kernel pointer surface with 4
+  parallel read-only agents (driver ioctls; net syscalls; core syscalls; io_uring+ipc). SIX real gaps found, all
+  in kernel/syscall/syscall.c, all unprivileged -- FIXED THIS TURN (F109); TWO lower-severity net-layer gaps
+  recorded for next turn; driver ioctls + io_uring + the rest audited CLEAN.
+  FIXED (F109, all in syscall.c, all routed through copy_*_user):
+    sys_wait (1685): raw `*sp = (code&0xFF)<<8` to user status_ptr -> arbitrary kernel WRITE (LPE), every waitpid.
+    sys_pipe (2190/2209): raw `fds[0]=rfd; fds[1]=wfd` to user int[2] -> arbitrary kernel WRITE (LPE) + leaked the
+      installed fds on a bad pointer; every pipe(). (Flagged independently by the net AND core agents.)
+    sys_fb_info (2977): raw 24-byte struct write (incl. a phys addr) to user ptr -> arbitrary kernel WRITE (LPE).
+    sys_nanosleep (2889): raw `req->tv_sec/tv_nsec` read -> kernel READ oracle + #PF panic (DoS).
+    sys_shm_open (2740) / sys_shm_unlink (2852): raw `__builtin_memcpy(name, uname, namelen)` from user ptr ->
+      kernel READ + #PF panic (namelen WAS bounded to SHMEM_NAME_MAX, but the POINTER was unvalidated).
+  RECORDED for next turn (net-layer, lower severity -- #PF-DoS / 1-bit oracle, different files):
+    setsockopt optval (kernel/net/socket.c:635, the SO_BROADCAST `int v = *(const int*)optval`): the optval
+      pointer is passed from sys_setsockopt (syscall.c:3382) with no user_buf_check -> #PF/#GP DoS + a 1-bit
+      "is *KADDR nonzero" oracle. Fix: bounce optval through copy_from_user in sys_setsockopt; operate on the copy.
+    AF_UNIX sun_path (unix_sock.c ns_insert/ns_hash_str/ns_streq via sys_bind/sys_connect/sys_sendto): the
+      sockaddr base IS range-validated (user_buf_check sizeof(sockaddr_un)), but sun_path is then walked as an
+      unbounded C-string (no NUL in 108 bytes -> reads into the next, possibly-unmapped page) -> #PF DoS. Fix:
+      copy the sockaddr into a kernel sockaddr_un, force sun_path[UNIX_PATH_MAX-1]='\0' before any strlen/hash;
+      bound ns_hash_str/ns_streq with UNIX_PATH_MAX. Also the debug serial_puts_dbg(sa->sun_path) at syscall.c:3198.
+  AUDITED CLEAN (provably -- the whole surface):
+    driver ioctls: EVERY .ioctl across drivers routes `arg` (and embedded user sub-pointers) through copy_*_user --
+      DRM (per-handler copy_from/to_user on the top-level arg AND every nested objs_ptr/props_ptr/modes_ptr/id
+      array), evdev (copy_*_user_n wrappers for all EVIOCG*/S*; EVIOCGRAB treats arg as an int value), pty/tty
+      (the F-precedent), tty0 fallback incl. TIOCGSERIAL (the other precedent), pipe/unix FIONREAD. fb/virtio_gpu/
+      storage/hda/input-cores expose NO ioctl. CLEAN.
+    net syscalls: bind/connect/accept/sendto/recvfrom (user_buf_check before any deref; addrlen IN/OUT never
+      written raw -- getsockopt/getsockname/getpeername/accept4 are NOT implemented, so those classic addrlen
+      attack surfaces do not exist), sendmsg/recvmsg (copy_*_user for msghdr + each cmsg + the iovec ARRAY + every
+      iov_base chunk -- the usually-sloppy iovec path is correct), socketpair (copy_to_user with fd rollback --
+      the template sys_pipe now matches). CLEAN except the setsockopt/sun_path gaps above.
+    core syscalls: read/write (user_buf_prefault/user_buf_readable_ok), stat/fstat/readdir/getcwd, sigaction/
+      sigprocmask/sigreturn (+canonical gates + MXCSR sanitize), poll/select/epoll_wait, gettimeofday/timerfd,
+      uname/getrusage/times/getgroups, argv/envp (copy_user_strv per element+string), fb_blit (bounded prefault),
+      FUTEX (copy_from_user for the initial read AND the post-enqueue re-read; only WAIT/WAKE exist, no user-word
+      CAS), set_fs/arch_prctl (a value, never deref'd). CLEAN.
+    io_uring + ipc: every SQE-supplied address (READ/WRITE/RECV/SEND/CONNECT/ACCEPT/OPENAT/DRM_COMMIT) validated
+      via user_buf_check/copy_*_user at dispatch, in the SUBMITTER's mm (workers adopt owner_task->mm_shared + the
+      scheduler unconditionally reloads CR3, so validation and deref hit the same address space); SQE double-fetch
+      closed by a snapshot; ring indexing uses kernel-trusted masks not the user ring_mask; eventfd/signalfd/
+      timerfd buffers validated by the read/write prefault; epoll_event in/out via copy_*_user; ksec wire uses
+      kernel-resident structs (no user pointer on the wire). READV/WRITEV/SENDMSG/RECVMSG are not io_uring opcodes.
+      CLEAN.
+  VERDICT: the validation primitive (copy_from_user/copy_to_user/_access_ok/user_buf_check) is applied almost
+  everywhere; the six syscall.c gaps were the stragglers (raw out-param stores + raw name memcpy), now closed.
+  SCAN #3 not yet COMPLETE -- two net-layer gaps (setsockopt, sun_path) remain; finish them next turn.

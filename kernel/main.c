@@ -501,6 +501,12 @@ static void init_kthread(void) {
     extern void access_ok_selftest(void);
     access_ok_selftest();
 
+    // Raw user-pointer syscalls (wait/pipe/fb_info/nanosleep/shm_open/unlink)
+    // now route through copy_*_user; bad (kernel/non-canonical) pointers must
+    // return -EFAULT instead of an arbitrary kernel read/write or a #PF panic.
+    extern void syscall_user_ptr_selftest(void);
+    syscall_user_ptr_selftest();
+
     // Front-munmap of a file/shmem-backed VMA must advance file_off/file_len/
     // shmem_pgoff in lockstep with vma->start, else later faults map the wrong page.
     extern void mm_vma_trim_selftest(void);
