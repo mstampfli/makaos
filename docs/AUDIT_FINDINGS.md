@@ -1844,6 +1844,23 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ahci_read_multi itself has ZERO callers (dead code), so it is NOT currently reachable. Fix (defense-in-depth,
   mirror the siblings) = `while (bytes > 0 && n < 248u)` + caller fails on unconsumed remainder. agent
   CONFIDENCE HIGH it is a real latent defect AND HIGH it is unreachable today.
+  -> VERIFIED + FIXED (F101): confirmed build_prdt (ahci.c) had `while (bytes > 0)` with NO n<248 bound while
+  the three siblings (do_rw_direct ~633, ahci_submit_hhdm ~765 use nprdt<248 + fail-on-remainder; build_prdt_pages
+  bounded by npages); confirmed prdt[248] is a 4KiB cmd_table_t (ahci.c:131); confirmed the sole caller
+  ahci_read_multi (~946) passes PAGE_SIZE (1 entry) and ahci_read_multi has ZERO callers (grep: only the ahci.h
+  decl + comments) -> dead code, latent/unreachable. FIX (do-it-right, mirror the siblings' discipline): bounded
+  the loop `while (bytes > 0 && n < 248u)` so it can never write past prdt[247], and `if (bytes) return 0` to
+  signal overflow (the documented "caller must fail" contract, like ahci_submit_hhdm's fail-on-remainder). Left
+  ahci_read_multi as-is (it passes PAGE_SIZE so it always gets 1 and can never trigger 0; wiring a slot-freeing
+  overflow path into the dead caller would entangle slot management for an unreachable branch -- the helper's
+  return-0 contract is documented for any FUTURE large-bytes caller). VERIFICATION: a DETERMINISTIC unit test
+  (ahci_build_prdt_selftest, heap array since 250 entries > 8KiB kstack): 1 page -> 1 entry; exactly 248 pages
+  -> 248 entries all consumed; 249 pages -> returns 0 (overflow signalled) AND a canary at prdt[248] is
+  UNTOUCHED (proves the bound stopped at entry 247, no OOB). `[ahci_prdt] SELF-TEST PASSED (PRDT bounded to 248,
+  overflow signalled)`. The fix is in DEAD code so inert at boot; clean boot just confirms nothing else broke.
+  Clean boot FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 69 selftests PASSED incl. [ahci_prdt]
+  and [ahci_xfer], 0 FAILED/PANIC, no [WD], `More login:` renders. This closes fan-out #6 candidate (ll) -- and
+  with AHCI/NVMe SG SAFE + (jj) F99 / (kk) F100 / (ll) F101 all shipped, ALL of fan-out #6 is now resolved.
   PRIORITY (to verify+fix, sharpest first): (jj) CoW GUP missing-shootdown first -- HIGH, reachable, cross-
   process UAF-read, clean fix mirroring the isr14/fork shootdown; then (kk) unveil readdir gap (clean, mirrors
   the sibling syscalls); then (ll) build_prdt bound (trivial defense-in-depth on dead code). NOTE: this fan-out

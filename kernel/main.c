@@ -550,6 +550,9 @@ static void init_kthread(void) {
     ext2_dotdot_repoint_selftest();
     extern void xfer_bytes_ok_selftest(void);
     xfer_bytes_ok_selftest();
+    // AHCI build_prdt must bound writes to the 248-entry PRDT (no OOB past the cmd table).
+    extern void ahci_build_prdt_selftest(void);
+    ahci_build_prdt_selftest();
 
     // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
     // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.

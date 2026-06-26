@@ -396,12 +396,19 @@ static uint32_t slot_alloc(void) {
 }
 
 // ── PRDT builder ─────────────────────────────────────────────────────────
-// Build PRDT entries for a contiguous physical buffer.
-// Returns the number of entries written (≤ 248).
+// Build PRDT entries for a contiguous physical buffer.  Returns the number of
+// entries written (1..248), or 0 if `bytes` needs MORE than the 248-entry table
+// holds -- a caller MUST treat 0 as "transfer too fragmented" and fail, exactly
+// like the inline builders' fail-on-remainder (ahci_submit_hhdm / do_rw_direct).
+// The `n < 248u` bound makes the write safe by construction: it can never run
+// past prdt[247] / off the end of the 4 KiB cmd_table_t, no matter how large
+// `bytes` is.  (The sole caller, ahci_read_multi, passes PAGE_SIZE = one entry,
+// so it never overflows; the bound is defense-in-depth before this helper is
+// wired into any larger transfer.)
 
 static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes) {
     uint32_t n = 0;
-    while (bytes > 0) {
+    while (bytes > 0 && n < 248u) {
         // Stay within the current 4 KiB page boundary.
         uint32_t off   = (uint32_t)(phys & (PAGE_SIZE - 1));
         uint32_t chunk = PAGE_SIZE - off;
@@ -414,6 +421,7 @@ static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes)
         phys  += chunk;
         bytes -= chunk;
     }
+    if (bytes) return 0;   // did not fit the 248-entry table -> caller must fail
     return n;
 }
 
@@ -1176,5 +1184,28 @@ void xfer_bytes_ok_selftest(void) {
     }
     kprintf(fails ? "[ahci_xfer] SELF-TEST FAILED\n"
                   : "[ahci_xfer] SELF-TEST PASSED (sector-bytes u64, no wrap, bounded)\n");
+}
+
+#include "kheap.h"
+// build_prdt must bound its writes to the 248-entry PRDT table and signal
+// overflow (return 0) when a transfer needs more entries -- it must never write
+// past prdt[247], off the end of the 4 KiB cmd_table_t.  Heap-allocated array
+// (250 entries = 4000 bytes is too big for the 8 KiB kstack).
+void ahci_build_prdt_selftest(void) {
+    prdt_entry_t* prdt = (prdt_entry_t*)kmalloc(250u * sizeof(prdt_entry_t));
+    if (!prdt) { kprintf("[ahci_prdt] FAIL alloc\n"); return; }
+    int fails = 0;
+    // One page from a page-aligned base -> exactly one entry, all consumed.
+    if (build_prdt(prdt, 0x100000u, PAGE_SIZE) != 1u) fails++;
+    // Exactly 248 pages -> fills the table, all consumed.
+    if (build_prdt(prdt, 0x100000u, 248u * PAGE_SIZE) != 248u) fails++;
+    // 249 pages -> overflow: returns 0 AND never writes prdt[248] (canary proves
+    // the bound stopped the loop at entry 247, no OOB).
+    prdt[248].dba = 0xDEADBEEFu;
+    if (build_prdt(prdt, 0x100000u, 249u * PAGE_SIZE) != 0u) fails++;
+    if (prdt[248].dba != 0xDEADBEEFu) fails++;
+    kfree(prdt);
+    kprintf(fails ? "[ahci_prdt] SELF-TEST FAILED\n"
+                  : "[ahci_prdt] SELF-TEST PASSED (PRDT bounded to 248, overflow signalled)\n");
 }
 #endif
