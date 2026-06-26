@@ -207,26 +207,37 @@ static void unix_poll_wake(unix_sock_t* s) {
 
 // ── Circular buffer operations (SOCK_STREAM) ────────────────────────────
 
-static uint32_t cbuf_write(unix_sock_t* s, const void* data, uint32_t len) {
+// Move a chunk into/out of the OWNER's ring UNDER the owner's per-socket lock.
+// `kdata` MUST be a KERNEL buffer: the caller bounces user data in/out OUTSIDE
+// the lock (a user-memory access must never fault under a preempt-disabled
+// spinlock) in bounded chunks that also cap the lock-hold time.  The byte copy +
+// buf_count RMW + index advance are now atomic w.r.t. the peer, so a sender's
+// `buf_count +=` (cbuf_write_locked on the receiver) can no longer race the
+// owner's `buf_count -=` (cbuf_read_locked on itself) -- the permanent fill-level
+// corruption + torn stream bytes this used to allow.  Both ends lock the same
+// socket (the buffer owner); A->B and B->A use different locks (no AB-BA).
+static uint32_t cbuf_write_locked(unix_sock_t* s, const uint8_t* kdata, uint32_t len) {
+    spin_lock(&s->lock);
     uint32_t avail = UNIX_BUF_SIZE - s->buf_count;
     if (len > avail) len = avail;
-    const uint8_t* src = (const uint8_t*)data;
     for (uint32_t i = 0; i < len; i++) {
-        s->buf[s->buf_tail] = src[i];
+        s->buf[s->buf_tail] = kdata[i];
         s->buf_tail = (s->buf_tail + 1) & (UNIX_BUF_SIZE - 1);
     }
     s->buf_count += len;
+    spin_unlock(&s->lock);
     return len;
 }
 
-static uint32_t cbuf_read(unix_sock_t* s, void* data, uint32_t len) {
+static uint32_t cbuf_read_locked(unix_sock_t* s, uint8_t* kdata, uint32_t len) {
+    spin_lock(&s->lock);
     if (len > s->buf_count) len = s->buf_count;
-    uint8_t* dst = (uint8_t*)data;
     for (uint32_t i = 0; i < len; i++) {
-        dst[i] = s->buf[s->buf_head];
+        kdata[i] = s->buf[s->buf_head];
         s->buf_head = (s->buf_head + 1) & (UNIX_BUF_SIZE - 1);
     }
     s->buf_count -= len;
+    spin_unlock(&s->lock);
     return len;
 }
 
@@ -1279,6 +1290,8 @@ int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
 
         uint32_t total = 0;
         int ret;
+        uint8_t kbuf[512];   // bounce chunk: the user->kernel copy stays OUTSIDE
+                             // the per-socket lock; bounds stack + lock-hold.
 
         while (total < len) {
             // If peer closed, EPIPE.  (close() clears s->peer + sets state.)
@@ -1287,8 +1300,12 @@ int unix_sock_send_ex(vfs_file_t* f, const void* buf, uint32_t len,
                 goto stream_out;
             }
 
-            uint32_t wrote = cbuf_write(peer, (const uint8_t*)buf + total,
-                                         len - total);
+            // Bounce a bounded chunk of the user buffer into kbuf OUTSIDE the
+            // lock, then commit it into the peer's ring under the peer's lock.
+            uint32_t chunk = len - total;
+            if (chunk > sizeof(kbuf)) chunk = (uint32_t)sizeof(kbuf);
+            __builtin_memcpy(kbuf, (const uint8_t*)buf + total, chunk);
+            uint32_t wrote = cbuf_write_locked(peer, kbuf, chunk);
             total += wrote;
 
             // Wake peer if it was blocked in recv or poll.
@@ -1357,7 +1374,21 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
             if (s->buf_count == 0) return 0; // EOF
         }
 
-        uint32_t got = cbuf_read(s, buf, len);
+        // Drain up to `len` bytes from our ring into the user buffer, bouncing
+        // through a kernel chunk so the ring copy + buf_count are under our lock
+        // but the user copy is OUTSIDE it.  A stream read returns whatever is
+        // available now (it does not wait to fill `len`), so stop when the ring
+        // drains (cbuf_read_locked returns 0).
+        uint8_t kbuf[512];
+        uint32_t got = 0;
+        while (got < len) {
+            uint32_t chunk = len - got;
+            if (chunk > sizeof(kbuf)) chunk = (uint32_t)sizeof(kbuf);
+            uint32_t r = cbuf_read_locked(s, kbuf, chunk);
+            if (r == 0) break;
+            __builtin_memcpy((uint8_t*)buf + got, kbuf, r);
+            got += r;
+        }
 
         // Drain committed: now wake the peer so a blocked sender
         // observes the newly-freed space.  ACQ_REL on wake_all pairs

@@ -205,6 +205,19 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   This is the "unpublish-before-RCU-deferred-free" ordering primitive: apply it wherever a
   pointer to an RCU-freed object is cleared around the deferred free.
 
+- `unix_sock_t.lock` + the "lock the queue OWNER, copy user data OUTSIDE the lock" discipline
+  (kernel/net/unix_sock.c, F111/F112/F113; full rules in docs/LOCKS.md) -- one per-socket leaf
+  spinlock serializes ALL of an AF_UNIX socket's per-socket queues (listener backlog, dgram rx,
+  SCM_RIGHTS ancillary, stream cbuf), which had assumed the retired single-CPU model. TWO reusable
+  rules: (1) each op locks EXACTLY the per-socket lock of the socket that OWNS the queue/buffer it
+  mutates (a send mutates the peer's queue -> locks the PEER's lock), so two connected sockets'
+  traffic uses two independent locks and never AB-BA deadlocks; (2) a spinlock is NEVER held across
+  a user-memory access -- list/pointer queues keep the user copy before/after the enqueue (dgram),
+  and the stream ring bounces user data through a bounded kernel chunk (cbuf_write_locked/
+  cbuf_read_locked operate on a KERNEL buffer; the 512-byte bounce caps both stack and lock-hold).
+  Apply rule (1) to any cross-CPU producer/consumer queue and rule (2) to any lock that guards a
+  buffer the kernel also fills from / drains to userland.
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device

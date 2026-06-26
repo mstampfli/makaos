@@ -2236,13 +2236,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
         free_rcu drains post-grace-period single-threaded (no lock).
     (C) stream cbuf buf_head/tail/count -- cbuf_write on the SENDER's CPU mutates the PEER's buffer (buf_count +=)
         while cbuf_read on the owner's CPU does buf_count -= : a non-atomic RMW from two CPUs = permanent fill-
-        level corruption + torn stream bytes (the unix_sock.h:106 comment is the smoking gun). STILL OPEN -- REVISED
-        (no-assumptions): cbuf_write/cbuf_read copy USER memory directly (the send/recv buf is the syscall pointer
-        passed straight in), so the data copy CANNOT run under the per-socket spinlock -- a page fault on the user
-        page under a preempt-disabled lock would deadlock.  So C is NOT a simple lock-wrap (unlike B/D, which only
-        move kernel-resident list pointers under the lock); it needs a KERNEL BOUNCE in unix_sock_send_ex/recv_ex
-        (copy user<->kernel OUTSIDE the lock, hold the lock only around the kernel<->ring copy + the count).  That
-        is a distinct, more careful refactor -> deferred to its own turn (do NOT cram it with B/D).
+        level corruption + torn stream bytes. FIXED (F113, the kernel-bounce refactor): cbuf_write/cbuf_read became
+        cbuf_write_locked/cbuf_read_locked -- they take the buffer-OWNER's lock internally and operate on a KERNEL
+        buffer; the send/recv callers bounce the user data through a 512-byte stack chunk OUTSIDE the lock (UNIX_BUF
+        _SIZE is 8 KiB, too big for a stack bounce; the chunk also caps lock-hold time) and loop, so the byte copy +
+        buf_count + index are now atomic w.r.t. the peer with NO user access under the spinlock. A sender into B
+        locks B->lock, a reader of B locks B->lock (same -- serialized); A->B and B->A use different locks (no
+        AB-BA). The blocking-when-full / blocking-when-empty WAIT_EVENT conditions stay unlocked (benign re-checked
+        reads). EOF/EPIPE/EAGAIN/EINTR + partial-write semantics preserved.
     (D) ancillary (SCM_RIGHTS) files[]/head/tail/count -- sendfd (into the PEER's ancillary) vs recvfd (own) vs
         free_rcu drain, no lock -> count lost-update, a passed fd leaked/double-delivered, free_rcu
         double-vfs_close. FIXED (F112): sendfd enqueues under peer->lock (re-checking the limit inside; the vfs_dup
@@ -2284,6 +2285,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
     pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
     (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
-  SCAN #4 IN PROGRESS: F111 fixed the AF_UNIX backlog (A); F112 fixed the AF_UNIX dgram (B) + ancillary (D) onto
-    the same per-socket lock. Remaining: AF_UNIX stream cbuf (C, needs the kernel-bounce refactor), the UDP rx
-    ring (socket_t also lacks a per-socket lock), the fd_flags cloexec lost-update, and s_mmio_next (latent).
+  SCAN #4 IN PROGRESS: the AF_UNIX cluster is now COMPLETE -- A backlog (F111), B dgram + D ancillary (F112), C
+    stream cbuf (F113), all on unix_sock_t.lock. Remaining SCAN #4 candidates: the UDP inet rx ring (socket_t also
+    lacks a per-socket lock), the fd_flags cloexec lost-update (syscall.c, clean low-risk), and s_mmio_next
+    (latent: __atomic_fetch_add + a documented MMIO_VIRT_END ceiling).

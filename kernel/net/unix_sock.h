@@ -103,10 +103,11 @@ typedef struct unix_sock {
     char     path[UNIX_PATH_MAX];
 
     // ── SOCK_STREAM data buffer (circular) ───────────────────────────────
-    // Written by peer (cbuf_write), read by owner (cbuf_read).  STILL the
-    // single-CPU model: the buf_count RMW races across CPUs (sender += vs owner
-    // -=).  Moving it onto `lock` needs a kernel bounce first (cbuf copies user
-    // memory and cannot hold the spinlock across the copy) -- a follow-up.
+    // Written by peer (cbuf_write_locked), read by owner (cbuf_read_locked),
+    // both under the OWNER's `lock` (F113) so the sender's buf_count += can no
+    // longer race the owner's buf_count -=.  The user<->ring copy is bounced
+    // through a kernel chunk in the send/recv callers so the spinlock is never
+    // held across a user-memory access.
     uint8_t  buf[UNIX_BUF_SIZE];
     uint32_t buf_head;      // read index
     uint32_t buf_tail;      // write index
@@ -137,19 +138,18 @@ typedef struct unix_sock {
     struct unix_sock* dgram_dest;
 
     // ── Per-socket data lock ─────────────────────────────────────────────
-    // Serializes the per-socket queues that used to assume the retired
-    // single-CPU model.  Guards the listener BACKLOG (backlog_head/tail/count,
-    // F111), the SOCK_DGRAM RX queue (dgram_head/tail/count, F112), and the
-    // SCM_RIGHTS ANCILLARY queue (ancillary.*, F112) against their cross-CPU
-    // producer/consumer.  Held ONLY around the list/count mutation: allocations,
-    // the user-data memcpy, and the wait_queue wakes happen OUTSIDE it (the
-    // memcpy reads/writes user memory, which must never fault under a
-    // preempt-disabled spinlock; the waitq touches rq_lock).  Never nested with
-    // another per-socket lock (each op locks exactly the OWNER of the queue it
-    // touches) nor with s_unix_pair_lock (separate critical sections).  The
-    // SOCK_STREAM cbuf (below) is the LAST single-CPU-model queue -- it copies
-    // user memory inside cbuf_write/cbuf_read, so it needs a kernel bounce
-    // before it can move onto this lock (a follow-up).
+    // Serializes ALL of this socket's per-socket queues, which used to assume
+    // the retired single-CPU model: the listener BACKLOG (backlog_head/tail/
+    // count, F111), the SOCK_DGRAM RX queue (dgram_head/tail/count, F112), the
+    // SCM_RIGHTS ANCILLARY queue (ancillary.*, F112), and the SOCK_STREAM cbuf
+    // (buf_head/tail/count, F113) -- each against its cross-CPU producer/
+    // consumer.  Held ONLY around the list/count/ring mutation: allocations, the
+    // user-data memcpy (bounced through a kernel chunk for the cbuf), and the
+    // wait_queue wakes happen OUTSIDE it (a user-memory access must never fault
+    // under a preempt-disabled spinlock; the waitq touches rq_lock).  Never
+    // nested with another per-socket lock (each op locks exactly the OWNER of the
+    // queue/buffer it touches, so A<->B traffic uses A->lock and B->lock
+    // independently) nor with s_unix_pair_lock (separate critical sections).
     spinlock_t lock;
 
     // ── Listener backlog (SOCK_STREAM only) ──────────────────────────────
