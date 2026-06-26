@@ -38,7 +38,21 @@ typedef struct timerfd_state {
     uint32_t          flags;
     wait_queue_t      wq;
 
-    // Home CPU — the per-CPU list this timer lives on.  Set on first
+    // Stable per-node lock.  settime moves a timer between per-CPU lists
+    // (detach from old home, attach to new home) as TWO separate locked
+    // sections under DIFFERENT pc->locks; home_cpu -- and hence which
+    // pc->lock "protects" the node -- changes mid-flight.  So pc->lock alone
+    // cannot serialize two concurrent settime callers on the same timer
+    // (fork/thread/SCM_RIGHTS share the one vfs_file_t): both could see the
+    // same home_cpu, take different pc->locks, and link the one node onto two
+    // per-CPU lists.  This lock is stable (independent of home_cpu) and is
+    // held across the WHOLE settime move, making it atomic vs other settimes.
+    // Lock order: t->lock outer, pc->lock inner.  tick/close take only
+    // pc->lock (tick never moves a node cross-CPU; close runs only at the
+    // last fd ref drop, which the settime fdget pin excludes), so no cycle.
+    spinlock_t        lock;
+
+    // Home CPU -- the per-CPU list this timer lives on.  Set on first
     // settime; stable for the life of the timer.  ~0u means "no home
     // yet (timer has never been armed)".
     uint32_t          home_cpu;
@@ -227,6 +241,7 @@ vfs_file_t* timerfd_new(int clockid, uint32_t flags) {
     timerfd_state_t* t = (timerfd_state_t*)kmalloc(sizeof(*t));
     if (!t) return NULL;
     __builtin_memset(t, 0, sizeof(*t));
+    spin_lock_init(&t->lock);
     t->clockid  = clockid;
     t->flags    = flags;
     t->home_cpu = ~(uint32_t)0;   // no home until first settime
@@ -271,6 +286,16 @@ int timerfd_settime(vfs_file_t* f, int flags,
         else                           new_expiry = now + new_value;
     }
 
+    // Serialize this entire detach-from-old-home + attach-to-new-home against
+    // any other settime on the SAME timer (see the t->lock comment on the
+    // struct).  Held across both per-CPU-locked sections so the home_cpu
+    // transition is atomic; without it two concurrent settimes could double-
+    // link the one node onto two per-CPU lists -> close frees it from one
+    // while the other still references it -> timerfd_tick UAF.  irqsave so no
+    // tick can interleave on this CPU mid-move; t->lock (outer) is always
+    // taken before any pc->lock (inner).
+    uint64_t nflags = spin_lock_irqsave(&t->lock);
+
     // Detach from old home (if any).
     if (t->home_cpu < MAX_CPUS) {
         timerfd_percpu_t* old_pc = &g_tfd_pcpu[t->home_cpu];
@@ -293,7 +318,10 @@ int timerfd_settime(vfs_file_t* f, int flags,
         old_val->it_interval.tv_sec = old_val->it_interval.tv_nsec = 0;
     }
 
-    if (!new_expiry) return 0;   // disarm-only
+    if (!new_expiry) {                                  // disarm-only
+        spin_unlock_irqrestore(&t->lock, nflags);
+        return 0;
+    }
 
     // Attach to CURRENT CPU's list.  The calling thread's home is the
     // most-likely CPU for its subsequent read(), keeping the wake local.
@@ -306,6 +334,8 @@ int timerfd_settime(vfs_file_t* f, int flags,
     t->interval_ns    = new_interval;
     tfd_list_insert(pc, t);
     spin_unlock_irqrestore(&pc->lock, lflags);
+
+    spin_unlock_irqrestore(&t->lock, nflags);
     return 0;
 }
 
@@ -407,4 +437,122 @@ void timerfd_selftest(void) {
     f->close(f);
 
     kprintf_atomic("[timerfd-selftest] PASS (oneshot + periodic + gettime + no-write)\n");
+}
+
+// ── Concurrent-settime race selftest ──────────────────────────────────
+// Drives the F92 fix: many threads on different CPUs hammer timerfd_settime
+// on a SHARED set of timerfds (as fork/thread/SCM_RIGHTS siblings would),
+// churning each timer's home CPU.  Without the per-node t->lock, two
+// concurrent settimes on one timer can link the single node onto two
+// per-CPU lists.  All timers are armed FAR in the future so they never
+// fire (timerfd_tick early-returns on head_expiry), so the lists are stable
+// at quiescence and no node is ever freed mid-storm.  After the storm we
+// walk every per-CPU list under its lock and assert each timer's node
+// appears on EXACTLY ONE list with a consistent home_cpu/in_list -- a
+// double-link shows up as a node counted on two lists (or a list cycle).
+#define TFR_FDS     16u
+#define TFR_THREADS 3u
+#define TFR_ITERS   20000u
+
+static vfs_file_t*       s_tfr_fd[TFR_FDS];
+static volatile uint32_t s_tfr_stop;
+static volatile uint32_t s_tfr_done;
+
+static void tfr_arm_far(vfs_file_t* f) {
+    // ~11 days out: far enough that the timer never expires during the test.
+    k_itimerspec_t spec = {0};
+    spec.it_value.tv_sec = 1000000;   // 1e6 s
+    timerfd_settime(f, 0, &spec, NULL);
+}
+
+static void tfr_storm_thread(void) {
+    uint32_t seed = (uint32_t)(uintptr_t)g_current | 1u;
+    for (uint32_t i = 0; i < TFR_ITERS &&
+             !__atomic_load_n(&s_tfr_stop, __ATOMIC_ACQUIRE); i++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;  // xorshift
+        uint32_t k = seed % TFR_FDS;
+        tfr_arm_far(s_tfr_fd[k]);
+    }
+    __atomic_fetch_add(&s_tfr_done, 1u, __ATOMIC_RELEASE);
+    g_current->state = TASK_DEAD;
+    sched_yield();
+    for (;;) __asm__ volatile("hlt");
+}
+
+void timerfd_race_selftest(void) {
+    tfd_pc_init_once();
+    kprintf_atomic("[timerfd_race] starting: %u storms + main, fds=%u iters=%u\n",
+                   TFR_THREADS, TFR_FDS, TFR_ITERS);
+    __atomic_store_n(&s_tfr_stop, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_tfr_done, 0u, __ATOMIC_RELEASE);
+
+    for (uint32_t k = 0; k < TFR_FDS; k++) {
+        s_tfr_fd[k] = timerfd_new(K_CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (!s_tfr_fd[k]) {
+            kprintf_atomic("[timerfd_race] FAIL alloc fd %u\n", k);
+            return;
+        }
+        tfr_arm_far(s_tfr_fd[k]);
+    }
+
+    for (uint32_t i = 0; i < TFR_THREADS; i++) {
+        task_t* t = task_create_kthread(tfr_storm_thread, pid_alloc());
+        if (t) sched_add(t);
+    }
+
+    // Main thread joins the storm so settime runs on >=2 CPUs at once.
+    uint32_t seed = 0x9e3779b9u;
+    for (uint32_t i = 0; i < TFR_ITERS; i++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        tfr_arm_far(s_tfr_fd[seed % TFR_FDS]);
+        if (__atomic_load_n(&s_tfr_done, __ATOMIC_ACQUIRE) == TFR_THREADS)
+            break;
+    }
+    __atomic_store_n(&s_tfr_stop, 1u, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&s_tfr_done, __ATOMIC_ACQUIRE) != TFR_THREADS)
+        cpu_relax();
+
+    // Quiesce: re-arm every timer single-threaded so each is guaranteed
+    // armed (on this CPU's list) exactly once if the move is atomic.
+    for (uint32_t k = 0; k < TFR_FDS; k++)
+        tfr_arm_far(s_tfr_fd[k]);
+
+    // Walk each per-CPU list under its lock; count how many lists hold each
+    // node and check home_cpu/in_list consistency.  Bounded walk guards a
+    // corrupting cycle.
+    uint32_t seen[TFR_FDS];
+    for (uint32_t k = 0; k < TFR_FDS; k++) seen[k] = 0;
+    uint32_t bad = 0;
+    for (uint32_t cpu = 0; cpu < MAX_CPUS; cpu++) {
+        timerfd_percpu_t* pc = &g_tfd_pcpu[cpu];
+        uint64_t flags = spin_lock_irqsave(&pc->lock);
+        timerfd_state_t* n = pc->head;
+        uint32_t walk = 0;
+        while (n && walk < TFR_FDS + 64u) {
+            for (uint32_t k = 0; k < TFR_FDS; k++) {
+                if ((timerfd_state_t*)s_tfr_fd[k]->ctx == n) {
+                    seen[k]++;
+                    if (n->home_cpu != cpu || !n->in_list) bad++;
+                    break;
+                }
+            }
+            n = n->next;
+            walk++;
+        }
+        if (n) bad++;   // walk hit the cap: list did not terminate (cycle)
+        spin_unlock_irqrestore(&pc->lock, flags);
+    }
+    for (uint32_t k = 0; k < TFR_FDS; k++)
+        if (seen[k] != 1) bad++;   // each armed timer must be on exactly one list
+
+    for (uint32_t k = 0; k < TFR_FDS; k++) {
+        if (s_tfr_fd[k]) { s_tfr_fd[k]->close(s_tfr_fd[k]); s_tfr_fd[k] = NULL; }
+    }
+
+    if (bad == 0) {
+        kprintf_atomic("[timerfd_race] SELF-TEST PASSED (no node on two per-CPU lists)\n");
+    } else {
+        kprintf_atomic("[timerfd_race] SELF-TEST FAILED (%u inconsistencies)\n", bad);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 }

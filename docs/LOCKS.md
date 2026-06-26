@@ -412,6 +412,29 @@ waitq can fire from IRQ context without serialising on epoll.
 under the lock, then releases the lock before `copy_to_user` so a
 user-page fault never happens with a spinlock held.
 
+### `g_tfd_pcpu[cpu].lock` (per-CPU) + `timerfd_state_t.lock` (per-fd) -- `kernel/io/timerfd.c`
+Two-level, IRQ-safe.  `g_tfd_pcpu[cpu].lock` (one per CPU) guards that
+CPU's sorted timer list (`head` / `head_expiry`) and the list linkage
+of the nodes on it (`next` / `in_list` / `next_expiry_ns` /
+`interval_ns`).  The tick fast path reads the atomic `head_expiry` with
+no lock and only takes the per-CPU lock to drain expired timers on its
+OWN CPU.  `timerfd_state_t.lock` (one per timerfd) is a STABLE per-node
+lock that serializes a whole `timerfd_settime` move (detach from the old
+home CPU's list, attach to the calling CPU's list).  It is required
+because a timer's home CPU -- and therefore which per-CPU lock protects
+its node fields -- changes across the move, so the per-CPU lock alone
+cannot serialize two concurrent `settime` callers sharing one timerfd
+(fork / thread / SCM_RIGHTS); without the node lock they could link the
+single node onto two per-CPU lists and a later close would free it from
+one while the other still references it (a `timerfd_tick` use-after-
+free).  **Lock order: `timerfd_state_t.lock` (outer) before
+`g_tfd_pcpu[].lock` (inner); never two per-CPU locks at once (the old
+home is unlocked before the new home is locked).**  `timerfd_tick` and
+`timerfd_close_op` take only the per-CPU lock: the tick never moves a
+node across CPUs, and close runs only at the last fd-ref drop, which the
+`settime` fdget pin (F81) excludes from racing any in-flight settime --
+so neither needs the node lock and there is no lock cycle.
+
 ### RCU-deferred free paths (not locks, but part of Phase 6)
 
 - `task_destroy` → `call_rcu(task_free_rcu)` frees kstack, mm,

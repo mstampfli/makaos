@@ -1502,6 +1502,30 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   timerfd close-vs-tick (pc->lock + preempt_disable) are SAFE. Fix = a per-node spinlock in timerfd_state_t
   held across the WHOLE settime detach+attach (and close remove), so the two per-CPU list ops on one node are
   atomic; the tick still takes only pc->lock.
+  -> VERIFIED + FIXED (F92): confirmed the detach (under old_pc->lock ~277-290) and the attach (under the
+  calling CPU's pc->lock ~303-308) are TWO separate critical sections with no node-level mutual exclusion, and
+  that tfd_list_insert has no already-linked guard. The per-CPU lock cannot serialize two settime callers
+  because home_cpu -- which selects WHICH pc->lock "protects" the node -- is what they are racing to change.
+  REFINED the recorded close angle (no-assumptions): close (timerfd_close_op) does NOT need the node lock --
+  w_sys_timerfd_settime/gettime fdget-PIN the file (F81), so close runs only at the last fd-ref drop, which
+  cannot overlap any in-flight settime; close vs the tick is already serialized by pc->lock. The unfixed race
+  is settime-vs-settime on a SHARED vfs_file_t (fork copies the fd table but both fds point at the same file;
+  threads/SCM_RIGHTS likewise), each caller holding its OWN fdget ref, which does NOT serialize them against
+  each other. FIX (do-it-right, minimal correct, one shared mechanism): added a STABLE per-node spinlock
+  timerfd_state_t.lock held (irqsave) across the WHOLE settime detach+attach, so the home_cpu transition is
+  atomic vs other settimes. Lock order t->lock (outer) -> pc->lock (inner); only one pc->lock held at a time
+  (old home unlocked before new home locked); tick/close take only pc->lock, so no cycle. Documented in
+  docs/LOCKS.md. VERIFICATION: a cross-CPU UAF, not deterministically reproducible -> a NEW concurrent stress
+  selftest (timerfd_race_selftest, mirrors dcache_race): 3 storm kthreads + main hammer settime on 16 SHARED
+  timerfds (armed far-future so they never fire and ticks early-return) for 20000 iters, churning home_cpu;
+  then walks every per-CPU list under its lock and asserts each timer's node is on EXACTLY ONE list with a
+  consistent home_cpu/in_list (a double-link shows as a node counted on two lists or a list cycle) -- PASSED
+  ("no node on two per-CPU lists"). The change is provably not boot-DHCP-exercised: no userland net/dhcp app
+  uses timerfd and the kernel TCP/IP retransmit path does not either, so timerfd is inert to the net path.
+  Clean boot: 2 boots hit the flaky F55 userspace-start stall (net ready, login + /bin/net paged, no lease, no
+  fault); the 3rd same-build re-boot reached the DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), all selftests
+  PASSED incl. [timerfd-selftest] and [timerfd_race], 0 FAILED/PANIC, no [WD], `More login:` renders. This
+  closes fan-out #4 candidate (dd).
   (ee) MEDIUM, F84/F85 class -- pipe ring data race: pipe head/tail/count (kernel/fs/pipe.h ~22-26, plain
   uint32_t, no lock in pipe_buf_t) are RMW'd by pipe_read (~54-56) and pipe_write (~111-113) on different CPUs
   with no lock/atomics -> torn count (a count--/count++ interleave loses an update), unreliable empty/full

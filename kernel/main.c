@@ -607,6 +607,11 @@ static void init_kthread(void) {
     extern void timerfd_selftest(void);
     timerfd_selftest();
 
+    // timerfd concurrent-settime race: per-node lock prevents a timer node
+    // from being linked onto two per-CPU lists by racing settime callers.
+    extern void timerfd_race_selftest(void);
+    timerfd_race_selftest();
+
     // Tier 1 #4 (socketpair): bidirectional AF_UNIX SOCK_STREAM pair.
     extern void socketpair_selftest(void);
     socketpair_selftest();
