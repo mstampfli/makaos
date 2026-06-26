@@ -1399,3 +1399,43 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   path unchanged) -- NOT boot-exercised (QEMU attaches no NVMe device, nvme_init bails at pci_find), so the
   change is provably inert at boot. Clean boot (3rd try past the flaky F55 stall): DHCP, 61 PASSED, no faults.
   All three fan-out candidates (v/x/w) resolved.
+- 2026-06-26 FAN-OUT #3 (5 read-only Explore agents over un-swept subsystems; reported HIGH confidence each,
+  NOT yet independently verified -- VERIFY against the real code before fixing). Two SAFE: futex + the
+  cleartid-join path (MakaOS has NO robust-list -- only a single-word cleartid join accessed via fault-safe
+  copy_to_user; no unbounded user-list walk to cap; F59 waiter lifetime intact; no FUTEX_REQUEUE) and shmem /
+  POSIX shm (two-level refcount = namespace + fd + per-VMA all balanced; the #PF page index is bounded < npages
+  under shm->lock; teardown RCU-deferred behind shmem_tryget; beyond F61; minor non-safety notes: a left-edge
+  VMA trim does not adjust shmem_pgoff = aliasing-not-OOB, and a mmap-vs-concurrent-remove ref LEAK -- neither
+  memory-unsafe). Three CANDIDATE bugs (all HIGH, all unprivileged-reachable concurrency UAFs):
+  (y) ksec unlocked single-slot rendezvous (kernel/security/ksec.c ~25-30 s_pending, used in ksec_request
+  ~67-98 and ksec_reader_thread ~120-146): s_pending is ONE global slot (the comment admits "Single-CPU... 
+  Multi-CPU extension: replace with a hash-table keyed on seq") but the scheduler is SMP; two processes racing
+  setuid/seteuid/setuid-exec overwrite s_pending.waiter (a raw task_t* with no lock, no refcount) and .seq, so
+  (a) the reader's sched_wake(s_pending.waiter) can fire on a task that already returned + exited + was freed =
+  UAF write through a dangling task_t*, and (b) a verdict (ALLOW) issued for one caller is delivered to a
+  different caller = verdict cross-talk -> PRIVILEGE ESCALATION in the privilege-gating daemon. The userland
+  policy parser is bounded (path/value copies capped at 127, POLICY_MAX checked) = SAFE. Fix = a spinlock over
+  every s_pending access with the waiter cleared-under-lock-before-wake (closes the UAF), and a per-seq
+  hash/array so concurrent callers do not share one slot (closes the cross-talk + the starvation hang) -- the
+  exact "hash-table keyed on seq" the code comment prescribes; the task ref must be lifetime-safe.
+  (z) /proc files_shared UAF (kernel/fs/proc.c: proc_fd_open ~287-297, proc_fd_readdir ~300-318, proc_stat fd
+  branch ~591-603): proc_open rcu_read_lock + sched_find_pid pins the TASK struct (RCU-freed in task_free_rcu),
+  but the proc fd handlers deref t->files_shared (the target's task_files_t + fdtable_t), which sys_exit frees
+  SYNCHRONOUSLY via task_files_release -> kfree (NO call_rcu, unlike mm_shared which is freed in task_free_rcu),
+  and NULLs files_shared with a plain store. So a reader in /proc/<B>/fd/* while B exits derefs a kfree'd
+  fdtable_t (then vfs_tryget on a freed slot pointer) = cross-process UAF read, reachable by any same-uid
+  process (parent reading /proc/<child>/fd/, virtfs grants mode 0400 owner=target uid). Distinct from the fdget
+  pattern (which only touches g_current's OWN table). Fix = RCU-defer the task_files_t free (mirror mm_shared:
+  release/free in task_free_rcu, or call_rcu the final-drop free), so the existing rcu_read_lock in proc_open
+  genuinely pins it; also make the files_shared store/loads atomic.
+  (aa) io_uring SQPOLL-spawns-worker-after-close UAF (kernel/io/io_uring.c: io_uring_close_file ~121-134 vs
+  io_sqp_kthread_entry ~587 -> io_wq_ensure_worker ~771): close stops/joins the io_wq worker BEFORE SQPOLL,
+  gating on a plain read of uring->worker; if no async op has run yet, worker==NULL so close skips the worker
+  stop+join, but the still-running SQPOLL kthread then hits an IOSQE_ASYNC SQE, calls io_wq_ensure_worker which
+  sets uring->worker=t (plain store) + sched_add -- a live worker; close then joins only SQPOLL and frees
+  uring/backing (pmm_buddy_free + kfree), and the orphaned worker UAFs the freed uring/backing (posts CQEs into
+  reused pages). Unprivileged: SQPOLL setup + IOSQE_ASYNC SQE + a sibling close(ring_fd). Distinct from F63
+  (fixed-files, the ONLY fixed-index consumer, bounded) and F76 (SQE snapshot); CQ overflow + re-register are
+  SAFE. Fix = stop + JOIN SQPOLL FIRST, then read/stop/join the worker (only after sqp_done can no new worker
+  be spawned); harden the worker publish to a release store + acquire load. PRIORITY: (z) /proc first (most
+  reachable, clearest root cause), then (aa) io_uring (cleanest fix, a reorder), then (y) ksec (biggest fix).
