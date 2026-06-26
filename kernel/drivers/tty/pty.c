@@ -462,16 +462,28 @@ extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 // -EINVAL (request not handled here; the caller handles its unique ioctls).
 static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) {
     switch (request) {
-        case 0x5401: // TCGETS
-            return copy_to_user((void*)arg, &tty->termios, sizeof(tty->termios))
-                   ? -EFAULT : 0;
+        case 0x5401: { // TCGETS
+            // Snapshot under tty->lock into a stack local, then copy out -- so a
+            // concurrent TCSET* cannot hand userland a half-updated struct, and
+            // copy_to_user (which can fault) never touches the live termios.
+            termios_t snap;
+            tty_get_termios(tty, &snap);
+            return copy_to_user((void*)arg, &snap, sizeof(snap)) ? -EFAULT : 0;
+        }
         case 0x5402: // TCSETS
         case 0x5403: // TCSETSW
-        case 0x5404: // TCSETSF
-            if (copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios)))
+        case 0x5404: { // TCSETSF
+            // Land the user copy in a stack local FIRST (copy_from_user can
+            // fault, so it must not run under tty->lock), then publish the
+            // whole struct atomically-w.r.t-readers via tty_set_termios.  A bad
+            // user pointer fails BEFORE any mutation -- no half-set termios.
+            termios_t tmp;
+            if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)))
                 return -EFAULT;
+            tty_set_termios(tty, &tmp);
             if (request == 0x5404) tty_flush_input(tty);
             return 0;
+        }
         case 0x540F: // TIOCGPGRP
             return copy_to_user((void*)arg, &tty->fg_pgid, sizeof(tty->fg_pgid))
                    ? -EFAULT : 0;

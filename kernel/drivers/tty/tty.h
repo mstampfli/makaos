@@ -140,3 +140,10 @@ void tty_flush_input(tty_t* tty);
 // wait and must NOT hold tty->lock.  Returns the number of bytes copied.
 // Shared by /dev/tty and pty-slave reads so both go through one locked path.
 uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len);
+
+// Publish a whole termios (tty_set_termios) / snapshot it (tty_get_termios)
+// under tty->lock, so a lock-free reader never observes a TCSET* multi-word
+// copy mid-update.  copy_from_user MUST land in a stack local FIRST (outside
+// the lock).  See the definitions in tty.c for the full rationale.
+void tty_set_termios(tty_t* tty, const termios_t* src);
+void tty_get_termios(tty_t* tty, termios_t* dst);

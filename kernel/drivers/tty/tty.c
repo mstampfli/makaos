@@ -50,6 +50,31 @@ static inline uint32_t rb_free(uint32_t head, uint32_t tail, uint32_t size) {
 static inline void tty_lock(tty_t* tty)   { preempt_disable(); spin_lock(&tty->lock); }
 static inline void tty_unlock(tty_t* tty) { spin_unlock(&tty->lock); preempt_enable(); }
 
+// PRIMITIVE: termios publish / snapshot (consistent multi-word copy) ────────
+// TCSET* overwrites the WHOLE termios, and tty->termios = *src is a multi-word
+// copy.  A lock-free reader (tty_input_char's signal/canon decisions,
+// tty_ldisc_drain's canon/VMIN read) racing that write on another CPU could
+// observe a half-updated struct -- a new c_lflag paired with an old c_cc[]
+// byte -- and swallow a ^C, fire a spurious SIGINT/SIGTSTP/SIGQUIT at the
+// foreground pgrp, or drain a line in the wrong mode.  Publishing under the
+// lock alone is NOT enough: the reader must take the same lock or it can still
+// catch the assignment mid-flight.  So all termios writers publish through
+// tty_set_termios and all readers that need a consistent view snapshot through
+// tty_get_termios -- the copy is always made under tty->lock and is never
+// observed mid-update.  copy_from_user (which can fault) must run into a stack
+// local FIRST, OUTSIDE the lock, since tty->lock is a preempt-disabled leaf
+// spinlock.  One source of truth for both ends, so they cannot drift.
+void tty_set_termios(tty_t* tty, const termios_t* src) {
+    tty_lock(tty);
+    tty->termios = *src;
+    tty_unlock(tty);
+}
+void tty_get_termios(tty_t* tty, termios_t* dst) {
+    tty_lock(tty);
+    *dst = tty->termios;
+    tty_unlock(tty);
+}
+
 // ── Ring-buffer push/pop ──────────────────────────────────────────────────
 // PURE ring ops: the CALLER must hold tty->lock.  The ring is mutated from
 // several CPUs (producer, consumer(s), and tty_flush_input), so every access
@@ -144,8 +169,14 @@ static void ldisc_flush_line(tty_t* tty) {
 void tty_input_char(tty_t* tty, char c) {
     if (!c) return;
 
-    uint32_t lflag = tty->termios.c_lflag;
-    const uint8_t* cc = tty->termios.c_cc;
+    // Take ONE consistent snapshot of termios up front (under tty->lock, via
+    // tty_get_termios) so a concurrent TCSET* on another CPU cannot make us
+    // mix a new c_lflag with an old c_cc[] byte mid-character.  Every termios
+    // read below uses this snapshot, never the live struct.
+    termios_t tio;
+    tty_get_termios(tty, &tio);
+    uint32_t lflag = tio.c_lflag;
+    const uint8_t* cc = tio.c_cc;
 
     // ── Signal characters (ISIG) ─────────────────────────────────────────
     if (lflag & ISIG) {
@@ -222,7 +253,7 @@ void tty_input_char(tty_t* tty, char c) {
             return;
         }
         // Carriage return → newline (ICRNL).
-        if (c == '\r' && (tty->termios.c_iflag & ICRNL)) {
+        if (c == '\r' && (tio.c_iflag & ICRNL)) {
             tty_input_char(tty, '\n');
             return;
         }
@@ -234,7 +265,7 @@ void tty_input_char(tty_t* tty, char c) {
 
     // ── Raw mode ─────────────────────────────────────────────────────────
     // CR→NL conversion even in raw mode if ICRNL is set.
-    if (c == '\r' && (tty->termios.c_iflag & ICRNL)) c = '\n';
+    if (c == '\r' && (tio.c_iflag & ICRNL)) c = '\n';
 
     if (lflag & ECHO) tty_echo(tty, (uint8_t)c);     // echo before push (fb I/O, no lock)
     tty_lock(tty);
@@ -262,11 +293,14 @@ void tty_flush_input(tty_t* tty) {
 // raw VMIN.  Never blocks -- the caller does the wait first -- and must be
 // called WITHOUT holding tty->lock.  Returns the number of bytes copied.
 uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len) {
+    uint64_t got = 0;
+    tty_lock(tty);
+    // Read the mode/VMIN under the SAME lock that guards the ring, so a
+    // concurrent TCSET* cannot tear ICANON against c_cc[VMIN] here (reuses the
+    // acquisition we already need for the drain loop -- no extra lock cost).
     int canon = (tty->termios.c_lflag & ICANON) != 0;
     uint32_t vmin = canon ? 1 : tty->termios.c_cc[VMIN];
     if (vmin == 0) vmin = 1;  // always read at least 1
-    uint64_t got = 0;
-    tty_lock(tty);
     while (got < len) {
         uint8_t ch;
         if (!rd_pop(tty, &ch)) break;
@@ -691,4 +725,94 @@ void tty_ldisc_selftest(void) {
     kfree(t);
     kprintf(fails ? "[tty_ldisc] SELF-TEST FAILED\n"
                   : "[tty_ldisc] SELF-TEST PASSED (locked push/drain/flush, no self-deadlock)\n");
+}
+
+// ── termios publish/snapshot selftest ──────────────────────────────────────
+// Proves the tty_set_termios / tty_get_termios primitive that closes the
+// TCSET*-vs-line-discipline data race: a published termios is snapshotted back
+// byte-for-byte (the whole struct is copied, not a partial view), republishing
+// fully overwrites it, and the line discipline (tty_input_char/tty_ldisc_drain)
+// honours the mode that was PUBLISHED through the locked path -- so the readers
+// really do observe set_termios's value, not a stale or torn one.  Single
+// threaded (the cross-CPU tear is a code-proof: both ends now take tty->lock),
+// but a missing/recursive unlock in the primitive would hang here under
+// preempt-disable and never print PASSED.  No __builtin_memcmp (no kernel
+// symbol) -- bytes are compared by hand.
+void tty_termios_snapshot_selftest(void) {
+    extern void kprintf(const char*, ...);
+    tty_t* t = (tty_t*)kmalloc(sizeof(tty_t));
+    if (!t) { kprintf("[tty_termios] SELF-TEST SKIP (no mem)\n"); return; }
+    __builtin_memset(t, 0, sizeof(*t));
+    spin_lock_init(&t->lock);
+    wait_queue_init(&t->waitq);
+    t->write_char = NULL;   // no echo -> no fb dependency
+    t->fg_pgid    = 0;      // no job-control signals
+    int fails = 0;
+
+    // (A) Publish a fully-populated termios; snapshot must match every byte.
+    termios_t a;
+    __builtin_memset(&a, 0, sizeof(a));
+    a.c_iflag = ICRNL;
+    a.c_lflag = ICANON | ECHO | ISIG;
+    a.c_line  = 7;
+    for (unsigned i = 0; i < NCCS; i++) a.c_cc[i] = (uint8_t)(0x10 + i);
+    tty_set_termios(t, &a);
+    termios_t snap;
+    tty_get_termios(t, &snap);
+    const uint8_t* pa = (const uint8_t*)&a;
+    const uint8_t* ps = (const uint8_t*)&snap;
+    for (unsigned i = 0; i < sizeof(termios_t); i++) {
+        if (pa[i] != ps[i]) {
+            kprintf("[tty_termios] FAIL snapshot byte %u: %u != %u\n",
+                    i, (unsigned)pa[i], (unsigned)ps[i]);
+            fails++; break;
+        }
+    }
+
+    // (B) Republish a DIFFERENT termios; the snapshot must fully overwrite --
+    // no field from (A) survives.  Catches a partial publish.
+    termios_t b;
+    __builtin_memset(&b, 0, sizeof(b));
+    b.c_lflag = 0;                 // raw
+    b.c_cc[VMIN] = 3;
+    tty_set_termios(t, &b);
+    tty_get_termios(t, &snap);
+    if (snap.c_lflag != 0 || snap.c_iflag != 0 || snap.c_line != 0 ||
+        snap.c_cc[VMIN] != 3) {
+        kprintf("[tty_termios] FAIL republish stale lflag=%u iflag=%u\n",
+                (unsigned)snap.c_lflag, (unsigned)snap.c_iflag);
+        fails++;
+    }
+
+    // (C) The line discipline must obey the PUBLISHED mode.  Canonical first:
+    // a completed line drains at '\n'.
+    termios_t canon;
+    __builtin_memset(&canon, 0, sizeof(canon));
+    canon.c_lflag = ICANON;
+    tty_set_termios(t, &canon);
+    uint8_t buf[16];
+    tty_input_char(t, 'h'); tty_input_char(t, 'i'); tty_input_char(t, '\n');
+    uint64_t n = tty_ldisc_drain(t, buf, sizeof(buf));
+    if (n != 3 || buf[0] != 'h' || buf[1] != 'i' || buf[2] != '\n') {
+        kprintf("[tty_termios] FAIL canon-after-publish n=%lu\n", (unsigned long)n);
+        fails++;
+    }
+
+    // (D) Publish raw (VMIN=1): a single char is now immediately drainable,
+    // proving the reader picked up the newly published mode.
+    termios_t raw;
+    __builtin_memset(&raw, 0, sizeof(raw));
+    raw.c_lflag = 0;
+    raw.c_cc[VMIN] = 1;
+    tty_set_termios(t, &raw);
+    tty_input_char(t, 'Z');
+    n = tty_ldisc_drain(t, buf, sizeof(buf));
+    if (n != 1 || buf[0] != 'Z') {
+        kprintf("[tty_termios] FAIL raw-after-publish n=%lu\n", (unsigned long)n);
+        fails++;
+    }
+
+    kfree(t);
+    kprintf(fails ? "[tty_termios] SELF-TEST FAILED\n"
+                  : "[tty_termios] SELF-TEST PASSED (publish/snapshot consistent, ldisc obeys published mode)\n");
 }

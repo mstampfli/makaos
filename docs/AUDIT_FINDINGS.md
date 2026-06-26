@@ -2037,3 +2037,25 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   mirroring F88/F95/F99); then (mm) bcache poisoning (clean one-line is_user guard); then (oo) pty reopen UAF
   (clean: NULL + tryget + rebuild); then (qq) io_uring SQ serialization (biggest, multi-part fix); then (nn) tty
   termios race (MEDIUM, data race not corruption).
+  VERIFIED+FIXED (F106): confirmed against the real code -- all THREE writer sites copy_from_user STRAIGHT into
+  the live tty->termios with NO lock (pty_tty_ioctl_common TCSETS/W/F at pty.c:471, shared by master+slave
+  ioctl; the /dev/tty fallback TCSETS/W at syscall.c:4374 and TCSETSF at 4377), and the readers
+  (tty_input_char's c_lflag/c_cc/c_iflag at tty.c:147/148/225/237; tty_ldisc_drain's c_lflag/c_cc[VMIN] at
+  265/266) read lock-free on another CPU; tty->lock is preempt_disable + spinlock (so copy_from_user, which can
+  fault, must NOT run under it); VINTR=0/VQUIT=1/VMIN=6/VSUSP=10 are all constant < NCCS=19 with no pointers in
+  the struct -> data race, MEDIUM, no memory corruption (confirmed). REFINEMENT (no-assumptions): publishing the
+  copy under tty->lock is NOT sufficient on its own -- `tty->termios = tmp` is itself a multi-word copy, so a
+  lock-free reader could still catch it mid-assignment; BOTH ends must take the lock. Also surfaced TWO MORE
+  whole-struct readers the recorded prescription missed: TCGETS (pty.c:466, syscall.c:4370) copy_to_user the
+  live struct, handing userland a torn copy under the same race. FIX (do-it-right, one shared mechanism):
+  extracted the tty_set_termios / tty_get_termios primitive (PRIMITIVE, tty.c) -- publish/snapshot the whole
+  termios under tty->lock; copy_from_user/copy_to_user run on a stack local OUTSIDE the lock. All three TCSET*
+  sites publish through tty_set_termios; tty_input_char snapshots once at entry via tty_get_termios; both TCGETS
+  sites snapshot through it; tty_ldisc_drain moved its mode/VMIN reads inside its existing lock (zero added
+  cost). Output-path single-field reads (c_oflag OPOST/ONLCR, c_lflag TOSTOP) intentionally stay lock-free
+  (atomic single-field loads, no cross-field signal/safety dependency, hot path). New deterministic selftest
+  tty_termios_snapshot_selftest (byte-for-byte round-trip + full-overwrite republish + ldisc obeys the published
+  mode); clean boot, `[tty_termios] SELF-TEST PASSED`. This closes fan-out #7 candidate (nn).
+  *** FAN-OUT #7 FULLY RESOLVED *** -- (pp) F102, (mm) F103, (oo) F104, (qq) F105, (nn) F106 all VERIFIED+FIXED.
+  NEXT PHASE: bug-TYPE codebase scans (one bug type at a time), starting with the sync-free-under-reader class
+  (the F88/F95/F102 RCU-defer family, recurred 3x).

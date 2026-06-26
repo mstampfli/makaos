@@ -4366,17 +4366,32 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
         tty->fg_pgid = pg;
         return 0;
     }
-    case TCGETS:
-        return (copy_to_user((void*)arg, &tty->termios, sizeof(tty->termios)) == 0)
+    case TCGETS: {
+        // Snapshot under tty->lock, then copy out: never hand userland a struct
+        // torn by a concurrent TCSET*, and keep copy_to_user off the live one.
+        termios_t snap;
+        tty_get_termios(tty, &snap);
+        return (copy_to_user((void*)arg, &snap, sizeof(snap)) == 0)
                ? 0 : (uint64_t)-EFAULT;
+    }
     case TCSETS:
-    case TCSETSW:
-        return (copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios)) == 0)
-               ? 0 : (uint64_t)-EFAULT;
+    case TCSETSW: {
+        // Copy into a stack local first (copy_from_user can fault; tty->lock is
+        // a preempt-disabled spinlock), then publish under the lock so a
+        // concurrent lock-free termios reader never sees a half-written struct.
+        termios_t tmp;
+        if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)) != 0)
+            return (uint64_t)-EFAULT;
+        tty_set_termios(tty, &tmp);
+        return 0;
+    }
     case TCSETSF: {
-        int r = copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios));
+        termios_t tmp;
+        if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)) != 0)
+            return (uint64_t)-EFAULT;  // bad pointer: do not mutate or flush
+        tty_set_termios(tty, &tmp);
         tty_flush_input(tty);
-        return (r == 0) ? 0 : (uint64_t)-EFAULT;
+        return 0;
     }
     case TCSBRK:
     case TCXONC:

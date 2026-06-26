@@ -155,6 +155,29 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   (heap OOB write). Mirrors the read-side ext2_dirent_namelen_clamp.
   `ext2_dirent_in_block_selftest` drives the underflow / past-block / rec<8 rejects.
 
+### E. Locking idioms (concurrency primitives, not data validation)
+The recurring "publish/snapshot a whole multi-field struct under its lock so a
+lock-free reader never observes a half-written value" pattern. A plain struct
+assignment is a multi-word copy: writing it under the lock is NOT enough -- the
+reader must take the SAME lock, or it can catch the assignment mid-flight.
+
+- `tty_set_termios(tty, *src)` / `tty_get_termios(tty, *dst)` (kernel/drivers/tty/tty.c,
+  F106) -- publish / snapshot the whole `termios_t` under `tty->lock`. TCSET* overwrites
+  the entire termios; a lock-free line-discipline reader (tty_input_char's ISIG/ICANON
+  decision against c_cc[], tty_ldisc_drain's ICANON/VMIN) racing that write could mix a
+  new c_lflag with an old c_cc[] byte and swallow a ^C / fire a spurious signal / drain
+  in the wrong mode. ALL termios writers publish through tty_set_termios and ALL
+  whole-struct readers (the TCSET* sites land copy_from_user in a stack local first;
+  tty_input_char snapshots once at entry; both TCGETS sites snapshot then copy_to_user)
+  go through this one pair, so copy_from_user/copy_to_user (which can fault) never run
+  under the preempt-disabled spinlock and a reader never sees a torn struct. Output-path
+  single-field reads (c_oflag OPOST/ONLCR, c_lflag TOSTOP) intentionally stay lock-free:
+  atomic single-field loads, no cross-field dependency, hot path. `tty_termios_snapshot_selftest`
+  drives byte-for-byte round-trip + full-overwrite republish + ldisc-obeys-published-mode.
+  This is the first cataloged member of the "snapshot/publish a shared struct under its
+  owning lock" family; apply it wherever a multi-field struct is overwritten wholesale
+  while a reader walks its fields lock-free.
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
