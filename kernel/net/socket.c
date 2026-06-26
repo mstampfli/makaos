@@ -275,6 +275,7 @@ vfs_file_t* socket_open(int domain, int type) {
 
     __builtin_memset(s, 0, sizeof(socket_t));
     wait_queue_init(&s->waitq);
+    spin_lock_init(&s->udp_rx_lock);
 
     s->type = (uint8_t)sock_type;
 
@@ -386,6 +387,7 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     if (!cs) { tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
     __builtin_memset(cs, 0, sizeof(socket_t));
     wait_queue_init(&cs->waitq);
+    spin_lock_init(&cs->udp_rx_lock);
     cs->type  = SOCK_STREAM;
     cs->pcb   = child_pcb;
     cs->bound = 1;
@@ -497,16 +499,29 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
         return tcp_recv_data(s->pcb, buf, len, nonblock);
     }
 
-    // UDP: wait for a datagram (or EAGAIN in nonblock).
-    if (!s->udp_rx_head) {
-        if (nonblock) return -EAGAIN;
-        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+    // UDP: wait for a datagram, then dequeue UNDER the per-socket lock so a
+    // concurrent deliver (net rx kthread) or a 2nd receiver cannot tear the ring
+    // or lose the count.  Re-check the head inside the lock + retry the wait if
+    // another receiver drained it; the user copy-out happens AFTER the dequeue
+    // (outside the lock -- a user write must never fault under it).
+    skbuff_t* skb;
+    for (;;) {
+        if (!s->udp_rx_head) {
+            if (nonblock) return -EAGAIN;
+            WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        }
+        spin_lock(&s->udp_rx_lock);
+        skb = s->udp_rx_head;
+        if (skb) {
+            s->udp_rx_head = skb->next;
+            if (!s->udp_rx_head) s->udp_rx_tail = 0;
+            s->udp_rx_count--;
+        }
+        spin_unlock(&s->udp_rx_lock);
+        if (skb) break;
+        if (nonblock) return -EAGAIN;   // raced empty -> nothing to read
+        // lost the datagram to another receiver -> re-wait
     }
-
-    skbuff_t* skb = s->udp_rx_head;
-    s->udp_rx_head = skb->next;
-    if (!s->udp_rx_head) s->udp_rx_tail = 0;
-    s->udp_rx_count--;
 
     uint32_t copy = skb->len < len ? skb->len : len;
     __builtin_memcpy(buf, skb->data, copy);
@@ -582,15 +597,28 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
 
     int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
 
-    if (!s->udp_rx_head) {
+    // Dequeue under the per-socket lock (same discipline as socket_recv): the
+    // deliver kthread + a 2nd receiver must not tear the ring; re-check the head
+    // inside and retry the wait on a lost race; the src_addr stamp + the user
+    // copy-out happen AFTER the dequeue, outside the lock.
+    skbuff_t* skb;
+    for (;;) {
+        if (!s->udp_rx_head) {
+            if (nonblock) return -EAGAIN;
+            WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        }
+        spin_lock(&s->udp_rx_lock);
+        skb = s->udp_rx_head;
+        if (skb) {
+            s->udp_rx_head = skb->next;
+            if (!s->udp_rx_head) s->udp_rx_tail = 0;
+            s->udp_rx_count--;
+        }
+        spin_unlock(&s->udp_rx_lock);
+        if (skb) break;
         if (nonblock) return -EAGAIN;
-        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        // lost the datagram to another receiver -> re-wait
     }
-
-    skbuff_t* skb = s->udp_rx_head;
-    s->udp_rx_head = skb->next;
-    if (!s->udp_rx_head) s->udp_rx_tail = 0;
-    s->udp_rx_count--;
 
     if (src_addr) {
         src_addr->sin_family = AF_INET;
@@ -677,22 +705,24 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     socket_t* s = udp_table_find(dst_port);
     if (!s) { rcu_read_unlock(); skb_free(skb); return; }
 
-    // Drop if queue is full — upper bound avoids unbounded memory growth.
+    // Enqueue under the per-socket udp_rx lock so a concurrent recv/recvfrom
+    // dequeue cannot tear the list or lose the count.  Re-check the full-queue
+    // limit under the lock (the unlocked pre-check could race the count).  The
+    // skb is exclusively ours until linked; skb_free on a full queue and the
+    // wakes stay OUTSIDE the lock.
+    skb->next = 0;
+    spin_lock(&s->udp_rx_lock);
     if (s->udp_rx_count >= UDP_RX_QUEUE_MAX) {
+        spin_unlock(&s->udp_rx_lock);
         rcu_read_unlock();
-        skb_free(skb);
+        skb_free(skb);   // upper bound avoids unbounded memory growth
         return;
     }
-
-    // Enqueue. The skb already has src_ip_be and src_port_be stamped.
-    skb->next = 0;
-    if (s->udp_rx_tail) {
-        s->udp_rx_tail->next = skb;
-    } else {
-        s->udp_rx_head = skb;
-    }
+    if (s->udp_rx_tail) s->udp_rx_tail->next = skb;
+    else                s->udp_rx_head = skb;
     s->udp_rx_tail = skb;
     s->udp_rx_count++;
+    spin_unlock(&s->udp_rx_lock);
 
     // Wake any task blocked in socket_recv / socket_recvfrom.
     wait_queue_wake_all(&s->waitq);

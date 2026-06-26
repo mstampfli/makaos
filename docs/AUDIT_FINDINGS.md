@@ -2249,11 +2249,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
         double-vfs_close. FIXED (F112): sendfd enqueues under peer->lock (re-checking the limit inside; the vfs_dup
         is outside, undone with vfs_close on a full re-check), recvfd / recvfd_nb dequeue under self->lock
         re-checking count inside; wakes outside.  Only kernel vfs_file_t* pointers move under the lock (no user copy).
-  OTHER GAPS (recorded, not yet fixed):
-    UDP inet rx ring (socket.c udp_rx_head/tail/count): socket_deliver_udp (rx-thread, ~688) vs socket_recv/
-      recvfrom (process, ~506/590) vs sock_free_rcu drain -- rcu keeps the socket alive but does not serialize the
-      queue -> count lost-update + torn head/tail (leaked skb / write onto freed skb). Fix: a per-socket lock (the
-      inet socket_t also lacks one) around deliver/recv/recvfrom/free.
+  OTHER GAPS:
+    UDP inet rx ring (socket.c udp_rx_head/tail/count): socket_deliver_udp vs socket_recv/recvfrom vs sock_free_rcu
+      drain -- rcu keeps the socket alive but does not serialize the queue -> count lost-update + torn head/tail
+      (leaked skb / write onto freed skb). FIXED (F114): added socket_t.udp_rx_lock (a plain spinlock -- VERIFIED
+      that socket_deliver_udp runs in net_rx_thread, a KTHREAD, not a hard IRQ, so no irqsave needed); the deliver
+      enqueue re-checks the full-queue limit and links under the lock, recv/recvfrom dequeue under the lock
+      re-checking the head inside + retry the wait on a lost multi-receiver race; the skb free, the user copy-out,
+      and the wakes stay OUTSIDE the lock. sock_free_rcu drains post-grace-period at refcount 0 (deliver is
+      RCU-serialized, recv cannot run on a closed fd) so it is single-threaded -- no lock. Verified directly by the
+      DHCP lease (the UDP rx ring carries the DHCP OFFER/ACK). TCP rings stay on pcb->lock (this lock is UDP-only).
     fd_flags cloexec lost-update (syscall.c:3200, sys_socket_inner): after fd_install returns, `tf->ft->fd_flags[fd]
       = FD_CLOEXEC` is a PLAIN store with no tf->lock and a plain tf->ft load, while a sibling thread's
       fd_table_grow COW-copies fd_flags under tf->lock and RCU-publishes a new table -> the FD_CLOEXEC store can
@@ -2285,7 +2290,6 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
     pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
     (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
-  SCAN #4 IN PROGRESS: the AF_UNIX cluster is now COMPLETE -- A backlog (F111), B dgram + D ancillary (F112), C
-    stream cbuf (F113), all on unix_sock_t.lock. Remaining SCAN #4 candidates: the UDP inet rx ring (socket_t also
-    lacks a per-socket lock), the fd_flags cloexec lost-update (syscall.c, clean low-risk), and s_mmio_next
-    (latent: __atomic_fetch_add + a documented MMIO_VIRT_END ceiling).
+  SCAN #4 IN PROGRESS: AF_UNIX cluster COMPLETE (A/B/C/D, F111-F113); UDP inet rx ring FIXED (F114). Remaining:
+    the fd_flags cloexec lost-update (syscall.c, clean low-risk), and s_mmio_next (latent: __atomic_fetch_add + a
+    documented MMIO_VIRT_END ceiling).

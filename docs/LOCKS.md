@@ -403,6 +403,20 @@ at refcount 0 (RCU-serialized vs the producers; consumers cannot run on a
 refcount-0 socket), so that path is single-threaded by construction and takes no
 lock.
 
+### `socket_t.udp_rx_lock` -- `kernel/net/socket.c`
+Per-socket leaf spinlock (F114) guarding the inet UDP receive ring
+(`udp_rx_head/tail/count`).  `socket_deliver_udp` (the net receive path, running
+in the `net_rx_thread` KTHREAD -- the virtio-net IRQ only `irq_notify`s it, so a
+plain preempt-disabling spinlock is correct, no irqsave) ENQUEUES under it;
+`socket_recv` / `socket_recvfrom` DEQUEUE under it (re-checking the head inside
+and retrying the wait on a lost multi-receiver race).  Held ONLY around the ring
+mutation -- the skb alloc/free, the user copy-out, the `src_addr` stamp, and the
+`wait_queue_wake_all`/`sock_poll_wake` (which touch `rq_lock`) stay OUTSIDE it.
+Leaf: never nested with the rcu/tx/udp-table locks.  `sock_free_rcu` drains the
+ring post-grace-period at refcount 0 (the deliver is RCU-serialized, no recv can
+run on a closed fd), so that path is single-threaded and takes no lock.  TCP
+rings are guarded separately by `pcb->lock`; this lock is UDP-only.
+
 ### `s_namespace_lock` — `kernel/mm/shmem.c`
 Guards the `s_namespace` table pointer.  `shmem_ns_find` walks
 lock-free inside `rcu_read_lock()` and bumps the found object's

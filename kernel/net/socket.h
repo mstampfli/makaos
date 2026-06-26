@@ -77,6 +77,15 @@ typedef struct socket_t {
     // UDP receive queue: a simple singly-linked list of skbuffs.  Each skb
     // carries its own src_ip_be + src_port (stamped at delivery) so multiple
     // senders can interleave without clobbering each other.
+    // Per-socket leaf spinlock guarding the udp_rx ring (head/tail/count): the
+    // net rx kthread (socket_deliver_udp) ENQUEUES while a process recv/recvfrom
+    // DEQUEUES on another CPU, so the list + count need serialization.  Held ONLY
+    // around the ring mutation; the skb alloc/free, the user copy-out, and the
+    // wait_queue wakes stay OUTSIDE it.  net_rx_thread is a kthread (not a hard
+    // IRQ -- the virtio-net IRQ only irq_notify's it), so a plain
+    // preempt-disabling spinlock suffices (no irqsave).  (TCP rings are guarded
+    // separately by pcb->lock; this lock is UDP-only.)
+    spinlock_t udp_rx_lock;
     skbuff_t* udp_rx_head;
     skbuff_t* udp_rx_tail;
     uint16_t  udp_rx_count;
