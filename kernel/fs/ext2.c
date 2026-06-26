@@ -90,6 +90,23 @@ static inline int ext2_inode_size_valid(uint32_t inode_size, uint32_t block_size
         && inode_size <= block_size
         && (inode_size & (inode_size - 1u)) == 0u;   // power of two
 }
+// PRIMITIVE (on-disk group geometry validation): a group's block bitmap and its
+// inode bitmap each occupy exactly ONE filesystem block, so a group holds at
+// most block_size*8 blocks and block_size*8 inodes.  s_blocks_per_group /
+// s_inodes_per_group are untrusted u32 superblock fields; a forged value above
+// block_size*8 makes the in-group bit index (rel % blocks_per_group, or the
+// bitmap_find_free scan up to blocks_per_group) run past the fixed 4096-byte
+// bitmap scratch -> heap OOB read/write in alloc_block / free_block /
+// alloc_inode / free_inode_num.  block_size <= EXT2_BLOCK_SIZE_MAX (4096), so
+// block_size*8 <= 32768 bits fits the scratch.  Also rejects zero (div-by-zero
+// in the group math).  Pure -> unit-tested.
+static inline int ext2_group_geom_valid(uint32_t blocks_per_grp,
+                                        uint32_t inodes_per_grp,
+                                        uint32_t block_size) {
+    uint32_t cap = block_size * 8u;   // bits in a one-block bitmap
+    return blocks_per_grp != 0 && inodes_per_grp != 0
+        && blocks_per_grp <= cap && inodes_per_grp <= cap;
+}
 static uint32_t s_inodes_per_grp  = 0;
 static uint32_t s_blocks_per_grp  = 0;
 static uint32_t s_inode_size      = 128; // bytes per inode on disk
@@ -870,11 +887,15 @@ uint8_t ext2_init(uint32_t part_lba) {
     s_inode_size      = (sb->s_rev_level >= 1 && sb->s_inode_size > 0)
                         ? sb->s_inode_size : 128;
 
-    // Reject a degenerate superblock (all fields untrusted on-disk data): zero
-    // blocks/inodes per group would divide by zero here and in inode-location
-    // math, and a zero total block count would make every block-range check
-    // fail.  s_block_size was already validated by ext2_block_size_checked.
-    if (s_blocks_per_grp == 0 || s_inodes_per_grp == 0 || s_blocks_count == 0)
+    // Reject a degenerate superblock (all fields untrusted on-disk data): a zero
+    // total block count would make every block-range check fail.  s_block_size
+    // was already validated by ext2_block_size_checked.
+    if (s_blocks_count == 0) return 0;
+    // The per-group block and inode bitmaps each occupy one block, so blocks-
+    // and inodes-per-group must each be in [1, block_size*8].  A larger forged
+    // value would overrun the fixed 4096-byte bitmap scratch in alloc/free ->
+    // heap OOB read/write.  Refuse the mount.
+    if (!ext2_group_geom_valid(s_blocks_per_grp, s_inodes_per_grp, s_block_size))
         return 0;
 
     // s_inode_size is untrusted (u16 on disk): a value that is not a power of two,
@@ -1607,6 +1628,33 @@ void ext2_block_size_selftest(void) {
     }
     kprintf(fails ? "[ext2_blksz_test] SELF-TEST FAILED\n"
                   : "[ext2_blksz_test] SELF-TEST PASSED (block size validated <= 4096)\n");
+}
+
+// Pure test of ext2_group_geom_valid (the bitmap-OOB mount guard): blocks- and
+// inodes-per-group must be in [1, block_size*8] so the in-group bit index stays
+// within the one-block (<= 4096-byte) bitmap scratch.
+void ext2_group_geom_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t bpg, ipg, bs, want; } c[] = {
+        { 8192,  8192,  1024, 1 },   // 1 KiB blocks: cap 8192 -> legit max passes
+        { 8193,  100,   1024, 0 },   // blocks_per_group over cap -> reject
+        { 100,   8193,  1024, 0 },   // inodes_per_group over cap -> reject
+        { 32768, 32768, 4096, 1 },   // 4 KiB blocks: cap 32768 -> legit max passes
+        { 32769, 100,   4096, 0 },   // over cap -> reject
+        { 0,     100,   1024, 0 },   // zero blocks -> reject
+        { 100,   0,     1024, 0 },   // zero inodes -> reject
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_group_geom_valid(c[i].bpg, c[i].ipg, c[i].bs);
+        if ((got != 0) != (c[i].want != 0)) {
+            kprintf("[ext2_geom] FAIL bpg=%u ipg=%u bs=%u got=%d want=%u\n",
+                    c[i].bpg, c[i].ipg, c[i].bs, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[ext2_geom] SELF-TEST FAILED\n"
+                  : "[ext2_geom] SELF-TEST PASSED (group geometry bounded to block_size*8)\n");
 }
 #endif
 

@@ -1378,6 +1378,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ext2_block_valid/ext2_run_valid; symlinks unimplemented -- readlink EINVAL / symlink EPERM; free_block(0) is
   a no-op; F56 covers the overwrite race). Fix = clamp both fields <= s_block_size*8 at mount (~877), mirroring
   ext2_block_size_checked / ext2_inode_size_valid; add a pure ext2_group_geom_valid helper + selftest.
+  -> VERIFIED + FIXED (F86): all premises confirmed (fixed 4096-byte scratch, bitmap helpers unbounded, mount
+  guarded only != 0, bit = rel % blocks_per_grp unclamped, group-check is not a bit-check). Added pure
+  ext2_group_geom_valid (both fields in [1, block_size*8]) gating the mount at ext2.c:877; pure
+  ext2_group_geom_selftest (legit maxima 8192@1KiB / 32768@4KiB pass, +1 over cap rejected, zero rejected).
+  Clean boot 61 PASSED incl. ext2_geom, and the real root fs mounting through the gate proves the bound is not
+  too strict. Trust model: crafted/corrupt ext2 image only.
   (w) MED-LOW, malicious-controller only, NOT reachable on QEMU (DSTRD=0 fits all 64 QIDs in 0x2000) -- NVMe
   doorbell BAR0 OOB: nvme.c:677 maps BAR0 at a fixed 0x2000, but the doorbell offset 0x1000+(2*qid+1)*stride
   scales with device CAP.DSTRD (stride = 4<<dstrd, never validated, ~687) and qid up to nr_queues (capped
