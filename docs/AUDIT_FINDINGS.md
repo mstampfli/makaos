@@ -1700,6 +1700,29 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the locally-submitted idx; single TX desc 0 always valid). NOTE: this is a malicious-DEVICE threat so it is
   NOT boot-exercised by QEMU's benign NIC model -- the fix is a hardening/selftest, provably inert at boot.
   agent CONFIDENCE HIGH (grep-confirmed s_rx_bufs written only for [0,127]; validation admits [0,255]).
+  -> VERIFIED + FIXED (F98): confirmed virtio_desc_id_valid (virtio_net.c:303) is index_ok(id, VIRTQ_SIZE=256)
+  while the RX alloc loop (~583) and refill loop (~336) both run i < VIRTQ_SIZE/2, so s_rx_bufs[128..255] stay
+  {phys=0, virt=NULL}; rx_poll (~434) gated on virtio_desc_id_valid (admits [0,255]) then uses s_rx_bufs[desc_id]
+  .virt as the memcpy SOURCE (~450) and .phys as a re-posted descriptor addr (~454) -- so a device id in
+  [128,255] => raw=NULL memcpy + a descriptor re-posted at physical frame 0. REFINEMENT (the recorded "bound to
+  128" must NOT touch the generic validator): checked virtio_desc_id_valid's OTHER callers -- virtq_submit (307)
+  and the TX completion (409) operate over the FULL 256-entry desc ring, so the generic 256 bound is CORRECT for
+  them; only the RX path is tighter (its id also indexes the 128-populated s_rx_bufs[]). Also nailed down WHY
+  desc_id maps to s_rx_bufs[desc_id]: rxq_refill pairs descriptor idx with buffer i, and the sequential free
+  list makes the posted RX desc ids exactly 0..127, so a legit completion id equals its buffer index. FIX
+  (do-it-right, ONE source of truth): added VIRTQ_NUM_RX_BUFS (= VIRTQ_SIZE/2) in virtio_net.h used by the alloc
+  loop, the refill loop, AND a new RX-specific virtio_rx_id_valid(id) = index_ok(id, VIRTQ_NUM_RX_BUFS) that
+  rx_poll now uses instead of the generic full-ring guard -- so the validation bound and the populated-buffer
+  count can never disagree again. The generic virtio_desc_id_valid stays 256 for TX/submit. Fixed the misleading
+  "VIRTQ_SIZE buffers" comments (the code only ever populated VIRTQ_SIZE/2). VERIFICATION: a malicious-DEVICE
+  threat NOT triggerable by QEMU's benign NIC -> a DETERMINISTIC bounds selftest (virtio_rx_id_valid_selftest:
+  0 and 127 valid; 128 and 255 -- in the desc ring but past the rx buffers -- REJECTED; 256 / garbage rejected)
+  + the normal RX path IS boot-exercised (DHCP receives through rx_poll with legit ids 0..127), so a clean boot
+  with DHCP proves the bound change did not break normal receive. `[virtio_rxid] SELF-TEST PASSED`. Clean boot
+  FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 68 selftests PASSED incl. [virtio_rxid] and the
+  neighbouring [virtio_descid] / [nvme_cid], 0 FAILED/PANIC, no [WD], `More login:` renders. This closes fan-out
+  #5 candidate (hh) -- and with futex SAFE + (gg) F95 / (ii) F96 / (ff) F97 / (hh) F98 all shipped, ALL of
+  fan-out #5 is now resolved.
   (ii) HIGH, crafted-image / SMP race -- ext2_rename frees a dst inode ignoring i_links_count: the dst-removal
   branch of ext2_rename (kernel/fs/ext2.c ~3061-3068) removes ONE dirent then UNCONDITIONALLY free_inode_blocks
   + sets i_links_count=0 + free_inode_num(dst_ino), never reading i_links_count -- diverging from ext2_unlink's

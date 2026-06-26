@@ -697,6 +697,10 @@ static void init_kthread(void) {
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();
+    // virtio-net RX completion id bounded to the POPULATED rx buffers (a device
+    // id in the desc ring but past the rx buffers -> NULL source / phys-0 repost).
+    extern void virtio_rx_id_valid_selftest(void);
+    virtio_rx_id_valid_selftest();
 
     // NVMe device completion-id bounds (req[] OOB from a malicious/buggy NVMe).
     extern void nvme_cid_valid_selftest(void);

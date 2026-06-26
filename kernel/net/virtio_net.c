@@ -152,8 +152,9 @@ typedef struct {
 
 // ── Packet buffers for RX ─────────────────────────────────────────────────
 // Each RX descriptor gets its own pre-allocated buffer.  We allocate
-// VIRTQ_SIZE buffers of ETH_MAX_FRAME + VIRTIO_NET_HDR_LEN bytes each.
-// Stored as physical addresses (passed to device) + virtual (for CPU access).
+// VIRTQ_NUM_RX_BUFS buffers of ETH_MAX_FRAME + VIRTIO_NET_HDR_LEN bytes each
+// (the array is sized VIRTQ_SIZE but only the first VIRTQ_NUM_RX_BUFS slots are
+// populated).  Stored as physical addresses (for the device) + virtual (CPU).
 typedef struct {
     phys_addr_t phys;
     uint8_t*    virt;
@@ -295,12 +296,21 @@ static uint16_t virtq_alloc_desc(virtq_t* vq) {
 }
 
 // PRIMITIVE (device-supplied index, category D -> delegates to index_ok).
-// Is a descriptor id a valid index into the VIRTQ_SIZE-entry desc/buffer
-// tables?  Device-supplied ids (read from the used ring) MUST pass this before
-// being used as an index -- an out-of-range id otherwise drives an OOB read of
-// s_rx_bufs[] and an OOB write of s_rxq.desc[] / the free list.  Pure ->
-// unit-tested (virtio_desc_id_valid_selftest).
+// Is a descriptor id a valid index into the VIRTQ_SIZE-entry desc ring / free
+// list?  Device-supplied ids (read from the used ring) MUST pass this before
+// being used as an index -- an out-of-range id otherwise drives an OOB write of
+// s_rxq.desc[] / the free list.  Used by the TX completion path and virtq_submit,
+// which operate over the FULL desc ring.  Pure -> unit-tested.
 static int virtio_desc_id_valid(uint32_t id) { return index_ok(id, VIRTQ_SIZE); }
+
+// PRIMITIVE (device-supplied RX completion id, category D).  The RX path is
+// TIGHTER than virtio_desc_id_valid: a completion id also indexes s_rx_bufs[],
+// which is populated only for VIRTQ_NUM_RX_BUFS entries (those are the only RX
+// descriptors we ever post), so an id in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) is one
+// the device invented -- its s_rx_bufs[] slot is {NULL, 0}, which would memcpy
+// from a NULL source and re-post a descriptor pointing at physical frame 0.
+// Pure -> unit-tested (virtio_rx_id_valid_selftest).
+static int virtio_rx_id_valid(uint32_t id) { return index_ok(id, VIRTQ_NUM_RX_BUFS); }
 
 // Return a descriptor to the free list.
 static void virtq_free_desc(virtq_t* vq, uint16_t idx) {
@@ -325,15 +335,18 @@ static void virtq_submit(virtq_t* vq, uint16_t head_idx, uint16_t qidx) {
 }
 
 // ── RX ring setup ─────────────────────────────────────────────────────────
-// Pre-populate the RX ring with VIRTQ_SIZE device-writable buffers so the
-// device can deposit incoming packets immediately.
+// Pre-populate the RX ring with VIRTQ_NUM_RX_BUFS device-writable buffers so
+// the device can deposit incoming packets immediately.
 
 static void rxq_refill(void) {
     // Each RX descriptor chain: [virtio_net_hdr (10 B)] [frame (1514 B)]
     // We use two descriptors per packet: one for the header, one for data.
     // Actually simpler: one large buffer = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME.
-    // Use single-descriptor approach (simpler, one page per slot).
-    for (uint16_t i = 0; i < VIRTQ_SIZE / 2; i++) {
+    // Use single-descriptor approach (simpler, one page per slot).  Posts
+    // exactly VIRTQ_NUM_RX_BUFS descriptors (the populated s_rx_bufs[] slots);
+    // the sequential free list makes the posted desc ids 0..VIRTQ_NUM_RX_BUFS-1,
+    // so a completion id from the device maps back to s_rx_bufs[id].
+    for (uint16_t i = 0; i < VIRTQ_NUM_RX_BUFS; i++) {
         uint16_t idx = virtq_alloc_desc(&s_rxq);
         if (idx == 0xFFFFu) break;
 
@@ -427,11 +440,14 @@ int virtio_net_rx_poll(skbuff_t** skb_out) {
     uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
     s_rxq.last_used_idx++;   // advance first so a bad entry can't wedge the ring
 
-    // desc_id is written by the device and indexes s_rx_bufs[] / s_rxq.desc[]
-    // (both VIRTQ_SIZE entries).  An out-of-range id would OOB-read the source
-    // buffer pointer (and memcpy from it) and OOB-write four descriptor fields.
+    // desc_id is written by the device and indexes s_rx_bufs[] (the memcpy
+    // source) and s_rxq.desc[].  Only VIRTQ_NUM_RX_BUFS s_rx_bufs[] entries are
+    // populated -- those are the only RX descriptors we posted -- so use the
+    // TIGHTER rx bound, not the full-ring virtio_desc_id_valid: an id the device
+    // invented in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) has a {NULL, 0} buffer slot,
+    // which would memcpy from NULL and re-post a descriptor at physical frame 0.
     // Drop the bogus completion: do not index the tables and do not re-post it.
-    if (!virtio_desc_id_valid(desc_id)) return 0;
+    if (!virtio_rx_id_valid(desc_id)) return 0;
 
     // The packet starts after the virtio-net header.
     uint8_t* raw    = s_rx_bufs[desc_id].virt;
@@ -580,7 +596,9 @@ int virtio_net_init(void) {
     // Step 6: Configure virtqueues.
 
     // Allocate RX packet buffers (one page each = 4 KiB, holds max frame).
-    for (uint16_t i = 0; i < VIRTQ_SIZE / 2; i++) {
+    // Exactly VIRTQ_NUM_RX_BUFS slots are populated; s_rx_bufs[] entries beyond
+    // that stay {NULL, 0} and are rejected by virtio_rx_id_valid at completion.
+    for (uint16_t i = 0; i < VIRTQ_NUM_RX_BUFS; i++) {
         phys_addr_t p = pmm_buddy_alloc(0);
         if (!p) return 0;
         s_rx_bufs[i].phys = p;
@@ -747,4 +765,32 @@ void virtio_desc_id_valid_selftest(void) {
     }
     kprintf(fails ? "[virtio_descid] SELF-TEST FAILED\n"
                   : "[virtio_descid] SELF-TEST PASSED (device desc-id bounds)\n");
+}
+
+// ── virtio_rx_id_valid selftest ───────────────────────────────────────────
+// Deterministic check of the TIGHTER RX-completion bound: an id is valid only
+// if it indexes a POPULATED s_rx_bufs[] slot ([0, VIRTQ_NUM_RX_BUFS)).  The
+// gap [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) passes the generic desc-id guard but must
+// be REJECTED here -- those slots are {NULL, 0} and a device inventing such an
+// id would memcpy from NULL and re-post a descriptor at physical frame 0.
+void virtio_rx_id_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t id; int want; } c[] = {
+        { 0,                    1 },  // first populated slot
+        { VIRTQ_NUM_RX_BUFS-1,  1 },  // last populated slot (127)
+        { VIRTQ_NUM_RX_BUFS,    0 },  // first unpopulated (128): generic-valid but rx-INVALID
+        { VIRTQ_SIZE-1,         0 },  // 255: in the desc ring but no rx buffer
+        { VIRTQ_SIZE,           0 },  // == 256, OOB everywhere
+        { 0xFFFFFFFFu,          0 },  // device garbage
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (virtio_rx_id_valid(c[i].id) != c[i].want) {
+            kprintf("[virtio_rxid] FAIL id=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].id, virtio_rx_id_valid(c[i].id), c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[virtio_rxid] SELF-TEST FAILED\n"
+                  : "[virtio_rxid] SELF-TEST PASSED (rx-completion id bounded to populated buffers)\n");
 }
