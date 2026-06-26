@@ -1788,6 +1788,28 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   one flush after the loop for scale); the rc==1 RO->RW widen-only branch needs no shootdown. agent CONFIDENCE
   HIGH on the defect (the lone frame-swapping CoW break with only a local invlpg), MEDIUM on worst-case freed-
   frame leak (needs the co-owner to free within the stale window) / HIGH on the stale-read corruption variant.
+  -> VERIFIED + FIXED (F99): confirmed vmm_get_user_pages's CoW break (vmm.c ~302-315) does *pte = nf (frame
+  swap) + invlpg(va) (LOCAL only) + pmm_ref_dec(phys), all under lock_mm->vma_lock (acquired per-page ~296,
+  released ~329), with NO tlb_flush_range; confirmed the contrast -- isr14_page_fault's CoW break (~720-752)
+  records flush_page under the lock, UNLOCKS, then tlb_flush_range(task_get_mm_shared(g_current), ...) AFTER the
+  unlock with an explicit IPI-ack-deadlock note, and its rc==1 widen-only branch sets no flush_page; confirmed
+  REACHABILITY -- vmm_get_user_pages is called by ahci_read_user (ahci.c:893), the AHCI read/pread DMA-pin path,
+  so a user read into a fork-CoW page hits the break. FIX (do-it-right, mirror the EXISTING isr14/fork shootdown
+  discipline -- one shared mechanism applied to the missed site, BATCHED per the prime directive): set a
+  cow_broke flag in the CoW-break branch; converted the function's early returns to a single out: exit;
+  restructured to return `ret`; and at out: -- AFTER every per-page vma_lock is released -- if cow_broke do ONE
+  tlb_flush_range(task_get_mm_shared(g_current), uaddr&~0xFFF, uaddr&~0xFFF + count*PAGE_SIZE) covering the whole
+  pinned span (one IPI round for all swapped pages, vs N). The rc==1 widen-only branch sets no flag (a stale RO
+  entry just re-faults harmlessly). The local invlpg(va) stays for immediate local consistency. Verified the OOM
+  / !pte / not-present / widen / unpin paths all still behave (the goto out reaches the flush+return on every
+  exit; over-flushing non-CoW pages in the span is safe). VERIFICATION: a cross-CPU stale-TLB race, NOT
+  deterministically reproducible -> rigorous code-proof (identical to the isr14 shootdown the codebase already
+  trusts) + the function is boot-exercised on every AHCI DMA-pin read (file loads), so a clean boot proves the
+  restructure did not break the pin/DMA/demand-paging path (the cow_broke flush is gated and mostly inert at
+  boot). No bespoke selftest: the flush-range arithmetic is trivial and a true cross-CPU race is not
+  deterministic (same honest proof method as F97/F95/F89). Clean boot FIRST try: DHCP lease (ifconfig IP
+  10.0.2.15 GW 10.0.2.2), 68 selftests PASSED, 0 FAILED/PANIC, no [WD], `More login:` renders. This closes
+  fan-out #6 candidate (jj).
   (kk) MEDIUM, unprivileged sandbox bypass -- sys_readdir is missing the unveil_ok gate (kernel/syscall/syscall.c
   ~1740, the check belongs after fs_lookup ~1775 before the dispatch ~1779): unveil_ok (syscall.c ~328) is the
   single unveil enforcement point and EVERY other path syscall calls it (open 411, exec 961, stat 1860, unlink

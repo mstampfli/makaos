@@ -288,7 +288,10 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
     // pins) still referenced.  That frame came back as the next
     // thread's stack while AHCI wrote font-file bytes into it.
     extern mm_t* task_get_mm(void* task);
+    extern task_mm_t* task_get_mm_shared(void* task);
     mm_t* lock_mm = g_current ? task_get_mm(g_current) : NULL;
+    int      cow_broke = 0;   // a CoW frame-swap happened -> shoot down siblings
+    uint32_t ret       = count;
 
     for (uint32_t i = 0; i < count; i++) {
         virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
@@ -304,15 +307,18 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
                 phys_addr_t nf = pmm_buddy_alloc(0);
                 if (nf == PMM_INVALID_ADDR) {
                     if (lock_mm) spin_unlock(&lock_mm->vma_lock);
-                    return 0;
+                    ret = 0; goto out;
                 }
                 uint8_t* s = (uint8_t*)(phys + HHDM_OFFSET);
                 uint8_t* d = (uint8_t*)(nf + HHDM_OFFSET);
                 __builtin_memcpy(d, s, PAGE_SIZE);
                 *pte = nf | leaf;
-                invlpg(va);
+                invlpg(va);                 // LOCAL CPU only -- siblings flushed below
                 pmm_ref_dec(phys);
                 out[i] = (void*)(nf + HHDM_OFFSET);
+                cow_broke = 1;              // PTE swapped to nf; a sibling on
+                                            // another CPU may still cache the old
+                                            // (phys, RO) entry -> shoot it down at out:
             } else if (!(*pte & PAGE_WRITABLE) && pmm_ref_get(phys) == 1) {
                 // Sole owner, still marked RO from old CoW — re-enable write.
                 *pte |= PAGE_WRITABLE;
@@ -333,14 +339,14 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             // install under it with a presence re-check (a concurrent
             // isr14 fault may install first — use its frame).
             phys_addr_t frame = pmm_buddy_alloc(0);
-            if (frame == PMM_INVALID_ADDR) return 0;
+            if (frame == PMM_INVALID_ADDR) { ret = 0; goto out; }
             __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
             if (lock_mm) spin_lock(&lock_mm->vma_lock);
             pte = vmm_pte_get(pml4_phys, va, 1, inter);
             if (!pte) {
                 if (lock_mm) spin_unlock(&lock_mm->vma_lock);
                 pmm_buddy_free(frame, 0);
-                return 0;
+                ret = 0; goto out;
             }
             if (*pte & PAGE_PRESENT) {
                 phys_addr_t have = *pte & PAGE_ADDR_MASK;
@@ -356,7 +362,21 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             }
         }
     }
-    return count;
+out:
+    // A CoW frame-swap above (*pte = nf) changed the translation for EVERY
+    // thread sharing this address space (THREAD_SHARE_MM), but each iteration
+    // only did a LOCAL invlpg.  A sibling on another CPU may still cache the
+    // pre-swap (old phys, RO) entry and, once the CoW co-owner frees + recycles
+    // that frame, read freed memory (cross-process use-after-free read).  Shoot
+    // the pinned span down on every CPU of this mm -- AFTER releasing every
+    // per-page vma_lock (a target spinning on vma_lock with IRQs off would
+    // deadlock the IPI-ack wait, the same rule as isr14_page_fault's CoW break).
+    // One batched range flush covers all swapped pages.  The rc==1 widen-only
+    // branch sets no flag (a stale RO entry just causes a harmless re-fault).
+    if (cow_broke && lock_mm && g_current)
+        tlb_flush_range(task_get_mm_shared(g_current), uaddr & ~0xFFFULL,
+                        (uaddr & ~0xFFFULL) + (uint64_t)count * PAGE_SIZE);
+    return ret;
 }
 
 // Allocate a physical frame, map it at vaddr in the CURRENT address space.
