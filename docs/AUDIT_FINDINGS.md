@@ -2259,12 +2259,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       and the wakes stay OUTSIDE the lock. sock_free_rcu drains post-grace-period at refcount 0 (deliver is
       RCU-serialized, recv cannot run on a closed fd) so it is single-threaded -- no lock. Verified directly by the
       DHCP lease (the UDP rx ring carries the DHCP OFFER/ACK). TCP rings stay on pcb->lock (this lock is UDP-only).
-    fd_flags cloexec lost-update (syscall.c:3200, sys_socket_inner): after fd_install returns, `tf->ft->fd_flags[fd]
-      = FD_CLOEXEC` is a PLAIN store with no tf->lock and a plain tf->ft load, while a sibling thread's
-      fd_table_grow COW-copies fd_flags under tf->lock and RCU-publishes a new table -> the FD_CLOEXEC store can
-      land in the old (pending-RCU-free) table and be lost (fd survives exec -- the wayland/foot fd-leak class),
-      plus a minor UAF-write to the freed old table. Fix: fold cloexec into fd_install under tf->lock (like the
-      sys_open path), or wrap the set in tf->lock with a fresh ft re-read. Clean, low-risk, security-relevant.
+    fd_flags cloexec lost-update (syscall.c, sys_socket_inner): after fd_install returned, `tf->ft->fd_flags[fd] =
+      FD_CLOEXEC` was a PLAIN store with no tf->lock, while a sibling thread's fd_table_grow COW-copies fd_flags
+      under tf->lock and RCU-publishes a new table -> the FD_CLOEXEC store could land in the old (pending-RCU-free)
+      table and be lost (fd survives exec -- the wayland/foot fd-leak class) + a minor write to the freed old table.
+      VERIFIED it was the LONE outlier (sys_open / dup2 / F_SETFD / openpty set fd_flags under the lock already).
+      FIXED (F115, the chokepoint): added fd_install_cloexec(f, cloexec) which sets fd_table[fd] AND fd_flags[fd] in
+      ONE tf->lock critical section; fd_install(f) delegates with 0; sys_socket_inner installs with the cloexec flag
+      atomically (the racy post-install store is gone). Also explicitly writes fd_flags[fd] (was relying on the slot
+      being pre-cleared), so a reused slot can never carry a stale flag. The other 7 fd_install callers are
+      unchanged (they delegate). Boot-proven (every fd-creating syscall flows through fd_install; the timerfd_race
+      stress drives 20000 install/close iters).
     s_mmio_next unlocked + unbounded (vmm.c:135/143): vmm_map_mmio reads-then-bumps the monotonic MMIO VA cursor
       with NO lock/atomic AND no ceiling. CONFIRMED LATENT (today): every caller is a boot-serial initcall on the
       BSP (run_dag is single-threaded; APs parked) so there is no concurrency yet -- it becomes an active overlap
@@ -2290,6 +2295,6 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
     pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
     (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
-  SCAN #4 IN PROGRESS: AF_UNIX cluster COMPLETE (A/B/C/D, F111-F113); UDP inet rx ring FIXED (F114). Remaining:
-    the fd_flags cloexec lost-update (syscall.c, clean low-risk), and s_mmio_next (latent: __atomic_fetch_add + a
-    documented MMIO_VIRT_END ceiling).
+  SCAN #4 IN PROGRESS: AF_UNIX cluster COMPLETE (A/B/C/D, F111-F113); UDP inet rx ring FIXED (F114); fd_flags
+    cloexec lost-update FIXED (F115). Remaining (LAST): s_mmio_next (latent: __atomic_fetch_add for a disjoint
+    reservation + a documented MMIO_VIRT_END ceiling -- hardening, like F108). Then SCAN #4 is exhausted -> SCAN #5.

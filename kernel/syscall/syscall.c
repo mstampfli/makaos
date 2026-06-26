@@ -3099,7 +3099,16 @@ static uint64_t sys_openpty(uint64_t user_fds) {
 // while 4 relied on fd_install closing (leak on the !g_current path).  One rule
 // kills both bug classes -- every call site now closes `f` on the negative
 // branch, and fd_install closes it on none.
-static int64_t fd_install(vfs_file_t* f) {
+// Install f at the lowest free fd >= 3 AND set its close-on-exec flag, BOTH in
+// the SAME tf->lock critical section, so the fd and its FD_CLOEXEC bit are
+// published together.  Setting cloexec as a SEPARATE unlocked step (the old
+// sys_socket_inner did) raced a sibling thread's fd_table_grow: the grow
+// COW-copies fd_flags under the lock and RCU-publishes a new table, so a plain
+// post-install store could land in the OLD (pending-free) table and be lost --
+// the fd then survived exec (an fd leak across exec).  Also explicitly writes
+// fd_flags[fd] (rather than relying on the slot already being 0), so a reused
+// slot can never carry a stale flag.  fd_flags is uint32_t here (FD_CLOEXEC).
+static int64_t fd_install_cloexec(vfs_file_t* f, int cloexec) {
     if (!g_current) return -EBADF;
     task_files_t* tf = g_current->files_shared;
     spin_lock(&tf->lock);
@@ -3112,11 +3121,14 @@ static int64_t fd_install(vfs_file_t* f) {
         }
         if (!tf->ft->fd_table[fd]) {
             tf->ft->fd_table[fd] = f;
+            tf->ft->fd_flags[fd] = cloexec ? FD_CLOEXEC : 0u;
             spin_unlock(&tf->lock);
             return (int64_t)fd;
         }
     }
 }
+
+static int64_t fd_install(vfs_file_t* f) { return fd_install_cloexec(f, 0); }
 
 // fdget: look up an open file description by fd.  On success the returned
 // vfs_file_t has been ref-bumped via vfs_tryget — the caller MUST pair the
@@ -3192,13 +3204,12 @@ static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto)
     #define MK_SOCK_NONBLOCK 0x00800
     if (type & MK_SOCK_NONBLOCK)
         f->flags |= O_NONBLOCK;
-    int64_t fd = fd_install(f);
-    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }   // fd_install failed -> we own f
-    if (type & MK_SOCK_CLOEXEC) {
-        task_files_t* tf = g_current->files_shared;
-        if (tf && tf->ft && (uint64_t)fd < tf->ft->cap)
-            tf->ft->fd_flags[fd] = FD_CLOEXEC;
-    }
+    // Install the fd AND its close-on-exec flag atomically under tf->lock.  The
+    // old code set FD_CLOEXEC as a separate unlocked store after fd_install,
+    // which a sibling fd_table_grow could drop into the freed old table (the fd
+    // then survived exec).  fd_install_cloexec sets both in one locked step.
+    int64_t fd = fd_install_cloexec(f, (type & MK_SOCK_CLOEXEC) != 0);
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }   // install failed -> we own f
     serial_puts_dbg("[socket] fd="); serial_hex_dbg((uint64_t)fd);
     return (uint64_t)fd;
 }

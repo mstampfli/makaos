@@ -218,6 +218,15 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   Apply rule (1) to any cross-CPU producer/consumer queue and rule (2) to any lock that guards a
   buffer the kernel also fills from / drains to userland.
 
+- `fd_install_cloexec(f, cloexec)` (kernel/syscall/syscall.c, F115) -- install an fd AND set its
+  FD_CLOEXEC flag in the SAME tf->lock critical section (sets fd_table[fd] and fd_flags[fd] together,
+  then unlocks).  fd_install(f) delegates with cloexec=0.  Setting fd_flags as a SEPARATE unlocked
+  step after fd_install (the old sys_socket path) raced a sibling fd_table_grow (COW + RCU-publish
+  under tf->lock): the flag could land in the freed old table and be lost (the fd then survived exec).
+  This is the "set a slot's flags in the SAME lock that installs the slot, never as a follow-up store"
+  primitive -- the single chokepoint for fd creation; any future create-with-cloexec (accept4,
+  epoll_create1, eventfd) must use it, not a post-install store.
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
