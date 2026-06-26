@@ -2943,6 +2943,56 @@ int ext2_mkdir(const char* path) {
     return 1;
 }
 
+// ── link-count drop (shared by unlink + rename dst-removal) ─────────────────
+// Pure: drop one hard link.  Returns 1 if the inode should now be freed (the
+// count reached 0), 0 if other names still reference it.  The `> 0` guard
+// stops a corrupt/0 count from wrapping the u16 to 65535; a drop at 0 reports
+// "free" so an already-orphaned inode is reclaimed rather than leaked.
+static int ext2_link_drop(uint16_t* links) {
+    if (*links > 0) (*links)--;
+    return (*links == 0);
+}
+
+// Drop one link from an already-inode_lock'd leaf and free its inode + data
+// blocks ONLY when the link count reaches 0 (otherwise just write back the
+// decremented count).  Always consumes the lock.  This is the single
+// count-aware free site shared by ext2_unlink and ext2_rename's dst-removal so
+// the two cannot drift -- the rename path used to free unconditionally, which
+// destroyed a still-referenced multi-link inode.
+static void ext2_drop_link_locked(irtree_leaf_t* leaf, uint32_t ino) {
+    if (ext2_link_drop(&leaf->inode.i_links_count)) {
+        free_inode_blocks(&leaf->inode);
+        leaf->inode.i_dtime = 1;
+        inode_writeback(leaf);
+        inode_unlock(leaf);
+        free_inode_num(ino);
+    } else {
+        inode_writeback(leaf);
+        inode_unlock(leaf);
+    }
+}
+
+// Deterministic check of the link-drop decision shared by unlink + rename:
+// only the drop that takes the count to 0 reports "free", and a corrupt/0
+// count never wraps.  This is the core of the fix -- rename used to skip this
+// logic entirely and free a multi-link inode on every dst-removal.
+void ext2_link_drop_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    uint16_t c;
+    c = 2; if (ext2_link_drop(&c) != 0 || c != 1) fails++;   // 2->1: keep
+    c = 1; if (ext2_link_drop(&c) != 1 || c != 0) fails++;   // 1->0: free
+    c = 3;                                                    // 3->2->1->0
+    if (ext2_link_drop(&c) != 0 || c != 2) fails++;
+    if (ext2_link_drop(&c) != 0 || c != 1) fails++;
+    if (ext2_link_drop(&c) != 1 || c != 0) fails++;
+    c = 0; if (ext2_link_drop(&c) != 1 || c != 0) fails++;   // underflow guard: stays 0
+    if (fails)
+        kprintf_atomic("[ext2_link_drop] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[ext2_link_drop] PASS (free only at links==0, no u16 underflow)\n");
+}
+
 // ── ext2_unlink ───────────────────────────────────────────────────────────
 // Remove a regular file at `path`.  Returns 1 on success, 0 on failure.
 int ext2_unlink(const char* path) {
@@ -2978,17 +3028,7 @@ int ext2_unlink(const char* path) {
     if (!leaf) return 0;
 
     // Decrement link count; only free inode/data when it reaches 0.
-    if (leaf->inode.i_links_count > 0) leaf->inode.i_links_count--;
-    if (leaf->inode.i_links_count == 0) {
-        free_inode_blocks(&leaf->inode);
-        leaf->inode.i_dtime = 1;
-        inode_writeback(leaf);
-        inode_unlock(leaf);
-        free_inode_num(ino);
-    } else {
-        inode_writeback(leaf);
-        inode_unlock(leaf);
-    }
+    ext2_drop_link_locked(leaf, ino);
 
     // Phase 7C: invalidate the dentry that cached this path component.
     // Future lookups for (parent_ino, basename) will miss dcache and
@@ -3057,15 +3097,19 @@ int ext2_rename(const char* src, const char* dst) {
         // potential parent↔child deadlock if a future codepath nests
         // them in the opposite order).
         inode_unlock(dleaf);
-        dir_remove_entry(dst_parent_ino, dst_base);
-        dleaf = inode_lock(dst_ino);
-        if (dleaf) {
-            free_inode_blocks(&dleaf->inode);
-            dleaf->inode.i_links_count = 0;
-            inode_writeback(dleaf);
-            inode_unlock(dleaf);
+        // Remove dst's name and drop ONE link, freeing the inode + blocks only
+        // when its link count reaches 0 (mirrors ext2_unlink via the shared
+        // helper).  The old code freed unconditionally (i_links_count = 0 +
+        // free_inode_blocks + free_inode_num), which destroyed a still-
+        // referenced multi-link dst -- the surviving name then pointed at a
+        // freed/reissued inode (cross-link).  Gate the drop on dir_remove_entry
+        // succeeding: if a racing unlink(dst) already removed the name (and may
+        // have freed the inode), it owns the drop and freeing here too would
+        // double-free the inode bit + blocks.
+        if (dir_remove_entry(dst_parent_ino, dst_base)) {
+            dleaf = inode_lock(dst_ino);
+            if (dleaf) ext2_drop_link_locked(dleaf, dst_ino);
         }
-        free_inode_num(dst_ino);
     }
 
     // Add new directory entry pointing at the same inode.

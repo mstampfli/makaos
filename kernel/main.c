@@ -505,6 +505,11 @@ static void init_kthread(void) {
     extern void rename_under_selftest(void);
     rename_under_selftest();
 
+    // unlink/rename must drop ONE link and free the inode only at links==0, so
+    // renaming over a multi-link file does not destroy a still-referenced inode.
+    extern void ext2_link_drop_selftest(void);
+    ext2_link_drop_selftest();
+
     // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
     // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
     // per-page VMA-backing validator (no prefault, so file-backed sources keep

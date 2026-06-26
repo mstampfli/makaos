@@ -1685,6 +1685,30 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   when it hits 0) and factor the "remove one name + drop a link + maybe free" sequence into ONE helper called by
   both rename and unlink so the decrement-and-conditional-free is atomic and the paths cannot double-free. agent
   CONFIDENCE HIGH (3062-3068 sets links_count=0 with no count read, vs the correct ext2_unlink pattern same file).
+  -> VERIFIED + FIXED (F96): confirmed ext2_rename's dst-removal (~3062-3068) does free_inode_blocks +
+  i_links_count=0 + free_inode_num UNCONDITIONALLY with no count read, vs ext2_unlink (~2980-2991) which
+  decrements then frees ONLY at 0; i_links_count is uint16_t (ext2.h:81); sys_link returns -EPERM (syscall.c
+  ~5219) so a multi-link file can only come from a crafted/corrupt image (the threat model); the dir-dst case is
+  REJECTED earlier (rename over a directory returns 0 at ~3050-3054), so only a regular-file dst reaches the
+  free (no "." / ".." link accounting needed here). CONFIRMED the secondary race: ext2_rename's dir_remove_entry
+  at ~3060 was UNCHECKED, while ext2_unlink CHECKS it (~2976) -- so a racing unlink(dst) that already removed
+  the name + freed the inode let rename re-lock the freed dst_ino and free it again (double-free of the inode
+  bit + blocks, runtime-reachable on a single-link file, no crafted image). FIX (do-it-right, ONE shared
+  mechanism so the paths cannot drift): extracted a PURE ext2_link_drop(uint16_t* links) (decrement with a > 0
+  underflow guard, returns 1 iff the count hit 0) and a shared ext2_drop_link_locked(leaf, ino) (the count-aware
+  free tail, always consumes the inode lock); ext2_unlink now calls it, and ext2_rename's dst-removal calls it
+  too BUT gated on dir_remove_entry succeeding -- if a racing unlink already removed the name, rename skips the
+  drop (that path owns the free), closing the double-free without taking a coarser lock (the dir_remove_entry
+  success is the single ownership token, which ext2_unlink already relied on). The old unconditional
+  free_inode_num (which ran even when inode_lock failed) is gone -- on a re-lock failure rename now leaks rather
+  than wrongly freeing, matching ext2_unlink's behaviour. VERIFICATION: the primary multi-link case needs a
+  crafted image (can't be created at runtime, sys_link EPERM) so it is not end-to-end testable at boot -> a
+  DETERMINISTIC unit test of the core decision (ext2_link_drop_selftest: 2->1 keep, 1->0 free, 3->2->1->0,
+  underflow drop-at-0 stays 0 + reports free) + code-proof of the wiring + the rename/unlink paths are boot-
+  exercised. `[ext2_link_drop] PASS (free only at links==0, no u16 underflow)`. Clean boot FIRST try: DHCP lease
+  (ifconfig IP 10.0.2.15 GW 10.0.2.2), 66 selftests PASSED incl. [ext2_link_drop] and [rename_under] /
+  [ext2_dotdot] (the neighbouring rename tests, unaffected), 0 FAILED/PANIC, no [WD], `More login:` renders.
+  This closes fan-out #5 candidate (ii).
   PRIORITY (to verify+fix, sharpest first): (gg) tcp pcb_wake UAF first -- HIGH, remote-reachable UAF WRITE,
   cleanest root-cause fix (RCU-defer the file free, mirroring F88/F89); then (ii) ext2 rename link-count (clean,
   mirrors ext2_unlink); then (ff) exec-vs-threads PML4 free (most severe/unprivileged but the biggest, most
