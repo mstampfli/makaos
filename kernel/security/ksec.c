@@ -16,18 +16,38 @@ static vfs_file_t* s_agent_read  = NULL;  // kernel reads responses from here
 static vfs_file_t* s_agent_write = NULL;  // kernel writes requests here
 static int         s_agent_ready = 0;
 
-// Monotonic sequence counter.
-static volatile uint32_t s_seq = 0;
+// Monotonic sequence counter (atomic: concurrent setuid callers must get
+// distinct seqs, else two slots collide and the reader matches the wrong one).
+static uint32_t s_seq = 0;
 
-// Pending request slot — one outstanding request at a time.
-// (Single-CPU, cooperative: only one task can be sleeping in ksec_request
-// at a time.  Multi-CPU extension: replace with a hash-table keyed on seq.)
-static struct {
-    uint32_t       seq;
+// In-flight request slots, keyed by sequence number.  Replaces the old single
+// global slot: on SMP a second concurrent caller (sys_setuid / sys_seteuid /
+// setuid-exec) overwrote the one slot -> the reader could sched_wake a task_t*
+// that had already returned + exited (a UAF), AND a "behind" caller read the
+// other caller's verdict (cross-talk -> privilege escalation in the gate).
+// Each ksec_request now claims its OWN slot under s_ksec_lock; the reader
+// matches a response to its slot by seq.  seq == 0 marks a free slot
+// (ksec_next_seq never returns 0).  This is the "hash-table keyed on seq" the
+// old comment prescribed for the multi-CPU case.
+#define KSEC_MAX_INFLIGHT 64
+
+typedef struct {
+    uint32_t        seq;       // 0 == free slot
     ksec_response_t resp;
-    task_t*        waiter;    // task sleeping waiting for this response
-    int            done;      // 1 = response received
-} s_pending = {0, {0}, NULL, 0};
+    task_t*         waiter;    // task sleeping for this response
+    int             done;      // 1 == response received
+} ksec_slot_t;
+
+static spinlock_t  s_ksec_lock = SPINLOCK_INIT;
+static ksec_slot_t s_slots[KSEC_MAX_INFLIGHT];
+
+// Find the in-flight slot for `seq` (NULL if none).  Caller MUST hold s_ksec_lock.
+static ksec_slot_t* ksec_slot_find(uint32_t seq) {
+    if (!seq) return NULL;
+    for (int i = 0; i < KSEC_MAX_INFLIGHT; i++)
+        if (s_slots[i].seq == seq) return &s_slots[i];
+    return NULL;
+}
 
 // ── ksec_register_agent ───────────────────────────────────────────────────
 
@@ -52,7 +72,9 @@ int ksec_agent_present(void) {
 // ── ksec_next_seq ─────────────────────────────────────────────────────────
 
 uint32_t ksec_next_seq(void) {
-    return ++s_seq;   // pre-increment: seq 0 is never used
+    uint32_t s;
+    do { s = __atomic_add_fetch(&s_seq, 1u, __ATOMIC_RELAXED); } while (s == 0);
+    return s;   // never 0 (the free-slot marker); skips 0 on a u32 wrap
 }
 
 // ── ksec_request ─────────────────────────────────────────────────────────
@@ -65,35 +87,52 @@ uint32_t ksec_next_seq(void) {
 // Returns -EAGAIN if no agent is registered (caller should apply fallback).
 
 int ksec_request(const ksec_request_t* req, ksec_response_t* resp) {
-    int64_t written;
-
     if (!req || !resp) return -EINVAL;
     if (!s_agent_ready) return -EAGAIN;
 
-    // Populate the pending slot.
-    s_pending.seq    = req->seq;
-    s_pending.waiter = g_current;
-    s_pending.done   = 0;
+    // Claim a per-seq slot under the lock.  Fail CLOSED if all are in use --
+    // denying a setuid is safe; sharing one slot is the bug we are fixing.
+    spin_lock(&s_ksec_lock);
+    ksec_slot_t* slot = NULL;
+    for (int i = 0; i < KSEC_MAX_INFLIGHT; i++)
+        if (s_slots[i].seq == 0) { slot = &s_slots[i]; break; }
+    if (!slot) { spin_unlock(&s_ksec_lock); return -EAGAIN; }
+    slot->seq    = req->seq;
+    slot->waiter = g_current;
+    slot->done   = 0;
+    spin_unlock(&s_ksec_lock);
 
-    // Write request to the agent.  The write_pipe is a kernel pipe — this
-    // must not block (the ksec reader thread is always running and draining
-    // the pipe before it fills).
-    written = vfs_write(s_agent_write, req, sizeof(ksec_request_t));
+    // Write the request to the agent.  The write_pipe is a kernel pipe -- this
+    // must not block (the reader thread drains the response pipe continuously).
+    int64_t written = vfs_write(s_agent_write, req, sizeof(ksec_request_t));
     if (written != (int64_t)sizeof(ksec_request_t)) {
-        s_pending.waiter = NULL;
+        spin_lock(&s_ksec_lock);
+        slot->seq = 0; slot->waiter = NULL;
+        spin_unlock(&s_ksec_lock);
         return -EIO;
     }
 
-    // Sleep until the reader thread wakes us.
-    while (!s_pending.done) {
+    // Sleep until the reader sets our slot's done.  The lock is DROPPED around
+    // sched_sleep (never held across a sleep).  The reader sets done + wakes us
+    // UNDER the lock, and we free our slot UNDER the lock after waking -- so the
+    // reader never wakes a task that has already freed its slot or returned.
+    // Signal-interruptible: a killed/signalled setuid frees its slot and returns
+    // rather than leaving a dangling waiter (a UAF wake) or hanging forever.
+    spin_lock(&s_ksec_lock);
+    while (!slot->done) {
+        spin_unlock(&s_ksec_lock);
         sched_sleep();
-        // After waking: check done again (spurious wakeups are safe here —
-        // sched_sleep only returns when sched_wake is called by reader thread,
-        // so in practice done will be 1, but defensive loop is correct).
+        if (signal_has_actionable(&g_current->sigstate)) {
+            spin_lock(&s_ksec_lock);
+            slot->seq = 0; slot->waiter = NULL;
+            spin_unlock(&s_ksec_lock);
+            return -EINTR;
+        }
+        spin_lock(&s_ksec_lock);
     }
-
-    *resp = s_pending.resp;
-    s_pending.waiter = NULL;
+    *resp = slot->resp;
+    slot->seq = 0; slot->waiter = NULL;
+    spin_unlock(&s_ksec_lock);
     return 0;
 }
 
@@ -135,13 +174,19 @@ void ksec_reader_thread(void) {
             continue;
         }
 
-        // Match sequence number.
-        if (s_pending.waiter && s_pending.seq == resp.seq && !s_pending.done) {
-            s_pending.resp = resp;
-            s_pending.done = 1;
-            sched_wake(s_pending.waiter);
+        // Match the response to its in-flight slot by seq, UNDER the lock.
+        // Set done + wake the waiter under the lock: the requester frees its
+        // slot only under the lock (after waking), so it cannot free/return
+        // before we finish -- no wake of a freed task.
+        spin_lock(&s_ksec_lock);
+        ksec_slot_t* slot = ksec_slot_find(resp.seq);
+        if (slot && !slot->done) {
+            slot->resp = resp;
+            slot->done = 1;
+            if (slot->waiter) sched_wake(slot->waiter);
         }
-        // Unmatched response: stale, discard silently.
+        spin_unlock(&s_ksec_lock);
+        // Unmatched / stale response (no slot): discarded silently.
     }
 }
 
@@ -201,5 +246,37 @@ void ksec_exec_setuid_selftest(void) {
     }
     kprintf(fails ? "[ksec_setuid] SELF-TEST FAILED\n"
                   : "[ksec_setuid] SELF-TEST PASSED (setuid-exec escalation fails closed)\n");
+}
+
+// Deterministic test of the per-seq slot bookkeeping (the SMP rendezvous fix):
+// distinct seqs claim distinct slots, ksec_slot_find matches by seq, seq 0 and
+// an unknown seq match nothing, and a freed slot is reusable.  The cross-CPU
+// overwrite/UAF is not deterministically reproducible -> this proves the slot
+// table logic; code-proof covers the concurrent case (every slot access under
+// s_ksec_lock; the requester frees its slot under the lock after the wake).
+void ksec_slot_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    spin_lock(&s_ksec_lock);
+    for (int i = 0; i < KSEC_MAX_INFLIGHT; i++) {
+        s_slots[i].seq = 0; s_slots[i].waiter = (task_t*)0; s_slots[i].done = 0;
+    }
+    // Claim three distinct seqs -> three distinct free slots.
+    ksec_slot_t* a = (ksec_slot_t*)0; ksec_slot_t* b = (ksec_slot_t*)0; ksec_slot_t* c = (ksec_slot_t*)0;
+    for (int i = 0; i < KSEC_MAX_INFLIGHT && !a; i++) if (s_slots[i].seq == 0) { s_slots[i].seq = 10; a = &s_slots[i]; }
+    for (int i = 0; i < KSEC_MAX_INFLIGHT && !b; i++) if (s_slots[i].seq == 0) { s_slots[i].seq = 20; b = &s_slots[i]; }
+    for (int i = 0; i < KSEC_MAX_INFLIGHT && !c; i++) if (s_slots[i].seq == 0) { s_slots[i].seq = 30; c = &s_slots[i]; }
+    if (!a || !b || !c || a == b || b == c || a == c) fails++;
+    // ksec_slot_find returns the right slot, and nothing for seq 0 / unknown.
+    if (ksec_slot_find(10) != a || ksec_slot_find(20) != b || ksec_slot_find(30) != c) fails++;
+    if (ksec_slot_find(99) != (ksec_slot_t*)0) fails++;
+    if (ksec_slot_find(0)  != (ksec_slot_t*)0) fails++;
+    // Free b -> its slot is reusable, find(20) now matches nothing.
+    b->seq = 0; b->waiter = (task_t*)0;
+    if (ksec_slot_find(20) != (ksec_slot_t*)0) fails++;
+    a->seq = 0; c->seq = 0;   // clean the table back to all-free
+    spin_unlock(&s_ksec_lock);
+    kprintf(fails ? "[ksec_slot] SELF-TEST FAILED\n"
+                  : "[ksec_slot] SELF-TEST PASSED (per-seq slot claim/find/free)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */

@@ -475,6 +475,12 @@ static void init_kthread(void) {
     extern void ksec_exec_setuid_selftest(void);
     ksec_exec_setuid_selftest();
 
+    // ksec request rendezvous: per-seq in-flight slots (not one shared slot)
+    // under a lock, so concurrent setuid callers cannot overwrite each other's
+    // waiter (a wake-of-freed-task UAF) or read each other's verdict.
+    extern void ksec_slot_selftest(void);
+    ksec_slot_selftest();
+
     // unveil sandbox gate (now enforced by every path syscall, not just open).
     extern void unveil_gate_selftest(void);
     unveil_gate_selftest();

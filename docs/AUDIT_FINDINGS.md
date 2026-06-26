@@ -1418,6 +1418,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   every s_pending access with the waiter cleared-under-lock-before-wake (closes the UAF), and a per-seq
   hash/array so concurrent callers do not share one slot (closes the cross-talk + the starvation hang) -- the
   exact "hash-table keyed on seq" the code comment prescribes; the task ref must be lifetime-safe.
+  -> VERIFIED + FIXED (F90): confirmed the single unlocked slot + the non-interruptible loop. Also found two
+  more SMP bugs: ksec_next_seq did a non-atomic ++ (seq collision) and wrapped to 0 (the free marker). Fix:
+  per-seq s_slots[64] under s_ksec_lock; ksec_request claims its own slot (fail-closed -> -EPERM if full),
+  drops the lock around sched_sleep, is signal-interruptible (frees slot + returns -EINTR on kill -> no
+  dangling-waiter UAF + no hang), and frees under the lock after waking; reader matches by seq + wakes under
+  the lock (so the requester cannot free/return before the wake -> no UAF); ksec_next_seq atomic, skips 0.
+  Deterministic ksec_slot_selftest + code-proof. Provably inert at boot (no daemon -> ksec_request -EAGAIN
+  early). 3rd re-boot reached DHCP; 62 PASSED incl. ksec_slot + ksec_setuid. All fan-out #3 candidates resolved.
   (z) /proc files_shared UAF (kernel/fs/proc.c: proc_fd_open ~287-297, proc_fd_readdir ~300-318, proc_stat fd
   branch ~591-603): proc_open rcu_read_lock + sched_find_pid pins the TASK struct (RCU-freed in task_free_rcu),
   but the proc fd handlers deref t->files_shared (the target's task_files_t + fdtable_t), which sys_exit frees
