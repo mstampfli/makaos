@@ -1636,6 +1636,29 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (the four facts -- plain kfree at socket.c:248, unlocked deref+write in pcb_wake, unlocked set_file, wake_all
   writes wq->head -- all confirmed; RX/close are separate SMP threads); ruled out the txbuf/rxbuf ring overread
   (kmalloc(65536) rounds to a 128KiB buddy block, indices masked, copies clamped).
+  -> VERIFIED + FIXED (F95): confirmed all four facts AND that pcb_wake (tcp.c:213-215) runs inside the
+  tcp_recv (rcu 366-533) / tcp_timer_tick (rcu 544-590) reader sections, so RCU-deferring the FILE free is the
+  clean fix. KEY DISCOVERY (verify-all-angles): the UDP path has the SAME class -- sock_poll_wake (socket.c:140)
+  writes s->file->waitq from socket_deliver_udp's rcu_read_lock (socket.c:691), and s->file is the same
+  vfs_file_t (s->file = f at socket_open:303, f->ctx = s) freed by the same kfree(self) at 248 -- so ONE fix
+  covers both tcp and udp. And the fix is literally the EXISTING AF_UNIX discipline: unix_sock_free_rcu
+  (unix_sock.c:371) already frees s->file in its grace-period callback for exactly this reason ("peers reach it
+  via peer->file for poll wakeups ... freeing it here, not eagerly in unix_sock_close, closes the ->file UAF
+  window"); the AF_INET path simply MISSED it. FIX (do-it-right, ONE shared mechanism mirroring AF_UNIX): (1)
+  sock_free_rcu now frees s->file (== self) in the SAME grace period; (2) sock_close's main path no longer
+  kfree's self synchronously (the !s early-return, which has no RCU reader, still frees synchronously -- safe);
+  (3) tcp_pcb_set_file is now a __ATOMIC_RELEASE store and pcb_wake's sock_file load a __ATOMIC_ACQUIRE load, so
+  a reader either observes the file (covered by the grace period) or NULL (skips). UDP needs no extra ordering:
+  s->file is immutable after open and s is unpublished from the udp_table before the deferred free, so a reader
+  holding s under RCU keeps both s and s->file alive. VERIFICATION: a cross-CPU RX-vs-close UAF, not
+  deterministically reproducible -> code-proof (the file is now reclaimed ONLY via the grace period that the
+  pcb_wake/sock_poll_wake readers run under, same as F88/F89/AF-UNIX) + a deterministic invariant selftest
+  (sock_file_lifetime_selftest: opens an inet DGRAM socket, asserts s->file==f / f->ctx==s / type -- the
+  backptr the dual-free relies on -- then closes it through the deferred path; `[sock_file_life] PASS`) + the
+  close path is HEAVILY boot-exercised (DHCP uses UDP sockets open/close, so sock_close/sock_free_rcu run on the
+  boot path). Clean boot FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 65 selftests PASSED incl.
+  [sock_file_life], [socketpair], [scm_rights], [unix_refcount], [tcp_orphan], 0 FAILED/PANIC, no [WD], `More
+  login:` renders. This closes fan-out #5 candidate (gg).
   (hh) HIGH, malicious/buggy device -- virtio-net RX desc_id bounded against the wrong count: virtio_net_rx_poll
   (kernel/net/virtio_net.c ~434) validates the device-supplied used->ring[].id with virtio_desc_id_valid (~303,
   index_ok(id, VIRTQ_SIZE=256)), but only VIRTQ_SIZE/2=128 RX buffers are ever allocated (~583, i<VIRTQ_SIZE/2)

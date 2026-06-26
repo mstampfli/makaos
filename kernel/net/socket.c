@@ -221,6 +221,12 @@ static void sock_free_rcu(void* data) {
             skb = next;
         }
     }
+    // Free the socket's vfs_file_t in the SAME grace period (mirrors the
+    // AF_UNIX unix_sock_free_rcu discipline).  The TCP pcb_wake (pcb->sock_file)
+    // and UDP sock_poll_wake (s->file) readers load this file and write
+    // f->waitq inside rcu_read_lock, so freeing it here -- not eagerly in
+    // sock_close -- guarantees it outlives any such reader.
+    if (s->file) kfree(s->file);
     kfree(s);
 }
 
@@ -242,10 +248,13 @@ static void sock_close(vfs_file_t* self) {
     if (s->type == SOCK_DGRAM && s->bound)
         udp_table_remove(s->local_port);
 
-    // Expedited: this path is close() on an inet socket — user-syscall
-    // return blocks on the RCU grace period without it.
+    // Expedited: this path is close() on an inet socket -- user-syscall
+    // return blocks on the RCU grace period without it.  sock_free_rcu frees
+    // BOTH s and s->file (== self) after the grace period, so the vfs_file_t
+    // is deliberately NOT kfree'd here: a concurrent pcb_wake / sock_poll_wake
+    // reader that already loaded the file pointer inside rcu_read_lock would
+    // otherwise write through f->waitq after a synchronous free (UAF).
     call_rcu_expedited(sock_free_rcu, s);
-    kfree(self);
 }
 
 static int64_t sock_seek(vfs_file_t* self, int64_t offset, int whence) {
@@ -690,4 +699,36 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     // And any task sleeping in poll()/select() on this fd.
     sock_poll_wake(s);
     rcu_read_unlock();
+}
+
+// ── socket file-lifetime selftest ──────────────────────────────────────────
+// Deterministic check of the socket<->vfs_file_t backpointer invariant that
+// the RCU-deferred dual free relies on: a socket's vfs_file_t is reachable as
+// s->file and points back via f->ctx, so freeing s->file in sock_free_rcu (the
+// grace-period callback) frees exactly the file that the TCP pcb_wake / UDP
+// sock_poll_wake readers may still hold inside rcu_read_lock.  Also exercises
+// the close path so a regression that double-freed or leaked the file would
+// surface.  (The cross-CPU RX-vs-close race itself is not deterministically
+// reproducible; the fix is proven by this invariant + the code-proof that the
+// file is freed only via the grace period, like the AF_UNIX precedent.)
+void sock_file_lifetime_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* f = socket_open(AF_INET, SOCK_DGRAM);
+    if (!f) { kprintf("[sock_file_life] FAIL open\n"); return; }
+    socket_t* s = (socket_t*)f->ctx;
+    if (!s) {
+        fails++;
+    } else {
+        if (s->file != f)          fails++;   // the file sock_free_rcu frees
+        if (s->type != SOCK_DGRAM) fails++;
+    }
+    // Close: f (== s->file) is now reclaimed via the RCU grace period in
+    // sock_free_rcu, NOT synchronously here, so a late pcb_wake / sock_poll_wake
+    // reader stays safe.  Must not crash / double-free.
+    f->close(f);
+    if (fails)
+        kprintf("[sock_file_life] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf("[sock_file_life] PASS (s->file backptr consistent, RCU-deferred free)\n");
 }

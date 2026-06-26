@@ -617,6 +617,12 @@ static void init_kthread(void) {
     extern void timerfd_race_selftest(void);
     timerfd_race_selftest();
 
+    // inet socket file lifetime: the vfs_file_t is freed via the RCU grace
+    // period (sock_free_rcu), so a tcp pcb_wake / udp sock_poll_wake reader
+    // cannot write through a synchronously-freed file.
+    extern void sock_file_lifetime_selftest(void);
+    sock_file_lifetime_selftest();
+
     // Tier 1 #4 (socketpair): bidirectional AF_UNIX SOCK_STREAM pair.
     extern void socketpair_selftest(void);
     socketpair_selftest();

@@ -210,8 +210,12 @@ static void pcb_wake(tcp_pcb_t* pcb) {
         pcb->waiter = NULL;
         sched_wake(t);
     }
-    if (pcb->sock_file) {
-        vfs_file_t* f = (vfs_file_t*)pcb->sock_file;
+    void* sf = __atomic_load_n(&pcb->sock_file, __ATOMIC_ACQUIRE);
+    if (sf) {
+        // sf is the socket's vfs_file_t.  This wake runs inside the tcp_recv /
+        // tcp_timer_tick rcu_read_lock section, and sock_close defers the file
+        // free to sock_free_rcu, so f outlives this reader -- no UAF write.
+        vfs_file_t* f = (vfs_file_t*)sf;
         wait_queue_wake_all(f->waitq);
     }
 }
@@ -826,7 +830,11 @@ void tcp_pcb_set_waiter(tcp_pcb_t* pcb, void* waiter) {
 }
 
 void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file) {
-    if (pcb) pcb->sock_file = file;
+    // RELEASE store: (un)publishes the poll backpointer so a pcb_wake reader
+    // either observes the file (and is covered by the file's RCU grace period,
+    // sock_free_rcu) or observes NULL and skips the wake.  Pairs with the
+    // ACQUIRE load in pcb_wake.
+    if (pcb) __atomic_store_n(&pcb->sock_file, file, __ATOMIC_RELEASE);
 }
 
 uint32_t tcp_pcb_rx_used(const tcp_pcb_t* pcb) {
