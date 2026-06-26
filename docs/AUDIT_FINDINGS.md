@@ -2419,3 +2419,45 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     the headline remote DoS). Residual lower-severity leaks recorded above (ARP cache cap, AF_UNIX dgram cap,
     kthread PML4-on-OOM, boot-init error-path leaks, the TCP listener-close orphan reaping + per-listener cap).
     Next: BUG-TYPE SCAN #7 (NULL-deref / unchecked-allocation) -- or pick off a residual leak if higher-value.
+
+- 2026-06-27 BUG-TYPE SCAN #7 (NULL-deref / unchecked-allocation): an alloc/lookup result deref'd without a NULL/
+  not-found check -> a kernel #PF panic (DoS). Swept the whole tree with 4 parallel read-only agents (net; fs+vfs;
+  drivers+io; mm+proc). The ONLY unprivileged/remote-reachable NULL-deref was the headline -- FIXED (F120); the
+  rest are OOM-only-kernel-path or dead code, recorded for follow-up.
+  FIXED (F120): virtio_net_rx_poll NULL skb -> eth_recv(NULL) #PF (kernel/net/virtio_net.c + net.c). On skb_alloc
+    OOM the function set *skb_out=NULL but still returned 1 ("packet ready"), and net_rx_thread fed that NULL
+    straight into eth_recv, which derefs skb->len -> kernel #PF; OOM-triggered but on the universal RX dispatch
+    path (a remote peer driving RX load under memory pressure makes every received frame hit it). FIX: restructured
+    the poll into a loop that drops an OOM-failed (or bogus-desc-id) packet -- recycling its descriptor so the RX
+    ring does not leak -- and CONTINUES to the next used entry, so it only ever returns 1 with a VALID skb (the
+    "return 1 => valid skb" contract is now sound, so a future caller cannot reintroduce the bug). Verified by the
+    DHCP lease (the OFFER/ACK are received through the new loop -> ifconfig IP 10.0.2.15) + code-proof (the
+    `if (!skb) continue` drop path).
+  RECORDED (OOM-only / boot-init / dead code -- NOT unprivileged-reachable, lower priority):
+    vmm_map_mmio 0-on-exhaustion (F116) deref'd without a 0-check at boot-init MMIO sites: ioapic.c:127 s_base,
+      nvme.c:682 s_regs + :622 s_msix_table, ahci.c:1023 s_hba + :1102 s_msix_entry, virtio_net.c:712 msix_table --
+      the window never exhausts today (1 TiB), so latent; fix = `if (!ptr) return 0/-ENODEV;` after each (mirror
+      hda.c:391 / virtio_input.c:331 / virtio_gpu.c:472 which already do).
+    task_create_kthread (process.c:292) passes vmm_alloc_pml4() into task_mm_alloc with NO == PMM_INVALID_ADDR
+      check -> on OOM pml4_phys = UINT64_MAX -> context_switch loads CR3=UINT64_MAX -> #GP/triple-fault (OOM, kernel
+      kthread create only, privileged). Fix: check `p == PMM_INVALID_ADDR` before task_mm_alloc (mirror task_fork).
+    task_create_user (process.c:326/327) unchecked vmm_alloc_pml4 + mm_create -> NULL/wild use (OOM, DEAD code --
+      no live callers). fat32_open (fat32.c:239-249) derefs f/fd without NULL checks (OOM, DEAD -- fat32 unwired,
+      no VFS hookup).
+    WRONG SENTINEL (not NULL-deref but a sibling wild-pointer bug, boot-init): several DMA-buffer callers test
+      `if (!phys)` for pmm_buddy_alloc OOM, but it returns PMM_INVALID_ADDR=UINT64_MAX (not 0), so the check misses
+      and `phys + HHDM_OFFSET` wraps to a wild non-NULL pointer -> a wild write on OOM (hda.c:412/428/461/468/479,
+      virtio_input.c:362-363, ahci/ac97/virtio_gpu DMA sites). The correct idiom (== PMM_INVALID_ADDR) is already
+      used at io_uring.c:231 / drm.c:526 / nvme.c:722. Candidate for a sentinel-correctness sweep.
+  AUDITED CLEAN: net (every skb_alloc/kmalloc/pcb_find/ns_find/udp_table_find NULL-checked or has the miss branch;
+    udp/tcp skb_put are safe-by-construction sized-to-fit), fs+vfs (vfs_alloc_file/dentry/eventfd/timerfd/signalfd/
+    pipe/proc + epoll/poll/select all check-then-rollback; ext2/dcache lookups have the miss branch; the
+    check-then-rollback ext2_open_by_ino is the pattern fat32 fails to follow), drivers (pty/evdev/drm/io_uring/tty
+    per-open allocs all checked; drm find_dumb/find_fb/find_prop callers all check; io_uring pmm == PMM_INVALID_ADDR
+    + sqe_fdget checked), mm+proc (elf malformed-ELF bounds-gated; page-fault/demand-page mm + g_current guarded;
+    every pmm_buddy_alloc checked == PMM_INVALID_ADDR; shmem/mm/signal/futex/sched lookups have the miss branch;
+    kstack_alloc PANICS on OOM so its unchecked callers are clean-by-design). The subsystem is overwhelmingly
+    check-then-error.
+  SCAN #7 SUBSTANTIALLY COMPLETE: the only unprivileged/remote NULL-deref (virtio_net RX) FIXED (F120). Residuals
+    (the boot-init vmm_map_mmio 0-checks + the PMM_INVALID_ADDR wrong-sentinel sweep + task_create_kthread) are
+    recorded. Next: BUG-TYPE SCAN #8-as-a-type.

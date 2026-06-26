@@ -431,58 +431,73 @@ int virtio_net_tx(const void* data, uint16_t len) {
 int virtio_net_rx_poll(skbuff_t** skb_out) {
     if (!s_ok) return 0;
 
-    __asm__ volatile("lfence" ::: "memory");
-    if (s_rxq.used->idx == s_rxq.last_used_idx) return 0;  // nothing received
-    serial_puts_dbg("[virtio] rx packet!\n");
+    // Loop over used entries so a DROPPED packet (skb_alloc OOM, or a bogus
+    // device-invented desc id) does NOT end the drain and is NEVER handed back
+    // as a NULL skb.  The old code returned 1 with *skb_out==NULL on skb_alloc
+    // failure under RX memory pressure, and net_rx_thread fed that NULL straight
+    // into eth_recv -> a kernel NULL-deref #PF (a remote-driven, OOM-triggered
+    // DoS).  We only ever return 1 with a VALID skb here.
+    for (;;) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (s_rxq.used->idx == s_rxq.last_used_idx) return 0;  // nothing received
+        serial_puts_dbg("[virtio] rx packet!\n");
 
-    uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
-    uint32_t desc_id   = s_rxq.used->ring[used_slot].id;
-    uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
-    s_rxq.last_used_idx++;   // advance first so a bad entry can't wedge the ring
+        uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
+        uint32_t desc_id   = s_rxq.used->ring[used_slot].id;
+        uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
+        s_rxq.last_used_idx++;   // advance first so a bad entry can't wedge the ring
 
-    // desc_id is written by the device and indexes s_rx_bufs[] (the memcpy
-    // source) and s_rxq.desc[].  Only VIRTQ_NUM_RX_BUFS s_rx_bufs[] entries are
-    // populated -- those are the only RX descriptors we posted -- so use the
-    // TIGHTER rx bound, not the full-ring virtio_desc_id_valid: an id the device
-    // invented in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) has a {NULL, 0} buffer slot,
-    // which would memcpy from NULL and re-post a descriptor at physical frame 0.
-    // Drop the bogus completion: do not index the tables and do not re-post it.
-    if (!virtio_rx_id_valid(desc_id)) return 0;
+        // desc_id is written by the device and indexes s_rx_bufs[] (the memcpy
+        // source) and s_rxq.desc[].  Only VIRTQ_NUM_RX_BUFS s_rx_bufs[] entries
+        // are populated -- those are the only RX descriptors we posted -- so use
+        // the TIGHTER rx bound, not the full-ring virtio_desc_id_valid: an id the
+        // device invented in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) has a {NULL, 0}
+        // buffer slot, which would memcpy from NULL and re-post a descriptor at
+        // physical frame 0.  Drop the bogus completion (do NOT index the tables
+        // or re-post it) and move to the next used entry.
+        if (!virtio_rx_id_valid(desc_id)) continue;
 
-    // The packet starts after the virtio-net header.
-    uint8_t* raw    = s_rx_bufs[desc_id].virt;
-    uint32_t eth_len = (pkt_len > VIRTIO_NET_HDR_LEN)
-                       ? (pkt_len - VIRTIO_NET_HDR_LEN) : 0;
-    // CLAMP against the actual RX buffer payload — pkt_len comes straight
-    // from the device-written used ring and is otherwise untrusted.  The
-    // source buffer holds at most ETH_MAX_FRAME payload bytes; a device
-    // reporting more would make the memcpy over-read past the source page
-    // into adjacent kernel memory (info leak / corruption).
-    if (eth_len > ETH_MAX_FRAME) eth_len = ETH_MAX_FRAME;
+        // The packet starts after the virtio-net header.
+        uint8_t* raw    = s_rx_bufs[desc_id].virt;
+        uint32_t eth_len = (pkt_len > VIRTIO_NET_HDR_LEN)
+                           ? (pkt_len - VIRTIO_NET_HDR_LEN) : 0;
+        // CLAMP against the actual RX buffer payload -- pkt_len comes straight
+        // from the device-written used ring and is otherwise untrusted.  The
+        // source buffer holds at most ETH_MAX_FRAME payload bytes; a device
+        // reporting more would make the memcpy over-read past the source page
+        // into adjacent kernel memory (info leak / corruption).
+        if (eth_len > ETH_MAX_FRAME) eth_len = ETH_MAX_FRAME;
 
-    skbuff_t* skb = skb_alloc(eth_len);
-    if (skb && eth_len > 0) {
-        uint8_t* dst = (uint8_t*)skb_put(skb, eth_len);
-        __builtin_memcpy(dst, raw + VIRTIO_NET_HDR_LEN, eth_len);
+        skbuff_t* skb = skb_alloc(eth_len);
+        if (skb && eth_len > 0) {
+            uint8_t* dst = (uint8_t*)skb_put(skb, eth_len);
+            __builtin_memcpy(dst, raw + VIRTIO_NET_HDR_LEN, eth_len);
+        }
+
+        // Return the descriptor to the avail ring REGARDLESS (even on skb_alloc
+        // OOM) so the device gets the buffer back and the RX ring does not leak
+        // descriptors.
+        s_rxq.desc[desc_id].addr  = s_rx_bufs[desc_id].phys;
+        s_rxq.desc[desc_id].len   = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME;
+        s_rxq.desc[desc_id].flags = VIRTQ_DESC_F_WRITE;
+        s_rxq.desc[desc_id].next  = 0;
+        s_rxq.avail->ring[s_rxq.avail_idx & (VIRTQ_SIZE - 1)] = (uint16_t)desc_id;
+        s_rxq.avail_idx++;
+        __asm__ volatile("mfence" ::: "memory");
+        s_rxq.avail->idx = s_rxq.avail_idx;
+        __asm__ volatile("mfence" ::: "memory");
+        // Notify device that avail ring has new entries (queue 0 = RX).
+        volatile uint16_t* notify_reg =
+            (volatile uint16_t*)(s_notify + s_rxq.notify_off * s_notify_mult);
+        *notify_reg = 0;
+
+        // skb_alloc OOM: the packet is dropped (its descriptor was recycled
+        // above) -- skip it; never hand a NULL skb to eth_recv.
+        if (!skb) continue;
+
+        *skb_out = skb;
+        return 1;
     }
-
-    // Return the descriptor to the avail ring so the device can reuse it.
-    s_rxq.desc[desc_id].addr  = s_rx_bufs[desc_id].phys;
-    s_rxq.desc[desc_id].len   = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME;
-    s_rxq.desc[desc_id].flags = VIRTQ_DESC_F_WRITE;
-    s_rxq.desc[desc_id].next  = 0;
-    s_rxq.avail->ring[s_rxq.avail_idx & (VIRTQ_SIZE - 1)] = (uint16_t)desc_id;
-    s_rxq.avail_idx++;
-    __asm__ volatile("mfence" ::: "memory");
-    s_rxq.avail->idx = s_rxq.avail_idx;
-    __asm__ volatile("mfence" ::: "memory");
-    // Notify device that avail ring has new entries (queue 0 = RX).
-    volatile uint16_t* notify_reg =
-        (volatile uint16_t*)(s_notify + s_rxq.notify_off * s_notify_mult);
-    *notify_reg = 0;
-
-    *skb_out = skb;
-    return 1;
 }
 
 const uint8_t* virtio_net_mac(void) { return s_mac; }
