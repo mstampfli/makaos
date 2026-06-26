@@ -222,6 +222,10 @@ typedef struct io_uring {
     struct io_overflow_cqe* overflow_head;
     struct io_overflow_cqe* overflow_tail;
     spinlock_t              overflow_lock;
+    // Number of nodes on the overflow list.  Capped at IO_URING_OVERFLOW_MAX so
+    // a ring that never reaps its CQ cannot grow the list without bound (a
+    // kernel-memory DoS); drained to 0 at close so the list is never leaked.
+    uint32_t                overflow_count;
 
     // Kernel-side aliases (HHDM) into the backing memory — lets the
     // kernel read/write ring fields without going through the user

@@ -33,6 +33,12 @@ extern uint64_t tsc_read_ns(void);
 
 #define IO_URING_MIN_ENTRIES 1u
 #define IO_URING_MAX_ENTRIES 4096u
+// Cap on the CQ-overflow list length.  A ring whose CQ is full spills extra
+// completions onto a kmalloc'd singly-linked list; an unprivileged ring that
+// never reaps its CQ would otherwise grow it without bound (kernel-memory DoS).
+// Past the cap, completions drop + bump the user-visible overflow counter (the
+// same last-resort behavior as the OOM branch).  ~96 KiB max overflow per ring.
+#define IO_URING_OVERFLOW_MAX 4096u
 
 // Forward declarations for helpers used across phases.
 static int     io_sqp_spawn(io_uring_t* uring);
@@ -181,6 +187,19 @@ void io_uring_close_file(struct vfs_file_t* f) {
                             uring->user_vaddr + uring->backing_bytes);
             uring->user_vaddr = 0;
         }
+        // Drain any pending CQ-overflow nodes -- the drain-on-post path is the
+        // ONLY other freer and it only runs while the ring is open, so a ring
+        // closed with a non-empty overflow list would leak every node.  The
+        // SQPOLL + worker kthreads are joined above and the fd is gone, so no
+        // poster races this (the overflow_lock is taken for symmetry).
+        {
+            uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
+            struct io_overflow_cqe* n = uring->overflow_head;
+            while (n) { struct io_overflow_cqe* nx = n->next; kfree(n); n = nx; }
+            uring->overflow_head = uring->overflow_tail = NULL;
+            uring->overflow_count = 0;
+            spin_unlock_irqrestore(&uring->overflow_lock, of);
+        }
         // Now that no mapping aliases them, return the backing pages.
         uint8_t order = 0;
         while ((1ULL << order) < npg) order++;
@@ -244,6 +263,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
     spin_lock_init(&uring->fixed_files_lock);
     uring->overflow_head = NULL;
     uring->overflow_tail = NULL;
+    uring->overflow_count = 0;
     spin_lock_init(&uring->overflow_lock);
 
     // Kernel-side HHDM aliases — read/write these directly, no fault.
@@ -351,6 +371,7 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
 
             uring->overflow_head = n->next;
             if (!uring->overflow_head) uring->overflow_tail = NULL;
+            uring->overflow_count--;
             kfree(n);
         }
         spin_unlock_irqrestore(&uring->overflow_lock, of);
@@ -360,9 +381,19 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
     uint32_t head = __atomic_load_n(&uring->cq_hdr->head, __ATOMIC_ACQUIRE);
 
     if ((tail - head) >= uring->cq_entries) {
-        // CQ still full — push onto overflow list instead of
-        // dropping.  Bump the user-visible overflow counter as a
-        // hint (userspace can monitor it to throttle submissions).
+        // CQ still full -- push onto the overflow list instead of dropping.
+        // BUT cap the list: a ring that never reaps its CQ would otherwise grow
+        // it without bound (kernel-memory DoS).  Past the cap, drop + count
+        // (the same last-resort behavior as the OOM branch below); userspace
+        // sees cq_hdr->overflow and reaps.
+        if (uring->overflow_count >= IO_URING_OVERFLOW_MAX) {
+            uring->cq_hdr->overflow++;
+            spin_unlock_irqrestore(&uring->cq_lock, f);
+            wait_queue_wake_all(&uring->waitq);
+            return;
+        }
+        // Bump the user-visible overflow counter as a hint (userspace can
+        // monitor it to throttle submissions).
         struct io_overflow_cqe* n = (struct io_overflow_cqe*)
             kmalloc(sizeof(*n));
         if (!n) {
@@ -381,6 +412,7 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
         if (uring->overflow_tail) uring->overflow_tail->next = n;
         else                      uring->overflow_head = n;
         uring->overflow_tail = n;
+        uring->overflow_count++;
         spin_unlock_irqrestore(&uring->overflow_lock, of);
 
         uring->cq_hdr->overflow++;

@@ -2352,3 +2352,57 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       evictor is wired up. Fix: gate the dec+free on a found flag.
   SCAN #5 IN PROGRESS: the reachable double-free (sys_pipe) is FIXED (F117); the rest of the class is audited clean.
     No other reachable double-free remains -> SCAN #5 effectively COMPLETE; advance to SCAN #6 next turn.
+
+- 2026-06-27 BUG-TYPE SCAN #6 (resource-leak / exhaustion): an alloc/get never freed/put on a reachable path,
+  especially a remotely/unprivileged-triggerable UNBOUNDED leak (DoS). Swept the whole tree with 4 parallel
+  read-only agents (net; fs+vfs; drivers+io; mm+proc). Several real leaks found; FIXED the io_uring CQ-overflow
+  leak (F118 -- clean, boot-verifiable, in-class). The HIGHEST-severity finding (the remote TCP SYN-flood leak) is
+  recorded with its full design below for a DEDICATED careful turn (it has real SMP-synchronization subtleties --
+  rushing it would introduce a UAF, worse than the leak).
+  FIXED (F118): io_uring CQ-overflow list (kernel/io/io_uring.c) -- TWO sub-bugs, both unprivileged-local: (a)
+    UNBOUNDED GROWTH -- io_uring_post_cqe pushes a kmalloc'd node onto overflow_head whenever the CQ ring is full,
+    with NO cap; a process that submits ops and never reaps its CQ grows the list without bound (kernel-memory
+    DoS); (b) LEAK ON CLOSE -- io_uring_close_file frees the ring but never drains overflow_head (the only freer is
+    the drain-on-post in a SUBSEQUENT post_cqe, which never runs after close), so a ring closed with a non-empty
+    list leaks every node. FIX: added overflow_count + IO_URING_OVERFLOW_MAX (4096, ~96 KiB/ring) -- past the cap,
+    post_cqe drops + bumps the user-visible overflow counter (same as the OOM branch); io_uring_close_file now
+    drains the list (kfree each node) before kfree(uring), under overflow_lock (the SQPOLL+worker kthreads are
+    joined and the fd is gone, so no poster races). overflow_count is touched only inside post_cqe's cq_lock
+    section (cap read + inc/dec under the nested overflow_lock), so no race. Verified by [io_uring_test] (create/
+    enter/complete/close) + clean boot.
+  RECORDED -- HEADLINE for a DEDICATED turn (TCP half-open SYN-flood leak, kernel/net/tcp.c -- REMOTE unauth
+    UNBOUNDED, ~128 KiB/half-open, the single highest-severity finding of the whole campaign): a TCP_SYN_RCVD child
+    (tcp_pcb_alloc + 64 KiB txbuf + 64 KiB rxbuf, published on s_pcb_head) is NEVER freed if the final ACK never
+    arrives -- tcp_timer_tick rewinds + resends the SYN-ACK forever with NO retransmit cap / RTO timeout (no
+    counter field in struct tcp_pcb), and the ONLY tcp_pcb_free callers are in socket.c (PCBs that own an fd); a
+    SYN_RCVD child has sock_file==NULL and no fd, so nothing frees it. Plus tcp_pcb_free of a listener only NULLs
+    child->listener (the F-fix for the late-ACK UAF), orphaning completed-but-unaccepted children in accept_queue
+    forever. FIX DESIGN (verified, and the SUBTLETIES that make it a careful change, NOT a tight rush): add a
+    `uint8_t rexmit` to the pcb; in tcp_timer_tick cap SYN_RCVD-orphan retransmits and reap past the cap. CRITICAL
+    SUBTLETIES discovered: (1) tcp_timer_tick walks s_pcb_head UNDER rcu_read_lock, but tcp_pcb_free calls
+    call_rcu_expedited -> synchronize_rcu_expedited, which PANICS if called with preempt disabled / under a reader
+    section -- so you CANNOT free inside the walk; mark-then-reap-after-rcu_read_unlock is required (or collect via
+    a separate link field). (2) tcp_timer_tick (net_tcp_timer_thread) reaping a SYN_RCVD child RACES the rx thread
+    (net_rx_thread) completing the handshake (SYN_RCVD->ESTABLISHED + accept_queue push); a reap that does not
+    re-check state under a lock (s_pcb_wlock) would free a now-VALID connection (UAF / lost conn). So the reap
+    decision + unlink must be atomic with the state transition -- the state machine needs real synchronization.
+    Because a half-baked version introduces a UAF (worse than the leak), this is deferred to a dedicated turn with
+    a proper design + a deterministic reap selftest (alloc SYN_RCVD orphan -> set rexmit=cap -> tick -> assert
+    reaped via an on-list check, all single-threaded so no synchronize_rcu_expedited deadlock). TCP is NOT
+    boot-exercised (DHCP is UDP), so the selftest is essential.
+  RECORDED (lower-severity leaks, for follow-up): ARP cache no eviction/cap (arp.c -- remote on-link, unbounded,
+    ~16 B/entry; add LRU/aging + a cap); AF_UNIX SOCK_DGRAM queue no cap (unix_sock.c unix_sock_sendto -- the lone
+    uncapped AF_UNIX queue; add UNIX_DGRAM_QUEUE_MAX like UDP_RX_QUEUE_MAX); task_create_kthread leaks the PML4
+    frame on task_mm_alloc OOM (process.c -- error-only, bounded, one frame; mirror task_fork's pmm_buddy_free
+    cleanup; task_create_user has the same shape but no live callers); nvme/hda/virtio_input/ahci boot-init
+    error-path leaks of already-allocated DMA/MMIO (error-only, one-shot at boot, bounded); nvme idbuf/smoke-test
+    page leaked even on success (one page/boot).
+  AUDITED CLEAN: net skb/sock/pcb (freed on every path; the leak is the unbounded half-open table, not the skbs);
+    fs+vfs (vfs_alloc_file/dentry/eventfd/timerfd/signalfd/pipe/epoll/ext2-scratch all freed on all paths incl.
+    error; dcache + irtree caches have eviction caps + shrinkers; fd_install contract honored); drivers (pty/evdev/
+    drm per-open ctx freed on close + error; io_uring instance/fixed_files/work-nodes freed on all paths EXCEPT the
+    overflow list = F118); mm+proc (task_fork/sys_thread/exec/elf error paths free pml4+mm+files; pid_alloc 1:1
+    with pid_free incl. fork allocating the pid LAST; futex waiters stack-resident + always unlinked; VMA/shmem/
+    pcache/page-fault refs balanced; no unprivileged pid/frame exhaustion path). All refcounts u32 -- no wrap.
+  SCAN #6 IN PROGRESS: io_uring overflow leak FIXED (F118). NEXT (dedicated turn): the TCP half-open SYN-flood
+    leak (the headline -- remote unauth, but needs the careful synchronized reaper above).
