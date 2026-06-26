@@ -1621,6 +1621,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   tlb_flush_mm as defense-in-depth (but insufficient alone -- the sibling's CR3 still points at the freed PML4,
   so the threads must actually be gone). agent CONFIDENCE HIGH (read sys_exec 911-1138, no refs==1 gate / no
   shootdown / no thread-kill).
+  -> VERIFIED + FIXED (F97): confirmed sys_exec's commit block (syscall.c ~1072-1081) does the in-place swap
+  (mm_shared->pml4_phys = new_pml4) + vmm_switch (current CPU's CR3 only) + vmm_free_user_ex(old_pml4) +
+  pmm_buddy_free(old_pml4) with NO sibling-kill and NO TLB shootdown (the comment reasons only about the
+  single-threaded current-CPU case); confirmed sys_thread + THREAD_SHARE_MM (~1458-1460) shares the SAME
+  task_mm_t and bumps refs to 2; confirmed the clone-without-share path (~1474) and fork (~550) DO tlb_flush_mm
+  (the contrast). KEY REFINEMENT (the recorded "spin until mm_shared->refs == 1" is UNSAFE): a killed sibling
+  drops its mm ref only in task_free_rcu (process.c:382) -- AFTER an RCU grace period -- so g_current spinning
+  on refs==1 inside the exec syscall could stall that grace period and DEADLOCK. So the fix must NOT wait. FIX
+  (do-it-right, additive + zero-risk to the proven common path): keep the sole-owner (refs==1) in-place-swap +
+  direct-free path UNCHANGED (every boot exec is single-threaded, so the boot-critical path is untouched); for a
+  SHARED mm (refs > 1) detach onto a FRESH task_mm_t (task_mm_alloc(new_pml4,new_mm)), SIGKILL the thread group
+  (signal_send_group, then clear g_current's OWN pending SIGKILL since sig_group_visit also targets it), point
+  g_current at the fresh mm, vmm_switch, and task_mm_release the old shared mm -- which does NOT free old_pml4
+  here (siblings still hold refs) but lets task_mm_release free it when the last SIGKILL'd sibling exits
+  (refs -> 0). So old_pml4 stays live while any sibling references it: no UAF, no spin, no deadlock. Reused the
+  EXISTING refcount-based free (task_mm_release), the "one shared mechanism" the prime directive wants. RESIDUAL
+  (correctness, not safety -- recorded in docs/SCALABILITY_DEBT.md): tgid/leader identity is left unchanged, so
+  the rare NON-leader execve leaves a tgid pointing at the reaped old leader instead of doing the full POSIX
+  de_thread leader-switch (benign -- no UAF; the surviving thread runs the new image). VERIFICATION: the refs>1
+  branch is INERT at boot (all boot execs are single-threaded) so not end-to-end testable there -> a
+  DETERMINISTIC threshold selftest (exec_mm_teardown_selftest: only refs==1 frees in place; refs 2/8/0 take the
+  detach path) + rigorous code-proof + a clean boot that exercises the UNCHANGED sole-owner path on EVERY
+  program launch (init/login/bash/net all execve). `[exec_mm] PASS (only sole-owner frees old pml4 in place)`.
+  Clean boot FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 67 selftests PASSED incl. [exec_mm] and
+  the neighbouring [task_exit_state] / [signal_send_pid], 0 FAILED/PANIC, no [WD], `More login:` renders. (Note:
+  the session scratchpad had been wiped, so the boot harness bootclean.sh/shot.py/OVMF_VARS were recreated this
+  turn.) This closes fan-out #5 candidate (ff).
   (gg) HIGH, remote-triggerable -- pcb_wake UAF write of the socket's vfs_file_t: pcb_wake (kernel/net/tcp.c
   ~213-215) loads f = pcb->sock_file then wait_queue_wake_all(f->waitq) which does __atomic_exchange_n(&wq->head,
   ...) = a WRITE; it runs from the net RX thread / TCP timer thread on any segment/timer for the pcb. sock_close

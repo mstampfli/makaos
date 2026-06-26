@@ -896,6 +896,31 @@ fail:
     return rc;
 }
 
+extern void signal_send_group(uint32_t tgid, int sig);
+
+// exec address-space teardown decision.  Sole owner of the task_mm_t
+// (refs == 1, the single-threaded common case) frees the old pml4 in place;
+// a SHARED mm (refs > 1, a multithreaded process) must NOT free the old pml4
+// out from under sibling threads still running on it -- it detaches onto a
+// fresh mm and lets the refcount free the old one when the siblings exit.
+static inline int exec_mm_sole_owner(uint32_t refs) { return refs == 1u; }
+
+// Deterministic check of the exec teardown threshold: ONLY refs==1 takes the
+// in-place free-old-pml4 path; refs>=2 (any sibling thread) takes the detach +
+// kill + refcount-defer path that prevents the cross-domain page-table UAF.
+void exec_mm_teardown_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    if (exec_mm_sole_owner(1) != 1) fails++;   // sole owner -> free in place
+    if (exec_mm_sole_owner(2) != 0) fails++;   // one sibling -> must NOT free
+    if (exec_mm_sole_owner(8) != 0) fails++;   // many siblings -> must NOT free
+    if (exec_mm_sole_owner(0) != 0) fails++;   // defensive (refs==0 impossible)
+    if (fails)
+        kprintf_atomic("[exec_mm] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[exec_mm] PASS (only sole-owner frees old pml4 in place)\n");
+}
+
 // ── sys_exec (execve) ─────────────────────────────────────────────────────
 // execve(path_ptr, argv_ptr, envp_ptr)
 //
@@ -1069,16 +1094,54 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // upper-half mappings (vmm_alloc_pml4 copied PML4[256..511]), so the
     // kernel keeps running across the switch and the remaining exec code
     // touches only kernel state — never the old lower-half image.
-    phys_addr_t old_pml4 = g_current->mm_shared->pml4_phys;
-    mm_t*       old_mm   = g_current->mm_shared->mm;
+    // MULTITHREADED exec (sibling THREAD_SHARE_MM threads share this task_mm_t
+    // and run on other CPUs with CR3 == old_pml4): the in-place swap + direct
+    // free below would change the address space out from under them AND return
+    // their page tables to the buddy allocator while their hardware walkers
+    // still walk them -- a cross-domain use-after-free / LPE.  POSIX requires
+    // exec to terminate every OTHER thread first.  We do NOT spin waiting for
+    // them to die: a killed sibling drops its mm ref only in task_free_rcu
+    // (after a grace period), and g_current spinning in this syscall could
+    // stall that grace period -> deadlock.  Instead, when we are not the sole
+    // owner, detach onto a FRESH task_mm_t and let the OLD one be freed by its
+    // refcount once the (now SIGKILL'd) siblings exit -- old_pml4 stays live
+    // while any sibling references it, so there is no UAF and no wait.
+    if (!exec_mm_sole_owner(__atomic_load_n(&g_current->mm_shared->refs,
+                                            __ATOMIC_ACQUIRE))) {
+        task_mm_t* fresh = task_mm_alloc(new_pml4, new_mm);
+        if (!fresh) {
+            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); mm_destroy(new_mm);
+            return (uint64_t)-ENOMEM;
+        }
+        // SIGKILL every thread in the group; sig_group_visit also targets
+        // g_current, so clear our OWN pending SIGKILL -- we are the surviving
+        // thread and must complete the exec.  (tgid/leader identity is left as
+        // is: for the common leader-exec case g_current is already its group's
+        // sole survivor; a non-leader exec leaving a tgid pointing at the
+        // reaped leader is a benign residual -- the full POSIX leader-switch is
+        // future work, see docs/SCALABILITY_DEBT.md.)
+        signal_send_group(g_current->tgid, SIGKILL);
+        __atomic_and_fetch(&g_current->sigstate.pending,
+                           ~(1u << (SIGKILL - 1)), __ATOMIC_ACQ_REL);
+        task_mm_t* old_shared = g_current->mm_shared;
+        g_current->mm_shared  = fresh;
+        vmm_switch(new_pml4);   // CR3 = new_pml4 on THIS cpu
+        // Drop OUR ref on the old shared mm.  Siblings still hold refs, so this
+        // does NOT free old_pml4 here; task_mm_release frees it once the last
+        // SIGKILL'd sibling exits (refs -> 0).  No direct free, no spin.
+        task_mm_release(old_shared);
+    } else {
+        phys_addr_t old_pml4 = g_current->mm_shared->pml4_phys;
+        mm_t*       old_mm   = g_current->mm_shared->mm;
 
-    g_current->mm_shared->pml4_phys = new_pml4;
-    g_current->mm_shared->mm        = new_mm;
-    vmm_switch(new_pml4);   // CR3 = new_pml4; old hierarchy now unreferenced
+        g_current->mm_shared->pml4_phys = new_pml4;
+        g_current->mm_shared->mm        = new_mm;
+        vmm_switch(new_pml4);   // CR3 = new_pml4; old hierarchy now unreferenced
 
-    vmm_free_user_ex(old_pml4, old_mm);   // safe: no CPU walks old_pml4 now
-    pmm_buddy_free(old_pml4, 0);
-    mm_destroy(old_mm);
+        vmm_free_user_ex(old_pml4, old_mm);   // safe: sole owner, no CPU walks old_pml4 now
+        pmm_buddy_free(old_pml4, 0);
+        mm_destroy(old_mm);
+    }
 
     // ── setuid-on-exec ────────────────────────────────────────────────────
     // The exec is now COMMITTED (new address space installed, old freed), so a

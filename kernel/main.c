@@ -674,6 +674,11 @@ static void init_kthread(void) {
     extern void signal_send_pid_selftest(void);
     signal_send_pid_selftest();
 
+    // exec teardown: a multithreaded exec must not free the old page tables
+    // while sibling threads still run on them (cross-domain page-table UAF/LPE).
+    extern void exec_mm_teardown_selftest(void);
+    exec_mm_teardown_selftest();
+
     // TCP ring-drain arithmetic + underflow clamp (T4 defense-in-depth).
     extern void tcp_ring_consume_selftest(void);
     tcp_ring_consume_selftest();

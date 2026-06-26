@@ -361,3 +361,28 @@ battery PASSES — chaselev (0 duplicates), slab_test (200k allocs, hit rate
 double-alloc detector), typesafe/dcache/io_uring/eventfd/timerfd/socketpair/
 scm_rights/signalfd/drm-mock — all PASS, with no `[pmm] DOUBLE-ALLOC`, no #GP,
 no RCU stall.  Safe to enable by default if the boot-time cost is acceptable.
+
+---
+
+## execve in a multithreaded process: full POSIX leader-switch not done (F97)
+
+F97 closed the cross-domain page-table UAF/LPE where a multithreaded exec freed
+the old PML4 hierarchy while sibling THREAD_SHARE_MM threads still ran on it.
+The fix (kernel/syscall/syscall.c, sys_exec): when g_current is NOT the sole
+owner of its task_mm_t (refs > 1), it SIGKILLs the thread group, detaches
+g_current onto a FRESH task_mm_t, and drops its ref on the old shared mm -- so
+old_pml4 is freed by task_mm_release only when the last killed sibling exits
+(no spin/deadlock, no UAF).  This is SECURITY-COMPLETE (the LPE is closed).
+
+REMAINING (correctness, not safety): the full POSIX de_thread leader-switch is
+NOT implemented.  g_current's tgid/leader identity is left unchanged.  For the
+common case (the group LEADER calls execve) this is already correct -- g_current
+stays its group's sole survivor with tgid == pid.  For the rare case where a
+NON-leader thread calls execve, g_current keeps a tgid pointing at the (now
+SIGKILL'd, soon-reaped) old leader, instead of becoming the new leader and
+taking over the leader pid.  That is a benign residual (no UAF; the surviving
+thread runs the new image), but POSIX would have the exec'ing thread assume the
+leader identity.  The proper fix needs the tgid-index re-key + child-list /
+waitpid reparenting (a de_thread).  This path is INERT at boot (every boot exec
+is single-threaded, refs == 1), so it is untestable by the boot battery; the
+[exec_mm] selftest covers the sole-owner-vs-shared decision threshold.
