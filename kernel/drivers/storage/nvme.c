@@ -43,6 +43,11 @@
 #define NVME_REG_ACQ        0x0030  // Admin CQ Base Address (RW, 64b)
 // Doorbells start at 0x1000, stride = 4 << (CAP.DSTRD).
 // SQyTDBL at 0x1000 + 2*y*stride; CQyHDBL at 0x1000 + (2*y+1)*stride.
+// The doorbell offset scales with the device-reported CAP.DSTRD and the queue
+// id, so BAR0 is mapped to cover the highest doorbell we may write (qid up to
+// MAX_CPUS); a controller advertising a stride that would need more than this
+// is refused rather than allowed to drive an MMIO store past the mapping.
+#define NVME_BAR0_MAX_MAP   0x100000u   // 1 MiB ceiling on the BAR0 doorbell map
 
 // ── CC (Controller Configuration) bit layout ────────────────────────────
 #define CC_EN              (1u << 0)   // Enable
@@ -691,6 +696,24 @@ uint8_t nvme_init(void) {
     kprintf("[nvme] VS=%x.%x.%x CAP_lo=%x CAP_hi=%x mqes=%u dstrd_field=%u stride=%u\n",
             (vs >> 16) & 0xFFFF, (vs >> 8) & 0xFF, vs & 0xFF,
             cap_lo, cap_hi, s_max_qentries, dstrd, s_doorbell_stride);
+
+    // Size the BAR0 mapping to cover the doorbells of every I/O queue we may
+    // create.  The highest doorbell is cq_doorbell(MAX_CPUS) = 0x1000 +
+    // (2*MAX_CPUS + 1)*stride; the stride is the device-reported 4 << CAP.DSTRD,
+    // so the fixed 0x2000 map above is overrun once DSTRD is large enough -- an
+    // OOB MMIO store at the sq/cq_doorbell write sites.  Remap over the real
+    // extent before any doorbell is touched (the admin queue setup below writes
+    // the qid-0 doorbells).  The common small-stride case (QEMU/real devices,
+    // DSTRD=0 -> extent 0x1208) stays within 0x2000 and is left unchanged.
+    uint64_t db_extent = 0x1000ull + (2ull * MAX_CPUS + 1ull) * s_doorbell_stride + 4ull;
+    db_extent = (db_extent + 0xFFFull) & ~0xFFFull;   // round up to a page
+    if (db_extent > NVME_BAR0_MAX_MAP) {
+        kprintf("[nvme] CAP.DSTRD=%u needs a %u-byte doorbell region (> %u); refusing\n",
+                dstrd, (uint32_t)db_extent, (uint32_t)NVME_BAR0_MAX_MAP);
+        return 0;
+    }
+    if (db_extent > 0x2000ull)
+        s_regs = (uint8_t*)vmm_map_mmio(bar_phys, db_extent);
 
     // 4. Allocate admin queues (one 4 KiB page each — enough for 64 entries
     //    of SQE=64B (4096/64=64) and CQE=16B (4096/16=256)).

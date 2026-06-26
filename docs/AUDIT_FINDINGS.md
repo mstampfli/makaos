@@ -1391,3 +1391,11 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   bounded by nvme_cid_valid on the only indexing consume; phase-gated; cid-reuse UAF-free, req[] static; F48
   covers the PRP wrap). Fix = size/cap the BAR0 mapping from the real doorbell extent after CAP + nr_queues are
   known. PRIORITY next: (v) evdev UAF first (sharpest, no crafted image), then (x) ext2 bitmap, then (w) nvme.
+  -> VERIFIED + FIXED (F87): all premises confirmed (fixed 0x2000 map, stride = 4<<dstrd unvalidated, doorbell
+  = s_regs+0x1000+(2*qid+1)*stride, qid up to MAX_CPUS). After reading CAP, the driver now computes
+  db_extent = round_up(0x1000 + (2*MAX_CPUS+1)*stride + 4, page), refuses the controller above a 1 MiB ceiling
+  (absurd DSTRD), and remaps BAR0 over db_extent before the qid-0 doorbells are touched; the DSTRD=0 case rounds
+  to 0x2000 and is left unchanged (no remap). Code-proof (extent covers the highest doorbell + the write; QEMU
+  path unchanged) -- NOT boot-exercised (QEMU attaches no NVMe device, nvme_init bails at pci_find), so the
+  change is provably inert at boot. Clean boot (3rd try past the flaky F55 stall): DHCP, 61 PASSED, no faults.
+  All three fan-out candidates (v/x/w) resolved.
