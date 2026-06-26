@@ -2306,3 +2306,49 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     rest of the kernel was audited lock/atomic-correct. Documented-known lower-priority residuals stay parked (the
     TCP T4 snd_nxt/state/waiter set, timerfd_gettime home_cpu, dcache hash_next splice, pcache accessed bit). Next:
     BUG-TYPE SCAN #5.
+
+- 2026-06-27 BUG-TYPE SCAN #5 (double-free / unbalanced-refcount): an object freed more than once, or a refcount
+  dropped more times than taken (-> premature/double free), or a free on an error path the caller also frees.
+  Distinct from SCAN #1 (sync-free) and SCAN #4 (data-race on the count). Swept the whole tree with 4 parallel
+  read-only agents (net; fs+vfs; drivers+io; mm+proc). ONE reachable double-free found + FIXED (F117); a cluster of
+  audited-clean; plus recorded LEAK/NULL-deref/convention candidates of OTHER classes.
+  FIXED (F117): sys_pipe failure-path double-free (syscall.c). On `goto fail` (fd_table_grow OOM), if the read end
+    was ALREADY installed (rfd >= 0 -- the grow can fail while searching for the WRITE slot, after r was installed
+    at fd_table[rfd]), the `fail:` path did a bare vfs_close(r), freeing it via the pipe refcount while
+    fd_table[rfd] still pointed at the freed r -> a later sys_close / process-exit task_files_release double-frees
+    r (heap corruption / UAF). Reachable when the table is one slot from full + grow OOMs; exit guarantees the 2nd
+    free. FIX: at fail:, sys_close(rfd) for an INSTALLED read end (clears the slot + drops the ref), vfs_close(r)
+    only when never installed; the write end is never installed on this path. Mirrors the socketpair + copyout-fail
+    rollback discipline. (The copyout-fail path above already did this; the fail: path was the lone holdout.)
+  AUDITED CLEAN (the double-free class, with the mechanism): net -- every skb (single-owner handed downward, freed
+    once by the terminal layer), tcp_pcb_free (unlink under wlock + RCU-defer, every caller NULLs its pointer),
+    sock_free_rcu (NULL-after-free of s->pcb), unix_get/unix_put + unix_refcount_tryget (free only on 1->0, never
+    resurrect from 0; backlog/dgram_dest/pin_peer/owner refs all 1:1), SCM_RIGHTS transfer (one in-flight dup ref,
+    dropped exactly once by recipient close / free-rcu drain / ENOBUFS rollback). fs+vfs -- pipe_destroy (open_ends
+    ACQ_REL, free on 0 only), eventfd/signalfd/timerfd close (free ctx + NULL self->ctx + free self), dcache
+    (unlink-under-wlock + DYING-CAS, parent ref +1/-1 once), epoll (tryget-pin + RCU-defer + fd_install contract),
+    fd_install contract (success transfers ownership / failure leaves it with the caller -- every caller honors it,
+    installed ends closed via sys_close, un-installed via vfs_close). drivers+io -- pty (do_free under s_pty_lock,
+    NULL-after-free of slave_file = F104), io_uring (worker/SQPOLL stop+JOIN before free, fixed_files NULL-after-
+    swap under lock, single setup-fail rollback), evdev (unlink under d->lock), drm gem/fb (per-page refcount 1:1,
+    idempotent cursor drop, clone resource-id neutered). mm+proc -- pmm_ref_dec (free only on 1->0 under g_pmm_lock
+    + rc==0 guard + tripwires), CoW break (per-PTE-lock re-check, one dec), the F107 exit-teardown SIBLINGS all
+    single-release (files_shared unpublish-before-release; mm_shared/cwd/cred/unveil freed only in task_free_rcu;
+    task_destroy runs once -- do_switch[DEAD] vs sys_wait[ZOMBIE] are state-disjoint), shmem (dec + pages[i]=0
+    guard), VMA (rcu unlink before the destroy walk), all alloc-helper error paths kfree directly (not via the
+    RCU task_destroy) so no caller double-frees. ALL refcounts are u32 -- no realistic wrap.
+  RECORDED for later (OTHER classes the agents surfaced -- NOT double-free, do NOT fix this turn):
+    LEAK (net, remotely-triggerable DoS): half-open TCP child PCBs in TCP_SYN_RCVD are never reaped (tcp.c -- ~128
+      KiB per SYN that never gets the final ACK; a SYN flood exhausts kernel memory), and listener close orphans
+      completed-but-unaccepted children in accept_queue (tcp_pcb_free only NULLs child->listener). Fix: an RTO/
+      attempt cap that frees half-open children + free the accept_queue on listener close. Candidate for a LEAK
+      scan or a TCP-hardening turn.
+    NULL-DEREF: virtio_net_rx_poll can return 1 with *skb_out == NULL (skb_alloc fail) -> net_rx_thread calls
+      eth_recv(NULL); fat32_open derefs f/fd without checking kmalloc. Candidate for a NULL-deref scan.
+    CONVENTION (drm.c create_dumb kmalloc-fail branch uses pmm_buddy_free instead of the per-page pmm_ref_dec every
+      other branch uses -- currently safe (rc==1 just-alloc'd) but leaves the rc array inconsistent; normalize).
+    LATENT (mm): pcache_evict_one unconditionally pmm_ref_dec+kfree(cand) even if the hash unlink did not find it
+      -- safe today (single reclaim thread; pcache_evict_inode has zero callers) but a real double-free if a 2nd
+      evictor is wired up. Fix: gate the dec+free on a found flag.
+  SCAN #5 IN PROGRESS: the reachable double-free (sys_pipe) is FIXED (F117); the rest of the class is audited clean.
+    No other reachable double-free remains -> SCAN #5 effectively COMPLETE; advance to SCAN #6 next turn.

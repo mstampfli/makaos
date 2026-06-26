@@ -226,6 +226,12 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   This is the "set a slot's flags in the SAME lock that installs the slot, never as a follow-up store"
   primitive -- the single chokepoint for fd creation; any future create-with-cloexec (accept4,
   epoll_create1, eventfd) must use it, not a post-install store.
+  COROLLARY (fd-creating-syscall ROLLBACK discipline, F117): when a multi-fd syscall (pipe, socketpair)
+  fails AFTER installing one or more ends, roll back each end by ITS STATE -- an INSTALLED end via
+  `sys_close(fd)` (which clears fd_table[fd] AND drops the ref), an UN-installed end via `vfs_close(f)`.
+  A bare vfs_close on an installed end frees it while the fd-table slot still points at it -> a later
+  close/exit double-frees (the F117 sys_pipe bug).  socketpair and the pipe copyout-fail path already do
+  this; the rule is "never vfs_close a vfs_file_t that is reachable from the fd table -- go through its fd".
 
 - `vmm_map_mmio` MMIO VA bump-reserve (kernel/mm/vmm.c, F116) -- the lock-free-bump-allocator-with-ceiling
   shape: reserve a disjoint span via `base = __atomic_fetch_add(&cursor, span, RELAXED)` (two concurrent

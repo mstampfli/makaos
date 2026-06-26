@@ -2223,7 +2223,16 @@ static uint64_t sys_pipe(uint64_t fds_ptr) {
     }
     return 0;
 fail:
-    vfs_close(r);
+    // The read end may already be INSTALLED in the fd table (rfd >= 0) -- the
+    // grow can fail while searching for the WRITE slot, after r was installed.
+    // Closing it with a bare vfs_close would free it (via the pipe refcount)
+    // while fd_table[rfd] still points at it, so a later sys_close / process
+    // exit double-frees r.  Mirror socketpair: close an INSTALLED end via its fd
+    // (sys_close clears the slot AND drops the ref), an un-installed end
+    // directly.  The write end is never installed on this path (its branch
+    // breaks out of the loop before any grow), so vfs_close(w) is always right.
+    if (rfd >= 0) sys_close((uint64_t)rfd);
+    else          vfs_close(r);
     vfs_close(w);
     return (uint64_t)-ENFILE;
 }
