@@ -146,6 +146,27 @@ void task_files_release(task_files_t* f) {
     call_rcu_expedited(task_files_free_rcu, f);
 }
 
+// PRIMITIVE: drop a task's fd table on exit, in the ONE correct order.
+// task_files_release RCU-defers the table-struct free (a /proc/<pid>/fd reader
+// snapshots files_shared, then tf->ft, then a fd, under rcu_read_lock), and
+// call_rcu_expedited runs the grace period + frees INLINE.  So the caller MUST
+// unpublish files_shared with a RELEASE store BEFORE the release: otherwise the
+// inline grace period elapses while the pointer is still published, and a reader
+// that opens its rcu_read_lock section just after it loads an already-freed
+// table -> cross-process UAF (freed task_files_t / fdtable_t, and vfs_tryget on
+// a freed vfs_file_t vtable).  Both exit paths (sys_exit and the fatal-signal
+// SIG_DFL terminate) go through here so the unpublish-before-release order is a
+// single source of truth and cannot drift -- it previously HAD drifted: the
+// signal path freed first and NULLed after (a plain store), reopening the UAF on
+// every fatal-signal exit whose fd table hit refcount 0 racing ps / readdir of
+// /proc/<pid>/fd.
+void task_drop_files(task_t* t) {
+    task_files_t* tf = t->files_shared;
+    if (!tf) return;
+    __atomic_store_n(&t->files_shared, NULL, __ATOMIC_RELEASE);
+    task_files_release(tf);
+}
+
 // ── PID pool ──────────────────────────────────────────────────────────────
 // Bitmap allocation: O(1) amortised via next-fit cursor + ctzll on free words.
 // 65535 PIDs = 1024 x 64-bit words = 8 KiB BSS.
@@ -465,6 +486,46 @@ void task_exit_state_selftest(void) {
 
     kprintf_atomic(fails ? "[task_exit_state] SELF-TEST FAILED\n"
                          : "[task_exit_state] PASS (thread self-reaps TASK_DEAD, leader zombifies)\n");
+}
+
+// Deterministic selftest for task_drop_files: the unpublish-BEFORE-release
+// ordering that closes the /proc/<pid>/fd-reader-vs-RCU-deferred-free UAF.
+// Uses a table with refs==2 so the release inside task_drop_files only
+// DECREMENTS (no inline grace period, no fd-close of a fake table) -- proving
+// the caller's files_shared is NULLed AND the table is released exactly once.
+// A revert to release-before-unpublish would NOT fail this (the order is
+// invisible single-threaded), but a revert that DROPS the unpublish entirely
+// (leaving files_shared dangling) would -- and the code-proof + the heavy
+// boot exercise (every process exit routes through task_drop_files) cover the
+// cross-CPU race itself.
+void task_files_drop_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+
+    task_files_t* f = task_files_alloc();   // refs = 1, ft = NULL
+    task_t* t = kmalloc(sizeof(task_t));
+    if (f && t) {
+        f->refs = 2;                         // a second sharer keeps it alive past one release
+        __builtin_memset(t, 0, sizeof(*t));
+        t->files_shared = f;
+
+        task_drop_files(t);                  // must: NULL t->files_shared, then release (2 -> 1)
+
+        if (t->files_shared != NULL) { fails++;
+            kprintf_atomic("[task_drop_files] FAIL files_shared not unpublished\n"); }
+        if (f->refs != 1) { fails++;
+            kprintf_atomic("[task_drop_files] FAIL refs=%u expected 1\n", (unsigned)f->refs); }
+
+        task_files_release(f);               // drop the last ref (1 -> 0, RCU-deferred free)
+    } else {
+        fails++;
+        kprintf_atomic("[task_drop_files] FAIL alloc\n");
+        if (f) task_files_release(f);
+    }
+    if (t) kfree(t);
+
+    kprintf_atomic(fails ? "[task_drop_files] SELF-TEST FAILED\n"
+                         : "[task_drop_files] PASS (unpublish-before-release, table released once)\n");
 }
 
 void task_destroy(task_t* t) {

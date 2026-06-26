@@ -330,6 +330,11 @@ task_mm_t*    task_mm_alloc(phys_addr_t pml4, mm_t* mm);
 void          task_mm_release(task_mm_t* m);
 task_files_t* task_files_alloc(void);
 void          task_files_release(task_files_t* f);
+// Drop a task's fd table on exit in the ONE correct order: unpublish
+// files_shared (RELEASE) BEFORE task_files_release, so the RCU-deferred table
+// free cannot race a /proc/<pid>/fd reader.  Both the sys_exit and the
+// fatal-signal terminate paths MUST use this so the order cannot drift.
+void          task_drop_files(task_t* t);
 
 // ── API ───────────────────────────────────────────────────────────────────
 

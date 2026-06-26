@@ -470,6 +470,12 @@ static void init_kthread(void) {
     extern void task_exit_state_selftest(void);
     task_exit_state_selftest();
 
+    // fd-table drop on exit: files_shared is unpublished (RELEASE) BEFORE the
+    // RCU-deferred table free, so a /proc/<pid>/fd reader cannot race it; one
+    // shared mechanism (task_drop_files) for sys_exit + the fatal-signal path.
+    extern void task_files_drop_selftest(void);
+    task_files_drop_selftest();
+
     // setuid-on-exec escalation gate (now wired via ksec).  Verify it fails
     // closed: only an explicit ksec ALLOW (with an agent present) escalates.
     extern void ksec_exec_setuid_selftest(void);

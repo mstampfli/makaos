@@ -431,6 +431,10 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
     }
 
     // Drop the fd table now so peers see EOF immediately (matching sys_exit).
+    // Go through task_drop_files (the shared mechanism) so the unpublish-BEFORE-
+    // release order is identical to sys_exit and cannot drift: this path used to
+    // release first and NULL after (a plain store), which reopened the
+    // RCU-deferred-free vs /proc/<pid>/fd-reader UAF on every fatal-signal exit.
     if (g_current->files_shared) {
         extern void kprintf(const char*, ...);
         {
@@ -440,8 +444,7 @@ void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax) {
         kprintf("[signal] releasing files of pid=%u comm=\"%s\" refs=%u\n",
                 (unsigned)g_current->pid, g_current->comm,
                 (unsigned)g_current->files_shared->refs);
-        task_files_release(g_current->files_shared);
-        g_current->files_shared = NULL;
+        task_drop_files(g_current);
     } else {
         extern void kprintf(const char*, ...);
         kprintf("[signal] pid=%u comm=\"%s\" has NO files_shared (leak?)\n",

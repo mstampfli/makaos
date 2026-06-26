@@ -2059,3 +2059,44 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   *** FAN-OUT #7 FULLY RESOLVED *** -- (pp) F102, (mm) F103, (oo) F104, (qq) F105, (nn) F106 all VERIFIED+FIXED.
   NEXT PHASE: bug-TYPE codebase scans (one bug type at a time), starting with the sync-free-under-reader class
   (the F88/F95/F102 RCU-defer family, recurred 3x).
+
+- 2026-06-26 BUG-TYPE SCAN #1 (sync-free-under-reader): the F88/F95/F102 class -- a SHARED object kfree'd
+  synchronously while a concurrent reader on another CPU (RCU walker, IRQ/timer wait_queue wake, poll/epoll
+  waiter) can still dereference it -> use-after-free. Swept the WHOLE tree with 4 parallel read-only agents
+  (net, fs+vfs, drivers, mm+proc/io). ONE real gap found, FIXED (F107); everything else audited CLEAN.
+  REAL GAP (FIXED, F107): kernel/proc/signal.c:443-444 (signal_deliver_pending, fatal SIG_DFL terminate) dropped
+    the fd table in the WRONG order -- task_files_release(g_current->files_shared) THEN g_current->files_shared =
+    NULL (a plain store). task_files_release -> call_rcu_expedited (rcu.c:245: synchronize_rcu_expedited(); func()
+    -- frees INLINE), and a /proc/<pid>/fd reader (proc.c:290-298/567-600) does rcu_read_lock(); tf =
+    load_acquire(&t->files_shared); ft = tf->ft; vfs_tryget(ft->fd_table[n]). Because the inline grace period
+    elapses while files_shared is STILL published, a reader that opens its rcu_read_lock section just after it
+    loads an already-freed task_files_t/fdtable_t and vfs_tryget's a freed vfs_file_t vtable -> cross-process UAF.
+    The task is still in pid_ht (task_set_exit_state runs later, signal.c:460), so it is sched_find_pid-able. The
+    sibling sys_exit path (syscall.c:727) already does it correctly (unpublish RELEASE-store BEFORE release) with
+    a comment naming this exact contract -- the two had DRIFTED. FIX (F107): extracted task_drop_files() (the one
+    shared unpublish-before-release mechanism) and routed BOTH paths through it so they cannot drift again.
+  AUDITED CLEAN (provably, not sampled -- every shared-object free in scope):
+    net/: socket.c sock_free_rcu (call_rcu_expedited + RELEASE/ACQUIRE sock_file), udp_table_free_rcu, tcp.c
+      tcp_pcb_free_rcu (+ listener-orphan-under-wlock), unix_sock.c unix_sock_free_rcu (refcount + tryget +
+      peer-backpointer-under-lock), ns_table/arp_table free_rcu -- all RCU-deferred or refcount-pinned. (One
+      OUT-OF-SCOPE note: AF_UNIX backlog_head link/unlink in connect/accept vs unix_sock_free_rcu's walk is a
+      list-mutation race, NOT this UAF class -- logged for a separate look.)
+    fs+vfs: every vfs_file_t close is refcount-pinned (sys_close removes the fd under tf->lock, teardown runs
+      only on 1->0; readers reach it via fdget->vfs_tryget). timerfd (pc->lock holds the IRQ tick's wake AND
+      close's removal), signalfd (s_sfd_lock), pipe (open_ends shared-lifetime + ACQ_REL wake-before-free),
+      dcache (RCU + SLAB_TYPESAFE_BY_RCU + DYING-CAS), eventfd, ext2/fat32/proc close (no IRQ/poll waitq reader),
+      epoll (F102: tryget-pin + call_rcu_expedited) -- all CLEAN.
+    drivers: evdev per-open client+ring vs the IRQ producer is unlink-under-d->lock(irqsave)-then-free (the
+      F88/F95 model); pty (F104 NULL-under-lock + tryget); tty per-open ctx (producer touches only global g_tty0);
+      drm per-fd event ring (synchronous producer, no async vblank IRQ, io_uring path VFS-refcount-pinned); hda/
+      ac97/nvme/ahci/fb/virtio_gpu use static/global slot state, no per-open free -- all CLEAN.
+    mm+proc/io: io_uring close joins the SQPOLL+io_wq kthreads before free & pins the GETEVENTS waiter via fdget
+      (F105 worker_lock makes it a single joinable worker); exec-vs-siblings (F97 detach + refcount free); task/
+      mm teardown (call_rcu_expedited(task_free_rcu) after pid_ht/idx removal); TLB-shootdown IPI (cpu_mask is a
+      CR3 shadow cleared in do_switch, IPI derefs only BSS); futex (mm is a compare-only hash key, never deref'd;
+      task snapshotted before the RELEASE woken-store); shmem (refcount + tryget + call_rcu); VMA free
+      (rcu_assign_pointer + call_rcu_head); slab page return (SLAB_TYPESAFE_BY_RCU call_rcu_head); fdtable grow
+      (RELEASE publish + call_rcu_expedited old) -- all CLEAN except the signal.c gap above.
+  VERDICT: the codebase is consistently hardened against this class via four mechanisms (refcount-pin+tryget,
+  RCU-defer, unlink/unpublish-before-free under the waker's lock, kthread-join). The single drift (signal.c) is
+  fixed; SCAN #1 is COMPLETE. Next: BUG-TYPE SCAN #2 (next highest-value type).

@@ -178,6 +178,19 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   owning lock" family; apply it wherever a multi-field struct is overwritten wholesale
   while a reader walks its fields lock-free.
 
+- `task_drop_files(task_t* t)` (kernel/proc/process.c, F107) -- drop a task's fd table on
+  exit in the ONE correct order: unpublish `t->files_shared` with a RELEASE store, THEN
+  `task_files_release`. task_files_release RCU-defers the table-struct free, and a
+  /proc/<pid>/fd reader snapshots files_shared (then tf->ft, then a fd) under rcu_read_lock;
+  call_rcu_expedited runs the grace period and frees INLINE, so the unpublish MUST precede
+  the release or a reader entering its rcu_read_lock section just after it loads a freed
+  table (cross-process UAF). Both exit paths -- sys_exit and the fatal-signal SIG_DFL
+  terminate -- now go through this, so the order is a single source of truth and cannot
+  drift (it had: the signal path freed before unpublishing, which is what F107 fixed).
+  `task_files_drop_selftest` proves the unpublish + single-release on a refs==2 table.
+  This is the "unpublish-before-RCU-deferred-free" ordering primitive: apply it wherever a
+  pointer to an RCU-freed object is cleared around the deferred free.
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
