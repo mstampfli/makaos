@@ -641,6 +641,11 @@ static void init_kthread(void) {
     extern void pipe_refcount_selftest(void);
     pipe_refcount_selftest();
 
+    // Pipe concurrent read/write: per-pipe ring lock keeps head/tail/count and
+    // the payload bytes from tearing under racing readers/writers.
+    extern void pipe_race_selftest(void);
+    pipe_race_selftest();
+
     // epoll watched-file pin: file survives close while a watch is registered.
     extern void epoll_watch_refcount_selftest(void);
     epoll_watch_refcount_selftest();

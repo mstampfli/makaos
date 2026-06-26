@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vfs.h"
+#include "smp.h"   // spinlock_t for the per-pipe ring lock
 
 // ── Kernel pipe ───────────────────────────────────────────────────────────
 // A pipe is a one-directional byte stream backed by a circular kernel buffer.
@@ -19,6 +20,17 @@
 #define PIPE_BUF_SIZE 4096  // must be power of 2
 
 typedef struct {
+    // ring lock: serialises every RMW of the ring state below (head/tail/
+    // count + the buf bytes they index) AND of writer_refs/reader_refs.  A
+    // pipe end can be SHARED across tasks (fork dups the fd table but both
+    // fds point at this one pipe_buf_t; threads/SCM_RIGHTS likewise), so two
+    // CPUs can read+write (or multi-read / multi-write) concurrently; without
+    // this the non-atomic count--/count++ lose updates (torn count -> wrong
+    // empty/full gating, count underflow wraps to ~4e9) and head/tail/buf
+    // tear.  Plain spin_lock (never taken in IRQ context).  Dropped before
+    // any WAIT_EVENT sleep or wait_queue_wake_all, and before the user-source
+    // copy in pipe_write (that source is demand-paged, not prefaulted).
+    spinlock_t lock;
     uint8_t  buf[PIPE_BUF_SIZE];
     uint32_t head;          // read index
     uint32_t tail;          // write index

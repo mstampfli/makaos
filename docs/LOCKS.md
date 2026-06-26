@@ -435,6 +435,26 @@ node across CPUs, and close runs only at the last fd-ref drop, which the
 `settime` fdget pin (F81) excludes from racing any in-flight settime --
 so neither needs the node lock and there is no lock cycle.
 
+### `pipe_buf_t.lock` (per-pipe) -- `kernel/fs/pipe.c`
+One plain spinlock per pipe.  Guards every RMW of the ring state -- head /
+tail / count and the `buf` bytes they index -- and of the writer_refs /
+reader_refs open flags.  A pipe end can be SHARED across tasks (fork dups
+the fd table but both fds point at the one pipe_buf_t; threads and
+SCM_RIGHTS likewise), so two CPUs can read+write (or multi-read /
+multi-write) concurrently; without the lock the non-atomic count--/count++
+lose updates (torn count, and a count-- underflow wraps the u32 to ~4e9 so
+an empty pipe looks full of data).  **Not IRQ-off** (no pipe path runs in
+interrupt context) and **dropped before every blocking point**: before each
+WAIT_EVENT_HOOK sleep, before every wait_queue_wake_all (a wake can
+schedule), and before pipe_destroy (which frees the struct holding the
+lock).  pipe_read drains directly into the prefaulted sys_read user buffer
+under the lock (same convention as pty_master_drain); pipe_write copies the
+NON-prefaulted user source into a small kernel bounce buffer with the lock
+DROPPED (the source is demand-paged on access and must not fault under a
+spinlock), then pushes from the bounce buffer into the ring under the lock.
+poll / ioctl read `count` locklessly as an advisory snapshot (a 32-bit
+aligned read is atomic; the authoritative re-check happens under the lock).
+
 ### RCU-deferred free paths (not locks, but part of Phase 6)
 
 - `task_destroy` → `call_rcu(task_free_rcu)` frees kstack, mm,

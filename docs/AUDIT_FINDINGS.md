@@ -1534,6 +1534,34 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (THREAD_SHARE_FILES) read/write concurrently. Close-time lifetime, bounds, refcount/EOF are SAFE. Fix = a
   per-pipe spinlock around the head/tail/count/refs RMWs (mirror pty master_lock / evdev d->lock; drop before
   sched_sleep/wake). NOTE: PT_INTERP does NOT exist (static-only ELF loader), so the interp angle is moot.
+  -> VERIFIED + FIXED (F93): confirmed pipe_buf_t has plain non-atomic head/tail/count and NO lock, and that
+  pipe_read does count-- + head advance while pipe_write does count++ + tail advance with zero synchronization;
+  the shared count is a non-atomic RMW from both sides, so two tasks sharing the pipe (fork DUPS the fd table
+  but both fds point at the one pipe_buf_t; threads/SCM_RIGHTS likewise) racing read+write lose count updates
+  (and count-- underflow wraps the u32 to ~4e9 = empty pipe looks full). REFINED two points (no-assumptions):
+  (1) the recorded "drop before sched_sleep/wake" is necessary but NOT sufficient -- the read and write data
+  paths touch the USER buffer, and sys_read PREFAULTS its dst (so draining into it under the lock cannot fault,
+  exactly as pty_master_drain documents) but sys_write does NOT prefault its src (a write reads the buffer, so
+  absent pages are demand-paged on ACCESS), so the write path must copy the user source into a kernel bounce
+  buffer with the lock DROPPED and only then push into the ring under the lock; holding the lock across src[]
+  would fault under the spinlock. (2) writer_refs/reader_refs are ALSO RMW'd lock-free (close hooks decrement,
+  read/write read them), so I brought those under the same lock for a uniform discipline. FIX (do-it-right, ONE
+  shared mechanism mirroring pty master_lock): added pipe_buf_t.lock (plain spinlock, never IRQ context).
+  pipe_read drains available bytes into the prefaulted user dst under the lock, dropping it before WAIT_EVENT /
+  wake. pipe_write snapshots full/reader under the lock, bounces a <=256B chunk user->kernel with the lock
+  dropped, then pushes what fits under the lock (a count<PIPE_BUF_SIZE guard makes overflow impossible even if a
+  concurrent writer refilled the ring) and wakes readers per chunk -- which also closes a latent missed-wakeup
+  window in the old code (it filled the ring then only woke readers at the very end). close hooks clear
+  reader_refs/writer_refs under the lock, dropping it before the peer wake and pipe_destroy (which frees the
+  lock). Documented in docs/LOCKS.md. poll/ioctl keep their advisory lockless count read (32-bit aligned reads
+  are atomic). VERIFICATION: a cross-CPU data race, not deterministically reproducible -> a NEW concurrent
+  selftest (pipe_race_selftest): a writer + reader kthread on a SHARED pipe stream a known sequence (byte at
+  offset k == k&0xFF); the reader verifies every received byte equals its offset value AND the total received
+  equals what was sent; the writer closes the write end so the reader terminates on EOF (cannot hang even if
+  bytes are dropped) -- `[pipe_race] SELF-TEST PASSED (in-order, no lost/torn bytes, 65536/65536)`. Pipes ARE
+  boot-exercised (bash pipelines), so the clean boot is a real exercise. Clean boot first try (no F55 stall this
+  time): DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 63 selftests PASSED incl. [pipe_refcount] and
+  [pipe_race], 0 FAILED/PANIC, no [WD], `More login:` renders. This closes fan-out #4 candidate (ee).
   (cc) MEDIUM, data corruption not OOB -- file-backed mmap left-trim wrong-page: mm_vma_remove Case 3 (left
   edge overlap, kernel/mm/mm.c ~434-436) advances v->start = end but does NOT advance v->file_off / v->file_len
   (the split Case 4 ~413-415 and the ELF split both DO), so after a front munmap of a file-backed VMA every
