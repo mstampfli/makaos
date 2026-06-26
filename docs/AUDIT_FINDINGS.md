@@ -1345,3 +1345,36 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   routing each through copy_*_user (which the performance-sensitive sites avoid by design) or building the
   extable; the extable is a cross-cutting mechanism too large for one audit step. Deferred as a dedicated
   effort; design recorded here so it is known debt, not a buried landmine.
+- 2026-06-26 FAN-OUT (read-only audit over un-swept subsystems; reported by Explore agents, HIGH confidence
+  each, NOT yet independently verified -- VERIFY against the real code before fixing). Two subsystems came back
+  SAFE: virtio-gpu/virtio-input virtqueues (every device-writable used-ring id/idx/len and every userspace
+  ioctl index is masked to the ring size or bounds-checked; sizes via mul_within_u32/drm_dumb_size; rings
+  serialised by per-queue IRQ-safe locks or a single kthread) and the ELF loader / initial user stack
+  (argc/envc/strlen capped at the syscall entry, pages > VMM_USER_STACK_PAGES rejected, rsp < ubase backstop,
+  N_AUXV matches the writes, every PT_LOAD range bounded; the eager-path file_off+nbytes sum is dead code,
+  backing_file always non-NULL). Three CANDIDATE bugs:
+  (v) HIGH, directly unprivileged-reachable -- evdev evdev_client_t USE-AFTER-FREE: input_device_emit
+  (kernel/drivers/input/evdev.c ~164-182) walks d->clients and derefs each client (ring_push + sched_wake +
+  wait_queue_wake_all) with NO lock, while evdev_vfs_close (~261-281) unlinks + kfree's the client; a keyboard/
+  mouse producer on one CPU can write into / wake a client a sibling close() just freed (producer reaches c via
+  d->clients, holds no fd ref, so the fd refcount does not protect it). Same class as F84/F70/F65; subsumes a
+  torn-index race on c->head/c->tail (plain uint32_t, no lock). Reachable: open /dev/input/event0 (0660),
+  read() in one thread, close() in a sibling, input flowing. Fix = one per-device lock over the client-list
+  lifetime AND the per-client ring head/tail (mirror F84), free RCU-deferred or wakes outside the lock.
+  (x) HIGH, needs a crafted/corrupt ext2 image -- ext2 block/inode bitmap OOB: s_blocks_per_grp /
+  s_inodes_per_grp from the untrusted superblock are validated only != 0 (ext2.c ~877), never clamped to the
+  one-block bitmap capacity s_block_size*8; the bitmap scratch is a fixed 4096 bytes, so bit = rel %
+  s_blocks_per_grp (free_block ~1783) or bitmap_find_free(buf, s_blocks_per_grp) (alloc_block ~1756) with the
+  field > 32768 indexes buf[bit>>3] past 4096 = heap OOB write/read; reached via truncate/write ->
+  free_inode_blocks -> free_block. Same for s_inodes_per_grp (alloc_inode ~1716 / free_inode_num ~1807). The 3
+  named angles (indirect traversal, symlink, truncate double-free) are SAFE (disk block numbers go through
+  ext2_block_valid/ext2_run_valid; symlinks unimplemented -- readlink EINVAL / symlink EPERM; free_block(0) is
+  a no-op; F56 covers the overwrite race). Fix = clamp both fields <= s_block_size*8 at mount (~877), mirroring
+  ext2_block_size_checked / ext2_inode_size_valid; add a pure ext2_group_geom_valid helper + selftest.
+  (w) MED-LOW, malicious-controller only, NOT reachable on QEMU (DSTRD=0 fits all 64 QIDs in 0x2000) -- NVMe
+  doorbell BAR0 OOB: nvme.c:677 maps BAR0 at a fixed 0x2000, but the doorbell offset 0x1000+(2*qid+1)*stride
+  scales with device CAP.DSTRD (stride = 4<<dstrd, never validated, ~687) and qid up to nr_queues (capped
+  MAX_CPUS=64), so DSTRD>=3 drives an MMIO store past the mapping. The completion data-path is SAFE (cid
+  bounded by nvme_cid_valid on the only indexing consume; phase-gated; cid-reuse UAF-free, req[] static; F48
+  covers the PRP wrap). Fix = size/cap the BAR0 mapping from the real doorbell extent after CAP + nr_queues are
+  known. PRIORITY next: (v) evdev UAF first (sharpest, no crafted image), then (x) ext2 bitmap, then (w) nvme.
