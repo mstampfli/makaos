@@ -1923,6 +1923,26 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   CONFIDENCE HIGH on the bug/reachability, MEDIUM on max priv-esc impact. (Rest of bcache audited SAFE: lock-free
   per-way Dekker protocol correct, static BSS buffers (no UAF), pin get/put balanced, write-through (no dirty
   writeback), LBA/index bounds-checked.)
+  -> VERIFIED + FIXED (F103): confirmed ext2_vfs_read (ext2.c:1263-1275) computes is_user = (dest < HHDM_OFFSET)
+  and gates the DMA (ahci_read_user vs ahci_read) on it, but the cache-warm loop (1272-1275) bcache_fill(phys_blk
+  +i, dest+i*bs, bs) was UNCONDITIONAL, copying from the user `dest` into the SHARED static cache slot tagged by
+  the physical block; ext2_vfs_pread (1356-1366) is identical. So a sibling thread (shared mm) overwriting `dest`
+  between the DMA and the bcache_fill memcpy poisons the cross-process cache slot with attacker bytes, served to
+  any later bcache_get(phys_blk) reader of that on-disk block (integrity bypass; secondary: a racing munmap
+  faults the memcpy on a user VA in kernel mode). The kernel-read path (ELF loader / demand paging) uses
+  is_user==0 (a trusted HHDM kmalloc'd staging buffer) and is the path the warm comment's "second exec is a
+  cache hit" actually serves. FIX (do-it-right, mirror the codebase's ahci_read (trusted) vs ahci_read_user
+  (untrusted) split): guard BOTH cache-warm loops with `if (!is_user)`, so the shared cache is warmed ONLY from a
+  trusted kernel source; the user-read path forgoes the opportunistic warm (a later read cold-misses and re-fills
+  from disk -- correct by construction) and the returned data on the fast path is unchanged (only the cache
+  SIDE-EFFECT is gated). VERIFICATION: a one-line correctness gate (the user-path warm was never a needed side
+  effect) -> code-proof + the file-read path (read/pread) and the cache are HEAVILY boot-exercised (login/bash/
+  net read files; [dcache_test]/[dcache_race]/[ext2_*] selftests exercise the cache + demand paging), so a clean
+  boot proves gating the user warm did not break reads or the kernel-path cache. First boot hit the flaky F55
+  userspace-start stall (net ready, login + /bin/net paged, no DHCP lease, NO fault, all 67-69 kernel selftests
+  PASSED -- so the change is provably not the cause); the SAME-build re-boot reached the DHCP lease (ifconfig IP
+  10.0.2.15 GW 10.0.2.2), 69 selftests PASSED incl. the dcache/ext2 cache tests, 0 FAILED/PANIC, no [WD],
+  `More login:` renders. This closes fan-out #7 candidate (mm).
   (oo) HIGH, pty-owner reachable -- pty slave reopen UAF: pty_slave_close (kernel/drivers/tty/pty.c ~417, kfree
   at ~432) frees the shared slave vfs_file_t UNCONDITIONALLY even when the master is still open (do_free=0), but
   never NULLs pty->slave_file nor clears slave_claimed, leaving the pty node in s_pty_head with a dangling

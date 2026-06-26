@@ -1266,13 +1266,22 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                 } else {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
-                // Warm the block cache from the just-DMA'd data so a second
-                // exec of the same binary is a pure cache hit.  bcache_fill
-                // silently drops updates for currently-pinned slots — harmless.
-                for (uint32_t i = 0; i < run; i++)
-                    bcache_fill(phys_blk + i,
-                                dest + (uint64_t)i * s_block_size,
-                                s_block_size);
+                // Warm the SHARED block cache from the just-DMA'd data so a
+                // second exec of the same binary is a pure cache hit -- but ONLY
+                // when the source is a trusted KERNEL buffer (ELF loader / demand
+                // paging, is_user==0).  For a user destination `dest` is unpinned
+                // user memory (ahci_read_user unpinned it) that a sibling thread
+                // can overwrite between the DMA and this memcpy: warming from it
+                // would poison the shared cross-process cache slot tagged
+                // phys_blk with attacker bytes (and a racing munmap would fault
+                // here in kernel mode).  The user-read path simply forgoes the
+                // opportunistic warm; a later read re-fills from disk.  (bcache_
+                // fill silently drops updates for currently-pinned slots.)
+                if (!is_user)
+                    for (uint32_t i = 0; i < run; i++)
+                        bcache_fill(phys_blk + i,
+                                    dest + (uint64_t)i * s_block_size,
+                                    s_block_size);
             }
             // file_blks_left rounds UP, so a run covering the file's
             // final block DMA'd that block's tail slack into dst too.
@@ -1360,10 +1369,16 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
                 } else {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
-                for (uint32_t i = 0; i < run; i++)
-                    bcache_fill(phys_blk + i,
-                                dest + (uint64_t)i * s_block_size,
-                                s_block_size);
+                // Warm the SHARED cache ONLY from a trusted kernel source -- a
+                // user `dest` is unpinned user memory a sibling thread can
+                // overwrite between the DMA and this memcpy, which would poison
+                // the cross-process cache slot tagged phys_blk (same as
+                // ext2_vfs_read above).
+                if (!is_user)
+                    for (uint32_t i = 0; i < run; i++)
+                        bcache_fill(phys_blk + i,
+                                    dest + (uint64_t)i * s_block_size,
+                                    s_block_size);
             }
             total   += bytes;
             cur_pos += bytes;
