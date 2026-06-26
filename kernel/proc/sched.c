@@ -1479,24 +1479,40 @@ static void do_switch(uint8_t preempted) {
     }
 
     // ── Phase 9-7 TLB shootdown bookkeeping ──────────────────────────────
-    // Update the per-mm cpumasks *before* touching CR3.  The mask is
-    // "CPUs whose CR3 currently points at this mm's pml4" — a pure
-    // accounting shadow of CR3.  Only user mms participate (kthreads
-    // run in whatever pml4 was previously loaded → lazy TLB; they hold
-    // no user mappings themselves, so any pending shootdown for a user
-    // mm need not target them).
+    // The per-mm cpu_mask is "CPUs whose CR3 currently points at this mm's
+    // pml4" -- a pure accounting shadow of CR3, read by tlb_flush_mm to pick
+    // its IPI targets.  Only user mms participate (kthreads run in whatever
+    // pml4 was previously loaded -> lazy TLB; they hold no user mappings, so a
+    // user-mm shootdown need not target them).
     //
-    // Clear prev's bit first: after context_switch writes CR3 for a
-    // different mm, this CPU's TLB for prev's user entries is gone
-    // (we don't use global pages, so mov-to-cr3 is a full flush).
-    // If prev's mm equals next's mm (two tasks sharing one address
-    // space, e.g. threads), context_switch will skip the CR3 write,
-    // and we set the same bit right back below — net no-op.
+    // Update the mask ONLY when the address space actually changes
+    // (prev->mm_shared != next->mm_shared).  Two threads sharing one
+    // task_mm_t have prev->mm_shared == next->mm_shared, so a clear-then-set
+    // would net to a no-op but open a transient window in which this CPU's bit
+    // reads 0 while CR3 still points at the mm -- a concurrent tlb_flush_mm
+    // could read the mask in that window and SKIP us, leaving a stale entry.
+    // Skipping the ops keeps the bit set throughout (strictly conservative --
+    // we never drop out of our own running mm's shootdown set) and saves two
+    // atomics on the hot thread-switch path.
+    //
+    // For a real address-space change we clear prev then set next here, BEFORE
+    // context_switch.  The brief clear..CR3-reload window for prev is safe
+    // because context_switch ALWAYS reloads CR3 when pml4_phys != 0 (true for
+    // every runtime mm; mov-to-cr3 is a full flush as we use no global pages),
+    // so prev's stale entries are gone before this CPU runs any code that could
+    // touch them -- and we never touch prev's mm again after switching to next.
+    // NOTE: context_switch does NOT skip the CR3 write for same-mm switches (it
+    // keys only on pml4_phys != 0); the same-mm safety above comes from NOT
+    // clearing the bit, not from a skipped reload.  If context_switch is ever
+    // changed to skip same-mm CR3 reloads, this skip-when-equal guard is what
+    // keeps the mask correct.
     uint32_t cpu_id = c->id;
-    if (prev->mm_shared && prev->mm_shared->mm)
-        task_mm_cpumask_clear(prev->mm_shared, cpu_id);
-    if (next->mm_shared && next->mm_shared->mm)
-        task_mm_cpumask_set(next->mm_shared, cpu_id);
+    if (prev->mm_shared != next->mm_shared) {
+        if (prev->mm_shared && prev->mm_shared->mm)
+            task_mm_cpumask_clear(prev->mm_shared, cpu_id);
+        if (next->mm_shared && next->mm_shared->mm)
+            task_mm_cpumask_set(next->mm_shared, cpu_id);
+    }
 
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 

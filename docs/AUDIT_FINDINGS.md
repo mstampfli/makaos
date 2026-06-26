@@ -2100,3 +2100,58 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   VERDICT: the codebase is consistently hardened against this class via four mechanisms (refcount-pin+tryget,
   RCU-defer, unlink/unpublish-before-free under the waker's lock, kthread-join). The single drift (signal.c) is
   fixed; SCAN #1 is COMPLETE. Next: BUG-TYPE SCAN #2 (next highest-value type).
+
+- 2026-06-26 BUG-TYPE SCAN #2 (sibling-stale-TLB-after-PTE-change): the F97/F99 class -- a PTE cleared/downgraded
+  in an mm live on another CPU, the frame then freed/reused while a sibling writes through the stale TLB entry
+  (write-after-free into a recycled frame) or keeps writing a shared page through a stale RW entry (CoW-isolation
+  leak). Swept the WHOLE tree with 4 parallel read-only agents (vmm munmap/mprotect, CoW/fault, teardown/reclaim/
+  shmem, kernel-side remaps). NO ACTIVE GAP found -- the class is already correctly hardened. Shipped a HARDENING
+  of a latent landmine the sweep surfaced (F108).
+  TLB API (ground truth): tlb_flush_range(mm,s,e)/tlb_flush_mm(mm) (tlb.c:250/254) IPI exactly mm->cpu_mask
+    (a precise CR3 shadow set/cleared in do_switch) + self, spin-wait on ACK, take NO lock, emit a SEQ_CST fence
+    (tlb.c:202) to close the Dekker race with switch_mm -- so callers MUST flush with the mm/vma lock DROPPED.
+    tlb_flush_kernel_range(s,e) (tlb.c:268) is the all-CPU variant for shared kernel mappings. No global pages
+    (PAGE_GLOBAL defined but unused), so mov-to-cr3 is a full local flush.
+  AUDITED CLEAN (every PTE clear/downgrade in scope; flush-before-free + all-CPU + outside-lock, OR a no-sibling
+  precondition, OR metadata-only, OR refcounted-frame-never-recycled):
+    munmap/MAP_FIXED/brk-shrink: mm_unmap_range_flush_free (syscall.c:2392) does unmap -> tlb_flush_range (2410,
+      all CPUs, no lock) -> pmm_ref_dec free (2411): flush-before-free, correct.
+    CoW break: vmm_get_user_pages (vmm.c:315) batched tlb_flush_range at out: (376, after every vma_lock drop) =
+      F99; isr14 #PF CoW (vmm.c:745) single-page tlb_flush_range (770) after vma_lock drop. Old frame rc>1 (not
+      freed). Permission-WIDEN (RO->RW, vmm.c:324/754) and fresh not-present->present installs correctly skip the
+      shootdown (a too-restrictive stale entry only re-faults; x86 caches no not-present entry).
+    fork/sys_thread write-protect: vmm_clone_user_ex downgrades the PARENT RW->RO, then tlb_flush_mm(parent) at
+      process.c:612 + syscall.c:1532 (all CPUs, no lock). Frame shared (rc bumped), not freed.
+    teardown: vmm_free_user_ex (process.c:39) runs only at refs==0 (cpu_mask empty, RCU grace elapsed -> no live
+      sibling); sole-owner exec frees old tables only after vmm_switch on the only CPU; MULTITHREADED exec (F97)
+      detaches onto a FRESH mm + SIGKILLs siblings + refcount-frees the old pml4 later -> clears no live PTE.
+    shmem/pcache/DRM destroy-while-mapped: drop only the OBJECT's per-frame ref (pmm_ref_dec); never clear a PTE,
+      never pmm_buddy_free a mapped frame -- a frame mapped elsewhere is held by that mapper's PTE ref; the
+      eventual unmapper runs flush-before-free. io_uring fd teardown: unmap -> tlb_flush_range -> buddy_free.
+    kernel-side: kstack recycle (tss.c) uses all-CPU tlb_flush_kernel_range at the NEXT alloc before the slot has
+      an owner; MMIO window + kheap demand-map are fresh not-present->present at never-reused VAs; HHDM/kernel
+      PML4 are boot-only. No vmalloc/ioremap/iounmap/kmap/fixmap exist (audited-clean by absence).
+  HARDENING SHIPPED (F108) -- latent fragility, NOT an active bug: do_switch (sched.c:1495) cleared prev's cpumask
+    bit then set next's UNCONDITIONALLY; for a same-mm thread switch (prev->mm_shared == next->mm_shared) that
+    nets to a no-op but opens a transient window where this CPU's bit reads 0 while CR3 still points at the mm, so
+    a concurrent tlb_flush_mm could SKIP this CPU. It is currently SAFE only because context_switch ALWAYS reloads
+    CR3 when pml4_phys != 0 (full flush) right after -- but the sched.c comment FALSELY claimed context_switch
+    "skips the CR3 write" for same-mm, inviting a future optimization that would turn the window into a real
+    stale-TLB UAF. FIX: update the cpumask ONLY when prev->mm_shared != next->mm_shared (the bit stays set for
+    thread switches -> strictly conservative, never under-targets a running mm; removes the window; saves two
+    atomics on the hot path) + corrected the comment to state the true mechanism + the invariant the safety rests
+    on. Verified by code-proof (strict-conservatism) + a clean SMP boot with the chaselev work-stealing stress
+    (20000 ops, 0 missing/0 duplicates) and all 73 selftests, 0 faults.
+  OUT-OF-CLASS observations (logged for later scans, NOT this type):
+    (a) vmm_clone_user_ex intra-walk RW->RO window: a parent sibling can write through a stale RW entry into an
+        already-downgraded, now-child-shared frame during the (long) clone before the batched tlb_flush_mm -- a
+        CoW-isolation/data-integrity nuance on a still-live shared frame (refcounts stay correct, no frame freed),
+        NOT a UAF. Candidate for a CoW-correctness look.
+    (b) s_mmio_next (vmm.c:131/143) is bumped with NO lock -- a data race on the MMIO VA allocator (concurrent
+        driver init), not a TLB bug. Candidate for the data-race SCAN.
+    (c) vmm_page_free / vmm_page_alloc (vmm.c:383/395) are DEAD CODE (no callers); vmm_page_free does a local-only
+        invlpg + free, so if ever revived for a runtime KERNEL VA it would be a real all-CPU-shootdown gap.
+        Candidate for a dead-code sweep / guard with a comment.
+  VERDICT: the sibling-stale-TLB class is already hardened (flush-before-free + no-sibling preconditions +
+  refcounted frames); the shootdown is already primitised (tlb_flush_range/tlb_flush_mm/tlb_flush_kernel_range),
+  so nothing new to extract. F108 removed the one latent landmine. SCAN #2 COMPLETE. Next: BUG-TYPE SCAN #3.
