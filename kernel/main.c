@@ -495,6 +495,11 @@ static void init_kthread(void) {
     extern void access_ok_selftest(void);
     access_ok_selftest();
 
+    // Front-munmap of a file/shmem-backed VMA must advance file_off/file_len/
+    // shmem_pgoff in lockstep with vma->start, else later faults map the wrong page.
+    extern void mm_vma_trim_selftest(void);
+    mm_vma_trim_selftest();
+
     // rename(2) must reject moving a directory into its own subtree (mv /a /a/b)
     // -- it would detach the subtree into an unreachable cycle.
     extern void rename_under_selftest(void);

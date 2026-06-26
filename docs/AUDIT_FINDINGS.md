@@ -1572,3 +1572,28 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   backing.) Fix = in Case 3 compute delta = end - v->start, then v->file_off += delta, v->file_len -= delta
   (clamp), before overwriting v->start (mirror Case 4). PRIORITY: (bb) dcache UAF first (sharpest -- HIGH,
   most reachable, clean fix mirroring T1), then (dd) timerfd UAF, then (ee) pipe ring, then (cc) mmap left-trim.
+  -> VERIFIED + FIXED (F94): confirmed mm_vma_remove's front-trim (the `else` branch, mm.c ~435-436, labelled
+  "Case 3 left edge overlap") advances v->start = end but leaves the backing offsets stale, while the split
+  (Case 4 ~413-415) advances them; confirmed the fault path keys the backing off (page - vma->start) -- file:
+  src_off = vma_file_off + (page - vma_start) (vmm.c ~816/847), shmem: pg_idx = (page - vma_start)/PAGE_SIZE +
+  vma_shmem_pgoff (vmm.c ~961) -- so a stale offset maps a page (end - old_start) too early; bounded by file_len
+  / file_size so intra-file disclosure, not OOB. REFINED the recorded prescription (verify-all-angles): it named
+  only file_off/file_len, but Case 4 ALSO advances shmem_pgoff (unconditionally, ~403-404), and the shmem fault
+  path keys off shmem_pgoff the same way -- so a front-munmap of a SHMEM-backed VMA has the IDENTICAL bug; the
+  fix must advance shmem_pgoff too. Case 2 (right-edge / shrink-end, ~432) is CORRECT as-is: start is unchanged
+  so the backing offset stays valid and the smaller end bounds later faults (matching Case 4's left fragment,
+  which also leaves file_len untouched on an end-shrink). FIX (do-it-right, ONE shared mechanism, no drift):
+  extracted a static helper vma_backing_advance(v, delta) that advances shmem_pgoff (page units) + file_off and
+  clamps file_len, used by BOTH the front-trim (Case 3, applied to v) and the split (Case 4, applied to the
+  right fragment after copying v's backing into it) -- field-by-field equivalent to the old inline Case-4 math
+  (file / anon / shmem all verified), so no Case-4 regression. delta = end - v->start computed before start
+  moves. VERIFICATION: an offset-math bug, not concurrency -> a deterministic selftest (mm_vma_trim_selftest):
+  helper unit cases (file-backed 2-page front-trim advances file_off+file_len+shmem_pgoff; file_len underflow
+  clamps to 0; anonymous keeps file_off/file_len 0 and still advances shmem_pgoff) PLUS a real-path case that
+  builds a stack file-backed VMA + synthetic mm, calls mm_vma_remove to front-trim 2 of 4 pages (Case 3, no
+  free), and asserts start/end/file_off/file_len all moved in lockstep. `[mm_vma_trim] PASS`. Likely NOT boot-
+  exercised (a boot-time front-munmap of a file/shmem mapping then re-fault is not on the path), so the change
+  is effectively inert at boot like the NVMe/ksec cases; the selftest is the real proof. Clean boot FIRST try:
+  DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 64 selftests PASSED incl. [mm_vma_trim], 0 FAILED/PANIC, no
+  [WD], `More login:` renders. This closes fan-out #4 candidate (cc) -- and with (bb)/(dd)/(ee)/(cc) all fixed,
+  ALL of fan-out #4 is now resolved.
