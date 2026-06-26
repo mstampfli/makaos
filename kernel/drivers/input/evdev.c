@@ -97,6 +97,7 @@ input_device_t* input_device_register(const char* name,
     input_device_t* d = kmalloc(sizeof(*d));
     if (!d) return NULL;
     __builtin_memset(d, 0, sizeof(*d));
+    spin_lock_init(&d->lock);
 
     d->event_nr   = s_next_event_nr++;
     int i = 0;
@@ -160,7 +161,13 @@ void input_device_emit(input_device_t* d,
 
     input_event_t ev = { .type = type, .code = code, .value = value };
 
-    // Fan out to every non-grabbed client, OR only to the grabber.
+    // Fan out to every non-grabbed client, OR only to the grabber.  Hold the
+    // device lock (IRQ-safe) across the whole walk so a concurrent close()
+    // cannot unlink+free a client while we push into / wake it, and so the
+    // ring head/tail update cannot race a reader's drain.  The wakes do not
+    // sleep and the lock order (d->lock -> rq/waitq locks) is acyclic, so it is
+    // safe to wake under the lock (no snapshot array needed for the fan-out).
+    uint64_t flags = spin_lock_irqsave(&d->lock);
     evdev_client_t* grabber = NULL;
     if (d->grabbed) {
         for (evdev_client_t* c = d->clients; c; c = c->next)
@@ -180,6 +187,7 @@ void input_device_emit(input_device_t* d,
             if (c->file)   wait_queue_wake_all(c->file->waitq);
         }
     }
+    spin_unlock_irqrestore(&d->lock, flags);
 }
 
 // ── Keyboard bridge from input_core ──────────────────────────────────────
@@ -234,20 +242,32 @@ static int64_t evdev_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
     evdev_client_t* c = (evdev_client_t*)self->ctx;
     if (!c) return -EBADF;
     if (len < sizeof(input_event_t)) return -EINVAL;
+    input_device_t* d = c->dev;
+    if (!d) return -EBADF;
 
     int nonblock = (self->flags & 0x800 /*O_NONBLOCK*/) != 0;
+    // The ring head/tail are read + mutated under d->lock so the producer's
+    // push cannot race our drain.  The lock is dropped around sched_sleep --
+    // the wake_pending interlock in sched_wake/sched_sleep handles a wake that
+    // fires between releasing the lock and parking, so no wakeup is lost.
+    uint64_t flags = spin_lock_irqsave(&d->lock);
     while (ring_empty(c)) {
-        if (nonblock) return -EAGAIN;
+        if (nonblock) { spin_unlock_irqrestore(&d->lock, flags); return -EAGAIN; }
         c->reader = g_current;
+        spin_unlock_irqrestore(&d->lock, flags);
         sched_sleep();
         if (signal_has_actionable(&g_current->sigstate))
             return -EINTR;
+        flags = spin_lock_irqsave(&d->lock);
     }
 
     input_event_t* out = (input_event_t*)buf;
     uint64_t written = 0;
     uint64_t max_events = len / sizeof(input_event_t);
+    // out[] is a prefaulted sys_read buffer, so the copy under the lock cannot
+    // fault (same contract as tty_ldisc_drain / pty_master_drain).
     while (written < max_events && ring_pop(c, &out[written])) written++;
+    spin_unlock_irqrestore(&d->lock, flags);
     return (int64_t)(written * sizeof(input_event_t));
 }
 
@@ -262,19 +282,25 @@ static void evdev_vfs_close(vfs_file_t* self) {
     evdev_client_t* c = (evdev_client_t*)self->ctx;
     if (c) {
         // Un-mute the console when the compositor releases the keyboard.
+        // Done outside d->lock (it touches a separate input_core refcount).
         if (c->dev == s_keyboard_dev) input_kbd_ungrab();
-        // Drop grab if we hold it.
-        if (c->grabbed && c->dev) {
-            if (c->dev->grabbed > 0) c->dev->grabbed--;
-            c->grabbed = 0;
-        }
-        if (c->dev) {
-            evdev_client_t** pp = &c->dev->clients;
+        input_device_t* d = c->dev;
+        if (d) {
+            // Drop our grab and unlink from the client list UNDER d->lock so a
+            // concurrent input_device_emit walk cannot deref c after we free it.
+            uint64_t flags = spin_lock_irqsave(&d->lock);
+            if (c->grabbed) {
+                if (d->grabbed > 0) d->grabbed--;
+                c->grabbed = 0;
+            }
+            evdev_client_t** pp = &d->clients;
             while (*pp) {
                 if (*pp == c) { *pp = c->next; break; }
                 pp = &(*pp)->next;
             }
+            spin_unlock_irqrestore(&d->lock, flags);
         }
+        // c is now unlinked: no emit walk can reach it, so the free is safe.
         kfree(c);
     }
     kfree(self);
@@ -418,15 +444,20 @@ static int64_t evdev_vfs_ioctl(vfs_file_t* self, uint64_t req, uint64_t arg) {
     }
     case EVIOCGRAB_NR: {
         // arg is int (0 = ungrab, nonzero = grab).  Our ioctl wrapper
-        // receives arg as the raw syscall arg — not a pointer.
+        // receives arg as the raw syscall arg -- not a pointer.  d->grabbed
+        // and c->grabbed are read by the producer's grab-check, so mutate
+        // them under d->lock.
         int want = (int)arg;
+        uint64_t flags = spin_lock_irqsave(&d->lock);
+        int64_t rc = 0;
         if (want) {
-            if (d->grabbed && !c->grabbed) return -EBUSY;
-            if (!c->grabbed) { d->grabbed++; c->grabbed = 1; }
+            if (d->grabbed && !c->grabbed) rc = -EBUSY;
+            else if (!c->grabbed) { d->grabbed++; c->grabbed = 1; }
         } else {
             if (c->grabbed) { d->grabbed--; c->grabbed = 0; }
         }
-        return 0;
+        spin_unlock_irqrestore(&d->lock, flags);
+        return rc;
     }
     case EVIOCSCLOCKID_NR: {
         int id = 0;
@@ -513,9 +544,12 @@ vfs_file_t* evdev_open_device(uint32_t event_nr) {
     f->rdev    = (13u << 8) | ((64u + event_nr) & 0xff);
     c->file = f;
 
-    // Push into device's client list.
+    // Push into device's client list under d->lock so the insert cannot race
+    // a concurrent input_device_emit walk or a sibling close() unlink.
+    uint64_t flags = spin_lock_irqsave(&d->lock);
     c->next    = d->clients;
     d->clients = c;
+    spin_unlock_irqrestore(&d->lock, flags);
 
     // A userland reader of the keyboard means a compositor has taken
     // over input.  Mute the kernel console TTY for the lifetime of this
@@ -563,4 +597,65 @@ void evdev_init(void) {
     }
 
     input_register_handler(&s_evdev_handler);
+}
+
+// Deterministic evdev ring + client-lifetime selftest (the d->lock fix):
+// drive the producer (input_device_emit -- locked fan-out push) and a locked
+// drain, then unlink + free the client, asserting the events round-trip and the
+// lock does not self-deadlock.  The concurrent producer-vs-close UAF is not
+// deterministically reproducible -> this proves the locked single-threaded path;
+// code-proof covers the cross-CPU case (d->lock serialises the emit walk against
+// the unlink + free and the ring head/tail mutations).
+void evdev_ring_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    input_device_t* d = (input_device_t*)kmalloc(sizeof(input_device_t));
+    evdev_client_t* c = (evdev_client_t*)kmalloc(sizeof(evdev_client_t));
+    if (!d || !c) {
+        if (d) kfree(d);
+        if (c) kfree(c);
+        kprintf("[evdev_ring] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    __builtin_memset(d, 0, sizeof(*d));
+    __builtin_memset(c, 0, sizeof(*c));
+    spin_lock_init(&d->lock);
+    c->dev = d; c->reader = NULL; c->file = NULL;
+    c->next = d->clients; d->clients = c;   // single-threaded setup, no lock needed
+
+    // Producer: three EV_KEY events, each a locked ring_push (reader/file NULL
+    // so no wake fires).
+    input_device_emit(d, EV_KEY, KEY_A, 1);
+    input_device_emit(d, EV_KEY, KEY_A, 0);
+    input_device_emit(d, EV_KEY, KEY_B, 1);
+
+    // Consumer: drain under the lock via ring_pop -- expect the 3 events back.
+    input_event_t evs[8];
+    int got = 0;
+    uint64_t flags = spin_lock_irqsave(&d->lock);
+    while (got < 8 && ring_pop(c, &evs[got])) got++;
+    spin_unlock_irqrestore(&d->lock, flags);
+
+    if (got != 3 ||
+        evs[0].type != EV_KEY || evs[0].code != KEY_A || evs[0].value != 1 ||
+        evs[1].value != 0 || evs[2].code != KEY_B) {
+        fails++;
+        kprintf("[evdev_ring] FAIL roundtrip got=%d\n", got);
+    }
+
+    // Lifetime: unlink + free under the lock (mirror evdev_vfs_close); proves no
+    // self-deadlock and a clean list after the client is gone.
+    flags = spin_lock_irqsave(&d->lock);
+    evdev_client_t** pp = &d->clients;
+    while (*pp) { if (*pp == c) { *pp = c->next; break; } pp = &(*pp)->next; }
+    spin_unlock_irqrestore(&d->lock, flags);
+    if (d->clients != (evdev_client_t*)0) {
+        fails++;
+        kprintf("[evdev_ring] FAIL list not empty after unlink\n");
+    }
+
+    kfree(c);
+    kfree(d);
+    kprintf(fails ? "[evdev_ring] SELF-TEST FAILED\n"
+                  : "[evdev_ring] SELF-TEST PASSED (locked emit/drain + client unlink)\n");
 }

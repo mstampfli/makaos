@@ -140,6 +140,10 @@ typedef struct input_device {
 
     struct evdev_client* clients;
     int              grabbed;           // EVIOCGRAB holder count
+    spinlock_t       lock;              // serialises the client list lifetime +
+                                        // each client's ring head/tail.  IRQ-safe
+                                        // (spin_lock_irqsave): the mouse producer
+                                        // runs input_device_emit in IRQ context.
 
     struct input_device* next;
 } input_device_t;

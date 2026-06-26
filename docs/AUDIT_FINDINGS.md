@@ -1361,6 +1361,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   torn-index race on c->head/c->tail (plain uint32_t, no lock). Reachable: open /dev/input/event0 (0660),
   read() in one thread, close() in a sibling, input flowing. Fix = one per-device lock over the client-list
   lifetime AND the per-client ring head/tail (mirror F84), free RCU-deferred or wakes outside the lock.
+  -> VERIFIED + FIXED (F85): independently confirmed against the real code, incl. that the MOUSE producer runs
+  in IRQ context (i8042 ISR -> mouse_isr_packet -> input_device_emit), so the lock is IRQ-safe. Added
+  input_device_t.lock (spin_lock_irqsave) held across the emit fan-out (walk + ring_push + wakes; wakes under
+  the lock are safe -- acyclic order, non-sleeping), the close unlink (free after unlink), the read
+  empty-check + ring_pop (dropped around sched_sleep; wake_pending covers the gap), EVIOCGRAB, and the open
+  insert; poll/FIONREAD keep lockless advisory reads. Deterministic evdev_ring_selftest (locked emit/drain
+  round-trip + client unlink). Clean boot 60 PASSED incl. evdev_ring, no hang on the boot-exercised keyboard.
   (x) HIGH, needs a crafted/corrupt ext2 image -- ext2 block/inode bitmap OOB: s_blocks_per_grp /
   s_inodes_per_grp from the untrusted superblock are validated only != 0 (ext2.c ~877), never clamped to the
   one-block bitmap capacity s_block_size*8; the bitmap scratch is a fixed 4096 bytes, so bit = rel %

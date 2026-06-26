@@ -708,6 +708,12 @@ static void init_kthread(void) {
     // consumer (master_read), so a cross-CPU drain cannot race a push.
     extern void pty_master_ring_selftest(void);
     pty_master_ring_selftest();
+
+    // evdev: the per-open client list + each client's event ring are now
+    // serialised by a per-device IRQ-safe lock, so the IRQ/kthread producer
+    // (input_device_emit) cannot deref a client a concurrent close() freed.
+    extern void evdev_ring_selftest(void);
+    evdev_ring_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference
