@@ -512,6 +512,7 @@ vfs_file_t* unix_sock_open(int type) {
     if (!s) return NULL;
     zero_mem(s, sizeof(unix_sock_t));
     wait_queue_init(&s->waitq);
+    spin_lock_init(&s->lock);
 
     s->type  = (uint8_t)sock_type;
     s->state = UNIX_STATE_UNCONNECTED;
@@ -1046,13 +1047,21 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
                         if (signal_has_actionable(&g_current->sigstate))
                             return NULL;);
         if (listener->state != UNIX_STATE_LISTENING) return NULL;
-        if (!listener->backlog_head) continue;   // spurious wake, re-wait
 
-        // Dequeue the first pending connection.
+        // Dequeue the first pending connection UNDER the listener's per-socket
+        // lock so a concurrent connect() push or a second accept() pop cannot
+        // tear the singly-linked list or double-pop (double-free) the same node.
+        // Re-check the head inside the lock (the wait condition was tested
+        // unlocked, and another accepter may have drained it).
+        spin_lock(&listener->lock);
         unix_pending_t* pend = listener->backlog_head;
-        listener->backlog_head = pend->next;
-        if (!listener->backlog_head) listener->backlog_tail = NULL;
-        listener->backlog_count--;
+        if (pend) {
+            listener->backlog_head = pend->next;
+            if (!listener->backlog_head) listener->backlog_tail = NULL;
+            listener->backlog_count--;
+        }
+        spin_unlock(&listener->lock);
+        if (!pend) continue;   // empty (spurious wake / lost the race) -> re-wait
 
         unix_sock_t* client = pend->client;   // owns one ref (unix_get in connect)
         kfree(pend);
@@ -1178,23 +1187,35 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
     // accept()/close-drain drops this ref).  Without it, a client that bails
     // (-EINTR below) and closes leaves pend->client dangling for accept to
     // dereference -- a use-after-free.  Mirrors the F58 dgram_dest owned ref.
-    unix_pending_t* pend = kmalloc(sizeof(unix_pending_t));
+    unix_pending_t* pend = kmalloc(sizeof(unix_pending_t));   // alloc OUTSIDE the lock
     if (!pend) { rcu_read_unlock(); return -ENOMEM; }
     pend->next   = NULL;
     unix_get(s);
     pend->client = s;
 
-    if (target->backlog_tail) {
-        target->backlog_tail->next = pend;
-    } else {
-        target->backlog_head = pend;
+    // Link onto the listener backlog under its per-socket lock so a concurrent
+    // accept() pop, a second connect() push, and the count++ cannot tear the
+    // list or lose the count.  Re-check LISTENING + the backlog limit under the
+    // lock (a racing fill could have crossed it since the unlocked pre-check).
+    spin_lock(&target->lock);
+    if (target->state != UNIX_STATE_LISTENING ||
+        target->backlog_count >= target->backlog_max) {
+        spin_unlock(&target->lock);
+        unix_put(s);          // undo the backlog ref we just took
+        kfree(pend);
+        rcu_read_unlock();
+        return -ECONNREFUSED;
     }
+    if (target->backlog_tail) target->backlog_tail->next = pend;
+    else                      target->backlog_head = pend;
     target->backlog_tail = pend;
     target->backlog_count++;
-
     s->state = UNIX_STATE_CONNECTING;
+    spin_unlock(&target->lock);
 
-    // Wake the listener if it's blocked in accept() or poll().
+    // Wake the listener if it's blocked in accept() or poll().  OUTSIDE the lock
+    // -- wait_queue_wake_all touches rq_lock, which must never nest under a leaf
+    // data lock.
     unix_wake(target);
     unix_poll_wake(target);
 

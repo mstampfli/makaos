@@ -2213,3 +2213,68 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   everywhere; the six syscall.c gaps (F109) + the two net-layer gaps (F110) were the stragglers, now all closed.
   SCAN #3 COMPLETE (8 gaps fixed across F109+F110; the rest of the user->kernel pointer surface audited clean).
   Next: BUG-TYPE SCAN #4.
+
+- 2026-06-26 BUG-TYPE SCAN #4 (data-race on shared mutable state): a field/counter/list/flag mutated or read
+  from multiple CPUs (cross-core or process-vs-IRQ) WITHOUT a lock or correct atomic/order -> torn/stale/lost-
+  update/list-corruption (NOT UAF, NOT a benign single aligned-word flag load). Swept the whole tree with 4
+  parallel read-only agents (net; mm+proc; drivers+io; fs+ipc). Found a CLUSTER in AF_UNIX (one root: no per-
+  socket data lock), one UDP-rx-ring gap, one fd_flags lost-update, and the latent s_mmio_next. Fixed the sharpest
+  (the AF_UNIX backlog double-free, F111); the rest are recorded below for the next turns.
+  ROOT (AF_UNIX): unix_sock_t carried NO per-socket data lock -- unix_sock.h:106 literally says "Protected by
+    single-threaded kernel". Four queues race producer-vs-consumer across CPUs:
+    (A) backlog_head/tail/count -- connect() push (unix_sock.c ~1187) vs accept() pop (~1052) vs a 2nd connect,
+        all under rcu_read_lock only (which keeps the socket alive but does NOT serialize the list) -> torn list,
+        lost/over-limit count, and DOUBLE kfree(pend)/unix_put(client). FIXED (F111): added unix_sock_t.lock
+        (per-socket spinlock); connect re-checks LISTENING+limit and links under target->lock, accept pops under
+        listener->lock (re-check head inside), alloc + wait_queue wakes stay OUTSIDE the lock, never nested with
+        s_unix_pair_lock; free_rcu drains post-grace-period single-threaded (RCU-serialized vs connect, accept
+        cannot run on a refcount-0 listener) so it needs no lock. Documented in docs/LOCKS.md.
+    (B) dgram_head/tail/count -- unix_sock_sendto enqueue (~1422) vs unix_sock_recv_ex dequeue (~1365), no lock ->
+        torn list / lost message / count lost-update. RECORDED: wrap all three (enqueue/dequeue/free drain) in the
+        new per-socket lock next turn.
+    (C) stream cbuf buf_head/tail/count -- cbuf_write on the SENDER's CPU mutates the PEER's buffer (buf_count +=)
+        while cbuf_read on the owner's CPU does buf_count -= : a non-atomic RMW from two CPUs = permanent fill-
+        level corruption + torn stream bytes (the unix_sock.h:106 comment is the smoking gun). RECORDED: lock the
+        buffer-owner's per-socket lock around cbuf_write/cbuf_read next turn (count touched by both sides -> a lock,
+        not a bare SPSC fix).
+    (D) ancillary (SCM_RIGHTS) files[]/head/tail/count -- sendfd (~1485) vs recvfd (~1540) vs free_rcu drain, no
+        lock -> count lost-update, a passed fd leaked/double-delivered, free_rcu double-vfs_close. RECORDED: same
+        per-socket lock next turn.
+  OTHER GAPS (recorded, not yet fixed):
+    UDP inet rx ring (socket.c udp_rx_head/tail/count): socket_deliver_udp (rx-thread, ~688) vs socket_recv/
+      recvfrom (process, ~506/590) vs sock_free_rcu drain -- rcu keeps the socket alive but does not serialize the
+      queue -> count lost-update + torn head/tail (leaked skb / write onto freed skb). Fix: a per-socket lock (the
+      inet socket_t also lacks one) around deliver/recv/recvfrom/free.
+    fd_flags cloexec lost-update (syscall.c:3200, sys_socket_inner): after fd_install returns, `tf->ft->fd_flags[fd]
+      = FD_CLOEXEC` is a PLAIN store with no tf->lock and a plain tf->ft load, while a sibling thread's
+      fd_table_grow COW-copies fd_flags under tf->lock and RCU-publishes a new table -> the FD_CLOEXEC store can
+      land in the old (pending-RCU-free) table and be lost (fd survives exec -- the wayland/foot fd-leak class),
+      plus a minor UAF-write to the freed old table. Fix: fold cloexec into fd_install under tf->lock (like the
+      sys_open path), or wrap the set in tf->lock with a fresh ft re-read. Clean, low-risk, security-relevant.
+    s_mmio_next unlocked + unbounded (vmm.c:135/143): vmm_map_mmio reads-then-bumps the monotonic MMIO VA cursor
+      with NO lock/atomic AND no ceiling. CONFIRMED LATENT (today): every caller is a boot-serial initcall on the
+      BSP (run_dag is single-threaded; APs parked) so there is no concurrency yet -- it becomes an active overlap
+      the moment any non-serial caller (AP init / hot-plug / deferred probe) appears. Fix: __atomic_fetch_add for a
+      disjoint reservation + a documented MMIO_VIRT_END ceiling check.
+  DOCUMENTED-KNOWN / lower priority (recorded): TCP snd_nxt / send-snapshot / state / waiter (tcp.c, the T4
+    "remaining" note at tcp.c:170-174 -- snd_nxt advanced without pcb->lock, send reads an unlocked snapshot,
+    pcb->state torn multi-writer, pcb->waiter a single slot that loses a 2nd blocker's wakeup); ac97_write
+    unlocked ring (DEAD -- ac97 has no initcall, /dev/dsp -> hda); timerfd_gettime reads home_cpu outside t->lock
+    (stale remaining-time only); dcache_grow_locked plain hash_next splice (benign on x86 TSO); pcache `accessed`
+    CLOCK bit touched under two different locks (benign heuristic).
+  AUDITED CLEAN (mechanism): TCP ring accounting + accept queue (pcb->lock), virtio tx (s_tx_lock) / rx (single
+    consumer + lfence/mfence), ARP/UDP-port/unix-ns/PCB tables (RCU + per-table wlock), pmm refcount (g_pmm_lock)
+    + g_free_pages (atomics), PCP/slab per-CPU (cmpxchg16b + remote-free Treiber), VMA list (vma_lock + RCU),
+    shmem (refcount + per-object lock + RCU ns), pid pool / pid_ht / pgid-tgid-sid idx (locks + RCU), run/sleep/
+    zombie lists + children Treiber stack + task state (rq_lock / CAS / atomics), cpu_mask (atomic or/and + SEQ_CST
+    fence -- the SCAN #2 Dekker barrier), futex buckets (b->lock + read-before-publish), signal pending/blocked
+    (atomic bit ops), evdev ring+client list (d->lock irqsave), virtio_input/kbd/mouse (SPSC, BSP-pinned IRQ via
+    ioapic RDT_DEST(0)), tty/pty rings (tty->lock / master_lock, kthread producer not IRQ), virtio_gpu (synchronous
+    under s_ctrl/cursor_lock, no IRQ), drm event ring (SPSC release/acquire) + modeset seqlock, ahci (s_ci_lock
+    irqsave + done-release/acquire), nvme (per-CPU queues, MSI-X steered), hda (SPSC + mfence), io_uring (cq_lock
+    + SQPOLL sole consumer + overflow_lock), eventfd/timerfd/signalfd (atomics / pc->lock+t->lock / s_sfd_lock),
+    dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
+    pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
+    (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
+  SCAN #4 IN PROGRESS: F111 fixed the AF_UNIX backlog (sharpest -- double-free). Remaining: the AF_UNIX dgram/cbuf/
+    ancillary (B/C/D, same new lock), the UDP rx ring, the fd_flags cloexec lost-update, and s_mmio_next (latent).

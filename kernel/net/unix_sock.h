@@ -133,6 +133,19 @@ typedef struct unix_sock {
     // lifetimes interfering.  NULL = no connected default destination.
     struct unix_sock* dgram_dest;
 
+    // ── Per-socket data lock ─────────────────────────────────────────────
+    // Serializes the per-socket queues that used to assume the retired
+    // single-CPU model.  Currently guards the listener backlog
+    // (backlog_head/tail/count) against the connect() producer, the accept()
+    // consumer, and a second concurrent connect/accept on another CPU.  Held
+    // ONLY around the list mutation: allocations and wait_queue wakes happen
+    // OUTSIDE it (the waitq touches rq_lock, which must never nest under a leaf
+    // data lock), and it is never nested with s_unix_pair_lock (connect/accept
+    // take the two in separate critical sections).  The dgram / stream-cbuf /
+    // ancillary queues are still single-CPU-model and will move onto this same
+    // lock incrementally.
+    spinlock_t lock;
+
     // ── Listener backlog (SOCK_STREAM only) ──────────────────────────────
     unix_pending_t* backlog_head;
     unix_pending_t* backlog_tail;

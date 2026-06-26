@@ -377,6 +377,23 @@ ancillary fd close, struct free) via `call_rcu(unix_sock_free_rcu)`,
 so a concurrent `connect`/`sendto` inside `rcu_read_lock()` sees a
 consistent peer until it exits the reader section.
 
+### `unix_sock_t.lock` -- `kernel/net/unix_sock.c`
+Per-socket leaf spinlock (F111).  Serializes the per-socket queues that used to
+assume the retired single-CPU model.  Currently guards the LISTENER BACKLOG
+(`backlog_head` / `backlog_tail` / `backlog_count`): `unix_sock_connect` links a
+pending node under the LISTENER's lock (the backlog owner), `unix_sock_accept`
+pops under the same lock, so a connect-push racing an accept-pop (or a second
+concurrent connect/accept) can no longer tear the list or double-free a `pend`.
+Held ONLY around the list mutation -- the `kmalloc(pend)` and the
+`unix_wake`/`unix_poll_wake` (which touch `rq_lock`) stay OUTSIDE it, and it is
+never held together with `s_unix_pair_lock` (connect/accept take the two in
+separate critical sections), so there is no lock-order inversion.
+`unix_sock_free_rcu` drains the backlog post-grace-period at refcount 0
+(RCU-serialized vs connect; accept cannot run on a refcount-0 listener), so that
+path is single-threaded by construction and takes no lock.  The dgram / stream
+cbuf / ancillary queues are still single-CPU-model and will move onto this same
+lock incrementally (SCAN #4 follow-ups).
+
 ### `s_namespace_lock` — `kernel/mm/shmem.c`
 Guards the `s_namespace` table pointer.  `shmem_ns_find` walks
 lock-free inside `rcu_read_lock()` and bumps the found object's
