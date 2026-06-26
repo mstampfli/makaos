@@ -184,6 +184,11 @@ typedef struct io_uring {
     wait_queue_t           wq_waitq;    // worker sleeps here when head==NULL
     volatile uint32_t      worker_stop; // set on ring close
     volatile uint32_t      worker_done; // worker's last write before TASK_DEAD
+    spinlock_t             worker_lock; // serialises io_wq_ensure_worker's
+                                        // check-create-publish so two concurrent
+                                        // consumers spawn at most ONE worker (a
+                                        // second spawn would orphan the first ->
+                                        // a worker close never joins = UAF)
 
     // ── Phase 8F: SQPOLL kthread ───────────────────────────────
     // When IORING_SETUP_SQPOLL was requested, a dedicated poller

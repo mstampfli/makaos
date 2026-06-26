@@ -411,3 +411,28 @@ the reopen path, and set pty->slave_file before the s_pty_head insert in
 pty_alloc so slave_file==NULL unambiguously means "closed" (no not-fully-built
 window).  Deferred to keep this fix surgical on the boot-critical pty path; the
 [pty_reopen] selftest pins the safety invariant (slave_file cleared, no UAF).
+
+---
+
+## io_uring: non-SQPOLL concurrent enter() can double-execute a SQE (F105)
+
+F105 closed the io_uring SQ-consumer memory-safety bugs: enter() no longer
+consumes a SQPOLL ring (the poller is the sole consumer), and
+io_wq_ensure_worker is serialised so at most one async worker is ever spawned
+(closing the orphaned-worker use-after-free for every consumer-race path).
+
+REMAINING (correctness, NOT memory-safety -- no UAF/OOB): on a NON-SQPOLL ring,
+two threads that share the ring fd and both call io_uring_enter concurrently
+still run the SQ consumer loop unserialised (sys_io_uring_enter takes only
+fdget/fdput), so they can read the same sq_head, dispatch the same SQE twice
+(a double send/write/open) and double-advance the head.  This is io_uring
+MISUSE (the ring is designed for a single submitter thread) and yields only a
+duplicate operation + duplicate CQE, never memory corruption (the worker-orphan
+UAF is already closed).  The proper fix mirrors Linux's uring_lock over
+io_submit_sqes but WITHOUT holding a spinlock across a blocking sync dispatch
+(IORING_OP_WRITE etc. block on disk I/O): claim one SQE under a per-ring
+submit_lock (COPY it to a local to avoid the user-reuses-the-slot TOCTOU,
+advance + publish sq_head), release the lock, then dispatch the copy outside it;
+the IO_LINK chain logic must claim the whole chain under the lock.  Deferred to
+keep F105 surgical on the boot-critical io_uring path; the memory-safety bugs
+are fully closed.

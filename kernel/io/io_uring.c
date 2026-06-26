@@ -234,6 +234,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
     uring->wq_head = NULL;
     uring->worker_stop = 0;
     uring->worker_done = 0;
+    spin_lock_init(&uring->worker_lock);
     uring->sqp_task = NULL;
     uring->sqp_stop = 0;
     uring->sqp_done = 0;
@@ -758,8 +759,22 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE)) return 0;
     if (!uring->owner_task) return -EINVAL;
 
+    // Serialise the check-create-publish: two concurrent consumers (a non-SQPOLL
+    // ring driven by two threads sharing its fd) would both observe worker==NULL
+    // and each spawn a kthread; the second store would orphan the first, and
+    // io_uring_close_file joins only the published worker -> the orphan runs on
+    // and touches the freed `uring` (use-after-free).  Double-checked locking:
+    // re-test under the lock so exactly ONE worker is ever created.  Held only
+    // on the first async op; task_create_kthread / sched_add do not sleep and
+    // never take this lock, so no sleep-under-spinlock and no cycle.
+    spin_lock(&uring->worker_lock);
+    if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE)) {
+        spin_unlock(&uring->worker_lock);
+        return 0;
+    }
+
     task_t* t = task_create_kthread(io_wq_worker_entry, pid_alloc());
-    if (!t) return -ENOMEM;
+    if (!t) { spin_unlock(&uring->worker_lock); return -ENOMEM; }
 
     // Swap the freshly-allocated kernel mm/files for the owner's.
     // refs++ keeps them alive for the worker's lifetime; release the
@@ -781,6 +796,7 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     t->kthread_ctx = uring;
     __atomic_store_n(&uring->worker, t, __ATOMIC_RELEASE);
     sched_add(t);
+    spin_unlock(&uring->worker_lock);
     return 0;
 }
 
@@ -1040,20 +1056,27 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
                          uint32_t min_complete, uint32_t flags) {
     if (!uring) return -EINVAL;
 
-    // Phase 8F: wake the SQPOLL kthread if it's parked.  Caller bumps
-    // sq_tail, then calls enter(ENTER_SQ_WAKEUP) on observing
-    // IORING_SQ_NEED_WAKEUP set.
-    if ((flags & IORING_ENTER_SQ_WAKEUP) && uring->sqp_task) {
-        wait_queue_wake_all(&uring->sqp_waitq);
-        // SQPOLL rings don't do synchronous submission from enter —
-        // the poller handles it.  We only care about GETEVENTS below.
-        if (!(flags & IORING_ENTER_GETEVENTS)) return 0;
+    uint32_t submitted = 0;
+
+    // SQPOLL rings: the poller kthread (io_sqp_kthread_entry) is the SOLE SQ
+    // consumer.  enter() must NEVER consume the SQ here, REGARDLESS of flags --
+    // doing so races the poller: both read the same sq_head, dispatch the same
+    // SQE twice (double send/write/open + a duplicate CQE), non-atomically store
+    // head back (lost update -> unbounded re-dispatch), and an async SQE makes
+    // both call io_wq_ensure_worker, orphaning a worker that close never joins
+    // (use-after-free).  The old guard only skipped the SQ_WAKEUP-without-
+    // GETEVENTS case, so enter(GETEVENTS) and enter(0) on a SQPOLL ring fell
+    // through into the consumer loop.  Just wake the poller if asked, then go
+    // straight to the GETEVENTS wait below.
+    if (uring->sqp_task) {
+        if (flags & IORING_ENTER_SQ_WAKEUP)
+            wait_queue_wake_all(&uring->sqp_waitq);
+        goto getevents;
     }
 
-    uint32_t submitted = 0;
     uint32_t mask = io_sq_mask(uring);   // TRUSTED count, not the user-writable header
 
-    // Snapshot user's sq_tail with acquire — pairs with the user's
+    // Snapshot user's sq_tail with acquire -- pairs with the user's
     // release store after filling the SQE.
     uint32_t user_tail = __atomic_load_n(&uring->sq_hdr->tail, __ATOMIC_ACQUIRE);
     uint32_t head      = uring->sq_hdr->head;
@@ -1118,6 +1141,7 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
     // Publish new sq_head to user.
     __atomic_store_n(&uring->sq_hdr->head, head, __ATOMIC_RELEASE);
 
+getevents:
     // GETEVENTS: block until the CQ has min_complete entries waiting
     // for userspace.  WAIT_EVENT handles the canonical "register →
     // re-check → sleep → remove" protocol, including wake_pending

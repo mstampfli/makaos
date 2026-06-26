@@ -455,6 +455,20 @@ spinlock), then pushes from the bounce buffer into the ring under the lock.
 poll / ioctl read `count` locklessly as an advisory snapshot (a 32-bit
 aligned read is atomic; the authoritative re-check happens under the lock).
 
+### `io_uring_t.worker_lock` (per-ring) -- `kernel/io/io_uring.c`
+One spinlock per io_uring instance.  Serialises io_wq_ensure_worker's
+check-create-publish so AT MOST ONE async worker kthread is ever spawned
+per ring.  Without it, two concurrent SQ consumers (a non-SQPOLL ring
+driven by two threads sharing its fd) both observe `worker == NULL` and
+each spawn a kthread; the second store orphans the first, and
+io_uring_close_file joins only the published worker, so the orphan runs on
+and touches the freed ring (use-after-free).  Double-checked: a lock-free
+acquire-load fast path returns immediately when the worker already exists;
+only the first async op takes the lock.  Held across task_create_kthread +
+sched_add (neither sleeps nor takes this lock, so no sleep-under-spinlock
+and no cycle).  SQPOLL rings spawn the worker only from the single poller
+kthread, so they never contend it.
+
 ### RCU-deferred free paths (not locks, but part of Phase 6)
 
 - `task_destroy` → `call_rcu(task_free_rcu)` frees kstack, mm,

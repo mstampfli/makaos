@@ -1995,6 +1995,32 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   Linux uring_lock); (3) CAS-publish uring->worker so a race cannot orphan a worker. agent CONFIDENCE HIGH on the
   double-execution/double-completion (the loop is provably lock-free and the poller is a 2nd active consumer the
   guard fails to exclude for the common GETEVENTS call), MEDIUM-HIGH on the orphaned-worker UAF.
+  -> VERIFIED + FIXED (F105): confirmed io_uring_enter_impl's SQPOLL-skip (io_uring.c ~1046-1051) only fired for
+  (SQ_WAKEUP && !GETEVENTS), so enter(GETEVENTS) and enter(0) on a SQPOLL ring fell through into the unlocked
+  consumer loop (plain `head` load at ~1059); the SQPOLL poller (io_sqp_kthread_entry ~580-602) runs the same
+  loop with NO lock (relying on sole-consumer); io_wq_ensure_worker (~757) did a non-atomic load-NULL ->
+  task_create_kthread -> RELEASE-store, so two consumers each spawn + the 2nd store orphans the 1st (close joins
+  only uring->worker -> the orphan touches freed uring = UAF). REFINED the fix (no-assumptions): split the
+  memory-safety bugs from the correctness bug. The MEMORY-SAFETY bugs are the SQPOLL enter-vs-poller double-
+  consume + BOTH cases' orphaned-worker UAF. FIX (do-it-right, low-risk, NO lock held across blocking dispatch
+  -- IORING_OP_WRITE is sync-dispatched and blocks on disk I/O, so a submit-lock across dispatch would be sleep-
+  under-spinlock): (a) enter NEVER consumes a SQPOLL ring regardless of flags (goto getevents; the poller is the
+  sole consumer, closing the SQPOLL double-consume + its orphan, no lock); (b) added a per-ring worker_lock and
+  made io_wq_ensure_worker double-checked-locked so AT MOST ONE worker is ever spawned (closes the orphaned-
+  worker UAF for EVERY consumer-race path, incl. concurrent non-SQPOLL enters; held only on the first async op,
+  no sleep under it). The remaining NON-SQPOLL concurrent-enter DOUBLE-EXECUTION (two threads sharing the ring
+  fd both running the consumer -> a duplicate op + CQE; correctness, NOT memory-safety since the orphan UAF is
+  closed) is recorded as a follow-up in docs/SCALABILITY_DEBT.md (its proper fix needs copy-SQE-then-dispatch-
+  outside-the-lock to avoid holding a spinlock across a blocking WRITE; deferred to keep this surgical). VERIFY-
+  ALL-ANGLES: the goto skips only mask/user_tail/head (unused at getevents); submitted=0 for a SQPOLL enter
+  (correct -- it submits nothing); worker_lock init'd in the ring ctor + documented in docs/LOCKS.md; close-vs-
+  enter-spawn already serialised by the enter fdget ref. VERIFICATION: a cross-CPU race, not deterministically
+  reproducible -> code-proof + the existing [io_uring_test] (drives create -> NOP-batch + steady-state enter/
+  dispatch/complete -> close) and [io_ring_idx] selftests both PASS (the submit/complete path is unbroken) + a
+  clean boot. First boot hit the flaky F55 stall (net ready, login + /bin/net paged, no DHCP, 0 faults, 70
+  selftests PASSED incl. [io_uring_test]/[io_ring_idx]); the same-build re-boot reached the DHCP lease (ifconfig
+  IP 10.0.2.15 GW 10.0.2.2), 70 selftests PASSED, 0 FAILED/PANIC, no [WD], `More login:` renders. This closes
+  fan-out #7 candidate (qq).
   (nn) MEDIUM, unprivileged -- tty termios update race: TCSETS/TCSETSW/TCSETSF copy_from_user straight into the
   live tty->termios with NO tty->lock (kernel/drivers/tty/pty.c ~459-465; the /dev/tty fallback syscall.c
   ~4372-4380), racing the lock-free termios reads in tty_input_char (tty.c ~147-218, reads c_lflag + c_cc[]) and
