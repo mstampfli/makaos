@@ -1488,8 +1488,10 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         fdtable_t* src = g_current->files_shared->ft;
         fd_table_init(files, src->cap);
         fdtable_t* dst = files->ft;
-        for (uint32_t i = 0; i < src->cap; i++)
+        for (uint32_t i = 0; i < src->cap; i++) {
             dst->fd_table[i] = vfs_dup(src->fd_table[i]);
+            dst->fd_flags[i] = src->fd_flags[i];   // mirror task_fork: preserve FD_CLOEXEC
+        }
         t->files_shared = files;
     }
 

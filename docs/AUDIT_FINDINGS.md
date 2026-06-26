@@ -1303,3 +1303,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   a concurrently-dying fd now returns -EBADF instead of inserting an inert watch (more correct, race-only).
   Code-proof + epoll_pin selftest passes + clean boot (DHCP, 58 PASSED). Completes epoll fd safety (F80 epfd
   + F82 watched fd).
+- sys_thread private-fd-table clone drops FD_CLOEXEC -> CLOEXEC fd survives exec -> FIXED (F83, follow-up (t),
+  LOW correctness): the non-shared branch (syscall.c:1491) copied fd_table[i] via vfs_dup but not fd_flags[i],
+  unlike task_fork (process.c:558-561, copies both) and fd_table_grow (copies both). FD_CLOEXEC lives in the
+  parallel fd_flags[] (process.h:106) and exec closes fds with it set (syscall.c:1034-1043), so a spawn'd task
+  (private fd table) that holds a CLOEXEC fd then execs leaks it. Fix: add dst->fd_flags[i] = src->fd_flags[i]
+  to the clone loop, mirroring task_fork exactly. Code-proof + clean boot (spawn path is boot-exercised; 58
+  PASSED).
