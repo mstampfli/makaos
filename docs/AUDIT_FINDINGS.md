@@ -1310,3 +1310,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (private fd table) that holds a CLOEXEC fd then execs leaks it. Fix: add dst->fd_flags[i] = src->fd_flags[i]
   to the clone loop, mirroring task_fork exactly. Code-proof + clean boot (spawn path is boot-exercised; 58
   PASSED).
+- PTY master ring (m_head/m_tail) mutated unlocked by producer vs consumer on different CPUs -> data race /
+  lost wakeup -> FIXED (F84, follow-up (r)): pty_slave_write_char/write_buf (producer, slave write() path, no
+  lock -- tty.c forbids tty->lock there) and pty_master_read (consumer, no lock) raced the plain uint32_t
+  head/tail; masked indices keep it in-bounds (correctness, not OOB). The slave INPUT ring is correctly
+  serialised by tty->lock (tty_input_char + tty_ldisc_drain); the master OUTPUT ring just lacked the symmetric
+  lock. Multi-producer/consumer-capable, so a lock (not SPSC atomics) is needed. Fix: a per-pty master_lock
+  around the head/tail mutations only (write_char push, write_buf Phase-1, extracted pty_master_drain mirroring
+  tty_ldisc_drain), released before every wake and the blocking WAIT_EVENT (no nest, no sleep-under-lock). Drain
+  copies under the lock safely (sys_read prefaults the user buffer). Added pty_master_ring_selftest (round-trips
+  "hithere" through the locked push/drain). Clean boot 59 PASSED incl. pty_mring + pty_life.

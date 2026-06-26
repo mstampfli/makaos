@@ -702,6 +702,12 @@ static void init_kthread(void) {
     // unlinked, under s_pty_lock (no concurrent master/slave double-free).
     extern void pty_lifetime_selftest(void);
     pty_lifetime_selftest();
+
+    // PTY master ring: the slave-output ring (m_head/m_tail) is now mutated
+    // under master_lock by both the producer (write_char/write_buf) and the
+    // consumer (master_read), so a cross-CPU drain cannot race a push.
+    extern void pty_master_ring_selftest(void);
+    pty_master_ring_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference

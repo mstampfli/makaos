@@ -115,11 +115,14 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
 
     if (!pty->master_open) return;  // master closed, discard output
 
-    // Push into master ring buffer
+    // Push into master ring buffer under master_lock so a concurrent
+    // master_read drain (other CPU) cannot race the head/tail update.
+    spin_lock(&pty->master_lock);
     if (!mb_full(pty)) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
     }
+    spin_unlock(&pty->master_lock);
     // Full ring: drop is no longer expected for the normal single-byte
     // echo path.  The batched pty_slave_write_buf applies real flow
     // control instead; this per-byte fallback is only used for line-
@@ -131,7 +134,9 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
 }
 
 // Push one OPOST'd byte into the master ring.  Returns 1 on success,
-// 0 if the ring is full (caller must block or give up).
+// 0 if the ring is full (caller must block or give up).  The CALLER must
+// hold pty->master_lock (mirrors the tty rd_push "caller holds the lock"
+// contract); pty_slave_write_buf takes it around the whole push phase.
 static inline int pty_master_push_byte(pty_t* pty, uint8_t c) {
     if (mb_full(pty)) return 0;
     pty->master_buf[pty->m_head] = c;
@@ -159,8 +164,10 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
 
     uint64_t i = 0;
     while (i < len) {
-        // Phase 1: push as much as fits without blocking.
+        // Phase 1: push as much as fits without blocking, under
+        // master_lock so the head update cannot race a master_read drain.
         int pushed_any = 0;
+        spin_lock(&pty->master_lock);
         while (i < len) {
             uint8_t c = buf[i];
             if (opost_onlcr && c == '\n') {
@@ -182,6 +189,7 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
             i++;
             pushed_any = 1;
         }
+        spin_unlock(&pty->master_lock);
 
         // Wake the master reader so it can start draining.
         if (pushed_any) {
@@ -209,6 +217,21 @@ typedef struct {
     pty_t* pty;
 } pty_master_ctx_t;
 
+// Drain up to len bytes from the master ring into out, under master_lock
+// (mirrors tty_ldisc_drain).  out is a sys_read buffer whose pages were
+// prefaulted by user_buf_prefault before read() was called, so the copy
+// under the spinlock cannot fault.  Returns the number of bytes drained.
+static uint64_t pty_master_drain(pty_t* pty, uint8_t* out, uint64_t len) {
+    uint64_t got = 0;
+    spin_lock(&pty->master_lock);
+    while (got < len && !mb_empty(pty)) {
+        out[got++] = pty->master_buf[pty->m_tail];
+        pty->m_tail = mb_next(pty->m_tail);
+    }
+    spin_unlock(&pty->master_lock);
+    return got;
+}
+
 // Master read: get slave's output
 static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
@@ -230,12 +253,8 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
                         return -4 /*EINTR*/;);
     if (mb_empty(pty)) return 0;  // woke on EOF
 
-    uint8_t* out = (uint8_t*)buf;
-    uint64_t got = 0;
-    while (got < len && !mb_empty(pty)) {
-        out[got++] = pty->master_buf[pty->m_tail];
-        pty->m_tail = mb_next(pty->m_tail);
-    }
+    // Drain under master_lock via the shared helper (mirrors tty_ldisc_drain).
+    uint64_t got = pty_master_drain(pty, (uint8_t*)buf, len);
     // Backpressure: if we drained anything, wake slave writers that
     // might be blocked waiting for ring space.
     if (got) wait_queue_wake_all(&pty->slave_drain_waitq);
@@ -641,6 +660,7 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     slave->waitq           = &slave->_waitq; wait_queue_init(slave->waitq);
     wait_queue_init(&pty->slave.waitq);
     spin_lock_init(&pty->slave.lock);  // ldisc lock for the slave's ring + line buf
+    spin_lock_init(&pty->master_lock); // serialises the master-output ring head/tail
     slave->secondary_waitq = &pty->slave.waitq;  // woken by ldisc when data arrives
     slave->flags       = 0;
     slave->refcount    = 1;
@@ -764,4 +784,54 @@ void pty_lifetime_selftest(void) {
 
     kprintf(fails ? "[pty_life] SELF-TEST FAILED\n"
                   : "[pty_life] SELF-TEST PASSED (pair freed once, unlinked)\n");
+}
+
+// Deterministic master-ring selftest (the master_lock fix): drive the producer
+// (slave write_char + write_buf) and the consumer (pty_master_drain), all of
+// which now take master_lock, and verify the ring round-trips with no self-
+// deadlock.  The concurrent producer-vs-consumer race is not deterministically
+// reproducible -> this proves the locked single-threaded discipline; code-proof
+// covers the cross-CPU case (master_lock makes the head/tail mutations atomic,
+// mirroring tty->lock over the slave input ring).
+void pty_master_ring_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf("[pty_mring] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+
+    // Producer A: per-byte path (locked push).
+    pty_slave_write_char(&pty->slave, 'h');
+    pty_slave_write_char(&pty->slave, 'i');
+    // Producer B: batched path (locked Phase-1 push); 5 bytes fit, no block.
+    pty_slave_write_buf(&pty->slave, (const uint8_t*)"there", 5);
+
+    // Consumer: drain via the locked helper -- expect "hithere".
+    uint8_t out[8];
+    __builtin_memset(out, 0, sizeof(out));
+    uint64_t got = pty_master_drain(pty, out, sizeof(out));
+    const char* exp = "hithere";
+    int match = (got == 7);
+    for (uint64_t k = 0; match && k < 7; k++)
+        if (out[k] != (uint8_t)exp[k]) match = 0;
+    if (!match) {
+        fails++;
+        kprintf("[pty_mring] FAIL roundtrip got=%lu\n", (unsigned long)got);
+    }
+    // Ring is drained empty; a second drain returns 0 (head == tail).
+    if (pty_master_drain(pty, out, sizeof(out)) != 0) {
+        fails++;
+        kprintf("[pty_mring] FAIL ring not empty after drain\n");
+    }
+
+    // Tear down: close both ends (master then slave) so the pair is freed and
+    // unlinked, exactly like pty_lifetime_selftest.
+    m->close(m);
+    s->close(s);
+
+    kprintf(fails ? "[pty_mring] SELF-TEST FAILED\n"
+                  : "[pty_mring] SELF-TEST PASSED (locked master-ring push/drain round-trip)\n");
 }

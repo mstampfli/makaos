@@ -34,6 +34,11 @@ typedef struct pty {
     uint8_t*     master_buf;                    // ring: slave output → master read (kmalloc'd)
     uint32_t     m_head;                        // master ring head (write position)
     uint32_t     m_tail;                        // master ring tail (read position)
+    spinlock_t   master_lock;                   // serialises the master ring head/tail
+                                                // mutations: producer (slave write_char/
+                                                // write_buf) vs consumer (master_read) on
+                                                // different CPUs. Mirrors tty->lock over
+                                                // the slave input ring.
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
     wait_queue_t master_waitq;                  // wait queue for master-side
                                                 // blocking reads + poll/epoll
