@@ -118,18 +118,27 @@ void io_uring_close_file(struct vfs_file_t* f) {
         // park-after-stop lost-wakeup window, and sched_yield so the kthread
         // (typically on another CPU) makes progress.  close()/task-exit both
         // run in process context, so yielding here is safe.
-        if (uring->worker)
-            __atomic_store_n(&uring->worker_stop, 1u, __ATOMIC_RELEASE);
+        // Stop + JOIN the SQPOLL kthread FIRST.  It is the only io_wq-worker
+        // spawn site that runs WITHOUT an fd ref (io_uring_enter holds an fdget
+        // ref, so it cannot race this last-ref-drop close); until SQPOLL is
+        // provably dead it can still io_wq_ensure_worker() on an IOSQE_ASYNC SQE
+        // and publish uring->worker AFTER we read it -- an orphaned worker that
+        // never sees worker_stop and then UAFs the freed ring.  Joining SQPOLL
+        // first makes uring->worker stable before we decide to stop/join it.
         if (uring->sqp_task)
             __atomic_store_n(&uring->sqp_stop, 1u, __ATOMIC_RELEASE);
-        while (uring->worker &&
-               !__atomic_load_n(&uring->worker_done, __ATOMIC_ACQUIRE)) {
-            wait_queue_wake_all(&uring->wq_waitq);
-            sched_yield();
-        }
         while (uring->sqp_task &&
                !__atomic_load_n(&uring->sqp_done, __ATOMIC_ACQUIRE)) {
             wait_queue_wake_all(&uring->sqp_waitq);
+            sched_yield();
+        }
+        // SQPOLL is dead now -> read uring->worker with acquire (observes a
+        // worker SQPOLL may have published just before exiting), then stop+join.
+        if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&uring->worker_stop, 1u, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&uring->worker_done, __ATOMIC_ACQUIRE)) {
+            wait_queue_wake_all(&uring->wq_waitq);
             sched_yield();
         }
         // Phase 8G: release fixed files.
@@ -746,7 +755,7 @@ static void io_wq_worker_entry(void) {
 // created on first async-flagged op.  Shares mm_shared + files_shared
 // with the ring's owner task so it can touch user buffers and fds.
 static int io_wq_ensure_worker(io_uring_t* uring) {
-    if (uring->worker) return 0;
+    if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE)) return 0;
     if (!uring->owner_task) return -EINVAL;
 
     task_t* t = task_create_kthread(io_wq_worker_entry, pid_alloc());
@@ -766,9 +775,11 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     if (t->mm_shared)    __atomic_add_fetch(&t->mm_shared->refs, 1, __ATOMIC_RELAXED);
     if (t->files_shared) __atomic_add_fetch(&t->files_shared->refs, 1, __ATOMIC_RELAXED);
 
-    // Stash the ring pointer so the worker can find it.
+    // Stash the ring pointer so the worker can find it.  Publish uring->worker
+    // with RELEASE so io_uring_close_file's ACQUIRE read (after it has joined
+    // SQPOLL, this worker's spawner) is guaranteed to observe it and join it.
     t->kthread_ctx = uring;
-    uring->worker = t;
+    __atomic_store_n(&uring->worker, t, __ATOMIC_RELEASE);
     sched_add(t);
     return 0;
 }

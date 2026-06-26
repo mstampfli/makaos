@@ -1446,3 +1446,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   SAFE. Fix = stop + JOIN SQPOLL FIRST, then read/stop/join the worker (only after sqp_done can no new worker
   be spawned); harden the worker publish to a release store + acquire load. PRIORITY: (z) /proc first (most
   reachable, clearest root cause), then (aa) io_uring (cleanest fix, a reorder), then (y) ksec (biggest fix).
+  -> VERIFIED + FIXED (F89): confirmed the join order + the plain publish, AND that the enter spawn-site is
+  ref-serialised (sys_io_uring_enter holds an fdget ref so close cannot run during it) -- so SQPOLL is the only
+  spawn site that races close. Fix: io_uring_close_file now stops+JOINS SQPOLL FIRST, then reads/stops/joins
+  the worker; the worker publish is a release store and every uring->worker read (close join + ensure_worker
+  fast-path) an acquire load. io_uring_test still PASSES + clean boot (DHCP, 61 PASSED).
