@@ -52,9 +52,18 @@ static spinlock_t       s_unix_ns_wlock = SPINLOCK_INIT;
 // lock: every alloc and wake happens OUTSIDE it, so no nesting / deadlock.
 static spinlock_t       s_unix_pair_lock = SPINLOCK_INIT;
 
+// Bounded equality.  Every path here lives in a UNIX_PATH_MAX buffer and is
+// NUL-terminated by construction (ns_path_copy caps stored paths; the syscall
+// boundary copy_sockaddr_un_from_user NUL-caps incoming ones).  Capping the walk
+// at UNIX_PATH_MAX makes it safe-by-construction -- it can never run off the end
+// even if a future caller forgets to terminate.  For NUL-terminated inputs the
+// result is identical to the old byte-for-byte compare.
 static int ns_streq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
+    for (uint32_t i = 0; i < UNIX_PATH_MAX; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
 }
 
 static void ns_path_copy(char* dst, const char* src) {
@@ -63,9 +72,14 @@ static void ns_path_copy(char* dst, const char* src) {
     dst[i] = '\0';
 }
 
+// Bounded FNV-1a.  Capped at UNIX_PATH_MAX (paths never exceed it); for any
+// NUL-terminated path shorter than the cap the hash is identical to the old
+// unbounded walk, so the namespace hashing is unchanged for every real path.
 static uint32_t ns_hash_str(const char* s, uint32_t cap) {
     uint32_t h = 2166136261u;
-    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    for (uint32_t i = 0; i < UNIX_PATH_MAX && s[i]; i++) {
+        h ^= (uint8_t)s[i]; h *= 16777619u;
+    }
     return h & (cap - 1u);
 }
 
@@ -556,6 +570,38 @@ int unix_sock_pair(int type, vfs_file_t** out) {
     out[0] = a;
     out[1] = b;
     return 0;
+}
+
+// ── namespace string helpers selftest ─────────────────────────────────
+// Audit fix (BUG-TYPE SCAN #3): sys_bind/connect/sendto used to walk the user
+// sun_path as an unbounded C-string in ns_hash_str/ns_streq (read past the
+// validated sockaddr into the next page -> #PF DoS).  The syscall boundary now
+// copies + NUL-caps sun_path, and these helpers are capped at UNIX_PATH_MAX.
+// Verify they are bounded (a full non-NUL-terminated UNIX_PATH_MAX buffer does
+// not run off the end) and that equality/hashing still match C-string semantics
+// for normal NUL-terminated paths.
+void unix_ns_str_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    if (!ns_streq("/run/x", "/run/x")) fails++;
+    if ( ns_streq("/run/x", "/run/y")) fails++;
+    if (!ns_streq("", "")) fails++;
+    // Hash must stop at the NUL: trailing garbage after it changes nothing.
+    char a[UNIX_PATH_MAX], b[UNIX_PATH_MAX];
+    __builtin_memset(a, 0, sizeof(a));
+    __builtin_memset(b, 0, sizeof(b));
+    a[0] = '/'; a[1] = 'x';
+    b[0] = '/'; b[1] = 'x'; b[3] = 'Z'; b[4] = 'Q';   // garbage past the NUL at [2]
+    if (ns_hash_str(a, 256) != ns_hash_str(b, 256)) fails++;
+    // Bounded: a fully non-NUL-terminated buffer must terminate at the cap.
+    __builtin_memset(a, 'A', sizeof(a));
+    __builtin_memset(b, 'A', sizeof(b));
+    if (!ns_streq(a, b)) fails++;            // equal through UNIX_PATH_MAX
+    (void)ns_hash_str(a, 256);               // must return (capped), not run off
+    b[UNIX_PATH_MAX - 1] = 'B';
+    if (ns_streq(a, b)) fails++;             // differ only at the last byte
+    kprintf(fails ? "[unix_ns_str] SELF-TEST FAILED\n"
+                  : "[unix_ns_str] SELF-TEST PASSED (bounded hash/streq, NUL-stop)\n");
 }
 
 // ── socketpair selftest ──────────────────────────────────────────────

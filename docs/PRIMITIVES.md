@@ -88,6 +88,20 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   no raw user-string reads bypassing it (the dev[]/comm[] per-char loops read
   post-copy KERNEL buffers, not user pointers), so no copy_str_from_user rename is
   warranted -- it stays the named path wrapper.
+- `copy_sockaddr_un_from_user(ksa, addr_ptr)` (syscall.c, F110) -- copy a user
+  sockaddr_un into a kernel buffer AND force sun_path NUL-termination
+  (`sun_path[sizeof-1]='\0'`).  sys_bind/connect/sendto used to cast addr_ptr to a
+  user `sockaddr_un_t*` and walk sa->sun_path as a C-string (ns_hash_str/ns_streq +
+  debug print); user_buf_check validated only the 110-byte struct, so a 108-non-NUL
+  sun_path read past it into the next page -> #PF DoS.  All three AF_UNIX sites now
+  go through this one helper, so no user memory is ever walked as a string; the
+  downstream ns_hash_str/ns_streq are additionally capped at UNIX_PATH_MAX
+  (safe-by-construction).  This is the "copy + NUL-cap a user struct that the kernel
+  will then treat as a C-string" idiom -- apply it wherever a user struct carries a
+  to-be-walked string field.  `unix_ns_str_selftest` covers the bounded hash/streq.
+  (Sibling raw-out-param fixes F109: sys_wait/pipe/fb_info copy_to_user a kernel
+  local; sys_nanosleep/shm_open/shm_unlink copy_from_user into one; sys_setsockopt
+  bounces optval into a kernel buffer so no option handler derefs the raw pointer.)
 
 ### C. Rings (producer/consumer accounting)
 - `tcp_ring_consume(head, used, n, mask)` -- clamped drain, never underflows (F18).

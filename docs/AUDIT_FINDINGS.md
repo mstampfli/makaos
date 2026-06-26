@@ -2172,15 +2172,20 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     sys_nanosleep (2889): raw `req->tv_sec/tv_nsec` read -> kernel READ oracle + #PF panic (DoS).
     sys_shm_open (2740) / sys_shm_unlink (2852): raw `__builtin_memcpy(name, uname, namelen)` from user ptr ->
       kernel READ + #PF panic (namelen WAS bounded to SHMEM_NAME_MAX, but the POINTER was unvalidated).
-  RECORDED for next turn (net-layer, lower severity -- #PF-DoS / 1-bit oracle, different files):
+  FIXED (F110, the net-layer pair -- lower severity, #PF-DoS / 1-bit oracle):
     setsockopt optval (kernel/net/socket.c:635, the SO_BROADCAST `int v = *(const int*)optval`): the optval
-      pointer is passed from sys_setsockopt (syscall.c:3382) with no user_buf_check -> #PF/#GP DoS + a 1-bit
-      "is *KADDR nonzero" oracle. Fix: bounce optval through copy_from_user in sys_setsockopt; operate on the copy.
-    AF_UNIX sun_path (unix_sock.c ns_insert/ns_hash_str/ns_streq via sys_bind/sys_connect/sys_sendto): the
-      sockaddr base IS range-validated (user_buf_check sizeof(sockaddr_un)), but sun_path is then walked as an
-      unbounded C-string (no NUL in 108 bytes -> reads into the next, possibly-unmapped page) -> #PF DoS. Fix:
-      copy the sockaddr into a kernel sockaddr_un, force sun_path[UNIX_PATH_MAX-1]='\0' before any strlen/hash;
-      bound ns_hash_str/ns_streq with UNIX_PATH_MAX. Also the debug serial_puts_dbg(sa->sun_path) at syscall.c:3198.
+      pointer was passed from sys_setsockopt (syscall.c) with no validation -> #PF/#GP DoS + a 1-bit "is *KADDR
+      nonzero" oracle. FIXED: sys_setsockopt now bounces optval into a 128-byte kernel buffer via copy_from_user
+      (rejects vallen > 128 with -EINVAL) and passes the COPY to socket_setsockopt, so no option handler ever
+      derefs the raw user pointer.
+    AF_UNIX sun_path (sys_bind/sys_connect/sys_sendto cast addr_ptr to a USER sockaddr_un and walked sa->sun_path
+      as an unbounded C-string via serial_puts_dbg + unix_sock_bind/connect/sendto -> ns_hash_str/ns_streq; the
+      base was user_buf_check-validated for 110 bytes but a 108-non-NUL sun_path read past it into the next,
+      possibly-unmapped page -> #PF DoS). FIXED: extracted copy_sockaddr_un_from_user (PRIMITIVE) which
+      copy_from_user's the whole sockaddr into a kernel sockaddr_un and FORCE-NUL-caps sun_path[len-1]; all three
+      sites now use the kernel copy, so no user memory is walked. ns_hash_str/ns_streq additionally capped at
+      UNIX_PATH_MAX (safe-by-construction; identical hash/compare for every real NUL-terminated path). New
+      unix_ns_str_selftest (bounded hash/streq, NUL-stop).
   AUDITED CLEAN (provably -- the whole surface):
     driver ioctls: EVERY .ioctl across drivers routes `arg` (and embedded user sub-pointers) through copy_*_user --
       DRM (per-handler copy_from/to_user on the top-level arg AND every nested objs_ptr/props_ptr/modes_ptr/id
@@ -2205,5 +2210,6 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       kernel-resident structs (no user pointer on the wire). READV/WRITEV/SENDMSG/RECVMSG are not io_uring opcodes.
       CLEAN.
   VERDICT: the validation primitive (copy_from_user/copy_to_user/_access_ok/user_buf_check) is applied almost
-  everywhere; the six syscall.c gaps were the stragglers (raw out-param stores + raw name memcpy), now closed.
-  SCAN #3 not yet COMPLETE -- two net-layer gaps (setsockopt, sun_path) remain; finish them next turn.
+  everywhere; the six syscall.c gaps (F109) + the two net-layer gaps (F110) were the stragglers, now all closed.
+  SCAN #3 COMPLETE (8 gaps fixed across F109+F110; the rest of the user->kernel pointer surface audited clean).
+  Next: BUG-TYPE SCAN #4.

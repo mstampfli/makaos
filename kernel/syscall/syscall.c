@@ -3208,6 +3208,20 @@ static inline int is_unix_sock(vfs_file_t* f) {
     return f && f->close == unix_sock_close;
 }
 
+// Copy a user sockaddr_un into a kernel buffer and GUARANTEE sun_path is NUL-
+// terminated.  The AF_UNIX namespace hash/compare (ns_hash_str/ns_streq) and the
+// debug prints walk sun_path as a C-string; reading it straight out of user
+// memory let a sun_path with no NUL in its 108 bytes run past the validated
+// struct into the next (possibly unmapped) page -> kernel #PF (DoS).  Copying +
+// NUL-capping here means every downstream walk is over a bounded kernel string.
+// Returns 0 or -EFAULT.
+static int copy_sockaddr_un_from_user(sockaddr_un_t* ksa, uint64_t addr_ptr) {
+    if (copy_from_user(ksa, (const void*)(uintptr_t)addr_ptr, sizeof(*ksa)) != 0)
+        return -EFAULT;
+    ksa->sun_path[sizeof(ksa->sun_path) - 1] = '\0';
+    return 0;
+}
+
 // bind(fd, sockaddr*, addrlen) → 0 or -errno
 static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
@@ -3219,11 +3233,11 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
-        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
-        serial_puts_dbg("[bind] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
-        int r = unix_sock_bind(f, sa->sun_path);
+        sockaddr_un_t ksa;
+        if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+        if (ksa.sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
+        serial_puts_dbg("[bind] unix path="); serial_puts_dbg(ksa.sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_bind(f, ksa.sun_path);
         serial_puts_dbg("[bind] result="); serial_hex_dbg((uint64_t)(int64_t)r);
         ret = (uint64_t)(int64_t)r; goto out;
     }
@@ -3306,11 +3320,11 @@ uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
-        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
-        serial_puts_dbg("[connect] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
-        int r = unix_sock_connect(f, sa->sun_path);
+        sockaddr_un_t ksa;
+        if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+        if (ksa.sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
+        serial_puts_dbg("[connect] unix path="); serial_puts_dbg(ksa.sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_connect(f, ksa.sun_path);
         serial_puts_dbg("[connect] result="); serial_hex_dbg((uint64_t)(int64_t)r);
         ret = (uint64_t)(int64_t)r; goto out;
     }
@@ -3338,10 +3352,10 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
 
     if (is_unix_sock(f)) {
         if (addr_ptr) {
-            if (user_buf_check(addr_ptr, sizeof(sockaddr_un_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
-            const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
+            sockaddr_un_t ksa;
+            if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
             int r = unix_sock_sendto(f, (const void*)buf_ptr, (uint32_t)len,
-                                      sa->sun_path);
+                                      ksa.sun_path);
             ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
         }
         int r = unix_sock_send(f, (const void*)buf_ptr, (uint32_t)len);
@@ -3401,13 +3415,27 @@ static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                                 uint64_t val_ptr, uint64_t vallen) {
     vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
+    // Bounce optval into a kernel buffer so socket_setsockopt never derefs the
+    // raw user pointer: the SO_BROADCAST handler did *(const int*)optval, so a
+    // kernel/non-canonical optval was a #PF/#GP DoS + a 1-bit kernel-read
+    // oracle.  No socket option needs more than a few bytes.  Declared before
+    // any goto so the is_unix_sock skip does not jump over an initializer.
+    uint8_t kopt[128];
+    const void* kvp = NULL;
     uint64_t ret;
     if (is_unix_sock(f)) {
         // Unix sockets: accept everything silently (no options honoured yet).
         ret = 0; goto out;
     }
+    if (val_ptr) {
+        if (vallen > sizeof(kopt)) { ret = (uint64_t)-EINVAL; goto out; }
+        if (copy_from_user(kopt, (const void*)(uintptr_t)val_ptr, vallen) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
+        kvp = kopt;
+    }
     ret = (uint64_t)(int64_t)socket_setsockopt(f, (int)level, (int)opt,
-                                               (const void*)val_ptr, (uint32_t)vallen);
+                                               kvp, (uint32_t)vallen);
 out:
     fdput(f);
     return ret;

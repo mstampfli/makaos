@@ -656,6 +656,11 @@ static void init_kthread(void) {
     extern void unix_refcount_selftest(void);
     unix_refcount_selftest();
 
+    // AF_UNIX namespace string helpers: bounded hash/compare so a user sun_path
+    // can never be walked past UNIX_PATH_MAX (the boundary now NUL-caps it too).
+    extern void unix_ns_str_selftest(void);
+    unix_ns_str_selftest();
+
     // AF_UNIX stream listen/accept backlog: a queued connect() client holds an
     // owned ref so it cannot dangle, and accept() atomically claims it before
     // pairing (the backlog client UAF fix).
