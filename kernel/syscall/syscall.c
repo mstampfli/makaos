@@ -1773,6 +1773,16 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     {
         fs_node_t fsn;
         int fsr = fs_lookup(path, &g_current->cred, ACL_PERM_READ | ACL_PERM_EXEC, &fsn);
+        // unveil sandbox: a directory outside the unveiled set must be
+        // indistinguishable from one that does not exist, exactly as sys_stat
+        // does -- otherwise readdir leaks its entries (names + inode#/size) even
+        // though open/stat on them are blocked.  fs_lookup normalized `path`
+        // (collapsed `..`) above, so this cannot be bypassed with a trailing
+        // `..`.  UNVEIL_READ is the documented permission for readdir.  Checked
+        // before the fsr result so existence is not leaked either.  (No-op when
+        // no unveil is active: unveil_ok allows everything until the first
+        // unveil() call.)  Covers ext2, /proc and /dev uniformly, like sys_stat.
+        if (!unveil_ok(path, UNVEIL_READ)) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
         if (fsr != 0) { kfree(kbuf); kfree(path); return (uint64_t)(int64_t)fsr; }
         if (fsn.type != FS_TYPE_DIR) { kfree(kbuf); kfree(path); return (uint64_t)-ENOTDIR; }
 

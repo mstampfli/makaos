@@ -1820,6 +1820,24 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the prefix math + added the gate to unlink/rename/mkdir/rmdir/truncate/exec -- readdir was simply never added).
   Fix = after `fs_lookup(path, ...)` add `if (!unveil_ok(path, UNVEIL_READ)) { kfree(kbuf); kfree(path); return
   -ENOENT; }` (free both buffers on the deny path), mirroring sys_stat. agent CONFIDENCE HIGH the gate is absent.
+  -> VERIFIED + FIXED (F100): confirmed sys_readdir's full body (syscall.c ~1740-1823) has NO unveil_ok call --
+  fs_lookup (~1775) only does ACL_PERM_READ|EXEC checks; confirmed sys_stat IS the model (~1859-1860:
+  fs_lookup then `if (!unveil_ok(path, UNVEIL_READ)) return -ENOENT` BEFORE the fsr check, to hide); confirmed
+  fs_lookup calls normalize_path in place (virtfs.c:383) so `..` cannot bypass the prefix check; and confirmed
+  UNVEIL_READ is the RIGHT constant -- unveil.h:27 documents it as "O_RDONLY, stat, readdir". FIX (do-it-right,
+  mirror sys_stat exactly, ONE shared mechanism): inserted `if (!unveil_ok(path, UNVEIL_READ)) { kfree(kbuf);
+  kfree(path); return -ENOENT; }` immediately after fs_lookup, BEFORE the fsr check and BEFORE the is_virtual
+  dispatch, so it covers ext2 AND /proc AND /dev uniformly (matching sys_stat) and hides existence too; both
+  kmalloc'd buffers (kbuf ~1769, path ~1747) are freed on the deny path. No-op when no unveil is active
+  (unveil_ok allows all until the first unveil() call), so unconfined readdir is unchanged. VERIFICATION: the
+  fix wires readdir to the EXISTING, already-tested unveil_ok/unveil_check decision -> no new selftest needed
+  (the [unveil] selftest covers prefix + boundary + perm bits incl. UNVEIL_READ, and [virtfs_unveil] covers the
+  mount boundary; adding a redundant readdir-specific unveil test would re-test the same mechanism). Code-proof
+  (identical to the 8 sibling call sites: open/exec/stat/unlink/rename/mkdir/access/truncate) + clean boot
+  (login/bash/ls readdir with no unveil active -> allowed, so the gate must not break unconfined listing).
+  Clean boot FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 68 selftests PASSED incl. `[unveil]`
+  and `[virtfs_unveil]`, 0 FAILED/PANIC, no [WD], `More login:` renders (directory listing works). This closes
+  fan-out #6 candidate (kk).
   (ll) LOW, latent/unreachable -- build_prdt (kernel/drivers/storage/ahci.c ~402-418) writes prdt[n++] with NO
   n<248 bound (unlike its three siblings), so a bytes value > 248*page_span would OOB-write past prdt[248] off
   the 4KiB cmd_table_t; but its ONLY caller ahci_read_multi (~946) always passes bytes=PAGE_SIZE (1 entry) and
