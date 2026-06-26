@@ -1428,6 +1428,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pattern (which only touches g_current's OWN table). Fix = RCU-defer the task_files_t free (mirror mm_shared:
   release/free in task_free_rcu, or call_rcu the final-drop free), so the existing rcu_read_lock in proc_open
   genuinely pins it; also make the files_shared store/loads atomic.
+  -> VERIFIED + FIXED (F88, option b): confirmed task_files_release vfs_close's the fds synchronously (the
+  load-bearing exit_files EOF semantics, syscall.c:678) AND kfree's the struct synchronously. Fix keeps the
+  synchronous close but call_rcu_expedited's the STRUCT free (task_files_free_rcu); sys_exit unpublishes
+  files_shared with a release store BEFORE task_files_release (correct unpublish->call_rcu RCU order); the 3
+  proc readers snapshot files_shared once with an acquire load (also closing a 2nd-order double-read NULL-deref
+  race). The fd_table[n] file pointers are covered by the existing tryget-under-rcu (like fdget). Code-proof +
+  clean boot (exit path + /proc heavily boot-exercised; task_exit_state/tgleader selftests pass; 61 PASSED).
   (aa) io_uring SQPOLL-spawns-worker-after-close UAF (kernel/io/io_uring.c: io_uring_close_file ~121-134 vs
   io_sqp_kthread_entry ~587 -> io_wq_ensure_worker ~771): close stops/joins the io_wq worker BEFORE SQPOLL,
   gating on a plain read of uring->worker; if no async op has run yet, worker==NULL so close skips the worker

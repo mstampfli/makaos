@@ -286,22 +286,28 @@ static const proc_pid_file_t s_proc_pid_files[] = {
 // file so a concurrent close on the target can't free it under us.
 static vfs_file_t* proc_fd_open(task_t* t, const char* fd_str) {
     uint32_t n = str_to_uint(fd_str);
-    if (!t->files_shared) return NULL;
-    vfs_file_t* f;
+    vfs_file_t* f = NULL;
     rcu_read_lock();
-    fdtable_t* ft = __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE);
-    if (!ft || n >= ft->cap) { rcu_read_unlock(); return NULL; }
-    f = vfs_tryget(__atomic_load_n(&ft->fd_table[n], __ATOMIC_ACQUIRE));
+    // Snapshot files_shared ONCE under rcu: task_files_release RCU-defers the
+    // table struct free, so a non-NULL snapshot stays valid for this whole
+    // section (and a single load avoids a NULL-deref race vs a concurrent exit
+    // that unpublishes files_shared).
+    task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+    fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
+    if (ft && n < ft->cap)
+        f = vfs_tryget(__atomic_load_n(&ft->fd_table[n], __ATOMIC_ACQUIRE));
     rcu_read_unlock();
-    return f;  // already has +1 ref from tryget
+    return f;  // +1 ref from tryget, or NULL
 }
 
 // Readdir /proc/<pid>/fd/ — list open fd numbers as entry names.
 static int proc_fd_readdir(task_t* t, ext2_entry_t* out, int max) {
-    if (!t->files_shared) return 0;
     int count = 0;
     rcu_read_lock();
-    fdtable_t* ft = __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE);
+    // Snapshot files_shared ONCE under rcu (task_files_release RCU-defers the
+    // table free; a single load avoids a NULL-deref race vs a concurrent exit).
+    task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+    fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
     if (!ft) { rcu_read_unlock(); return 0; }
     for (uint32_t i = 0; i < ft->cap && count < max; i++) {
         if (!ft->fd_table[i]) continue;
@@ -590,9 +596,8 @@ int proc_stat(const char* path, struct stat* out) {
         // /proc/<pid>/fd/<n>
         if (sub[0]=='f' && sub[1]=='d' && sub[2]=='/') {
             uint32_t n = str_to_uint(sub + 3);
-            fdtable_t* ft = t->files_shared
-                            ? __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE)
-                            : NULL;
+            task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+            fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
             if (!ft || n >= ft->cap || !ft->fd_table[n]) { rc = -1; goto stat_out; }
             out->st_ino    = pid + 0x30000 + n;
             out->st_size   = 0;

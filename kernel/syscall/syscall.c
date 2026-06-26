@@ -718,10 +718,16 @@ static uint64_t sys_exit(uint64_t code) {
         }
 
         // Drop the fd table now so peers (pipes, sockets, ttys) see EOF
-        // immediately rather than at reap time.
+        // immediately rather than at reap time.  UNPUBLISH files_shared with a
+        // release store BEFORE releasing it: task_files_release RCU-defers the
+        // table struct free, and a /proc/<pid>/fd reader loads files_shared
+        // under rcu_read_lock.  Unpublishing first means no new reader can grab
+        // the table after the call_rcu, so the grace period waits out any
+        // reader that already snapshotted it (no cross-process UAF).
         if (g_current->files_shared) {
-            task_files_release(g_current->files_shared);
-            g_current->files_shared = NULL;
+            task_files_t* tf = g_current->files_shared;
+            __atomic_store_n(&g_current->files_shared, NULL, __ATOMIC_RELEASE);
+            task_files_release(tf);
         }
 
         // Log page-cache stats for demand-paged (VMA_FILE) processes.

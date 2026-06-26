@@ -111,6 +111,21 @@ task_files_t* task_files_alloc(void) {
     return f;
 }
 
+// RCU callback: free the fd-table struct memory after a grace period.  A
+// concurrent /proc/<pid>/fd reader snapshots the target's task_files_t + its
+// fdtable_t under rcu_read_lock; deferring the free keeps that snapshot valid
+// (the fds themselves are already closed synchronously in task_files_release).
+static void task_files_free_rcu(void* data) {
+    task_files_t* f = (task_files_t*)data;
+    fdtable_t* ft = f->ft;
+    if (ft) {
+        kfree(ft->fd_table);
+        kfree(ft->fd_flags);
+        kfree(ft);
+    }
+    kfree(f);
+}
+
 void task_files_release(task_files_t* f) {
     if (!f) return;
     // ATOMIC — see task_mm_release.  Shared fd tables are inc/dec'd
@@ -118,16 +133,17 @@ void task_files_release(task_files_t* f) {
     if (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0)
         return;
     fdtable_t* ft = f->ft;
-    int closed = 0;
     if (ft) {
+        // Close the fds NOW (synchronous) so pipe/socket/tty peers see EOF at
+        // exit time -- the load-bearing exit_files() semantics.
         for (uint32_t i = 0; i < ft->cap; i++)
-            if (ft->fd_table[i]) { vfs_close(ft->fd_table[i]); closed++; }
-        (void)closed;
-        kfree(ft->fd_table);
-        kfree(ft->fd_flags);
-        kfree(ft);
+            if (ft->fd_table[i]) vfs_close(ft->fd_table[i]);
     }
-    kfree(f);
+    // ...but DEFER the struct free: a /proc/<pid>/fd reader may be mid-snapshot
+    // of this table under rcu_read_lock.  sys_exit unpublishes files_shared
+    // BEFORE this release so no new reader can grab it; the grace period then
+    // waits out any reader that already did, closing the cross-process UAF.
+    call_rcu_expedited(task_files_free_rcu, f);
 }
 
 // ── PID pool ──────────────────────────────────────────────────────────────
