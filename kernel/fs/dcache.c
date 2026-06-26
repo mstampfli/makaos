@@ -396,13 +396,24 @@ dentry_t* dcache_install(dentry_t* parent, uint32_t parent_ino,
     dentry_t* existing = bucket_find_locked(tbl, b, parent_ino, name,
                                              name_len, name_hash);
     if (existing) {
+        // Take the caller's reference on `existing` UNDER g_dcache_wlock,
+        // BEFORE releasing it.  The shrinker claims a dentry for free by
+        // CAS'ing its refcount 0 -> DCACHE_REF_DYING AND unlinking it ALL
+        // under this same lock (dcache_shrink), so a still-linked entry found
+        // here is never DYING and cannot be claimed while we hold the lock --
+        // the bump and the shrinker's claim are mutually exclusive.  The old
+        // code bumped AFTER the unlock: the shrinker could CAS 0 -> DYING and
+        // RCU-free `existing` in that gap, and the bare fetch_add then wrapped
+        // DYING (0xFFFFFFFF) -> 0 on a freed slot = use-after-free.  (Unlike
+        // the lock-free dcache_lookup, install holds the lock, so the lock --
+        // not a DYING-aware CAS -- is the serialization here.)
+        __atomic_fetch_add(&existing->refcount, 1u, __ATOMIC_ACQ_REL);
         spin_unlock_irqrestore(&g_dcache_wlock, f);
         // Dispose of our candidate; it was never visible.
         if (d->name_ext) kfree(d->name_ext);
         if (parent) __atomic_fetch_sub(&parent->refcount, 1u,
                                          __ATOMIC_ACQ_REL);
         pmm_slab_free(d);
-        __atomic_fetch_add(&existing->refcount, 1u, __ATOMIC_ACQ_REL);
         return existing;
     }
 

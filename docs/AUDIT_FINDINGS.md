@@ -1476,6 +1476,20 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   a DYING-aware CAS under the lock; the install-hits-existing path was left bare. Reachable by any open/stat/
   exec on SMP + the concurrent shrinker. Fix = acquire existing's ref with the SAME DYING-refusing CAS, UNDER
   g_dcache_wlock (the shrinker also holds it), and on DYING fall through to install the fresh candidate instead.
+  -> VERIFIED + FIXED (F91): confirmed the bare fetch_add at ~405 runs AFTER the spin_unlock at ~399, and that
+  the lookup-path T1 CAS (dcache.c ~244-254) is the DYING-aware acquire. KEY REFINEMENT of the prescription
+  (no-assumptions): the shrinker (dcache_shrink ~475-498) CAS-claims 0 -> DYING (~488) AND
+  dentry_unlink_and_free_locked (~493) BOTH under ONE g_dcache_wlock hold -- so a DYING dentry is unlinked from
+  the hash bucket before the lock is released, meaning a still-linked entry returned by bucket_find_locked UNDER
+  the lock is NEVER DYING. So the correct fix is simply to take the reference UNDER g_dcache_wlock (before the
+  unlock): the lock -- which the shrinker also holds for its claim+unlink -- is the serialization, making the
+  bump and the shrinker's claim mutually exclusive. A DYING-aware CAS here would be redundant (its DYING branch
+  is unreachable under the lock) and would misleadingly imply the lock-free concurrency that the lock prevents;
+  the CAS is the lock-FREE dcache_lookup's mechanism (lookup holds no lock, so it CAN race the shrinker). Fix:
+  moved the `__atomic_fetch_add(&existing->refcount, 1u, __ATOMIC_ACQ_REL)` to BEFORE the spin_unlock_irqrestore;
+  candidate-d disposal (kfree name_ext, parent ref dec, pmm_slab_free) stays after the unlock (d was never
+  visible). dcache_test + dcache_race (2 lookers + shrinker, 50000 iters, 0 child_ino corruptions) STILL PASS +
+  clean boot (DHCP, all selftests PASSED, login renders).
   (dd) HIGH, unprivileged -- timerfd concurrent-settime per-CPU-list corruption UAF: timerfd_settime
   (kernel/io/timerfd.c ~256-310) detaches the node from its old home-CPU list under old_pc->lock, drops the
   lock (no preempt_disable across the gap), then attaches to the current CPU's list under pc->lock, writing
