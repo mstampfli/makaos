@@ -2370,7 +2370,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     joined and the fd is gone, so no poster races). overflow_count is touched only inside post_cqe's cq_lock
     section (cap read + inc/dec under the nested overflow_lock), so no race. Verified by [io_uring_test] (create/
     enter/complete/close) + clean boot.
-  RECORDED -- HEADLINE for a DEDICATED turn (TCP half-open SYN-flood leak, kernel/net/tcp.c -- REMOTE unauth
+  FIXED (F119, the headline -- TCP half-open SYN-flood leak, kernel/net/tcp.c -- REMOTE unauth
     UNBOUNDED, ~128 KiB/half-open, the single highest-severity finding of the whole campaign): a TCP_SYN_RCVD child
     (tcp_pcb_alloc + 64 KiB txbuf + 64 KiB rxbuf, published on s_pcb_head) is NEVER freed if the final ACK never
     arrives -- tcp_timer_tick rewinds + resends the SYN-ACK forever with NO retransmit cap / RTO timeout (no
@@ -2386,10 +2386,21 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     (net_rx_thread) completing the handshake (SYN_RCVD->ESTABLISHED + accept_queue push); a reap that does not
     re-check state under a lock (s_pcb_wlock) would free a now-VALID connection (UAF / lost conn). So the reap
     decision + unlink must be atomic with the state transition -- the state machine needs real synchronization.
-    Because a half-baked version introduces a UAF (worse than the leak), this is deferred to a dedicated turn with
-    a proper design + a deterministic reap selftest (alloc SYN_RCVD orphan -> set rexmit=cap -> tick -> assert
-    reaped via an on-list check, all single-threaded so no synchronize_rcu_expedited deadlock). TCP is NOT
-    boot-exercised (DHCP is UDP), so the selftest is essential.
+    HOW F119 FIXED IT (both subtleties handled): added uint8_t rexmit (++ in tcp_timer_tick's SYN_RCVD rto branch,
+    timer-thread-only -> no lock) + uint8_t reaped + a transient reap_next link. SUBTLETY (1): the reap runs AFTER
+    rcu_read_unlock (a separate s_pcb_wlock pass collects over-cap orphans via reap_next, unlinks them leaving their
+    own ->next intact so a concurrent reader is undisturbed), then ONE synchronize_rcu_expedited covers the whole
+    batch before the direct tcp_pcb_free_rcu frees -- no synchronize under a reader, and one grace period not N.
+    SUBTLETY (2): the establish-vs-reap decision is atomic on s_pcb_wlock -- tcp_recv's SYN_RCVD->ESTABLISHED
+    transition now runs under s_pcb_wlock and checks `!reaped && state==SYN_RCVD` (aborts if the reaper claimed it),
+    and the reaper sets ->reaped + unlinks under the same lock -- so a child that just established is never reaped
+    and a being-reaped child is never queued onto an accept queue (no UAF). accept_q_push stays under the LISTENER's
+    lock (separate critical section, no two-lock nesting). VERIFIED by a NEW deterministic selftest tcp_synreap_
+    selftest (over-cap SYN_RCVD orphan reaped; owned child kept) + the existing [tcp_orphan]/[tcp_accept] still PASS
+    (the establish-serialization did not break the handshake/accept paths) + a clean boot. The cross-thread reap-vs-
+    handshake race is closed by reasoning (the s_pcb_wlock establish-or-reap pattern) since TCP is not boot-SMP-
+    exercised. SECONDARY (listener-close orphan reaping of completed-but-unaccepted children, + a per-listener
+    half-open cap) recorded as a follow-up -- the SYN_RCVD reaper bounds the UNBOUNDED remote DoS (the headline).
   RECORDED (lower-severity leaks, for follow-up): ARP cache no eviction/cap (arp.c -- remote on-link, unbounded,
     ~16 B/entry; add LRU/aging + a cap); AF_UNIX SOCK_DGRAM queue no cap (unix_sock.c unix_sock_sendto -- the lone
     uncapped AF_UNIX queue; add UNIX_DGRAM_QUEUE_MAX like UDP_RX_QUEUE_MAX); task_create_kthread leaks the PML4
@@ -2404,5 +2415,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     overflow list = F118); mm+proc (task_fork/sys_thread/exec/elf error paths free pml4+mm+files; pid_alloc 1:1
     with pid_free incl. fork allocating the pid LAST; futex waiters stack-resident + always unlinked; VMA/shmem/
     pcache/page-fault refs balanced; no unprivileged pid/frame exhaustion path). All refcounts u32 -- no wrap.
-  SCAN #6 IN PROGRESS: io_uring overflow leak FIXED (F118). NEXT (dedicated turn): the TCP half-open SYN-flood
-    leak (the headline -- remote unauth, but needs the careful synchronized reaper above).
+  SCAN #6 SUBSTANTIALLY COMPLETE: io_uring overflow leak FIXED (F118), TCP half-open SYN-flood leak FIXED (F119 --
+    the headline remote DoS). Residual lower-severity leaks recorded above (ARP cache cap, AF_UNIX dgram cap,
+    kthread PML4-on-OOM, boot-init error-path leaks, the TCP listener-close orphan reaping + per-listener cap).
+    Next: BUG-TYPE SCAN #7 (NULL-deref / unchecked-allocation) -- or pick off a residual leak if higher-value.

@@ -16,6 +16,11 @@
 
 // ── TCP constants ─────────────────────────────────────────────────────────
 #define TCP_RTO_NS        1000000000ULL   // retransmit timeout: 1 second
+// Max SYN-ACK retransmits for a SYN_RCVD half-open before the timer reaps it.
+// At TCP_RTO_NS=1s this is ~6 s of grace before an un-completed, un-accepted
+// half-open is freed -- enough for a slow legitimate client, but it bounds a
+// remote SYN flood (each withheld-final-ACK SYN otherwise leaks ~128 KiB).
+#define TCP_SYN_RCVD_MAX_RETRIES 5u
 #define TCP_MSS           1460u           // max segment size (1500 - 20 IP - 20 TCP)
 #define TCP_WINDOW        65535u          // advertised receive window
 #define TCP_TIME_WAIT_NS  4000000000ULL   // TIME_WAIT: 2×MSL = 4 seconds
@@ -48,6 +53,18 @@ struct tcp_pcb {
 
     // Retransmission.
     uint64_t rto_deadline;  // TSC nanoseconds when oldest unacked segment expires
+    // SYN-ACK retransmit count for a SYN_RCVD half-open.  Incremented by the
+    // timer thread each time the SYN-ACK is resent; past TCP_SYN_RCVD_MAX_RETRIES
+    // an UN-ACCEPTED half-open (sock_file==NULL) is reaped, so a remote SYN that
+    // never completes cannot leak its ~128 KiB forever (a SYN-flood DoS).  Only
+    // the timer thread writes it; no lock needed for the counter itself.
+    uint8_t  rexmit;
+    // Set by the timer reaper UNDER s_pcb_wlock when it claims a half-open for
+    // freeing.  tcp_recv's handshake completion checks it (also under
+    // s_pcb_wlock) and aborts the establish, so a child the reaper is freeing is
+    // never moved to ESTABLISHED / pushed onto an accept queue (no UAF of a
+    // being-reaped child).
+    uint8_t  reaped;
 
     // Send buffer (ring).
     uint8_t* txbuf;
@@ -91,6 +108,10 @@ struct tcp_pcb {
 
     // Intrusive singly-linked list node for s_pcb_head.
     struct tcp_pcb* next;
+    // Transient link used ONLY by the timer reaper to chain claimed half-opens
+    // for a batched free after one RCU grace period.  Separate from `next` so a
+    // concurrent RCU reader still walking `next` is undisturbed by the chaining.
+    struct tcp_pcb* reap_next;
 };
 
 // ── PCB list ──────────────────────────────────────────────────────────────
@@ -424,12 +445,26 @@ void tcp_recv(skbuff_t* skb) {
 
     case TCP_SYN_RCVD:
         if ((flags & TCP_ACK) && ntoh32(seg->ack) == pcb->snd_nxt) {
-            pcb->snd_una = ntoh32(seg->ack);
-            pcb->state   = TCP_ESTABLISHED;
+            // Commit the establish atomically vs the timer half-open reaper: if
+            // the reaper already claimed this half-open (over its SYN-ACK
+            // retransmit cap) it set ->reaped + unlinked it under s_pcb_wlock and
+            // is freeing it -- do NOT establish or queue a child that is being
+            // reaped (that would push a freed pcb onto the accept queue).  The
+            // reaper, also under s_pcb_wlock, observes ESTABLISHED here and skips
+            // it.  The accept_q_push stays under the LISTENER's lock (separate
+            // critical section; no two-lock nesting).
+            int establish = 0;
+            uint64_t wf = spin_lock_irqsave(&s_pcb_wlock);
+            if (!pcb->reaped && pcb->state == TCP_SYN_RCVD) {
+                pcb->snd_una = ntoh32(seg->ack);
+                pcb->state   = TCP_ESTABLISHED;
+                establish = 1;
+            }
+            spin_unlock_irqrestore(&s_pcb_wlock, wf);
             // Move to listener's accept queue under the LISTENER's lock (it
             // races accept()'s dequeue); wake accept() OUTSIDE the lock.
             tcp_pcb_t* lst = pcb->listener;
-            if (lst) {
+            if (establish && lst) {
                 tcp_pcb_lock(lst);
                 bool queued = accept_q_push(lst, pcb);
                 tcp_pcb_unlock(lst);
@@ -540,6 +575,8 @@ void tcp_recv(skbuff_t* skb) {
 
 // ── Timer tick ────────────────────────────────────────────────────────────
 
+static void tcp_pcb_free_rcu(void* data);   // defined below; used by the reaper
+
 void tcp_timer_tick(void) {
     uint64_t now = tsc_read_ns();
     // RCU reader section: a concurrent tcp_pcb_free can unlink a pcb we're
@@ -568,6 +605,10 @@ void tcp_timer_tick(void) {
             } else if (pcb->state == TCP_SYN_RCVD) {
                 flags = TCP_SYN | TCP_ACK;
                 pcb->snd_nxt = pcb->snd_una;
+                // Count SYN-ACK retransmits of an UN-ACCEPTED half-open so the
+                // reaper below can free it once it exceeds the cap (only the
+                // timer thread writes rexmit -> no lock needed).
+                if (!pcb->sock_file && pcb->rexmit < 255u) pcb->rexmit++;
             } else {
                 // ESTABLISHED / FIN_WAIT / CLOSE_WAIT / ...: resend data.
                 rlen = pcb->snd_nxt - pcb->snd_una;
@@ -592,6 +633,47 @@ void tcp_timer_tick(void) {
         }
     }
     rcu_read_unlock();
+
+    // ── Reap SYN_RCVD half-opens past the SYN-ACK retransmit cap ─────────────
+    // A SYN_RCVD child with no socket (never accepted) whose final ACK never
+    // arrives would resend its SYN-ACK forever and never be freed -- an
+    // unbounded remote SYN-flood kernel-memory leak (~128 KiB each).  This MUST
+    // run OUTSIDE the rcu_read_lock above: tcp_pcb_free_rcu is reached via a
+    // grace period, and synchronize_rcu_expedited PANICS if called under a
+    // reader / preempt-disabled.  Claim each victim UNDER s_pcb_wlock (atomic vs
+    // tcp_recv's handshake completion, which sets ESTABLISHED under the same
+    // lock and checks ->reaped): set ->reaped (so a racing establish aborts),
+    // unlink it (leaving its own ->next intact so a concurrent reader walking
+    // ->next is undisturbed), and chain it via ->reap_next.  Then ONE grace
+    // period covers the whole batch before the direct frees.
+    tcp_pcb_t* reap = NULL;
+    uint64_t f = spin_lock_irqsave(&s_pcb_wlock);
+    tcp_pcb_t* prev = NULL;
+    for (tcp_pcb_t* p = s_pcb_head; p; ) {
+        tcp_pcb_t* pn = p->next;
+        if (p->state == TCP_SYN_RCVD && !p->sock_file &&
+            p->rexmit > TCP_SYN_RCVD_MAX_RETRIES) {
+            p->reaped = 1;
+            if (prev) rcu_assign_pointer(prev->next, pn);
+            else      rcu_assign_pointer(s_pcb_head, pn);
+            p->reap_next = reap;   // chain (separate field; ->next left intact)
+            reap = p;
+            // prev unchanged -- p is unlinked
+        } else {
+            prev = p;
+        }
+        p = pn;
+    }
+    spin_unlock_irqrestore(&s_pcb_wlock, f);
+
+    if (reap) {
+        synchronize_rcu_expedited();   // one grace period for the whole batch
+        while (reap) {
+            tcp_pcb_t* nx = reap->reap_next;
+            tcp_pcb_free_rcu(reap);    // grace period elapsed -> free directly
+            reap = nx;
+        }
+    }
 }
 
 // ── Public PCB management ─────────────────────────────────────────────────
@@ -1016,4 +1098,59 @@ void tcp_listener_orphan_selftest(void) {
     tcp_pcb_free(child);   // cleanup
     kprintf(fails ? "[tcp_orphan] SELF-TEST FAILED\n"
                   : "[tcp_orphan] SELF-TEST PASSED (listener free orphans SYN_RCVD children)\n");
+}
+
+// Walk s_pcb_head and report whether `target` is still on it.  Pointer-compare
+// only -- safe even if `target` was just RCU-freed (we never deref it).
+static int tcp_pcb_on_list(tcp_pcb_t* target) {
+    int found = 0;
+    rcu_read_lock();
+    for (tcp_pcb_t* p = rcu_dereference(s_pcb_head); p; p = rcu_dereference(p->next))
+        if (p == target) { found = 1; break; }
+    rcu_read_unlock();
+    return found;
+}
+
+// Verify the SYN_RCVD half-open reaper: a child past the SYN-ACK retransmit cap
+// with NO socket (never accepted) is freed by tcp_timer_tick (so a remote SYN
+// flood cannot leak kernel memory unbounded); a child WITH a socket is never
+// reaped.  Single-threaded, so tcp_timer_tick's reap-pass synchronize_rcu_
+// expedited has no concurrent reader and cannot deadlock.  Robust against the
+// live net_tcp_timer_thread: it reaps the same orphan (same outcome) and never
+// touches the owned child (sock_file != NULL).
+void tcp_synreap_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    // (A) an over-cap SYN_RCVD orphan (sock_file==NULL) gets reaped.
+    tcp_pcb_t* orphan = tcp_pcb_alloc(0xFEED);
+    if (!orphan) { kprintf("[tcp_synreap] SELF-TEST SKIP (no mem)\n"); return; }
+    orphan->state     = TCP_SYN_RCVD;
+    orphan->sock_file = NULL;
+    orphan->rexmit    = (uint8_t)(TCP_SYN_RCVD_MAX_RETRIES + 1u);   // over the cap
+    tcp_timer_tick();                                               // reap-pass frees it
+    if (tcp_pcb_on_list(orphan)) {
+        fails++;
+        kprintf("[tcp_synreap] FAIL over-cap orphan not reaped\n");
+        tcp_pcb_free(orphan);   // not reaped -> free so the test does not leak
+    }
+
+    // (B) a SYN_RCVD child WITH a socket is NEVER reaped, even over the cap.
+    tcp_pcb_t* owned = tcp_pcb_alloc(0xFEEE);
+    if (owned) {
+        owned->state     = TCP_SYN_RCVD;
+        owned->sock_file = (void*)owned;      // any non-NULL = "has a socket owner"
+        owned->rexmit    = (uint8_t)(TCP_SYN_RCVD_MAX_RETRIES + 1u);
+        tcp_timer_tick();
+        if (!tcp_pcb_on_list(owned)) {
+            fails++;
+            kprintf("[tcp_synreap] FAIL child with a socket was reaped\n");
+        } else {
+            owned->sock_file = NULL;
+            tcp_pcb_free(owned);              // cleanup
+        }
+    }
+
+    kprintf(fails ? "[tcp_synreap] SELF-TEST FAILED\n"
+                  : "[tcp_synreap] SELF-TEST PASSED (over-cap SYN_RCVD half-open reaped, owned child kept)\n");
 }

@@ -431,6 +431,15 @@ Guards the `s_pcb_head` linked-list head and every `->next` link.
 with `rcu_dereference` on each `->next`, which keeps the pcbs alive
 via the `call_rcu`-deferred `tcp_pcb_free_rcu` path.  `tcp_pcb_alloc`
 publishes at the head via `rcu_assign_pointer`.
+Also serializes the SYN_RCVD half-open ESTABLISH-vs-REAP decision (F119): the
+timer reaper sets `pcb->reaped` + unlinks an over-cap half-open under this lock,
+and `tcp_recv`'s SYN_RCVD->ESTABLISHED transition runs under it and commits only
+if `!reaped && state==SYN_RCVD` -- so a child being reaped is never established/
+queued and a just-established child is never reaped (no UAF).  The reaper takes
+ONLY this lock (the `accept_q_push` stays under the listener's `pcb->lock`, a
+separate critical section -- no two-lock nesting); the reaper frees AFTER
+`rcu_read_unlock` (one `synchronize_rcu_expedited` per batch -- never under a
+reader).
 
 ### `task_idx_t.lock` (×3) — `kernel/proc/sched.c`
 One IRQ-safe spinlock per `task_idx_t` (pgid, tgid, sid).  Held on

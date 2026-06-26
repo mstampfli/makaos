@@ -241,6 +241,17 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   ranges: the atomic fetch_add makes it concurrency-safe-by-construction and the ceiling turns silent
   exhaustion into an explicit, detectable failure (mirrors the checked.h bounds family for the wrap guard).
 
+- Bounded-resource CAP + timer REAPER (io_uring overflow F118; TCP SYN_RCVD half-opens F119) -- any resource a
+  remote/unprivileged peer can create (overflow CQEs, half-open connections, queued datagrams) needs an explicit
+  CAP (drop past it) AND, if the resource can get stuck (a half-open whose peer vanishes), a timer-driven REAPER
+  that frees it after a deadline.  CAP alone bounds memory but a stuck resource still blocks the slot; the reaper
+  drains it.  REAPER RULES (the F119 hazards): (1) if the timer walks an RCU list, the FREE must run AFTER
+  rcu_read_unlock (synchronize_rcu_expedited PANICS under a reader) -- collect victims under the list lock via a
+  SEPARATE link field (leaving ->next intact for concurrent readers), then one grace period per batch; (2) if a
+  second thread can "complete" the resource (a handshake), serialize the complete-vs-reap decision on ONE lock +
+  a `reaped` flag (complete commits only if !reaped; reap claims only if not completed) so neither frees/queues a
+  resource the other owns (no UAF).
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device

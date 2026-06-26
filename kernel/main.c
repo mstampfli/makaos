@@ -714,6 +714,11 @@ static void init_kthread(void) {
     extern void tcp_listener_orphan_selftest(void);
     tcp_listener_orphan_selftest();
 
+    // SYN_RCVD half-open reaper: a never-completed, never-accepted half-open is
+    // freed past the SYN-ACK retransmit cap, bounding a remote SYN-flood leak.
+    extern void tcp_synreap_selftest(void);
+    tcp_synreap_selftest();
+
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();
