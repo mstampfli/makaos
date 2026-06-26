@@ -4735,6 +4735,12 @@ typedef struct {
     // call f->poll, or kmalloc while holding it (though we still avoid
     // copy_to_user under the lock to minimise hold time).
     spinlock_t      lock;
+    // Back-pointer to the epoll fd's own vfs_file_t (the one whose _waitq is
+    // file_wq).  Used by epoll_state_free_rcu so the deferred free reclaims the
+    // file in the SAME grace period as the state -- a watched fd's IRQ-context
+    // epoll_wake_func derefs both (ewe->epoll_wq/p_has_ready into the state,
+    // ewe->file_wq into this file), so neither may be freed synchronously.
+    struct vfs_file_t* file;
 } epoll_state_t;
 
 // Hash table helpers.  Key = fd (int32_t, always ≥ 0).
@@ -4827,9 +4833,23 @@ static void epoll_watch_free_rcu(void* data) {
     kfree(data);
 }
 
-// RCU free helper for epoll_state_t (closing epoll fd).  The state is
-// referenced by every epoll_we_t as `ewe->p_has_ready = &state->has_ready`
-// and `ewe->epoll_wq = &state->wq`.  A concurrent wait_queue_wake_all
+// RCU free helper for epoll_state_t + its slots + the epoll vfs_file_t.  Every
+// epoll_we_t holds `ewe->p_has_ready = &state->has_ready`, `ewe->epoll_wq =
+// &state->wq` (both inside the state) and `ewe->file_wq = &state->file->_waitq`
+// (inside the file).  A concurrent wait_queue_wake_all on another CPU -- an
+// IRQ-context wake from a watched fd, drained as an RCU reader inside
+// epoll_wake_func -- derefs these AFTER epoll_close unregisters the watches, so
+// freeing them synchronously is a use-after-free (and a controllable indirect
+// call through the freed waitq chain).  Defer all three to a grace period, the
+// same way epoll_watch_free_rcu defers the watch, so the wake drainer has left
+// its RCU reader section before the memory is reclaimed.
+static void epoll_state_free_rcu(void* data) {
+    epoll_state_t* state = (epoll_state_t*)data;
+    kfree(state->slots);
+    if (state->file) kfree(state->file);
+    kfree(state);
+}
+
 // VFS ops for the epoll fd itself.
 static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
@@ -4906,18 +4926,24 @@ static int epoll_poll(vfs_file_t* self, int events) {
     return ready;
 }
 static void epoll_close(vfs_file_t* self) {
-    if (self->ctx) {
-        epoll_state_t* state = (epoll_state_t*)self->ctx;
+    epoll_state_t* state = self->ctx ? (epoll_state_t*)self->ctx : NULL;
+    if (state) {
         for (uint32_t i = 0; i < state->cap; i++) {
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
             epoll_watch_unregister(w);   // uses w->file pin, not a fresh lookup
             call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
         }
-        kfree(state->slots);
-        kfree(state);
+        // state->slots, state, AND self are still referenced by any in-flight
+        // epoll_wake_func (ewe->p_has_ready/epoll_wq point into state,
+        // ewe->file_wq into self) running as an RCU reader on another CPU.
+        // Unregister above stopped NEW wakes; defer the free of all three
+        // (self via state->file) to a grace period so the drainer finishes
+        // first -- a synchronous kfree here would be a cross-CPU UAF.
+        call_rcu_expedited(epoll_state_free_rcu, state);
+    } else {
+        kfree(self);   // no epoll state -> nothing holds self's waitq
     }
-    kfree(self);
 }
 
 // epoll_create1(flags) → fd or -errno
@@ -4952,6 +4978,7 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     f->ctx            = state;
     f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
     state->file_wq     = f->waitq;    // wake target for outer epolls (see epoll_we_t)
+    state->file        = f;           // for the RCU-deferred free (epoll_state_free_rcu)
     f->secondary_waitq = NULL;
     f->flags          = 0;
     f->refcount       = 1;

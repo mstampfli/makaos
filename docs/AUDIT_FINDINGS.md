@@ -1883,6 +1883,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the free waits out every in-flight wait_queue_wake_all drainer; the free MUST cover self (file_wq points into
   it). agent CONFIDENCE HIGH (watch is RCU-freed but state/self are not; wake_func provably derefs both; close
   takes no lock/RCU the wake path observes; the orphaned 4830 comment names the missing helper).
+  -> VERIFIED + FIXED (F102): confirmed epoll_wake_func (wait.c:262-274) derefs ewe->p_has_ready (a write into
+  &state->has_ready), ewe->epoll_wq (drain &state->wq) and ewe->file_wq (drain self's _waitq) and returns
+  WQ_KEEP (stays registered, runs from IRQ); confirmed state->file_wq = f->waitq (= &self->_waitq) at
+  sys_epoll_create, so the ewe references BOTH state and self; confirmed epoll_close (syscall.c) call_rcu's the
+  watch w (epoll_watch_free_rcu, so the ewe MEMORY survives a grace period) but SYNCHRONOUSLY kfree'd
+  state->slots + state + self; confirmed epoll_watch_unregister removes the ewe from the watched waitq + drops
+  the w->file pin but does NOT wait for an in-flight wait_queue_wake_all (an RCU reader already past the dead
+  flag still calls epoll_wake_func) -> the in-flight wake writes/walks freed state/self = cross-CPU UAF +
+  controllable indirect call through the freed waitq chain; confirmed the orphaned ~4830 comment trails off
+  exactly where epoll_state_free_rcu should be (it was never written -- runs straight into epoll_read). FIX
+  (do-it-right, ONE shared mechanism, the exact helper the comment promised, mirroring epoll_watch_free_rcu +
+  F88/F95/F99 RCU-defer-the-free): added a back-pointer `struct vfs_file_t* file` to epoll_state_t (set to f in
+  sys_epoll_create), wrote epoll_state_free_rcu(state) that kfree's state->slots + state->file (== self) +
+  state, and restructured epoll_close to call_rcu_expedited(epoll_state_free_rcu, state) AFTER unregistering all
+  watches instead of the three synchronous kfrees (the no-state branch still frees self synchronously -- nothing
+  holds its waitq). So state+slots+self are reclaimed in the same grace period as the watch, after every
+  in-flight epoll_wake_func drainer has left its RCU reader section: no UAF, no double-free of self (it is freed
+  ONLY via the deferred path; epoll_close is the sole close hook). VERIFIED-ALL-ANGLES: no-watches case (defer
+  still correct), watched-fd-closed-first (the w->file vfs_tryget pin keeps the watched waitq alive until
+  unregister, so no dangling ewe -- unchanged), self freed once, call_rcu_expedited manages its own node (no
+  embedded rcu_head needed, like epoll_watch_free_rcu). VERIFICATION: a cross-CPU IRQ-vs-close UAF, NOT
+  deterministically reproducible -> code-proof (identical to the established epoll_watch_free_rcu / F88 / F95
+  RCU-defer pattern, which the code's own comment already prescribed) + the existing [epoll_pin] selftest + a
+  clean boot that exercises epoll create/ctl/wait/close HEAVILY (the sway/swaybar/foot desktop event loops),
+  proving the RCU-defer did not break epoll lifetime / leak / double-free (same honest proof as F88/F89/F95).
+  Clean boot FIRST try: DHCP lease (ifconfig IP 10.0.2.15 GW 10.0.2.2), 69 selftests PASSED incl. [epoll_pin],
+  0 FAILED/PANIC, no [WD], `More login:` renders. This closes fan-out #7 candidate (pp).
   (mm) HIGH, unprivileged -- bcache poisoning: ext2_vfs_read (kernel/fs/ext2.c ~1272-1275) and ext2_vfs_pread
   (~1363-1366) warm the SHARED cross-process block cache by bcache_fill(phys_blk+i, dest+i*bs, bs) where dest is
   the USER buffer when is_user (the is_user tag at ~1263/1357 is NOT applied to the cache-warm loop). The zero-
