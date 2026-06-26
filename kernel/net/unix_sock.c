@@ -1383,11 +1383,20 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
         if (!s->dgram_head) return 0;
     }
 
+    // Dequeue under the per-socket lock (a 2nd receiver or a concurrent sendto
+    // enqueue must not tear the list / double-pop).  Re-check the head inside.
+    spin_lock(&s->lock);
     unix_dgram_t* msg = s->dgram_head;
-    s->dgram_head = msg->next;
-    if (!s->dgram_head) s->dgram_tail = NULL;
-    s->dgram_count--;
+    if (msg) {
+        s->dgram_head = msg->next;
+        if (!s->dgram_head) s->dgram_tail = NULL;
+        s->dgram_count--;
+    }
+    spin_unlock(&s->lock);
+    if (!msg) return 0;   // lost the race / spurious wake -> nothing to read
 
+    // msg is unlinked and solely ours now -> copy to the user + free OUTSIDE the
+    // lock (the user write must never fault under the spinlock).
     uint32_t copy = msg->len < len ? msg->len : len;
     uint8_t* src = UNIX_DGRAM_DATA(msg);
     uint8_t* dst = (uint8_t*)buf;
@@ -1439,14 +1448,18 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
 
     __builtin_memcpy(UNIX_DGRAM_DATA(msg), buf, len);
 
-    // Enqueue into target's receive queue.
-    if (target->dgram_tail) {
-        target->dgram_tail->next = msg;
-    } else {
-        target->dgram_head = msg;
-    }
+    // Enqueue into target's receive queue under its per-socket lock so a
+    // concurrent recv() dequeue or a second sendto() enqueue cannot tear the
+    // singly-linked list or lose the count.  The kmalloc + the user-data memcpy
+    // above and the wakes below stay OUTSIDE the lock (the memcpy reads user
+    // memory, which must never fault under a preempt-disabled spinlock; the
+    // wakes touch rq_lock).
+    spin_lock(&target->lock);
+    if (target->dgram_tail) target->dgram_tail->next = msg;
+    else                    target->dgram_head = msg;
     target->dgram_tail = msg;
     target->dgram_count++;
+    spin_unlock(&target->lock);
 
     // Wake receiver (blocking recv or poll).
     unix_wake(target);
@@ -1498,16 +1511,28 @@ int unix_sock_sendfd(vfs_file_t* sock, vfs_file_t* file, uint32_t rights) {
     unix_ancillary_t* anc = &peer->ancillary;
     if (anc->count >= UNIX_ANCILLARY_MAX) { unix_put(peer); return -ENOBUFS; }
 
-    // Dup the file description and stamp attenuated rights.
+    // Dup the file description and stamp attenuated rights (a refcount bump --
+    // done OUTSIDE the lock).
     vfs_file_t* dup = vfs_dup(file);
     if (!dup) { unix_put(peer); return -ENOMEM; }
     dup->rights = rights;
 
+    // Enqueue under the peer's per-socket lock (the peer OWNS the ancillary
+    // queue) so a concurrent recvfd dequeue or a 2nd sendfd cannot lose the
+    // count or double-occupy a slot.  Re-check the limit under the lock.
+    spin_lock(&peer->lock);
+    if (anc->count >= UNIX_ANCILLARY_MAX) {
+        spin_unlock(&peer->lock);
+        vfs_close(dup);          // undo the dup we just took
+        unix_put(peer);
+        return -ENOBUFS;
+    }
     uint8_t idx = anc->tail;
     anc->files[idx]  = dup;
     anc->rights[idx] = rights;
     anc->tail = (anc->tail + 1) % UNIX_ANCILLARY_MAX;
     anc->count++;
+    spin_unlock(&peer->lock);
 
     // Wake peer in case it's blocked in recvfd or poll.
     unix_wake(peer);
@@ -1528,13 +1553,19 @@ vfs_file_t* unix_sock_recvfd_nb(vfs_file_t* sock) {
     unix_sock_t* s = (unix_sock_t*)sock->ctx;
     if (!s) return NULL;
     unix_ancillary_t* anc = &s->ancillary;
-    if (anc->count == 0) return NULL;
 
-    uint8_t idx = anc->head;
-    vfs_file_t* file = anc->files[idx];
-    anc->files[idx] = NULL;
-    anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
-    anc->count--;
+    // Dequeue under the owner's per-socket lock, re-checking count inside so a
+    // 2nd recvfd or a concurrent sendfd cannot double-take the same slot.
+    spin_lock(&s->lock);
+    vfs_file_t* file = NULL;
+    if (anc->count != 0) {
+        uint8_t idx = anc->head;
+        file = anc->files[idx];
+        anc->files[idx] = NULL;
+        anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
+        anc->count--;
+    }
+    spin_unlock(&s->lock);
     return file;
 }
 
@@ -1558,11 +1589,17 @@ vfs_file_t* unix_sock_recvfd(vfs_file_t* sock) {
         if (anc->count == 0) return NULL;
     }
 
-    uint8_t idx = anc->head;
-    vfs_file_t* file = anc->files[idx];
-    anc->files[idx] = NULL;
-    anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
-    anc->count--;
-
+    // Dequeue under the owner's per-socket lock, re-checking count inside (the
+    // wait condition was tested unlocked; another recvfd may have drained it).
+    spin_lock(&s->lock);
+    vfs_file_t* file = NULL;
+    if (anc->count != 0) {
+        uint8_t idx = anc->head;
+        file = anc->files[idx];
+        anc->files[idx] = NULL;
+        anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
+        anc->count--;
+    }
+    spin_unlock(&s->lock);
     return file;
 }

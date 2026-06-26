@@ -2229,17 +2229,25 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
         listener->lock (re-check head inside), alloc + wait_queue wakes stay OUTSIDE the lock, never nested with
         s_unix_pair_lock; free_rcu drains post-grace-period single-threaded (RCU-serialized vs connect, accept
         cannot run on a refcount-0 listener) so it needs no lock. Documented in docs/LOCKS.md.
-    (B) dgram_head/tail/count -- unix_sock_sendto enqueue (~1422) vs unix_sock_recv_ex dequeue (~1365), no lock ->
-        torn list / lost message / count lost-update. RECORDED: wrap all three (enqueue/dequeue/free drain) in the
-        new per-socket lock next turn.
+    (B) dgram_head/tail/count -- unix_sock_sendto enqueue vs unix_sock_recv_ex dequeue, no lock -> torn list /
+        lost message / count lost-update. FIXED (F112): sendto links under target->lock (the queue owner), recv_ex
+        dequeues under self->lock re-checking the head inside; the kmalloc + the user-data memcpy (into the kernel
+        msg node, BEFORE the enqueue) and the user copy-out (AFTER the dequeue) + the wakes stay OUTSIDE the lock.
+        free_rcu drains post-grace-period single-threaded (no lock).
     (C) stream cbuf buf_head/tail/count -- cbuf_write on the SENDER's CPU mutates the PEER's buffer (buf_count +=)
         while cbuf_read on the owner's CPU does buf_count -= : a non-atomic RMW from two CPUs = permanent fill-
-        level corruption + torn stream bytes (the unix_sock.h:106 comment is the smoking gun). RECORDED: lock the
-        buffer-owner's per-socket lock around cbuf_write/cbuf_read next turn (count touched by both sides -> a lock,
-        not a bare SPSC fix).
-    (D) ancillary (SCM_RIGHTS) files[]/head/tail/count -- sendfd (~1485) vs recvfd (~1540) vs free_rcu drain, no
-        lock -> count lost-update, a passed fd leaked/double-delivered, free_rcu double-vfs_close. RECORDED: same
-        per-socket lock next turn.
+        level corruption + torn stream bytes (the unix_sock.h:106 comment is the smoking gun). STILL OPEN -- REVISED
+        (no-assumptions): cbuf_write/cbuf_read copy USER memory directly (the send/recv buf is the syscall pointer
+        passed straight in), so the data copy CANNOT run under the per-socket spinlock -- a page fault on the user
+        page under a preempt-disabled lock would deadlock.  So C is NOT a simple lock-wrap (unlike B/D, which only
+        move kernel-resident list pointers under the lock); it needs a KERNEL BOUNCE in unix_sock_send_ex/recv_ex
+        (copy user<->kernel OUTSIDE the lock, hold the lock only around the kernel<->ring copy + the count).  That
+        is a distinct, more careful refactor -> deferred to its own turn (do NOT cram it with B/D).
+    (D) ancillary (SCM_RIGHTS) files[]/head/tail/count -- sendfd (into the PEER's ancillary) vs recvfd (own) vs
+        free_rcu drain, no lock -> count lost-update, a passed fd leaked/double-delivered, free_rcu
+        double-vfs_close. FIXED (F112): sendfd enqueues under peer->lock (re-checking the limit inside; the vfs_dup
+        is outside, undone with vfs_close on a full re-check), recvfd / recvfd_nb dequeue under self->lock
+        re-checking count inside; wakes outside.  Only kernel vfs_file_t* pointers move under the lock (no user copy).
   OTHER GAPS (recorded, not yet fixed):
     UDP inet rx ring (socket.c udp_rx_head/tail/count): socket_deliver_udp (rx-thread, ~688) vs socket_recv/
       recvfrom (process, ~506/590) vs sock_free_rcu drain -- rcu keeps the socket alive but does not serialize the
@@ -2276,5 +2284,6 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
     pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
     (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
-  SCAN #4 IN PROGRESS: F111 fixed the AF_UNIX backlog (sharpest -- double-free). Remaining: the AF_UNIX dgram/cbuf/
-    ancillary (B/C/D, same new lock), the UDP rx ring, the fd_flags cloexec lost-update, and s_mmio_next (latent).
+  SCAN #4 IN PROGRESS: F111 fixed the AF_UNIX backlog (A); F112 fixed the AF_UNIX dgram (B) + ancillary (D) onto
+    the same per-socket lock. Remaining: AF_UNIX stream cbuf (C, needs the kernel-bounce refactor), the UDP rx
+    ring (socket_t also lacks a per-socket lock), the fd_flags cloexec lost-update, and s_mmio_next (latent).

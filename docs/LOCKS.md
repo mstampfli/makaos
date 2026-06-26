@@ -378,21 +378,27 @@ so a concurrent `connect`/`sendto` inside `rcu_read_lock()` sees a
 consistent peer until it exits the reader section.
 
 ### `unix_sock_t.lock` -- `kernel/net/unix_sock.c`
-Per-socket leaf spinlock (F111).  Serializes the per-socket queues that used to
-assume the retired single-CPU model.  Currently guards the LISTENER BACKLOG
-(`backlog_head` / `backlog_tail` / `backlog_count`): `unix_sock_connect` links a
-pending node under the LISTENER's lock (the backlog owner), `unix_sock_accept`
-pops under the same lock, so a connect-push racing an accept-pop (or a second
-concurrent connect/accept) can no longer tear the list or double-free a `pend`.
-Held ONLY around the list mutation -- the `kmalloc(pend)` and the
-`unix_wake`/`unix_poll_wake` (which touch `rq_lock`) stay OUTSIDE it, and it is
-never held together with `s_unix_pair_lock` (connect/accept take the two in
-separate critical sections), so there is no lock-order inversion.
-`unix_sock_free_rcu` drains the backlog post-grace-period at refcount 0
-(RCU-serialized vs connect; accept cannot run on a refcount-0 listener), so that
-path is single-threaded by construction and takes no lock.  The dgram / stream
-cbuf / ancillary queues are still single-CPU-model and will move onto this same
-lock incrementally (SCAN #4 follow-ups).
+Per-socket leaf spinlock (F111/F112).  Serializes the per-socket queues that used
+to assume the retired single-CPU model.  Guards THREE queues:
+- the LISTENER BACKLOG (`backlog_head/tail/count`, F111): `unix_sock_connect`
+  links under the LISTENER's lock, `unix_sock_accept` pops under the same lock.
+- the SOCK_DGRAM RX queue (`dgram_head/tail/count`, F112): `unix_sock_sendto`
+  links under the TARGET's lock, `unix_sock_recv_ex` dequeues under self's lock.
+- the SCM_RIGHTS ANCILLARY queue (`ancillary.*`, F112): `unix_sock_sendfd`
+  enqueues under the PEER's lock, `unix_sock_recvfd{,_nb}` dequeue under self's.
+RULE: each op locks EXACTLY the per-socket lock of the socket that OWNS the queue
+it touches (a send mutates the peer/target's queue -> locks THAT socket's lock),
+so no path ever holds two per-socket locks at once (no AB-BA deadlock between two
+connected sockets).  Held ONLY around the list/count mutation -- the allocations,
+the user-data memcpy/copy-out, and the `unix_wake`/`unix_poll_wake` (which touch
+`rq_lock`) stay OUTSIDE it (a user-memory access must never fault under a
+preempt-disabled spinlock).  Never held together with `s_unix_pair_lock`.
+`unix_sock_free_rcu` drains all three queues post-grace-period at refcount 0
+(RCU-serialized vs the producers; consumers cannot run on a refcount-0 socket),
+so that path is single-threaded by construction and takes no lock.  The SOCK_STREAM
+cbuf is the LAST single-CPU-model queue -- it copies user memory inside
+cbuf_write/cbuf_read, so it needs a kernel bounce before it can move onto this
+lock (a SCAN #4 follow-up).
 
 ### `s_namespace_lock` — `kernel/mm/shmem.c`
 Guards the `s_namespace` table pointer.  `shmem_ns_find` walks
