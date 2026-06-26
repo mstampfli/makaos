@@ -1865,3 +1865,79 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   process UAF-read, clean fix mirroring the isr14/fork shootdown; then (kk) unveil readdir gap (clean, mirrors
   the sibling syscalls); then (ll) build_prdt bound (trivial defense-in-depth on dead code). NOTE: this fan-out
   ran 3 agents (not the usual ~5); bcache/buffer eviction + tty ldisc deeper remain un-swept for a later round.
+- 2026-06-26 FAN-OUT #7 (5 read-only Explore agents: bcache eviction, tty/pty line discipline, /dev node
+  lifetime, epoll, io_uring SQ/CQ; reported confidence as noted, NOT yet independently verified -- VERIFY each
+  before fixing, EVERY fan-out prescription so far needed refinement). FIVE candidate findings:
+  (pp) HIGH, unprivileged LPE -- epoll_close frees epoll_state_t + the epoll vfs_file_t SYNCHRONOUSLY while a
+  watched fd's IRQ-context epoll_wake_func still derefs them: each epoll_watch registers a persistent epoll_we_t
+  on the WATCHED fd's waitq; epoll_wake_func (kernel/wait.c ~261-274) derefs ewe->p_has_ready (&state->has_ready),
+  ewe->epoll_wq (&state->wq), ewe->file_wq (the epoll vfs_file's _waitq) -- pointers that live INSIDE the epoll
+  object, not the watch. epoll_close (kernel/syscall/syscall.c ~4917-4920) call_rcu's the watch w (so the entry's
+  OWN memory survives) but then SYNCHRONOUSLY kfree's state->slots, state, and self. A device IRQ wake on CPU A
+  (already past the dead-flag check inside wait_queue_wake_all's RCU reader) races close(epfd) on CPU B: after the
+  free, CPU A does __atomic_store_n(ewe->p_has_ready,1) into freed state + wait_queue_wake_all(&state->wq /
+  self->_waitq) walking freed (reallocatable) head/func -> a controllable indirect call / write-what = LPE. The
+  code's OWN comment (~4830) promises an epoll_state_free_rcu that was NEVER written (runs straight into
+  epoll_read). Distinct from the watched-file pin (reverse direction) and the generic fd UAF. Fix = add
+  epoll_state_free_rcu and RCU-defer the state+slots+self free (mirror epoll_watch_free_rcu and F88/F95/F99), so
+  the free waits out every in-flight wait_queue_wake_all drainer; the free MUST cover self (file_wq points into
+  it). agent CONFIDENCE HIGH (watch is RCU-freed but state/self are not; wake_func provably derefs both; close
+  takes no lock/RCU the wake path observes; the orphaned 4830 comment names the missing helper).
+  (mm) HIGH, unprivileged -- bcache poisoning: ext2_vfs_read (kernel/fs/ext2.c ~1272-1275) and ext2_vfs_pread
+  (~1363-1366) warm the SHARED cross-process block cache by bcache_fill(phys_blk+i, dest+i*bs, bs) where dest is
+  the USER buffer when is_user (the is_user tag at ~1263/1357 is NOT applied to the cache-warm loop). The zero-
+  copy fast path DMAs disk data into the user pages via ahci_read_user, which UNPINS them before returning
+  (ahci.c ~907-914); then the cache-warm loop re-reads from user memory. A sibling thread (shared mm) overwrites
+  the user buffer between the DMA and the bcache_fill memcpy -> the shared bcache slot tagged phys_blk holds
+  attacker bytes, served to ANY later reader of that on-disk block (cross-process cache poisoning / integrity
+  bypass; secondary: a racing munmap faults the memcpy on a user VA in kernel mode). Fix = guard the cache-warm
+  loop with `if (!is_user)` (only warm the cache from a trusted kernel source; the demand-paging path uses
+  is_user==0 and is unaffected), mirroring the ahci_read (trusted) vs ahci_read_user (untrusted) split. agent
+  CONFIDENCE HIGH on the bug/reachability, MEDIUM on max priv-esc impact. (Rest of bcache audited SAFE: lock-free
+  per-way Dekker protocol correct, static BSS buffers (no UAF), pin get/put balanced, write-through (no dirty
+  writeback), LBA/index bounds-checked.)
+  (oo) HIGH, pty-owner reachable -- pty slave reopen UAF: pty_slave_close (kernel/drivers/tty/pty.c ~417, kfree
+  at ~432) frees the shared slave vfs_file_t UNCONDITIONALLY even when the master is still open (do_free=0), but
+  never NULLs pty->slave_file nor clears slave_claimed, leaving the pty node in s_pty_head with a dangling
+  slave_file. A reopen of /dev/pts/N (pty_open_slave_by_index ~698) passes the ineffective `if (!p->slave_file)`
+  guard (~706) and resurrects the freed object with __atomic_fetch_add(&p->slave_file->refcount,1) (~714) on
+  freed slab, installs the dangling pointer as a live fd -> every read/write/ioctl/poll on freed memory + a later
+  close drives slave_open_count negative (double-free/unlink). Deterministic single-process: open(ptmx),
+  open(pts/N), close(slave), open(pts/N). /dev/pts/N is mode 0620 uid 0 so the pty OWNER (any process that
+  created the pty) can hit it on its own pty. Fix = in pty_slave_close under s_pty_lock, when !do_free set
+  pty->slave_file=NULL + slave_claimed=0; in reopen use vfs_tryget(p->slave_file) (fails if refcount hit 0)
+  instead of the raw fetch_add; and on reopen with slave_file==NULL + master alive, build a fresh slave
+  vfs_file_t+ctx on demand (decouple the shared vfs_file_t lifetime from the pty -- the real root cause). agent
+  CONFIDENCE HIGH (the free is unconditional, slave_file never cleared on this path, reopen derefs+resurrects it
+  past the NULL guard; pty_lifetime_selftest never covers close-slave-then-reopen-with-master-alive).
+  (qq) HIGH, unprivileged -- io_uring SQ consumer unserialized: io_uring_enter_impl's SQPOLL-skip guard
+  (kernel/io/io_uring.c ~1046-1050) only fires for (SQ_WAKEUP && !GETEVENTS), so enter(GETEVENTS) on a SQPOLL
+  ring falls through into the unlocked consumer loop (~1058-1119) which races the always-running SQPOLL poller's
+  identical loop (~581-602): both read head (plain load), pick the same sqe, dispatch_exec it TWICE (double
+  send/open/write), post two CQEs, and non-atomically store head back (lost update -> unbounded re-dispatch).
+  Memory-safety escalation: for an async SQE both call io_wq_ensure_worker (~757) whose non-atomic
+  load-NULL->create->store (~782) lets two consumers each spawn a worker; the second store orphans the first, and
+  io_uring_close_file joins only uring->worker (the second) and frees uring while the orphan still runs -> UAF
+  (distinct from F89, which fixed join ORDER of the single known worker). Also the concurrent-enter() variant
+  (two threads sharing the ring fd, sys_io_uring_enter takes no ring lock) double-consumes with no SQPOLL. Fix =
+  (1) skip SQ submission for ALL SQPOLL enters (goto getevents regardless of flags, poller is the sole consumer);
+  (2) a per-ring submit_lock across the head-read->dispatch->head-store for non-SQPOLL concurrent enters (mirrors
+  Linux uring_lock); (3) CAS-publish uring->worker so a race cannot orphan a worker. agent CONFIDENCE HIGH on the
+  double-execution/double-completion (the loop is provably lock-free and the poller is a 2nd active consumer the
+  guard fails to exclude for the common GETEVENTS call), MEDIUM-HIGH on the orphaned-worker UAF.
+  (nn) MEDIUM, unprivileged -- tty termios update race: TCSETS/TCSETSW/TCSETSF copy_from_user straight into the
+  live tty->termios with NO tty->lock (kernel/drivers/tty/pty.c ~459-465; the /dev/tty fallback syscall.c
+  ~4372-4380), racing the lock-free termios reads in tty_input_char (tty.c ~147-218, reads c_lflag + c_cc[]) and
+  tty_ldisc_drain (tty.c ~265-266, reads c_lflag/c_cc[VMIN]) on another CPU -> a reader observes a half-written
+  termios (ICANON/ISIG flipped, a c_cc[VINTR/VSUSP/VQUIT] byte torn) -> spurious SIGINT/SIGQUIT/SIGTSTP to the
+  fg pgrp or a swallowed ^C or a line drained in the wrong mode. NOT memory corruption (every c_cc index is a
+  constant < NCCS=19, the struct has no pointers); the tty.h lock comment deliberately scopes the lock to exclude
+  termios, so this is a NEW gap not covered by F84/F85. Fix = copy_from_user into a stack-local termios_t tmp
+  OUTSIDE the lock (it can fault), then publish under tty_lock (tty->termios = tmp); snapshot the needed termios
+  fields under the lock on the read side (or guard termios with a seqlock to keep the hot input path lock-free).
+  agent CONFIDENCE HIGH it is a real SMP data race, severity bounded MEDIUM (no memory-safety consequence).
+  PRIORITY (to verify+fix, sharpest first): (pp) epoll UAF first -- HIGH, fully unprivileged, IRQ-context UAF
+  with a CONTROLLABLE indirect call (LPE), cleanest fix (the RCU-defer the code's own comment already names,
+  mirroring F88/F95/F99); then (mm) bcache poisoning (clean one-line is_user guard); then (oo) pty reopen UAF
+  (clean: NULL + tryget + rebuild); then (qq) io_uring SQ serialization (biggest, multi-part fix); then (nn) tty
+  termios race (MEDIUM, data race not corruption).
