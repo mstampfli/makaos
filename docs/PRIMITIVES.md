@@ -227,6 +227,14 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   primitive -- the single chokepoint for fd creation; any future create-with-cloexec (accept4,
   epoll_create1, eventfd) must use it, not a post-install store.
 
+- `vmm_map_mmio` MMIO VA bump-reserve (kernel/mm/vmm.c, F116) -- the lock-free-bump-allocator-with-ceiling
+  shape: reserve a disjoint span via `base = __atomic_fetch_add(&cursor, span, RELAXED)` (two concurrent
+  callers can never get overlapping ranges -- no lock needed) AND bound it against a documented end with the
+  overflow-safe test `base >= END || span > END - base` (never compute base+span), failing the allocation
+  rather than running past the window.  Apply this to any monotonic VA/ID/offset cursor that hands out
+  ranges: the atomic fetch_add makes it concurrency-safe-by-construction and the ceiling turns silent
+  exhaustion into an explicit, detectable failure (mirrors the checked.h bounds family for the wrap guard).
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device

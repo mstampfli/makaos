@@ -2270,11 +2270,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       being pre-cleared), so a reused slot can never carry a stale flag. The other 7 fd_install callers are
       unchanged (they delegate). Boot-proven (every fd-creating syscall flows through fd_install; the timerfd_race
       stress drives 20000 install/close iters).
-    s_mmio_next unlocked + unbounded (vmm.c:135/143): vmm_map_mmio reads-then-bumps the monotonic MMIO VA cursor
-      with NO lock/atomic AND no ceiling. CONFIRMED LATENT (today): every caller is a boot-serial initcall on the
-      BSP (run_dag is single-threaded; APs parked) so there is no concurrency yet -- it becomes an active overlap
-      the moment any non-serial caller (AP init / hot-plug / deferred probe) appears. Fix: __atomic_fetch_add for a
-      disjoint reservation + a documented MMIO_VIRT_END ceiling check.
+    s_mmio_next unlocked + unbounded (vmm.c): vmm_map_mmio read-then-bumped the monotonic MMIO VA cursor with NO
+      lock/atomic AND no ceiling. CONFIRMED LATENT: every caller is a boot-serial initcall on the BSP (run_dag is
+      single-threaded; APs parked) so there is no concurrency yet -- it becomes an active overlap the moment any
+      non-serial caller (AP init / hot-plug / deferred probe) appears. HARDENED (F116, like F108's do_switch
+      landmine -- latent, not active): reserve a disjoint [base, base+span) via __atomic_fetch_add(&s_mmio_next,
+      span, RELAXED) so two concurrent callers can never get overlapping VAs, + a documented MMIO_VIRT_END ceiling
+      (1 TiB window, collision-free vs the HHDM below / kernel image above) with an overflow-safe bound (span >
+      MMIO_VIRT_END - base) so it can never run past the window into adjacent kernel VA (a 0 return + a diag
+      kprintf on exhaustion, which never fires at real device counts). The map is a fresh not-present->present
+      install at a never-reused VA, so no TLB shootdown is needed (SCAN #2). Boot-proven: every MMIO driver
+      (virtio-net/gpu/input, ahci, nvme, hda, ioapic) maps its BARs through it -- net + framebuffer up.
   DOCUMENTED-KNOWN / lower priority (recorded): TCP snd_nxt / send-snapshot / state / waiter (tcp.c, the T4
     "remaining" note at tcp.c:170-174 -- snd_nxt advanced without pcb->lock, send reads an unlocked snapshot,
     pcb->state torn multi-writer, pcb->waiter a single slot that loses a 2nd blocker's wakeup); ac97_write
@@ -2295,6 +2301,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     dcache (RCU + DYING-CAS + g_dcache_wlock), bcache (Dekker pin/tag seqlock), inode irtree (per-leaf seqlock),
     pipe (p->lock), epoll (state->lock + has_ready release/acquire), fd table reads (RCU + tryget), poll/select
     (fdget + wait_group), wait-queue MPSC (CAS). The codebase is overwhelmingly lock/atomic-correct.
-  SCAN #4 IN PROGRESS: AF_UNIX cluster COMPLETE (A/B/C/D, F111-F113); UDP inet rx ring FIXED (F114); fd_flags
-    cloexec lost-update FIXED (F115). Remaining (LAST): s_mmio_next (latent: __atomic_fetch_add for a disjoint
-    reservation + a documented MMIO_VIRT_END ceiling -- hardening, like F108). Then SCAN #4 is exhausted -> SCAN #5.
+  *** SCAN #4 COMPLETE *** -- AF_UNIX cluster (A/B/C/D, F111-F113), UDP inet rx ring (F114), fd_flags cloexec
+    lost-update (F115), s_mmio_next latent hardening (F116). Every active data race the sweep found is fixed; the
+    rest of the kernel was audited lock/atomic-correct. Documented-known lower-priority residuals stay parked (the
+    TCP T4 snd_nxt/state/waiter set, timerfd_gettime home_cpu, dcache hash_next splice, pcache accessed bit). Next:
+    BUG-TYPE SCAN #5.

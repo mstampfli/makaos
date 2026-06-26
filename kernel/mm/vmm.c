@@ -128,11 +128,34 @@ phys_addr_t vmm_kernel_pml4_get(void) {
 // Pages are mapped uncacheable (PCD+PWT) so device register reads/writes are
 // not buffered or reordered by the CPU cache.
 #define MMIO_VIRT_BASE 0xFFFF900000000000ULL
+// End of the private MMIO VA window (1 TiB above the base; the next used kernel
+// VA is the HHDM far below and the kernel image far above, so this window is
+// collision-free).  vmm_map_mmio bump-allocates within [BASE, END); a
+// reservation that would cross END fails rather than running into adjacent
+// kernel VA.  1 TiB dwarfs the total device-BAR footprint (a few hundred KiB),
+// so this ceiling never fires at real device counts -- it just makes exhaustion
+// an explicit failure instead of a silent overrun.
+#define MMIO_VIRT_END  0xFFFF910000000000ULL
 static virt_addr_t s_mmio_next = MMIO_VIRT_BASE;
 
 virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    virt_addr_t base = s_mmio_next;
+    uint64_t span  = pages * PAGE_SIZE;
+    // Reserve a disjoint [base, base+span) lock-free: __atomic_fetch_add hands
+    // each caller a unique span even if two run concurrently.  Every caller today
+    // is a boot-serial initcall on the BSP (run_dag is single-threaded; the APs
+    // are parked), so the old plain read-then-bump was LATENT-unsafe, not an
+    // active bug -- this makes the cursor safe-by-construction for any future
+    // AP / hot-plug / deferred-probe caller.  Bound it so it can never run past
+    // the window (overflow-safe form: never compute base + span).
+    virt_addr_t base = (virt_addr_t)__atomic_fetch_add(&s_mmio_next, span,
+                                                       __ATOMIC_RELAXED);
+    if (base >= MMIO_VIRT_END || span > MMIO_VIRT_END - base) {
+        extern void kprintf(const char*, ...);
+        kprintf("[vmm] MMIO window exhausted (base=%lx span=%lx)\n",
+                (unsigned long)base, (unsigned long)span);
+        return 0;   // caller gets NULL -> a detectable fault, not a silent overrun
+    }
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD | PAGE_PWT;
     for (uint64_t i = 0; i < pages; i++) {
         vmm_page_map(g_kernel_pml4,
@@ -140,7 +163,6 @@ virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
                      phys + i * PAGE_SIZE,
                      flags);
     }
-    s_mmio_next += pages * PAGE_SIZE;
     return base;
 }
 
