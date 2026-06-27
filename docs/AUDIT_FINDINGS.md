@@ -2744,3 +2744,39 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     first (reproduce by re-booting SELFTESTS=1; bisect which lock pair inverts).
   Next: SCAN #13-as-a-type = LOCK-ORDERING / DEADLOCK, led by the ext2_perm_op concurrent-fs hang above; sweep the
     lock inventory (docs/LOCKS.md) for any two locks acquired in different orders by different paths.
+
+- 2026-06-27 BUG-TYPE SCAN #13 (lock-ordering / deadlock), led by the ext2_perm_op flaky boot HANG. ROOT-CAUSED this
+  turn (no fix yet -- the fix is a substantial dedicated change). Investigation:
+  (1) STATIC lock-order map (3 parallel agents over ext2 mutate / ext2 read+dcache / bcache+pcache+reclaim-kthreads)
+    found the blocking-lock graph is ACYCLIC -- NO classic AB-BA inversion. Verified: bcache way-lock is spin_TRYLOCK
+    (cannot deadlock); g_pmm_lock is a sink (pmm never calls into fs); s_rename_lock has no incoming edge (only
+    ext2_rename takes it); pcache_evict_inode (the only bucket->clock nesting) is DEAD (zero callers) and
+    pcache_evict_one releases clock before taking the bucket; every reclaim kthread (slab/dcache/irtree shrinker,
+    pcache reclaim) RELEASES its own lock before touching any fs lock; the read path holds no inode/bcache lock across
+    dcache calls; ext2 takes inode locks ONE AT A TIME (unlink/rename drop the child before the parent). So it is NOT
+    a lock-order inversion. The AHCI completion waits (slot_wait, submit_busy_acquire) use the canonical
+    WAIT_EVENT(_HOOK) + a rescan hook, so it is NOT a simple lost-wakeup either.
+  (2) DYNAMIC capture of a LIVE hang (QMP info registers -a + addr2line on build/kernel.elf): of 4 CPUs, THREE were
+    halted (sched_enter_idle / kmain park) and ONE -- CPU#3 -- was the lone runner, spinning in cpu_relax INSIDE
+    read_inode (RIP 0xffffffff8001b056 = read_inode+150 = an inlined cpu_relax). That is a SEQLOCK READER retry: a
+    read_inode is spinning because the ext2 per-inode SEQLOCK is held with the sequence ODD (a writer active), and the
+    writer is NOT on any CPU (all others idle).
+  ROOT CAUSE: the ext2 per-inode seqlock WRITE side (inode_lock -> seq_write_begin, a plain non-preempt-disabling
+    spin_lock) is HELD ACROSS A BLOCKING SLEEP -- the dir-mutation paths (dir_add_entry/dir_remove_entry/
+    dir_set_dotdot/inode_writeback) do read_block/write_block = bcache_fill -> ahci_read/ahci_write -> slot_wait
+    (sched_sleep) WHILE holding inode_lock. When the AHCI completion is slow or its IRQ is occasionally lost (the
+    flaky trigger -- slot_wait's rescan-on-wake CANNOT recover a lost IRQ if NO wake ever arrives), the writer sleeps
+    indefinitely holding the seqlock (sequence stuck ODD), and EVERY concurrent reader of that inode (here a userland
+    fs read racing the selftest's create/unlink/rename) spins FOREVER in the seqlock reader retry -> total fs freeze.
+    Sleeping while holding a spinlock-class lock is the core defect; the lost AHCI completion is the trigger that
+    turns "slow" into "forever".
+  FIX (DEDICATED next turn -- substantial): the correct fix is to NOT hold the inode seqlock write side across the
+    blocking I/O -- restructure the dir/writeback paths so the bcache read/write (the AHCI sleep) happens OUTSIDE the
+    seqlock (do the I/O into a buffer, then take the seqlock only to publish), mirroring how inode_lock's own
+    inode_load_into already does the bcache I/O BEFORE seq_write_begin (ext2.c:576<580). AND/OR make slot_wait
+    recover a lost AHCI completion without needing a wake (a bounded timeout that triggers ahci_rescan_completions, so
+    a dropped IRQ self-heals). The first removes the cascade (readers never spin on an I/O-blocked writer); the second
+    removes the trigger. Prefer doing BOTH; at minimum the seqlock-across-I/O fix (it is the unprivileged-reachable
+    DoS: any concurrent reader+writer of one inode hangs the FS if an I/O stalls). NOTE: this only manifests under
+    SELFTESTS=1 (ext2_perm_op runs fs mutations concurrently with userland) -- the shipping disk runs no selftests --
+    but the seqlock-across-blocking-I/O is a REAL latent fs-wide deadlock for any concurrent inode contention.

@@ -243,8 +243,18 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     {
         extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
         mm_t* mm = g_current->mm_shared->mm;
-        if (!mm || !mm_vma_find(mm, frame_base - 8) ||
-            !mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1)) {
+        // mm_vma_find is an RCU reader walk (rcu_dereference of vma->next) and
+        // its contract REQUIRES rcu_read_lock for the duration of the walk, else
+        // a concurrent sibling munmap's async vma_free_rcu can free a node
+        // mid-walk -> a freed-vma read (garbage start/end/next).  Every vmm.c
+        // caller wraps it; this was the lone exception.  Snapshot the coverage
+        // boolean under the lock (the returned pointer is only NULL-tested, never
+        // dereferenced after), then handle the kill outside.
+        rcu_read_lock();
+        int covered = mm && mm_vma_find(mm, frame_base - 8) &&
+                      mm_vma_find(mm, frame_base + sizeof(sigframe_t) - 1);
+        rcu_read_unlock();
+        if (!covered) {
             extern void kprintf(const char*, ...);
             kprintf("[signal] setup_frame VMA kill: comm=\"%s\" sig=%d "
                     "kf_rsp=%p frame=%p\n",
