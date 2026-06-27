@@ -2971,10 +2971,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   init-only, no audio); sys_readlink (syscall.c:5517) + sys_times (5663) drop copy_to_user -> return success on a
   faulted user buffer (one-line -EFAULT each; no kernel leak/crash); vmm.c:160 vmm_map_mmio ignores vmm_page_map
   (kernel BAR mapper, boot-only LOW).
-  OOB-class candidate for this scan's continuation: ext2_vfs_pread (ext2.c:~1416) is missing the EOF byte-clamp that
-  ext2_vfs_read has (ext2.c:~1327) -- the aligned fast path advances `total += run * s_block_size` without clamping to
-  i_size, so a pread whose final block is partial returns PHANTOM tail bytes (the last block's content past EOF) =
-  info-exposure via the mmap/page-fault pread path. A bounded over-return, not an OOB write, MED.
+  OOB-class item FIXED (F150, MED): ext2_vfs_pread (ext2.c:~1416) was missing the EOF byte-clamp that
+  ext2_vfs_read has (ext2.c:~1327) -- the aligned fast path advanced `total += run * s_block_size` without clamping to
+  i_size, so a pread whose final block is partial returned PHANTOM tail bytes (the last block's content past EOF) =
+  info-exposure via the mmap/page-fault pread path. A bounded over-return, not an OOB write, MED. Fixed by mirroring
+  ext2_vfs_read's exact one-line `if (bytes > remain_file) bytes = remain_file;` clamp into the pread fast path before
+  the `total += bytes; cur_pos += bytes;` advance; see AUTOFIX_LOG F150.
   METHOD NOTE: SCAN #17 was opened by promoting the strongest already-identified OOB finding rather than a fresh
   6-agent sweep; a full OOB/over-read sweep (every memcpy/array-index/ring-read against an untrusted or wrapping
   bound) is the natural next step if more are wanted -- the prior SCANs already audited most memcpy/index sites clean.

@@ -528,6 +528,12 @@ static void init_kthread(void) {
     extern void ext2_perm_op_selftest(void);
     ext2_perm_op_selftest();
 
+    // Audit fix (F150): ext2_vfs_pread's aligned fast path DMA's whole blocks;
+    // its run can cover a partial final block and return the on-disk slack past
+    // i_size (info-exposure).  Prove pread now clamps the byte count to EOF.
+    extern void ext2_pread_eof_selftest(void);
+    ext2_pread_eof_selftest();
+
     // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
     // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
     // per-page VMA-backing validator (no prefault, so file-backed sources keep

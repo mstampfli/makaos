@@ -1414,6 +1414,12 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
                                     dest + (uint64_t)i * s_block_size,
                                     s_block_size);
             }
+            // file_blks_left rounds UP, so a run covering the file's final block
+            // DMA'd that block's tail slack past EOF into dst.  Clamp the byte
+            // COUNT to i_size exactly as ext2_vfs_read does -- without this a
+            // pread past a partial final block returns phantom on-disk slack
+            // bytes (stale data past end-of-file = info-exposure).
+            if (bytes > remain_file) bytes = remain_file;
             total   += bytes;
             cur_pos += bytes;
             continue;
@@ -3339,4 +3345,56 @@ void ext2_perm_op_selftest(void) {
 
     kprintf(fails ? "[fs_permop] SELF-TEST FAILED\n"
                   : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rename via in-op perm check)\n");
+}
+
+// Deterministic guard for the ext2_vfs_pread EOF-clamp fix (F150): a pread that
+// reads PAST a partial final block must return EXACTLY i_size-offset bytes, not
+// the on-disk slack past end-of-file.  Uses a MULTI-block file with a partial
+// final block (so the aligned fast-path run covers the final block and would
+// over-return) created via the real write/open path, then preads more than the
+// file size from offset 0 and asserts the count is i_size (no phantom tail).
+void ext2_pread_eof_selftest(void) {
+    extern void kprintf(const char*, ...);
+    if (!s_mounted) { kprintf("[ext2_pread_eof] SKIP (ext2 not mounted)\n"); return; }
+    cred_t root; __builtin_memset(&root, 0, sizeof root);
+    uint32_t fsize = s_block_size + 100u;            // multi-block, partial final block
+    uint8_t* wbuf = (uint8_t*)kmalloc(fsize);
+    uint8_t* rbuf = (uint8_t*)kmalloc(fsize + s_block_size);
+    if (!wbuf || !rbuf) {
+        if (wbuf) kfree(wbuf);
+        if (rbuf) kfree(rbuf);
+        kprintf("[ext2_pread_eof] SKIP (no mem)\n");
+        return;
+    }
+    for (uint32_t i = 0; i < fsize; i++) wbuf[i] = (uint8_t)(i & 0xFF);
+    __builtin_memset(rbuf, 0xAA, fsize + s_block_size);
+
+    int fails = 0;
+    vfs_file_t* f = NULL;
+    if (!ext2_write_file("/__pread_eof", wbuf, fsize, &root)) {
+        fails++;
+    } else {
+        f = ext2_open("/__pread_eof");
+        if (!f || !f->pread) {
+            fails++;
+        } else {
+            // Read MORE than the file across the partial final block: must
+            // return EXACTLY fsize bytes (not the full final block slack).
+            int64_t got = f->pread(f, rbuf, fsize + s_block_size, 0);
+            if (got != (int64_t)fsize) {
+                kprintf("[ext2_pread_eof] FAIL got=%ld want=%u (phantom tail past EOF)\n",
+                        (long)got, fsize);
+                fails++;
+            } else {
+                for (uint32_t i = 0; i < fsize; i++)
+                    if (rbuf[i] != (uint8_t)(i & 0xFF)) { fails++; break; }
+            }
+        }
+        if (f && f->close) f->close(f);
+        ext2_unlink("/__pread_eof", &root);
+    }
+    kfree(wbuf);
+    kfree(rbuf);
+    kprintf(fails ? "[ext2_pread_eof] SELF-TEST FAILED\n"
+                  : "[ext2_pread_eof] SELF-TEST PASSED (pread clamps to i_size, no phantom tail past EOF)\n");
 }
