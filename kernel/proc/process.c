@@ -349,9 +349,19 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
 // `pml4` MUST be a valid frame (the PMM_INVALID_ADDR alloc-failure case is handled
 // by the caller before any mm exists, with a bare kfree(t)); `mm == NULL` is valid
 // (kernel threads, and the failure points reached before an mm is built).
-static void task_create_unwind(task_t* t, phys_addr_t pml4, mm_t* mm) {
-    if (mm) mm_destroy(mm);
-    vmm_free_user(pml4);
+// Tear down a half-built task.  destroy_mm (if any) is the child's OWN mm to
+// free.  layout_mm describes pml4's VMA layout so the leaf-frame free can skip
+// VMA_MMIO frames: vmm_clone_user_ex shares a VMA_MMIO frame into a forked
+// child WITHOUT a per-PTE pmm ref (the frame's lifetime is owned by drm.c), so
+// an unconditional pmm_ref_dec here would drop the PARENT's still-live, GPU-
+// scanned device frame -> UAF.  For a fork, layout_mm is the parent's mm (same
+// VMA layout); for an empty/kernel-only pml4 it is NULL (no MMIO to skip).
+// Free the frames BEFORE mm_destroy, which frees the VMAs vmm_free_user_ex
+// consults.
+static void task_create_unwind(task_t* t, phys_addr_t pml4, mm_t* destroy_mm,
+                               mm_t* layout_mm) {
+    vmm_free_user_ex(pml4, layout_mm);
+    if (destroy_mm) mm_destroy(destroy_mm);
     pmm_buddy_free(pml4, 0);
     kfree(t);
 }
@@ -370,7 +380,7 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     phys_addr_t pml4 = vmm_alloc_pml4();
     if (pml4 == PMM_INVALID_ADDR) { kfree(t); return NULL; }
     task_mm_t* mm = task_mm_alloc(pml4, NULL);
-    if (!mm) { task_create_unwind(t, pml4, NULL); return NULL; }
+    if (!mm) { task_create_unwind(t, pml4, NULL, NULL); return NULL; }
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(mm); kfree(t); return NULL; }
@@ -414,9 +424,9 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
     // and the mm_vma_add(mm, ...) below would then NULL-deref.  Fail here, freeing
     // the PML4 frame (which used to be leaked along with the mm on task_mm_alloc
     // failure too).
-    if (!mm) { task_create_unwind(t, pml4, NULL); return NULL; }
+    if (!mm) { task_create_unwind(t, pml4, NULL, NULL); return NULL; }
     task_mm_t* tmm = task_mm_alloc(pml4, mm);
-    if (!tmm) { task_create_unwind(t, pml4, mm); return NULL; }
+    if (!tmm) { task_create_unwind(t, pml4, mm, NULL); return NULL; }
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
@@ -690,7 +700,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     if (!vmm_clone_user_ex(new_pml4, parent->mm_shared->pml4_phys,
                            parent->mm_shared->mm)) {
-        task_create_unwind(t, new_pml4, NULL);
+        task_create_unwind(t, new_pml4, NULL, parent->mm_shared->mm);
         return NULL;
     }
 
@@ -708,13 +718,13 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     mm_t* new_mm = mm_clone(parent->mm_shared->mm);
     if (!new_mm) {
-        task_create_unwind(t, new_pml4, NULL);
+        task_create_unwind(t, new_pml4, NULL, parent->mm_shared->mm);
         return NULL;
     }
 
     task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
     if (!tmm) {
-        task_create_unwind(t, new_pml4, new_mm);
+        task_create_unwind(t, new_pml4, new_mm, parent->mm_shared->mm);
         return NULL;
     }
 

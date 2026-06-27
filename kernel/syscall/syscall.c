@@ -1535,7 +1535,11 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         // CoW clone: pass mm so private pages are CoW-shared, not deep-copied.
         if (!vmm_clone_user_ex(new_pml4, g_current->mm_shared->pml4_phys,
                                g_current->mm_shared->mm)) {
-            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
+            // mm-aware free: the clone shares the spawner's VMA_MMIO frames into
+            // new_pml4 WITHOUT a per-PTE pmm ref, so pass the spawner's mm so
+            // vmm_free_user_ex skips them (an unconditional dec would UAF the
+            // spawner's live device frame).
+            vmm_free_user_ex(new_pml4, g_current->mm_shared->mm); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
         // Same CoW-vs-stale-TLB shootdown as task_fork — see
@@ -1549,7 +1553,9 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
         if (!tmm) {
             if (new_mm) mm_destroy(new_mm);
-            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
+            // mm-aware free (spawner's mm identifies the MMIO PTEs the clone
+            // shared without a ref) so the dec cannot UAF a live device frame.
+            vmm_free_user_ex(new_pml4, g_current->mm_shared->mm); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
         t->mm_shared = tmm;

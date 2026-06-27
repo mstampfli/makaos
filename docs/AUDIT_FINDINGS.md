@@ -3026,3 +3026,46 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   integer-overflow (#14), error-path-leak (#15), ignored-return (#16), and OOB/over-read (#17) classes now all swept,
   the high-value memory-safety space across the syscall/net/io_uring/fs/drm surface is substantially mined out; the
   remaining recorded items are LOW (MSI-X fallback, sys_read uniformity).
+
+- 2026-06-27 BUG-TYPE SCAN #19 (REFCOUNT BALANCE / lifetime: UAF via underflow/double-put/use-after-put, missing-put
+  leak, non-atomic RMW races), opened. METHOD: 3 parallel agents (fs/vfs+fd-table+dcache; net/socket/pcb/skb;
+  mm/pmm/fork+io_uring/ipc), each given the exact bug shapes + the safe pattern, after first mapping the refcount
+  primitives (vfs_file_t atomic refcount + vfs_dup/get/put; pmm per-frame ref_inc/dec/get/zero; dentry; shmem atomic;
+  skbuff; tcp_pcb RCU; unix_sock atomic). LEAD FIXED (F156, HIGH -- a real UAF of a live GPU-scanned page): the
+  fork/spawn error-path teardown pmm_ref_dec'd a VMA_MMIO frame that vmm_clone_user_ex shared into the child WITHOUT a
+  matching pmm_ref_inc (MMIO frames are owned by drm.c, no per-PTE ref), because task_create_unwind + sys_thread freed
+  via vmm_free_user(pml4)=vmm_free_user_ex(pml4, NULL) and the MMIO-skip needs a non-NULL mm. Fixed by making both
+  teardowns mm-aware (parent/spawner mm identifies the MMIO PTEs); see AUTOFIX_LOG F156. The kernel is otherwise
+  unusually well-defended for this class -- every other audited subsystem is balanced (documented below).
+  TWO MORE GENUINE FINDINGS recorded for follow-up (verify each against the real code before fixing):
+  1. [MED, UAF/double-free] sys_openpty (syscall.c:~3087-3127) force-closes installed fds via `master->close(master)` /
+     `slave->close(slave)` directly on its error paths (slave-install-fail + copy_to_user-fail) instead of vfs_close /
+     sys_close. ->close() runs the pty driver teardown UNCONDITIONALLY, bypassing the atomic refcount, so under a shared
+     fd table (CLONE_FILES sibling that dup/fdget's the just-installed mfd in the window before the error path) it frees
+     the pty_t while the sibling holds a ref -> UAF + double-free (pty close is non-idempotent). Single-threaded is
+     harmless (refcount==1). Every other install/copyout-fail path in the file uses the safe primitive (sys_pipe uses
+     sys_close for installed ends with a long comment; sys_accept/sys_recvfd use vfs_close) -- openpty is the lone
+     hand-rolled ->close(). FIX: installed end -> sys_close(mfd)/sys_close(sfd); never-installed end -> vfs_close.
+  2. [MED, leak/DoS] Listener close does not drain queued-but-unaccepted ESTABLISHED child PCBs: sock_close SOCK_STREAM
+     (socket.c:~237-244) frees only the listener's own pcb; tcp_pcb_free (tcp.c:~780-814) NULLs each child's ->listener
+     backpointer but never frees the children or the accept_queue. The only drain is accept_q_pop (tcp_accept). Close a
+     listener with a filled backlog before accept() -> each queued child (ESTABLISHED, sock_file==NULL) leaks ~128 KiB
+     (txbuf+rxbuf) and is never collected (the half-open reaper matches only SYN_RCVD); bounded TCP_BACKLOG=8/close but
+     UNBOUNDED across repeated listen/fill/close -> local mem-exhaustion DoS, remotely amplifiable. This is the residual
+     F141 (establish-AFTER-listener-gone) did NOT cover (queued-BEFORE-close). FIX: drain+free/RST the backlog on
+     listener teardown (the RST-each-backlog-entry control Linux uses).
+  Subsystems verified BALANCED (do not re-audit): skbuff (single-owner, skb_clone/ref/get called ZERO times -> every
+  skb refcount==1, freed once on every path; tx synchronous bounce-copy, no DMA-after-free; udp deliver single-socket,
+  no clone-to-N); tcp_pcb (F132 in-place rebind intact, sock_close vs reaper disjoint under s_pcb_wlock); AF_UNIX
+  (atomic + non-resurrecting tryget + RCU + clear-backptr-before-free); CoW fork<->unmap (one pmm_ref_inc per child
+  PTE under vma_lock, one dec per unmap, free at rc->0); CoW-break/get_user_pages; shmem (object ref + per-PTE ref);
+  pcache (caller ref + cache ref, evict TOCTOU safe); munmap/brk (dec after TLB shootdown, MMIO skipped); exec/elf
+  (mm-aware frees, fresh-image error paths); io_uring fixed-files (tryget + pin-before-unregister, SQPOLL/worker
+  stop-joined before release); eventfd/signalfd/timerfd/pty (no pmm refs, lock-guarded single free site, tryget).
+  DEAD field: mm_t.refcount (mm.c:70) set to 1, never inc/dec'd (thread sharing uses task_mm_t.refs) -- harmless,
+  deletable. Out-of-class data race (recorded, not a lifetime bug): tcp_timer_tick now runs from TWO threads and mutates
+  pcb seq accounting under rcu_read_lock without pcb->lock (the documented "T4" issue) -- no double-free (reap lists
+  disjoint), so not a refcount finding.
+  METHOD NOTE: SCAN #19 was a from-scratch 3-agent parallel sweep; it found ONE HIGH UAF (F156) + two MED follow-ups,
+  so the refcount class was NOT mined out (unlike #18). The openpty + listener-backlog items are the next concrete
+  backlog.
