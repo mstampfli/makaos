@@ -102,6 +102,67 @@ uint8_t fd_table_grow(task_files_t* f) {
     return 1;
 }
 
+// Clone src's fd table into dst (a fresh task_files_t) for fork / thread-copy /
+// spawn, taking a NEW reference (vfs_dup) on each open file.  Runs UNDER
+// src->lock: a sibling thread sharing src (THREAD_SHARE_FILES) can be in
+// sys_close()/fd_table_grow() concurrently, and the old lock-free copy read a
+// slot then vfs_dup'd it after the sibling's vfs_close had already freed the
+// file -> a use-after-free (vfs_dup loads f->refcount on freed memory).  Holding
+// src->lock makes a non-NULL slot guaranteed-live (its own ref keeps refcount
+// >= 1, and close cannot NULL+free it without the lock), so vfs_dup is safe; the
+// lock also pins src->ft against a concurrent grow's RCU free.  vfs_dup / the
+// fdtable_alloc kmalloc never sleep, so holding the spinlock across them is sound
+// (fd_table_grow already allocates under this same lock).  Returns 1, or 0 on
+// OOM (dst->ft stays NULL, which task_files_release handles).
+uint8_t fd_table_clone(task_files_t* dst, task_files_t* src) {
+    spin_lock(&src->lock);
+    fdtable_t* sft = src->ft;
+    if (!fd_table_init(dst, sft->cap)) { spin_unlock(&src->lock); return 0; }
+    fdtable_t* dft = dst->ft;
+    for (uint32_t i = 0; i < sft->cap; i++) {
+        dft->fd_table[i] = vfs_dup(sft->fd_table[i]);
+        dft->fd_flags[i] = sft->fd_flags[i];
+    }
+    spin_unlock(&src->lock);
+    return 1;
+}
+
+// Deterministic correctness guard for fd_table_clone (F126): clone a small
+// table and assert cap + each slot pointer + flags are copied and every cloned
+// file's refcount is bumped (the per-fd new reference).  The race fix itself
+// (the src->lock around the copy) is code-proven + boot-exercised -- every
+// fork/spawn/thread-create clones through here -- so this pins the copy logic.
+void fd_table_clone_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    static vfs_file_t fa, fb;
+    __builtin_memset(&fa, 0, sizeof fa); fa.refcount = 1;
+    __builtin_memset(&fb, 0, sizeof fb); fb.refcount = 1;
+
+    task_files_t src; __builtin_memset(&src, 0, sizeof src);
+    spin_lock_init(&src.lock); src.refs = 1;
+    task_files_t dst; __builtin_memset(&dst, 0, sizeof dst);
+    spin_lock_init(&dst.lock); dst.refs = 1;
+
+    if (!fd_table_init(&src, 8)) { kprintf("[fd_clone] FAIL src init\n"); return; }
+    src.ft->fd_table[0] = &fa; src.ft->fd_flags[0] = 7u;
+    src.ft->fd_table[3] = &fb;
+
+    if (!fd_table_clone(&dst, &src)) { kprintf("[fd_clone] FAIL clone\n"); fails++; }
+    else {
+        if (dst.ft->cap != 8) fails++;
+        if (dst.ft->fd_table[0] != &fa || dst.ft->fd_table[3] != &fb) fails++;  // same desc shared
+        if (dst.ft->fd_flags[0] != 7u) fails++;                                 // FD_CLOEXEC preserved
+        if (dst.ft->fd_table[1] != NULL || dst.ft->fd_table[2] != NULL) fails++;// empty slots stay NULL
+        if (fa.refcount != 2u || fb.refcount != 2u) fails++;                    // each got a new ref
+    }
+
+    if (dst.ft) { kfree(dst.ft->fd_table); kfree(dst.ft->fd_flags); kfree(dst.ft); }
+    kfree(src.ft->fd_table); kfree(src.ft->fd_flags); kfree(src.ft);
+    kprintf(fails ? "[fd_clone] SELF-TEST FAILED\n"
+                  : "[fd_clone] SELF-TEST PASSED (cap+slots+flags copied, refs bumped)\n");
+}
+
 task_files_t* task_files_alloc(void) {
     task_files_t* f = kmalloc(sizeof(task_files_t));
     if (!f) return NULL;
@@ -626,15 +687,11 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
-    // Snapshot the parent's fdtable_t (outside RCU is fine — fork runs
-    // in the parent's own task context so its own table can't be
-    // concurrently torn down).
-    fdtable_t* pft = parent->files_shared->ft;
-    fd_table_init(files, pft->cap);
-    fdtable_t* cft = files->ft;
-    for (uint32_t i = 0; i < pft->cap; i++) {
-        cft->fd_table[i] = vfs_dup(pft->fd_table[i]);
-        cft->fd_flags[i] = pft->fd_flags[i];
+    // Copy the parent's fd table under the parent's lock: a sibling thread
+    // sharing the table can close()/grow() concurrently, so the old lock-free
+    // vfs_dup loop could vfs_dup a file a sibling had just freed (a UAF).
+    if (!fd_table_clone(files, parent->files_shared)) {
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
     }
 
     t->pid              = pid_alloc();

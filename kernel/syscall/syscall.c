@@ -1555,12 +1555,11 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     } else {
         task_files_t* files = task_files_alloc();
         if (!files) { task_mm_release(t->mm_shared); pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }
-        fdtable_t* src = g_current->files_shared->ft;
-        fd_table_init(files, src->cap);
-        fdtable_t* dst = files->ft;
-        for (uint32_t i = 0; i < src->cap; i++) {
-            dst->fd_table[i] = vfs_dup(src->fd_table[i]);
-            dst->fd_flags[i] = src->fd_flags[i];   // mirror task_fork: preserve FD_CLOEXEC
+        // Clone under the source lock (see fd_table_clone): a sibling thread
+        // closing an fd concurrently must not let us vfs_dup a freed file.
+        if (!fd_table_clone(files, g_current->files_shared)) {
+            task_files_release(files); task_mm_release(t->mm_shared);
+            pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
         t->files_shared = files;
     }

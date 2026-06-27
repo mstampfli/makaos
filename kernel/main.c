@@ -730,6 +730,11 @@ static void init_kthread(void) {
     extern void out_struct_zerofill_selftest(void);
     out_struct_zerofill_selftest();
 
+    // fd_table_clone correctness: fork/spawn/thread copy the parent fd table
+    // (under its lock so a sibling close cannot free a file mid-vfs_dup).
+    extern void fd_table_clone_selftest(void);
+    fd_table_clone_selftest();
+
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();

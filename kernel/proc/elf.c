@@ -518,21 +518,21 @@ static vfs_file_t* resolve_stdio(const int* spec, int i) {
     int fd = spec[i];
     if (fd == -2) return vfs_null_open(); // explicit /dev/null
 
-    // Caller is the parent (g_current) setting up the child's stdio.
-    // Walk the parent's own fdtable_t directly; no task_files_t.lock
-    // needed because fork/spawn runs in the parent's own task context
-    // and its own fd table is only mutated by itself.
-    fdtable_t* ft = (g_current && g_current->files_shared)
-                    ? g_current->files_shared->ft : NULL;
-
-    if (fd == -1) {
-        if (ft && (uint32_t)i < ft->cap && ft->fd_table[i])
-            return vfs_dup(ft->fd_table[i]);
-        return tty_open(0); // no parent fd — fall back to tty0
-    }
-    if (ft && (uint32_t)fd < ft->cap && ft->fd_table[fd])
-        return vfs_dup(ft->fd_table[fd]);
-    return tty_open(0); // requested fd doesn't exist — fall back to tty0
+    // Caller is the parent (g_current) setting up the child's stdio.  Dup the
+    // requested slot (`fd`, or `i` when fd==-1 means "inherit") under the
+    // parent's fd-table lock: a sibling thread sharing the table can close()
+    // the fd concurrently, and the old lock-free "check slot then vfs_dup it"
+    // double-fetched the slot and could vfs_dup a file the sibling had just
+    // freed (a use-after-free).  Under the lock a non-NULL slot is live, so the
+    // single vfs_dup is safe; vfs_dup(NULL) returns NULL for an empty slot.
+    task_files_t* tf = (g_current) ? g_current->files_shared : NULL;
+    if (!tf) return tty_open(0);
+    uint32_t slot = (fd == -1) ? (uint32_t)i : (uint32_t)fd;
+    vfs_file_t* f = NULL;
+    spin_lock(&tf->lock);
+    if (slot < tf->ft->cap) f = vfs_dup(tf->ft->fd_table[slot]);
+    spin_unlock(&tf->lock);
+    return f ? f : tty_open(0);   // empty / out-of-range slot -> fall back to tty0
 }
 
 // ── elf_load ──────────────────────────────────────────────────────────────

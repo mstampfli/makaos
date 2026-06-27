@@ -372,6 +372,9 @@ void     pid_free(uint32_t pid);
 // fd table helpers — operate on task_files_t directly.
 uint8_t fd_table_init(task_files_t* f, uint32_t cap);
 uint8_t fd_table_grow(task_files_t* f);
+// Clone src's table into a fresh dst, vfs_dup'ing each fd under src->lock
+// (fork / thread-copy / spawn).  1 on success, 0 on OOM (dst->ft left NULL).
+uint8_t fd_table_clone(task_files_t* dst, task_files_t* src);
 
 // Fork the current user task.
 // user_rbp/rbx/r12-r15 are the callee-saved registers at the syscall site;

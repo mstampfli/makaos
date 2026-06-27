@@ -2604,3 +2604,47 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     (TOCTOU/race-window -- the ahci_submit_sg READ_POISON re-check gap -- OR a recorded residual: socket_bind port-0
     overload, the ignored-OOM-return cluster [process.c fd_table_init/pid_alloc, elf.c mm_vma_add], io_uring
     DRM_COMMIT fdput leak).
+
+- 2026-06-27 BUG-TYPE SCAN #11 (TOCTOU / double-fetch / check-then-use race-window): the time-of-check-to-time-of-use
+  GAP (distinct from SCAN #4's unsynchronized field access). Swept the whole tree with 4 parallel agents (drivers+io
+  [io_uring SQE double-fetch]; mm+proc+syscall [fd-table lookup-then-use, futex, copy_from_user re-read]; net [pcb
+  lookup-then-use, revalidate-after-wake]; fs+vfs [path TOCTOU, dcache/bcache lookup-then-use]). The prime surface --
+  io_uring SQE -- is CLEAN (dispatch_exec snapshots the whole 64-byte SQE into a kernel local once; all reads use the
+  snapshot; the SQ index uses a kernel-trusted mask). Highest-value finding FIXED (F126); others recorded.
+  FIXED (F126): the fork/spawn/thread fd-table lock-free vfs_dup use-after-free (3 sites: process.c task_fork,
+    syscall.c sys_thread, elf.c resolve_stdio). Copying a SHARED fd table did `vfs_dup(src->fd_table[i])` with no
+    lock, so a sibling thread's sys_close() could free the file in the window -> vfs_dup loads f->refcount on freed
+    memory (UAF). vfs.h:82-84 says lock-free observers MUST use vfs_tryget, not vfs_dup. FIX: extracted
+    fd_table_clone(dst, src) that vfs_dup's every slot UNDER src->lock (a non-NULL slot is then guaranteed live, its
+    own ref keeps refcount>=1); task_fork/sys_thread call it (+ now handle the OOM return, fixing a latent
+    fd_table_init-ignored NULL-deref); resolve_stdio (which also DOUBLE-FETCHED the slot) reads it once under the
+    lock. New fd_table_clone_selftest + heavy boot-exercise (every spawn clones through it; login + DHCP prove it).
+  RECORDED (real, queued for follow-up turns):
+    sys_spawn stdio double-fetch (syscall.c:1471) -- HIGH-ish DoS, ONE-LINE fix, do NEXT: after copy_from_user'ing
+      stdio[3] into a kernel local (1375), the job-control branch RE-READS `((const int*)stdio_ptr)[0]` from user
+      memory instead of the snapshot stdio[0]; a sibling thread munmap's the page during the wide elf_exec_from_ext2
+      window -> the raw read #PF-panics the kernel (unprivileged DoS, no fault-fixup). Fix = test stdio[0].
+    TCP lost-wakeup (tcp.c, 4 sites: tcp_recv_data:865, tcp_send:817, socket_accept:369, socket_connect:449) -- MED
+      hang/DoS. Each checks its wait condition, then publishes pcb->waiter, then sched_sleep WITHOUT re-checking the
+      condition after publishing; pcb_wake only wakes a non-NULL waiter, so a wake landing in the check->publish gap
+      is lost -> recv/send/accept/connect hangs with the condition already true. The canonical WAIT_EVENT_HOOK
+      (wait.h) does publish-then-RE-CHECK; these 4 hand-rolled waits omit it. Fix = add the recheck-after-publish.
+    Path TOCTOU on unlink/rename/mkdir/open+O_CREAT (syscall.c + ext2.c) -- HIGH impact, race-gated, INVASIVE fix.
+      The syscall-level permission check resolves+validates the parent, then the ext2 op RE-resolves the path from
+      scratch with no perm re-check; a concurrent rename of an intermediate component swaps the target -> a
+      destructive op (delete/replace/create) in a directory whose write perm was never validated. The clean pattern
+      already exists (existing-file sys_open resolves once -> ext2_open_ino). Needs resolve-once-to-inode for the
+      mutating ops -- a dedicated design turn. (Related out-of-class: fs_lookup doesn't check final-file r/w perm for
+      ext2 -- a permission-model gap.) Also LOW: mmap re-resolves f->path instead of f->ino (wrong-size); socket_bind
+      RCU-frees a pcb a blocked sibling holds by raw pointer (latent, hangs not UAFs).
+  AUDITED CLEAN: io_uring (SQE snapshot in dispatch_exec; sqe_fdget/uring_fdget hold the lock / RCU+tryget across the
+    use; REGISTER_FILES single-fetch under lock), drm/evdev/pty/tty ioctls (copy_from_user the arg into a kernel
+    local, use only that), fdget (RCU + vfs_tryget -- the canonical lookup-then-use, refcount-pinned), poll/mmap/
+    sigaction/setgroups (single copy_from_user into a kernel local), futex (enqueue-then-recheck under the bucket
+    lock, compare-vs-register-val), net (tcp/udp/unix lookups stay under rcu_read_lock or pin via tryget through the
+    use; UDP recv re-checks head under the lock after wake; unix peer is RCU+refcount; F119 establish-vs-reap under
+    s_pcb_wlock), fs (dcache_lookup returns a refcounted handle held across the use; bcache_get pins; proc uses
+    RCU-snapshot+vfs_tryget; existing-file open/exec resolve-once-to-inode-number; copy_path_from_user single-fetch).
+  SCAN #11 SUBSTANTIALLY COMPLETE: the fd-table lookup-then-use UAF FIXED (F126) with a new mechanism + unit test;
+    io_uring (the prime double-fetch surface) verified clean. Next: SCAN #12-as-a-type, OR knock off the recorded
+    one-line sys_spawn stdio double-fetch (a clean DoS fix) before the bigger TCP-lost-wakeup / path-TOCTOU items.

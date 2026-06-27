@@ -270,6 +270,24 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   This is the "unpublish-before-RCU-deferred-free" ordering primitive: apply it wherever a
   pointer to an RCU-freed object is cleared around the deferred free.
 
+- `fd_table_clone(dst, src)` (kernel/proc/process.c, F126) -- clone a task's fd table for
+  fork / thread-copy / spawn, vfs_dup'ing each open file UNDER `src->lock`.  The three sites
+  (task_fork, sys_thread, resolve_stdio) used to read a slot and vfs_dup it LOCK-FREE, which
+  is a use-after-free when the table is shared across threads: a sibling sys_close() can free
+  the file in the gap and vfs_dup then loads f->refcount on freed memory.  Per vfs.h, a
+  lock-free OBSERVED file pointer must use vfs_tryget (CAS-if-nonzero); but the correct fix
+  here is to hold the OWNING lock so the observation is not lock-free at all -- under
+  src->lock a non-NULL slot is guaranteed live (its own ref keeps refcount >= 1, and close
+  cannot NULL+free it without the lock), so the plain vfs_dup is safe AND src->ft is pinned
+  against a concurrent grow's RCU free.  This is the "vfs_dup under the owning fd-table lock"
+  rule, mirroring sys_close / fd_install which mutate the table under the same lock; it is
+  the single source for the full-table clone (resolve_stdio inlines the same lock for its
+  one-fd dup, reading the slot ONCE -- it previously double-fetched it).  vfs_dup / the
+  fdtable_alloc kmalloc never sleep, so holding the spinlock across them is sound (fd_table_grow
+  already allocates under this lock).  RULE: never vfs_dup a file observed from a table you do
+  not own without holding that table's lock (or an RCU section + vfs_tryget).
+  `fd_table_clone_selftest` pins the clone logic (cap + slot pointers + flags copied, refs bumped).
+
 - `unix_sock_t.lock` + the "lock the queue OWNER, copy user data OUTSIDE the lock" discipline
   (kernel/net/unix_sock.c, F111/F112/F113; full rules in docs/LOCKS.md) -- one per-socket leaf
   spinlock serializes ALL of an AF_UNIX socket's per-socket queues (listener backlog, dgram rx,
