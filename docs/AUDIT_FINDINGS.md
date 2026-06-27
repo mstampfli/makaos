@@ -2861,9 +2861,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   out[0..i); pmm_ref_dec refuses to free a pinned frame, so a multi-page user read that OOMs mid-pin leaked pinned
   pages permanently (DoS). Fixed by unpinning [0..i) at the out: label on failure; see AUTOFIX_LOG F139.
   RESIDUAL (real, lower severity -- noted for follow-up turns, NOT lock leaks / double-frees):
-    (MED, mm) vmm.c isr14_page_fault kernel demand-map (~1216): `vmm_page_map(...)` return is UNCHECKED -- on a
-      double-OOM (the leaf frame allocs but an intermediate PT page cannot) the leaf frame is neither mapped nor
-      freed -> one-page leak. Rare (near-OOM in kernel space). FIX: check the return, pmm_buddy_free(frame) on fail.
+    *** FIXED F143 (2026-06-27): vmm.c isr14_page_fault kernel demand-map (~1229) had an UNCHECKED vmm_page_map --
+      on a double-OOM (leaf allocs, intermediate PT page cannot) the leaf was neither mapped nor freed (leak) AND the
+      handler returned with the fault unresolved -> re-fault loop leaking another leaf each pass. Fixed: check the
+      return, pmm_buddy_free(frame, 0) + goto kernel_panic (the same unrecoverable-#PF route) on failure. The user
+      branch (1039) was already checked. Code-proof + boot (kheap demand-map runs constantly at boot: 84 selftests, 0
+      faults).
     *** FIXED F140 (2026-06-27): process.c task_create_user (~387) and task_create_kthread (~353) leaked the
       vmm_alloc_pml4() frame (+ the mm_create() mm_t in the user case) on task_mm_alloc failure, NULL-deref'd if
       mm_create() returned NULL (task_mm_alloc(pml4, NULL) succeeded -> mm_vma_add NULL-deref), and never guarded

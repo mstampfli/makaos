@@ -1226,7 +1226,15 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) goto kernel_panic;
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
-        vmm_page_map(g_kernel_pml4, fault_addr & ~PAGE_MASK, frame, VMM_KDATA);
+        if (!vmm_page_map(g_kernel_pml4, fault_addr & ~PAGE_MASK, frame, VMM_KDATA)) {
+            // vmm_page_map OOM'd on an intermediate page-table page: the leaf is
+            // neither mapped nor freed.  Free it (no leak) and panic
+            // deterministically -- returning here would leave the fault
+            // unresolved, so the access re-faults and leaks another leaf each
+            // pass until the buddy is exhausted.
+            pmm_buddy_free(frame, 0);
+            goto kernel_panic;
+        }
         return;
     }
 
