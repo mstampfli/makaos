@@ -332,15 +332,30 @@ int socket_bind(vfs_file_t* f, uint16_t port) {
         return 0;
     }
 
-    // TCP: rebind the PCB to the requested local port.
+    // TCP: rebind the socket's existing ephemeral pcb to the requested local
+    // port IN PLACE.  Do NOT free + realloc s->pcb: the other socket ops
+    // (sock_poll/connect/send/recv/listen/shutdown/accept) deref s->pcb
+    // locklessly, so freeing it while a sibling thread uses the same (shared or
+    // dup'd) fd would leave that thread holding a freed pcb -- a use-after-free
+    // write into its rx/tx rings.  socket_open already gave us a CLOSED ephemeral
+    // pcb published on s_pcb_head; retargeting its port keeps s->pcb pointing at
+    // the SAME live object, so no reader can ever observe a freed pcb.
     if (s->pcb) {
-        tcp_pcb_set_file(s->pcb, NULL);
-        tcp_pcb_free(s->pcb);
-        s->pcb = 0;
+        // Only a brand-new CLOSED socket may be bound.  Binding a connected or
+        // listening socket is illegal (POSIX -EINVAL) -- and an in-place port
+        // change would corrupt a live connection's / listener's demux.  A socket
+        // can reach a non-CLOSED state with s->bound still 0 (connect() without
+        // an explicit bind uses the ephemeral pcb), so the s->bound check above
+        // does not cover this; gate on the pcb state.
+        if (tcp_pcb_state(s->pcb) != TCP_CLOSED) return -EINVAL;
+        tcp_pcb_set_local_port(s->pcb, port);
+    } else {
+        // Defensive: a TCP socket always has an ephemeral pcb from socket_open;
+        // alloc one only if it is somehow missing.
+        s->pcb = tcp_pcb_alloc(port);
+        if (!s->pcb) return -EADDRINUSE;
+        tcp_pcb_set_file(s->pcb, f);
     }
-    s->pcb = tcp_pcb_alloc(port);
-    if (!s->pcb) return -EADDRINUSE;
-    tcp_pcb_set_file(s->pcb, f);
     s->local_port = port;
     s->bound = 1;
     return 0;
@@ -763,4 +778,40 @@ void sock_file_lifetime_selftest(void) {
         kprintf("[sock_file_life] SELF-TEST FAILED (%d)\n", fails);
     else
         kprintf("[sock_file_life] PASS (s->file backptr consistent, RCU-deferred free)\n");
+}
+
+// Guard for the F132 fix: socket_bind on a TCP socket must NOT free + realloc
+// s->pcb (a sibling thread on a shared/dup'd fd derefs s->pcb locklessly -> a
+// UAF write into the freed pcb's rings).  A fresh CLOSED socket rebinds its
+// ephemeral pcb IN PLACE (same pointer, new port); a non-CLOSED (connected /
+// listening) socket rejects bind with -EINVAL and keeps its pcb untouched.
+void socket_bind_rebind_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    // (1) Fresh CLOSED socket: bind rebinds the ephemeral pcb in place -- the
+    // pcb pointer must NOT change (the old free+realloc changed it).
+    vfs_file_t* f1 = socket_open(AF_INET, SOCK_STREAM);
+    if (!f1) { kprintf("[sock_bind] FAILED: open1\n"); return; }
+    socket_t* s1 = (socket_t*)f1->ctx;
+    struct tcp_pcb* pcb1 = s1->pcb;
+    if (!pcb1)                        fails++;
+    if (socket_bind(f1, 23456) != 0)  fails++;
+    if (s1->pcb != pcb1)              fails++;   // SAME pcb -- rebound in place, not freed
+    if (s1->local_port != 23456)      fails++;
+    f1->close(f1);
+
+    // (2) A LISTENing socket (s->bound still 0, so the s->bound check does not
+    // cover it): bind must be rejected with -EINVAL and leave the pcb untouched.
+    vfs_file_t* f2 = socket_open(AF_INET, SOCK_STREAM);
+    if (!f2) { kprintf("[sock_bind] FAILED: open2\n"); return; }
+    socket_t* s2 = (socket_t*)f2->ctx;
+    socket_listen(f2);
+    struct tcp_pcb* pcb2 = s2->pcb;
+    if (socket_bind(f2, 34567) != -EINVAL) fails++;   // non-CLOSED -> rejected
+    if (s2->pcb != pcb2)                   fails++;    // pcb unchanged (never freed)
+    f2->close(f2);
+
+    kprintf(fails ? "[sock_bind] SELF-TEST FAILED\n"
+                  : "[sock_bind] SELF-TEST PASSED (rebind in place; non-CLOSED bind rejected, pcb kept)\n");
 }

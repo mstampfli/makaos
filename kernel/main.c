@@ -656,6 +656,12 @@ static void init_kthread(void) {
     extern void sock_file_lifetime_selftest(void);
     sock_file_lifetime_selftest();
 
+    // F132: socket_bind rebinds a TCP socket's ephemeral pcb in place (no free/
+    // realloc -> no UAF for a sibling deref of s->pcb); a non-CLOSED socket
+    // rejects bind without freeing its pcb.
+    extern void socket_bind_rebind_selftest(void);
+    socket_bind_rebind_selftest();
+
     // Tier 1 #4 (socketpair): bidirectional AF_UNIX SOCK_STREAM pair.
     extern void socketpair_selftest(void);
     socketpair_selftest();

@@ -2701,13 +2701,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       now as before; failure (HELD) hash-unlinks ONLY (lookups miss) and lets the holder's last dcache_put drop it to
       the LRU where the shrinker reclaims it. Verified: new dcache_held_invalidate_selftest (hold a ref across an
       invalidate -> lookups miss, held dentry intact) + [dcache_test]/[dcache_race] still pass + heavy boot dcache use.
-    (MED) socket_bind RCU-frees the old TCP s->pcb (socket.c:338 tcp_pcb_free, then s->pcb=0) while another thread on
-      the same shared fd derefs s->pcb in sock_poll/connect/send/recv/listen/shutdown OUTSIDE rcu_read_lock --
-      socket_bind does NOT drop the file ref, so it is not serialized vs in-flight users, and these readers take no
-      socket lock/rcu around s->pcb. connect/send/recv WRITE into the freed pcb + its rx/tx rings. One-shot (only the
-      first bind frees; s->bound rejects the rest). FIX: RCU-protect s->pcb (read under rcu_read_lock, defer the
-      rebind free) or serialize control ops, mirroring the s->file/sock_file discipline. (This supersedes the SCAN
-      #11 "socket_bind latent" note -- it is a UAF write, not just a hang.)
+    FIXED (F132): socket_bind RCU-freed + realloc'd the old TCP s->pcb while sock_poll/connect/send/recv/listen/
+      shutdown/accept deref s->pcb LOCKLESSLY -> a sibling thread on a shared/dup'd fd could hold a freed pcb and
+      WRITE into its rx/tx rings. Option B (RCU-protect s->pcb) is infeasible (the readers BLOCK, so no rcu_read_lock
+      across the sleep; the pcb is not refcounted). FIX (Option C + a guard): rebind the existing ephemeral CLOSED pcb
+      IN PLACE (new tcp_pcb_set_local_port atomic store -- the pcb is on s_pcb_head + CLOSED, so retargeting demux
+      needs no free), so s->pcb NEVER changes; and reject bind on a non-CLOSED (connected/listening) pcb with -EINVAL
+      (POSIX-correct, and an in-place port change would corrupt a live connection). Verified by socket_bind_rebind_
+      selftest (fresh bind keeps the SAME pcb pointer; non-CLOSED bind rejected, pcb kept) + [tcp_accept/orphan/synreap].
     (LOW/latent) mm_clone (mm.c:342/345) shmem_ref/vfs_dup raw VMA-backing pointers snapshotted in a CLOSED rcu
       section (no shmem_tryget/vfs_tryget) -> a fork racing a sibling munmap of the same VMA could ref a freed
       shmem/file; latent behind the ~10 ms async vma-free latency (goes live if vma free is made expedited, which a
@@ -2728,8 +2729,18 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     signalfd last-ref free + signalfd_disown_all; pty/tty/drm/ahci/nvme refcount or static), mm+proc (mm_destroy /
     sched lists save-next; zombies rq_lock-pinned; task_free_rcu orders disown-before-free; futnext captured before
     the RELEASE store; fault path trygets under rcu). The subsystems are overwhelmingly lifetime-correct.
-  SCAN #12 STATUS: the two HIGH UAFs FIXED -- evdev dangling-task (F130) and dcache_invalidate unconditional-free
-    (F131, with a new dcache_held_invalidate selftest). Remaining: the MED socket_bind pcb UAF (RCU-protect s->pcb /
-    serialize control ops -- a clean next candidate), the LOW/latent mm_clone tryget + signal_setup_frame rcu_read_lock,
-    and the FLAGGED do_switch switching_from item (needs a runtime poison-on-free check before fixing). Next: the MED
-    socket_bind pcb UAF, OR advance to SCAN #13-as-a-type (lock-ordering/deadlock, OR a recorded residual).
+  SCAN #12 STATUS: the two HIGH UAFs FIXED -- evdev dangling-task (F130), dcache_invalidate (F131) -- and the MED
+    socket_bind pcb UAF FIXED (F132, rebind-in-place + a non-CLOSED guard). Remaining UAF residuals: LOW/latent
+    mm_clone tryget + signal_setup_frame rcu_read_lock, and the FLAGGED do_switch switching_from (needs a runtime
+    poison-on-free check). SCAN #12 essentially complete.
+  *** NEW HIGH-PRIORITY LEAD found WHILE verifying F132 (a flaky boot HANG): ext2_perm_op_selftest (the F129
+    create/unlink/mkdir/rename test) HUNG 2 of 3 SELFTESTS=1 boots -- it runs in init_kthread CONCURRENTLY with
+    userland fs access (svcmgr reading /etc/services, net.svc) + the shrinker/pcache reclaim kthreads, so the likely
+    cause is a LOCK-ORDER INVERSION / deadlock in the concurrent ext2-mutation-vs-read path (s_rename_lock /
+    inode_lock / bcache / g_dcache_wlock taken in conflicting orders by the mutate vs read paths). NOT caused by F132
+    (tcp/socket only -- the 2nd hung boot still reached DHCP; only the selftest sweep stalled) and the shipping disk
+    runs no selftests, BUT the SAME ext2 ops are unprivileged-reachable, so a real concurrent-fs deadlock would be a
+    DoS. This is the prime SCAN #13 (lock-ordering/deadlock) target -- investigate the ext2 mutate-vs-read lock order
+    first (reproduce by re-booting SELFTESTS=1; bisect which lock pair inverts).
+  Next: SCAN #13-as-a-type = LOCK-ORDERING / DEADLOCK, led by the ext2_perm_op concurrent-fs hang above; sweep the
+    lock inventory (docs/LOCKS.md) for any two locks acquired in different orders by different paths.

@@ -919,6 +919,16 @@ void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file) {
     if (pcb) __atomic_store_n(&pcb->sock_file, file, __ATOMIC_RELEASE);
 }
 
+void tcp_pcb_set_local_port(tcp_pcb_t* pcb, uint16_t port) {
+    // Rebind an ephemeral, CLOSED pcb's local port IN PLACE (socket_bind).  The
+    // pcb is already published on s_pcb_head and has no traffic yet, so an
+    // atomic store retargets demux (pcb_find matches on local_port) without
+    // freeing + reallocating the pcb -- so a sibling socket op derefing s->pcb
+    // can never observe a freed pcb (the bind UAF).  A concurrent demux reader
+    // sees the old or new port; for a CLOSED pcb neither matches a live flow.
+    if (pcb) __atomic_store_n(&pcb->local_port, port, __ATOMIC_RELEASE);
+}
+
 uint32_t tcp_pcb_rx_used(const tcp_pcb_t* pcb) {
     return pcb ? pcb->rxbuf_used : 0;
 }

@@ -124,3 +124,7 @@ void tcp_pcb_set_waiter(tcp_pcb_t* pcb, void* waiter);
 // wake any task sleeping in poll()/select() on the socket fd.  Declared as
 // void* to avoid dragging vfs.h into tcp.h.
 void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file);
+
+// Rebind an ephemeral, CLOSED pcb's local port in place (socket_bind) -- no
+// free/realloc, so a concurrent socket op derefing s->pcb cannot hit a freed pcb.
+void tcp_pcb_set_local_port(tcp_pcb_t* pcb, uint16_t port);
