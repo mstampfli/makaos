@@ -2678,3 +2678,56 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     (use-after-free distinct from double-free, OR lock-ordering/deadlock, OR uninitialized-padding round 2), OR clear a
     smaller clean residual (socket_bind port-0 overload, the ignored-OOM-return cluster, ahci_submit_sg READ_POISON),
     OR take the TCP lost-wakeup when a blocking-wait test harness can be built.
+
+- 2026-06-27 BUG-TYPE SCAN #12 (use-after-free: an object dereferenced AFTER it was freed; distinct from SCAN #5
+  double-free and SCAN #11 lookup-then-use TOCTOU). Swept the whole tree with 4 parallel agents (net; fs+vfs;
+  drivers+io; mm+proc+signal), instructed to find NEW UAFs (not re-derive F107/F117/F119/F126). The kernel is
+  heavily hardened (RCU + refcount + save-next-before-free are pervasive); a handful of NEW gaps found.
+  FIXED (F130): evdev blocking-read dangling-task UAF (drivers/input/evdev.c). A blocking /dev/input/eventN read
+    stored c->reader = g_current then returned -EINTR on a signal wake WITHOUT clearing it; once the reader exits
+    with the fd kept open (shared fd / fork), a later input event's sched_wake(c->reader) -- from the keyboard/mouse
+    IRQ or the virtio_input kthread -- writes into a freed+reallocated task_t slab (scheduler corruption). FIX:
+    re-take d->lock after sched_sleep and `if (c->reader == g_current) c->reader = NULL;` before the EINTR
+    return/loop, making the read path's c->reader handling exhaustive (mirrors signalfd_disown_all + the producer's
+    own clear). Verified: code-proof + [evdev_ring] boot-exercise.
+  RECORDED (NEW, queued for follow-up):
+    (HIGH) dcache_invalidate frees a dentry UNCONDITIONALLY (dcache.c:450 dentry_unlink_and_free_locked ->
+      call_rcu_head, NO refcount check) while a path-walk holds it by refcount alone OUTSIDE rcu (dcache_lookup
+      rcu_read_unlocks before returning the handle; ext2_lookup_path reads d->child_ino + dcache_put after a
+      preemption point) -> on a hit racing a concurrent unlink/rename/create/mkdir on the same (parent,name), the
+      grace period can close and free d before the holder's dcache_put -> a freed read of child_ino + a freed WRITE
+      (dcache_put's refcount-- into a reallocated SLAB_TYPESAFE_BY_RCU slot can drive a DIFFERENT live dentry to 0 ->
+      cascading UAF + LRU corruption). The SHRINKER path was hardened (DCACHE_REF_DYING CAS); the invalidate path was
+      NOT -- a genuine asymmetry. FIX: make dcache_invalidate/_subtree honor the refcount (mark dying + let the last
+      dcache_put free, like the shrinker) instead of unconditional call_rcu. A strong next-turn candidate (HIGH,
+      unprivileged, clean fix-by-analogy to the shrinker).
+    (MED) socket_bind RCU-frees the old TCP s->pcb (socket.c:338 tcp_pcb_free, then s->pcb=0) while another thread on
+      the same shared fd derefs s->pcb in sock_poll/connect/send/recv/listen/shutdown OUTSIDE rcu_read_lock --
+      socket_bind does NOT drop the file ref, so it is not serialized vs in-flight users, and these readers take no
+      socket lock/rcu around s->pcb. connect/send/recv WRITE into the freed pcb + its rx/tx rings. One-shot (only the
+      first bind frees; s->bound rejects the rest). FIX: RCU-protect s->pcb (read under rcu_read_lock, defer the
+      rebind free) or serialize control ops, mirroring the s->file/sock_file discipline. (This supersedes the SCAN
+      #11 "socket_bind latent" note -- it is a UAF write, not just a hang.)
+    (LOW/latent) mm_clone (mm.c:342/345) shmem_ref/vfs_dup raw VMA-backing pointers snapshotted in a CLOSED rcu
+      section (no shmem_tryget/vfs_tryget) -> a fork racing a sibling munmap of the same VMA could ref a freed
+      shmem/file; latent behind the ~10 ms async vma-free latency (goes live if vma free is made expedited, which a
+      mm.c comment already intends). FIX: tryget inside the snapshot rcu section (like the fault path / vmm_clone).
+    (LOW/latent) signal_setup_frame (signal.c:246-247) calls mm_vma_find WITHOUT rcu_read_lock -- the only such
+      caller (all vmm.c callers wrap it); a freed-VMA read mid-walk if a sibling munmaps. FIX: wrap in rcu_read_lock.
+    (LOW/dead) pcache_evict_inode lock-order inversion vs pcache_evict_one -> double-free; but pcache_evict_inode has
+      ZERO callers (declared, never wired) -> unreachable until someone adds a caller.
+    (FLAGGED, needs RUNTIME confirmation -- potentially HIGH) do_switch sets c->switching_from = prev (sched.c:1435)
+      and never NULLs it; the next do_switch writes so->on_cpu=0 (sched.c:1316/1536) -- IF the reaper at 1542 frees
+      the just-DEAD task inline (expedited), that is a freed-task write every thread death. The agent could not
+      resolve the context-switch resume semantics statically (the asm suggests prev resolves to the resuming task, so
+      1542 would never fire -- but DEAD kthreads ARE reaped without leaks, a contradiction). Needs a dynamic check
+      (poison-on-free + watch switching_from reads) before fixing -- do NOT guess.
+  AUDITED CLEAN (NEW UAFs): net (skb single-owner-per-dispatch, pcb/sock RCU-deferred + save-next reapers, unix_sock
+    refcount+RCU, ARP COW), fs (vfs/pipe/proc/virtfs refcounted or RCU; ext2 reads locals-before-put; bcache pinned;
+    irtree refcount-0-only free), drivers+io (io_uring save-next iterators + fixed_files tryget; eventfd/timerfd/
+    signalfd last-ref free + signalfd_disown_all; pty/tty/drm/ahci/nvme refcount or static), mm+proc (mm_destroy /
+    sched lists save-next; zombies rq_lock-pinned; task_free_rcu orders disown-before-free; futnext captured before
+    the RELEASE store; fault path trygets under rcu). The subsystems are overwhelmingly lifetime-correct.
+  SCAN #12 SUBSTANTIALLY COMPLETE: the cleanest HIGH UAF (evdev dangling task) FIXED (F130). The HIGH dcache_invalidate
+    UAF is the strongest recorded follow-up (clean fix-by-analogy to the shrinker). Next: dcache_invalidate, OR the
+    MED socket_bind pcb UAF, OR continue/advance per the re-arm.

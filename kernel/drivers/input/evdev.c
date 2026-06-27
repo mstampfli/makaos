@@ -256,9 +256,20 @@ static int64_t evdev_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
         c->reader = g_current;
         spin_unlock_irqrestore(&d->lock, flags);
         sched_sleep();
-        if (signal_has_actionable(&g_current->sigstate))
-            return -EINTR;
+        // Re-take the lock and DISOWN ourselves before we can leave.  The
+        // producer (input_device_emit) NULLs c->reader when IT wakes us, but a
+        // signal wake does not -- and returning -EINTR with c->reader still
+        // pointing at this task lets a later input event sched_wake() a freed
+        // task_t once this task exits with the fd kept open by a sibling/fork
+        // (a write into a reallocated task slab -> scheduler corruption).  Clear
+        // only OUR own entry (== g_current) so a second reader thread that
+        // overwrote c->reader is left intact.
         flags = spin_lock_irqsave(&d->lock);
+        if (c->reader == g_current) c->reader = NULL;
+        if (signal_has_actionable(&g_current->sigstate)) {
+            spin_unlock_irqrestore(&d->lock, flags);
+            return -EINTR;
+        }
     }
 
     input_event_t* out = (input_event_t*)buf;
