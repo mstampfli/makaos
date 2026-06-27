@@ -2967,8 +2967,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   This was the strongest finding across SCANs #14-16 (the only remote memory-disclosure). The RX path already used
   masked per-byte indexing (clean); only the two TX reads linearized.
   STILL-OPEN (carried from SCAN #16, ignored-error-return MED/LOW residuals -- opportunistic cleanup): hda.c:206
-  verb_send poll-timeout returns stale RIRB data as a valid response (needs a return-type change to signal timeout;
-  init-only, no audio); sys_readlink (syscall.c:5517) + sys_times (5663) dropped copy_to_user -> returned success on a
+  verb_send poll-timeout returned stale RIRB data as a valid response -- RESOLVED (F152): verb_send now takes an
+  int* timed_out, signals a timeout instead of falling through to the stale s_rirb[exp] slot (and no longer advances
+  the read pointer on timeout), and codec_configure skips/aborts the FG/widget on the flag rather than ingesting a
+  phantom topology; sys_readlink (syscall.c:5517) + sys_times (5663) dropped copy_to_user -> returned success on a
   faulted user buffer -- RESOLVED (F151): both now return -EFAULT when copy_to_user fails, mirroring the file's
   canonical idiom (sys_getrusage/sys_gettimeofday); vmm.c:160 vmm_map_mmio ignores vmm_page_map
   (kernel BAR mapper, boot-only LOW).

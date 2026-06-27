@@ -192,25 +192,43 @@ static inline void sd_w32(uint32_t r,uint32_t v){ w32(s_sd_base+r,v); }
 
 // ── CORB/RIRB verb interface ──────────────────────────────────────────────
 
-static uint32_t verb_send(uint32_t verb) {
+// Issue one codec verb and return its 32-bit RIRB response.  Polls the RIRB
+// write pointer for the codec's reply; on TIMEOUT (no reply within the poll
+// window) it sets *timed_out (if non-NULL) and returns 0 WITHOUT consuming a
+// RIRB slot.  Callers that read a value (get_param) MUST check the flag and
+// reject the read -- the old code fell through and returned s_rirb[exp], the
+// STALE slot for this verb (zero-init before the first response, otherwise a
+// previous response's leftover), so a slow/absent codec fabricated a phantom
+// widget topology (node count / func type / caps) during enumeration.  On
+// timeout the read pointer is left UNADVANCED (the codec wrote nothing) so the
+// ring stays consistent for a later verb; the old unconditional `s_rirb_rp =
+// exp` desynced the ring by one slot on every timeout.  timed_out may be NULL
+// for SET verbs whose response carries no value (best-effort config writes).
+static uint32_t verb_send(uint32_t verb, int* timed_out) {
     uint16_t wp = (uint16_t)((r16(HDA_CORBWP) + 1u) & (RING_SZ - 1u));
     s_corb[wp] = verb;
     __asm__ volatile("mfence" ::: "memory");
     w16(HDA_CORBWP, wp);
 
     uint16_t exp = (uint16_t)((s_rirb_rp + 1u) & (RING_SZ - 1u));
+    int got = 0;
     for (int i = 0; i < 500000; i++) {
         __asm__ volatile("lfence" ::: "memory");
-        if (r16(HDA_RIRBWP) == exp) break;
+        if (r16(HDA_RIRBWP) == exp) { got = 1; break; }
     }
+    if (!got) {
+        if (timed_out) *timed_out = 1;
+        return 0;
+    }
+    if (timed_out) *timed_out = 0;
     uint64_t resp = s_rirb[exp];
     s_rirb_rp = exp;
     w8(HDA_RIRBSTS, RIRBSTS_RINTFL);
     return (uint32_t)(resp & 0xFFFFFFFFu);
 }
 
-static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par) {
-    return verb_send(VERB12(cad, nid, V_GET_PARAM, par));
+static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par, int* timed_out) {
+    return verb_send(VERB12(cad, nid, V_GET_PARAM, par), timed_out);
 }
 
 // PRIMITIVE (hda node-id scan bound).  HDA node ids (function groups, widgets)
@@ -234,7 +252,9 @@ static inline uint32_t hda_node_scan_end(uint8_t start, uint8_t count) {
 // 48 kHz / 16-bit / stereo output on stream tag 1.
 
 static int codec_configure(uint8_t cad) {
-    uint32_t nc      = get_param(cad, 0, PAR_NODE_COUNT);
+    int to = 0;
+    uint32_t nc      = get_param(cad, 0, PAR_NODE_COUNT, &to);
+    if (to) return 0;                       // root NODE_COUNT unreadable: cannot configure
     uint8_t fg_start = (uint8_t)((nc >> 16) & 0xFFu);
     uint8_t fg_count = (uint8_t)(nc & 0xFFu);
 
@@ -243,34 +263,42 @@ static int codec_configure(uint8_t cad) {
     // the iteration inside the valid 0..255 nid space, so fgn/wn never truncate).
     for (uint32_t fg = fg_start; fg < hda_node_scan_end(fg_start, fg_count); fg++) {
         uint8_t fgn = (uint8_t)fg;
-        if ((get_param(cad, fgn, PAR_FUNC_TYPE) & 0xFFu) != 0x01u) continue;
+        // Skip this function group on a verb timeout (stale FUNC_TYPE would mis-
+        // classify it) as well as on a non-audio type.
+        uint32_t ft = get_param(cad, fgn, PAR_FUNC_TYPE, &to);
+        if (to || (ft & 0xFFu) != 0x01u) continue;
 
-        uint32_t wc      = get_param(cad, fgn, PAR_NODE_COUNT);
+        uint32_t wc      = get_param(cad, fgn, PAR_NODE_COUNT, &to);
+        if (to) continue;                   // widget count unreadable: skip this FG
         uint8_t w_start  = (uint8_t)((wc >> 16) & 0xFFu);
         uint8_t w_count  = (uint8_t)(wc & 0xFFu);
 
         uint8_t dac = 0, pin = 0;
         for (uint32_t w = w_start; w < hda_node_scan_end(w_start, w_count); w++) {
             uint8_t   wn   = (uint8_t)w;
-            uint32_t cap   = get_param(cad, wn, PAR_WIDGET_CAP);
+            uint32_t cap   = get_param(cad, wn, PAR_WIDGET_CAP, &to);
+            if (to) continue;               // widget caps unreadable: skip this widget
             uint8_t  wtype = (uint8_t)((cap >> 20) & 0xFu);
             if (!dac && wtype == WTYPE_AUDIO_OUT) {
                 dac = wn;
             } else if (!pin && wtype == WTYPE_PIN) {
-                if (get_param(cad, wn, PAR_PIN_CAP) & (1u << 4))
+                uint32_t pc = get_param(cad, wn, PAR_PIN_CAP, &to);
+                if (!to && (pc & (1u << 4)))
                     pin = wn;
             }
         }
         if (!dac || !pin) continue;
 
-        verb_send(VERB12(cad, dac, V_SET_POWER, 0));
-        verb_send(VERB12(cad, pin, V_SET_POWER, 0));
-        verb_send(VERB4(cad, dac, V4_SET_FMT, FMT_48K_16BIT_STEREO));
-        verb_send(VERB12(cad, dac, V_SET_STRM, (1u << 4) | 0u));  // tag=1, ch=0
-        verb_send(VERB4(cad, dac, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE));
-        verb_send(VERB12(cad, pin, V_SET_CONN_SEL, 0));
-        verb_send(VERB12(cad, pin, V_SET_PIN_CTL, PIN_OUT_EN | PIN_HP_EN));
-        verb_send(VERB4(cad, pin, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE));
+        // SET verbs carry no response value, so a timeout is best-effort: pass
+        // NULL rather than treating the (empty) reply as data.
+        verb_send(VERB12(cad, dac, V_SET_POWER, 0), 0);
+        verb_send(VERB12(cad, pin, V_SET_POWER, 0), 0);
+        verb_send(VERB4(cad, dac, V4_SET_FMT, FMT_48K_16BIT_STEREO), 0);
+        verb_send(VERB12(cad, dac, V_SET_STRM, (1u << 4) | 0u), 0);  // tag=1, ch=0
+        verb_send(VERB4(cad, dac, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE), 0);
+        verb_send(VERB12(cad, pin, V_SET_CONN_SEL, 0), 0);
+        verb_send(VERB12(cad, pin, V_SET_PIN_CTL, PIN_OUT_EN | PIN_HP_EN), 0);
+        verb_send(VERB4(cad, pin, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE), 0);
         return 1;
     }
     return 0;
