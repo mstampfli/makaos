@@ -2992,3 +2992,35 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   METHOD NOTE: SCAN #17 was opened by promoting the strongest already-identified OOB finding rather than a fresh
   6-agent sweep; a full OOB/over-read sweep (every memcpy/array-index/ring-read against an untrusted or wrapping
   bound) is the natural next step if more are wanted -- the prior SCANs already audited most memcpy/index sites clean.
+
+- 2026-06-27 BUG-TYPE SCAN #18 (MEMORY-SAFETY: DOUBLE-FETCH / TOCTOU on user-controlled memory), opened and SWEPT
+  CLEAN for its named class; the sweep SURFACED one out-of-class bug, fixed as F154. CLASS: the kernel reads a user
+  value (copy_from_user / raw deref after a check), validates it, then re-reads the SAME user location and uses the
+  second (unvalidated) read to drive a length/index/offset/pointer -- a concurrent thread (shared mm) flips it between
+  the two reads (arbitrary kernel R/W LPE). METHOD: 3 parallel read-only sweeps (syscall.c; net+ipc; fs+drm/KMS) plus
+  a direct read of io_uring's SQE dispatch, the strongest candidate. RESULT -- NO double-fetch anywhere: the kernel is
+  consistently single-fetch and has been EXPLICITLY hardened for this class. The user-mapped io_uring SQE ring (the
+  classic double-fetch site) snapshots each SQE ONCE into a kernel local before any field read (io_uring.c:961
+  `io_sqe_t snap = *sqe; sqe = &snap;` + the async w->sqe copy at 921); SQ indices mask with the kernel-trusted
+  sq_entries-1, never the user ring_mask; futex does the correct Linux-style copy_from_user-into-local re-read compared
+  to a register arg; sendmsg/recvmsg copy msghdr/cmsg/iovec each once into kernel locals (per-iteration copies are of
+  DISTINCT addresses, the safe pattern); the DRM atomic-commit parser (drm_ioctl_atomic, drm.c:1007, the multi-level
+  user-array parser flagged as the strongest lead) copies the drm_mode_atomic_t once into kernel `a`, bounds count_objs
+  <= DRM_MAX_SCANOUTS, and reads every count/ptr from the kernel copy; poll/select/epoll/setsockopt/getgroups all
+  copy-once. So the double-fetch class is MINED OUT (the copy_from_user/copy_path_from_user primitives are the
+  established single-source-of-truth idiom).
+  OUT-OF-CLASS LEAD FIXED (F154, the raw unvalidated user-deref class -- a residual the earlier unvalidated-input sweep
+  missed): sys_unveil (syscall.c:4311) copied the user path with a RAW byte loop `for i: path[i] = upath[i]` over the
+  user pointer path_ptr with NO _access_ok / copy_from_user -- the lone deviation from the file's otherwise-uniform
+  copy_from_user discipline. An unmapped/kernel/non-canonical path_ptr takes an unrecoverable kernel #PF (panic =
+  unprivileged DoS, unveil is an ordinary syscall any process calls), and a kernel-half path_ptr reads KERNEL memory
+  into the unveil entry (info-exposure). Fixed (F154) with copy_from_user (range-check + prefault) -> -EFAULT, the
+  exact class+fix that copy_path_from_user already exists for; see AUTOFIX_LOG F154.
+  LOW note (not fixed, recorded): sys_read (syscall.c:~310) validates its buf with user_buf_prefault directly rather
+  than user_buf_check/_access_ok -- still defended (a kernel/non-canonical buf has no user VMA so prefault returns -1,
+  and prefault rejects addr+len wrap), so NOT exploitable; a uniformity tightening, not a bug. ALSO still open: the
+  F153 MSI-X-table-mapper NULL-deref follow-up (nvme/ahci/virtio_net, LOW, needs per-driver legacy-INTx fallback).
+  METHOD NOTE: SCAN #18 was a from-scratch 3-agent parallel sweep of the user/kernel boundary; with the double-fetch,
+  integer-overflow (#14), error-path-leak (#15), ignored-return (#16), and OOB/over-read (#17) classes now all swept,
+  the high-value memory-safety space across the syscall/net/io_uring/fs/drm surface is substantially mined out; the
+  remaining recorded items are LOW (MSI-X fallback, sys_read uniformity).

@@ -4312,9 +4312,14 @@ static uint64_t sys_unveil(uint64_t path_ptr, uint64_t pathlen, uint64_t perms) 
     if (!g_current) return (uint64_t)-EINVAL;
     if (pathlen == 0 || pathlen >= UNVEIL_PATH_MAX) return (uint64_t)-EINVAL;
     char path[UNVEIL_PATH_MAX];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i;
-    for (i = 0; i < pathlen; i++) path[i] = upath[i];
+    // Read the path through copy_from_user (range-check + prefault), never a raw
+    // deref of path_ptr: the old `path[i] = upath[i]` loop took an unrecoverable
+    // kernel #PF (panic = unprivileged DoS) on an unmapped/kernel/non-canonical
+    // path_ptr, and copied KERNEL memory into path for a kernel-half pointer
+    // (info-exposure into the unveil entry).  pathlen is already bounded to
+    // [1, UNVEIL_PATH_MAX), so the copy and the NUL terminator stay in bounds.
+    if (copy_from_user(path, (const void*)path_ptr, pathlen) != 0)
+        return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
     int r = unveil_add(&g_current->unveil, path, (uint8_t)perms);
     if (r != 0) return (uint64_t)(int64_t)r;
