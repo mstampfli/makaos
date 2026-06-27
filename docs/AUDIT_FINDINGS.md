@@ -3018,8 +3018,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   exact class+fix that copy_path_from_user already exists for; see AUTOFIX_LOG F154.
   LOW note (not fixed, recorded): sys_read (syscall.c:~310) validates its buf with user_buf_prefault directly rather
   than user_buf_check/_access_ok -- still defended (a kernel/non-canonical buf has no user VMA so prefault returns -1,
-  and prefault rejects addr+len wrap), so NOT exploitable; a uniformity tightening, not a bug. ALSO still open: the
-  F153 MSI-X-table-mapper NULL-deref follow-up (nvme/ahci/virtio_net, LOW, needs per-driver legacy-INTx fallback).
+  and prefault rejects addr+len wrap), so NOT exploitable; a uniformity tightening, not a bug. The F153
+  MSI-X-table-mapper NULL-deref follow-up (nvme/ahci/virtio_net) is RESOLVED (F155): each now guards the table write
+  per its own IRQ model -- nvme returns 0 (MSI-X required, no INTx fallback), ahci skips MSI-X so its MSI/INTx fallback
+  arms instead, virtio_net fails init (no working wired INTx path); see AUTOFIX_LOG F155.
   METHOD NOTE: SCAN #18 was a from-scratch 3-agent parallel sweep of the user/kernel boundary; with the double-fetch,
   integer-overflow (#14), error-path-leak (#15), ignored-return (#16), and OOB/over-read (#17) classes now all swept,
   the high-value memory-safety space across the syscall/net/io_uring/fs/drm surface is substantially mined out; the

@@ -1111,24 +1111,29 @@ uint8_t ahci_init(void) {
                     s_msix_entry = (volatile uint32_t*)
                                    vmm_map_mmio(bar_phys + tbl_off, 16u);
 
-                    // Fixed delivery to BSP LAPIC — works in both xAPIC and
-                    // x2APIC modes.  Lowest-priority (mode 001) is NOT
-                    // supported in x2APIC and silently drops the interrupt.
-                    uint32_t msi_addr = (uint32_t)lapic_msi_addr();
-                    uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
+                    // A failed table map (NULL) must not be programmed: leave
+                    // irq_armed = 0 so the MSI (then INTx) fallback below arms
+                    // the device, rather than NULL-deref s_msix_entry.
+                    if (s_msix_entry) {
+                        // Fixed delivery to BSP LAPIC -- works in both xAPIC and
+                        // x2APIC modes.  Lowest-priority (mode 001) is NOT
+                        // supported in x2APIC and silently drops the interrupt.
+                        uint32_t msi_addr = (uint32_t)lapic_msi_addr();
+                        uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
 
-                    s_msix_entry[0] = msi_addr;   // addr_lo
-                    s_msix_entry[1] = 0;           // addr_hi
-                    s_msix_entry[2] = msi_data;    // data
-                    s_msix_entry[3] = 0;           // vector_ctrl: bit0=0 → unmasked
+                        s_msix_entry[0] = msi_addr;   // addr_lo
+                        s_msix_entry[1] = 0;           // addr_hi
+                        s_msix_entry[2] = msi_data;    // data
+                        s_msix_entry[3] = 0;           // vector_ctrl: bit0=0 -> unmasked
 
-                    // Enable MSI-X in message control (bit 31).
-                    // Also clear Function Mask (bit 30) so vectors fire.
-                    uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
-                    mc = (mc | (1u << 31)) & ~(1u << 30);
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
+                        // Enable MSI-X in message control (bit 31).
+                        // Also clear Function Mask (bit 30) so vectors fire.
+                        uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
+                        mc = (mc | (1u << 31)) & ~(1u << 30);
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
 
-                    irq_armed = 1;
+                        irq_armed = 1;
+                    }
                 }
             }
 

@@ -638,6 +638,14 @@ static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
     map_bytes = (map_bytes + 0xFFFu) & ~0xFFFu;
     s_msix_table = (volatile uint32_t*)
                    vmm_map_mmio(bar_phys + tbl_off, map_bytes);
+    if (!s_msix_table) {
+        // MSI-X is required here (each per-CPU I/O queue uses its own vector;
+        // this driver has no INTx fallback), so a failed table map fails enable
+        // -- consistent with the !bar_phys guard above -- rather than NULL-deref
+        // the programming loop below.
+        kprintf("[nvme] MSI-X table map failed\n");
+        return 0;
+    }
 
     // Program one entry per CPU we actually want to service.
     for (uint32_t cpu = 0; cpu < nr_wanted; cpu++) {

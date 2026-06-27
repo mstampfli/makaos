@@ -726,6 +726,16 @@ int virtio_net_init(void) {
                                               (uint8_t)bir);
             volatile uint32_t* msix_table = (volatile uint32_t*)
                 vmm_map_mmio(bar_phys + tbl_off, 0x1000u);
+            if (!msix_table) {
+                // No working legacy-INTx path is wired for this NIC (modern
+                // QEMU exposes only MSI-X), so a failed table map means no IRQ
+                // can ever be delivered -- fail init (s_ok stays 0, the NIC is
+                // treated as absent) rather than NULL-deref the writes below or
+                // silently run an IRQ-less NIC whose RX would stall.
+                extern void kprintf(const char*, ...);
+                kprintf("[virtio-net] MSI-X table map failed; no IRQ\n");
+                return 0;
+            }
 
             uint32_t msi_addr = (uint32_t)lapic_msi_addr();
             uint32_t msi_data = lapic_msi_data(VEC_VIRTIO_NET);
