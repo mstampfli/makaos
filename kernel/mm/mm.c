@@ -317,17 +317,32 @@ mm_t* mm_clone(const mm_t* src) {
         snap[i].start       = v->start;
         snap[i].end         = v->end;
         snap[i].flags       = v->flags;
-        snap[i].shmem       = v->shmem;
         snap[i].shmem_pgoff = v->shmem_pgoff;
-        snap[i].file        = v->file;
         snap[i].file_off    = v->file_off;
         snap[i].file_len    = v->file_len;
+        // PIN the backing objects HERE, under the SAME rcu_read_lock that keeps
+        // the src VMA alive, via tryget -- NOT a raw pointer snapshot followed by
+        // a shmem_ref/vfs_dup in a later, separate rcu section.  A concurrent
+        // sibling munmap of this VMA defers its free (vma_free_rcu ->
+        // shmem_unref/vfs_close); a raw snapshot then ref'd AFTER rcu_read_unlock
+        // could increment the refcount of an already-freed object.  tryget bumps
+        // the ref while the object is still live (mirrors the fault path /
+        // vmm_clone_user_ex), and fails (->NULL) cleanly if it is mid-teardown.
+        snap[i].shmem = (v->shmem && shmem_tryget(v->shmem)) ? v->shmem : NULL;
+        snap[i].file  = v->file ? vfs_tryget(v->file) : NULL;
     }
     rcu_read_unlock();
     uint32_t cnt = i;
 
     for (uint32_t k = 0; k < cnt; k++) {
         if (!mm_vma_add(dst, snap[k].start, snap[k].end, snap[k].flags)) {
+            // OOM: snap[0..k-1] were handed to dst VMAs (mm_destroy releases
+            // their refs); snap[k..cnt-1] are still pinned only by snap -- drop
+            // those refs here so the tryget'd backing objects are not leaked.
+            for (uint32_t j = k; j < cnt; j++) {
+                if (snap[j].shmem) shmem_unref(snap[j].shmem);
+                if (snap[j].file)  vfs_close(snap[j].file);
+            }
             kfree(snap);
             mm_destroy(dst);
             return NULL;
@@ -336,16 +351,18 @@ mm_t* mm_clone(const mm_t* src) {
             rcu_read_lock();
             vma_t* dv = mm_vma_find(dst, snap[k].start);
             if (dv) {
-                if (snap[k].shmem) {
-                    dv->shmem       = snap[k].shmem;
-                    dv->shmem_pgoff = snap[k].shmem_pgoff;
-                    shmem_ref(snap[k].shmem);
-                }
-                if (snap[k].file) {
-                    dv->file     = vfs_dup(snap[k].file);
-                    dv->file_off = snap[k].file_off;
-                    dv->file_len = snap[k].file_len;
-                }
+                // The ref was already taken by tryget in the snapshot above;
+                // hand it to the dst VMA (mm_destroy will release it).
+                dv->shmem       = snap[k].shmem;
+                dv->shmem_pgoff = snap[k].shmem_pgoff;
+                dv->file        = snap[k].file;
+                dv->file_off    = snap[k].file_off;
+                dv->file_len    = snap[k].file_len;
+            } else {
+                // Should not happen (we just added this VMA); release the pinned
+                // refs rather than leak them.
+                if (snap[k].shmem) shmem_unref(snap[k].shmem);
+                if (snap[k].file)  vfs_close(snap[k].file);
             }
             rcu_read_unlock();
         }

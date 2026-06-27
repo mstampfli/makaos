@@ -2713,8 +2713,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       section (no shmem_tryget/vfs_tryget) -> a fork racing a sibling munmap of the same VMA could ref a freed
       shmem/file; latent behind the ~10 ms async vma-free latency (goes live if vma free is made expedited, which a
       mm.c comment already intends). FIX: tryget inside the snapshot rcu section (like the fault path / vmm_clone).
+      *** FIXED F134 (2026-06-27): the snapshot loop now takes the ref via shmem_tryget/vfs_tryget INSIDE the snapshot
+      rcu section (object pinned while the src VMA that holds it alive is rcu-protected) and the apply loop hands the
+      already-pinned pointer to the dst VMA (no second ref); OOM/dv==NULL paths release the still-snap-pinned refs.
+      Built clean, boot-verified (82 PASSED, DHCP, 0 faults).
     (LOW/latent) signal_setup_frame (signal.c:246-247) calls mm_vma_find WITHOUT rcu_read_lock -- the only such
       caller (all vmm.c callers wrap it); a freed-VMA read mid-walk if a sibling munmaps. FIX: wrap in rcu_read_lock.
+      *** FIXED F133 (rcu_read_lock around both mm_vma_find calls; SIGKILL if the frame is not covered).
     (LOW/dead) pcache_evict_inode lock-order inversion vs pcache_evict_one -> double-free; but pcache_evict_inode has
       ZERO callers (declared, never wired) -> unreachable until someone adds a caller.
     (FLAGGED, needs RUNTIME confirmation -- potentially HIGH) do_switch sets c->switching_from = prev (sched.c:1435)
@@ -2730,9 +2735,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     sched lists save-next; zombies rq_lock-pinned; task_free_rcu orders disown-before-free; futnext captured before
     the RELEASE store; fault path trygets under rcu). The subsystems are overwhelmingly lifetime-correct.
   SCAN #12 STATUS: the two HIGH UAFs FIXED -- evdev dangling-task (F130), dcache_invalidate (F131) -- and the MED
-    socket_bind pcb UAF FIXED (F132, rebind-in-place + a non-CLOSED guard). Remaining UAF residuals: LOW/latent
-    mm_clone tryget + signal_setup_frame rcu_read_lock, and the FLAGGED do_switch switching_from (needs a runtime
-    poison-on-free check). SCAN #12 essentially complete.
+    socket_bind pcb UAF FIXED (F132, rebind-in-place + a non-CLOSED guard). The two LOW/latent residuals are now also
+    FIXED: mm_clone tryget (F134) and signal_setup_frame rcu_read_lock (F133). Remaining: ONLY the FLAGGED do_switch
+    switching_from (needs a runtime poison-on-free check, do NOT guess). SCAN #12 complete bar that one runtime check.
   *** NEW HIGH-PRIORITY LEAD found WHILE verifying F132 (a flaky boot HANG): ext2_perm_op_selftest (the F129
     create/unlink/mkdir/rename test) HUNG 2 of 3 SELFTESTS=1 boots -- it runs in init_kthread CONCURRENTLY with
     userland fs access (svcmgr reading /etc/services, net.svc) + the shrinker/pcache reclaim kthreads, so the likely
@@ -2761,22 +2766,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     read_inode (RIP 0xffffffff8001b056 = read_inode+150 = an inlined cpu_relax). That is a SEQLOCK READER retry: a
     read_inode is spinning because the ext2 per-inode SEQLOCK is held with the sequence ODD (a writer active), and the
     writer is NOT on any CPU (all others idle).
-  ROOT CAUSE: the ext2 per-inode seqlock WRITE side (inode_lock -> seq_write_begin, a plain non-preempt-disabling
-    spin_lock) is HELD ACROSS A BLOCKING SLEEP -- the dir-mutation paths (dir_add_entry/dir_remove_entry/
-    dir_set_dotdot/inode_writeback) do read_block/write_block = bcache_fill -> ahci_read/ahci_write -> slot_wait
-    (sched_sleep) WHILE holding inode_lock. When the AHCI completion is slow or its IRQ is occasionally lost (the
-    flaky trigger -- slot_wait's rescan-on-wake CANNOT recover a lost IRQ if NO wake ever arrives), the writer sleeps
-    indefinitely holding the seqlock (sequence stuck ODD), and EVERY concurrent reader of that inode (here a userland
-    fs read racing the selftest's create/unlink/rename) spins FOREVER in the seqlock reader retry -> total fs freeze.
-    Sleeping while holding a spinlock-class lock is the core defect; the lost AHCI completion is the trigger that
-    turns "slow" into "forever".
-  FIX (DEDICATED next turn -- substantial): the correct fix is to NOT hold the inode seqlock write side across the
-    blocking I/O -- restructure the dir/writeback paths so the bcache read/write (the AHCI sleep) happens OUTSIDE the
-    seqlock (do the I/O into a buffer, then take the seqlock only to publish), mirroring how inode_lock's own
-    inode_load_into already does the bcache I/O BEFORE seq_write_begin (ext2.c:576<580). AND/OR make slot_wait
-    recover a lost AHCI completion without needing a wake (a bounded timeout that triggers ahci_rescan_completions, so
-    a dropped IRQ self-heals). The first removes the cascade (readers never spin on an I/O-blocked writer); the second
-    removes the trigger. Prefer doing BOTH; at minimum the seqlock-across-I/O fix (it is the unprivileged-reachable
-    DoS: any concurrent reader+writer of one inode hangs the FS if an I/O stalls). NOTE: this only manifests under
-    SELFTESTS=1 (ext2_perm_op runs fs mutations concurrently with userland) -- the shipping disk runs no selftests --
-    but the seqlock-across-blocking-I/O is a REAL latent fs-wide deadlock for any concurrent inode contention.
+  ROOT CAUSE (REVISED 2026-06-27 -- the first cut below was INCOMPLETE/WRONG and is corrected): the ext2 per-inode
+    seqlock WRITE side (inode_lock -> seq_write_begin, a plain non-preempt-disabling spin_lock) IS held across a
+    blocking sleep -- the dir-mutation paths (dir_add_entry/dir_remove_entry/dir_set_dotdot/inode_writeback) do
+    read_block/write_block = bcache_fill -> ahci_read/ahci_write -> slot_wait (sched_sleep) WHILE holding inode_lock,
+    and that IS a real latent priority-inversion / fs-wide-contention defect (a concurrent reader of that inode spins
+    in the seqlock reader retry for the duration of the writer's I/O). BUT the captured 280 s FREEZE is NOT explained
+    by a "lost AHCI completion that never wakes": re-reading the completion path disproves it -- sched_tick
+    (kernel/proc/sched.c:1188) calls ahci_poll_completions() UNCONDITIONALLY every tick (~1000x/s/CPU), which calls
+    ahci_rescan_completions() (ahci.c:552-594), which BOTH sets s_slot_done[slot] AND wait_queue_wake_all(
+    s_slot_wq[slot]) (ahci.c:588-589). So a dropped MSI is recovered and the sleeping submitter is woken within ~1 ms
+    REGARDLESS of whether the IRQ fired -- the I/O always completes, the seqlock is always released, and a
+    reader-spins-on-an-I/O-blocked-writer window is bounded by one disk I/O (ms), not 280 s. The lost-completion theory
+    is therefore RETRACTED.
+  STILL-OPEN ROOT (needs a dedicated dynamic-capture turn): the one live QMP capture showed only the SPINNING side --
+    CPU#3 in read_inode's seqlock reader retry (RIP -> read_inode+150, inlined cpu_relax), the other 3 CPUs idle. The
+    ASLEEP seqlock WRITER (whose held odd-sequence the reader is waiting on) and WHAT it is blocked on were NOT
+    captured, so the actual wedge (a genuine lost wakeup elsewhere? a writer parked on a different wait with the
+    seqlock held? a missed s_slot_wq publish race? a non-AHCI sleep under inode_lock?) is unproven. Do NOT land an
+    invasive seqlock-across-I/O refactor as "the deadlock fix" until the asleep writer's stack proves it is the cause
+    -- the refactor is justified on its own latent-inversion merits, but mis-attributing the freeze to it would leave
+    the real wedge live. NEXT TURN (dedicated): reproduce + capture the ASLEEP writer -- walk the task list / read each
+    task's saved RIP+RSP via QMP memory reads, or temporarily enable a SCHED_TICK_HEARTBEAT / lock-hold watchdog to
+    distinguish "writer still running I/O" from "writer parked with seqlock held", and resolve every task's RIP with
+    addr2line. Only then target the fix (decouple the seqlock from the I/O AND/OR fix whatever wakeup is actually
+    lost). NOTE: manifests only under SELFTESTS=1 (ext2_perm_op runs fs mutations concurrently with userland) -- the
+    shipping disk runs no selftests -- and is FLAKY (~1 in 3 boots), consistent with a narrow race, not the
+    deterministic lost-IRQ the first cut assumed.
+  (SUPERSEDED first cut, kept for the record): "the writer sleeps indefinitely holding the seqlock because slot_wait
+    cannot recover a lost IRQ if no wake arrives" -- FALSE, the per-tick ahci_poll_completions self-heal supplies the
+    wake; see the REVISED root above.
