@@ -2933,11 +2933,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       swap on `&& dir_set_dotdot(...)` so counts stay consistent with the (un-repointed) "..". Code-proof + boot
       ([fs_permop] rename + [ext2_dotdot] PASSED, 0 faults). Residual (separate lock-scan item): unlink-vs-rename do
       not mutually exclude (different locks) -- the rollback makes rename atomic w.r.t. its own ops.
-    (MED, mm display) vmm.c:191 vmm_map_physical_user (SYS_FB_MAP) ignores vmm_page_map -> on OOM a FB hole faults to a
-      zeroed anon frame (silent display corruption, writes never reach the device); vmm.c:160 vmm_map_mmio same, boot-
-      only LOW. (MED, elf) elf.c:261 ignores vmm_page_map in the eager PT_LOAD copy -> on OOM a segment silently loads
-      as a zero page (corrupt image run as valid) + frame leak; elf.c:308 ignores the stack-VMA mm_vma_add -> reports
-      success with no stack VMA. (MED, drivers) hda.c:206 verb_send poll-timeout returns stale RIRB data as a valid
+    *** FIXED F148 (2026-06-27): vmm.c:191 vmm_map_physical_user (FB map) ignored vmm_page_map -> a holey mapping
+      reported as success faulted a zeroed anon frame over the device buffer; elf.c:261 eager PT_LOAD ignored
+      vmm_page_map -> segment silently loaded as zeros (corrupt image) + frame leak; elf.c:289 AT_PHDR set out_phdr
+      even on a failed map; elf.c:308 ignored the stack mm_vma_add -> no-stack-VMA process reported as success. All now
+      check the return, free the leaf frame / unmap the partial PTEs + drop the VMA, and FAIL. Code-proof + boot (FB
+      came up, all userspace binaries ELF-loaded + ran, DHCP, 0 faults). RESIDUAL (LOW, boot-only): vmm.c:160
+      vmm_map_mmio (kernel BAR mapper) has the same ignored vmm_page_map -> a hole faults to a zeroed VMM_KDATA frame
+      over the BAR; boot-time device init when RAM is plentiful, essentially unreachable -- a future cleanup.
+    (MED, drivers) hda.c:206 verb_send poll-timeout returns stale RIRB data as a valid
       response -> codec mis-config / no audio (init-only). (MED, syscall) sys_readlink (syscall.c:5517) and sys_times
       (5663) drop copy_to_user -> return success on a faulted user buffer (caller reads garbage; no kernel leak/crash).
     (out-of-class, flagged for honesty) tcp.c:874/643 tx-ring linear read straddling the 64 KiB wrap point -> heap

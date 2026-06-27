@@ -258,7 +258,19 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                         __builtin_memcpy(fptr + frame_off, data + file_off, nbytes);
                     }
                 }
-                vmm_page_map(pml4, page, frame, pte_flags);
+                if (!vmm_page_map(pml4, page, frame, pte_flags)) {
+                    // OOM on an intermediate PT page: this frame is NOT mapped,
+                    // so vmm_free_user won't reclaim it (free it here) and the
+                    // segment page would demand-fault a fresh ZERO page -- the
+                    // code/data we just copied would silently load as zeros (a
+                    // corrupt image run as valid).  Free the frame + the rest of
+                    // the half-built image and fail, like the alloc-fail path.
+                    pmm_buddy_free(frame, 0);
+                    mm_destroy(mm);
+                    vmm_free_user(pml4);
+                    pmm_buddy_free(pml4, 0);
+                    return 0;
+                }
             }
         }
 
@@ -285,9 +297,14 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
                 __builtin_memset(fptr, 0, PAGE_SIZE);
                 __builtin_memcpy(fptr, data, hdr_bytes);
-                if (mm_vma_add(mm, hpage, hpage + PAGE_SIZE, VMA_R | VMA_ANON)) {
+                // Only point AT_PHDR at the page if BOTH the VMA add and the
+                // map succeed -- a failed map (PT-page OOM) would otherwise set
+                // AT_PHDR to an unmapped page that demand-faults to zeros, the
+                // exact zero-phdr -> broken-TLS hazard this safety net exists to
+                // avoid.  On either failure free the frame and leave AT_PHDR 0.
+                if (mm_vma_add(mm, hpage, hpage + PAGE_SIZE, VMA_R | VMA_ANON) &&
                     vmm_page_map(pml4, hpage, frame,
-                                 mm_vma_pte_flags(VMA_R | VMA_ANON));
+                                 mm_vma_pte_flags(VMA_R | VMA_ANON))) {
                     *out_phdr_vaddr = hpage + ehdr->e_phoff;
                 } else {
                     pmm_buddy_free(frame, 0);
@@ -305,7 +322,14 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     // Stack VMA (demand-paged).
     virt_addr_t stack_end   = VMM_USER_STACK_TOP;
     virt_addr_t stack_start = stack_end - VMM_USER_STACK_PAGES * PAGE_SIZE;
-    mm_vma_add(mm, stack_start, stack_end, VMA_R | VMA_W | VMA_ANON);
+    if (!mm_vma_add(mm, stack_start, stack_end, VMA_R | VMA_W | VMA_ANON)) {
+        // No stack VMA -> the first user stack access would fault with no
+        // covering VMA (SIGSEGV) while we report success.  Fail the load.
+        mm_destroy(mm);
+        vmm_free_user(pml4);
+        pmm_buddy_free(pml4, 0);
+        return 0;
+    }
 
     *out_pml4  = pml4;
     *out_mm    = mm;

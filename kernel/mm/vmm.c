@@ -189,10 +189,23 @@ virt_addr_t vmm_map_physical_user(mm_t* mm, phys_addr_t pml4_phys,
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_PWT | PAGE_NX;
     uint64_t npages = len / PAGE_SIZE;
     for (uint64_t i = 0; i < npages; i++) {
-        vmm_page_map(pml4_phys,
-                     vaddr + i * PAGE_SIZE,
-                     phys  + i * PAGE_SIZE,
-                     flags);
+        if (!vmm_page_map(pml4_phys,
+                          vaddr + i * PAGE_SIZE,
+                          phys  + i * PAGE_SIZE,
+                          flags)) {
+            // OOM allocating an intermediate PT page: a hole here would be
+            // reported as a mapped range, and a later user access to the hole
+            // demand-faults a ZEROED anon frame over the device buffer (silent
+            // display/DMA corruption).  Unmap the [0..i) pages already mapped
+            // (device phys, not owned here -- just clear the PTEs), drop the
+            // VMA, and fail.  The user never receives vaddr, so no TLB shootdown
+            // is needed (the pages were never accessed).
+            phys_addr_t old;
+            for (uint64_t j = 0; j < i; j++)
+                vmm_page_unmap(pml4_phys, vaddr + j * PAGE_SIZE, &old);
+            mm_vma_remove(mm, vaddr, vaddr + len);
+            return 0;
+        }
     }
     return vaddr;
 }
