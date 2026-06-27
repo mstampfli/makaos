@@ -412,10 +412,14 @@ static void bcache_put(bcache_ref_t* r) {
 //     consistent read; on a rare collision they redo the memcpy.
 //     They NEVER block on a writer — that's the entire point of using
 //     a seqlock here over a spinlock.
-//   - Writers use inode_lock / inode_unlock which call seq_write_begin
-//     / seq_write_end on the leaf.  Two CPUs writing different inodes
-//     never contend.  Two CPUs writing the SAME inode serialise on the
-//     leaf's internal write_lock for tens of nanoseconds.
+//   - Writers use inode_lock / inode_unlock.  inode_lock takes ONLY the
+//     leaf's internal write_lock (serialising writers of the same inode);
+//     it does NOT bump the sequence odd, so it may be held across blocking
+//     disk I/O without making readers spin.  The sequence is bumped odd
+//     only by inode_pub_begin / inode_pub_end around the brief in-memory
+//     publish of leaf->inode (SCAN #13: holding the sequence odd across
+//     I/O deadlocked a preempt-disabled irtree_get reader against the
+//     sleeping writer).  Two CPUs writing different inodes never contend.
 //   - The L0 / L1 pointer slots are publish-once stores; lookup is a
 //     plain acquire-load with no atomics on the hot path.  Allocation
 //     of a fresh leaf the first time we touch a given inode is
@@ -425,10 +429,11 @@ static void bcache_put(bcache_ref_t* r) {
 // The leaf's `inode` field doubles as the in-memory authoritative copy
 // of the inode for read-modify-write sequences: callers do
 // `leaf = inode_lock(ino)` (which fault-loads the disk image into the
-// leaf if needed), mutate `leaf->inode`, then call inode_writeback() to
-// push the change to disk before inode_unlock.  The seqcount bump on
-// the unlock side is what lets concurrent irtree_get readers notice the
-// change without taking any lock.
+// leaf if needed), do their disk I/O, then publish the final bytes with
+// inode_pub_begin(); leaf->inode = ...; inode_pub_end(); before
+// inode_writeback() persists them and inode_unlock() drops the write_lock.
+// The seqcount bump on the publish is what lets concurrent irtree_get
+// readers notice the change without taking any lock.
 
 #define IRTREE_BITS  8
 #define IRTREE_SIZE  (1u << IRTREE_BITS)   // 256
@@ -542,14 +547,27 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
 // No locking — safe to call without holding anything.
 static uint8_t inode_load_into(uint32_t ino, ext2_inode_t* out);
 
-// Public per-inode write-side lock: returns the leaf with its seqlock
-// held in WRITE state.
+// Public per-inode write-side lock.  Returns the leaf with its per-inode
+// write_lock (the seqlock's embedded spinlock) held to SERIALISE writers --
+// but with the sequence counter EVEN, NOT bumped to the odd "write in
+// progress" state.
 //
-// Critical design rule: we NEVER hold the seqlock across disk I/O.  If
-// the leaf needs loading, we do the I/O into a local buffer FIRST, then
-// briefly take the seqlock to publish.  Holding a seqlock across a
-// blocking AHCI read would cause every concurrent reader (via irtree_get
-// → seq_begin) to spin for milliseconds — and forever if the I/O hangs.
+// Critical design rule (SCAN #13 fix): the seqlock SEQUENCE is never held odd
+// across blocking disk I/O.  A writer may sleep arbitrarily long inside
+// write_block/inode_writeback (AHCI submit + completion wait); if it held the
+// sequence odd across that sleep, every concurrent irtree_get reader would spin
+// in seq_begin's cpu_relax -- and irtree_get spins with rcu_read_lock held
+// (== preempt_disable), so a reader on the sleeping writer's CPU can never be
+// preempted to let the writer run.  That is a hard deadlock (a preempt-disabled
+// reader starves the runnable task that would complete the writer's I/O), which
+// the AHCI completion self-heal cannot break.  So inode_lock holds ONLY the
+// write_lock across the I/O (a plain spinlock -- preemptible, so writer-vs-writer
+// contention self-heals); the sequence is bumped odd ONLY by inode_pub_begin /
+// inode_pub_end around the brief IN-MEMORY publish of leaf->inode (no I/O there).
+// The seqlock protects exactly the 128-byte leaf->inode snapshot irtree_get
+// copies -- it never protected directory data blocks (those go through bcache),
+// so moving the I/O outside the sequence weakens no guarantee: a reader gets a
+// consistent pre- or post-publish inode, exactly as before.
 //
 // Benign race: two CPUs may load the same inode concurrently; both
 // publish identical bytes.  Last-writer-wins is correct.
@@ -586,14 +604,30 @@ static irtree_leaf_t* inode_lock(uint32_t ino) {
         seq_write_end(&leaf->seq);
     }
 
-    seq_write_begin(&leaf->seq);
+    // Serialise writers WITHOUT bumping the sequence odd: hold only the
+    // embedded write_lock across the caller's (possibly I/O-bearing) critical
+    // section.  Readers see a consistent EVEN sequence and never spin here.
+    spin_lock(&leaf->seq.write_lock);
     return leaf;
 }
 
 static void inode_unlock(irtree_leaf_t* leaf) {
     if (!leaf) return;
-    seq_write_end(&leaf->seq);
+    spin_unlock(&leaf->seq.write_lock);
     __atomic_fetch_sub(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
+}
+
+// Publish in-memory changes to leaf->inode (and leaf->valid) atomically w.r.t.
+// seqlock readers.  The caller MUST already hold the write side via inode_lock
+// (write_lock held), so these bump ONLY the sequence (the _unlocked variants --
+// no nested spinlock).  NO blocking I/O may run between begin and end: that is
+// the whole point (readers spin in seq_begin only for this nanosecond-scale
+// window, never across the writer's disk I/O).
+static inline void inode_pub_begin(irtree_leaf_t* leaf) {
+    seq_write_begin_unlocked(&leaf->seq);
+}
+static inline void inode_pub_end(irtree_leaf_t* leaf) {
+    seq_write_end_unlocked(&leaf->seq);
 }
 
 // Brief-section reader: copy the cached inode out under a seqlock retry
@@ -1458,7 +1492,9 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     fd->inode.i_blocks = ((fd->file_size + s_block_size - 1) / s_block_size) * (s_block_size / 512);
     irtree_leaf_t* leaf = inode_lock(fd->ino);
     if (leaf) {
+        inode_pub_begin(leaf);
         leaf->inode = fd->inode;
+        inode_pub_end(leaf);
         inode_writeback(leaf);
         inode_unlock(leaf);
     }
@@ -2127,7 +2163,9 @@ success:
     // Both happen under the seqlock writer side held by inode_lock, so
     // a concurrent reader sees either the pre-update or post-update
     // inode but never a torn snapshot.
+    inode_pub_begin(dir_leaf);
     dir_leaf->inode = dir_inode;
+    inode_pub_end(dir_leaf);
     inode_writeback(dir_leaf);
     inode_unlock(dir_leaf);
     return 1;
@@ -2590,7 +2628,9 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
             work.i_blocks      = n_blocks * (s_block_size / 512);
             work.i_mode        = EXT2_S_IFREG | 0644;
             work.i_links_count = 1;
+            inode_pub_begin(leaf);
             leaf->inode = work;          // commit to the cache only on success
+            inode_pub_end(leaf);
             inode_writeback(leaf);
         }
         inode_unlock(leaf);
@@ -2642,8 +2682,10 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
     {
         irtree_leaf_t* leaf = inode_lock(new_ino);
         if (leaf) {
+            inode_pub_begin(leaf);
             leaf->inode = new_inode;
             leaf->valid = 1;
+            inode_pub_end(leaf);
             inode_writeback(leaf);
             inode_unlock(leaf);
         }
@@ -2952,8 +2994,10 @@ int ext2_mkdir(const char* path, const void* cred) {
     {
         irtree_leaf_t* leaf = inode_lock(new_ino);
         if (leaf) {
+            inode_pub_begin(leaf);
             leaf->inode = new_inode;
             leaf->valid = 1;
+            inode_pub_end(leaf);
             inode_writeback(leaf);
             inode_unlock(leaf);
         }
@@ -2970,7 +3014,9 @@ int ext2_mkdir(const char* path, const void* cred) {
     {
         irtree_leaf_t* pleaf = inode_lock(parent_ino);
         if (pleaf) {
+            inode_pub_begin(pleaf);
             pleaf->inode.i_links_count++;
+            inode_pub_end(pleaf);
             inode_writeback(pleaf);
             inode_unlock(pleaf);
         }
@@ -3015,16 +3061,25 @@ static int ext2_link_drop(uint16_t* links) {
 // the two cannot drift -- the rename path used to free unconditionally, which
 // destroyed a still-referenced multi-link inode.
 static void ext2_drop_link_locked(irtree_leaf_t* leaf, uint32_t ino) {
-    if (ext2_link_drop(&leaf->inode.i_links_count)) {
-        free_inode_blocks(&leaf->inode);
-        leaf->inode.i_dtime = 1;
-        inode_writeback(leaf);
-        inode_unlock(leaf);
-        free_inode_num(ino);
-    } else {
-        inode_writeback(leaf);
-        inode_unlock(leaf);
+    // Work on a LOCAL copy: free_inode_blocks does bitmap I/O while clearing
+    // i_block[]/i_blocks, so mutating the cached leaf->inode in place would let
+    // a reader see a half-freed inode (the sequence is even during I/O now).
+    // Compute the final inode off-cache, publish it atomically (brief seq
+    // bracket, no I/O), then persist.
+    ext2_inode_t work = leaf->inode;
+    uint16_t links = work.i_links_count;   // local: avoid &packed-member
+    int freed = ext2_link_drop(&links);
+    work.i_links_count = links;
+    if (freed) {
+        free_inode_blocks(&work);
+        work.i_dtime = 1;
     }
+    inode_pub_begin(leaf);
+    leaf->inode = work;
+    inode_pub_end(leaf);
+    inode_writeback(leaf);
+    inode_unlock(leaf);
+    if (freed) free_inode_num(ino);
 }
 
 // Deterministic check of the link-drop decision shared by unlink + rename:
@@ -3207,13 +3262,17 @@ int ext2_rename(const char* src, const char* dst, const void* cred) {
 
         irtree_leaf_t* spleaf = inode_lock(src_parent_ino);
         if (spleaf) {
+            inode_pub_begin(spleaf);
             if (spleaf->inode.i_links_count > 0) spleaf->inode.i_links_count--;
+            inode_pub_end(spleaf);
             inode_writeback(spleaf);
             inode_unlock(spleaf);
         }
         irtree_leaf_t* dpleaf = inode_lock(dst_parent_ino);
         if (dpleaf) {
+            inode_pub_begin(dpleaf);
             dpleaf->inode.i_links_count++;
+            inode_pub_end(dpleaf);
             inode_writeback(dpleaf);
             inode_unlock(dpleaf);
         }

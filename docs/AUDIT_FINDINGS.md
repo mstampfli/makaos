@@ -2779,20 +2779,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     REGARDLESS of whether the IRQ fired -- the I/O always completes, the seqlock is always released, and a
     reader-spins-on-an-I/O-blocked-writer window is bounded by one disk I/O (ms), not 280 s. The lost-completion theory
     is therefore RETRACTED.
-  STILL-OPEN ROOT (needs a dedicated dynamic-capture turn): the one live QMP capture showed only the SPINNING side --
-    CPU#3 in read_inode's seqlock reader retry (RIP -> read_inode+150, inlined cpu_relax), the other 3 CPUs idle. The
-    ASLEEP seqlock WRITER (whose held odd-sequence the reader is waiting on) and WHAT it is blocked on were NOT
-    captured, so the actual wedge (a genuine lost wakeup elsewhere? a writer parked on a different wait with the
-    seqlock held? a missed s_slot_wq publish race? a non-AHCI sleep under inode_lock?) is unproven. Do NOT land an
-    invasive seqlock-across-I/O refactor as "the deadlock fix" until the asleep writer's stack proves it is the cause
-    -- the refactor is justified on its own latent-inversion merits, but mis-attributing the freeze to it would leave
-    the real wedge live. NEXT TURN (dedicated): reproduce + capture the ASLEEP writer -- walk the task list / read each
-    task's saved RIP+RSP via QMP memory reads, or temporarily enable a SCHED_TICK_HEARTBEAT / lock-hold watchdog to
-    distinguish "writer still running I/O" from "writer parked with seqlock held", and resolve every task's RIP with
-    addr2line. Only then target the fix (decouple the seqlock from the I/O AND/OR fix whatever wakeup is actually
-    lost). NOTE: manifests only under SELFTESTS=1 (ext2_perm_op runs fs mutations concurrently with userland) -- the
-    shipping disk runs no selftests -- and is FLAKY (~1 in 3 boots), consistent with a narrow race, not the
-    deterministic lost-IRQ the first cut assumed.
-  (SUPERSEDED first cut, kept for the record): "the writer sleeps indefinitely holding the seqlock because slot_wait
-    cannot recover a lost IRQ if no wake arrives" -- FALSE, the per-tick ahci_poll_completions self-heal supplies the
-    wake; see the REVISED root above.
+  ROOT PROVEN + FIXED (F135, 2026-06-27 -- a per-inode seqlock-across-blocking-I/O DEADLOCK; the "needs a dedicated
+    capture turn" note below was carried out and the cause is now nailed from four angles): the ext2 per-inode seqlock
+    WRITE side (inode_lock -> seq_write_begin = spin_lock(write_lock) + bump-sequence-ODD) was held across BLOCKING
+    AHCI I/O -- dir_add_entry/inode_writeback/the publishes do write_block -> ahci_write -> submit_busy_acquire ->
+    sched_sleep WHILE the leaf's sequence is odd.  The seqlock READER irtree_get (inlined into read_inode) spins in
+    seq_begin's cpu_relax INSIDE rcu_read_lock, and rcu_read_lock == preempt_disable -- so a reader of that inode spins
+    PREEMPT-DISABLED for the whole time the writer holds the sequence odd.  A preempt-disabled spinner monopolises its
+    CPU, so the runnable task needed to release the global AHCI submit lock (s_submit_busy) and wake the sleeping writer
+    can never get that CPU -> a CPU-mediated deadlock the per-tick ahci_poll_completions self-heal cannot break.
+  PROOF (no-assumptions / real-proof): (1) STATIC code; (2) DISASSEMBLY -- read_inode does `incl %gs:0x4284`
+    (preempt_disable) at +0x1b, the `pause` (cpu_relax) at +0x94 is INSIDE that region, released by `decl %gs:0x4284`
+    at +0xa4; the prior live RIP read_inode+150 == 0x96 is exactly that pause; (3) LIVE CAPTURE via a temporary
+    inode-lock-hold watchdog (the existing global-stall watchdog never fires -- the spinner is preemptible so
+    nonidle_switches keeps moving): held_by_pid=10 SLEEPING on inode_lock(ino=2) ~3.4s with backtrace
+    dir_add_entry(ext2.c:2034) -> write_block(736) -> submit_busy_acquire(ahci.c) -> sched_sleep, pid=19 RUNNING
+    preempt=1, 3 CPUs idle, cpu2 nr=1 (a runnable task starved behind the spinner); (4) PERMANENCE -- the instance
+    never recovered.  The earlier "lost AHCI completion" diagnosis (F134) was wrong about the MECHANISM but right that
+    the seqlock-across-I/O was the problem.
+  FIX (do-it-right, ROOT = the directive's PRIMARY "decouple the lock from the I/O"): the seqlock only ever protected
+    the 128-byte leaf->inode copy irtree_get reads (NEVER the directory data blocks -- those go through bcache), so the
+    sequence is now held odd ONLY around the brief in-memory publish of leaf->inode, never across disk I/O.  inode_lock
+    holds ONLY the embedded write_lock (preemptible spinlock; serialises same-inode writers + dir-block consistency
+    across the I/O) with the sequence EVEN; new inode_pub_begin/inode_pub_end bracket all 9 leaf->inode mutation sites
+    (ext2_vfs_write, dir_add_entry, create-overwrite, create+mkdir new-inode, mkdir/rename parent link counts,
+    ext2_drop_link_locked refactored to a LOCAL copy).  Readers get a consistent pre/post-publish inode without
+    spinning during writer I/O -> the preempt-disabled spin and the deadlock are gone; no fs semantics change.
+  VERIFIED: a temporary hold-watchdog made the deadlock reliably catchable (~3s).  PRE-fix ~1 in 5-6 SELFTESTS=1 boots
+    hung (caught twice on boot #5).  POST-fix 40/40 boots CLEAN, ZERO [WD], all fs_permop PASSED.  Capture
+    instrumentation reverted; shipped change is ext2.c-only.  Final fix-only boot: 80 selftests PASSED, fs_permop
+    PASSED, DHCP, 0 faults, full 174-line boot.  SCAN #13 (lock-ordering/deadlock) CLOSED.

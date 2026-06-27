@@ -335,8 +335,15 @@ template. This list is for tracking the *plan*, not the code.
 
 - **fd table mutation:** per-task_files_t mutex. Read path is
   RCU-protected.
-- **ext2 inode lock:** per-directory mutex. Reads are RCU via the
-  inode cache.
+- **ext2 inode lock (per-inode irtree leaf):** `inode_lock` holds the
+  leaf seqlock's embedded `write_lock` (a plain, preemptible spinlock) to
+  serialise writers of the same inode; it is held across the writer's
+  blocking disk I/O. The seqlock SEQUENCE is bumped odd ONLY by
+  `inode_pub_begin`/`inode_pub_end` around the brief in-memory publish of
+  `leaf->inode` -- NEVER across I/O. Reads (`irtree_get`) are a seqlock
+  retry inside `rcu_read_lock`. F135: holding the sequence odd across the
+  AHCI I/O deadlocked a preempt-disabled reader against the sleeping
+  writer; the sequence-vs-write_lock split fixed it.
 - **VMA list mutation:** per-address-space mutex. Page fault handler
   walks under RCU.
 
