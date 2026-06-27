@@ -177,8 +177,20 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   the old `uint32_t bytes = w*h*4` wrapped for a large/crafted mode -> undersized
   backing while the GPU + paint loop access the full w*h -> host OOB. Rejects a 0
   dimension / over-cap mode (vgpu_setup_scanout_buffer then returns 0; both callers
-  handle it). `vgpu_fb_bytes_selftest` drives the 2^32 wrap + over-cap rejects. The
-  drm.c size math (drm_dumb_size F23, addfb/atomic) already uses u64 -> not in scope.
+  handle it). `vgpu_fb_bytes_selftest` drives the 2^32 wrap + over-cap rejects. Most
+  drm.c size math (drm_dumb_size F23, addfb/atomic) already uses u64; the one gap was
+  SET_CURSOR -- see drm_cursor_bytes below.
+- `drm_cursor_bytes(width, height, backing_size, *bytes)` (kernel/drivers/video/drm.c,
+  F136) -- the width*height*4 bytes a 32bpp ARGB cursor needs, which must fit the dumb
+  buffer that backs it. width*height is a u64 product of two u32 (cannot overflow u64)
+  and the *4 is guarded by `ckd_mul_u64`. The old SET_CURSOR guard `(uint64_t)w*h*4 >
+  d->size` (and the matching pin-page count `(w*h*4 + 4095)/4096`) WRAPPED u64 once w*h
+  >= 2^62 (w=h=0x80000000 -> *4 == 2^64 -> 0): `0 > d->size` is false, so user-supplied
+  absurd cursor dimensions slipped past the bound into resource_create/resource_transfer
+  (host-side OOB on the small backing) with a wrapped-to-zero pin count. w/h come
+  straight from the DRM_IOCTL_MODE_CURSOR struct (untrusted, uncapped). Reused for the
+  pin-page count so both share one overflow-safe value. `drm_cursor_bytes_selftest`
+  drives the 2^64 *4 wrap + over-backing + zero-dim rejects.
 - `ext2_inode_size_valid(inode_size, block_size)` (kernel/fs/ext2.c, F50) -- gates
   the untrusted superblock s_inode_size at mount: power of two, >= sizeof(ext2_inode_t),
   <= block_size. That makes inode_size divide block_size, so an inode tiles a block

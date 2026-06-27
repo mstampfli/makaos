@@ -20,6 +20,7 @@
 #include "kheap.h"
 #include "kprintf.h"
 #include "errno.h"
+#include "checked.h"   // ckd_mul_u64 / mul_within_u32 (overflow-safe sizing)
 #include "pmm.h"
 #include "vmm.h"
 #include "process.h"
@@ -495,6 +496,26 @@ static int drm_dumb_size(uint32_t w, uint32_t h, uint32_t bpp,
     *pitch = (uint32_t)p;                    // safe: p <= 16384*4 = 65536
     *size  = s;
     return 0;
+}
+
+// PRIMITIVE (drm cursor backing-size check).  An ARGB (32bpp) cursor of
+// width*height pixels needs width*height*4 bytes, which must fit the dumb
+// buffer that backs it.  Returns true + the byte size in *bytes on success.
+// Overflow-safe by construction: width*height is a u64 product of two u32 (it
+// can never overflow u64), and the *4 is guarded by ckd_mul_u64.  A bare
+// `(uint64_t)w*h*4 > backing` guard WRAPS u64 once w*h >= 2^62 (e.g.
+// w=h=0x80000000 -> *4 == 2^64 -> 0), so the bound is bypassed and absurd
+// dimensions reach resource_create/resource_transfer (host-side OOB) and a
+// wrapped-to-zero pin-page count.  Pure -> unit-tested (drm_cursor_bytes_
+// selftest).  NOT for non-32bpp formats.
+static inline bool drm_cursor_bytes(uint32_t width, uint32_t height,
+                                    uint64_t backing_size, uint64_t* bytes) {
+    if (!width || !height) return false;
+    uint64_t need;
+    if (!ckd_mul_u64((uint64_t)width * height, 4u, &need)) return false;
+    if (need > backing_size) return false;
+    *bytes = need;
+    return true;
 }
 
 static int drm_ioctl_create_dumb(vfs_file_t* f, uint64_t arg) {
@@ -2263,8 +2284,11 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
     drm_client_t* c = client_of(f);
     drm_dumb_t* d = find_dumb(c, a.handle);
     if (!d) return -ENOENT;
-    if (!a.width || !a.height ||
-        (uint64_t)a.width * a.height * 4 > d->size) return -EINVAL;
+    // Overflow-safe: width*height*4 must fit the backing.  The old bare
+    // (uint64_t)w*h*4 > d->size guard wrapped u64 (w=h=2^31 -> *4 == 2^64 -> 0)
+    // and accepted absurd dimensions.  cur_bytes is reused for the pin count.
+    uint64_t cur_bytes;
+    if (!drm_cursor_bytes(a.width, a.height, d->size, &cur_bytes)) return -EINVAL;
 
     // (Re)mint the ARGB alias ONLY when the backing PHYS or the cursor
     // dimensions actually change — never merely because wlroots handed us
@@ -2291,8 +2315,7 @@ static int drm_ioctl_mode_cursor(vfs_file_t* f, uint64_t arg, int has_hotspot) {
         // like an fb) so the per-commit close of the transient GETFB
         // handle — and the eventual cursor-BO teardown — can't return
         // them to the buddy allocator while the alias is still latched.
-        uint32_t pages = (uint32_t)(((uint64_t)a.width * a.height * 4u
-                                     + 4095u) / 4096u);
+        uint32_t pages = (uint32_t)((cur_bytes + 4095u) / 4096u);
         for (uint32_t i = 0; i < pages; i++)
             pmm_ref_inc(d->phys + (phys_addr_t)i * 4096u);
         cs->cursor_res       = id;
@@ -2674,6 +2697,42 @@ void drm_dumb_size_selftest(void) {
     }
     kprintf(fails ? "[drm_dumb] SELF-TEST FAILED\n"
                   : "[drm_dumb] SELF-TEST PASSED (overflow-safe dumb size)\n");
+}
+
+// ── drm_cursor_bytes selftest ─────────────────────────────────────────────
+// Deterministic check of the overflow-safe SET_CURSOR backing-size guard.  The
+// 0x80000000 / 0xFFFFFFFF rows are exactly the u64 `w*h*4` wrap the old guard
+// hit: (uint64_t)0x80000000*0x80000000*4 == 2^64 -> 0, so `0 > d->size` was
+// false and absurd cursor dimensions slipped through to resource_transfer.
+void drm_cursor_bytes_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    uint64_t b;
+    struct { uint32_t w, h; uint64_t backing; bool eok; uint64_t ebytes; } c[] = {
+        { 64,  64,  16384,      true,  16384ULL },   // exact 64x64 ARGB fits
+        { 32,  32,  16384,      true,  4096ULL },    // fits with room
+        { 64,  65,  16384,      false, 0 },          // 16640 > 16384 -> reject
+        { 1,   1,   4,          true,  4ULL },        // minimal
+        { 1,   1,   3,          false, 0 },          // 4 > 3 backing -> reject
+        { 0,   64,  16384,      false, 0 },          // zero width
+        { 64,  0,   16384,      false, 0 },          // zero height
+        { 0x80000000u, 0x80000000u, 4096, false, 0 },// THE bug: *4 == 2^64 wraps to 0
+        { 0x80000000u, 0x80000000u, 0xFFFFFFFFFFFFFFFFULL, false, 0 }, // even a max backing: *4 overflows u64 -> reject
+        { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFFFFFFFFFULL, false, 0 }, // w*h*4 overflows u64
+        { 0x40000000u, 0x4u, 0xFFFFFFFFFFFFFFFFULL, true, 0x400000000ULL }, // 2^30*4 px *4 = 2^34 bytes, no wrap, fits huge backing
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        b = 0xDEADULL;
+        bool ok = drm_cursor_bytes(c[i].w, c[i].h, c[i].backing, &b);
+        int good = (ok == c[i].eok) && (!ok || b == c[i].ebytes);
+        if (!good) {
+            kprintf("[drm_cursor] FAIL i=%u ok=%d bytes=%lu\n",
+                    i, (int)ok, (unsigned long)b);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[drm_cursor] SELF-TEST FAILED\n"
+                  : "[drm_cursor] SELF-TEST PASSED (overflow-safe cursor backing-size)\n");
 }
 
 // ── drm_atomic per-object prop-count bound selftest ───────────────────────

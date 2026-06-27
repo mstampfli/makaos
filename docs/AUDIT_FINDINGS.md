@@ -2809,3 +2809,36 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     hung (caught twice on boot #5).  POST-fix 40/40 boots CLEAN, ZERO [WD], all fs_permop PASSED.  Capture
     instrumentation reverted; shipped change is ext2.c-only.  Final fix-only boot: 80 selftests PASSED, fs_permop
     PASSED, DHCP, 0 faults, full 174-line boot.  SCAN #13 (lock-ordering/deadlock) CLOSED.
+- 2026-06-27 BUG-TYPE SCAN #14 (INTEGER OVERFLOW / UNDERFLOW / ARITHMETIC-WRAP), codebase-wide. METHOD: 5 parallel
+  subagents swept net / fs / drm+fb / syscall+io_uring+ipc / storage+input for arithmetic on untrusted values (on-disk
+  ext2 fields, packet header lengths, syscall+SQE sizes/offsets/counts, fb/drm dimensions, device-reported lengths)
+  that can wrap or underflow and then feed an allocation size, a memcpy length, a bounds check, or an array index --
+  with each candidate verified against the real operand widths + existing guards (not guessed). The codebase is
+  heavily hardened against this class already (checked.h ckd_*/mul_within/index_ok/in_range, the copy_from_user /
+  ring / on-disk domain wrappers).
+  FIXED (F136, the lead item -- the only USER-REACHABLE overflow-defeats-a-bound bug): DRM SET_CURSOR
+  `(uint64_t)a.width * a.height * 4 > d->size` -- the *4 overflows u64 (w=h=2^31 -> 2^64 -> 0), bypassing the backing
+  bound and feeding absurd dims to resource_create/transfer (host OOB) + a wrapped-to-zero pin count. New
+  drm_cursor_bytes primitive (ckd_mul_u64 on the *4) + selftest; see AUTOFIX_LOG F136.
+  RESIDUAL (lower severity, noted for follow-up -- NOT user-reachable / not memory-unsafe):
+    (MED, device-trust-boundary) nvme.c ~778 `s_ns_lba_size = 1u << lbads` where lbads is an 8-bit Identify-Namespace
+      field (0..255): a shift >= 32 is UB (x86 masks to `1u << (lbads&31)`), yielding a bogus sector size that then
+      feeds the otherwise-correct `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)` DMA guard. A malicious/buggy
+      controller could make the guard size wrong. FIX: bound `lbads` (e.g. reject > 12) before the shift. nvme is not
+      the boot device.
+    (MED-LOW, DoS only) hda.c ~225,233 `for (uint8_t fg = fg_start; fg < fg_start + fg_count; fg++)` -- the bound
+      `fg_start + fg_count` (device codec NODE_COUNT, two u8s) can exceed 255, so the u8 counter wraps and the loop
+      never terminates (issues codec verbs forever). No array index -> hang/DoS, not OOB. FIX: widen the loop var to
+      u32. Audio-init only.
+    (MED, bounded-but-fragile) tcp.c ~847 `sendable = pcb->snd_wnd - (pcb->snd_nxt - pcb->snd_una)` -- snd_wnd is the
+      attacker-advertised window; if in-flight > window the subtraction underflows to ~4e9, but the very next line
+      `if (sendable > chunk) sendable = chunk` clamps it to <= TCP_MSS. Safe today (saved by adjacency), not safe by
+      construction; a saturate-to-0 on underflow would make it robust. No bug as-is.
+  AUDITED CLEAN (representative, do not re-investigate): net total_len-header_len / off+len / count*elem all guarded or
+  min-clamped (ipv4/udp/tcp/virtio_net/unix_sock/socket/net); fs on-disk block#s range-checked by ext2_block_valid
+  inside bcache_get + 64-bit LBAs + ext2_dirent_in_block + the mount-time geometry validators (the one raw wrap,
+  fat32 cluster_to_lba, is in build-excluded fat32.c); syscall/io_uring/ipc backstopped by ckd_add_u64 / _access_ok /
+  mmap_round_len / per-index npages checks / SHMEM_MAX_PAGES caps (mmap-shmem-attach + ftruncate page-conv wraps can
+  only alias within the same object, never OOB); storage/input via mul_within_u32/xfer_bytes_ok (AHCI/nvme DMA) +
+  power-of-2-masked rings (tty/pty/evdev/virtio_input) + CNT-checked input bitmaps. SCAN #14 lead item CLOSED; the
+  three residuals above are the remaining backlog for this type.

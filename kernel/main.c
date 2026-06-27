@@ -792,6 +792,9 @@ static void init_kthread(void) {
     drm_atomic_count_selftest();
     extern void vgpu_fb_bytes_selftest(void);
     vgpu_fb_bytes_selftest();
+    // SET_CURSOR backing-size guard: u64 w*h*4 wrap (SCAN #14 / F136).
+    extern void drm_cursor_bytes_selftest(void);
+    drm_cursor_bytes_selftest();
 
     // TTY ring free-slot arithmetic (canonical line-framing: all-or-nothing
     // flush so a partial push can never drop a cooked line's terminating '\n').
