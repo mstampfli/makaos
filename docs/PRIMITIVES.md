@@ -171,6 +171,15 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   while cdw12 carries a 16-bit-masked sector count -> a 32 MB DMA into a 4 KB PRP) now
   uses `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)`; covered by the mul_within
   cases in checked_selftest (nvme itself is not the boot device).
+- `nvme_lba_size_ok(lbads, *size)` (kernel/drivers/storage/nvme.c, F137) -- validates the
+  device-supplied Identify-Namespace LBA Data Size exponent (LBADS, 8 bits, 0..255) BEFORE
+  `1u << lbads`: a shift count >= 32 is UB (x86 masks to & 31 -> a tiny bogus sector size)
+  and a sub-512 / oversized size defeats the nvme_rw mul_within DMA guard above (the guard
+  under-counts -> OOB DMA past the 2-PRP region). Accepts only lbads 9..12 (512..4096-byte
+  sectors), computes the shift with no UB, and nvme_init refuses the namespace otherwise.
+  This is the upstream sibling of the mul_within guard: it keeps s_ns_lba_size itself sane
+  so the guard's bound is meaningful. `nvme_lba_size_ok_selftest` drives the sub-512 /
+  oversized / UB-shift (32, 255) rejects. The forbidden raw `1u << <untrusted>` is gone.
 - `vgpu_fb_bytes(w, h, *out)` (kernel/drivers/video/virtio_gpu.c, F49) -- the w*h*4
   bytes a w*h B8G8R8X8 scanout needs, via `mul_within_u32` (u64, no wrap) capped at
   VGPU_MAX_FB_BYTES (256 MiB). w/h are the device-reported scanout mode (untrusted);

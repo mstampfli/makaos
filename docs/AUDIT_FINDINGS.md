@@ -2821,11 +2821,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   bound and feeding absurd dims to resource_create/transfer (host OOB) + a wrapped-to-zero pin count. New
   drm_cursor_bytes primitive (ckd_mul_u64 on the *4) + selftest; see AUTOFIX_LOG F136.
   RESIDUAL (lower severity, noted for follow-up -- NOT user-reachable / not memory-unsafe):
-    (MED, device-trust-boundary) nvme.c ~778 `s_ns_lba_size = 1u << lbads` where lbads is an 8-bit Identify-Namespace
+    *** FIXED F137 (2026-06-27): nvme.c ~778 `s_ns_lba_size = 1u << lbads` where lbads is an 8-bit Identify-Namespace
       field (0..255): a shift >= 32 is UB (x86 masks to `1u << (lbads&31)`), yielding a bogus sector size that then
-      feeds the otherwise-correct `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)` DMA guard. A malicious/buggy
-      controller could make the guard size wrong. FIX: bound `lbads` (e.g. reject > 12) before the shift. nvme is not
-      the boot device.
+      fed the otherwise-correct `mul_within_u32(nlb, s_ns_lba_size, 8192, &bytes)` DMA guard (a malicious/buggy
+      controller made the guard size under-count -> OOB DMA past the 2-PRP region). New nvme_lba_size_ok(lbads, *size)
+      primitive accepts only lbads 9..12 (512..4096-byte sectors), computes the shift with no UB, and nvme_init
+      refuses the namespace otherwise. Selftest drives the 8/0 (sub-512), 13/31 (oversized), 32/255 (UB) rejects.
+      nvme is not the boot device.
     (MED-LOW, DoS only) hda.c ~225,233 `for (uint8_t fg = fg_start; fg < fg_start + fg_count; fg++)` -- the bound
       `fg_start + fg_count` (device codec NODE_COUNT, two u8s) can exceed 255, so the u8 counter wraps and the loop
       never terminates (issues codec verbs forever). No array index -> hang/DoS, not OOB. FIX: widen the loop var to

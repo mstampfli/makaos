@@ -142,6 +142,23 @@ static uint32_t        s_ns_nsid = 0;      // first namespace id
 static uint32_t        s_ns_lba_size = 512;
 static uint32_t        s_nr_ioq = 0;       // number of per-CPU I/O queues
 
+// PRIMITIVE (nvme LBA-size validation).  The Identify-Namespace LBA Data Size
+// exponent (LBADS, an 8-bit device-supplied field, 0..255) gives the sector
+// size as 2^LBADS.  A bare `1u << lbads` is UNDEFINED for lbads >= 32 (x86
+// masks the shift count to & 31, so e.g. lbads=32 yields 1 -- a tiny bogus
+// sector size), and any sub-512 / oversized size defeats nvme_rw's
+// mul_within_u32(nlb, s_ns_lba_size, 8192) DMA guard: a lying controller makes
+// our byte length under-count, so a transfer slips past the 2-PRP (<=8 KiB)
+// bound and the device DMAs past the PRPs.  Accept only the driver-supported
+// 512..4096-byte range (lbads 9..12) and compute the size with no UB; reject
+// everything else (nvme_init then refuses the namespace).  Returns true + the
+// byte size in *size on success.  Pure -> unit-tested (nvme_lba_size_ok_selftest).
+static inline bool nvme_lba_size_ok(uint32_t lbads, uint32_t* size) {
+    if (lbads < 9u || lbads > 12u) return false;   // only 512..4096-byte sectors
+    *size = 1u << lbads;                            // safe: lbads <= 12, no UB/wrap
+    return true;
+}
+
 // PCI location — saved so MSI-X setup can write PCI config.
 static pci_device_t    s_pci;
 static volatile uint32_t* s_msix_table = NULL;  // 16 B per entry × N entries
@@ -775,9 +792,17 @@ uint8_t nvme_init(void) {
     uint8_t  flbas = idbuf[26];
     uint8_t  lbaf_i = flbas & 0xF;
     uint32_t lbaf  = *(uint32_t*)(idbuf + 128 + 4 * lbaf_i);
-    uint32_t lbads = (lbaf >> 16) & 0xFF;   // 2^lbads = LBA size
+    uint32_t lbads = (lbaf >> 16) & 0xFF;   // 2^lbads = LBA size (device-supplied)
+    uint32_t lba_size;
+    if (!nvme_lba_size_ok(lbads, &lba_size)) {
+        // Out-of-range / UB-inducing LBADS: refuse the namespace rather than
+        // derive a bogus sector size that defeats nvme_rw's DMA-size guard.
+        kprintf("[nvme] NS%u: unsupported LBA data size 2^%u -- refusing namespace\n",
+                first_nsid, lbads);
+        return 0;
+    }
     s_ns_nsid = first_nsid;
-    s_ns_lba_size = 1u << lbads;
+    s_ns_lba_size = lba_size;
     kprintf("[nvme] NS%u: nsze=%lu lba_size=%u bytes\n",
             first_nsid, nsze, s_ns_lba_size);
 
@@ -881,4 +906,38 @@ void nvme_cid_valid_selftest(void) {
     }
     kprintf(fails ? "[nvme_cid] SELF-TEST FAILED\n"
                   : "[nvme_cid] SELF-TEST PASSED (device completion-id bounds)\n");
+}
+
+// Deterministic check of the LBADS validation: only the driver-supported
+// 512..4096-byte sizes (lbads 9..12) are accepted, the sub-512 / oversized
+// values are rejected, and the lbads >= 32 rows are exactly the `1u << lbads`
+// UB the raw code hit (the shift count wraps to & 31, yielding a tiny size that
+// defeats the DMA-size guard).  Rejecting BEFORE the shift makes the UB
+// unreachable.
+void nvme_lba_size_ok_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t lbads; bool eok; uint32_t esize; } c[] = {
+        { 9,   true,  512 },    // 512-byte sector (the common case)
+        { 10,  true,  1024 },
+        { 11,  true,  2048 },
+        { 12,  true,  4096 },   // 4 KiB sector
+        { 8,   false, 0 },      // 256-byte: sub-512, reject
+        { 0,   false, 0 },      // 1-byte: the guard-defeat input, reject
+        { 13,  false, 0 },      // 8 KiB: > 2-PRP path / oversized, reject
+        { 31,  false, 0 },      // 2^31: no UB but huge, reject
+        { 32,  false, 0 },      // THE UB edge: 1u<<32 is undefined -> rejected before the shift
+        { 255, false, 0 },      // max 8-bit field, reject
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t sz = 0xDEADu;
+        bool ok = nvme_lba_size_ok(c[i].lbads, &sz);
+        if (ok != c[i].eok || (ok && sz != c[i].esize)) {
+            kprintf("[nvme_lbads] FAIL lbads=%u ok=%d sz=%u\n",
+                    c[i].lbads, (int)ok, sz);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[nvme_lbads] SELF-TEST FAILED\n"
+                  : "[nvme_lbads] SELF-TEST PASSED (valid 512..4096 LBA size, no UB shift)\n");
 }

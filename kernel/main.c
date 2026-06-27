@@ -765,6 +765,9 @@ static void init_kthread(void) {
     // NVMe device completion-id bounds (req[] OOB from a malicious/buggy NVMe).
     extern void nvme_cid_valid_selftest(void);
     nvme_cid_valid_selftest();
+    // nvme LBADS validation: reject UB-inducing / bogus device LBA sizes (F137).
+    extern void nvme_lba_size_ok_selftest(void);
+    nvme_lba_size_ok_selftest();
 
     // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
     extern void virtfs_is_virtual_selftest(void);
