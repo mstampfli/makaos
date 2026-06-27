@@ -522,6 +522,12 @@ static void init_kthread(void) {
     extern void ext2_link_drop_selftest(void);
     ext2_link_drop_selftest();
 
+    // Path-TOCTOU fix: the mutating fs ops now permission-check the parent they
+    // themselves resolve.  Exercise create/unlink/mkdir/rename as root to prove
+    // authorized mutation still works through the in-op check.
+    extern void ext2_perm_op_selftest(void);
+    ext2_perm_op_selftest();
+
     // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
     // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
     // per-page VMA-backing validator (no prefault, so file-backed sources keep

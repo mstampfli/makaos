@@ -142,27 +142,32 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max);
 // Create or overwrite a file at `path` with `size` bytes from `data`.
 // Parent directory must already exist.
 // Returns 1 on success, 0 on failure.
-int ext2_write_file(const char* path, const uint8_t* data, uint32_t size);
+// `cred` (a cred_t*) gates NEW-file creation on parent write+exec, checked on
+// the parent inode THIS call resolves (closing the path-TOCTOU); NULL skips it
+// (internal overwrite/truncate of an existing file, which never creates).
+int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
+                    const void* cred);
 
 // Create an empty file at `path`.  Fails if the file already exists.
-// Returns 1 on success, 0 on failure (including EEXIST).
-int ext2_create(const char* path);
+// Returns 1 on success, 0 on failure (including EEXIST).  `cred` (a cred_t*) is
+// checked for write+exec on the parent dir the create resolves into.
+int ext2_create(const char* path, const void* cred);
 
 // Truncate the file at `path` to zero bytes.
 // Returns 1 on success, 0 on failure.
 int ext2_truncate(const char* path);
 
-// Create a directory at `path` (parent must exist).
-// Returns 1 on success, 0 on failure.
-int ext2_mkdir(const char* path);
+// Create a directory at `path` (parent must exist).  `cred` (a cred_t*) is
+// checked for write+exec on the resolved parent dir.
+int ext2_mkdir(const char* path, const void* cred);
 
-// Remove a regular file at `path`.
-// Returns 1 on success, 0 on failure.
-int ext2_unlink(const char* path);
+// Remove a regular file at `path`.  `cred` (a cred_t*) is checked for write+exec
+// on the resolved parent dir.
+int ext2_unlink(const char* path, const void* cred);
 
-// Rename/move `src` to `dst` (both must be on the same volume).
-// Returns 1 on success, 0 on failure.
-int ext2_rename(const char* src, const char* dst);
+// Rename/move `src` to `dst` (both must be on the same volume).  `cred` (a
+// cred_t*) is checked for write+exec on BOTH resolved parent dirs.
+int ext2_rename(const char* src, const char* dst, const void* cred);
 
 // Truncate or extend file at `path` to exactly `length` bytes.
 // Returns 1 on success, 0 on failure.

@@ -288,6 +288,22 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   not own without holding that table's lock (or an RCU section + vfs_tryget).
   `fd_table_clone_selftest` pins the clone logic (cap + slot pointers + flags copied, refs bumped).
 
+- `ext2_dir_write_ok(dir_ino, cred)` (kernel/fs/ext2.c, F129) -- the "permission-check on the
+  operation's OWN resolution" idiom that closes a path-TOCTOU.  A two-step "resolve path + check
+  perm" then "re-resolve path + act" is a TOCTOU: a concurrent rename of an intermediate component
+  swaps the target between the check and the act, so the act runs on a parent the check never saw.
+  The fix is NOT to re-check at the syscall layer (that resolves a THIRD time) but to perform the
+  permission decision INSIDE the mutating op, on the SAME parent inode the op resolved and is about
+  to modify -- so check and use are one resolution and cannot diverge.  ext2_unlink/mkdir/rename
+  (rename: BOTH parents under s_rename_lock) and ext2_create-via-ext2_write_file's create path each
+  call ext2_dir_write_ok on their own resolved parent_ino before mutating; a NULL cred skips it (the
+  overwrite/truncate callers that act on an EXISTING file, never create).  The syscall-layer check is
+  kept for the EACCES errno + early reject; the op-internal check is the authoritative TOCTOU-closer
+  (identical vfs_check_perm, so zero behavior change in the non-racing case).  RULE: when a
+  permission/validity check and the operation it guards each independently resolve the same untrusted
+  name/handle, move the check INTO the operation, onto the operation's own resolution.
+  `ext2_perm_op_selftest` exercises root create/unlink/mkdir/rename through the in-op check.
+
 - `unix_sock_t.lock` + the "lock the queue OWNER, copy user data OUTSIDE the lock" discipline
   (kernel/net/unix_sock.c, F111/F112/F113; full rules in docs/LOCKS.md) -- one per-socket leaf
   spinlock serializes ALL of an AF_UNIX socket's per-socket queues (listener backlog, dgram rx,

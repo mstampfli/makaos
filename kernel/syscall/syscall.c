@@ -503,7 +503,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         if (!f && (flags & O_CREAT)) {
             mode &= ~(uint64_t)g_current->umask;
             (void)mode;
-            if (!ext2_create(path)) return (uint64_t)-EIO;
+            if (!ext2_create(path, &g_current->cred)) return (uint64_t)-EIO;
             f = ext2_open(path);
         }
     }
@@ -1950,7 +1950,7 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     int upr = vfs_check_perm(&par_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (upr != 0) return (uint64_t)(int64_t)upr;
 
-    return ext2_unlink(path) ? 0 : (uint64_t)-ENOENT;
+    return ext2_unlink(path, &g_current->cred) ? 0 : (uint64_t)-ENOENT;
 }
 
 // Is `dst` a path strictly INSIDE `src` (a proper descendant)?  Both must be
@@ -2012,7 +2012,7 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     int spr = vfs_check_perm(&sp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (spr != 0) return (uint64_t)(int64_t)spr;
 
-    return ext2_rename(src, dst) ? 0 : (uint64_t)-ENOENT;
+    return ext2_rename(src, dst, &g_current->cred) ? 0 : (uint64_t)-ENOENT;
 }
 
 // ── sys_getcwd ────────────────────────────────────────────────────────────
@@ -2165,7 +2165,7 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     int mkpr = vfs_check_perm(&mkp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (mkpr != 0) return (uint64_t)(int64_t)mkpr;
 
-    return ext2_mkdir(path) ? 0 : (uint64_t)-EIO;
+    return ext2_mkdir(path, &g_current->cred) ? 0 : (uint64_t)-EIO;
 }
 
 // ── sys_dup ───────────────────────────────────────────────────────────────

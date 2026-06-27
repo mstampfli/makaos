@@ -2506,7 +2506,13 @@ void ext2_path_split_selftest(void) {
 
 // ── ext2_write_file ────────────────────────────────────────────────────────
 
-int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
+// True (0) iff `cred` may add/remove entries in directory `dir_ino` (write+exec).
+// Defined after the errno.h include below; forward-declared here so the mutating
+// ops can gate on the SAME parent inode they resolve (closes the path-TOCTOU).
+static int ext2_dir_write_ok(uint32_t dir_ino, const void* cred);
+
+int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
+                    const void* cred) {
     if (!s_mounted) return 0;
 
     // Split into parent dir and basename.
@@ -2522,6 +2528,14 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     if (!read_inode(parent_ino, &parent_inode)) return 0;
 
     uint32_t existing_ino = dir_lookup(&parent_inode, basename, str_len(basename));
+
+    // Creating a NEW file (existing_ino == 0) requires write+exec on THIS
+    // parent -- checked on the same parent_ino this call resolved and will
+    // dir_add_entry into, so a concurrent rename of an intermediate path
+    // component cannot land the create in a directory the caller was never
+    // authorized for (the path-TOCTOU).  A NULL cred (internal overwrite /
+    // truncate of an EXISTING file) skips it; it gates new-file creation only.
+    if (!existing_ino && cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
 
     // Scratch buffer reused for every block write below.  Lazily alloc'd
     // only after we've passed all the early-error checks in each branch.
@@ -2650,7 +2664,7 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 
 // ── ext2_create ───────────────────────────────────────────────────────────
 // Create an empty file.  Returns 0 if the file already exists.
-int ext2_create(const char* path) {
+int ext2_create(const char* path, const void* cred) {
     if (!s_mounted) return 0;
     char parent_path[EXT2_PATH_MAX];
     const char* basename = path_split(path, parent_path, sizeof(parent_path));
@@ -2661,8 +2675,9 @@ int ext2_create(const char* path) {
     if (!read_inode(parent_ino, &parent_inode)) return 0;
     // Fail if already exists.
     if (dir_lookup(&parent_inode, basename, str_len(basename))) return 0;
-    // Create empty file via ext2_write_file.
-    int r = ext2_write_file(path, (const uint8_t*)"", 0);
+    // Create empty file via ext2_write_file; pass cred so the parent write+exec
+    // check happens on ext2_write_file's OWN parent resolution (the create site).
+    int r = ext2_write_file(path, (const uint8_t*)"", 0, cred);
     // Phase 7C: invalidate any negative dentry that cached ENOENT
     // at this path.  After create, the path exists — future lookups
     // should re-resolve and install a positive dentry.
@@ -2673,7 +2688,7 @@ int ext2_create(const char* path) {
 // ── ext2_truncate ─────────────────────────────────────────────────────────
 // Truncate file to zero bytes.
 int ext2_truncate(const char* path) {
-    return ext2_write_file(path, (const uint8_t*)"", 0);
+    return ext2_write_file(path, (const uint8_t*)"", 0, NULL);  // existing file: no create-perm check
 }
 
 // ── ext2_truncate_to ──────────────────────────────────────────────────────
@@ -2708,7 +2723,7 @@ int ext2_truncate_to(const char* path, uint64_t length) {
         int64_t n = vfs_read(f, buf, new_size);
         vfs_close(f);
         if (n < 0) { kfree(buf); return 0; }
-        int r = ext2_write_file(path, buf, new_size);
+        int r = ext2_write_file(path, buf, new_size, NULL);  // existing file: no create-perm check
         kfree(buf);
         return r;
     } else {
@@ -2722,7 +2737,7 @@ int ext2_truncate_to(const char* path, uint64_t length) {
         if (n < 0) { kfree(buf); return 0; }
         // Zero the extended region.
         for (uint32_t i = cur_size; i < new_size; i++) buf[i] = 0;
-        int r = ext2_write_file(path, buf, new_size);
+        int r = ext2_write_file(path, buf, new_size, NULL);  // existing file: no create-perm check
         kfree(buf);
         return r;
     }
@@ -2737,6 +2752,26 @@ int ext2_truncate_to(const char* path, uint64_t length) {
 #include "perm.h"
 #include "cred.h"
 #include "errno.h"
+
+// ── ext2_dir_write_ok ───────────────────────────────────────────────────────
+// Returns 0 iff `cred` (a cred_t*) may create/remove directory entries in
+// directory inode `dir_ino` -- i.e. write+exec on the dir -- else a negative
+// errno.  The mutating ops (unlink/mkdir/rename/create-via-write_file) call this
+// on the SAME parent inode they themselves resolved and are about to modify, so
+// the permission decision and the modification are on ONE resolution.  That
+// closes the path-TOCTOU: the syscall-layer check resolves the parent
+// separately, and a concurrent rename of an intermediate path component could
+// otherwise make the op act on a different parent than was permission-checked.
+static int ext2_dir_write_ok(uint32_t dir_ino, const void* cred) {
+    ext2_inode_t din;
+    if (!read_inode(dir_ino, &din)) return -ENOENT;
+    inode_perm_t ip = {
+        .uid = din.i_uid, .gid = din.i_gid,
+        .mode = din.i_mode & 0x1FF,
+        .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
+    };
+    return vfs_check_perm(&ip, (const cred_t*)cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+}
 
 // Phase 7B: dcache-accelerated path walk.
 //
@@ -2844,7 +2879,7 @@ uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out) {
 
 // ── ext2_mkdir ────────────────────────────────────────────────────────────
 
-int ext2_mkdir(const char* path) {
+int ext2_mkdir(const char* path, const void* cred) {
     if (!s_mounted) return 0;
 
     // Check it doesn't already exist.
@@ -2856,6 +2891,11 @@ int ext2_mkdir(const char* path) {
 
     uint32_t parent_ino = path_to_inode(md_parent);
     if (!parent_ino) return 0;
+
+    // Write+exec on the resolved parent, BEFORE allocating anything (so a denial
+    // leaks nothing) and on the same parent_ino we dir_add_entry into below --
+    // closes the path-TOCTOU vs the syscall-layer check's separate resolution.
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
 
     // Allocate inode.
     uint32_t new_ino = alloc_inode();
@@ -3010,7 +3050,7 @@ void ext2_link_drop_selftest(void) {
 
 // ── ext2_unlink ───────────────────────────────────────────────────────────
 // Remove a regular file at `path`.  Returns 1 on success, 0 on failure.
-int ext2_unlink(const char* path) {
+int ext2_unlink(const char* path, const void* cred) {
     if (!s_mounted || !path) return 0;
 
     uint32_t ino = path_to_inode(path);
@@ -3022,6 +3062,11 @@ int ext2_unlink(const char* path) {
 
     uint32_t parent_ino = path_to_inode(ul_parent);
     if (!parent_ino) return 0;
+
+    // Write+exec on the resolved parent, on the same parent_ino we
+    // dir_remove_entry from below -- closes the path-TOCTOU vs the syscall-layer
+    // check's separate resolution (a swapped intermediate dir is now denied).
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
 
     // Lock the target inode for the whole link-count decrement +
     // possible free.  A concurrent open() that snapshots inode.i_dtime
@@ -3063,7 +3108,7 @@ int ext2_unlink(const char* path) {
 // exists at both names (or both nowhere).  rename is a control-plane
 // operation — taking a single global lock for it is what Linux does
 // and is fine for any reasonable workload.
-int ext2_rename(const char* src, const char* dst) {
+int ext2_rename(const char* src, const char* dst, const void* cred) {
     if (!s_mounted || !src || !dst) return 0;
 
     spin_lock(&s_rename_lock);
@@ -3089,6 +3134,17 @@ int ext2_rename(const char* src, const char* dst) {
     if (!dst_base || dst_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
     if (!dst_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
+
+    // Write+exec on BOTH resolved parents -- removing the src entry needs write
+    // on the src parent, adding the dst entry needs write on the dst parent.
+    // Checked here on the same inodes the op modifies (closes the path-TOCTOU),
+    // AND closes the gap where sys_rename only checked the SRC parent so a
+    // rename INTO a no-write directory wrongly succeeded.
+    if (cred && (ext2_dir_write_ok(src_parent_ino, cred) != 0 ||
+                 ext2_dir_write_ok(dst_parent_ino, cred) != 0)) {
+        spin_unlock(&s_rename_lock);
+        return 0;
+    }
 
     // If dst exists as a regular file, unlink it under its inode lock.
     uint32_t dst_ino = path_to_inode(dst);
@@ -3172,4 +3228,39 @@ int ext2_rename(const char* src, const char* dst) {
 
     spin_unlock(&s_rename_lock);
     return 1;
+}
+
+// Deterministic guard for the SCAN #11 path-TOCTOU fix (F129): exercise the
+// mutating ops with a ROOT cred and assert the in-op write+exec permission
+// check (now on the op's OWN resolved parent) does NOT block allowed access and
+// that create/unlink/mkdir/rename perform their state transitions.  Proves the
+// fix did not break normal (authorized) file mutation -- the part a clean boot
+// alone does not strongly exercise.  Self-cleaning (the one leftover scratch dir
+// is harmless; the disk image is rebuilt from the source tree each boot).
+void ext2_perm_op_selftest(void) {
+    extern void kprintf(const char*, ...);
+    if (!s_mounted) { kprintf("[fs_permop] SKIP (ext2 not mounted)\n"); return; }
+    int fails = 0;
+    cred_t root;
+    __builtin_memset(&root, 0, sizeof root);   // euid/egid 0 -> root, passes write+exec
+
+    // create -> resolves -> unlink -> gone.
+    if (!ext2_create("/__fsperm_a", &root))      fails++;
+    if (!path_to_inode("/__fsperm_a"))           fails++;
+    if (!ext2_unlink("/__fsperm_a", &root))      fails++;
+    if (path_to_inode("/__fsperm_a"))            fails++;
+
+    // mkdir -> resolves (no rmdir primitive; the dir is harmless this boot).
+    if (!ext2_mkdir("/__fsperm_d", &root))       fails++;
+    if (!path_to_inode("/__fsperm_d"))           fails++;
+
+    // create -> rename a->b -> old gone, new present -> unlink b.
+    if (!ext2_create("/__fsperm_s", &root))                fails++;
+    if (!ext2_rename("/__fsperm_s", "/__fsperm_t", &root)) fails++;
+    if (path_to_inode("/__fsperm_s"))                      fails++;
+    if (!path_to_inode("/__fsperm_t"))                     fails++;
+    if (!ext2_unlink("/__fsperm_t", &root))               fails++;
+
+    kprintf(fails ? "[fs_permop] SELF-TEST FAILED\n"
+                  : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rename via in-op perm check)\n");
 }
