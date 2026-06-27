@@ -2864,10 +2864,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     (MED, mm) vmm.c isr14_page_fault kernel demand-map (~1216): `vmm_page_map(...)` return is UNCHECKED -- on a
       double-OOM (the leaf frame allocs but an intermediate PT page cannot) the leaf frame is neither mapped nor
       freed -> one-page leak. Rare (near-OOM in kernel space). FIX: check the return, pmm_buddy_free(frame) on fail.
-    (MED, proc) process.c task_create_user (~387) and task_create_kthread (~353): on task_mm_alloc failure they
-      kfree(t) but LEAK the vmm_alloc_pml4() frame (and task_create_user also leaks the mm_create() mm_t); plus
-      task_create_user NULL-derefs if mm_create() returns NULL (task_mm_alloc(pml4, NULL) succeeds -> mm_vma_add NULL).
-      The reference-correct sibling is task_fork (frees mm_destroy + vmm_free_user + pmm_buddy_free + kfree). OOM-only.
+    *** FIXED F140 (2026-06-27): process.c task_create_user (~387) and task_create_kthread (~353) leaked the
+      vmm_alloc_pml4() frame (+ the mm_create() mm_t in the user case) on task_mm_alloc failure, NULL-deref'd if
+      mm_create() returned NULL (task_mm_alloc(pml4, NULL) succeeded -> mm_vma_add NULL-deref), and never guarded
+      vmm_alloc_pml4()==PMM_INVALID_ADDR. Fixed by extracting task_create_unwind(t, pml4, mm) (single source of truth,
+      matching task_fork) + a pml4-OOM guard + an mm_create-NULL guard before task_mm_alloc; task_fork's 3 hand-rolled
+      unwind sites were converted to the same helper. Code-proof + no-regression boot (task_create_user/kthread/fork
+      all exercised: userspace spawned, 84 selftests, 0 faults).
     (MED, net) tcp.c (~466): an ESTABLISHED child PCB (+128 KiB ring buffers) is DROPPED (fall-through, not early
       return) when the accept backlog is full, but the SYN-flood reaper only matches SYN_RCVD orphans, so the
       established orphan leaks on s_pcb_head forever. Remotely triggerable (complete > TCP_BACKLOG handshakes while

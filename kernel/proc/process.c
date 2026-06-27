@@ -341,6 +341,21 @@ static void task_init_common(task_t* t, uint32_t pid, uint32_t flags,
     __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
 }
 
+// PRIMITIVE (task-create unwind).  Single source of truth for the "allocated a
+// PML4 frame (+ maybe an mm_t), a later step failed" cleanup shared by
+// task_create_kthread / task_create_user / task_fork -- drop the mm_t if any,
+// free the user page tables + the PML4 frame, then free the task_t.  Hand-rolling
+// this sequence is exactly how two create paths used to LEAK the PML4 frame + mm.
+// `pml4` MUST be a valid frame (the PMM_INVALID_ADDR alloc-failure case is handled
+// by the caller before any mm exists, with a bare kfree(t)); `mm == NULL` is valid
+// (kernel threads, and the failure points reached before an mm is built).
+static void task_create_unwind(task_t* t, phys_addr_t pml4, mm_t* mm) {
+    if (mm) mm_destroy(mm);
+    vmm_free_user(pml4);
+    pmm_buddy_free(pml4, 0);
+    kfree(t);
+}
+
 // ── task_create_kthread ───────────────────────────────────────────────────
 task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     task_t* t = kmalloc(sizeof(task_t));
@@ -350,8 +365,12 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
     // (see the exec paths' history of init drift); explicit inits override.
     __builtin_memset(t, 0, sizeof(*t));
 
-    task_mm_t* mm = task_mm_alloc(vmm_alloc_pml4(), NULL);
-    if (!mm) { kfree(t); return NULL; }
+    // Capture the PML4 so it can be freed on the task_mm_alloc failure below
+    // (it used to be passed inline to task_mm_alloc and leaked on failure).
+    phys_addr_t pml4 = vmm_alloc_pml4();
+    if (pml4 == PMM_INVALID_ADDR) { kfree(t); return NULL; }
+    task_mm_t* mm = task_mm_alloc(pml4, NULL);
+    if (!mm) { task_create_unwind(t, pml4, NULL); return NULL; }
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(mm); kfree(t); return NULL; }
@@ -385,9 +404,15 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
     __builtin_memset(t, 0, sizeof(*t));
 
     phys_addr_t pml4 = vmm_alloc_pml4();
+    if (pml4 == PMM_INVALID_ADDR) { kfree(t); return NULL; }
     mm_t* mm = mm_create();
+    // mm_create() returns NULL on OOM; task_mm_alloc(pml4, NULL) would SUCCEED
+    // and the mm_vma_add(mm, ...) below would then NULL-deref.  Fail here, freeing
+    // the PML4 frame (which used to be leaked along with the mm on task_mm_alloc
+    // failure too).
+    if (!mm) { task_create_unwind(t, pml4, NULL); return NULL; }
     task_mm_t* tmm = task_mm_alloc(pml4, mm);
-    if (!tmm) { kfree(t); return NULL; }
+    if (!tmm) { task_create_unwind(t, pml4, mm); return NULL; }
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
@@ -657,7 +682,7 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     if (!vmm_clone_user_ex(new_pml4, parent->mm_shared->pml4_phys,
                            parent->mm_shared->mm)) {
-        vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        task_create_unwind(t, new_pml4, NULL);
         return NULL;
     }
 
@@ -675,13 +700,13 @@ task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint6
 
     mm_t* new_mm = mm_clone(parent->mm_shared->mm);
     if (!new_mm) {
-        vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        task_create_unwind(t, new_pml4, NULL);
         return NULL;
     }
 
     task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
     if (!tmm) {
-        mm_destroy(new_mm); vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); kfree(t);
+        task_create_unwind(t, new_pml4, new_mm);
         return NULL;
     }
 

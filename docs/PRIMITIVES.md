@@ -298,6 +298,19 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   terminate -- now go through this, so the order is a single source of truth and cannot
   drift (it had: the signal path freed before unpublishing, which is what F107 fixed).
   `task_files_drop_selftest` proves the unpublish + single-release on a refs==2 table.
+- `task_create_unwind(task_t* t, phys_addr_t pml4, mm_t* mm)` (kernel/proc/process.c, F140)
+  -- single source of truth for the "a task-create path allocated a PML4 frame (+ maybe an
+  mm_t), a later step failed" cleanup: `if (mm) mm_destroy(mm); vmm_free_user(pml4);
+  pmm_buddy_free(pml4, 0); kfree(t);`. task_create_kthread / task_create_user / task_fork
+  each hand-rolled this; two of them had DRIFTED and leaked the PML4 frame (+ mm_t) on
+  task_mm_alloc failure (and task_create_user NULL-deref'd on an mm_create OOM by calling
+  task_mm_alloc with a NULL mm). All three now call this one helper, with a separate
+  `pml4 == PMM_INVALID_ADDR` early-fail (bare kfree(t), no frame to free) and, for the user
+  path, an `mm_create()==NULL` guard BEFORE task_mm_alloc. Forbidden raw pattern: hand-rolled
+  `vmm_free_user(p); pmm_buddy_free(p,0); kfree(t)` on a create error path -- use this. (The
+  refcount-0 release of a CONSTRUCTED task_mm_t is the different task_mm_release / F-era path,
+  which uses vmm_free_user_ex and is NOT this.) No selftest (alloc/OOM unwind, frees real
+  resources) -- code-proof + the boot exercising kthread/user/fork success paths.
   This is the "unpublish-before-RCU-deferred-free" ordering primitive: apply it wherever a
   pointer to an RCU-freed object is cleared around the deferred free.
 
