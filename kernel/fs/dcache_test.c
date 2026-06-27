@@ -223,3 +223,40 @@ void dcache_race_selftest(void) {
         for (;;) __asm__ volatile("cli; hlt");
     }
 }
+
+// Guard for the F131 fix: dcache_invalidate must NOT free a dentry a path walk
+// holds by refcount -- it hash-unlinks (so future lookups miss + re-resolve) but
+// leaves the held dentry alive + usable; only the holder's final dcache_put
+// drops it to the LRU, where the shrinker reclaims it.  The old code call_rcu-
+// freed unconditionally, so the holder's later child_ino read + dcache_put hit
+// freed memory.  Single-threaded behavioral check (the cross-CPU freed-write is
+// code-proven + boot-exercised): hold a ref across an invalidate and confirm
+// future lookups miss yet the held dentry stays intact + puttable.
+void dcache_held_invalidate_selftest(void) {
+    extern void kprintf(const char*, ...);
+    const char* name = "__dcache_held_inval__";
+    uint32_t nlen = 0; while (name[nlen]) nlen++;
+    uint32_t nhash = dcache_name_hash(name, nlen);
+    const uint32_t pino = 0x7A11u, cino = 0xC0FFEEu;
+    int fails = 0;
+
+    dentry_t* d = dcache_install(NULL, pino, name, nlen, nhash, cino);
+    if (!d) { kprintf("[dcache_held] FAILED: install returned NULL\n"); return; }
+    // A path walk holds a SECOND reference (refcount now 2).
+    dentry_t* held = dcache_lookup(pino, name, nlen, nhash);
+    if (held != d) fails++;
+
+    // Invalidate while held: hash-unlink (lookups miss) but do NOT free d.
+    dcache_invalidate(pino, name, nlen);
+
+    dentry_t* post = dcache_lookup(pino, name, nlen, nhash);
+    if (post) { fails++; dcache_put(post); }            // future lookups must miss
+    if (!held || held->child_ino != cino) fails++;       // held dentry intact + usable
+
+    // Drop both refs -> d goes on the LRU (orphaned), the shrinker reclaims it.
+    dcache_put(held);
+    dcache_put(d);
+
+    kprintf(fails ? "[dcache_held] SELF-TEST FAILED\n"
+                  : "[dcache_held] SELF-TEST PASSED (held dentry survives invalidate, hash-unlinked)\n");
+}

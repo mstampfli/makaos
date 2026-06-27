@@ -450,6 +450,34 @@ static void dentry_unlink_and_free_locked(dcache_table_t* tbl, dentry_t* d) {
     call_rcu_head(&d->rcu_head, dentry_free_cb, d);
 }
 
+// Invalidate (writer holds g_dcache_wlock): make future lookups miss, and free
+// the dentry -- but ONLY if no path walk currently holds it.  The old code
+// call_rcu-freed UNCONDITIONALLY, so a dentry that dcache_lookup handed out
+// (refcount-pinned, NOT rcu-pinned -- dcache_lookup rcu_read_unlocks before
+// returning) could be freed while its holder still read child_ino + dcache_put'd
+// it -> a freed read + a freed refcount-- WRITE into a reused SLAB_TYPESAFE_BY_RCU
+// slot (cascading dentry UAF + LRU corruption).  Mirror the shrinker's discipline:
+// CAS refcount 0 -> DYING claims an UNREFERENCED dentry (the serialization point
+// vs a concurrent dcache_put's last-ref LRU-add) and frees it immediately, as
+// before.  If the CAS fails the dentry is HELD: do NOT free it -- just unlink it
+// from the hash (the invalidate's real purpose: future lookups miss and
+// re-resolve), and let the holder's final dcache_put return it to the LRU at
+// refcount 0, where the shrinker reclaims it later via its own 0 -> DYING CAS.
+static void dentry_invalidate_locked(dcache_table_t* tbl, dentry_t* d) {
+    uint32_t expect = 0;
+    if (__atomic_compare_exchange_n(&d->refcount, &expect, DCACHE_REF_DYING,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        dentry_unlink_and_free_locked(tbl, d);   // unreferenced: free now, as before
+        return;
+    }
+    // Held by a path walk -- hash-unlink only, never free here.
+    uint32_t b = dcache_bucket(d->parent_ino, d->name_hash, tbl->cap);
+    dentry_t** pp = &tbl->buckets[b];
+    while (*pp && *pp != d) pp = &(*pp)->hash_next;
+    if (*pp) rcu_assign_pointer(*pp, d->hash_next);
+    __atomic_fetch_add(&s_stat_invalidations, 1u, __ATOMIC_RELAXED);
+}
+
 void dcache_invalidate(uint32_t parent_ino, const char* name,
                         uint32_t name_len) {
     uint32_t name_hash = dcache_name_hash(name, name_len);
@@ -459,7 +487,7 @@ void dcache_invalidate(uint32_t parent_ino, const char* name,
     uint32_t b = dcache_bucket(parent_ino, name_hash, tbl->cap);
     dentry_t* d = bucket_find_locked(tbl, b, parent_ino, name,
                                       name_len, name_hash);
-    if (d) dentry_unlink_and_free_locked(tbl, d);
+    if (d) dentry_invalidate_locked(tbl, d);
     spin_unlock_irqrestore(&g_dcache_wlock, f);
 }
 
@@ -473,7 +501,7 @@ void dcache_invalidate_subtree(uint32_t dir_ino) {
         while (d) {
             dentry_t* next = d->hash_next;
             if (d->parent_ino == dir_ino) {
-                dentry_unlink_and_free_locked(tbl, d);
+                dentry_invalidate_locked(tbl, d);
             }
             d = next;
         }

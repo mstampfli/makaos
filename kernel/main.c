@@ -619,6 +619,13 @@ static void init_kthread(void) {
     extern void dcache_race_selftest(void);
     dcache_race_selftest();
 
+    // Audit fix F131: dcache_invalidate must not free a dentry a path walk
+    // holds by refcount -- hash-unlink only, let the last dcache_put + shrinker
+    // reclaim it.  Hold a ref across an invalidate; confirm lookups miss yet the
+    // held dentry stays intact.
+    extern void dcache_held_invalidate_selftest(void);
+    dcache_held_invalidate_selftest();
+
     // Phase 8D: io_uring kernel-side acceptance — NOP pipeline +
     // ns/op steady-state measurement.  Userland test binary lives
     // at /bin/test_io_uring for interactive testing.

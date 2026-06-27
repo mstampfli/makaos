@@ -2691,16 +2691,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     return/loop, making the read path's c->reader handling exhaustive (mirrors signalfd_disown_all + the producer's
     own clear). Verified: code-proof + [evdev_ring] boot-exercise.
   RECORDED (NEW, queued for follow-up):
-    (HIGH) dcache_invalidate frees a dentry UNCONDITIONALLY (dcache.c:450 dentry_unlink_and_free_locked ->
-      call_rcu_head, NO refcount check) while a path-walk holds it by refcount alone OUTSIDE rcu (dcache_lookup
-      rcu_read_unlocks before returning the handle; ext2_lookup_path reads d->child_ino + dcache_put after a
-      preemption point) -> on a hit racing a concurrent unlink/rename/create/mkdir on the same (parent,name), the
-      grace period can close and free d before the holder's dcache_put -> a freed read of child_ino + a freed WRITE
-      (dcache_put's refcount-- into a reallocated SLAB_TYPESAFE_BY_RCU slot can drive a DIFFERENT live dentry to 0 ->
-      cascading UAF + LRU corruption). The SHRINKER path was hardened (DCACHE_REF_DYING CAS); the invalidate path was
-      NOT -- a genuine asymmetry. FIX: make dcache_invalidate/_subtree honor the refcount (mark dying + let the last
-      dcache_put free, like the shrinker) instead of unconditional call_rcu. A strong next-turn candidate (HIGH,
-      unprivileged, clean fix-by-analogy to the shrinker).
+    FIXED (F131): dcache_invalidate freed a dentry UNCONDITIONALLY (dentry_unlink_and_free_locked -> call_rcu_head,
+      NO refcount check) while a path-walk held it by refcount alone OUTSIDE rcu (dcache_lookup rcu_read_unlocks
+      before returning the refcount-pinned handle) -> on a hit racing a concurrent unlink/rename/create/mkdir on the
+      same (parent,name), the grace period closes and frees d before the holder's dcache_put -> a freed read of
+      child_ino + a freed refcount-- WRITE into a reused SLAB_TYPESAFE_BY_RCU slot (cascading dentry UAF + LRU
+      corruption). The SHRINKER was hardened (DCACHE_REF_DYING CAS); invalidate was the asymmetric gap. FIX (by
+      analogy to the shrinker): dentry_invalidate_locked CAS's refcount 0 -> DYING -- success (unreferenced) frees
+      now as before; failure (HELD) hash-unlinks ONLY (lookups miss) and lets the holder's last dcache_put drop it to
+      the LRU where the shrinker reclaims it. Verified: new dcache_held_invalidate_selftest (hold a ref across an
+      invalidate -> lookups miss, held dentry intact) + [dcache_test]/[dcache_race] still pass + heavy boot dcache use.
     (MED) socket_bind RCU-frees the old TCP s->pcb (socket.c:338 tcp_pcb_free, then s->pcb=0) while another thread on
       the same shared fd derefs s->pcb in sock_poll/connect/send/recv/listen/shutdown OUTSIDE rcu_read_lock --
       socket_bind does NOT drop the file ref, so it is not serialized vs in-flight users, and these readers take no
@@ -2728,6 +2728,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     signalfd last-ref free + signalfd_disown_all; pty/tty/drm/ahci/nvme refcount or static), mm+proc (mm_destroy /
     sched lists save-next; zombies rq_lock-pinned; task_free_rcu orders disown-before-free; futnext captured before
     the RELEASE store; fault path trygets under rcu). The subsystems are overwhelmingly lifetime-correct.
-  SCAN #12 SUBSTANTIALLY COMPLETE: the cleanest HIGH UAF (evdev dangling task) FIXED (F130). The HIGH dcache_invalidate
-    UAF is the strongest recorded follow-up (clean fix-by-analogy to the shrinker). Next: dcache_invalidate, OR the
-    MED socket_bind pcb UAF, OR continue/advance per the re-arm.
+  SCAN #12 STATUS: the two HIGH UAFs FIXED -- evdev dangling-task (F130) and dcache_invalidate unconditional-free
+    (F131, with a new dcache_held_invalidate selftest). Remaining: the MED socket_bind pcb UAF (RCU-protect s->pcb /
+    serialize control ops -- a clean next candidate), the LOW/latent mm_clone tryget + signal_setup_frame rcu_read_lock,
+    and the FLAGGED do_switch switching_from item (needs a runtime poison-on-free check before fixing). Next: the MED
+    socket_bind pcb UAF, OR advance to SCAN #13-as-a-type (lock-ordering/deadlock, OR a recorded residual).
