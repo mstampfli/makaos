@@ -2871,10 +2871,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       matching task_fork) + a pml4-OOM guard + an mm_create-NULL guard before task_mm_alloc; task_fork's 3 hand-rolled
       unwind sites were converted to the same helper. Code-proof + no-regression boot (task_create_user/kthread/fork
       all exercised: userspace spawned, 84 selftests, 0 faults).
-    (MED, net) tcp.c (~466): an ESTABLISHED child PCB (+128 KiB ring buffers) is DROPPED (fall-through, not early
-      return) when the accept backlog is full, but the SYN-flood reaper only matches SYN_RCVD orphans, so the
-      established orphan leaks on s_pcb_head forever. Remotely triggerable (complete > TCP_BACKLOG handshakes while
-      accept() is slow). Documented as a known drop. FIX: tcp_close + tcp_pcb_free (or RST) the child on !queued.
+    *** FIXED F141 (2026-06-27): tcp.c (~466) ESTABLISHED child PCB (+128 KiB rings) DROPPED on a full accept backlog
+      (accept_q_push false fall-through) -> orphan leaks on s_pcb_head forever (the SYN_RCVD-only reaper never matches
+      it). Remotely triggerable (complete > TCP_BACKLOG handshakes faster than accept() drains) = the only remote-
+      reachable SCAN #15 leak. Fixed: on the not-queued branch (backlog full OR listener gone) send a RST and
+      tcp_pcb_free(pcb) -- safe under tcp_recv's rcu_read_lock (RCU-deferred free, pcb untouched after the break), no
+      double-free (reaper SYN_RCVD-only, establish single-CPU under s_pcb_wlock). Code-proof + boot (5 tcp selftests
+      PASSED, DHCP, 0 faults); the two sub-behaviors are already selftested (accept_q_push-full, tcp_pcb_free teardown).
     (MED, drivers) virtio_gpu.c vgpu_setup_scanout_buffer (~785): a host resource_create'd res_id is NOT destroyed on
       a later attach_backing / set_scanout failure (resource_create-without-destroy). virtq_alloc (~224) leaks the
       earlier 1-2 desc/avail frames on a later page-alloc failure. drm.c vfs_drm_open (~2620) over-counts

@@ -464,11 +464,35 @@ void tcp_recv(skbuff_t* skb) {
             // Move to listener's accept queue under the LISTENER's lock (it
             // races accept()'s dequeue); wake accept() OUTSIDE the lock.
             tcp_pcb_t* lst = pcb->listener;
-            if (establish && lst) {
-                tcp_pcb_lock(lst);
-                bool queued = accept_q_push(lst, pcb);
-                tcp_pcb_unlock(lst);
-                if (queued) pcb_wake(lst);
+            if (establish) {
+                bool queued = false;
+                if (lst) {
+                    tcp_pcb_lock(lst);
+                    queued = accept_q_push(lst, pcb);
+                    tcp_pcb_unlock(lst);
+                }
+                if (queued) {
+                    pcb_wake(lst);
+                } else {
+                    // Accept backlog full (accept_q_push == false) or the listener
+                    // is gone (lst NULLed by its own tcp_pcb_free): this just-
+                    // established child is orphaned -- sock_file == NULL and not on
+                    // any accept queue, so the SYN_RCVD-only half-open reaper never
+                    // matches it and it would leak on s_pcb_head forever (+ its
+                    // ~128 KiB tx/rx rings; a remote peer completing > TCP_BACKLOG
+                    // handshakes faster than accept() drains is a memory DoS).
+                    // Refuse the peer with a RST and free the child via the
+                    // RCU-deferred teardown.  Safe under tcp_recv's rcu_read_lock:
+                    // tcp_pcb_free unlinks + call_rcu-defers, and the code after the
+                    // switch never touches pcb again (just rcu_read_unlock + skb_free),
+                    // so the free lands after this reader section ends.  The reaper
+                    // (SYN_RCVD only) and a concurrent retransmit (handled by the
+                    // ESTABLISHED case, which never re-establishes) cannot double-free it.
+                    tcp_send_rst(pcb->local_ip, pcb->local_port,
+                                 pcb->remote_ip, pcb->remote_port,
+                                 pcb->snd_nxt, pcb->rcv_nxt);
+                    tcp_pcb_free(pcb);
+                }
             }
         }
         break;
