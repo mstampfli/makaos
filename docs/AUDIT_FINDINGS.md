@@ -2620,15 +2620,26 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     fd_table_init-ignored NULL-deref); resolve_stdio (which also DOUBLE-FETCHED the slot) reads it once under the
     lock. New fd_table_clone_selftest + heavy boot-exercise (every spawn clones through it; login + DHCP prove it).
   RECORDED (real, queued for follow-up turns):
-    sys_spawn stdio double-fetch (syscall.c:1471) -- HIGH-ish DoS, ONE-LINE fix, do NEXT: after copy_from_user'ing
-      stdio[3] into a kernel local (1375), the job-control branch RE-READS `((const int*)stdio_ptr)[0]` from user
-      memory instead of the snapshot stdio[0]; a sibling thread munmap's the page during the wide elf_exec_from_ext2
-      window -> the raw read #PF-panics the kernel (unprivileged DoS, no fault-fixup). Fix = test stdio[0].
+    FIXED (F127): sys_spawn stdio double-fetch (syscall.c:1471) -- unprivileged kernel #PF panic. After
+      copy_from_user'ing stdio[3] into a kernel local (1375, EFAULT on a bad ptr), the job-control branch RE-READ
+      `((const int*)stdio_ptr)[0]` raw from user memory; a sibling thread munmap's the page during the wide
+      elf_exec_from_ext2 window -> the raw read #PF-panics the kernel (no fault-fixup). FIX: replaced with
+      `if (stdio[0] == -1)` (the validated snapshot -- equivalent: -1 default covers the NULL case). Verified:
+      code-proof + boot (svcmgr/login spawn through this path; login renders, ctty granted).
     TCP lost-wakeup (tcp.c, 4 sites: tcp_recv_data:865, tcp_send:817, socket_accept:369, socket_connect:449) -- MED
-      hang/DoS. Each checks its wait condition, then publishes pcb->waiter, then sched_sleep WITHOUT re-checking the
-      condition after publishing; pcb_wake only wakes a non-NULL waiter, so a wake landing in the check->publish gap
-      is lost -> recv/send/accept/connect hangs with the condition already true. The canonical WAIT_EVENT_HOOK
-      (wait.h) does publish-then-RE-CHECK; these 4 hand-rolled waits omit it. Fix = add the recheck-after-publish.
+      hang/DoS, VERIFIED REAL but DEFERRED to a dedicated turn (the correct fix is a refactor, not a one-liner).
+      Each consumer checks its wait condition, then publishes pcb->waiter (plain store), then sched_sleep WITHOUT
+      re-checking; pcb_wake gates the wake on a plain-read pcb->waiter, so a wake landing in the check->publish gap is
+      lost -> recv/send/accept/connect hangs with the condition already true. The sched_sleep wake_pending interlock
+      CANNOT help: the wake is dropped at pcb_wake BEFORE sched_wake is ever called. A minimal publish-then-recheck is
+      INSUFFICIENT: pcb->waiter has no common lock, so consumer `store waiter; load cond` vs producer `store cond;
+      load waiter` is a store-load (Dekker) pattern needing explicit seq_cst fences on BOTH sides on x86 TSO -- subtle
+      and error-prone. The ROOT fix is to converge all 4 onto the lock-serialized wait_queue + WAIT_EVENT_HOOK
+      (wait.h), which is correct-by-construction (rq_lock + the queue serialize publish-vs-wake, no hand-rolled
+      fences) and also fixes the pcb->waiter single-waiter limit -- but that refactors the core net blocking paths
+      (pcb struct + pcb_wake + 4 sites across tcp.c/socket.c) whose blocking-with-contention is NOT boot-exercised, so
+      it needs a DEDICATED turn WITH a real blocking-wait test harness (a regression would HANG TCP, worse than the
+      rare race). NEXT after the path-TOCTOU, or whenever a TCP blocking-wait test can be built.
     Path TOCTOU on unlink/rename/mkdir/open+O_CREAT (syscall.c + ext2.c) -- HIGH impact, race-gated, INVASIVE fix.
       The syscall-level permission check resolves+validates the parent, then the ext2 op RE-resolves the path from
       scratch with no perm re-check; a concurrent rename of an intermediate component swaps the target -> a
@@ -2645,6 +2656,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     use; UDP recv re-checks head under the lock after wake; unix peer is RCU+refcount; F119 establish-vs-reap under
     s_pcb_wlock), fs (dcache_lookup returns a refcounted handle held across the use; bcache_get pins; proc uses
     RCU-snapshot+vfs_tryget; existing-file open/exec resolve-once-to-inode-number; copy_path_from_user single-fetch).
-  SCAN #11 SUBSTANTIALLY COMPLETE: the fd-table lookup-then-use UAF FIXED (F126) with a new mechanism + unit test;
-    io_uring (the prime double-fetch surface) verified clean. Next: SCAN #12-as-a-type, OR knock off the recorded
-    one-line sys_spawn stdio double-fetch (a clean DoS fix) before the bigger TCP-lost-wakeup / path-TOCTOU items.
+  SCAN #11 STATUS: the fd-table lookup-then-use UAF FIXED (F126, new mechanism + unit test) and the sys_spawn stdio
+    double-fetch FIXED (F127); io_uring (the prime double-fetch surface) verified clean. TWO recorded TOCTOU items
+    remain, both needing a dedicated turn: (1) the TCP blocking-wait lost-wakeup (4 sites -- wait_queue/WAIT_EVENT_HOOK
+    convergence + a blocking-wait test harness), and (2) the HIGH path-TOCTOU on unlink/rename/mkdir/open+O_CREAT
+    (resolve-once-to-inode redesign). Next: tackle one of those two as a focused turn, OR advance to SCAN #12-as-a-type
+    (use-after-free distinct from double-free, OR lock-ordering/deadlock, OR a recorded residual: socket_bind port-0
+    overload, the ignored-OOM-return cluster, io_uring DRM_COMMIT fdput leak, ahci_submit_sg READ_POISON).

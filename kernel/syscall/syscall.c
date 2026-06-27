@@ -1468,7 +1468,14 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // give the terminal to the child's process group immediately.
     // This is what a proper shell does after fork+exec: tcsetpgrp(tty, child_pgid).
     // Without this, bash detects it's not in the foreground and spins on SIGTTOU.
-    if (!stdio_ptr || (((const int*)stdio_ptr)[0] == -1)) {
+    // Use the validated kernel snapshot stdio[0], NOT a second raw read of the
+    // user pointer: stdio[] already holds the copy_from_user'd specs (and the
+    // {-1,-1,-1} default when stdio_ptr is NULL), so stdio[0]==-1 covers both
+    // the NULL and the inherit case.  The old `((const int*)stdio_ptr)[0]`
+    // re-fetched user memory across the wide elf_exec window -- a sibling thread
+    // could munmap the page (raw #PF -> unprivileged kernel panic) or flip the
+    // value (TOCTOU vs the snapshot the child was actually built from).
+    if (stdio[0] == -1) {
         tty_t* tty = tty_get_ctty();
         if (!tty) tty = &g_tty0;
         tty->fg_pgid = child->pgid;
