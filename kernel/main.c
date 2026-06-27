@@ -719,6 +719,12 @@ static void init_kthread(void) {
     extern void tcp_synreap_selftest(void);
     tcp_synreap_selftest();
 
+    // UDP send-size guard: an oversize user length must be rejected (-EMSGSIZE)
+    // before the user-u32 -> uint16_t UDP-length narrowing wraps and under-sizes
+    // the skb (which NULL-derefs on the unchecked skb_put -- an unprivileged DoS).
+    extern void udp_send_size_selftest(void);
+    udp_send_size_selftest();
+
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();

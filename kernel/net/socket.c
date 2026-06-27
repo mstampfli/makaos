@@ -480,8 +480,9 @@ int socket_send(vfs_file_t* f, const void* buf, uint32_t len) {
     int ar = udp_auto_bind(s);
     if (ar < 0) return ar;
     int r = udp_send(s->udp_peer_ip, s->local_port, s->udp_peer_port,
-                      buf, (uint16_t)len);
-    return (r < 0) ? -EIO : (int)len;
+                      buf, len);
+    if (r < 0) return (r == -EMSGSIZE) ? r : -EIO;   // surface "too long"
+    return (int)len;
 }
 
 // ── socket_recv ───────────────────────────────────────────────────────────
@@ -581,8 +582,9 @@ int socket_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     // server sees the correct ciaddr in the DHCP header.
     uint32_t src_ip = net_our_ip();
     int r = udp_send_ex(src_ip, dst_ip_be, s->local_port, dst_port,
-                         buf, (uint16_t)len);
-    return (r < 0) ? -EIO : (int)len;
+                         buf, len);
+    if (r < 0) return (r == -EMSGSIZE) ? r : -EIO;   // surface "too long"
+    return (int)len;
 }
 
 // ── socket_recvfrom ───────────────────────────────────────────────────────

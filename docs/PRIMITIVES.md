@@ -195,6 +195,27 @@ memset / a wild DMA base programmed into a device). One named test closes the cl
   No standalone selftest (the macro is a one-line sentinel compare; every boot
   exercises the success branch through ~4 drivers' DMA init).
 
+### G. Fixed-width wire/struct field bounds (cap BEFORE the narrowing)
+A value that will be written into a fixed-width on-the-wire or on-disk length
+field must be REJECTED if it exceeds that field's range, BEFORE it is narrowed
+into the field -- never narrowed first and bound after (the narrowing wraps and
+the post-narrow check passes a corrupt small value).  Cap at the protocol/struct
+chokepoint, carry the value full-width up to that point, and return a real errno.
+- `UDP_MAX_PAYLOAD` (kernel/net/udp.h, F123) = 65535 - IPV4_HDR_LEN - UDP_HDR_LEN
+  = 65507: the largest UDP payload that overflows NEITHER the 16-bit UDP length
+  field NOR the 16-bit IP total-length field.  `udp_send_ex` (the single sink for
+  both send/sendto) takes a full-width `uint32_t len` and rejects `len >
+  UDP_MAX_PAYLOAD` with -EMSGSIZE as its FIRST statement, so the later
+  `(uint16_t)(UDP_HDR_LEN + len)` cannot wrap.  `udp_send_size_selftest` drives
+  the boundary + the old wrap values {65528,65535,...}.
+- IP total-length backstop (kernel/net/ipv4.c, F123): `if (skb->len > 0xFFFF -
+  IPV4_HDR_LEN) return -EMSGSIZE;` at the top of `ipv4_send_ex` -- the UNIVERSAL
+  L3 chokepoint, so the IP total_len field cannot wrap for ANY L4 protocol
+  (one shared guard for UDP/TCP/ICMP, not a per-protocol check that can drift).
+  RULE: any new code forming a fixed-width length/size field from a wider value
+  caps the value at that field's max at the chokepoint, full-width, before the
+  narrowing cast -- mirror UDP_MAX_PAYLOAD / the ipv4_send_ex backstop.
+
 ### E. Locking idioms (concurrency primitives, not data validation)
 The recurring "publish/snapshot a whole multi-field struct under its lock so a
 lock-free reader never observes a half-written value" pattern. A plain struct

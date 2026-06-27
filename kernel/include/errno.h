@@ -39,6 +39,7 @@
 #define ENOMSG      42   // No message of desired type
 #define ENOTSOCK    88   // Socket operation on non-socket
 #define EDESTADDRREQ 89  // Destination address required
+#define EMSGSIZE    90   // Message too long
 #define ENOPROTOOPT 92   // Protocol not available
 #define EOPNOTSUPP  95   // Operation not supported on socket
 #define EAFNOSUPPORT 97  // Address family not supported

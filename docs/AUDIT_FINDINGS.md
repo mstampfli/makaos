@@ -2517,3 +2517,46 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     stale-data sentinel gap; socket_bind port-0 overload; fd_table_init/pid_alloc/mm_vma_add ignored OOM returns;
     io_uring DRM_COMMIT fdput leak) carried forward. Next: SCAN #9-as-a-type (int-truncation/sign-confusion -> OOB,
     OR TOCTOU -- the ahci_submit_sg READ_POISON gap is a strong TOCTOU/sentinel candidate -- OR a recorded residual).
+
+- 2026-06-27 BUG-TYPE SCAN #9 (integer-truncation / sign-confusion -> OOB / wrong-bound): a 64/32-bit value narrowed
+  to a smaller type before a bound check, or a signed value used unsigned, so a huge value looks small or a negative
+  one becomes huge. Distinct from the integer-OVERFLOW a*b/a+b class (checked.h, F46-F54) and the wrong-sentinel
+  SCAN #8. Swept the whole tree with 4 parallel read-only agents (net; fs+vfs; drivers+io; mm+proc+syscall). The
+  ONLY unprivileged/remote-reachable instance was the headline -- FIXED (F123); every other narrowing is bounded
+  downstream (recorded LOW/latent below).
+  FIXED (F123): UDP send-length u32->u16 truncation + 16-bit wrap -> unprivileged kernel NULL-deref panic
+    (kernel/net/udp.c + socket.c + ipv4.c). send/sendto on a SOCK_DGRAM socket with len in [65528,65535] narrowed
+    the user u32 to u16 with no size check; udp_send_ex's `(uint16_t)(UDP_HDR_LEN + len)` then wrapped (e.g.
+    65535 -> 7), under-sizing the skb so the first skb_put returned NULL and the header write #PF-panicked. FIX:
+    widened udp_send/udp_send_ex to uint32_t len + `if (len > UDP_MAX_PAYLOAD(65507)) return -EMSGSIZE` at the
+    single UDP chokepoint; a universal L3 backstop `if (skb->len > 0xFFFF - IPV4_HDR_LEN) return -EMSGSIZE` at
+    ipv4_send_ex (guards the IP total_len wrap for ALL L4 protocols); socket callers pass full-width len and surface
+    -EMSGSIZE; added EMSGSIZE(90) to errno.h. New udp_send_size_selftest (pure reject-path unit test) + DHCP proves
+    the valid path. mm/** uses == PMM_INVALID_ADDR / u64 bounds everywhere; nothing to fix there.
+  RECORDED (LOW / latent -- narrowing present but bounded downstream, NOT unprivileged OOB):
+    fs: ext2_vfs_pread `(uint32_t)offset` (ext2.c:1330) -- bounded by the u32 i_size, no OOB (wrong-offset only at
+      >4 GiB, unsupported). dir_remove_entry `(uint8_t)name_len` match vs full-width kmemeq (ext2.c:2173) -- a
+      clamp asymmetry vs dir_lookup, but every caller resolves via dir_lookup first (whose clamp rejects >255-byte
+      names), so unreachable; defense-in-depth gap. The `(uint32_t)(len-total)` read/write loop casts
+      (ext2.c:1226/1342/1427) -- clamped to remain_blk/remain_file per iteration, no OOB (stuck-loop only at an
+      exact 2^32 multiple). fat32.c -- DEAD (unwired), same patterns, unreachable.
+    mm/syscall: shmem/mmap page-count u64->u32 narrowings (syscall.c:2476/2679/5569, mm.c:371, vmm.c:1003/859) --
+      each saved by shmem_get_page's `pg_idx >= npages` hard bound (alias/SIGSEGV at >16 TiB VA, never kernel OOB).
+    drivers: NONE -- every untrusted size/index uses a checked.h/domain helper, a power-of-two ring mask, or u64
+      math (ahci xfer_bytes_ok, nvme mul_within_u32 + nvme_cid_valid, virtio_gpu vgpu_fb_bytes + scanout cap, drm
+      drm_dumb_size/drm_atomic_count_ok u64, virtio_input/evdev/pty/tty/hda ring masks, io_uring kernel-trusted
+      masks + user_buf_check). The ac97 `(uint32_t)phys` is the F121-touched OOM line + a genuine 32-bit-DMA HW
+      constraint (needs a <4 GiB DMA zone, not a bound), kernel-internal -- excluded.
+    net (sibling, same-class, now backstopped): eth.c:42 `(uint16_t)skb->len` and ipv4.c:118/126 TX `(uint16_t)`
+      total_len -- under-send/IP-total wrap, only reachable with skb->len > 65515, which no L4 caller produces after
+      the UDP cap, AND now caught by the F123 ipv4_send_ex backstop.
+  AUDITED CLEAN: net (RX paths clamp packet length fields to skb->len / ETH_MAX_FRAME; tcp dlen/hlen validated;
+    virtio_net device ids index_ok'd; arp/icmp fixed-size or skb->len-consistent; unix_sock backlog clamped), fs+vfs
+    (all on-disk ext2 fields routed through the checked.h + ext2 domain validators, mount-gated; dcache/pipe/proc/
+    virtfs bounded), drivers (see above -- uniformly bounded), mm+proc+syscall (copy_*_user form ranges in u64 via
+    ckd_add_u64; mmap_round_len overflow-safe; ELF u64 bounds-gated; fd numbers u64-vs-u32-cap; signal/argv/iovec/
+    cmsg counts range-checked). The kernel is overwhelmingly width-correct or downstream-bounded.
+  SCAN #9 SUBSTANTIALLY COMPLETE: the only unprivileged/remote truncation OOB (UDP send wrap) FIXED (F123) with a
+    new unit test. Residuals are all bounded-downstream LOW. Next: SCAN #10-as-a-type (TOCTOU/race-window -- the
+    ahci_submit_sg READ_POISON re-check gap is a strong candidate -- OR uninitialized-memory/info-leak to userspace,
+    OR a recorded residual: socket_bind port-0 overload, the ignored-OOM-return cluster, io_uring DRM_COMMIT fdput).
