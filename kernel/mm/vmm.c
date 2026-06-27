@@ -315,7 +315,8 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
     int      cow_broke = 0;   // a CoW frame-swap happened -> shoot down siblings
     uint32_t ret       = count;
 
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t i;   // function-scope: the failure index drives the unpin cleanup at out:
+    for (i = 0; i < count; i++) {
         virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
 
         if (lock_mm) spin_lock(&lock_mm->vma_lock);
@@ -398,6 +399,16 @@ out:
     if (cow_broke && lock_mm && g_current)
         tlb_flush_range(task_get_mm_shared(g_current), uaddr & ~0xFFFULL,
                         (uaddr & ~0xFFFULL) + (uint64_t)count * PAGE_SIZE);
+    // Mid-loop failure: unpin the frames already pinned in iterations [0..i).
+    // Each completed iteration pinned its frame (the DMA-target commit); the
+    // caller only unpins on SUCCESS, and pmm_ref_dec refuses to free a pinned
+    // frame, so without this a partial resolution leaks those pins PERMANENTLY
+    // (an unprivileged read into a multi-page user buffer that OOMs mid-pin
+    // would exhaust memory).  Unpin only drops the DMA pin count -- the frames
+    // stay mapped (their PTE ref keeps them alive), so this is not a free.
+    if (ret == 0)
+        for (uint32_t j = 0; j < i; j++)
+            pmm_unpin((phys_addr_t)((uint64_t)out[j] - HHDM_OFFSET));
     return ret;
 }
 

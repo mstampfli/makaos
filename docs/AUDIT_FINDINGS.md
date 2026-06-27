@@ -2848,3 +2848,45 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   only alias within the same object, never OOB); storage/input via mul_within_u32/xfer_bytes_ok (AHCI/nvme DMA) +
   power-of-2-masked rings (tty/pty/evdev/virtio_input) + CNT-checked input bitmaps. SCAN #14 lead item CLOSED; the
   three residuals above are the remaining backlog for this type.
+
+- 2026-06-27 BUG-TYPE SCAN #15 (ERROR-PATH RESOURCE LEAKS / cleanup bugs), codebase-wide. METHOD: 6 parallel
+  subagents traced every acquire (lock / kmalloc / pmm_alloc / refcount-bump / pin / fd) and EVERY exit of the holding
+  function across fs / net / mm / drivers / syscall+io_uring+ipc / proc+sched, hunting acquire-then-early-return-
+  without-release, double-release, and partial-failure leaks. The code is heavily hardened (single-exit goto-out
+  cleanup, __attribute__((cleanup)) on EXT2_SCRATCH, RCU-deferred frees, caller-frees-dst-on-clone-failure); NO
+  HIGH-severity LOCK leak or double-free was found in any compiled subsystem (every spin_lock/_irqsave is paired on
+  every branch; every skb has a single owner; every fdget has a matching fdput).
+  FIXED (F139, the lead item -- the one un-handled, caller-unmitigated PERMANENT leak): vmm_get_user_pages pinned each
+  resolved frame per-page but every mid-loop OOM (CoW-break / demand-alloc / PT-page) `goto out` without unpinning
+  out[0..i); pmm_ref_dec refuses to free a pinned frame, so a multi-page user read that OOMs mid-pin leaked pinned
+  pages permanently (DoS). Fixed by unpinning [0..i) at the out: label on failure; see AUTOFIX_LOG F139.
+  RESIDUAL (real, lower severity -- noted for follow-up turns, NOT lock leaks / double-frees):
+    (MED, mm) vmm.c isr14_page_fault kernel demand-map (~1216): `vmm_page_map(...)` return is UNCHECKED -- on a
+      double-OOM (the leaf frame allocs but an intermediate PT page cannot) the leaf frame is neither mapped nor
+      freed -> one-page leak. Rare (near-OOM in kernel space). FIX: check the return, pmm_buddy_free(frame) on fail.
+    (MED, proc) process.c task_create_user (~387) and task_create_kthread (~353): on task_mm_alloc failure they
+      kfree(t) but LEAK the vmm_alloc_pml4() frame (and task_create_user also leaks the mm_create() mm_t); plus
+      task_create_user NULL-derefs if mm_create() returns NULL (task_mm_alloc(pml4, NULL) succeeds -> mm_vma_add NULL).
+      The reference-correct sibling is task_fork (frees mm_destroy + vmm_free_user + pmm_buddy_free + kfree). OOM-only.
+    (MED, net) tcp.c (~466): an ESTABLISHED child PCB (+128 KiB ring buffers) is DROPPED (fall-through, not early
+      return) when the accept backlog is full, but the SYN-flood reaper only matches SYN_RCVD orphans, so the
+      established orphan leaks on s_pcb_head forever. Remotely triggerable (complete > TCP_BACKLOG handshakes while
+      accept() is slow). Documented as a known drop. FIX: tcp_close + tcp_pcb_free (or RST) the child on !queued.
+    (MED, drivers) virtio_gpu.c vgpu_setup_scanout_buffer (~785): a host resource_create'd res_id is NOT destroyed on
+      a later attach_backing / set_scanout failure (resource_create-without-destroy). virtq_alloc (~224) leaks the
+      earlier 1-2 desc/avail frames on a later page-alloc failure. drm.c vfs_drm_open (~2620) over-counts
+      s_drm_open_count on a kmalloc-fail return. All init/OOM/device-error paths, LOW-MED.
+    (MED, race-gated, syscall) syscall.c sys_mmap shmem-attach (~2695): the shmem_ref / shmem_create object leaks if a
+      concurrent same-mm munmap removes the just-added VMA before the relock finds it to store v->shmem. Not covered
+      by fail_unmap (the ref is taken after the last goto fail_unmap). FIX: re-validate or unref on not-found.
+    (correctness, NOT leaks) io_uring.c mid-chain ENOMEM loses/skips a CQE (does not rewind *phead) -> userspace hang;
+      sendmsg SCM_RIGHTS is not all-or-nothing; elf.c/process.c a few unchecked fd_table_init -> NULL-deref crash (not
+      a leak). These are real but out-of-class (hangs/crashes, not resource leaks) -- candidates for later type scans.
+  AUDITED CLEAN (representative, do not re-investigate): ext2 inode_lock/inode_unlock paired on all 15 sites +
+  EXT2_SCRATCH auto-cleanup + s_rename_lock released on every early return; net all spin_lock_irqsave paired + single-
+  owner skb dispatch + RCU-deferred pcb/sock frees; mm vmm_clone_user_ex/mm_clone (F134)/shmem/pmm all lock+ref
+  balanced with correct == PMM_INVALID_ADDR sentinel checks; drivers ahci/nvme submit_busy_acquire/release paired on
+  every exit incl errors + ahci_read_user unconditional unpin + drm create_dumb/addfb2/cursor-alias resource_destroy+
+  pmm_ref_dec on failure; syscall/io_uring every fdget->fdput + fd_install-failure-closes + epoll/poll/select single
+  out: cleanup; proc task_fork/sys_thread/sys_exec/sys_spawn/elf full error unwinding + all rq_lock/pid-table locks
+  balanced. SCAN #15 lead item CLOSED; the residuals above are the backlog for this type.
