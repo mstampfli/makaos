@@ -2617,7 +2617,6 @@ vfs_file_t* vfs_drm_open(void) {
     __builtin_memset(c, 0, sizeof(*c));
     c->next_dumb_handle = 1;
     c->next_fb_id       = 1;
-    __atomic_add_fetch(&s_drm_open_count, 1, __ATOMIC_ACQ_REL);
 
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
     if (!f) { kfree(c); return NULL; }
@@ -2640,6 +2639,10 @@ vfs_file_t* vfs_drm_open(void) {
     // advertised devnum so wlroots' fstat-then-udev cross-check
     // resolves.
     f->rdev     = (226u << 8) | 0u;
+    // Count the open ONLY once it has fully succeeded -- bumping before the
+    // vfs_file_t alloc (as before) over-counted on a kmalloc failure, so the
+    // last-close restore-default-scanout heuristic could never reach 0.
+    __atomic_add_fetch(&s_drm_open_count, 1, __ATOMIC_ACQ_REL);
     return f;
 }
 

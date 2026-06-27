@@ -2878,10 +2878,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       tcp_pcb_free(pcb) -- safe under tcp_recv's rcu_read_lock (RCU-deferred free, pcb untouched after the break), no
       double-free (reaper SYN_RCVD-only, establish single-CPU under s_pcb_wlock). Code-proof + boot (5 tcp selftests
       PASSED, DHCP, 0 faults); the two sub-behaviors are already selftested (accept_q_push-full, tcp_pcb_free teardown).
-    (MED, drivers) virtio_gpu.c vgpu_setup_scanout_buffer (~785): a host resource_create'd res_id is NOT destroyed on
-      a later attach_backing / set_scanout failure (resource_create-without-destroy). virtq_alloc (~224) leaks the
-      earlier 1-2 desc/avail frames on a later page-alloc failure. drm.c vfs_drm_open (~2620) over-counts
-      s_drm_open_count on a kmalloc-fail return. All init/OOM/device-error paths, LOW-MED.
+    *** FIXED F142 (2026-06-27): virtio_gpu.c vgpu_setup_scanout_buffer (~785) leaked the created host res_id on a
+      later attach_backing/set_scanout failure (now virtio_gpu_resource_unref(res_id) before the return); virtq_alloc
+      (~224) leaked the earlier desc/avail frames on a later page-alloc failure (now a goto free_avail/free_desc
+      ladder); drm.c vfs_drm_open (~2620) over-counted s_drm_open_count on a kmalloc-fail return (the bump moved to
+      success-only). All init/OOM/device-error paths. Code-proof + boot (GPU init OK at boot: scanout 1280x800,
+      vgpu_fbsz/drm selftests PASSED, 0 faults).
     (MED, race-gated, syscall) syscall.c sys_mmap shmem-attach (~2695): the shmem_ref / shmem_create object leaks if a
       concurrent same-mm munmap removes the just-added VMA before the relock finds it to store v->shmem. Not covered
       by fail_unmap (the ref is taken after the last goto fail_unmap). FIX: re-validate or unref on not-found.

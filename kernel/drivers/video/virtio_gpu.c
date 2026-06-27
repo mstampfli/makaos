@@ -228,12 +228,12 @@ static int virtq_alloc(virtq_t* vq) {
     __builtin_memset(vq->desc, 0, VIRTQ_SIZE * sizeof(virtq_desc_t));
 
     vq->avail_phys = pmm_buddy_alloc(0);
-    if (!PMM_ALLOC_OK(vq->avail_phys)) return 0;
+    if (!PMM_ALLOC_OK(vq->avail_phys)) goto free_desc;   // else desc_phys leaks
     vq->avail = (virtq_avail_t*)((uintptr_t)vq->avail_phys + HHDM_OFFSET);
     __builtin_memset(vq->avail, 0, sizeof(virtq_avail_t));
 
     vq->used_phys = pmm_buddy_alloc(0);
-    if (!PMM_ALLOC_OK(vq->used_phys)) return 0;
+    if (!PMM_ALLOC_OK(vq->used_phys)) goto free_avail;   // else desc_phys + avail_phys leak
     vq->used = (virtq_used_t*)((uintptr_t)vq->used_phys + HHDM_OFFSET);
     __builtin_memset(vq->used, 0, sizeof(virtq_used_t));
 
@@ -244,6 +244,12 @@ static int virtq_alloc(virtq_t* vq) {
     vq->avail_idx     = 0;
     vq->last_used_idx = 0;
     return 1;
+
+free_avail:
+    pmm_buddy_free(vq->avail_phys, 0);
+free_desc:
+    pmm_buddy_free(vq->desc_phys, 0);
+    return 0;
 }
 
 static void virtq_activate(volatile virtio_pci_common_cfg_t* cfg,
@@ -783,10 +789,13 @@ static int vgpu_setup_scanout_buffer(uint32_t w, uint32_t h) {
     if (!virtio_gpu_resource_attach_backing_single(res_id, phys,
                                      (uint32_t)((uint64_t)1 << order) * 4096u)) {
         kprintf("[virtio-gpu] ATTACH_BACKING failed\n");
+        // res_id was created on the host above -- destroy it, else it leaks.
+        virtio_gpu_resource_unref(res_id);
         pmm_buddy_free(phys, order); return 0;
     }
     if (!virtio_gpu_set_scanout(0, res_id, w, h)) {
         kprintf("[virtio-gpu] SET_SCANOUT failed\n");
+        virtio_gpu_resource_unref(res_id);
         pmm_buddy_free(phys, order); return 0;
     }
 
