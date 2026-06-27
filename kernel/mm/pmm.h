@@ -7,6 +7,12 @@
 #define PMM_INVALID_FRAME UINT64_MAX
 #define PMM_INVALID_ADDR  UINT64_MAX
 
+// True iff a pmm_buddy_alloc / vmm_alloc_pml4 result is a VALID frame.  The OOM
+// sentinel is PMM_INVALID_ADDR == UINT64_MAX, NOT 0 -- so a `!phys` / `== 0`
+// test NEVER catches OOM, and `phys + HHDM_OFFSET` then wraps to a wild kernel
+// pointer.  ALWAYS gate an allocation result through this (or `== PMM_INVALID_ADDR`).
+#define PMM_ALLOC_OK(p) ((p) != PMM_INVALID_ADDR)
+
 #define PMM_RESERVED_FRAMES ((4 * 1024 * 1024) >> PAGE_SHIFT)
 
 #define MAX_ORDER 32

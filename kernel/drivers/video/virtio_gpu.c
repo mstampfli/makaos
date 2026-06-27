@@ -223,17 +223,17 @@ static int find_virtio_cap(uint8_t bus, uint8_t dev, uint8_t fn,
 // ── Virtqueue allocation + activation ───────────────────────────────
 static int virtq_alloc(virtq_t* vq) {
     vq->desc_phys = pmm_buddy_alloc(0);
-    if (!vq->desc_phys) return 0;
+    if (!PMM_ALLOC_OK(vq->desc_phys)) return 0;
     vq->desc = (virtq_desc_t*)((uintptr_t)vq->desc_phys + HHDM_OFFSET);
     __builtin_memset(vq->desc, 0, VIRTQ_SIZE * sizeof(virtq_desc_t));
 
     vq->avail_phys = pmm_buddy_alloc(0);
-    if (!vq->avail_phys) return 0;
+    if (!PMM_ALLOC_OK(vq->avail_phys)) return 0;
     vq->avail = (virtq_avail_t*)((uintptr_t)vq->avail_phys + HHDM_OFFSET);
     __builtin_memset(vq->avail, 0, sizeof(virtq_avail_t));
 
     vq->used_phys = pmm_buddy_alloc(0);
-    if (!vq->used_phys) return 0;
+    if (!PMM_ALLOC_OK(vq->used_phys)) return 0;
     vq->used = (virtq_used_t*)((uintptr_t)vq->used_phys + HHDM_OFFSET);
     __builtin_memset(vq->used, 0, sizeof(virtq_used_t));
 
@@ -512,12 +512,12 @@ int virtio_gpu_init(void) {
 
     // Command bounce buffer.
     s_cmd_phys = pmm_buddy_alloc(0);
-    if (!s_cmd_phys) return 0;
+    if (!PMM_ALLOC_OK(s_cmd_phys)) return 0;
     s_cmd_virt = (uint8_t*)((uintptr_t)s_cmd_phys + HHDM_OFFSET);
 
     // Cursor-queue bounce buffer (separate page — see vgpu_send_cursor).
     s_cursor_phys = pmm_buddy_alloc(0);
-    if (!s_cursor_phys) return 0;
+    if (!PMM_ALLOC_OK(s_cursor_phys)) return 0;
     s_cursor_virt = (uint8_t*)((uintptr_t)s_cursor_phys + HHDM_OFFSET);
 
     s_common->device_status = VIRTIO_STATUS_ACKNOWLEDGE |
@@ -768,7 +768,7 @@ static int vgpu_setup_scanout_buffer(uint32_t w, uint32_t h) {
     uint8_t  order = 0;
     while (((uint32_t)1 << order) < pages) order++;
     phys_addr_t phys = pmm_buddy_alloc(order);
-    if (!phys) { kprintf("[virtio-gpu] fb alloc fail (%u pages order=%u)\n",
+    if (!PMM_ALLOC_OK(phys)) { kprintf("[virtio-gpu] fb alloc fail (%u pages order=%u)\n",
                          pages, order); return 0; }
     uint8_t* virt = (uint8_t*)((uintptr_t)phys + HHDM_OFFSET);
     __builtin_memset(virt, 0, (uint64_t)((uint64_t)1 << order) * 4096u);

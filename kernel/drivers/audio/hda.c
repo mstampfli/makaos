@@ -409,7 +409,7 @@ int hda_init(void) {
 
     // 6. CORB: 256 entries × 4 B = 1 KiB (fits in one 4 KiB page).
     phys_addr_t corb_phys = pmm_buddy_alloc(0);
-    if (!corb_phys) return 0;
+    if (!PMM_ALLOC_OK(corb_phys)) return 0;
     s_corb = (uint32_t*)((uintptr_t)corb_phys + HHDM_OFFSET);
     __builtin_memset(s_corb, 0, 256 * sizeof(uint32_t));
 
@@ -425,7 +425,7 @@ int hda_init(void) {
 
     // 7. RIRB: 256 entries × 8 B = 2 KiB (fits in one page).
     phys_addr_t rirb_phys = pmm_buddy_alloc(0);
-    if (!rirb_phys) return 0;
+    if (!PMM_ALLOC_OK(rirb_phys)) return 0;
     s_rirb = (uint64_t*)((uintptr_t)rirb_phys + HHDM_OFFSET);
     __builtin_memset(s_rirb, 0, 256 * sizeof(uint64_t));
 
@@ -458,14 +458,14 @@ int hda_init(void) {
 
     // 10. Allocate BDL (one page; 8 entries × 16 B = 128 B).
     phys_addr_t bdl_phys = pmm_buddy_alloc(0);
-    if (!bdl_phys) return 0;
+    if (!PMM_ALLOC_OK(bdl_phys)) return 0;
     s_bdl = (bdle_t*)((uintptr_t)bdl_phys + HHDM_OFFSET);
 
     // 11. Allocate DMA buffers (one per BDL entry) and populate BDL.
     //     All buffers start zeroed (silence).
     for (uint32_t i = 0; i < BDL_ENTRIES; i++) {
         phys_addr_t p = pmm_buddy_alloc(BUF_ORDER);
-        if (!p) return 0;
+        if (!PMM_ALLOC_OK(p)) return 0;
         s_buf[i] = (uint8_t*)((uintptr_t)p + HHDM_OFFSET);
         for (uint32_t j = 0; j < BUF_BYTES; j++) s_buf[i][j] = 0;
         s_bdl[i].addr_lo = (uint32_t)(p & 0xFFFFFFFFu);
@@ -476,7 +476,7 @@ int hda_init(void) {
 
     // 12. Allocate software FIFO (one order-1 alloc = 2 pages = 8 KiB).
     phys_addr_t fifo_phys = pmm_buddy_alloc(1);
-    if (!fifo_phys) return 0;
+    if (!PMM_ALLOC_OK(fifo_phys)) return 0;
     s_fifo    = (uint8_t*)((uintptr_t)fifo_phys + HHDM_OFFSET);
     s_fifo_wp = 0;
     s_fifo_rp = 0;

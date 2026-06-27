@@ -231,9 +231,14 @@ static void port_start(hba_port_t* p) {
 static void port_init(hba_port_t* p) {
     port_stop(p);
 
-    // Shared structures
+    // Shared structures.  pmm_buddy_alloc returns PMM_INVALID_ADDR (UINT64_MAX),
+    // NOT 0, on OOM; without this guard the memset below would write through
+    // UINT64_MAX + HHDM_OFFSET (a wild kernel pointer) and program that wild
+    // address into the device DMA command header.  port_init is void, so on OOM
+    // just leave the port un-initialised (dead, but no wild write/DMA).
     s_cmdlist_phys = pmm_buddy_alloc(0);
     s_fis_phys     = pmm_buddy_alloc(0);
+    if (!PMM_ALLOC_OK(s_cmdlist_phys) || !PMM_ALLOC_OK(s_fis_phys)) return;
     __builtin_memset((void*)(s_cmdlist_phys + HHDM_OFFSET), 0, PAGE_SIZE);
     __builtin_memset((void*)(s_fis_phys     + HHDM_OFFSET), 0, PAGE_SIZE);
 
@@ -242,6 +247,7 @@ static void port_init(hba_port_t* p) {
     cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
     for (uint32_t i = 0; i < s_nslots; i++) {
         s_ctbl_phys[i] = pmm_buddy_alloc(0);
+        if (!PMM_ALLOC_OK(s_ctbl_phys[i])) return;   // OOM: no wild memset / DMA program
         __builtin_memset((void*)(s_ctbl_phys[i] + HHDM_OFFSET), 0, PAGE_SIZE);
         hdr[i].ctba  = (uint32_t)(s_ctbl_phys[i] & 0xFFFFFFFF);
         hdr[i].ctbau = (uint32_t)(s_ctbl_phys[i] >> 32);

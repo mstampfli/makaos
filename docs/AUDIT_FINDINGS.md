@@ -2461,3 +2461,48 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   SCAN #7 SUBSTANTIALLY COMPLETE: the only unprivileged/remote NULL-deref (virtio_net RX) FIXED (F120). Residuals
     (the boot-init vmm_map_mmio 0-checks + the PMM_INVALID_ADDR wrong-sentinel sweep + task_create_kthread) are
     recorded. Next: BUG-TYPE SCAN #8-as-a-type.
+
+- 2026-06-27 BUG-TYPE SCAN #8 (wrong-sentinel / unchecked-or-wrong-checked error return): a call whose failure
+  sentinel is tested with the WRONG predicate (or not at all), so the error path never fires and a poison value is
+  used as if valid. Headline (queued from SCAN #7): pmm_buddy_alloc / vmm_alloc_pml4 return PMM_INVALID_ADDR ==
+  UINT64_MAX on OOM (NOT 0), but many DMA-buffer callers tested `if (!phys)` / `== 0`, which NEVER catches OOM ->
+  `phys + HHDM_OFFSET` wraps to a wild kernel pointer (~HHDM_OFFSET-1) -> a wild kernel memset / DMA program on OOM.
+  Swept the whole tree; mm/** is uniformly clean (== PMM_INVALID_ADDR). The cluster is the driver DMA-init paths.
+  FIXED (F121, ONE commit -- same root): extracted PMM_ALLOC_OK(p) := ((p) != PMM_INVALID_ADDR) into pmm.h and gated
+    all 20 pmm_buddy_alloc results across 5 drivers through it, so a `!phys`/`==0` mis-check can never recur:
+      ahci.c port_init -- had NO checks at all: s_cmdlist_phys/s_fis_phys (239/240) + each s_ctbl_phys[i] (249) were
+        memset through +HHDM_OFFSET AND programmed into the device command-header DMA registers with the raw result;
+        on OOM that is a wild memset + a wild DMA base handed to the controller. Added early `return;` guards (241,
+        250) so OOM aborts before any wild memset / DMA program.
+      hda.c (412/428/461/468/479): corb/rirb/bdl/per-buffer/fifo -- 5 sites converted `if (!x) return 0;` ->
+        `if (!PMM_ALLOC_OK(x)) return 0;`.
+      virtio_gpu.c (226/231/236/515/520/771): the 3 virtq rings (desc/avail/used) + s_cmd/s_cursor + the framebuffer
+        alloc -- 6 sites converted.
+      virtio_input.c (362-363): the 4-way disjunction (eventq desc/avail/used + s_evbuf) converted in one guard.
+      ac97.c (312/319): the BDL alloc had a uint32 TRUNCATION bug -- `s_bdl_phys = (uint32_t)pmm_buddy_alloc(0)`
+        truncated UINT64_MAX to 0xFFFFFFFF (non-zero), so even the `!s_bdl_phys` check missed; restructured to test
+        the full-width phys_addr_t before the u32 narrowing; the DMA-buffer loop site also converted. (ac97 is DEAD
+        -- no initcall, /dev/dsp routes to hda_write -- so latent, but fixed for uniformity.)
+    Verified: a clean boot with ahci/hda/virtio-gpu/virtio-input all initialising proves the non-OOM path is
+    unbroken (a valid frame passes PMM_ALLOC_OK exactly as `!phys` passed before); the OOM branch is code-proven (a
+    UINT64_MAX result now correctly fails). mm/** already used == PMM_INVALID_ADDR everywhere, so no fix there.
+  RECORDED (out-of-type, found by the SCAN #8 sweep -- HIGHER severity than the in-type residuals, queued for
+  dedicated turns):
+    *** HIGHEST PRIORITY -- spawn SPAWN_ATTR_UNVEIL raw user-pointer deref (a SCAN #3 straggler): sys_spawn's
+      SPAWN_ATTR_UNVEIL handling validates the user unveil-rule array with `_access_ok` then does a RAW memcpy from
+      the user pointer (syscall.c ~1449) with NO copy_from_user / prefault, so a user passing a pointer to an
+      UNMAPPED-but-in-range page faults IN the kernel -> an unprivileged kernel #PF panic (DoS). Fix = copy the
+      array via copy_from_user (which handles the fault) instead of _access_ok + raw memcpy. This is the next turn.
+    ahci_submit_sg omits the AHCI_READ_POISON sentinel re-check that the sibling AHCI read paths perform after the
+      DMA completes, so a poisoned (failed-read) sector can be returned as valid data on an unprivileged file read
+      (stale-data-as-valid). Medium; queue for a TOCTOU/sentinel follow-up.
+  RECORDED (in-type, lower severity -- the remaining wrong-sentinel / ignored-return residuals):
+    socket_bind: port 0 is BOTH a valid "any port" request AND the empty-slot sentinel in the bind table, so the
+      0-as-sentinel overload can misclassify; needs an explicit occupied flag rather than port==0.
+    Ignored OOM error returns (the caller drops a negative/sentinel return and proceeds): process.c fd_table_init /
+      pid_alloc, elf.c:308 mm_vma_add -- all ignore failure and continue (OOM-only, kernel path). Plus the boot-init
+      vmm_map_mmio 0-on-exhaustion sites carried over from SCAN #7 (ioapic/nvme/ahci/virtio_net MSI-X maps).
+    io_uring DRM_COMMIT path leaks an fdput (an unbalanced get/put on the error branch).
+  SCAN #8 COMPLETE for the headline cluster: the wild-write-on-OOM DMA cluster is fixed at root in one commit with a
+    reusable PMM_ALLOC_OK primitive (docs/PRIMITIVES.md). Next: the spawn SPAWN_ATTR_UNVEIL unprivileged-panic fix
+    (highest recorded severity), then SCAN #9-as-a-type.

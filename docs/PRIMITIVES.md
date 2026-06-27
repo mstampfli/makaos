@@ -169,6 +169,24 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   (heap OOB write). Mirrors the read-side ext2_dirent_namelen_clamp.
   `ext2_dirent_in_block_selftest` drives the underflow / past-block / rec<8 rejects.
 
+### F. Allocation-result sentinels (test the RIGHT failure value)
+A fallible allocator whose failure value is NOT 0 must be tested against its actual
+sentinel, never `!x` / `== 0`. The PMM is exactly this trap: pmm_buddy_alloc /
+vmm_alloc_pml4 return `PMM_INVALID_ADDR == UINT64_MAX` on OOM, so a `!phys` test
+NEVER fires and `phys + HHDM_OFFSET` then wraps to a wild kernel pointer (a wild
+memset / a wild DMA base programmed into a device). One named test closes the class:
+- `PMM_ALLOC_OK(p)` := `((p) != PMM_INVALID_ADDR)` (kernel/mm/pmm.h, F121) -- the
+  canonical "is this pmm_buddy_alloc / vmm_alloc_pml4 result a VALID frame" test.
+  Documented in-header with WHY `!phys`/`==0` is wrong. Used at EVERY driver
+  DMA-init alloc site (ahci/hda/ac97/virtio_gpu/virtio_input, 20 sites); mm/** and
+  io_uring/drm/nvme use the equivalent explicit `== PMM_INVALID_ADDR`. RULE: any new
+  pmm_buddy_alloc / vmm_alloc_pml4 caller gates the result through PMM_ALLOC_OK (or
+  the explicit `== PMM_INVALID_ADDR`) -- NEVER `!phys`, and NEVER narrow to a
+  uint32 before the check (UINT64_MAX truncates to 0xFFFFFFFF, non-zero -> the
+  truncated check silently misses; the F121 ac97 BDL site was exactly this bug).
+  No standalone selftest (the macro is a one-line sentinel compare; every boot
+  exercises the success branch through ~4 drivers' DMA init).
+
 ### E. Locking idioms (concurrency primitives, not data validation)
 The recurring "publish/snapshot a whole multi-field struct under its lock so a
 lock-free reader never observes a half-written value" pattern. A plain struct

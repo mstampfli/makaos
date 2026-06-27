@@ -359,8 +359,8 @@ int virtio_input_init(void) {
     s_eventq.avail_phys = pmm_buddy_alloc(0);
     s_eventq.used_phys  = pmm_buddy_alloc(0);
     s_evbuf_phys        = pmm_buddy_alloc(0);
-    if (!s_eventq.desc_phys || !s_eventq.avail_phys ||
-        !s_eventq.used_phys || !s_evbuf_phys)
+    if (!PMM_ALLOC_OK(s_eventq.desc_phys) || !PMM_ALLOC_OK(s_eventq.avail_phys) ||
+        !PMM_ALLOC_OK(s_eventq.used_phys) || !PMM_ALLOC_OK(s_evbuf_phys))
         return 0;
     s_eventq.desc  = (virtq_desc_t*) (s_eventq.desc_phys  + HHDM_OFFSET);
     s_eventq.avail = (virtq_avail_t*)(s_eventq.avail_phys + HHDM_OFFSET);
