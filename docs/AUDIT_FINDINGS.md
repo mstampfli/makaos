@@ -2887,9 +2887,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       ladder); drm.c vfs_drm_open (~2620) over-counted s_drm_open_count on a kmalloc-fail return (the bump moved to
       success-only). All init/OOM/device-error paths. Code-proof + boot (GPU init OK at boot: scanout 1280x800,
       vgpu_fbsz/drm selftests PASSED, 0 faults).
-    (MED, race-gated, syscall) syscall.c sys_mmap shmem-attach (~2695): the shmem_ref / shmem_create object leaks if a
-      concurrent same-mm munmap removes the just-added VMA before the relock finds it to store v->shmem. Not covered
-      by fail_unmap (the ref is taken after the last goto fail_unmap). FIX: re-validate or unref on not-found.
+    *** FIXED F144 (2026-06-27): syscall.c sys_mmap shmem-attach (~2695) -- the shmem_ref (named-fd) / shmem_create
+      (anon) object leaked if a concurrent same-mm munmap removed the just-added VMA before the relock-search found it
+      to store v->shmem (the search fell through with no break, no unref). Fixed: each loop tracks an `attached` flag
+      and `if (!attached) shmem_unref(shm)` after the lock -- named-fd drops the bumped ref, anon destroys the
+      orphaned object; the found path is unchanged (exactly one ref to the VMA). Code-proof + boot (mmap/shmem
+      selftests PASSED, 0 faults). *** This was the LAST SCAN #15 residual -- SCAN #15 is now FULLY CLOSED
+      (F139-F144).
     (correctness, NOT leaks) io_uring.c mid-chain ENOMEM loses/skips a CQE (does not rewind *phead) -> userspace hang;
       sendmsg SCM_RIGHTS is not all-or-nothing; elf.c/process.c a few unchecked fd_table_init -> NULL-deref crash (not
       a leak). These are real but out-of-class (hangs/crashes, not resource leaks) -- candidates for later type scans.

@@ -2698,15 +2698,22 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             // Attach shmem backing under the writer lock so concurrent
             // page-fault readers on other CPUs see the shmem fields
             // atomically rather than in two torn halves.
+            int attached = 0;
             spin_lock(&mm->vma_lock);
             for (vma_t* v = mm->vmas; v; v = v->next) {
                 if (v->start == vaddr) {
                     v->shmem       = shm;
                     v->shmem_pgoff = pg_off;
+                    attached = 1;
                     break;
                 }
             }
             spin_unlock(&mm->vma_lock);
+            // A concurrent same-mm munmap / MAP_FIXED replace can remove the VMA
+            // between mm_vma_add above and this relock; then no VMA takes the ref
+            // we just shmem_ref'd and munmap never sees it -> permanent leak.
+            // Drop it here so the only owner is the VMA (when found) or nobody.
+            if (!attached) shmem_unref(shm);
         } else {
             // MAP_SHARED | MAP_ANONYMOUS: create a new anonymous shmem.
             shm = shmem_create(npages,
@@ -2715,15 +2722,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                                0600);
             if (!shm) goto fail_unmap;
 
+            int attached = 0;
             spin_lock(&mm->vma_lock);
             for (vma_t* v = mm->vmas; v; v = v->next) {
                 if (v->start == vaddr) {
                     v->shmem       = shm;
                     v->shmem_pgoff = 0;
+                    attached = 1;
                     break;
                 }
             }
             spin_unlock(&mm->vma_lock);
+            // VMA concurrently removed (see the named-fd path): destroy the
+            // orphaned anonymous shmem (its only ref) instead of leaking it.
+            if (!attached) shmem_unref(shm);
         }
     }
 
