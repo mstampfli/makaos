@@ -768,6 +768,9 @@ static void init_kthread(void) {
     // nvme LBADS validation: reject UB-inducing / bogus device LBA sizes (F137).
     extern void nvme_lba_size_ok_selftest(void);
     nvme_lba_size_ok_selftest();
+    // hda codec node-scan bound: device NODE_COUNT can't infinite-loop a u8 (F138).
+    extern void hda_node_scan_end_selftest(void);
+    hda_node_scan_end_selftest();
 
     // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
     extern void virtfs_is_virtual_selftest(void);

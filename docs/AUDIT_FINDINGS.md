@@ -2828,14 +2828,18 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       primitive accepts only lbads 9..12 (512..4096-byte sectors), computes the shift with no UB, and nvme_init
       refuses the namespace otherwise. Selftest drives the 8/0 (sub-512), 13/31 (oversized), 32/255 (UB) rejects.
       nvme is not the boot device.
-    (MED-LOW, DoS only) hda.c ~225,233 `for (uint8_t fg = fg_start; fg < fg_start + fg_count; fg++)` -- the bound
-      `fg_start + fg_count` (device codec NODE_COUNT, two u8s) can exceed 255, so the u8 counter wraps and the loop
-      never terminates (issues codec verbs forever). No array index -> hang/DoS, not OOB. FIX: widen the loop var to
-      u32. Audio-init only.
-    (MED, bounded-but-fragile) tcp.c ~847 `sendable = pcb->snd_wnd - (pcb->snd_nxt - pcb->snd_una)` -- snd_wnd is the
-      attacker-advertised window; if in-flight > window the subtraction underflows to ~4e9, but the very next line
-      `if (sendable > chunk) sendable = chunk` clamps it to <= TCP_MSS. Safe today (saved by adjacency), not safe by
-      construction; a saturate-to-0 on underflow would make it robust. No bug as-is.
+    *** FIXED F138 (2026-06-27): hda.c ~225,233 the function-group AND per-FG widget `for (uint8_t n = start;
+      n < start + count; n++)` loops -- start/count are device codec NODE_COUNT u8s; start+count > 255 wrapped the u8
+      counter into an infinite codec-verb loop (DoS). New hda_node_scan_end(start, count) primitive returns
+      min(start+count, 256) and both loops now use a uint32_t counter, so they always terminate inside the u8 nid
+      space. Selftest drives the 255+1 / 200+100 / 255+255 infinite-loop inputs. Audio-init only; DoS not OOB.
+    (NOT A BUG -- optional hardening only) tcp.c ~847 `sendable = pcb->snd_wnd - (pcb->snd_nxt - pcb->snd_una)` --
+      snd_wnd is the attacker-advertised window; if in-flight > window the subtraction underflows to ~4e9, but the
+      very next line `if (sendable > chunk) sendable = chunk` clamps it to <= TCP_MSS. Safe today (saved by
+      adjacency), not safe by construction; a saturate-to-0 on underflow would make it robust. No fix required.
+  SCAN #14 STATUS: FULLY CLOSED -- the 3 real overflow/wrap bugs are FIXED (F136 DRM SET_CURSOR u64 wrap, F137 nvme
+    LBADS undefined shift, F138 hda u8-loop infinite loop); the tcp send-window item above is a non-bug (saved by its
+    clamp). The rest of the tree was audited clean (see below). Next: SCAN #15 = a NEW bug type.
   AUDITED CLEAN (representative, do not re-investigate): net total_len-header_len / off+len / count*elem all guarded or
   min-clamped (ipv4/udp/tcp/virtio_net/unix_sock/socket/net); fs on-disk block#s range-checked by ext2_block_valid
   inside bcache_get + 64-bit LBAs + ext2_dirent_in_block + the mount-time geometry validators (the one raw wrap,

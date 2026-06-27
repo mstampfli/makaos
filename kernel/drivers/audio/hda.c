@@ -213,6 +213,22 @@ static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par) {
     return verb_send(VERB12(cad, nid, V_GET_PARAM, par));
 }
 
+// PRIMITIVE (hda node-id scan bound).  HDA node ids (function groups, widgets)
+// are u8 (0..255).  A codec NODE_COUNT param reports the subordinate-node start
+// and count as two device-supplied u8s, so their sum can reach 510.  A raw
+// `for (uint8_t n = start; n < start + count; n++)` loop NEVER terminates once
+// start+count > 255: the u8 counter wraps at 255 while the int-promoted bound
+// stays ahead, so a malformed/malicious codec hangs audio init in an infinite
+// codec-verb loop (DoS).  Return the half-open scan end clamped to 256 so the
+// loop (driven by a u32 counter) always terminates and never iterates past the
+// valid u8 nid space (which would truncate back to a low nid via get_param's
+// u8 nid arg and re-process a node).  Pure -> unit-tested (hda_node_scan_end_
+// selftest).
+static inline uint32_t hda_node_scan_end(uint8_t start, uint8_t count) {
+    uint32_t end = (uint32_t)start + count;
+    return end > 256u ? 256u : end;
+}
+
 // ── Codec enumeration and configuration ──────────────────────────────────
 // Walk the widget graph, find the first DAC→pin path, configure for
 // 48 kHz / 16-bit / stereo output on stream tag 1.
@@ -222,22 +238,27 @@ static int codec_configure(uint8_t cad) {
     uint8_t fg_start = (uint8_t)((nc >> 16) & 0xFFu);
     uint8_t fg_count = (uint8_t)(nc & 0xFFu);
 
-    for (uint8_t fg = fg_start; fg < fg_start + fg_count; fg++) {
-        if ((get_param(cad, fg, PAR_FUNC_TYPE) & 0xFFu) != 0x01u) continue;
+    // u32 counter + clamped end so a device NODE_COUNT with start+count > 255
+    // cannot wrap a u8 counter into an infinite loop (hda_node_scan_end keeps
+    // the iteration inside the valid 0..255 nid space, so fgn/wn never truncate).
+    for (uint32_t fg = fg_start; fg < hda_node_scan_end(fg_start, fg_count); fg++) {
+        uint8_t fgn = (uint8_t)fg;
+        if ((get_param(cad, fgn, PAR_FUNC_TYPE) & 0xFFu) != 0x01u) continue;
 
-        uint32_t wc      = get_param(cad, fg, PAR_NODE_COUNT);
+        uint32_t wc      = get_param(cad, fgn, PAR_NODE_COUNT);
         uint8_t w_start  = (uint8_t)((wc >> 16) & 0xFFu);
         uint8_t w_count  = (uint8_t)(wc & 0xFFu);
 
         uint8_t dac = 0, pin = 0;
-        for (uint8_t w = w_start; w < w_start + w_count; w++) {
-            uint32_t cap   = get_param(cad, w, PAR_WIDGET_CAP);
+        for (uint32_t w = w_start; w < hda_node_scan_end(w_start, w_count); w++) {
+            uint8_t   wn   = (uint8_t)w;
+            uint32_t cap   = get_param(cad, wn, PAR_WIDGET_CAP);
             uint8_t  wtype = (uint8_t)((cap >> 20) & 0xFu);
             if (!dac && wtype == WTYPE_AUDIO_OUT) {
-                dac = w;
+                dac = wn;
             } else if (!pin && wtype == WTYPE_PIN) {
-                if (get_param(cad, w, PAR_PIN_CAP) & (1u << 4))
-                    pin = w;
+                if (get_param(cad, wn, PAR_PIN_CAP) & (1u << 4))
+                    pin = wn;
             }
         }
         if (!dac || !pin) continue;
@@ -542,4 +563,35 @@ int hda_init(void) {
     s_running = 0;
     s_ok      = 1;
     return 1;
+}
+
+// Deterministic check of the codec node-scan bound: legitimate small ranges
+// pass through unchanged, and every start+count that exceeds the u8 nid space
+// (the inputs that infinite-looped a raw u8 counter) clamp to 256 so the loop
+// terminates inside 0..255.  The 255+1 / 200+100 / 255+255 rows are exactly the
+// device NODE_COUNT values that wrapped the old `for (uint8_t n = start;
+// n < start+count; n++)` loops.
+void hda_node_scan_end_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint8_t start, count; uint32_t end; } c[] = {
+        { 2,   10,  12  },   // normal function-group range 2..11
+        { 1,   14,  15  },   // typical widget range
+        { 0,   0,   0   },   // empty count -> loop body never runs
+        { 128, 128, 256 },   // sum == 256 exactly (boundary, no clamp needed)
+        { 0,   255, 255 },   // 0..254, max within one byte
+        { 255, 1,   256 },   // sum 256: old u8 counter wrapped 255->0 forever
+        { 200, 100, 256 },   // sum 300 -> clamp to 256
+        { 255, 255, 256 },   // sum 510 (worst case) -> clamp to 256
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t e = hda_node_scan_end(c[i].start, c[i].count);
+        if (e != c[i].end) {
+            kprintf("[hda_nodes] FAIL start=%u count=%u end=%u want=%u\n",
+                    c[i].start, c[i].count, e, c[i].end);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[hda_nodes] SELF-TEST FAILED\n"
+                  : "[hda_nodes] SELF-TEST PASSED (codec node scan bound clamps to u8 nid space, terminates)\n");
 }

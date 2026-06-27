@@ -180,6 +180,16 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   This is the upstream sibling of the mul_within guard: it keeps s_ns_lba_size itself sane
   so the guard's bound is meaningful. `nvme_lba_size_ok_selftest` drives the sub-512 /
   oversized / UB-shift (32, 255) rejects. The forbidden raw `1u << <untrusted>` is gone.
+- `hda_node_scan_end(start, count)` (kernel/drivers/audio/hda.c, F138) -- the half-open
+  end `min(start + count, 256)` for an HDA codec node scan. start/count come from the
+  device NODE_COUNT param as two u8s (sum up to 510); HDA node ids are u8 (0..255), so a
+  raw `for (uint8_t n = start; n < start + count; n++)` loop never terminates once
+  start+count > 255 (the u8 counter wraps at 255 while the int-promoted bound stays
+  ahead) -- an infinite codec-verb loop / DoS from a malformed codec. Clamping to 256 and
+  iterating with a u32 counter makes the loop always terminate and stay in the valid nid
+  space (no truncate-and-re-process). Used at both codec_configure loops (function group +
+  widget). `hda_node_scan_end_selftest` drives the 255+1 / 200+100 / 255+255 wrap inputs.
+  Forbidden raw pattern: a u8/u16 loop counter compared against a device start+count sum.
 - `vgpu_fb_bytes(w, h, *out)` (kernel/drivers/video/virtio_gpu.c, F49) -- the w*h*4
   bytes a w*h B8G8R8X8 scanout needs, via `mul_within_u32` (u64, no wrap) capped at
   VGPU_MAX_FB_BYTES (256 MiB). w/h are the device-reported scanout mode (untrusted);
