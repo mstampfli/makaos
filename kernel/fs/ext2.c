@@ -3245,8 +3245,20 @@ int ext2_rename(const char* src, const char* dst, const void* cred) {
         return 0;
     }
 
-    // Remove old directory entry.
-    dir_remove_entry(src_parent_ino, src_base);
+    // Remove old directory entry.  If it FAILS (I/O error, OOM for its block
+    // buffer, or a concurrent unlink(src) that already removed src_base -- unlink
+    // takes the parent-inode lock, NOT s_rename_lock, so it races this window),
+    // src_ino would keep BOTH the new dst name and the old src name at
+    // i_links_count==1 (rename is a move, so the count was never bumped); a later
+    // unlink of either name then drops the count to 0 and frees the inode +
+    // blocks while the OTHER name still references it (cross-link / data
+    // corruption).  Roll the move back -- remove the dst dirent dir_add_entry
+    // just added -- and fail, so the rename is atomic (fully done or not at all).
+    if (!dir_remove_entry(src_parent_ino, src_base)) {
+        dir_remove_entry(dst_parent_ino, dst_base);
+        spin_unlock(&s_rename_lock);
+        return 0;
+    }
 
     // Moving a DIRECTORY to a different parent: its ".." backlink moves from the
     // old parent to the new one.  Repoint ".." (else it escapes to the old
@@ -3257,9 +3269,14 @@ int ext2_rename(const char* src, const char* dst, const void* cred) {
     // free it while this dir's ".." still references it -- a cross-link).  A
     // same-parent rename touches neither.  RMW each parent under its own inode
     // lock, taken one at a time (no nesting) to match the existing lock order.
-    if (is_dir && src_parent_ino != dst_parent_ino) {
-        dir_set_dotdot(src_ino, dst_parent_ino);
-
+    // Only swap the parents' link counts if ".." was ACTUALLY repointed: each
+    // subdir contributes one ".." link to its parent, so if dir_set_dotdot
+    // failed (I/O error / OOM / ".." not found) ".." still backlinks the OLD
+    // parent and the counts must NOT move -- decrementing the old parent there
+    // would make its count too low and let an over-decrement free it while this
+    // dir's ".." still references it (the cross-link the swap exists to prevent).
+    if (is_dir && src_parent_ino != dst_parent_ino &&
+        dir_set_dotdot(src_ino, dst_parent_ino)) {
         irtree_leaf_t* spleaf = inode_lock(src_parent_ino);
         if (spleaf) {
             inode_pub_begin(spleaf);

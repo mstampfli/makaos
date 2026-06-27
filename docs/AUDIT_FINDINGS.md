@@ -2925,12 +2925,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       enqueue failure (one CQE per SQE: head op = err, linked followers = -ECANCELED), returning void so the caller
       posts/advances nothing. SQE:CQE 1:1 on every path. Code-proof + boot ([io_uring_test] functional batch test
       PASSED, 0 faults).
-    (MED-HIGH, fs corruption) ext2.c:3249 ext2_rename ignores dir_remove_entry(src) -- on its failure (I/O error, OOM,
-      or a concurrent ext2_unlink(src) that races since it takes the parent-inode lock not s_rename_lock) src_ino ends
-      with TWO dirents at links_count==1; a later unlink frees the still-referenced inode + blocks -> cross-link /
-      data corruption. The dst removal 14 lines up IS gated; the src is not (asymmetry). Also ext2.c:3261
-      dir_set_dotdot return ignored -> moved dir's `..` not repointed but parent link counts still swapped (tree
-      inconsistency). FIX needs rollback of the dir_add_entry (or report failure), more involved -> own turn.
+    *** FIXED F147 (2026-06-27): ext2.c:3249 ext2_rename ignored dir_remove_entry(src) -> on failure (I/O error, OOM,
+      or a concurrent ext2_unlink(src) racing via the parent-inode lock not s_rename_lock) src_ino kept TWO dirents at
+      links_count==1 -> a later unlink frees the still-referenced inode (cross-link/corruption). Plus ext2.c:3261
+      dir_set_dotdot ignored before an unconditional parent link-count swap. Fixed: on dir_remove_entry(src) failure
+      ROLL BACK (remove the dst dirent dir_add_entry added) + return 0 so the rename is atomic; gate the link-count
+      swap on `&& dir_set_dotdot(...)` so counts stay consistent with the (un-repointed) "..". Code-proof + boot
+      ([fs_permop] rename + [ext2_dotdot] PASSED, 0 faults). Residual (separate lock-scan item): unlink-vs-rename do
+      not mutually exclude (different locks) -- the rollback makes rename atomic w.r.t. its own ops.
     (MED, mm display) vmm.c:191 vmm_map_physical_user (SYS_FB_MAP) ignores vmm_page_map -> on OOM a FB hole faults to a
       zeroed anon frame (silent display corruption, writes never reach the device); vmm.c:160 vmm_map_mmio same, boot-
       only LOW. (MED, elf) elf.c:261 ignores vmm_page_map in the eager PT_LOAD copy -> on OOM a segment silently loads
