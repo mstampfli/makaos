@@ -2917,12 +2917,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   files->ft->fd_table[0] write through NULL -> #PF panic on exec/spawn under OOM) + process.c:377/419 (deferred
   NULL-deref). All four now check + cleanup; see AUTOFIX_LOG F145.
   RESIDUAL (real, for later turns):
-    (HIGH, io_uring) io_uring.c:629 SQPOLL `io_wq_enqueue(uring, sqe)` return DROPPED then head++ -> on ENOMEM the SQE
-      is consumed with NO work + NO CQE posted -> a thread in io_uring_enter(GETEVENTS) on min_complete HANGS forever.
-      AND io_uring.c:870-896 `io_wq_enqueue_chain` advances *phead by m before a mid-chain wq_work_alloc ENOMEM and is
-      NOT rewound; the caller (1132-1137) posts ONE CQE + head++ -> m completions lost -> userspace hang. The two
-      io_uring lost-CQE notes, confirmed. FIX: SQPOLL post an error CQE on enqueue-fail; chain either rewind *phead or
-      post -ENOMEM/-ECANCELED CQEs for every consumed SQE. (OOM-gated but a reachable hang.)
+    *** FIXED F146 (2026-06-27): the io_uring lost-CQE-on-ENOMEM hang. SQPOLL (io_uring.c:629) ignored io_wq_enqueue's
+      -ENOMEM then head++ (SQE consumed, no CQE); io_wq_enqueue_chain advanced *phead past m built nodes then freed
+      them on a mid-chain OOM while the caller posted only 1 CQE -> m completions lost -> a GETEVENTS waiter on
+      min_complete hangs. Fixed: SQPOLL posts an error CQE on enqueue-fail; io_wq_enqueue_chain now builds into a local
+      cursor (commits *phead only on success) and a new io_wq_chain_fail() completes + consumes the whole chain on any
+      enqueue failure (one CQE per SQE: head op = err, linked followers = -ECANCELED), returning void so the caller
+      posts/advances nothing. SQE:CQE 1:1 on every path. Code-proof + boot ([io_uring_test] functional batch test
+      PASSED, 0 faults).
     (MED-HIGH, fs corruption) ext2.c:3249 ext2_rename ignores dir_remove_entry(src) -- on its failure (I/O error, OOM,
       or a concurrent ext2_unlink(src) that races since it takes the parent-inode lock not s_rename_lock) src_ino ends
       with TWO dirents at links_count==1; a later unlink frees the still-referenced inode + blocks -> cross-link /

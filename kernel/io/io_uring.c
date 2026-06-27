@@ -43,7 +43,10 @@ extern uint64_t tsc_read_ns(void);
 // Forward declarations for helpers used across phases.
 static int     io_sqp_spawn(io_uring_t* uring);
 static int     io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe);
-static int     io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+// Consumes the chain at *phead and posts exactly one CQE per SQE; on a failure
+// to enqueue it completes the whole chain with error CQEs.  Returns void: the
+// caller has nothing to post or advance afterward.
+static void    io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
                                      uint32_t user_tail, uint32_t mask);
 static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe);
 
@@ -626,7 +629,11 @@ static void io_sqp_kthread_entry(void) {
             while (head != user_tail) {
                 const io_sqe_t* sqe = &uring->sqes[head & mask];
                 if (sqe->flags & IOSQE_ASYNC) {
-                    io_wq_enqueue(uring, sqe);
+                    // On enqueue failure (no worker / wq_work_alloc OOM) the SQE
+                    // is still consumed below; post an error CQE so the slot
+                    // completes -- else a GETEVENTS waiter on min_complete hangs.
+                    int r = io_wq_enqueue(uring, sqe);
+                    if (r < 0) io_uring_post_cqe(uring, sqe->user_data, r, 0);
                 } else {
                     dispatch_one(uring, sqe);
                 }
@@ -854,32 +861,62 @@ static int io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe) {
     return 0;
 }
 
+// A chain could not be enqueued: complete + CONSUME the whole chain starting at
+// *phead.  Posts one CQE per SQE -- the head op gets `err`, each linked follower
+// gets -ECANCELED (mirroring the sync path's IO_LINK-failure cancel at the
+// dispatch loop) -- and advances *phead past the chain.  This preserves the
+// SQE:CQE 1:1 invariant: without it, an ENOMEM mid-submit consumed SQEs with no
+// CQE, hanging a thread blocked in io_uring_enter(GETEVENTS) on min_complete.
+static void io_wq_chain_fail(io_uring_t* uring, uint32_t* phead,
+                             uint32_t user_tail, uint32_t mask, int err) {
+    int first = 1;
+    while (*phead != user_tail) {
+        const io_sqe_t* sqe = &uring->sqes[*phead & mask];
+        io_uring_post_cqe(uring, sqe->user_data, first ? err : -ECANCELED, 0);
+        first = 0;
+        uint8_t flags = sqe->flags;
+        (*phead)++;
+        if (!(flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) break;
+    }
+}
+
 // Enqueue an SQE and any following IO_LINK/IO_HARDLINK SQEs as one
 // chained work item.  *phead is advanced past the whole chain.
 // The worker walks chain_next sequentially with IO_LINK cancel
-// semantics (see worker loop).
-static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+// semantics (see worker loop).  On any failure to enqueue (no worker, or a
+// mid-build OOM) the chain is completed with error CQEs and consumed, so the
+// caller never has to post or advance -- and no completion is ever lost.
+static void io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
                                  uint32_t user_tail, uint32_t mask) {
     int r = io_wq_ensure_worker(uring);
-    if (r < 0) return r;
+    if (r < 0) {
+        // No worker -> the whole chain cannot run; complete + consume it.
+        io_wq_chain_fail(uring, phead, user_tail, mask, r);
+        return;
+    }
 
-    // Build the chain by following IO_LINK / IO_HARDLINK flags.
+    // Build the chain into a LOCAL cursor; *phead is committed only once the
+    // whole chain is built (success) or by io_wq_chain_fail (failure) -- never
+    // left half-advanced past freed-but-uncompleted SQEs (the old bug).
+    uint32_t h = *phead;
     io_wq_work_t* first = NULL;
     io_wq_work_t* tail  = NULL;
 
     for (;;) {
-        if (*phead == user_tail) break;
-        const io_sqe_t* sqe = &uring->sqes[*phead & mask];
+        if (h == user_tail) break;
+        const io_sqe_t* sqe = &uring->sqes[h & mask];
 
         io_wq_work_t* w = wq_work_alloc();
         if (!w) {
-            // Partial-failure cleanup: free what we've built.
+            // Partial-build OOM: free what we built, then complete + consume
+            // the WHOLE chain from the original *phead with error CQEs.
             while (first) {
                 io_wq_work_t* n = first->chain_next;
                 wq_work_free(first);
                 first = n;
             }
-            return -ENOMEM;
+            io_wq_chain_fail(uring, phead, user_tail, mask, -ENOMEM);
+            return;
         }
         w->sqe        = *sqe;
         w->uring      = uring;
@@ -889,12 +926,12 @@ static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
         tail = w;
 
         uint8_t flags = sqe->flags;
-        (*phead)++;
+        h++;
         // End of chain when this SQE has neither IO_LINK nor IO_HARDLINK.
         if (!(flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) break;
     }
 
-    if (!first) return 0;
+    if (!first) { *phead = h; return; }
 
     // Push the head onto the worker's Treiber stack.  The chain_next
     // links the rest; worker walks both dimensions.
@@ -905,8 +942,8 @@ static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
     } while (!__atomic_compare_exchange_n(&uring->wq_head, &old, first,
                                             0, __ATOMIC_RELEASE,
                                             __ATOMIC_RELAXED));
+    *phead = h;   // commit the chain's advancement only after a successful push
     wait_queue_wake_all(&uring->wq_waitq);
-    return 0;
 }
 
 // Returns the op result; does NOT post a CQE (caller does).
@@ -1129,11 +1166,12 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
             // Offload the SQE — and any linked followers — as a
             // single chain work item.  The worker walks the chain
             // sequentially; IO_LINK failure cancels the tail.
-            int r = io_wq_enqueue_chain(uring, &head, user_tail, mask);
-            if (r < 0) {
-                io_uring_post_cqe(uring, sqe->user_data, r, 0);
-                head++;
-            }
+            // io_wq_enqueue_chain consumes `head` past the whole chain and posts
+            // exactly one CQE per SQE -- on success the worker completes them; on
+            // a failure to enqueue it completes them with error CQEs here.  So
+            // there is nothing to post or advance afterward (the old code posted
+            // a single CQE + head++, losing the rest of a partially-built chain).
+            io_wq_enqueue_chain(uring, &head, user_tail, mask);
             submitted++;
             // io_wq_enqueue_chain advances `head` past the whole
             // chain; we count the whole chain as one submission
