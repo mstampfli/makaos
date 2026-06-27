@@ -3047,14 +3047,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
      (clears slot + atomic vfs_close, frees only at rc->0) and never-installed end via vfs_close; the manual slot-NULL +
      ->close() dance is gone. The mfd<0 branch (neither installed) also stopped leaking the vfs_file_t that the bare
      ->close() left behind. See AUTOFIX_LOG F157.
-  2. [MED, leak/DoS] Listener close does not drain queued-but-unaccepted ESTABLISHED child PCBs: sock_close SOCK_STREAM
-     (socket.c:~237-244) frees only the listener's own pcb; tcp_pcb_free (tcp.c:~780-814) NULLs each child's ->listener
-     backpointer but never frees the children or the accept_queue. The only drain is accept_q_pop (tcp_accept). Close a
-     listener with a filled backlog before accept() -> each queued child (ESTABLISHED, sock_file==NULL) leaks ~128 KiB
-     (txbuf+rxbuf) and is never collected (the half-open reaper matches only SYN_RCVD); bounded TCP_BACKLOG=8/close but
-     UNBOUNDED across repeated listen/fill/close -> local mem-exhaustion DoS, remotely amplifiable. This is the residual
-     F141 (establish-AFTER-listener-gone) did NOT cover (queued-BEFORE-close). FIX: drain+free/RST the backlog on
-     listener teardown (the RST-each-backlog-entry control Linux uses).
+  2. [MED, leak/DoS] Listener close did not drain queued-but-unaccepted ESTABLISHED child PCBs: tcp_pcb_free
+     (tcp.c:~780-814) NULLed each child's ->listener backpointer but never freed the children or drained the
+     accept_queue; the only drain was accept_q_pop (tcp_accept), so closing a listener with a filled backlog before
+     accept() leaked each queued child (ESTABLISHED, sock_file==NULL) ~128 KiB (txbuf+rxbuf), never collected (the
+     reaper matches SYN_RCVD only) -> unbounded across listen/fill/close = DoS. RESOLVED (F158): tcp_pcb_free now drains
+     the accept backlog (gated on accept_count, after the s_pcb_wlock section), popping each child under the listener
+     lock then RST + tcp_pcb_free OUTSIDE it (so the child free's s_pcb_wlock never nests under the listener lock),
+     mirroring the F141 orphan dispose. Disjoint from accept() (popped once under the lock) and the reaper (SYN_RCVD
+     only), so no double-free. Deterministic guard added: tcp_listener_drain_selftest ([tcp_lstdrain]). See AUTOFIX_LOG
+     F158. *** With F158 the SCAN #19 follow-up backlog is EMPTY.
   Subsystems verified BALANCED (do not re-audit): skbuff (single-owner, skb_clone/ref/get called ZERO times -> every
   skb refcount==1, freed once on every path; tx synchronous bounce-copy, no DMA-after-free; udp deliver single-socket,
   no clone-to-N); tcp_pcb (F132 in-place rebind intact, sock_close vs reaper disjoint under s_pcb_wlock); AF_UNIX

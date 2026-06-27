@@ -807,6 +807,34 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
         }
     }
     spin_unlock_irqrestore(&s_pcb_wlock, flags);
+
+    // Listener teardown: RST + free every child still queued in the accept
+    // backlog.  A queued child is ESTABLISHED with sock_file == NULL, referenced
+    // ONLY by this accept_queue (its ->listener was just NULLed above), so once
+    // `pcb` is gone nothing else ever collects it -- tcp_accept is unreachable
+    // and the half-open reaper matches SYN_RCVD only -- an unbounded ~128 KiB/
+    // child leak across repeated listen/fill/close (the residual F141's orphan
+    // path did not cover: those were children establishing AFTER the listener
+    // went away; these were queued BEFORE).  Keyed on accept_count (non-zero
+    // only for a listener with queued children, regardless of state -- tcp_close
+    // has already set a closing listener to TCP_CLOSED by here), so a connected-
+    // socket free pays nothing.  Pop under the listener lock (accept_q's required
+    // lock), then RST + free OUTSIDE it so the child's tcp_pcb_free (which takes
+    // s_pcb_wlock) never nests under the listener lock -- matching the establish
+    // path's s_pcb_wlock-then-pcb_lock ordering.  Disjoint from accept() (each
+    // child is popped once under the lock) and from the reaper (SYN_RCVD only),
+    // so no double-free.  RST + RCU-deferred free mirror the F141 orphan dispose.
+    while (pcb->accept_count > 0) {
+        tcp_pcb_lock(pcb);
+        tcp_pcb_t* child = accept_q_pop(pcb);
+        tcp_pcb_unlock(pcb);
+        if (!child) break;   // raced empty (a concurrent accept took the last)
+        tcp_send_rst(child->local_ip, child->local_port,
+                     child->remote_ip, child->remote_port,
+                     child->snd_nxt, child->rcv_nxt);
+        tcp_pcb_free(child);
+    }
+
     // Defer the actual free until every in-flight reader has dropped
     // its reference.  Expedited: close() on a TCP socket releases its
     // PCB here, on the user-syscall return path.
@@ -1248,4 +1276,56 @@ void tcp_synreap_selftest(void) {
 
     kprintf(fails ? "[tcp_synreap] SELF-TEST FAILED\n"
                   : "[tcp_synreap] SELF-TEST PASSED (over-cap SYN_RCVD half-open reaped, owned child kept)\n");
+}
+
+// Verify the listener-close backlog drain (F158): freeing a listener PCB with
+// queued-but-unaccepted ESTABLISHED children (sock_file == NULL, sitting in the
+// accept_queue) must RST + free EVERY child -- they are referenced ONLY by the
+// queue, so the old tcp_pcb_free (which freed the listener but left the children
+// on s_pcb_head) leaked them.  Builds a full backlog, frees the listener WITHOUT
+// accepting, and asserts the queue drained (accept_count==0) and no child is
+// still on s_pcb_head.  Pointer-compare only (RCU-safe post-free); the listener
+// memory stays valid until its own RCU grace period, so reading accept_count
+// after the free is safe.  Side effect: N RSTs are sent to the children's (zero)
+// remote addresses -- harmless bogus packets, the same dispose the F141 orphan
+// path performs in production.
+void tcp_listener_drain_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst = tcp_pcb_alloc(0xFFFB);
+    if (!lst) { kprintf("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    lst->state = TCP_LISTEN;
+
+    tcp_pcb_t* kids[TCP_BACKLOG];
+    unsigned n = 0;
+    for (unsigned i = 0; i < TCP_BACKLOG; i++) {
+        tcp_pcb_t* c = tcp_pcb_alloc(0xFFFB);
+        if (!c) break;
+        c->state     = TCP_ESTABLISHED;
+        c->sock_file = NULL;
+        c->listener  = lst;
+        tcp_pcb_lock(lst);
+        bool q = accept_q_push(lst, c);
+        tcp_pcb_unlock(lst);
+        if (!q) { tcp_pcb_free(c); break; }
+        kids[n++] = c;
+    }
+    if (n == 0) { tcp_pcb_free(lst); kprintf("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    if (lst->accept_count != n) {
+        kprintf("[tcp_lstdrain] FAIL count %u != %u\n", lst->accept_count, n); fails++;
+    }
+
+    // Free the listener WITHOUT accepting -> the drain must RST + free every child.
+    tcp_pcb_free(lst);
+
+    if (lst->accept_count != 0) {
+        kprintf("[tcp_lstdrain] FAIL backlog not drained (%u left)\n", lst->accept_count); fails++;
+    }
+    for (unsigned i = 0; i < n; i++)
+        if (tcp_pcb_on_list(kids[i])) {
+            kprintf("[tcp_lstdrain] FAIL child %u leaked on s_pcb_head\n", i); fails++;
+        }
+
+    kprintf(fails ? "[tcp_lstdrain] SELF-TEST FAILED\n"
+                  : "[tcp_lstdrain] SELF-TEST PASSED (listener close drains + frees queued ESTABLISHED children)\n");
 }

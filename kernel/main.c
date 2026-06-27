@@ -747,6 +747,11 @@ static void init_kthread(void) {
     extern void tcp_synreap_selftest(void);
     tcp_synreap_selftest();
 
+    // Audit fix (F158): freeing a listener with queued-but-unaccepted
+    // ESTABLISHED children must RST + free them, not leak ~128 KiB each.
+    extern void tcp_listener_drain_selftest(void);
+    tcp_listener_drain_selftest();
+
     // UDP send-size guard: an oversize user length must be rejected (-EMSGSIZE)
     // before the user-u32 -> uint16_t UDP-length narrowing wraps and under-sizes
     // the skb (which NULL-derefs on the unchecked skb_put -- an unprivileged DoS).
