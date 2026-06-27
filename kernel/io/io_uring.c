@@ -1050,6 +1050,7 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
             if (!f) { res = -EBADF; break; }
             extern int drm_ring_atomic(vfs_file_t*, uint64_t);
             res = drm_ring_atomic(f, sqe->addr);
+            uring_fdput(f);   // sqe_fdget took a ref; balance it like READ/WRITE
             break;
         }
 

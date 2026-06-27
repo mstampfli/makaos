@@ -2640,14 +2640,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       (pcb struct + pcb_wake + 4 sites across tcp.c/socket.c) whose blocking-with-contention is NOT boot-exercised, so
       it needs a DEDICATED turn WITH a real blocking-wait test harness (a regression would HANG TCP, worse than the
       rare race). NEXT after the path-TOCTOU, or whenever a TCP blocking-wait test can be built.
-    Path TOCTOU on unlink/rename/mkdir/open+O_CREAT (syscall.c + ext2.c) -- HIGH impact, race-gated, INVASIVE fix.
-      The syscall-level permission check resolves+validates the parent, then the ext2 op RE-resolves the path from
-      scratch with no perm re-check; a concurrent rename of an intermediate component swaps the target -> a
-      destructive op (delete/replace/create) in a directory whose write perm was never validated. The clean pattern
-      already exists (existing-file sys_open resolves once -> ext2_open_ino). Needs resolve-once-to-inode for the
-      mutating ops -- a dedicated design turn. (Related out-of-class: fs_lookup doesn't check final-file r/w perm for
-      ext2 -- a permission-model gap.) Also LOW: mmap re-resolves f->path instead of f->ino (wrong-size); socket_bind
-      RCU-frees a pcb a blocked sibling holds by raw pointer (latent, hangs not UAFs).
+    FIXED (F128): io_uring IORING_OP_DRM_COMMIT fixed-file refcount LEAK (io_uring.c:1044) -- the handler took a ref
+      via sqe_fdget but never uring_fdput'd it (unlike READ/WRITE), so each DRM_COMMIT leaks a file ref; a FIXED
+      file then never reaches refcount 0 and is never freed -> unbounded kernel-memory leak under a commit loop (an
+      unprivileged DoS). FIX: added uring_fdput(f) on the success path (DRM_COMMIT was the lone unbalanced sqe_fdget
+      site; SEND/RECV/CONNECT/ACCEPT route through sys_* with their own fdget/fdput). Verified: code-proof (get/put
+      now balanced like READ/WRITE) + [io_uring_test] boot-exercises the dispatch/fdput path.
+    Path TOCTOU on unlink/rename/mkdir/open+O_CREAT (syscall.c + ext2.c) -- HIGH impact, race-gated, INVESTIGATED in
+      depth, DEFERRED to a dedicated turn (correct fix is subtle, NOT a half-landable change). The syscall-level perm
+      check resolves+validates the parent, then the ext2 op RE-resolves the path from scratch with no perm re-check;
+      a concurrent rename of an intermediate component swaps the target -> a destructive op in a directory whose write
+      perm was never validated. PLANNED FIX: move the WRITE|EXEC perm check INTO each ext2 op, on the parent inode the
+      op itself resolves, so check + use are on the SAME resolution (pass cred into the op; extract a shared
+      ext2_dir_write_ok(parent_ino, cred) helper). KEY FINDINGS from the investigation (so the dedicated turn does not
+      re-derive them): (1) the 4 ops are called ONLY from the 4 syscall sites (clean signature change); errno.h +
+      vfs_check_perm are available in ext2.c. (2) ext2_unlink/ext2_mkdir/ext2_rename resolve their parent(s) once and
+      operate directly -> a perm check on that resolution is clean; ext2_rename resolves BOTH parents (so it also
+      fixes the dst-parent gap below). (3) ext2_create is the HARD one: it delegates the actual creation to
+      ext2_write_file(path), which RE-resolves the path AND is shared with ext2_truncate (different perm semantics) --
+      so the check cannot just gate ext2_create's own parent_ino; it must gate ext2_write_file's create site without
+      affecting truncate. (4) errno preservation: keep the syscall checks (EACCES + early reject) and make the
+      op-internal check authoritative (least-invasive A2), OR plumb int* err_out through the ops (full move). (5) the
+      mutating ops are weakly boot-exercised -> the turn MUST add a create/unlink/mkdir/rename selftest (as root) to
+      verify normal access is unbroken. ALSO FIX IN THE SAME CHANGE: sys_rename checks only the SRC parent's write
+      perm, NOT the dst parent -- a real permission gap (rename into a no-write dir currently succeeds); moving the
+      check into ext2_rename (which resolves both parents) closes it. (Related out-of-class: fs_lookup doesn't check
+      final-file r/w perm for ext2 -- a separate permission-model gap.) Also LOW: mmap re-resolves f->path instead of
+      f->ino (wrong-size); socket_bind RCU-frees a pcb a blocked sibling holds by raw pointer (latent, hangs not UAFs).
   AUDITED CLEAN: io_uring (SQE snapshot in dispatch_exec; sqe_fdget/uring_fdget hold the lock / RCU+tryget across the
     use; REGISTER_FILES single-fetch under lock), drm/evdev/pty/tty ioctls (copy_from_user the arg into a kernel
     local, use only that), fdget (RCU + vfs_tryget -- the canonical lookup-then-use, refcount-pinned), poll/mmap/
@@ -2656,10 +2675,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     use; UDP recv re-checks head under the lock after wake; unix peer is RCU+refcount; F119 establish-vs-reap under
     s_pcb_wlock), fs (dcache_lookup returns a refcounted handle held across the use; bcache_get pins; proc uses
     RCU-snapshot+vfs_tryget; existing-file open/exec resolve-once-to-inode-number; copy_path_from_user single-fetch).
-  SCAN #11 STATUS: the fd-table lookup-then-use UAF FIXED (F126, new mechanism + unit test) and the sys_spawn stdio
-    double-fetch FIXED (F127); io_uring (the prime double-fetch surface) verified clean. TWO recorded TOCTOU items
-    remain, both needing a dedicated turn: (1) the TCP blocking-wait lost-wakeup (4 sites -- wait_queue/WAIT_EVENT_HOOK
-    convergence + a blocking-wait test harness), and (2) the HIGH path-TOCTOU on unlink/rename/mkdir/open+O_CREAT
-    (resolve-once-to-inode redesign). Next: tackle one of those two as a focused turn, OR advance to SCAN #12-as-a-type
-    (use-after-free distinct from double-free, OR lock-ordering/deadlock, OR a recorded residual: socket_bind port-0
-    overload, the ignored-OOM-return cluster, io_uring DRM_COMMIT fdput leak, ahci_submit_sg READ_POISON).
+  SCAN #11 STATUS: FIXED -- the fd-table lookup-then-use UAF (F126, new mechanism + unit test), the sys_spawn stdio
+    double-fetch (F127), and the io_uring DRM_COMMIT fdput leak (F128); io_uring (the prime double-fetch surface)
+    verified clean. TWO recorded items remain, BOTH needing a dedicated turn with a TEST HARNESS (their correct fixes
+    are subtle refactors of weakly-boot-exercised core paths -- deferred per real-proof, design notes captured above):
+    (1) the TCP blocking-wait lost-wakeup (4 sites -- wait_queue/WAIT_EVENT_HOOK convergence + a blocking-wait test),
+    and (2) the HIGH path-TOCTOU on the mutating fs ops (move-perm-check-into-the-op + the ext2_create/ext2_write_file
+    wrinkle + the rename dst-parent gap + a create/unlink/mkdir/rename selftest). Next: advance to SCAN #12-as-a-type
+    (use-after-free distinct from double-free, OR lock-ordering/deadlock, OR uninitialized-padding round 2), OR clear a
+    smaller clean residual (socket_bind port-0 overload, the ignored-OOM-return cluster, ahci_submit_sg READ_POISON),
+    OR take one of the two deferred dedicated-turn items when a test harness can be built.
