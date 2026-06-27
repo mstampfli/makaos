@@ -725,6 +725,11 @@ static void init_kthread(void) {
     extern void udp_send_size_selftest(void);
     udp_send_size_selftest();
 
+    // readdir/uname out-struct info-leak guard: the dirent buffer + utsname must
+    // be zeroed before fill so no name-tail / padding stale bytes reach userspace.
+    extern void out_struct_zerofill_selftest(void);
+    out_struct_zerofill_selftest();
+
     // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
     extern void virtio_desc_id_valid_selftest(void);
     virtio_desc_id_valid_selftest();

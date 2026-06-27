@@ -2560,3 +2560,47 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     new unit test. Residuals are all bounded-downstream LOW. Next: SCAN #10-as-a-type (TOCTOU/race-window -- the
     ahci_submit_sg READ_POISON re-check gap is a strong candidate -- OR uninitialized-memory/info-leak to userspace,
     OR a recorded residual: socket_bind port-0 overload, the ignored-OOM-return cluster, io_uring DRM_COMMIT fdput).
+
+- 2026-06-27 BUG-TYPE SCAN #10 (uninitialized-memory / kernel-info-leak to userspace): kernel stack/heap bytes that
+  were never initialized are copied out to an unprivileged user (struct padding, unset fields, a buffer's unwritten
+  tail), disclosing kernel pointers / other tasks' data. Swept the whole tree with 4 parallel read-only agents (net
+  [sockaddr out-params, recvmsg]; fs+vfs [stat/dirent/proc/dev]; drivers+io [every ioctl GET, signalfd, io_uring
+  CQE]; mm+proc+syscall [uname/sysinfo/rusage/siginfo + every copy_to_user]). Found TWO unprivileged HIGH leaks,
+  both the SAME shape (copy-out without zeroing), both in syscall.c -- FIXED as one cluster (F124/F125).
+  FIXED (F124): sys_readdir kernel-HEAP leak (kernel/syscall/syscall.c). `kbuf = kmalloc(max_entries *
+    sizeof(ext2_entry_t))` (syscall.c:1776) is NOT zeroed; ext2_entry_t (name[256]+u32+u32+u8, NOT packed -> 268 B
+    with 3 tail pad bytes) is filled by ext2_readdir/dev_readdir/proc_readdir/the inline /proc+/dev injection with
+    only name[0..nlen]+NUL + 3 fields, leaving the name tail + 3 pad bytes stale; copy_to_user ships the full struct
+    per entry -> up to ~64 KiB of kmalloc heap to any unprivileged process on any readable directory. Flagged by TWO
+    agents independently. FIX: __builtin_memset(kbuf, 0, ...) at the single copy-out owner before any filler runs
+    (covers all fillers, no drift).
+  FIXED (F125): sys_uname kernel-STACK leak (kernel/syscall/syscall.c:4090). `utsname_t u;` (6 x char[65] = 390 B)
+    is an unzeroed stack local; strncpy_k copies only strlen+1 per field (no zero-pad like POSIX strncpy), so the
+    full-struct copy_to_user leaks ~349 B of stale stack to any unprivileged uname() caller. FIX:
+    __builtin_memset(&u, 0, sizeof u) before the fills (the file's sys_stat/sys_fstat zero-then-fill convention).
+  Both verified by the new out_struct_zerofill_selftest (pins sizeof(ext2_entry_t)==268 / sizeof(utsname_t)==390 so
+    a future field-add that adds uncovered padding fails the build-boot, and asserts the zero-before-fill leaves the
+    tail + padding zero) + boot (svcmgr opendir/readdir of /etc/services exercises sys_readdir every boot).
+  RECORDED (not fixed -- dead/unreachable): proc_stat (fs/proc.c:538) fills a partial `struct stat` without zeroing,
+    but has NO caller (the live /proc stat path is sys_stat's is_virtual branch, which memsets) -- a latent footgun
+    if ever wired up. fat32 readdir/stat fillers -- DEAD (unwired, no VFS hookup).
+  RECORDED (informational -- NOT a kernel leak, but worth defensive zeroing): socket_recvfrom (socket.c:625) and
+    socket_accept (socket.c:378) leave sin_zero[8] of the sockaddr_in out-param unwritten, BUT the kernel writes the
+    address fields DIRECTLY into the validated user pointer (never stages a kernel struct + copies it), so the 8
+    unwritten bytes keep the USER's own prior memory -- discloses nothing from the kernel. Would become a real 8-byte
+    stack leak if ever refactored to stage-in-kernel-then-copy_to_user; zero-the-struct defensively if so. (Note:
+    this kernel has NO getsockname/getpeername/getsockopt syscall, eliminating the usual sockaddr leak vectors.)
+  AUDITED CLEAN: net (recv/recvfrom/recvmsg copy exactly the byte count read; SCM_RIGHTS cmsghdr no padding + all
+    fields set; sockets/PCBs memset at alloc), fs+vfs (sys_stat/sys_fstat __builtin_memset their out struct incl.
+    _pad0; proc content generators set *out_size to the exact written length; pipe/dev reads return only produced
+    bytes; urandom fills the full len), drivers+io (drm GET handlers copy_from_user the whole arg IN then write it
+    back OUT so untouched padding round-trips the USER's bytes; signalfd_siginfo `{0}` zeros its 46-byte __pad;
+    io_uring CQE packed 16 B all-fields-set + ring memset-0; evdev device memset-0 + names always NUL-terminated;
+    termios/winsize no padding; eventfd/timerfd copy exactly 8 defined bytes), mm+proc+syscall (getrusage/times/
+    gettimeofday/sigaction/epoll_event/poll/select/itimerspec all zero-init or no-padding-all-fields-set; task_t
+    memset at alloc; every user-visible mm frame zeroed before content). The kernel overwhelmingly zeroes-then-fills.
+  SCAN #10 SUBSTANTIALLY COMPLETE: both unprivileged info-leaks (readdir heap, uname stack) FIXED (F124/F125) with a
+    new unit test; the "zero-then-fill out-param" rule recorded in docs/PRIMITIVES.md. Next: SCAN #11-as-a-type
+    (TOCTOU/race-window -- the ahci_submit_sg READ_POISON re-check gap -- OR a recorded residual: socket_bind port-0
+    overload, the ignored-OOM-return cluster [process.c fd_table_init/pid_alloc, elf.c mm_vma_add], io_uring
+    DRM_COMMIT fdput leak).

@@ -110,6 +110,24 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   (Sibling raw-out-param fixes F109: sys_wait/pipe/fb_info copy_to_user a kernel
   local; sys_nanosleep/shm_open/shm_unlink copy_from_user into one; sys_setsockopt
   bounces optval into a kernel buffer so no option handler derefs the raw pointer.)
+- ZERO-THEN-FILL every out struct/buffer before copy_to_user (F124/F125, the
+  SCAN #10 info-leak class).  A struct/buffer copied to userspace must have EVERY
+  byte defined -- not just the fields the handler sets, but struct PADDING (gaps
+  between differently-sized fields, tail padding) and any unwritten buffer tail.
+  Leaving them stale leaks kernel stack/heap (pointers, other tasks' data) to an
+  unprivileged reader.  RULE: `struct X out; __builtin_memset(&out, 0, sizeof out);`
+  (or zero a kmalloc'd buffer -- there is NO kzalloc in this tree) BEFORE filling,
+  so padding AND future-added fields are always clean.  Zero at the SINGLE copy-out
+  owner, not per-filler (F124 zeroes the readdir kbuf once at sys_readdir, covering
+  the ext2/proc/dev/injected fillers in 3 files, instead of patching each).
+  Established convention: sys_stat/sys_fstat/sys_fb_info/getrusage/select already
+  memset (or `= {0}`) their out struct first; F124 (sys_readdir kmalloc heap) and
+  F125 (sys_uname stack, strncpy_k does not zero-pad) brought the two stragglers
+  onto it.  `out_struct_zerofill_selftest` pins the struct sizes (a future
+  field-add that creates uncovered padding fails the build-boot) + asserts the
+  tail/padding is zero after the zero-before-fill.  NOTE: a handler that
+  copy_from_user's the whole arg IN then writes it back OUT (the DRM GET pattern)
+  is already safe -- untouched padding round-trips the USER's own bytes.
 
 ### C. Rings (producer/consumer accounting)
 - `tcp_ring_consume(head, used, n, mask)` -- clamped drain, never underflows (F18).

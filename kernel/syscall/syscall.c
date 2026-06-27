@@ -1775,6 +1775,13 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) { kfree(path); return (uint64_t)-ENOMEM; }
+    // Zero the whole buffer BEFORE the directory fillers run: each filler writes
+    // only name[0..nlen]+NUL plus inode_num/size/is_dir, so the name[] tail and
+    // the 3 trailing pad bytes of every ext2_entry_t would otherwise stay as
+    // stale kmalloc heap and be shipped to userspace by the copy_to_user below
+    // (an unprivileged kernel-heap info-leak on any readable directory).  Zeroing
+    // at this single copy-out owner covers all fillers (ext2/proc/dev/injected).
+    __builtin_memset(kbuf, 0, max_entries * sizeof(ext2_entry_t));
 
     int count;
     {
@@ -4079,7 +4086,13 @@ static void strncpy_k(char* dst, const char* src, uint64_t n) {
 
 static uint64_t sys_uname(uint64_t buf_ptr) {
     if (!buf_ptr) return (uint64_t)-EINVAL;
+    // Zero the whole struct first: strncpy_k copies only strlen+1 bytes per
+    // field (it does NOT zero-pad like POSIX strncpy), so without this the tail
+    // of every 65-byte field after its NUL would carry stale kernel stack out to
+    // userspace (~349 bytes of an unprivileged uname() info-leak).  Same
+    // zero-then-fill discipline as sys_stat / sys_fstat.
     utsname_t u;
+    __builtin_memset(&u, 0, sizeof(u));
     strncpy_k(u.sysname,    "MakaOS",          65);
     strncpy_k(u.nodename,   "makaos",          65);
     strncpy_k(u.release,    "0.1.0",           65);
@@ -4087,6 +4100,46 @@ static uint64_t sys_uname(uint64_t buf_ptr) {
     strncpy_k(u.machine,    "x86_64",          65);
     strncpy_k(u.domainname, "(none)",          65);
     return (copy_to_user((void*)buf_ptr, &u, sizeof(u)) == 0) ? 0 : (uint64_t)-EFAULT;
+}
+
+// Deterministic guard for the SCAN #10 info-leak fixes (F124 sys_readdir,
+// F125 sys_uname): an out struct copied to userspace must carry NO stale bytes
+// in its name/string tail or compiler padding.  This PINS the struct sizes (so
+// a future field-add that creates uncovered padding fails here instead of
+// silently leaking) and verifies the fixes' zero-before-fill leaves every
+// non-written byte zero.  (The live guard that the handlers actually zero is
+// code-proof + boot: svcmgr's opendir/readdir of /etc/services exercises
+// sys_readdir every boot.)
+void out_struct_zerofill_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    if (sizeof(ext2_entry_t) != 268) { kprintf("[out_zerofill] FAIL ext2_entry_t sz=%lu\n",
+                                               (unsigned long)sizeof(ext2_entry_t)); fails++; }
+    {
+        ext2_entry_t e;
+        __builtin_memset(&e, 0xAA, sizeof(e));   // stale heap
+        __builtin_memset(&e, 0,    sizeof(e));   // the F124 fix: zero before fill
+        e.name[0] = 'a'; e.name[1] = '\0';
+        e.inode_num = 42; e.size = 7; e.is_dir = 1;
+        const uint8_t* p = (const uint8_t*)&e;
+        for (uint64_t i = 2;   i < 256;       i++) if (e.name[i] != 0) { fails++; break; }  // name tail
+        for (uint64_t i = 265; i < sizeof(e); i++) if (p[i]      != 0) { fails++; break; }  // 3 pad bytes
+    }
+
+    if (sizeof(utsname_t) != 390) { kprintf("[out_zerofill] FAIL utsname_t sz=%lu\n",
+                                            (unsigned long)sizeof(utsname_t)); fails++; }
+    {
+        utsname_t u;
+        __builtin_memset(&u, 0xAA, sizeof(u));   // stale stack
+        __builtin_memset(&u, 0,    sizeof(u));   // the F125 fix: zero before fill
+        u.sysname[0] = 'M'; u.sysname[1] = '\0';
+        for (uint64_t i = 2; i < 65; i++) if (u.sysname[i] != 0) { fails++; break; }  // field tail
+        for (uint64_t i = 0; i < 65; i++) if (u.machine[i] != 0) { fails++; break; }  // untouched field
+    }
+
+    kprintf(fails ? "[out_zerofill] SELF-TEST FAILED\n"
+                  : "[out_zerofill] SELF-TEST PASSED (readdir/uname out-struct tail+padding zeroed)\n");
 }
 
 // ── sys_umask ─────────────────────────────────────────────────────────────
