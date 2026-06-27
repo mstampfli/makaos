@@ -132,6 +132,15 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
 ### C. Rings (producer/consumer accounting)
 - `tcp_ring_consume(head, used, n, mask)` -- clamped drain, never underflows (F18).
 - `tcp_ring_reserve(tail, used, want, size, mask, *start)` -- clamped reserve (F44).
+- `tcp_tx_first_chunk(off, len)` (kernel/net/tcp.c, F149) -- the largest prefix of a
+  [off, off+len) tx-ring READ that stays BEFORE the TCP_TXBUF_SIZE wrap: min(len,
+  TCP_TXBUF_SIZE - off), so off + return <= TCP_TXBUF_SIZE always.  The TX send/
+  retransmit paths flat-memcpy'd up to TCP_MSS bytes from a masked ring offset, so a
+  span crossing the 64 KiB wrap over-read adjacent kernel heap and leaked it on the
+  wire; tcp_send_ring uses this to split the read into one-or-two segments that never
+  cross the wrap.  Forbidden raw pattern: a flat memcpy/read of a span from a ring
+  buffer using only a masked start index (the read can run past the buffer end).
+  `tcp_tx_first_chunk_selftest` drives the wrap boundaries (65535+1460, 1+65536, ...).
 - (`kernel/include/spsc.h` is the existing lock-free SPSC ring.) The sweep will
   reconcile tcp_ring_* / the tty rb_* helpers / `io_ring_index` into one generic,
   tested ring primitive used under the owning lock.

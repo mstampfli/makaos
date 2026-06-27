@@ -724,6 +724,9 @@ static void init_kthread(void) {
 
     extern void tcp_ring_reserve_selftest(void);
     tcp_ring_reserve_selftest();
+    // tx-ring read never crosses the 64K wrap (heap-OOB-read fix, F149).
+    extern void tcp_tx_first_chunk_selftest(void);
+    tcp_tx_first_chunk_selftest();
 
     extern void tcp_accept_q_selftest(void);
     tcp_accept_q_selftest();

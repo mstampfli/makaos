@@ -2957,3 +2957,24 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   io_uring every fdget->fdput + io_uring_setup fd_install-then-copyout closes-on-fault + dispatch_exec double-fetch
   guard; proc signal_setup_frame self-handles + sys_sigreturn copy checked + task_fork fully checked. SCAN #16 lead
   CLOSED; the io_uring lost-CQE hang is the next-strongest residual.
+
+- 2026-06-27 BUG-TYPE SCAN #17 (MEMORY-SAFETY: OUT-OF-BOUNDS / heap over-read), opened. LEAD FIXED (F149, HIGH, a
+  REMOTE kernel-heap info-leak): tcp.c tx-ring 64 KiB-wrap heap-OVER-READ -- tcp_send (~877) and the tcp_timer_tick
+  retransmit (~671) flat-memcpy'd up to TCP_MSS bytes from `txbuf + masked_offset`, so a send/in-flight span crossing
+  the ring wrap (off + len > TCP_TXBUF_SIZE=65536) over-read up to ~1459 bytes of adjacent kernel heap INTO the TCP
+  segment and onto the wire (info-disclosure) + dropped the wrapped tail. Fixed with a tested tcp_tx_first_chunk
+  no-wrap bound + a wrap-aware tcp_send_ring that splits into one-or-two consecutive segments; see AUTOFIX_LOG F149.
+  This was the strongest finding across SCANs #14-16 (the only remote memory-disclosure). The RX path already used
+  masked per-byte indexing (clean); only the two TX reads linearized.
+  STILL-OPEN (carried from SCAN #16, ignored-error-return MED/LOW residuals -- opportunistic cleanup): hda.c:206
+  verb_send poll-timeout returns stale RIRB data as a valid response (needs a return-type change to signal timeout;
+  init-only, no audio); sys_readlink (syscall.c:5517) + sys_times (5663) drop copy_to_user -> return success on a
+  faulted user buffer (one-line -EFAULT each; no kernel leak/crash); vmm.c:160 vmm_map_mmio ignores vmm_page_map
+  (kernel BAR mapper, boot-only LOW).
+  OOB-class candidate for this scan's continuation: ext2_vfs_pread (ext2.c:~1416) is missing the EOF byte-clamp that
+  ext2_vfs_read has (ext2.c:~1327) -- the aligned fast path advances `total += run * s_block_size` without clamping to
+  i_size, so a pread whose final block is partial returns PHANTOM tail bytes (the last block's content past EOF) =
+  info-exposure via the mmap/page-fault pread path. A bounded over-return, not an OOB write, MED.
+  METHOD NOTE: SCAN #17 was opened by promoting the strongest already-identified OOB finding rather than a fresh
+  6-agent sweep; a full OOB/over-read sweep (every memcpy/array-index/ring-read against an untrusted or wrapping
+  bound) is the natural next step if more are wanted -- the prior SCANs already audited most memcpy/index sites clean.

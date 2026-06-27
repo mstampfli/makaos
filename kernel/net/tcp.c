@@ -293,6 +293,32 @@ static int tcp_send_segment(tcp_pcb_t* pcb, uint8_t flags,
     return r;
 }
 
+// PRIMITIVE (tx-ring no-wrap chunk).  Bytes of a [off, off+len) span that lie
+// BEFORE the TCP_TXBUF_SIZE ring wrap -- the largest prefix tcp_send_segment can
+// flat-memcpy without reading past the 64 KiB txbuf.  off is a masked ring index
+// (0..TCP_TXBUF_SIZE-1), so off + return <= TCP_TXBUF_SIZE always.  The caller
+// sends this many bytes from `off`, then the remaining (len - this) from offset 0.
+// Pure -> unit-tested (tcp_tx_first_chunk_selftest).
+static inline uint32_t tcp_tx_first_chunk(uint32_t off, uint32_t len) {
+    uint32_t to_end = TCP_TXBUF_SIZE - off;   // off < TCP_TXBUF_SIZE -> to_end >= 1
+    return len <= to_end ? len : to_end;
+}
+
+// Send up to `len` bytes of buffered TX data starting at txbuf ring offset `off`,
+// splitting at the ring wrap so tcp_send_segment's flat memcpy NEVER reads past
+// the 64 KiB txbuf.  A span that crossed the wrap (off + len > TCP_TXBUF_SIZE)
+// used to over-read up to ~TCP_MSS bytes of adjacent kernel heap and transmit it
+// on the wire (remote info-leak) AND drop the wrapped tail.  Emits one segment
+// (no wrap) or two consecutive segments -- snd_nxt advances per segment, so the
+// seq numbers are contiguous.  Callers pass pure-data flags (no SYN/FIN) when len
+// can wrap, so duplicating the flags across a 2-way split is correct.
+static int tcp_send_ring(tcp_pcb_t* pcb, uint8_t flags, uint32_t off, uint32_t len) {
+    uint32_t first = tcp_tx_first_chunk(off, len);
+    int r = tcp_send_segment(pcb, flags, pcb->txbuf + off, (uint16_t)first);
+    if (r < 0 || first == len) return r;
+    return tcp_send_segment(pcb, flags, pcb->txbuf, (uint16_t)(len - first));
+}
+
 // ── Send a RST ────────────────────────────────────────────────────────────
 
 static void tcp_send_rst(uint32_t src_ip, uint16_t src_port,
@@ -621,7 +647,6 @@ void tcp_timer_tick(void) {
             // dropped it, and connect() hit the caller's timeout.
             uint8_t flags;
             uint32_t rlen = 0;
-            const void* rdata = NULL;
             uint32_t old_nxt = pcb->snd_nxt;
             if (pcb->state == TCP_SYN_SENT) {
                 flags = TCP_SYN;
@@ -640,9 +665,13 @@ void tcp_timer_tick(void) {
                 pcb->snd_nxt = pcb->snd_una;
                 flags = TCP_ACK;
                 if (pcb->fin_sent && rlen == 0) flags |= TCP_FIN;
-                rdata = pcb->txbuf + (pcb->txbuf_head & TCP_TXBUF_MASK);
             }
-            tcp_send_segment(pcb, flags, rdata, (uint16_t)rlen);
+            if (rlen > 0)
+                // Wrap-safe resend from txbuf_head (the oldest unacked byte): the
+                // in-flight span can cross the ring wrap -- tcp_send_ring splits it.
+                tcp_send_ring(pcb, flags, pcb->txbuf_head & TCP_TXBUF_MASK, rlen);
+            else
+                tcp_send_segment(pcb, flags, NULL, 0);
             if (!rlen && !pcb->fin_sent && pcb->state != TCP_SYN_SENT &&
                 pcb->state != TCP_SYN_RCVD)
                 pcb->snd_nxt = old_nxt;
@@ -873,8 +902,9 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock) {
         if (sendable) {
             uint32_t send_off = (pcb->txbuf_head +
                                  (pcb->snd_nxt - pcb->snd_una)) & TCP_TXBUF_MASK;
-            tcp_send_segment(pcb, TCP_ACK | TCP_PSH,
-                              pcb->txbuf + send_off, (uint16_t)sendable);
+            // Wrap-safe: send_off + sendable can cross the ring end; tcp_send_ring
+            // splits the read so the flat memcpy never runs past the 64 KiB txbuf.
+            tcp_send_ring(pcb, TCP_ACK | TCP_PSH, send_off, sendable);
         }
     }
     return (int)done;
@@ -1035,6 +1065,37 @@ void tcp_ring_reserve_selftest(void) {
     }
     kprintf(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
                   : "[tcp_reserve] SELF-TEST PASSED (ring reserve, clamp + wrap)\n");
+}
+
+// ── tx-ring no-wrap chunk selftest ─────────────────────────────────────────
+// Deterministic check that the TX read never crosses the 64 KiB txbuf wrap: for
+// every (off, len) the first chunk stays within [off, TCP_TXBUF_SIZE).  The
+// 65000+1460 / 65535+1460 / 1+65536 rows are exactly the spans whose flat memcpy
+// used to over-read adjacent kernel heap and leak it on the wire.
+void tcp_tx_first_chunk_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t off, len, want; } c[] = {
+        { 0,     1460,  1460  },   // start of ring, no wrap
+        { 64000, 1460,  1460  },   // 65536-64000=1536 >= 1460 -> no wrap
+        { 65000, 1460,  536   },   // 65536-65000=536 < 1460 -> clamp (tail 924)
+        { 65535, 1460,  1     },   // worst case: 1 byte before the wrap (tail 1459)
+        { 65535, 1,     1     },   // exactly fills to the ring end
+        { 0,     65536, 65536 },   // full ring from 0, no wrap
+        { 1,     65535, 65535 },   // 65536-1 == len, no wrap
+        { 1,     65536, 65535 },   // 65536-1 < len -> clamp (tail 1)
+        { 100,   0,     0     },   // zero-length
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t got = tcp_tx_first_chunk(c[i].off, c[i].len);
+        if (got != c[i].want || (uint64_t)c[i].off + got > TCP_TXBUF_SIZE) {
+            kprintf("[tcp_txwrap] FAIL off=%u len=%u got=%u want=%u\n",
+                    c[i].off, c[i].len, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf(fails ? "[tcp_txwrap] SELF-TEST FAILED\n"
+                  : "[tcp_txwrap] SELF-TEST PASSED (tx-ring read never crosses the 64K wrap)\n");
 }
 
 // ── accept-queue ring selftest ────────────────────────────────────────────
