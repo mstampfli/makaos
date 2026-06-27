@@ -3101,31 +3101,39 @@ static uint64_t sys_openpty(uint64_t user_fds) {
     // Install into fd table
     int64_t mfd = fd_install(master);
     if (mfd < 0) {
-        master->close(master);
-        slave->close(slave);
+        // Neither end is installed (master's fd_install failed, slave not yet
+        // attempted): each is owned by its local ref, so vfs_close drops it
+        // atomically -- freeing the pty_t (via ->close at rc->0) AND the
+        // vfs_file_t.  A bare ->close() force-runs the pty teardown and LEAKS
+        // the vfs_file_t.
+        vfs_close(master);
+        vfs_close(slave);
         return (uint64_t)mfd;
     }
 
     int64_t sfd = fd_install(slave);
     if (sfd < 0) {
-        // Close master fd
-        task_files_t* tf0 = g_current->files_shared;
-        spin_lock(&tf0->lock); tf0->ft->fd_table[mfd] = NULL; spin_unlock(&tf0->lock);
-        master->close(master);
-        slave->close(slave);
+        // master is INSTALLED (published in the shared fd table): release it via
+        // sys_close, which clears the slot AND drops the ref through vfs_close,
+        // freeing only at rc->0 -- so a CLONE_FILES sibling that grabbed mfd in
+        // the window keeps it alive instead of a use-after-free.  slave was never
+        // installed -> vfs_close.  (The old manual slot-NULL + ->close() bypassed
+        // the atomic refcount and force-freed the pty_t under any sibling ref.)
+        sys_close((uint64_t)mfd);
+        vfs_close(slave);
         return (uint64_t)sfd;
     }
 
     // Copy fds to userspace
     int fds[2] = { (int)mfd, (int)sfd };
     if (copy_to_user((void*)user_fds, fds, sizeof(fds)) != 0) {
-        task_files_t* tf0 = g_current->files_shared;
-        spin_lock(&tf0->lock);
-        tf0->ft->fd_table[mfd] = NULL;
-        tf0->ft->fd_table[sfd] = NULL;
-        spin_unlock(&tf0->lock);
-        master->close(master);
-        slave->close(slave);
+        // Both ends are installed: release each via its fd so the slot-clear and
+        // the ref-drop are one atomic vfs_close (freeing only at rc->0).  A
+        // sibling thread holding either just-installed fd keeps the pty alive;
+        // the old manual slot-NULL + ->close() force-freed the pty_t and UAF'd
+        // the sibling's ref.
+        sys_close((uint64_t)mfd);
+        sys_close((uint64_t)sfd);
         return (uint64_t)-EFAULT;
     }
 

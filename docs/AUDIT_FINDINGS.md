@@ -3037,15 +3037,16 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   via vmm_free_user(pml4)=vmm_free_user_ex(pml4, NULL) and the MMIO-skip needs a non-NULL mm. Fixed by making both
   teardowns mm-aware (parent/spawner mm identifies the MMIO PTEs); see AUTOFIX_LOG F156. The kernel is otherwise
   unusually well-defended for this class -- every other audited subsystem is balanced (documented below).
-  TWO MORE GENUINE FINDINGS recorded for follow-up (verify each against the real code before fixing):
-  1. [MED, UAF/double-free] sys_openpty (syscall.c:~3087-3127) force-closes installed fds via `master->close(master)` /
+  TWO MORE GENUINE FINDINGS (one fixed, one pending):
+  1. [MED, UAF/double-free] sys_openpty (syscall.c:~3087-3127) force-closed installed fds via `master->close(master)` /
      `slave->close(slave)` directly on its error paths (slave-install-fail + copy_to_user-fail) instead of vfs_close /
-     sys_close. ->close() runs the pty driver teardown UNCONDITIONALLY, bypassing the atomic refcount, so under a shared
-     fd table (CLONE_FILES sibling that dup/fdget's the just-installed mfd in the window before the error path) it frees
-     the pty_t while the sibling holds a ref -> UAF + double-free (pty close is non-idempotent). Single-threaded is
-     harmless (refcount==1). Every other install/copyout-fail path in the file uses the safe primitive (sys_pipe uses
-     sys_close for installed ends with a long comment; sys_accept/sys_recvfd use vfs_close) -- openpty is the lone
-     hand-rolled ->close(). FIX: installed end -> sys_close(mfd)/sys_close(sfd); never-installed end -> vfs_close.
+     sys_close. ->close() ran the pty driver teardown UNCONDITIONALLY, bypassing the atomic refcount, so under a shared
+     fd table (CLONE_FILES sibling that dup/fdget's the just-installed mfd in the window before the error path) it freed
+     the pty_t while the sibling held a ref -> UAF + double-free (pty close is non-idempotent). RESOLVED (F157): each
+     error branch now releases per its installed state, mirroring sys_pipe/socketpair -- installed end via sys_close
+     (clears slot + atomic vfs_close, frees only at rc->0) and never-installed end via vfs_close; the manual slot-NULL +
+     ->close() dance is gone. The mfd<0 branch (neither installed) also stopped leaking the vfs_file_t that the bare
+     ->close() left behind. See AUTOFIX_LOG F157.
   2. [MED, leak/DoS] Listener close does not drain queued-but-unaccepted ESTABLISHED child PCBs: sock_close SOCK_STREAM
      (socket.c:~237-244) frees only the listener's own pcb; tcp_pcb_free (tcp.c:~780-814) NULLs each child's ->listener
      backpointer but never frees the children or the accept_queue. The only drain is accept_q_pop (tcp_accept). Close a
