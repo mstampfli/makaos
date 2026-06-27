@@ -5514,7 +5514,12 @@ static uint64_t sys_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t bufsz
     const char* target = "/bin/bash";
     uint64_t tlen = 0; while (target[tlen]) tlen++;
     if (tlen > bufsz) tlen = bufsz;
-    copy_to_user((void*)buf_ptr, target, tlen);
+    // Propagate a faulted destination as -EFAULT instead of reporting a
+    // successful byte count: a caller passing a bad/unmapped buf must not
+    // believe the link was written.  (len==0 still succeeds: _access_ok and
+    // the prefault are no-ops for a zero-length copy, so bufsz==0 returns 0.)
+    if (copy_to_user((void*)buf_ptr, target, tlen) != 0)
+        return (uint64_t)-EFAULT;
     (void)upath;
     return (uint64_t)tlen;
 }
@@ -5660,7 +5665,10 @@ static uint64_t sys_times(uint64_t buf_ptr) {
 
     if (buf_ptr) {
         tms_t tms = { ticks, 0, 0, 0 };
-        copy_to_user((void*)buf_ptr, &tms, sizeof(tms));
+        // A faulted tms* destination must be -EFAULT, not a bogus tick count
+        // reported as success.  times(NULL) is still valid (skips the copy).
+        if (copy_to_user((void*)buf_ptr, &tms, sizeof(tms)) != 0)
+            return (uint64_t)-EFAULT;
     }
     return ticks;
 }

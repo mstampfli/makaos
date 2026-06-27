@@ -2968,8 +2968,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   masked per-byte indexing (clean); only the two TX reads linearized.
   STILL-OPEN (carried from SCAN #16, ignored-error-return MED/LOW residuals -- opportunistic cleanup): hda.c:206
   verb_send poll-timeout returns stale RIRB data as a valid response (needs a return-type change to signal timeout;
-  init-only, no audio); sys_readlink (syscall.c:5517) + sys_times (5663) drop copy_to_user -> return success on a
-  faulted user buffer (one-line -EFAULT each; no kernel leak/crash); vmm.c:160 vmm_map_mmio ignores vmm_page_map
+  init-only, no audio); sys_readlink (syscall.c:5517) + sys_times (5663) dropped copy_to_user -> returned success on a
+  faulted user buffer -- RESOLVED (F151): both now return -EFAULT when copy_to_user fails, mirroring the file's
+  canonical idiom (sys_getrusage/sys_gettimeofday); vmm.c:160 vmm_map_mmio ignores vmm_page_map
   (kernel BAR mapper, boot-only LOW).
   OOB-class item FIXED (F150, MED): ext2_vfs_pread (ext2.c:~1416) was missing the EOF byte-clamp that
   ext2_vfs_read has (ext2.c:~1327) -- the aligned fast path advanced `total += run * s_block_size` without clamping to
