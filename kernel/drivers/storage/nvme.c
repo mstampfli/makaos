@@ -697,6 +697,10 @@ uint8_t nvme_init(void) {
         return 0;
     }
     s_regs = (uint8_t*)vmm_map_mmio(bar_phys, 0x2000);
+    // A failed BAR0 map (OOM / MMIO-VA exhaustion -> NULL) must fail init, not
+    // NULL-deref s_regs in reg_rd32 below.  nvme_init returns 0 on every other
+    // setup failure; mirror that.
+    if (!s_regs) return 0;
 
     // 3. Read CAP to learn doorbell stride and max queue depth.  Read as
     //    two 32-bit halves — some controllers don't support a 64-bit MMIO
@@ -729,8 +733,13 @@ uint8_t nvme_init(void) {
                 dstrd, (uint32_t)db_extent, (uint32_t)NVME_BAR0_MAX_MAP);
         return 0;
     }
-    if (db_extent > 0x2000ull)
+    if (db_extent > 0x2000ull) {
         s_regs = (uint8_t*)vmm_map_mmio(bar_phys, db_extent);
+        // The remap to the larger doorbell window replaced the first mapping;
+        // on failure s_regs is now NULL, so fail init rather than NULL-deref
+        // the doorbells.
+        if (!s_regs) return 0;
+    }
 
     // 4. Allocate admin queues (one 4 KiB page each — enough for 64 entries
     //    of SQE=64B (4096/64=64) and CQE=16B (4096/16=256)).

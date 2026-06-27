@@ -1027,6 +1027,10 @@ uint8_t ahci_init(void) {
     uint64_t abar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn, AHCI_BAR);
     if (!abar_phys) return 0;
     s_hba = (hba_mem_t*)vmm_map_mmio(abar_phys, sizeof(hba_mem_t));
+    // A failed ABAR map (OOM / MMIO-VA exhaustion -> NULL) must fail init, not
+    // NULL-deref s_hba->ghc below.  ahci_init returns 0 on every other setup
+    // failure; mirror that so the boot falls back / reports no AHCI disk.
+    if (!s_hba) return 0;
 
     // 4. Enable AHCI mode.
     s_hba->ghc |= HBA_GHC_AE;

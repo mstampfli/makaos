@@ -158,10 +158,30 @@ virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
     }
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD | PAGE_PWT;
     for (uint64_t i = 0; i < pages; i++) {
-        vmm_page_map(g_kernel_pml4,
-                     base + i * PAGE_SIZE,
-                     phys + i * PAGE_SIZE,
-                     flags);
+        if (!vmm_page_map(g_kernel_pml4,
+                          base + i * PAGE_SIZE,
+                          phys + i * PAGE_SIZE,
+                          flags)) {
+            // OOM allocating an intermediate page-table page.  The old code
+            // ignored this and returned base, leaving a HOLE in the kernel MMIO
+            // window reported as fully mapped -- a later device-register access
+            // to the unmapped page takes an unrecoverable kernel #PF (panic),
+            // and if that VA is ever reused with a foreign PTE it touches the
+            // wrong physical page.  Clear the [0..i) PTEs already mapped (device
+            // phys, not owned here -- just drop the mappings) and fail with NULL,
+            // exactly as the window-exhaustion path above and vmm_map_physical_
+            // user (F148) do.  The bump-reserved VA span is abandoned (never
+            // reused; the 1 TiB window dwarfs all device BARs) and the pages were
+            // never accessed, so no TLB shootdown is needed.
+            extern void kprintf(const char*, ...);
+            kprintf("[vmm] MMIO map OOM at page %lu/%lu (phys=%lx vaddr=%lx)\n",
+                    (unsigned long)i, (unsigned long)pages,
+                    (unsigned long)phys, (unsigned long)base);
+            phys_addr_t old;
+            for (uint64_t j = 0; j < i; j++)
+                vmm_page_unmap(g_kernel_pml4, base + j * PAGE_SIZE, &old);
+            return 0;
+        }
     }
     return base;
 }

@@ -2,6 +2,7 @@
 #include "lapic.h"
 #include "vmm.h"
 #include "common.h"
+#include "panic.h"
 
 // ── IOAPIC MMIO interface ─────────────────────────────────────────────────
 // The IOAPIC exposes two 32-bit registers:
@@ -126,6 +127,13 @@ void ioapic_init(const acpi_info_t* info) {
     // Map IOAPIC MMIO (only 32 bytes needed but map a full page).
     s_base     = (volatile uint32_t*)vmm_map_mmio(
                      (phys_addr_t)info->ioapic_phys, 0x1000u);
+    // The IOAPIC is essential: without its MMIO window the kernel cannot route
+    // any device interrupt, so a failed map (OOM / VA exhaustion) is fatal and
+    // must fail LOUD rather than NULL-deref s_base in the register accesses
+    // below.
+    if (!s_base)
+        panic("ioapic_init: cannot map IOAPIC MMIO at phys=%lx",
+              (unsigned long)info->ioapic_phys);
     s_gsi_base = info->ioapic_gsi_base;
 
     // Save overrides for ioapic_isa_to_gsi().

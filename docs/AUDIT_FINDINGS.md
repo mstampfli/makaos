@@ -2972,8 +2972,17 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the read pointer on timeout), and codec_configure skips/aborts the FG/widget on the flag rather than ingesting a
   phantom topology; sys_readlink (syscall.c:5517) + sys_times (5663) dropped copy_to_user -> returned success on a
   faulted user buffer -- RESOLVED (F151): both now return -EFAULT when copy_to_user fails, mirroring the file's
-  canonical idiom (sys_getrusage/sys_gettimeofday); vmm.c:160 vmm_map_mmio ignores vmm_page_map
-  (kernel BAR mapper, boot-only LOW).
+  canonical idiom (sys_getrusage/sys_gettimeofday); vmm.c:160 vmm_map_mmio ignored vmm_page_map
+  (kernel BAR mapper, boot-only LOW) -- RESOLVED (F153): vmm_map_mmio now checks vmm_page_map in the loop,
+  unmaps the partial pages and returns 0 (NULL) on OOM instead of a half-mapped window (mirroring F148 + its own
+  exhaustion path), and the essential main-BAR callers that derefed the result unchecked now handle the NULL
+  (ioapic panics, ahci/nvme fail init). With F153 the SCAN #16/#17 ignored-error-return residual list is EXHAUSTED.
+  NEW follow-up found while enumerating vmm_map_mmio callers (a DISTINCT bug class -- callers ignoring vmm_map_mmio's
+  NULL return on MSI-X TABLE maps, not the vmm_page_map return): nvme.c:~640 (s_msix_table), ahci.c:~1108 (s_msix_entry),
+  virtio_net.c:~728 (msix_table local) map the MSI-X table via vmm_map_mmio then write msix_table[0..3] with NO NULL
+  check -> NULL-deref if the map fails. LOW (MSI-X setup, boot-only, fails only on the same rare early-OOM) and the
+  correct fix is a per-driver legacy-INTx fallback (not a blind return 0), so deferred as its own item rather than
+  guessed here. (hda/virtio_gpu/virtio_net/virtio_input MAIN BARs + virtio_input MSI-X already NULL-check and skip.)
   OOB-class item FIXED (F150, MED): ext2_vfs_pread (ext2.c:~1416) was missing the EOF byte-clamp that
   ext2_vfs_read has (ext2.c:~1327) -- the aligned fast path advanced `total += run * s_block_size` without clamping to
   i_size, so a pread whose final block is partial returned PHANTOM tail bytes (the last block's content past EOF) =
