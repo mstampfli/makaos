@@ -2488,11 +2488,19 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     UINT64_MAX result now correctly fails). mm/** already used == PMM_INVALID_ADDR everywhere, so no fix there.
   RECORDED (out-of-type, found by the SCAN #8 sweep -- HIGHER severity than the in-type residuals, queued for
   dedicated turns):
-    *** HIGHEST PRIORITY -- spawn SPAWN_ATTR_UNVEIL raw user-pointer deref (a SCAN #3 straggler): sys_spawn's
-      SPAWN_ATTR_UNVEIL handling validates the user unveil-rule array with `_access_ok` then does a RAW memcpy from
+    FIXED (F122) -- spawn SPAWN_ATTR_UNVEIL raw user-pointer deref (a SCAN #3 straggler): sys_spawn's
+      SPAWN_ATTR_UNVEIL handling validated the user unveil-rule array with `_access_ok` then did a RAW memcpy from
       the user pointer (syscall.c ~1449) with NO copy_from_user / prefault, so a user passing a pointer to an
-      UNMAPPED-but-in-range page faults IN the kernel -> an unprivileged kernel #PF panic (DoS). Fix = copy the
-      array via copy_from_user (which handles the fault) instead of _access_ok + raw memcpy. This is the next turn.
+      UNMAPPED-but-in-range page faulted IN the kernel -> an unprivileged kernel #PF panic (DoS). FIX: replaced
+      `_access_ok` + raw memcpy with copy_from_user (handles the fault -> -EFAULT -> bad_attr, never panics; mirrors
+      the spawn_attr copy 50 lines up that was already fixed this way), + kfree(ue) on the new copy-failure path,
+      + a SPAWN_UNVEIL_MAX=256 cap bounding the attacker-sized kmalloc. SIBLING bug closed in the same flow: each
+      copied ue[i].path is a user-controlled char[256] with no guaranteed NUL, and unveil_add's s_strlen is
+      unbounded -> an OOB heap read past the n*257-byte buffer; force-NUL-terminate each entry before unveil_add.
+      Verified: copy_from_user's bad-pointer rejection is already covered by copy_user/access_ok selftests, and the
+      SUCCESS path is boot-exercised (net.svc `unveil=/etc rwc` spawns /bin/net through this code every boot ->
+      DHCP lease proves it). Note: bad_attr fails open (child gets no unveil) -- pre-existing design, not a privesc,
+      left unchanged.
     ahci_submit_sg omits the AHCI_READ_POISON sentinel re-check that the sibling AHCI read paths perform after the
       DMA completes, so a poisoned (failed-read) sector can be returned as valid data on an unprivileged file read
       (stale-data-as-valid). Medium; queue for a TOCTOU/sentinel follow-up.
@@ -2503,6 +2511,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       pid_alloc, elf.c:308 mm_vma_add -- all ignore failure and continue (OOM-only, kernel path). Plus the boot-init
       vmm_map_mmio 0-on-exhaustion sites carried over from SCAN #7 (ioapic/nvme/ahci/virtio_net MSI-X maps).
     io_uring DRM_COMMIT path leaks an fdput (an unbalanced get/put on the error branch).
-  SCAN #8 COMPLETE for the headline cluster: the wild-write-on-OOM DMA cluster is fixed at root in one commit with a
-    reusable PMM_ALLOC_OK primitive (docs/PRIMITIVES.md). Next: the spawn SPAWN_ATTR_UNVEIL unprivileged-panic fix
-    (highest recorded severity), then SCAN #9-as-a-type.
+  SCAN #8 COMPLETE: the wild-write-on-OOM DMA cluster fixed at root with a reusable PMM_ALLOC_OK primitive (F121,
+    docs/PRIMITIVES.md), and the highest-severity out-of-type finding -- the spawn SPAWN_ATTR_UNVEIL unprivileged
+    #PF panic + its sibling OOB heap read -- fixed (F122). Remaining recorded residuals (ahci_submit_sg READ_POISON
+    stale-data sentinel gap; socket_bind port-0 overload; fd_table_init/pid_alloc/mm_vma_add ignored OOM returns;
+    io_uring DRM_COMMIT fdput leak) carried forward. Next: SCAN #9-as-a-type (int-truncation/sign-confusion -> OOB,
+    OR TOCTOU -- the ahci_submit_sg READ_POISON gap is a strong TOCTOU/sentinel candidate -- OR a recorded residual).

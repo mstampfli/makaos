@@ -214,6 +214,11 @@ typedef struct {
     uint8_t perms;    // UNVEIL_READ | UNVEIL_WRITE | UNVEIL_EXEC | UNVEIL_CREATE
 } spawn_unveil_entry_t;
 
+// Upper bound on SPAWN_ATTR_UNVEIL entries.  nunveil is attacker-controlled, so
+// the kernel-side copy buffer is bounded (at 257 bytes/entry this is ~64 KiB).
+// Real unveil sets are a handful of paths; an over-cap request is rejected.
+#define SPAWN_UNVEIL_MAX  256u
+
 // spawn_attr_t — ~32 bytes; unveil entries are a separate user pointer so the
 // struct is always kstack-safe regardless of how many unveil entries are passed.
 typedef struct {

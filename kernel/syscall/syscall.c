@@ -1439,18 +1439,25 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
         }
         if ((a.flags & SPAWN_ATTR_UNVEIL) && a.nunveil && a.unveil) {
             uint32_t n = a.nunveil;
-            uint64_t uptr = (uint64_t)(uintptr_t)a.unveil;
-            if (!_access_ok(uptr, (uint64_t)n * sizeof(spawn_unveil_entry_t)))
-                goto bad_attr;
-            // Copy unveil entries one page-safe chunk at a time — each entry
-            // is 257 bytes; kmalloc the whole array then walk it.
-            spawn_unveil_entry_t* ue = kmalloc((uint64_t)n * sizeof(spawn_unveil_entry_t));
+            if (n > SPAWN_UNVEIL_MAX) goto bad_attr;   // bound the attacker-sized copy
+            uint64_t bytes = (uint64_t)n * sizeof(spawn_unveil_entry_t);
+            // copy_from_user (validate + VMA-back), not _access_ok + raw memcpy:
+            // an in-range but UNMAPPED a.unveil pointer passes the range check
+            // then #PF-panics in the memcpy -- an unprivileged kernel DoS.  This
+            // mirrors the spawn_attr copy above; copy_from_user returns -EFAULT
+            // for a bad pointer instead of faulting in kernel mode.
+            spawn_unveil_entry_t* ue = kmalloc(bytes);
             if (!ue) goto bad_attr;
-            __builtin_memcpy(ue, a.unveil, (uint64_t)n * sizeof(spawn_unveil_entry_t));
+            if (copy_from_user(ue, a.unveil, bytes) != 0) { kfree(ue); goto bad_attr; }
             unveil_free(&child->unveil);
             unveil_init(&child->unveil);
-            for (uint32_t i = 0; i < n; i++)
+            for (uint32_t i = 0; i < n; i++) {
+                // path[] is fully user-controlled and may carry no NUL; force
+                // termination so unveil_add's strlen cannot over-read past the
+                // entry into adjacent heap (the buffer is n * 257 bytes).
+                ue[i].path[sizeof(ue[i].path) - 1] = '\0';
                 unveil_add(&child->unveil, ue[i].path, ue[i].perms);
+            }
             unveil_lock(&child->unveil);
             kfree(ue);
         }

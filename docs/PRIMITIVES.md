@@ -99,6 +99,14 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   (safe-by-construction).  This is the "copy + NUL-cap a user struct that the kernel
   will then treat as a C-string" idiom -- apply it wherever a user struct carries a
   to-be-walked string field.  `unix_ns_str_selftest` covers the bounded hash/streq.
+  The SAME idiom applied to the sys_spawn SPAWN_ATTR_UNVEIL array (F122): the unveil
+  entries were copied with `_access_ok` + a RAW memcpy (an unmapped-but-in-range
+  pointer #PF-panicked the kernel), and each entry's user-controlled char[256] path
+  was fed to unveil_add's UNBOUNDED s_strlen (an OOB heap read past the copy buffer).
+  Now: `copy_from_user(ue, a.unveil, n*sizeof)` (faults -> -EFAULT, never panics) +
+  a SPAWN_UNVEIL_MAX=256 cap on the attacker-sized count + force-NUL each
+  `ue[i].path[255]='\0'` before unveil_add.  This was the last `_access_ok` + raw
+  memcpy of a user array in sys_spawn (the spawn_attr_t copy was already converted).
   (Sibling raw-out-param fixes F109: sys_wait/pipe/fb_info copy_to_user a kernel
   local; sys_nanosleep/shm_open/shm_unlink copy_from_user into one; sys_setsockopt
   bounces optval into a kernel buffer so no option handler derefs the raw pointer.)
