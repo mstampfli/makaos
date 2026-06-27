@@ -374,7 +374,11 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(mm); kfree(t); return NULL; }
-    fd_table_init(files, FD_INITIAL_CAP);
+    // fd_table_init OOM leaves files->ft == NULL -> a later fdget/fd_install
+    // NULL-derefs.  Release and fail rather than build a task with no fd table.
+    if (!fd_table_init(files, FD_INITIAL_CAP)) {
+        task_files_release(files); task_mm_release(mm); kfree(t); return NULL;
+    }
     // Kernel threads have no stdio — fd 0/1/2 are NULL.
     // They don't do userspace I/O; any kernel-side printing goes direct to fb.
 
@@ -416,7 +420,11 @@ task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pi
 
     task_files_t* files = task_files_alloc();
     if (!files) { task_mm_release(tmm); kfree(t); return NULL; }
-    fd_table_init(files, FD_INITIAL_CAP);
+    // fd_table_init OOM leaves files->ft == NULL -> a later fdget/fd_install
+    // NULL-derefs.  Release and fail rather than build a task with no fd table.
+    if (!fd_table_init(files, FD_INITIAL_CAP)) {
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
+    }
     // fd 0/1/2 are NULL — raw blob processes have no TTY by default.
     // Caller assigns stdio if needed (e.g. elf_load_with_argv opens tty0
     // for the sys_spawn path; fork inherits from parent).

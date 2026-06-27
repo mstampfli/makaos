@@ -2905,3 +2905,47 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pmm_ref_dec on failure; syscall/io_uring every fdget->fdput + fd_install-failure-closes + epoll/poll/select single
   out: cleanup; proc task_fork/sys_thread/sys_exec/sys_spawn/elf full error unwinding + all rq_lock/pid-table locks
   balanced. SCAN #15 lead item CLOSED; the residuals above are the backlog for this type.
+
+- 2026-06-27 BUG-TYPE SCAN #16 (IGNORED-ERROR-RETURN / MISSING-RETURN-VALUE-CHECK), codebase-wide. METHOD: 6 parallel
+  subagents over fs / net / mm / drivers / syscall+io_uring / proc+elf, hunting call sites that drop a fallible return
+  (NULL alloc, negative errno, uint8_t/bool ok-flag, error enum, PMM_INVALID_ADDR sentinel) and then deref/use the
+  result or report success. The tree is heavily hardened (every pmm result checked with == PMM_INVALID_ADDR not == 0,
+  every fdget->fdput, every copy_to/from_user in ioctls checked, single-owner skb, careful unwinding); most "ignored"
+  returns are deliberately best-effort (inode_writeback, write_bgd, display-refresh transfer/flush) with the
+  authoritative state written through a CHECKED primitive.
+  FIXED (F145, the lead -- a kernel-panic-class crash): fd_table_init() return ignored at elf.c:567/701 (immediate
+  files->ft->fd_table[0] write through NULL -> #PF panic on exec/spawn under OOM) + process.c:377/419 (deferred
+  NULL-deref). All four now check + cleanup; see AUTOFIX_LOG F145.
+  RESIDUAL (real, for later turns):
+    (HIGH, io_uring) io_uring.c:629 SQPOLL `io_wq_enqueue(uring, sqe)` return DROPPED then head++ -> on ENOMEM the SQE
+      is consumed with NO work + NO CQE posted -> a thread in io_uring_enter(GETEVENTS) on min_complete HANGS forever.
+      AND io_uring.c:870-896 `io_wq_enqueue_chain` advances *phead by m before a mid-chain wq_work_alloc ENOMEM and is
+      NOT rewound; the caller (1132-1137) posts ONE CQE + head++ -> m completions lost -> userspace hang. The two
+      io_uring lost-CQE notes, confirmed. FIX: SQPOLL post an error CQE on enqueue-fail; chain either rewind *phead or
+      post -ENOMEM/-ECANCELED CQEs for every consumed SQE. (OOM-gated but a reachable hang.)
+    (MED-HIGH, fs corruption) ext2.c:3249 ext2_rename ignores dir_remove_entry(src) -- on its failure (I/O error, OOM,
+      or a concurrent ext2_unlink(src) that races since it takes the parent-inode lock not s_rename_lock) src_ino ends
+      with TWO dirents at links_count==1; a later unlink frees the still-referenced inode + blocks -> cross-link /
+      data corruption. The dst removal 14 lines up IS gated; the src is not (asymmetry). Also ext2.c:3261
+      dir_set_dotdot return ignored -> moved dir's `..` not repointed but parent link counts still swapped (tree
+      inconsistency). FIX needs rollback of the dir_add_entry (or report failure), more involved -> own turn.
+    (MED, mm display) vmm.c:191 vmm_map_physical_user (SYS_FB_MAP) ignores vmm_page_map -> on OOM a FB hole faults to a
+      zeroed anon frame (silent display corruption, writes never reach the device); vmm.c:160 vmm_map_mmio same, boot-
+      only LOW. (MED, elf) elf.c:261 ignores vmm_page_map in the eager PT_LOAD copy -> on OOM a segment silently loads
+      as a zero page (corrupt image run as valid) + frame leak; elf.c:308 ignores the stack-VMA mm_vma_add -> reports
+      success with no stack VMA. (MED, drivers) hda.c:206 verb_send poll-timeout returns stale RIRB data as a valid
+      response -> codec mis-config / no audio (init-only). (MED, syscall) sys_readlink (syscall.c:5517) and sys_times
+      (5663) drop copy_to_user -> return success on a faulted user buffer (caller reads garbage; no kernel leak/crash).
+    (out-of-class, flagged for honesty) tcp.c:874/643 tx-ring linear read straddling the 64 KiB wrap point -> heap
+      OOB read leaked onto the wire (a UAF/OOB-read, not an ignored return) -- HIGH, candidate for a UAF/OOB scan.
+      ext2_vfs_pread (ext2.c:1416) missing the EOF byte-clamp that ext2_vfs_read has -> phantom tail bytes past i_size
+      (info-exposure, a missing-clamp not an ignored return).
+  AUDITED CLEAN (representative): fs every read_block/read_inode/read_bgd/bcache_get failure checked before the
+  out-param/buffer is used + every kmalloc/EXT2_SCRATCH NULL-checked + ext2_block_valid/ext2_dir_write_ok used in the
+  correct sense; net every skb_alloc/lookup NULL-checked, skb_put provably-fits where unchecked, sends best-effort
+  with retransmit/ARP backstop; mm ZERO == 0 pmm mischecks (all 24 use == PMM_INVALID_ADDR), vmm_page_map checked
+  where it matters (fault install, kernel demand-map F143, vmm_page_alloc); drivers ahci/nvme submit results checked +
+  propagated, drm/virtio_gpu resource chain checked with unwind, evdev/pty/tty copy_to/from_user checked; syscall/
+  io_uring every fdget->fdput + io_uring_setup fd_install-then-copyout closes-on-fault + dispatch_exec double-fetch
+  guard; proc signal_setup_frame self-handles + sys_sigreturn copy checked + task_fork fully checked. SCAN #16 lead
+  CLOSED; the io_uring lost-CQE hang is the next-strongest residual.

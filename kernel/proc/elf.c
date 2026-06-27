@@ -564,7 +564,11 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
 
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
-    fd_table_init(files, 4);
+    // fd_table_init OOM leaves files->ft == NULL; the fd_table[0..2] stores
+    // below would then write through NULL (kernel #PF).  Release and fail.
+    if (!fd_table_init(files, 4)) {
+        task_files_release(files); kfree(t); task_mm_release(tmm); return NULL;
+    }
     files->ft->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
     files->ft->fd_table[1] = tty_open(0);
     files->ft->fd_table[2] = tty_open(0);
@@ -698,7 +702,11 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
 
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
-    fd_table_init(files, 4);
+    // fd_table_init OOM leaves files->ft == NULL; the fd_table[0..2] stores
+    // below would then write through NULL (kernel #PF).  Release and fail.
+    if (!fd_table_init(files, 4)) {
+        task_files_release(files); kfree(t); task_mm_release(tmm); return NULL;
+    }
     files->ft->fd_table[0] = resolve_stdio(stdio, 0);
     files->ft->fd_table[1] = resolve_stdio(stdio, 1);
     files->ft->fd_table[2] = resolve_stdio(stdio, 2);
