@@ -3072,3 +3072,33 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   METHOD NOTE: SCAN #19 was a from-scratch 3-agent parallel sweep; it found ONE HIGH UAF (F156) + two MED follow-ups,
   so the refcount class was NOT mined out (unlike #18). The openpty + listener-backlog items are the next concrete
   backlog.
+
+- 2026-06-27 BUG-TYPE SCAN #20 (SIGNEDNESS / TRUNCATION in size/length/index/offset math), opened and SWEPT CLEAN --
+  no memory-safety finding. CLASS: negative-as-huge-unsigned (a signed length/index into an unsigned size sink),
+  signed/unsigned miscompare, width truncation (u64 size/offset -> u32/u16/u8), sign-extension of a device/header byte.
+  This is distinct from #14 (integer OVERFLOW = multiply/add wrap). METHOD: 3 parallel agents (syscall/user-boundary;
+  net+fs; mm+drivers+io_uring), each given shapes (a)-(d) + the safe pattern + the checked.h primitives. RESULT --
+  the kernel is consistently disciplined for this class: (1) every syscall length/offset/count is typed uint64_t at the
+  ABI, so a user "negative" is a huge unsigned from the first instruction, and every copy/deref sink goes through
+  _access_ok (ckd_add_u64 wrap + USER_ADDR_MAX bound) which rejects a huge len; every unsigned count is upper-bounded
+  before alloc/index (nfds/maxevents/n_fds/size/max_entries); signed reinterpretations are deliberate + guarded
+  (sys_getgroups `(int64_t)size < 0` reject, sys_poll `fd >= 0`, mmap `(int64_t)fd != -1`). (2) every packet-parser
+  length-by-subtraction is guarded UPSTREAM before use as an unsigned copy length: ipv4 `ihl < IPV4_HDR_LEN || tot_len
+  < ihl`, udp `udplen < UDP_HDR_LEN || udplen > skb->len`, tcp `hlen < TCP_HDR_MIN_LEN || hlen > skb->len`, virtio_net
+  `pkt_len > VIRTIO_NET_HDR_LEN ? ... : 0` + ETH_MAX_FRAME clamp; tcp `sendable = snd_wnd - inflight` underflow is
+  immediately clamped to <= TCP_MSS. (3) ext2 on-disk metadata math is fenced by purpose-built tested primitives
+  (ext2_dirent_in_block aligns rec_len the SAME way the consumer does so slack cannot underflow; ext2_dirent_namelen_
+  clamp; ext2_blk_lba forms part_lba + blk*spb in u64; ext2_run_valid/ext2_block_valid before DMA). (4) device-supplied
+  indices are index_ok'd (virtio desc_id, nvme CID, evdev/virtio_input code, drm `id - BASE` guarded by `id < BASE+n`);
+  DMA/product sizes go through mul_within_u32 / ckd_mul_u64 (ahci xfer_bytes_ok + npages<=130, nvme nlb*lba_size<=8192,
+  drm drm_dumb_size/drm_cursor_bytes, vgpu vgpu_fb_bytes); io_uring uses the kernel-TRUSTED sq/cq masks (never the
+  user ring_mask) + fixed-file `idx < nr` + the single-fetched-SQE user_buf_check. The ONLY truncations present are
+  BY-DESIGN and structurally non-exploitable (wrong-result only, no OOB): ext2 32-bit i_size/offsets (files are <4 GiB
+  so a >4 GiB offset is unreachable; every derived blk_idx/remain_file is also u32 + clamped to i_size + ext2_run_valid
+  range-checks the physical block); ext2_vfs_seek `cur_pos = (uint32_t)new_pos` (a >4 GiB lseek truncates the SEEK
+  position but reads clamp cur_pos to the <=4 GiB file_size -- a POSIX wrong-result nit, recorded LOW, not a bug); vmm
+  pg_file_idx `(uint32_t)(off >> PAGE_SHIFT)` used ONLY as a pcache HASH KEY (not an array index; the disk read uses the
+  full 64-bit src_off; aliasing only above 16 TiB which ext2/AHCI cannot reach). So the signedness/truncation class is
+  MINED OUT. METHOD NOTE: SCAN #20 was a from-scratch 3-agent parallel sweep; all three returned CLEAN with the
+  load-bearing guard named per subsystem, a strong diminishing-returns signal -- the campaign is wound down here (see
+  docs/SESSION_2026-06-27_bughunt.md).
