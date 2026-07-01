@@ -237,6 +237,7 @@ vfs_file_t* fat32_open(const char* name83) {
 
                 // Found — allocate fd and vfs_file_t from the heap.
                 fat32_fd_t* fd = kmalloc(sizeof(fat32_fd_t));
+                if (!fd) return NULL;   // OOM: was an unguarded NULL-deref below
                 fd->start_cluster = ((uint32_t)e->cluster_hi << 16) | e->cluster_lo;
                 fd->cur_cluster   = fd->start_cluster;
                 fd->cur_sector    = 0;
@@ -245,7 +246,8 @@ vfs_file_t* fat32_open(const char* name83) {
                 fd->bytes_read    = 0;
 
                 vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
-                if (f) __builtin_memset(f, 0, sizeof(*f));
+                if (!f) { kfree(fd); return NULL; }   // OOM: guard the deref, free fd
+                __builtin_memset(f, 0, sizeof(*f));
                 f->read     = fat32_read;
                 f->write    = NULL;
                 f->close    = fat32_close;
