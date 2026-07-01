@@ -122,6 +122,11 @@ void signal_send_pgrp(uint32_t pgid, int sig);
 // cannot be freed between lookup and delivery (closes a sched_find_pid UAF).
 // Skips zombies.  Returns 0 on delivery, -ESRCH if no such live task.
 int  signal_send_pid(uint32_t pid, int sig);
+// POSIX kill() authorization: sender may signal target if root or same uid.
+int  signal_may(const struct task_t* sender, const struct task_t* target);
+// Permission-checked user kill() paths (-EPERM if not permitted).
+int  signal_send_pid_user(struct task_t* sender, uint32_t pid, int sig);
+void signal_send_pgrp_user(struct task_t* sender, uint32_t pgid, int sig);
 void signal_deliver_pending(int may_setup_frame, uint64_t saved_rax);
 
 // Mask of signals whose POSIX SIG_DFL action is "ignore".  If one of these

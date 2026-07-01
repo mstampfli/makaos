@@ -750,7 +750,8 @@ static uint64_t sys_exit(uint64_t code) {
 static int s_bcast_sig = 0;
 static void kill_bcast_cb(task_t* t, void* data) {
     (void)data;
-    if (!(t->flags & TASK_FLAG_KTHREAD) && t->state != TASK_ZOMBIE)
+    if (!(t->flags & TASK_FLAG_KTHREAD) && t->state != TASK_ZOMBIE &&
+        signal_may(g_current, t))   // authorize: broadcast hits only signalable tasks
         signal_send(t, s_bcast_sig);
 }
 
@@ -777,13 +778,13 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
             signal_send(g_current, sig);    // self: cannot be freed
             return 0;
         }
-        return (uint64_t)signal_send_pid((uint32_t)pid, sig);  // 0 or -ESRCH
+        return (uint64_t)signal_send_pid_user(g_current, (uint32_t)pid, sig);  // 0/-ESRCH/-EPERM
     }
 
     if (pid == 0) {
         // POSIX: signal the CALLER'S PROCESS GROUP (not thread group).
         if (!g_current) return (uint64_t)-ESRCH;
-        signal_send_pgrp(g_current->pgid, sig);
+        signal_send_pgrp_user(g_current, g_current->pgid, sig);
         return 0;
     }
 
@@ -793,7 +794,7 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
         // (foot does exactly this).  This case used to fall through
         // to the -1 broadcast below, SIGHUP'ing every process on the
         // system — login, svcmgr and net included.
-        signal_send_pgrp((uint32_t)(-pid), sig);
+        signal_send_pgrp_user(g_current, (uint32_t)(-pid), sig);
         return 0;
     }
 

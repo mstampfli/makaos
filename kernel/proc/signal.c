@@ -114,6 +114,62 @@ int signal_send_pid(uint32_t pid, int sig) {
     return delivered ? 0 : -ESRCH;
 }
 
+// ── kill() permission (POSIX) ─────────────────────────────────────────────
+// A user process `sender` may signal `target` iff sender is root (euid 0) or
+// sender's real/effective uid equals the target's real or saved uid.  Self is
+// always allowed.  Used ONLY on the user kill() path; kernel-internal signals
+// (SIGCHLD, tty job control, WINCH, exit_group) call the unchecked helpers.
+int signal_may(const task_t* sender, const task_t* target) {
+    if (!sender || !target) return 0;
+    if (sender == target) return 1;
+    if (sender->cred.euid == 0) return 1;
+    uint32_t se = sender->cred.euid, sr = sender->cred.ruid;
+    uint32_t tr = target->cred.ruid, ts = target->cred.suid;
+    return se == tr || se == ts || sr == tr || sr == ts;
+}
+
+// kill(pid>0), authorized: -ESRCH if no live task, -EPERM if not permitted.
+int signal_send_pid_user(task_t* sender, uint32_t pid, int sig) {
+    rcu_read_lock();
+    task_t* t = sched_find_pid(pid);
+    int found = (t && t->state != TASK_ZOMBIE);
+    int perm  = found && signal_may(sender, t);
+    if (perm) signal_send(t, sig);
+    rcu_read_unlock();
+    return !found ? -ESRCH : (perm ? 0 : -EPERM);
+}
+
+typedef struct { int sig; task_t* sender; } sig_perm_ctx_t;
+static void sig_group_visit_perm(task_t* t, void* data) {
+    sig_perm_ctx_t* c = (sig_perm_ctx_t*)data;
+    if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE) return;
+    if (!signal_may(c->sender, t)) return;   // silently skip un-signalable members
+    signal_send(t, c->sig);
+}
+// kill(0) / kill(-pgid), authorized: signal only members the sender may.
+void signal_send_pgrp_user(task_t* sender, uint32_t pgid, int sig) {
+    sig_perm_ctx_t c = { sig, sender };
+    task_idx_pgid_walk(pgid, sig_group_visit_perm, &c);
+}
+
+// Pure permission-decision unit test for signal_may.
+void signal_perm_selftest(void) {
+    extern void kprintf(const char*, ...);
+    task_t root = {0}, alice = {0}, alice2 = {0}, bob = {0};
+    root.cred.euid = 0; root.cred.ruid = 0;
+    alice.cred.ruid  = alice.cred.euid  = alice.cred.suid  = 1000;
+    alice2.cred.ruid = alice2.cred.euid = alice2.cred.suid = 1000;
+    bob.cred.ruid    = bob.cred.euid    = bob.cred.suid    = 1001;
+    int f = 0;
+    if (!signal_may(&root, &bob))     f++;   // root -> anyone
+    if (!signal_may(&alice, &alice))  f++;   // self
+    if (!signal_may(&alice, &alice2)) f++;   // same uid
+    if ( signal_may(&alice, &bob))    f++;   // cross uid -> denied
+    if ( signal_may(&alice, &root))   f++;   // non-root cannot signal root
+    kprintf(f ? "[signal_perm] SELF-TEST FAILED\n"
+              : "[signal_perm] SELF-TEST PASSED (kill authz: root-any/self/same-uid; cross-uid denied)\n");
+}
+
 // Deterministic guard for the rcu-safe lookup helper.  Sending to a pid that
 // cannot exist takes the not-found path (no signal_send, no side effects) and
 // must return -ESRCH; reaching the next line at all proves the rcu_read_lock

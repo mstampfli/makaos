@@ -718,6 +718,8 @@ static void init_kthread(void) {
     // signal_send_pid: rcu-safe pid lookup + delivery (sched_find_pid UAF fix).
     extern void signal_send_pid_selftest(void);
     signal_send_pid_selftest();
+    extern void signal_perm_selftest(void);
+    signal_perm_selftest();
 
     // exec teardown: a multithreaded exec must not free the old page tables
     // while sibling threads still run on them (cross-domain page-table UAF/LPE).
