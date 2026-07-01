@@ -1512,6 +1512,8 @@ bad_cred:
 // The caller must allocate the thread's user stack and pass its top.
 static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flags) {
     if (!g_current) return (uint64_t)-EINVAL;
+    extern int user_task_over_cap(void);
+    if (user_task_over_cap()) return (uint64_t)-EAGAIN;   // RLIMIT_NPROC (fork-bomb guard)
 
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return (uint64_t)-ENOMEM;

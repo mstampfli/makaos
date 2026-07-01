@@ -251,6 +251,10 @@ static uint32_t s_pid_next = 10;
 // One serialized path; the critical section is a tiny O(1)-amortized scan.
 static spinlock_t s_pid_lock;
 
+// RLIMIT_NPROC (fork-bomb guard): global live-task count + a non-root cap.
+#define USER_TASK_MAX 4096u
+static uint32_t s_live_task_count = 0;
+
 uint32_t pid_alloc(void) {
     uint64_t _f = spin_lock_irqsave(&s_pid_lock);
     for (uint32_t pass = 0; pass < 2; pass++) {
@@ -269,6 +273,7 @@ uint32_t pid_alloc(void) {
             uint32_t pid = w * 64u + b;
             if (pid > PID_MAX) break;
             s_pid_bitmap[w] |= (1ull << b);
+            __atomic_add_fetch(&s_live_task_count, 1, __ATOMIC_RELAXED);
             s_pid_next = (pid + 1u <= PID_MAX) ? pid + 1u : 10u;
             spin_unlock_irqrestore(&s_pid_lock, _f);
             return pid;
@@ -281,8 +286,19 @@ uint32_t pid_alloc(void) {
 void pid_free(uint32_t pid) {
     if (pid < 10u || pid > PID_MAX) return;
     uint64_t _f = spin_lock_irqsave(&s_pid_lock);
-    s_pid_bitmap[pid / 64u] &= ~(1ull << (pid % 64u));
+    uint64_t bit = 1ull << (pid % 64u);
+    int was_set = (s_pid_bitmap[pid / 64u] & bit) != 0;
+    s_pid_bitmap[pid / 64u] &= ~bit;
     spin_unlock_irqrestore(&s_pid_lock, _f);
+    if (was_set) __atomic_sub_fetch(&s_live_task_count, 1, __ATOMIC_RELAXED);
+}
+
+// A non-root process may not create a task once the global live-task count is
+// at the cap (fork-bomb guard).  Root (euid 0, incl. every boot/system task)
+// and early-boot creation (g_current==NULL) are exempt.
+int user_task_over_cap(void) {
+    return g_current && g_current->cred.euid != 0 &&
+           __atomic_load_n(&s_live_task_count, __ATOMIC_RELAXED) >= USER_TASK_MAX;
 }
 
 // ── Common task init ──────────────────────────────────────────────────────
@@ -417,6 +433,7 @@ task_t* task_create_kthread(void (*entry)(void), uint32_t pid) {
 
 // ── task_create_user ──────────────────────────────────────────────────────
 task_t* task_create_user(phys_addr_t code_phys, uint32_t code_pages, uint32_t pid) {
+    if (user_task_over_cap()) return NULL;
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
     // Drift-proof: kmalloc returns slab poison.  Zero the whole task_t so any
@@ -694,6 +711,7 @@ void task_destroy(task_t* t) {
 task_t* task_fork(task_t* parent, uint64_t user_rip, uint64_t user_rflags, uint64_t user_rsp,
                   uint64_t user_rbp, uint64_t user_rbx,
                   uint64_t user_r12, uint64_t user_r13, uint64_t user_r14, uint64_t user_r15) {
+    if (user_task_over_cap()) return NULL;
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return NULL;
     // Drift-proof: kmalloc returns slab poison.  Zero the whole task_t so any

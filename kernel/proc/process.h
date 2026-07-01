@@ -367,6 +367,7 @@ extern void fork_trampoline(void);
 
 // PID pool.
 uint32_t pid_alloc(void);
+int user_task_over_cap(void);  // RLIMIT_NPROC fork-bomb guard
 void     pid_free(uint32_t pid);
 
 // fd table helpers — operate on task_files_t directly.
