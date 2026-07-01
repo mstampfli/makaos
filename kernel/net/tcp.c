@@ -127,8 +127,9 @@ struct tcp_pcb {
 static tcp_pcb_t* s_pcb_head   = NULL;
 static spinlock_t s_pcb_wlock  = SPINLOCK_INIT;
 
-// Ephemeral port counter.
-static uint16_t s_eph_port = 49152u;
+// Ephemeral port counter -- atomic so concurrent connect()s on different CPUs
+// each get a distinct port (a plain RMW lost updates -> duplicate local ports).
+static uint32_t s_eph_next = 0u;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1030,9 +1031,11 @@ int tcp_pcb_has_accept(const tcp_pcb_t* pcb) {
 }
 
 uint16_t tcp_ephemeral_port(void) {
-    uint16_t p = s_eph_port;
-    s_eph_port = (uint16_t)(s_eph_port == 65535u ? 49152u : s_eph_port + 1u);
-    return p;
+    // Lock-free: atomic fetch-add hands each caller a distinct index, mapped
+    // into the dynamic/private range [49152, 65535] (16384 ports).  Wrap/reuse
+    // after 16384 outstanding is inherent to ephemeral ports.
+    uint32_t n = __atomic_fetch_add(&s_eph_next, 1u, __ATOMIC_RELAXED);
+    return (uint16_t)(49152u + (n % 16384u));
 }
 
 // ── tcp_ring_consume selftest ─────────────────────────────────────────────
