@@ -484,12 +484,23 @@ static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) 
             if (request == 0x5404) tty_flush_input(tty);
             return 0;
         }
-        case 0x540F: // TIOCGPGRP
-            return copy_to_user((void*)arg, &tty->fg_pgid, sizeof(tty->fg_pgid))
-                   ? -EFAULT : 0;
-        case 0x5410: // TIOCSPGRP
-            return copy_from_user(&tty->fg_pgid, (const void*)arg, sizeof(tty->fg_pgid))
-                   ? -EFAULT : 0;
+        case 0x540F: { // TIOCGPGRP
+            // Snapshot to a local: copy_to_user must not read the LIVE fg_pgid
+            // (a concurrent TIOCSPGRP write could be in flight).
+            uint32_t pg = __atomic_load_n(&tty->fg_pgid, __ATOMIC_ACQUIRE);
+            return copy_to_user((void*)arg, &pg, sizeof(pg)) ? -EFAULT : 0;
+        }
+        case 0x5410: { // TIOCSPGRP
+            // copy_from_user directly INTO the live fg_pgid could tear it (its
+            // memcpy(len=4) may lower byte-wise) under a concurrent reader
+            // (Ctrl-C / SIGWINCH signal routing).  Land in a local, then publish
+            // with one aligned atomic store.  fg_pgid is a single word, so no
+            // tty->lock is needed (unlike the multi-word termios snapshot).
+            uint32_t pg;
+            if (copy_from_user(&pg, (const void*)arg, sizeof(pg))) return -EFAULT;
+            __atomic_store_n(&tty->fg_pgid, pg, __ATOMIC_RELEASE);
+            return 0;
+        }
         case 0x5413: // TIOCGWINSZ
             return copy_to_user((void*)arg, &tty->winsize, sizeof(tty->winsize))
                    ? -EFAULT : 0;
