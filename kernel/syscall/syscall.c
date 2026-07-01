@@ -2267,6 +2267,9 @@ fail:
 static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
     vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_SEEK)) {
+        fdput(f); return (uint64_t)-EACCES;
+    }
     if (!f->seek) { fdput(f); return (uint64_t)-EINVAL; }
     int64_t r = f->seek(f, (int64_t)offset, (int)(int64_t)whence);
     fdput(f);
@@ -2601,6 +2604,16 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                                 "missing RIGHT_READ → EACCES",
                         g_current->comm, (long)fd, f->path,
                         (uint32_t)f->rights);
+            fdput(f); return (uint64_t)-EACCES;
+        }
+        // Enforce the mmap-specific rights, distinct from read()/write(): a fd
+        // restricted from mapping -- especially PROT_EXEC, i.e. executing code
+        // from a fd it may only read -- must be denied even when RIGHT_READ is
+        // present.  Without this, RIGHT_MMAP_R/W/X were defined but never checked.
+        if (f->rights != 0 &&
+            (((prot & PROT_READ)  && !rights_check(f->rights, RIGHT_MMAP_R)) ||
+             ((prot & PROT_WRITE) && !rights_check(f->rights, RIGHT_MMAP_W)) ||
+             ((prot & PROT_EXEC)  && !rights_check(f->rights, RIGHT_MMAP_X)))) {
             fdput(f); return (uint64_t)-EACCES;
         }
         // Snapshot file size at mmap time — standard POSIX semantics.
@@ -4538,6 +4551,12 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     // behaviour when the slot is empty.
     vfs_file_t* f = fdget(fd);
     if (f) {
+        // Enforce the fd's RIGHT_IOCTL capability (rights==0 = unrestricted
+        // device/kernel fd, exempt).  restrict_fd/sendfd can drop this bit;
+        // without the check the downgrade was a silent no-op.
+        if (f->rights != 0 && !rights_check(f->rights, RIGHT_IOCTL)) {
+            fdput(f); return (uint64_t)-EACCES;
+        }
         if (f->ioctl) {
             uint64_t r = (uint64_t)f->ioctl(f, request, arg);
             fdput(f);
