@@ -19,6 +19,9 @@
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
+
+// POSIX-style /proc access gate: owner (same uid) or root only.
+extern int signal_may(const task_t* sender, const task_t* target);
 #include "mm.h"
 #include "common.h"
 #include "rcu.h"
@@ -454,6 +457,7 @@ vfs_file_t* proc_open(const char* path) {
     task_t* t = sched_find_pid(pid);
     vfs_file_t* result = NULL;
     if (!t) goto open_out;
+    if (!signal_may(g_current, t)) goto open_out;   // foreign task -> hidden (ENOENT)
 
     // after_pid: "" → /proc/<pid>/ directory (not openable as file)
     //            "/status", "/cmdline", "/maps" → file generators
@@ -515,6 +519,7 @@ int proc_readdir(const char* path, ext2_entry_t* out, int max) {
     task_t* t = sched_find_pid(pid);
     int rc = -1;
     if (!t) goto rd_out;
+    if (!signal_may(g_current, t)) goto rd_out;   // foreign task -> hidden (ENOENT)
 
     // /proc/<pid>  or  /proc/<pid>/
     if (!after_pid || after_pid[0] == '\0' ||
@@ -568,6 +573,7 @@ int proc_stat(const char* path, struct stat* out) {
     task_t* t = sched_find_pid(pid);
     int rc = -1;
     if (!t) goto stat_out;
+    if (!signal_may(g_current, t)) goto stat_out;   // foreign task -> hidden (ENOENT)
 
     // /proc/<pid>  (directory)
     if (!after_pid || after_pid[0] == '\0' ||
