@@ -3324,7 +3324,7 @@ static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
         ret = (uint64_t)(int64_t)r; goto out;
     }
 
-    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+    if (user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     ret = (uint64_t)(int64_t)socket_bind(f, port);
@@ -3411,7 +3411,7 @@ uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
         ret = (uint64_t)(int64_t)r; goto out;
     }
 
-    if (user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+    if (user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
     ret = (uint64_t)(int64_t)socket_connect(f, sa->sin_addr, port);
@@ -3430,7 +3430,7 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     if (!buf_ptr || !len) { ret = (uint64_t)-EINVAL; goto out; }
     // buf_ptr + the sockaddr are deref'd DIRECTLY below; validate them like the
     // rest of the kernel (an unchecked buf_ptr is an arbitrary-kernel-read leak).
-    if (user_buf_check(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+    if (user_buf_readable_ok(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
 
     if (is_unix_sock(f)) {
         if (addr_ptr) {
@@ -3444,7 +3444,7 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
         ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
     }
 
-    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+    if (addr_ptr && user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
