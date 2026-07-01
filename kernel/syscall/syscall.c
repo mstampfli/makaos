@@ -4469,6 +4469,10 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     uint64_t ret;
     if (!t || t->state == TASK_ZOMBIE) {
         ret = (uint64_t)-ESRCH;
+    } else if (t != g_current && t->ppid != g_current->pid) {
+        ret = (uint64_t)-EPERM;          // POSIX: setpgid only on self or a child
+    } else if (t->sid != g_current->sid) {
+        ret = (uint64_t)-EPERM;          // target must be in the caller's session
     } else if (t->pid == t->sid) {
         ret = (uint64_t)-EPERM;          // can't change pgid of a session leader
     } else {
