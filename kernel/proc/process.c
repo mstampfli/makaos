@@ -82,10 +82,17 @@ uint8_t fd_table_init(task_files_t* f, uint32_t cap) {
 // with the existing slots preserved, and hand the old one to call_rcu so
 // any concurrent reader still dereferencing the old arrays stays valid
 // until their RCU reader section ends.
+// RLIMIT_NOFILE: bound the per-process fd table so an unprivileged process
+// cannot open()/dup()/socket() unbounded fds -- each holds a kernel object
+// (a socket is a ~128 KiB pcb) and the doubling array itself grows without
+// limit, exhausting shared kernel heap.  4096 dwarfs any legit use; the grow
+// refusal propagates as the callers' existing EMFILE/ENFILE path.
+#define FD_MAX 4096u
 uint8_t fd_table_grow(task_files_t* f) {
     fdtable_t* old = f->ft;
     uint32_t old_cap = old->cap;
     uint32_t new_cap = old_cap * 2;
+    if (new_cap > FD_MAX) return 0;   // fd count capped at FD_MAX
 
     fdtable_t* neu = fdtable_alloc(new_cap);
     if (!neu) return 0;
