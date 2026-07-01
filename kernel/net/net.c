@@ -105,9 +105,11 @@ void net_set_dns(const uint32_t* servers, uint32_t count) {
 }
 
 // ── Net receive thread ────────────────────────────────────────────────────
-// Wakes on virtio RX IRQ, drains the ring, dispatches each frame.
-// Also fires tcp_timer_tick() every ~10 wakeups (loose timer, ±200 ms is fine
-// since TCP RTO minimum is 1 s).
+// Wakes on virtio RX IRQ, drains the ring, dispatches each frame.  The TCP
+// retransmit/reap timer runs on the dedicated net_tcp_timer_thread ONLY, so
+// tcp_timer_tick keeps a single writer (its snd_nxt/rexmit/rto_deadline updates
+// are lockless -- see tcp.c).  This thread must NOT also call it: doing so ran
+// tcp_timer_tick from two threads and raced a pcb's sequence accounting.
 
 // TCP timer thread: fires tcp_timer_tick() roughly every 200 ms so
 // retransmits and TIME_WAIT expiry don't depend on incoming traffic.
@@ -120,18 +122,11 @@ static void net_tcp_timer_thread(void) {
 }
 
 static void net_rx_thread(void) {
-    uint32_t tick = 0;
-
     for (;;) {
         // Drain the entire RX ring before sleeping.
         skbuff_t* skb;
         while (virtio_net_rx_poll(&skb))
             eth_recv(skb);
-
-        if (++tick >= 10u) {
-            tick = 0;
-            tcp_timer_tick();
-        }
 
         // Sleep until the virtio-net MSI fires.
         // The IRQ handler calls irq_notify(g_virtio_net_irq) on RX so we

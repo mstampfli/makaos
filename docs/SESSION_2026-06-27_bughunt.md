@@ -88,10 +88,10 @@ reuse rather than re-deriving checks inline.
   addr+len wrap rejected). A uniformity tightening, not a bug.
 - **mm_t.refcount** -- a dead field (thread sharing uses task_mm_t.refs);
   deletable, harmless.
-- **tcp_timer_tick "T4" two-thread data race** -- the retransmit block mutates
-  pcb seq accounting under rcu_read_lock without pcb->lock now that two timer
-  threads run; the code documents it. NOT a lifetime/refcount bug (reap lists
-  stay disjoint, no double-free) -- a correctness data race, separate concern.
+- **tcp_timer_tick "T4" two-thread data race** -- FIXED 2026-07-01 (F159):
+  net_rx_thread's redundant tcp_timer_tick call was dropped so only the
+  dedicated net_tcp_timer_thread fires it, restoring the lockless single-writer
+  invariant the retransmit accounting assumes.
 
 ## State
 
