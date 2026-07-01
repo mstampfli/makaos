@@ -3102,3 +3102,12 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   MINED OUT. METHOD NOTE: SCAN #20 was a from-scratch 3-agent parallel sweep; all three returned CLEAN with the
   load-bearing guard named per subsystem, a strong diminishing-returns signal -- the campaign is wound down here (see
   docs/SESSION_2026-06-27_bughunt.md).
+
+- 2026-07-01 CONCURRENCY + INFO-LEAK spot-scan (post-F159), SWEPT CLEAN -- cheap targeted look, no new bug. Concurrency:
+  the T4-class "single-writer/no-lock" premises are all sound (drm s_drm_open_count + input kbd-grab use __atomic_*;
+  s_handlers is init-only-write / post-init-read; tcp rexmit is single-writer again after F159; sched/rcu counters are
+  per-CPU-owned); IRQ handlers use the notify-thread pattern (virtio_net/virtio_input) or a lock (ahci s_ci_lock) or
+  touch only non-exercised device state (nvme/hda). Uninitialized-struct copyout: already hardened (F124/F125), syscall
+  copyout structs are memset-before-fill throughout. The one real concurrency bug (T4) was fixed as F159. High-value
+  memory-safety + concurrency space is mined out (F135-F159 across SCANs #13-#20 + concurrency); campaign stays wound
+  down -- see docs/SESSION_2026-06-27_bughunt.md.
