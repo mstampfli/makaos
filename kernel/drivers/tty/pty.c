@@ -460,6 +460,13 @@ extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 // slave tty, so the get/set logic is identical -- one source of truth here
 // instead of two drifting copies.  Returns 0, -EFAULT (bad user `arg`), or
 // -EINVAL (request not handled here; the caller handles its unique ioctls).
+// TIOCSPGRP authorization: is `pgid` a live process group in session `sid`?
+typedef struct { uint32_t sid; int found; } pty_pgsid_t;
+static void pty_pgid_sid_visit(task_t* t, void* data) {
+    pty_pgsid_t* c = (pty_pgsid_t*)data;
+    if (t->sid == c->sid) c->found = 1;
+}
+
 static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) {
     switch (request) {
         case 0x5401: { // TCGETS
@@ -498,6 +505,17 @@ static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) 
             // tty->lock is needed (unlike the multi-word termios snapshot).
             uint32_t pg;
             if (copy_from_user(&pg, (const void*)arg, sizeof(pg))) return -EFAULT;
+            // POSIX: the caller must own this controlling terminal (its session)
+            // and the new fg pgid must be a process group IN that session.  Without
+            // this a process could point the terminal foreground at a FOREIGN
+            // session's pgid -- redirecting terminal-generated signals (SIGINT/
+            // SIGWINCH) or hijacking the foreground (job-control confused-deputy).
+            if (!g_current || g_current->sid != tty->session) return -EPERM;
+            if (pg != g_current->pgid) {   // own pgid is trivially in-session
+                pty_pgsid_t vc = { g_current->sid, 0 };
+                task_idx_pgid_walk(pg, pty_pgid_sid_visit, &vc);
+                if (!vc.found) return -EPERM;   // no such pgrp in the caller's session
+            }
             __atomic_store_n(&tty->fg_pgid, pg, __ATOMIC_RELEASE);
             return 0;
         }
