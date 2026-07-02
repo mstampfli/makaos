@@ -91,7 +91,7 @@ _Static_assert(sizeof(dhcp_pkt_t) == DHCP_PKT_SIZE, "dhcp_pkt_t size");
 // ── Utilities ─────────────────────────────────────────────────────────────
 
 static void log_msg(const char* s) {
-    write(1, "[net] ", 9);
+    write(1, "[net] ", 6);   // "[net] " is 6 bytes -- writing 9 over-read the literal
     write(1, s, strlen(s));
     write(1, "\n", 1);
 }
@@ -420,9 +420,15 @@ static int do_lease(int sock) {
     dhcp_pkt_t pkt;
     int len = build_discover(&pkt);
 
-    // Exponential backoff per RFC 2131 §4.1: 4s, 8s, 16s, 32s, 64s.
-    int timeout_ms = 4000;
-    const int max_retries = 5;
+    // Bounded exponential backoff: 1s, 2s, 4s (~7s total) before we give up and
+    // let the caller fall back to the QEMU SLIRP static lease.  The old 4s..64s
+    // (124s total) meant that on any boot where SLIRP ignores our DISCOVER (it
+    // does so when it considers the guest already bound -- RFC 2131 4.1) the
+    // interface sat at 0.0.0.0 for ~2 minutes before the fallback fired, which
+    // read as a flaky network.  A real DHCP server answers in well under 1s, so
+    // three quick tries still cover transient loss; the renewal loop re-leases.
+    int timeout_ms = 1000;
+    const int max_retries = 3;
 
     for (int attempt = 0; attempt < max_retries; attempt++) {
         log_msg("sending DISCOVER");
