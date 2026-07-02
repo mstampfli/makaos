@@ -2106,17 +2106,13 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
         if (fsr != 0) return (uint64_t)(int64_t)fsr;
         if (fsn.type != FS_TYPE_DIR) return (uint64_t)-ENOTDIR;
         if (fsn.is_virtual) {
-            uint32_t len = 0;
-            while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
-            g_current->cwd[len] = '\0';
+            str_lcpy(g_current->cwd, path, KPATH_MAX);
             return 0;
         }
     }
 
     // ext2: fs_lookup already verified existence, type, and permissions.
-    uint32_t len = 0;
-    while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
-    g_current->cwd[len] = '\0';
+    str_lcpy(g_current->cwd, path, KPATH_MAX);
     return 0;
 }
 

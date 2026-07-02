@@ -4,6 +4,7 @@
 #include "uaccess.h"   // copy_to_user (shared decl)
 #include "errno.h"
 #include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (dgram + accept-backlog queues)
+#include "kstr.h"       // str_lcpy: shared bounded NUL-terminating copy (was local str_copy/ns_path_copy)
 #include "sched.h"
 #include "process.h"
 #include "smp.h"
@@ -69,12 +70,6 @@ static int ns_streq(const char* a, const char* b) {
     return 1;
 }
 
-static void ns_path_copy(char* dst, const char* src) {
-    int i = 0;
-    while (src[i] && i < UNIX_PATH_MAX - 1) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
-
 // Bounded FNV-1a.  Capped at UNIX_PATH_MAX (paths never exceed it); for any
 // NUL-terminated path shorter than the cap the hash is identical to the old
 // unbounded walk, so the namespace hashing is unchanged for every real path.
@@ -100,7 +95,7 @@ static void ns_table_raw_insert(unix_ns_table_t* t, const char* path,
                                   unix_sock_t* sock) {
     uint32_t i = ns_hash_str(path, t->cap);
     while (t->slots[i].sock) i = (i + 1u) & (t->cap - 1u);
-    ns_path_copy(t->slots[i].path, path);
+    str_lcpy(t->slots[i].path, path, UNIX_PATH_MAX);
     t->slots[i].sock = sock;
     t->cnt++;
 }
@@ -187,12 +182,6 @@ static void ns_remove(const char* path) {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────
-
-static void str_copy(char* dst, const char* src, int max) {
-    int i = 0;
-    while (src[i] && i < max - 1) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
 
 static void zero_mem(void* p, uint32_t n) {
     __builtin_memset(p, 0, n);
@@ -1010,7 +999,7 @@ int unix_sock_bind(vfs_file_t* f, const char* path) {
     int rc = ns_insert(path, s);
     if (rc) return rc;
 
-    str_copy(s->path, path, UNIX_PATH_MAX);
+    str_lcpy(s->path, path, UNIX_PATH_MAX);
     if (s->state == UNIX_STATE_UNCONNECTED)
         s->state = UNIX_STATE_BOUND;
     return 0;

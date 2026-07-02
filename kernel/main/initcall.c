@@ -1,6 +1,7 @@
 #include "initcall.h"
 #include "preempt.h"
 #include "common.h"
+#include "kstr.h"       // str_eq: shared string equality (was local ic_strcmp)
 #include "kheap.h"
 
 // ── Linker-provided section bounds ────────────────────────────────────────
@@ -8,12 +9,6 @@ extern initcall_t* __initcall_0_start[];  // INITCALL_LEVEL_EARLY
 extern initcall_t* __initcall_0_end[];
 extern initcall_t* __initcall_1_start[];  // INITCALL_LEVEL_SUBSYS
 extern initcall_t* __initcall_1_end[];
-
-// ── String helpers (no libc in freestanding kernel) ───────────────────────
-static int ic_strcmp(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return (unsigned char)*a - (unsigned char)*b;
-}
 
 // ── Serial output helpers (no heap, no tty yet) ───────────────────────────
 static void ic_puts(const char* s) {
@@ -73,7 +68,7 @@ static void run_dag(initcall_t** start, initcall_t** end) {
             for (uint32_t j = 0; j < n; j++) {
                 if (j == i) continue;
                 if (nodes[j].ic->name &&
-                    ic_strcmp(nodes[j].ic->name, *dep) == 0) {
+                    str_eq(nodes[j].ic->name, *dep)) {
                     found = 1;
                     break;
                 }
@@ -131,7 +126,7 @@ static void run_dag(initcall_t** start, initcall_t** end) {
             if (nodes[i].done) continue;
             const char** dep = nodes[i].ic->deps;
             while (*dep) {
-                if (ic_strcmp(*dep, node->ic->name) == 0) {
+                if (str_eq(*dep, node->ic->name)) {
                     if (nodes[i].in_degree > 0)
                         nodes[i].in_degree--;
                     if (nodes[i].in_degree == 0)

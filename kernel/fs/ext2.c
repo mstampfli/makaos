@@ -1578,10 +1578,7 @@ static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
     f->ctx   = fd;
     f->ino   = ino;
 
-    uint32_t pi = 0;
-    if (path)
-        while (pi < 255 && path[pi]) { f->path[pi] = path[pi]; pi++; }
-    f->path[pi] = '\0';
+    str_lcpy(f->path, path, sizeof(f->path));
     return f;
 }
 
