@@ -2288,7 +2288,7 @@ static uint8_t dir_set_dotdot(uint32_t dir_ino_num, uint32_t new_parent_ino) {
 // not fit in `cap` bytes -- previously the copy had NO bound, so a path longer
 // than the caller's fixed buffer (reachable via open(O_CREAT) with a ~511-byte
 // path) overran the kernel stack and smashed the saved return address.
-static const char* path_split(const char* path, char* parent_out, uint32_t cap) {
+const char* path_split(const char* path, char* parent_out, uint32_t cap) {
     if (cap < 2) return NULL;            // need room for at least "/" + NUL
     uint32_t len = str_len(path);
     // Find last '/'.

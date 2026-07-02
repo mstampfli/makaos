@@ -480,12 +480,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         } else {
             // fsr == -ENOENT && O_CREAT: check write+exec on parent directory.
             char parent[512];
-            uint64_t plen = 0;
-            while (path[plen]) plen++;
-            uint64_t slash = plen;
-            while (slash > 0 && path[slash] != '/') slash--;
-            if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
-            else { __builtin_memcpy(parent, path, slash); parent[slash] = '\0'; }
+            if (!path_split(path, parent, sizeof(parent))) return (uint64_t)-ENAMETOOLONG;
             // Use fs_lookup for the parent too — avoids a raw ext2_lookup_path.
             fs_node_t par_fsn;
             int par_r = fs_lookup(parent, &g_current->cred,
@@ -1929,12 +1924,8 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;  // sandbox
 
     // Check write permission on the file's parent directory.
-    // Find parent path (iterate to NUL -- normalize_path may have shortened it).
-    uint64_t last = 0;
-    for (uint64_t i = 0; path[i]; i++) if (path[i] == '/') last = i;
     char parent[256];
-    if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
-    else { __builtin_memcpy(parent, path, last); parent[last] = '\0'; }
+    if (!path_split(path, parent, sizeof(parent))) return (uint64_t)-ENAMETOOLONG;
 
     int ul_err = 0;
     uint32_t par_ino = ext2_lookup_path(parent, &g_current->cred, &ul_err);
@@ -1992,11 +1983,8 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     if (!unveil_ok(dst, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
 
     // Require write+exec on src parent directory.
-    uint64_t src_last = 0;
-    for (uint64_t i = 0; src[i]; i++) if (src[i] == '/') src_last = i;
     char src_parent[256];
-    if (src_last == 0) { src_parent[0] = '/'; src_parent[1] = '\0'; }
-    else { __builtin_memcpy(src_parent, src, src_last); src_parent[src_last] = '\0'; }
+    if (!path_split(src, src_parent, sizeof(src_parent))) return (uint64_t)-ENAMETOOLONG;
 
     int rn_err = 0;
     uint32_t sp_ino = ext2_lookup_path(src_parent, &g_current->cred, &rn_err);
@@ -2145,11 +2133,8 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;   // sandbox
 
     // Require write+exec on parent directory.
-    uint64_t mk_last = 0;
-    for (uint64_t i = 0; path[i]; i++) if (path[i] == '/') mk_last = i;
     char mk_parent[256];
-    if (mk_last == 0) { mk_parent[0] = '/'; mk_parent[1] = '\0'; }
-    else { __builtin_memcpy(mk_parent, path, mk_last); mk_parent[mk_last] = '\0'; }
+    if (!path_split(path, mk_parent, sizeof(mk_parent))) return (uint64_t)-ENAMETOOLONG;
 
     int mk_err = 0;
     uint32_t mkp_ino = ext2_lookup_path(mk_parent, &g_current->cred, &mk_err);
