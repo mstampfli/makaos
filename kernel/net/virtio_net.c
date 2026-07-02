@@ -1,5 +1,6 @@
 #include "virtio_net.h"
 #include "pci.h"
+#include "virtio_pci.h"   // shared virtio-PCI transport: caps, status bits, common_cfg, find_virtio_cap
 #include "vmm.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -13,57 +14,20 @@
 extern void virtio_net_irq_entry(void);
 
 // ── PCI IDs ───────────────────────────────────────────────────────────────
-#define VIRTIO_VENDOR          0x1AF4u
+// Generic virtio-PCI transport constants (VIRTIO_VENDOR, VIRTIO_PCI_CAP_*,
+// VIRTIO_STATUS_*, VIRTIO_F_VERSION_1) live in virtio_pci.h.
 #define VIRTIO_DEV_NET_MODERN  0x1041u  // virtio 1.x network device
 #define VIRTIO_DEV_NET_LEGACY  0x1000u  // transitional (also works)
 #define PCI_CLASS_NETWORK      0x02u
 #define PCI_SUBCLASS_ETHERNET  0x00u
 
-// ── virtio-PCI capability types ───────────────────────────────────────────
-#define VIRTIO_PCI_CAP_COMMON_CFG  1u
-#define VIRTIO_PCI_CAP_NOTIFY_CFG  2u
-#define VIRTIO_PCI_CAP_ISR_CFG     3u
-#define VIRTIO_PCI_CAP_DEVICE_CFG  4u
-#define VIRTIO_PCI_CAP_PCI_CFG     5u
-
-// ── virtio device status bits ─────────────────────────────────────────────
-#define VIRTIO_STATUS_ACKNOWLEDGE   1u
-#define VIRTIO_STATUS_DRIVER        2u
-#define VIRTIO_STATUS_DRIVER_OK     4u
-#define VIRTIO_STATUS_FEATURES_OK   8u
-#define VIRTIO_STATUS_FAILED       128u
-
-// ── virtio feature bits ───────────────────────────────────────────────────
-// We negotiate a minimal set — only what we need.
-#define VIRTIO_F_VERSION_1          (1ULL << 32)  // modern device
+// ── virtio-net feature bits ─────────────────────────────────────────────────
 #define VIRTIO_NET_F_MAC            (1ULL << 5)   // device has a MAC address
 #define VIRTIO_NET_F_STATUS         (1ULL << 16)  // device exposes link status
 
 #define DRIVER_FEATURES  (VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC)
 
-// ── virtio-PCI common configuration structure (spec §4.1.4.3) ────────────
-typedef struct __attribute__((packed)) {
-    uint32_t device_feature_select;
-    uint32_t device_feature;
-    uint32_t driver_feature_select;
-    uint32_t driver_feature;
-    uint16_t msix_config;
-    uint16_t num_queues;
-    uint8_t  device_status;
-    uint8_t  config_generation;
-    // Per-queue fields (select queue first via queue_select):
-    uint16_t queue_select;
-    uint16_t queue_size;
-    uint16_t queue_msix_vector;
-    uint16_t queue_enable;
-    uint16_t queue_notify_off;
-    uint32_t queue_desc_lo;
-    uint32_t queue_desc_hi;
-    uint32_t queue_driver_lo;   // avail ring
-    uint32_t queue_driver_hi;
-    uint32_t queue_device_lo;   // used ring
-    uint32_t queue_device_hi;
-} virtio_pci_common_cfg_t;
+// virtio_pci_common_cfg_t (spec 4.1.4.3) lives in virtio_pci.h.
 
 // ── virtio-net device configuration (spec §5.1.4) ────────────────────────
 typedef struct __attribute__((packed)) {
@@ -183,56 +147,7 @@ static phys_addr_t s_tx_buf_phys = 0;
 
 static uint8_t s_mac[ETH_ALEN];
 
-// ── PCI capability walker ─────────────────────────────────────────────────
-
-typedef struct {
-    uint8_t  bar;
-    uint32_t offset;
-    uint32_t length;
-    uint32_t extra;   // notify_off_multiplier for type 2
-} vcap_t;
-
-static int find_virtio_cap(uint8_t bus, uint8_t dev, uint8_t fn,
-                            uint8_t cap_type, vcap_t* out) {
-    // Walk PCI capability list looking for vendor-specific (type 9) caps
-    // that have virtio_pci_cap.cfg_type == cap_type.
-    uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dev, fn, 0x34u) & 0xFCu);
-    while (cap) {
-        uint32_t dw0 = pci_cfg_read32(bus, dev, fn, cap);
-        uint8_t  id  = (uint8_t)(dw0 & 0xFFu);
-        uint8_t  next = (uint8_t)((dw0 >> 8) & 0xFCu);
-        uint8_t  len  = (uint8_t)((dw0 >> 16) & 0xFFu);
-
-        if (id == 0x09u && len >= 16u) {  // vendor-specific PCI capability
-            // virtio_pci_cap layout at `cap`:
-            // +0: cap_vndr, cap_next, cap_len, cfg_type
-            // +4: bar
-            // +8: offset (32-bit)
-            // +12: length (32-bit)
-            uint32_t dw1 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 4u));
-            uint32_t dw2 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 8u));
-            uint32_t dw3 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 12u));
-
-            uint8_t cfg_type = (uint8_t)((dw0 >> 24) & 0xFFu);
-            uint8_t bar_idx  = (uint8_t)(dw1 & 0xFFu);
-
-            if (cfg_type == cap_type) {
-                out->bar    = bar_idx;
-                out->offset = dw2;
-                out->length = dw3;
-                if (cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG) {
-                    // notify_off_multiplier is an extra dword after cap+12
-                    out->extra = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 16u));
-                } else {
-                    out->extra = 0;
-                }
-                return 1;
-            }
-        }
-        cap = next;
-    }
-    return 0;
-}
+// vcap_t + find_virtio_cap (the PCI capability walker) live in virtio_pci.h.
 
 // ── Virtqueue helpers ─────────────────────────────────────────────────────
 

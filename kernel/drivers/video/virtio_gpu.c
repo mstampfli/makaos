@@ -13,6 +13,7 @@
 #include "drm_backend.h"
 #include "errno.h"
 #include "pci.h"
+#include "virtio_pci.h"   // shared virtio-PCI transport: caps, status bits, common_cfg, find_virtio_cap
 #include "vmm.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -24,25 +25,12 @@
 #include "checked.h"   // mul_within_u32: overflow-safe bounded multiply
 
 // ── PCI IDs ─────────────────────────────────────────────────────────
-#define VIRTIO_VENDOR            0x1AF4u
+// Generic virtio-PCI transport constants (VIRTIO_VENDOR, VIRTIO_PCI_CAP_*,
+// VIRTIO_STATUS_*, VIRTIO_F_VERSION_1) live in virtio_pci.h.
 #define VIRTIO_DEV_GPU_MODERN    0x1050u   // virtio 1.x GPU device
 #define VIRTIO_DEV_GPU_LEGACY    0x1040u   // transitional (also accepted)
 
-// ── virtio-PCI capability types ─────────────────────────────────────
-#define VIRTIO_PCI_CAP_COMMON_CFG  1u
-#define VIRTIO_PCI_CAP_NOTIFY_CFG  2u
-#define VIRTIO_PCI_CAP_ISR_CFG     3u
-#define VIRTIO_PCI_CAP_DEVICE_CFG  4u
-
-// ── virtio status bits ──────────────────────────────────────────────
-#define VIRTIO_STATUS_ACKNOWLEDGE 1u
-#define VIRTIO_STATUS_DRIVER      2u
-#define VIRTIO_STATUS_DRIVER_OK   4u
-#define VIRTIO_STATUS_FEATURES_OK 8u
-#define VIRTIO_STATUS_FAILED      128u
-
 // ── virtio-gpu feature bits (§5.7.3) ────────────────────────────────
-#define VIRTIO_F_VERSION_1             (1ULL << 32)
 #define VIRTIO_GPU_F_VIRGL             (1ULL << 0)   // 3D support (skip for now)
 #define VIRTIO_GPU_F_EDID              (1ULL << 1)   // EDID blobs
 #define VIRTIO_GPU_F_RESOURCE_UUID     (1ULL << 2)
@@ -78,28 +66,7 @@
 
 #define VIRTIO_GPU_MAX_SCANOUTS                16
 
-// ── virtio-PCI common configuration (§4.1.4.3) ──────────────────────
-typedef struct __attribute__((packed)) {
-    uint32_t device_feature_select;
-    uint32_t device_feature;
-    uint32_t driver_feature_select;
-    uint32_t driver_feature;
-    uint16_t msix_config;
-    uint16_t num_queues;
-    uint8_t  device_status;
-    uint8_t  config_generation;
-    uint16_t queue_select;
-    uint16_t queue_size;
-    uint16_t queue_msix_vector;
-    uint16_t queue_enable;
-    uint16_t queue_notify_off;
-    uint32_t queue_desc_lo;
-    uint32_t queue_desc_hi;
-    uint32_t queue_driver_lo;
-    uint32_t queue_driver_hi;
-    uint32_t queue_device_lo;
-    uint32_t queue_device_hi;
-} virtio_pci_common_cfg_t;
+// virtio_pci_common_cfg_t (spec 4.1.4.3) lives in virtio_pci.h.
 
 // ── virtio-gpu device configuration (§5.7.4) ────────────────────────
 typedef struct __attribute__((packed)) {
@@ -184,41 +151,7 @@ static virtq_t  s_cursor_vq; // VQ_CURSORQ (allocated but unused for now)
 static uint32_t s_num_scanouts = 0;
 static struct { uint32_t w, h, enabled; } s_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
 
-// ── PCI capability walker (identical to virtio_net's) ───────────────
-typedef struct {
-    uint8_t  bar;
-    uint32_t offset;
-    uint32_t length;
-    uint32_t extra;
-} vcap_t;
-
-static int find_virtio_cap(uint8_t bus, uint8_t dev, uint8_t fn,
-                            uint8_t cap_type, vcap_t* out) {
-    uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dev, fn, 0x34u) & 0xFCu);
-    while (cap) {
-        uint32_t dw0 = pci_cfg_read32(bus, dev, fn, cap);
-        uint8_t  id  = (uint8_t)(dw0 & 0xFFu);
-        uint8_t  next = (uint8_t)((dw0 >> 8) & 0xFCu);
-        uint8_t  len  = (uint8_t)((dw0 >> 16) & 0xFFu);
-        if (id == 0x09u && len >= 16u) {
-            uint32_t dw1 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 4u));
-            uint32_t dw2 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 8u));
-            uint32_t dw3 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 12u));
-            uint8_t cfg_type = (uint8_t)((dw0 >> 24) & 0xFFu);
-            if (cfg_type == cap_type) {
-                out->bar    = (uint8_t)(dw1 & 0xFFu);
-                out->offset = dw2;
-                out->length = dw3;
-                out->extra  = (cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG)
-                              ? pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 16u))
-                              : 0;
-                return 1;
-            }
-        }
-        cap = next;
-    }
-    return 0;
-}
+// vcap_t + find_virtio_cap (the PCI capability walker) live in virtio_pci.h.
 
 // ── Virtqueue allocation + activation ───────────────────────────────
 static int virtq_alloc(virtq_t* vq) {
