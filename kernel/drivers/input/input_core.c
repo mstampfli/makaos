@@ -62,7 +62,7 @@ void i8042_isr_drain(void) {
         preempt_disable();
         for (uint32_t i = 0; i < npkt; i++)
             mouse_isr_packet(pkts[i]);
-        this_cpu()->preempt_depth--;
+        preempt_enable_no_resched();
         irq_notify(12);
     }
     if (got_kbd)

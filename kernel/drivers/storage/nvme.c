@@ -531,7 +531,7 @@ void nvme_irq_handler(void) {
     // Manual decrement — calling preempt_enable() here would itself
     // re-open the sched_preempt → do_switch → `sti` path that would
     // let the next MSI-X nest inside this handler.
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // Expose asm stub.

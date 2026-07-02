@@ -251,7 +251,7 @@ void signalfd_notify(task_t* t, int sig) {
         s = s->next;
     }
     spin_unlock_irqrestore(&s_sfd_lock, fl);
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // ── Called from task_free_rcu when the owner task is about to be freed ──
@@ -282,7 +282,7 @@ void signalfd_disown_all(task_t* t) {
     }
     t->signalfd_head = NULL;
     spin_unlock_irqrestore(&s_sfd_lock, fl);
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // ── Boot-time selftest ───────────────────────────────────────────────

@@ -327,7 +327,7 @@ void ahci_irq_handler(void) {
         }
         __atomic_fetch_or(&s_free_mask, active, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
-        this_cpu()->preempt_depth--;
+        preempt_enable_no_resched();
         return;
     }
 
@@ -377,7 +377,7 @@ void ahci_irq_handler(void) {
         __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
     }
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // ── Slot allocation ───────────────────────────────────────────────────────
@@ -568,13 +568,13 @@ static void ahci_rescan_completions(void) {
         uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
         if (!active) {
             spin_unlock_irqrestore(&s_ci_lock, flags);
-            this_cpu()->preempt_depth--;
+            preempt_enable_no_resched();
             return;
         }
         uint32_t done = s_ncq ? (active & ~s_port->sact) : (active & ~s_port->ci);
         if (!done) {
             spin_unlock_irqrestore(&s_ci_lock, flags);
-            this_cpu()->preempt_depth--;
+            preempt_enable_no_resched();
             return;
         }
         __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);

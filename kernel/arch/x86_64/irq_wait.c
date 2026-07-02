@@ -123,7 +123,7 @@ void irq_notify(uint8_t irq) {
     if (atomic_load_acq(&s_wq[irq].head)) {
         preempt_disable();
         wait_queue_wake_all(&s_wq[irq]);
-        this_cpu()->preempt_depth--;
+        preempt_enable_no_resched();
     } else {
         // Atomic saturating increment: the same IRQ line can be delivered
         // to a different CPU each time (IOAPIC), and a waiter on a third

@@ -177,7 +177,7 @@ void timerfd_tick(void) {
                      pc->head ? pc->head->next_expiry_ns : ~(uint64_t)0,
                      __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&pc->lock, flags);
-    this_cpu()->preempt_depth--;   // see preempt_disable above
+    preempt_enable_no_resched();   // see preempt_disable above
 }
 
 // ── vfs_file_t ops ────────────────────────────────────────────────────
