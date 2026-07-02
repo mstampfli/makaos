@@ -88,9 +88,17 @@ static inline vfs_file_t* vfs_dup(vfs_file_t* f) {
     return f;
 }
 
+// Core anonymous-fd allocator: a zeroed vfs_file_t with refcount=1 and the
+// poll/wake queue pointed at `waitq` -- an EXTERNAL queue the caller already
+// wait_queue_init'd (eventfd/signalfd/timerfd keep their wq in the state struct,
+// not the file).  Pass NULL when the file will own its queue.  Caller sets
+// ops/ctx/flags.  The single kmalloc+zero+refcount source of truth.
+vfs_file_t* vfs_anon_fd(wait_queue_t* waitq);
+
 // Allocate a zeroed vfs_file_t with the embedded waitq wired (waitq=&_waitq +
-// wait_queue_init), secondary_waitq=NULL, refcount=1, rights=0.  The single
-// source of truth for the standard fd-alloc pattern; caller sets ops/ctx/etc.
+// wait_queue_init), secondary_waitq=NULL, refcount=1, rights=0.  The standard
+// fd-alloc pattern for files that OWN their queue; caller sets ops/ctx/etc.
+// Delegates to vfs_anon_fd so there is one alloc mechanism.
 vfs_file_t* vfs_alloc_file(void);
 
 // Atomic tryget — bumps refcount only if it is currently > 0.  Returns

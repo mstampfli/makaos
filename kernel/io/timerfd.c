@@ -247,16 +247,13 @@ vfs_file_t* timerfd_new(int clockid, uint32_t flags) {
     t->home_cpu = ~(uint32_t)0;   // no home until first settime
     wait_queue_init(&t->wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_anon_fd(&t->wq);
     if (!f) { kfree(t); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = timerfd_read_op;
     f->write = timerfd_write_op;
     f->poll  = timerfd_poll_op;
     f->close = timerfd_close_op;
     f->ctx   = t;
-    f->waitq = &t->wq;
-    f->refcount = 1;
     f->flags    = (flags & TFD_NONBLOCK) ? 0x800 : 0;
     return f;
 }

@@ -30,13 +30,20 @@ char g_cwd[256] = "/";
 // wait_queue_init), secondary_waitq = NULL, refcount = 1, rights = 0.  Caller
 // fills in the function pointers, ctx and any per-fd fields.  Exported as the
 // single source of truth for the ~dozen fd sites that hand-rolled this.
-vfs_file_t* vfs_alloc_file(void) {
+vfs_file_t* vfs_anon_fd(wait_queue_t* waitq) {
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) return NULL;
     __builtin_memset(f, 0, sizeof(*f));
-    f->waitq = &f->_waitq;
-    wait_queue_init(f->waitq);
+    f->waitq    = waitq;   // external queue (owned by the fd's state), or NULL
     f->refcount = 1;
+    return f;
+}
+
+vfs_file_t* vfs_alloc_file(void) {
+    vfs_file_t* f = vfs_anon_fd(NULL);
+    if (!f) return NULL;
+    f->waitq = &f->_waitq;      // this file owns its queue
+    wait_queue_init(f->waitq);
     return f;
 }
 

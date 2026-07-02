@@ -193,16 +193,13 @@ vfs_file_t* signalfd_new(uint32_t mask, uint32_t flags) {
     s->owner = g_current;
     wait_queue_init(&s->wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_anon_fd(&s->wq);
     if (!f) { kfree(s); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = signalfd_read_op;
     f->write = signalfd_write_op;
     f->poll  = signalfd_poll_op;
     f->close = signalfd_close_op;
     f->ctx   = s;
-    f->waitq = &s->wq;
-    f->refcount = 1;
     f->flags    = (flags & 0x800) ? 0x800 : 0;   // O_NONBLOCK bit
 
     // Link into owner's subscriber list (head-insert, O(1)).

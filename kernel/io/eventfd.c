@@ -112,21 +112,18 @@ vfs_file_t* eventfd_new(uint32_t init_val, uint32_t flags) {
     wait_queue_init(&s->read_wq);
     wait_queue_init(&s->write_wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_anon_fd(&s->read_wq);   // poll/epoll: read readiness (POLLIN)
     if (!f) { kfree(s); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = eventfd_read_op;
     f->write = eventfd_write_op;
     f->poll  = eventfd_poll_op;
     f->close = eventfd_close_op;
     f->ctx   = s;
-    f->waitq = &s->read_wq;                // poll/epoll: read readiness (POLLIN)
     // Write readiness (POLLOUT) fires on write_wq when a reader drains a full
     // eventfd.  Expose it as the secondary waitq so sys_poll/sys_select (which
     // register on both f->waitq and f->secondary_waitq) wake a POLLOUT waiter;
     // otherwise a task polling a FULL eventfd for POLLOUT starves forever.
     f->secondary_waitq = &s->write_wq;
-    f->refcount = 1;
     f->flags    = (flags & EFD_NONBLOCK) ? 0x800 : 0;
     return f;
 }
