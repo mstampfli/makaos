@@ -4458,16 +4458,24 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     return ret;
 }
 
-static uint64_t sys_getpgid(uint64_t pid_arg) {
-    if (pid_arg == 0) return (uint64_t)g_current->pgid;
-    // rcu_read_lock keeps the looked-up task alive across the field read.
+// Shared getpgid/getsid: pid_arg==0 means the caller's own group/session;
+// otherwise resolve the pid under RCU (the field is read INSIDE the rcu
+// section so the task can't be freed under us) and return -ESRCH for a
+// missing or zombie task.  want_sid picks sid over pgid -- the ONLY
+// difference between the two syscalls (both are unrestricted POSIX reads).
+static uint64_t pgid_sid_lookup(uint64_t pid_arg, int want_sid) {
+    if (pid_arg == 0)
+        return (uint64_t)(want_sid ? g_current->sid : g_current->pgid);
     rcu_read_lock();
     task_t* t = sched_find_pid((uint32_t)pid_arg);
     uint64_t r = (!t || t->state == TASK_ZOMBIE)
-                 ? (uint64_t)-ESRCH : (uint64_t)t->pgid;
+                 ? (uint64_t)-ESRCH
+                 : (uint64_t)(want_sid ? t->sid : t->pgid);
     rcu_read_unlock();
     return r;
 }
+
+static uint64_t sys_getpgid(uint64_t pid_arg) { return pgid_sid_lookup(pid_arg, 0); }
 
 static uint64_t sys_getpgrp(void) {
     return (uint64_t)g_current->pgid;
@@ -4490,16 +4498,7 @@ static uint64_t sys_setsid(void) {
     return (uint64_t)g_current->sid;
 }
 
-static uint64_t sys_getsid(uint64_t pid_arg) {
-    if (pid_arg == 0) return (uint64_t)g_current->sid;
-    // rcu_read_lock keeps the looked-up task alive across the field read.
-    rcu_read_lock();
-    task_t* t = sched_find_pid((uint32_t)pid_arg);
-    uint64_t r = (!t || t->state == TASK_ZOMBIE)
-                 ? (uint64_t)-ESRCH : (uint64_t)t->sid;
-    rcu_read_unlock();
-    return r;
-}
+static uint64_t sys_getsid(uint64_t pid_arg)  { return pgid_sid_lookup(pid_arg, 1); }
 
 // ── tcgetpgrp / tcsetpgrp ─────────────────────────────────────────────────
 static uint64_t sys_tcgetpgrp(uint64_t fd) {
