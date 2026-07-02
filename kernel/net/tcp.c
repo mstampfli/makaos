@@ -270,16 +270,8 @@ static int tcp_send_segment(tcp_pcb_t* pcb, uint8_t flags,
     }
 
     // Compute TCP checksum.
-    uint32_t pseudo = inet_pseudo_partial(pcb->local_ip, pcb->remote_ip,
-                                           IPPROTO_TCP,
-                                           (uint16_t)(TCP_HDR_MIN_LEN + dlen));
-    const uint16_t* pw = (const uint16_t*)h;
-    uint32_t sum = pseudo;
-    uint16_t l = TCP_HDR_MIN_LEN + dlen;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    if (l) sum += *(const uint8_t*)pw;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    h->checksum = (uint16_t)~sum;
+    h->checksum = transport_checksum(pcb->local_ip, pcb->remote_ip, IPPROTO_TCP,
+                                     h, (uint16_t)(TCP_HDR_MIN_LEN + dlen));
 
     // Advance snd_nxt (SYN and FIN each consume one sequence number).
     if (flags & (TCP_SYN | TCP_FIN)) pcb->snd_nxt++;
@@ -341,14 +333,8 @@ static void tcp_send_rst(uint32_t src_ip, uint16_t src_port,
     h->checksum = 0;
     h->urgent   = 0;
 
-    uint32_t pseudo = inet_pseudo_partial(src_ip, dst_ip, IPPROTO_TCP,
-                                           TCP_HDR_MIN_LEN);
-    const uint16_t* pw = (const uint16_t*)h;
-    uint32_t sum = pseudo;
-    uint16_t l = TCP_HDR_MIN_LEN;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    h->checksum = (uint16_t)~sum;
+    h->checksum = transport_checksum(src_ip, dst_ip, IPPROTO_TCP,
+                                     h, TCP_HDR_MIN_LEN);
 
     ipv4_send(skb, dst_ip, IPPROTO_TCP);
     skb_free(skb);
@@ -391,15 +377,8 @@ void tcp_recv(skbuff_t* skb) {
     // Verify checksum.
     uint16_t saved = seg->checksum;
     seg->checksum  = 0;
-    uint32_t pseudo = inet_pseudo_partial(skb->src_ip_be, skb->dst_ip_be,
-                                           IPPROTO_TCP, (uint16_t)skb->len);
-    const uint16_t* pw = (const uint16_t*)skb->data;
-    uint32_t sum = pseudo;
-    uint16_t l = (uint16_t)skb->len;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    if (l) sum += *(const uint8_t*)pw;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    uint16_t calc = (uint16_t)~sum;
+    uint16_t calc = transport_checksum(skb->src_ip_be, skb->dst_ip_be,
+                                       IPPROTO_TCP, skb->data, (uint16_t)skb->len);
     seg->checksum = saved;
     if (calc != saved) { skb_free(skb); return; }
 

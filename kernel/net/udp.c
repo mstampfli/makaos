@@ -22,15 +22,8 @@ void udp_recv(skbuff_t* skb) {
     if (hdr->checksum != 0) {
         uint16_t saved    = hdr->checksum;
         hdr->checksum     = 0;
-        uint32_t pseudo   = inet_pseudo_partial(skb->src_ip_be, skb->dst_ip_be,
-                                                 IPPROTO_UDP, udplen);
-        const uint16_t* p = (const uint16_t*)skb->data;
-        uint32_t sum      = pseudo;
-        uint16_t l        = udplen;
-        while (l > 1) { sum += *p++; l -= 2; }
-        if (l) sum += *(const uint8_t*)p;
-        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-        uint16_t calc = (uint16_t)~sum;
+        uint16_t calc = transport_checksum(skb->src_ip_be, skb->dst_ip_be,
+                                            IPPROTO_UDP, skb->data, udplen);
         hdr->checksum = saved;
         if (calc != saved) { skb_free(skb); return; }
     }
@@ -69,14 +62,7 @@ int udp_send_ex(uint32_t src_ip_be, uint32_t dst_ip_be,
 
     // Compute UDP checksum over the real source IP (what will go on the wire).
     uint32_t eff_src = src_ip_be ? src_ip_be : net_our_ip();
-    uint32_t pseudo = inet_pseudo_partial(eff_src, dst_ip_be, IPPROTO_UDP, udplen);
-    const uint16_t* p = (const uint16_t*)hdr;
-    uint32_t sum = pseudo;
-    uint16_t l = udplen;
-    while (l > 1) { sum += *p++; l -= 2; }
-    if (l) sum += *(const uint8_t*)p;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    hdr->checksum = (uint16_t)~sum;
+    hdr->checksum = transport_checksum(eff_src, dst_ip_be, IPPROTO_UDP, hdr, udplen);
     if (hdr->checksum == 0) hdr->checksum = 0xFFFF;  // RFC 768: 0 means disabled
 
     int r = ipv4_send_ex(skb, src_ip_be, dst_ip_be, IPPROTO_UDP);

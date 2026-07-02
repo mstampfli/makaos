@@ -51,3 +51,8 @@ uint16_t inet_checksum(const void* data, uint32_t len);
 // Compute the TCP/UDP pseudo-header checksum contribution.
 uint32_t inet_pseudo_partial(uint32_t src_ip_be, uint32_t dst_ip_be,
                               uint8_t proto, uint16_t payload_len);
+
+// The full TCP/UDP transport checksum (pseudo-header + `len` bytes of `data`,
+// odd-byte folded, ones-complement).  One source of truth for udp/tcp tx+rx.
+uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
+                            uint8_t proto, const void* data, uint16_t len);

@@ -37,9 +37,11 @@ uint32_t inet_pseudo_partial(uint32_t src_ip_be, uint32_t dst_ip_be,
     return sum;
 }
 
-__attribute__((unused))
-static uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
-                                    uint8_t proto, const void* data, uint16_t len) {
+// The one TCP/UDP transport checksum: pseudo-header + 16-bit ones-complement
+// sum over `len` bytes of `data` (with the trailing odd-byte fold) + ~sum.
+// Single source of truth for every udp/tcp send + receive-validate path.
+uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
+                            uint8_t proto, const void* data, uint16_t len) {
     uint32_t pseudo = inet_pseudo_partial(src_be, dst_be, proto, len);
     const uint16_t* p = (const uint16_t*)data;
     uint32_t sum = pseudo;
