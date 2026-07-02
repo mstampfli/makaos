@@ -4543,8 +4543,9 @@ static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
     (void)fd;
     tty_t* tty = tty_get_ctty();
     if (!tty) tty = &g_tty0;
-    tty->fg_pgid = (uint32_t)pgid;
-    return 0;
+    // Authorized set (SSOT): the console/tcsetpgrp path used to set fg_pgid with
+    // NO check -> a foreign-session process could hijack console Ctrl-C/Z/\.
+    return (uint64_t)(int64_t)tty_set_fg_pgrp(tty, (uint32_t)pgid);
 }
 
 // ── sys_ioctl ─────────────────────────────────────────────────────────────
@@ -4597,8 +4598,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
         uint32_t pg = 0;
         if (copy_from_user(&pg, (const void*)arg, sizeof(pg)) != 0)
             return (uint64_t)-EFAULT;
-        tty->fg_pgid = pg;
-        return 0;
+        return (uint64_t)(int64_t)tty_set_fg_pgrp(tty, pg);   // authorized (SSOT)
     }
     case TCGETS: {
         // Snapshot under tty->lock, then copy out: never hand userland a struct

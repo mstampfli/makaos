@@ -147,3 +147,7 @@ uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len);
 // the lock).  See the definitions in tty.c for the full rationale.
 void tty_set_termios(tty_t* tty, const termios_t* src);
 void tty_get_termios(tty_t* tty, termios_t* dst);
+// Authorized set-foreground-pgrp (SSOT for TIOCSPGRP/tcsetpgrp, pty + console).
+// Returns 0, or -EPERM if the caller does not own the tty's session or the pgid
+// is not a process group in that session.
+int  tty_set_fg_pgrp(tty_t* tty, uint32_t pg);

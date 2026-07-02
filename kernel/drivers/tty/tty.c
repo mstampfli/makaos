@@ -6,6 +6,7 @@
 #include "tty.h"
 #include "pty.h"
 #include "input_core.h"
+#include "errno.h"   // EPERM (tty_set_fg_pgrp)
 #include "vfs.h"
 #include "kheap.h"
 #include "sched.h"
@@ -73,6 +74,31 @@ void tty_get_termios(tty_t* tty, termios_t* dst) {
     tty_lock(tty);
     *dst = tty->termios;
     tty_unlock(tty);
+}
+
+// ── Set foreground process group (SINGLE SOURCE OF TRUTH) ──────────────────
+// TIOCSPGRP / tcsetpgrp on BOTH ptys and the console route through here, so the
+// authorization can never drift (the console + tcsetpgrp paths used to set
+// fg_pgid with NO check -> any process, even a foreign session, could point the
+// terminal foreground at an arbitrary pgrp and hijack Ctrl-C/Z/\\ -- the vuln
+// beae63c fixed for ptys only).  POSIX: the caller must own this controlling
+// terminal (its session) AND the new pgid must be a process group IN that
+// session.  Publishes with an ordered atomic store (pairs the readers' acquire
+// load).  Returns 0, or -EPERM if unauthorized.
+typedef struct { uint32_t sid; int found; } tty_pgsid_t;
+static void tty_pgid_sid_visit(task_t* t, void* data) {
+    tty_pgsid_t* c = (tty_pgsid_t*)data;
+    if (t->sid == c->sid) c->found = 1;
+}
+int tty_set_fg_pgrp(tty_t* tty, uint32_t pg) {
+    if (!g_current || g_current->sid != tty->session) return -EPERM;
+    if (pg != g_current->pgid) {   // own pgid is trivially in-session
+        tty_pgsid_t vc = { g_current->sid, 0 };
+        task_idx_pgid_walk(pg, tty_pgid_sid_visit, &vc);
+        if (!vc.found) return -EPERM;   // no such pgrp in the caller's session
+    }
+    __atomic_store_n(&tty->fg_pgid, pg, __ATOMIC_RELEASE);
+    return 0;
 }
 
 // ── Ring-buffer push/pop ──────────────────────────────────────────────────
