@@ -562,19 +562,24 @@ static vfs_file_t* resolve_stdio(const int* spec, int i) {
     return f ? f : tty_open(0);   // empty / out-of-range slot -> fall back to tty0
 }
 
-// ── elf_load ──────────────────────────────────────────────────────────────
-// Full task creation: address space + kstack + fd_table.
-// stdio: array of 3 fd specs (see resolve_stdio). Pass NULL to open tty0.
-task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
-                 vfs_file_t* backing_file) {
-    phys_addr_t pml4;
-    mm_t*       mm;
-    uint64_t    entry;
-
-    if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       NULL, NULL, NULL, backing_file)) return NULL;
-
-    // Allocate task + shared resources.
+// ---- elf_build_task ----------------------------------------------------------
+// The shared task_t construction for BOTH ELF load paths.  elf_load and
+// elf_load_with_argv previously carried ~57 identical lines of task-field init
+// that drifted (the sigstate.handlers / cleartid / fs_base / pf_* zeroing
+// comments below are the scars).  ONE mechanism now, with the only three real
+// differences as parameters:
+//   stdio     -- fd 0/1/2 source; NULL means tty0 for all three
+//                (resolve_stdio(NULL, i) == tty_open(0)).
+//   comm_name -- process-name source (basename taken, max 15 chars); NULL (the
+//                no-argv path) leaves comm empty.
+//   user_rsp  -- initial user RSP pushed as r13 (VMM_USER_STACK_TOP for the
+//                no-argv path, the SysV-built stack for the argv path).
+// Takes ownership of pml4/mm: on success they are held by the task's mm_shared;
+// on ANY failure they (and every partially-built resource) are freed and NULL
+// is returned.
+static task_t* elf_build_task(phys_addr_t pml4, mm_t* mm, uint32_t pid,
+                              const int stdio[3], const char* comm_name,
+                              uint64_t entry, uint64_t user_rsp) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
     // Zero the freshly slab-allocated task_t up front.  kmalloc returns slab
@@ -596,9 +601,10 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     if (!fd_table_init(files, 4)) {
         task_files_release(files); kfree(t); task_mm_release(tmm); return NULL;
     }
-    files->ft->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
-    files->ft->fd_table[1] = tty_open(0);
-    files->ft->fd_table[2] = tty_open(0);
+    // stdio==NULL resolves all three to tty0 (resolve_stdio(NULL, i)).
+    files->ft->fd_table[0] = resolve_stdio(stdio, 0);
+    files->ft->fd_table[1] = resolve_stdio(stdio, 1);
+    files->ft->fd_table[2] = resolve_stdio(stdio, 2);
 
     t->pid              = pid;
     t->tgid             = pid;
@@ -622,8 +628,8 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->sigstate.blocked   = 0;
     t->sigstate.sigframe_rsp = 0;
     // exec resets all caught signals to SIG_DFL (POSIX).  The task_t was
-    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..)
-    // — leaving it makes signal_setup_frame read poison as a "handler" and
+    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..) --
+    // leaving it makes signal_setup_frame read poison as a "handler" and
     // force-SIGKILL the process the moment ANY signal is delivered for an
     // unregistered slot (e.g. SIGCHLD when a child exits).  That was the
     // silent killer of sway/svcmgr/login behind the desktop presentation
@@ -632,12 +638,12 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
     // exec also resets these per-task fields, which the elf.c exec paths
     // previously left as slab garbage (a drift from process.c's task init):
-    //   cleartid_addr — a garbage value makes exit write 0 to a wild futex
-    //                   address (futex clear-on-exit) and wake on it;
-    //   fs_base       — garbage %fs base until libc sets TLS;
-    //   wake_pending  — garbage feeds the lost-wakeup scheduler guard;
-    //   last_ran_cpu  — garbage CPU-affinity hint;
-    //   pf_disk/cache — produced UINT_MAX "[pf] … (109% warm)" accounting.
+    //   cleartid_addr -- a garbage value makes exit write 0 to a wild futex
+    //                    address (futex clear-on-exit) and wake on it;
+    //   fs_base       -- garbage %fs base until libc sets TLS;
+    //   wake_pending  -- garbage feeds the lost-wakeup scheduler guard;
+    //   last_ran_cpu  -- garbage CPU-affinity hint;
+    //   pf_disk/cache -- produced UINT_MAX "[pf] ... (109% warm)" accounting.
     t->cleartid_addr = 0;
     t->fs_base       = 0;
     t->last_ran_cpu  = 0;
@@ -652,7 +658,7 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->sleep_until_ns   = 0;
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
-    // Credentials: inherit from parent if present, otherwise root.
+    // Credentials: inherit from the spawning process if present, otherwise root.
     if (g_current && g_current->files_shared)
         cred_copy(&t->cred, &g_current->cred);
     else
@@ -665,25 +671,51 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;
     *(--stk) = (uint64_t)user_trampoline;
-    t->comm[0] = '\0'; // elf_load: no argv — comm unknown
+
+    // comm: basename of comm_name (max 15 chars); empty when comm_name is NULL.
+    if (comm_name) {
+        const char* base = comm_name;
+        for (const char* p = comm_name; *p; p++) if (*p == '/') base = p + 1;
+        uint32_t ci = 0;
+        while (ci < 15 && base[ci]) { t->comm[ci] = base[ci]; ci++; }
+        t->comm[ci] = '\0';
+    } else {
+        t->comm[0] = '\0';
+    }
 
     // exec: reset pledge to PLEDGE_ALL and unveil to empty (full visibility).
     // The new image sets its own restrictions.
     t->pledge_mask = PLEDGE_ALL;
     unveil_init(&t->unveil);
 
-    *(--stk) = 0;                  // rbx
-    *(--stk) = 0;                  // rbp
-    *(--stk) = entry;              // r12 = user RIP
-    *(--stk) = VMM_USER_STACK_TOP; // r13 = user RSP (no argv yet — elf_load path)
-    *(--stk) = 0;                  // r14
-    *(--stk) = 0;                  // r15
+    *(--stk) = 0;          // rbx
+    *(--stk) = 0;          // rbp
+    *(--stk) = entry;      // r12 = user RIP
+    *(--stk) = user_rsp;   // r13 = user RSP
+    *(--stk) = 0;          // r14
+    *(--stk) = 0;          // r15
     t->ctx.rsp = (uint64_t)stk;
 
     return t;
 }
 
-// ── elf_load_with_argv ────────────────────────────────────────────────────
+// ---- elf_load ----------------------------------------------------------------
+// Full task creation: address space + kstack + fd_table.  No argv: stdio
+// defaults to tty0, comm stays empty, user RSP is the bare stack top.
+task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
+                 vfs_file_t* backing_file) {
+    phys_addr_t pml4;
+    mm_t*       mm;
+    uint64_t    entry;
+
+    if (!elf_load_into(data, size, &pml4, &mm, &entry,
+                       NULL, NULL, NULL, backing_file)) return NULL;
+
+    return elf_build_task(pml4, mm, pid, NULL /*stdio->tty0*/, NULL /*comm*/,
+                          entry, VMM_USER_STACK_TOP);
+}
+
+// ---- elf_load_with_argv ------------------------------------------------------
 // Like elf_load but also calls elf_setup_stack to build the SysV stack.
 // Required for Linux ABI binaries (bash, musl apps) that read argc/argv/envp.
 //
@@ -712,123 +744,111 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
         return NULL;
     }
 
-    // Allocate task + shared resources (same as elf_load).
-    task_t* t = kmalloc(sizeof(task_t));
-    if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
-    // Zero the freshly slab-allocated task_t up front.  kmalloc returns slab
-    // poison, and these exec paths have historically drifted from process.c's
-    // field-by-field init, leaving members as garbage (sigstate.handlers ->
-    // force-kill; cleartid_addr -> wild futex write on exit; fs_base /
-    // wake_pending / pf_disk / pf_cache).  Zeroing first makes any member not
-    // explicitly set below default to 0; the explicit non-zero inits (mm,
-    // files, pledge, ctx, ...) still run after and override.  Drift-proof.
-    __builtin_memset(t, 0, sizeof(*t));
-
-    task_mm_t* tmm = task_mm_alloc(pml4, mm);
-    if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
-
-    task_files_t* files = task_files_alloc();
-    if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
-    // fd_table_init OOM leaves files->ft == NULL; the fd_table[0..2] stores
-    // below would then write through NULL (kernel #PF).  Release and fail.
-    if (!fd_table_init(files, 4)) {
-        task_files_release(files); kfree(t); task_mm_release(tmm); return NULL;
-    }
-    files->ft->fd_table[0] = resolve_stdio(stdio, 0);
-    files->ft->fd_table[1] = resolve_stdio(stdio, 1);
-    files->ft->fd_table[2] = resolve_stdio(stdio, 2);
-
-    t->pid              = pid;
-    t->tgid             = pid;
-    t->ppid             = 0;
-    t->pgid             = pid;
-    t->sid              = pid;
-    t->flags            = 0;
-    t->state            = TASK_READY;
-    t->next             = NULL;
-    t->children         = NULL;
-    t->child_next       = NULL;
-    t->pg_prev = t->pg_next = NULL;
-    t->tg_prev = t->tg_next = NULL;
-    t->sid_prev = t->sid_next = NULL;
-    t->home_cpu = 0;
-    t->mm_shared        = tmm;
-    t->files_shared     = files;
-    t->mlfq_level       = 0;
-    t->mlfq_ticks_left  = 0;
-    t->sigstate.pending   = 0;
-    t->sigstate.blocked   = 0;
-    t->sigstate.sigframe_rsp = 0;
-    // exec resets all caught signals to SIG_DFL (POSIX).  The task_t was
-    // freshly allocated, so handlers[] is otherwise slab poison (0x5aa5..)
-    // — leaving it makes signal_setup_frame read poison as a "handler" and
-    // force-SIGKILL the process the moment ANY signal is delivered for an
-    // unregistered slot (e.g. SIGCHLD when a child exits).  That was the
-    // silent killer of sway/svcmgr/login behind the desktop presentation
-    // stall: a compositor died as soon as a helper (swaybg, status cmd,
-    // config `exec`) exited.  Fresh-zeroed pages masked it intermittently.
-    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
-    // exec also resets these per-task fields, which the elf.c exec paths
-    // previously left as slab garbage (a drift from process.c's task init):
-    //   cleartid_addr — a garbage value makes exit write 0 to a wild futex
-    //                   address (futex clear-on-exit) and wake on it;
-    //   fs_base       — garbage %fs base until libc sets TLS;
-    //   wake_pending  — garbage feeds the lost-wakeup scheduler guard;
-    //   last_ran_cpu  — garbage CPU-affinity hint;
-    //   pf_disk/cache — produced UINT_MAX "[pf] … (109% warm)" accounting.
-    t->cleartid_addr = 0;
-    t->fs_base       = 0;
-    t->last_ran_cpu  = 0;
-    t->wake_pending  = 0;
-    t->pf_disk       = 0;
-    t->pf_cache      = 0;
-    t->signalfd_head      = NULL;
-    t->drm_bytes_charged  = 0;
-    t->drm_priority       = 0;
-    t->umask            = 0022u;
-    t->exit_code        = 0;
-    t->sleep_until_ns   = 0;
-    t->cwd = kmalloc(KPATH_MAX);
-    if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
-    // Credentials: inherit from spawning process if present, otherwise root.
-    if (g_current && g_current->files_shared)
-        cred_copy(&t->cred, &g_current->cred);
-    else
-        cred_init_root(&t->cred);
-    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
-
-    virt_addr_t kstack_top = kstack_alloc();
-    t->kstack_top = kstack_top;
-
-    uint64_t* stk = (uint64_t*)kstack_top;
-    *(--stk) = 0;
-    *(--stk) = (uint64_t)user_trampoline;
-    // Set comm: basename of argv[0], max 15 chars.
-    {
-        const char* name = (argv && argv[0]) ? argv[0] : "unknown";
-        const char* base = name;
-        for (const char* p = name; *p; p++) if (*p == '/') base = p + 1;
-        uint32_t ci = 0;
-        while (ci < 15 && base[ci]) { t->comm[ci] = base[ci]; ci++; }
-        t->comm[ci] = '\0';
-    }
-
-    // exec: reset pledge to PLEDGE_ALL and unveil to empty.
-    // Credentials are inherited (set above); pledge/unveil reset on exec
-    // so the new image can set its own restrictions.
-    t->pledge_mask = PLEDGE_ALL;
-    unveil_init(&t->unveil);
-
-    *(--stk) = 0;          // rbx
-    *(--stk) = 0;          // rbp
-    *(--stk) = entry;      // r12 = user RIP
-    *(--stk) = user_rsp;   // r13 = user RSP (points to argc on stack)
-    *(--stk) = 0;          // r14
-    *(--stk) = 0;          // r15
-    t->ctx.rsp = (uint64_t)stk;
-
-    return t;
+    const char* comm_name = (argv && argv[0]) ? argv[0] : "unknown";
+    return elf_build_task(pml4, mm, pid, stdio, comm_name, entry, user_rsp);
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// [task_init]: exercises elf_build_task (the shared ELF task constructor) and
+// asserts EVERY task_t field lands at its expected initial value.  The drift
+// safety net for the exec-critical field init the two load paths used to
+// duplicate: a forgotten/wrong field is a corrupted task (force-kill, wild
+// futex write, priv confusion), and this fails loudly at boot instead.
+void task_init_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+
+    phys_addr_t pml4 = vmm_alloc_pml4();
+    mm_t* mm = (pml4 == PMM_INVALID_ADDR) ? NULL : mm_create();
+    if (pml4 == PMM_INVALID_ADDR || !mm) {
+        if (mm) mm_destroy(mm);
+        if (pml4 != PMM_INVALID_ADDR) { vmm_free_user(pml4); pmm_buddy_free(pml4, 0); }
+        kprintf_atomic("[task_init] SELF-TEST FAILED (OOM building test address space)\n");
+        return;
+    }
+
+    const uint32_t TPID = 4242u;
+    const uint64_t TENTRY = 0x400000ull;
+    task_t* t = elf_build_task(pml4, mm, TPID, NULL, NULL, TENTRY,
+                               VMM_USER_STACK_TOP);
+    if (!t) {   // elf_build_task freed pml4/mm on failure
+        kprintf_atomic("[task_init] SELF-TEST FAILED (elf_build_task returned NULL)\n");
+        return;
+    }
+
+    // Identity.
+    if (t->pid  != TPID) fails++;
+    if (t->tgid != TPID) fails++;
+    if (t->ppid != 0)    fails++;
+    if (t->pgid != TPID) fails++;
+    if (t->sid  != TPID) fails++;
+    if (t->flags != 0)   fails++;
+    if (t->state != TASK_READY) fails++;
+    // Resource pointers (never NULL) + fd 0/1/2 wired to tty0.
+    if (!t->mm_shared)    fails++;
+    if (!t->files_shared) fails++;
+    if (!t->kstack_top)   fails++;
+    if (t->ctx.rsp == 0)  fails++;
+    if (t->files_shared && t->files_shared->ft) {
+        if (!t->files_shared->ft->fd_table[0]) fails++;
+        if (!t->files_shared->ft->fd_table[1]) fails++;
+        if (!t->files_shared->ft->fd_table[2]) fails++;
+    } else fails++;
+    // List links start unlinked.
+    if (t->next || t->children || t->child_next) fails++;
+    if (t->pg_prev || t->pg_next)  fails++;
+    if (t->tg_prev || t->tg_next)  fails++;
+    if (t->sid_prev || t->sid_next) fails++;
+    // The historically-drifting zeroed fields (the scar list).
+    if (t->cleartid_addr != 0) fails++;
+    if (t->fs_base != 0)       fails++;
+    if (t->wake_pending != 0)  fails++;
+    if (t->last_ran_cpu != 0)  fails++;
+    if (t->pf_disk != 0 || t->pf_cache != 0) fails++;
+    if (t->signalfd_head != NULL) fails++;
+    if (t->on_cpu != 0)        fails++;
+    if (t->syscall_a5 != 0 || t->syscall_a6 != 0) fails++;
+    if (t->kthread_ctx != NULL) fails++;
+    // sigstate reset: pending/blocked/frame clear + handlers all zeroed.
+    if (t->sigstate.pending != 0 || t->sigstate.blocked != 0) fails++;
+    if (t->sigstate.sigframe_rsp != 0) fails++;
+    {
+        const volatile uint8_t* hb = (const volatile uint8_t*)&t->sigstate.handlers;
+        for (unsigned i = 0; i < sizeof(t->sigstate.handlers); i++)
+            if (hb[i] != 0) { fails++; break; }
+    }
+    // Misc scalars.
+    if (t->umask != 0022u) fails++;
+    if (t->exit_code != 0) fails++;
+    if (t->sleep_until_ns != 0) fails++;
+    if (t->mlfq_level != 0 || t->mlfq_ticks_left != 0) fails++;
+    if (t->home_cpu != 0) fails++;
+    if (t->drm_bytes_charged != 0 || t->drm_priority != 0) fails++;
+    // cwd == "/", comm empty (NULL comm_name), pledge full.
+    if (!t->cwd || t->cwd[0] != '/' || t->cwd[1] != '\0') fails++;
+    if (t->comm[0] != '\0') fails++;
+    if (t->pledge_mask != PLEDGE_ALL) fails++;
+    // The two parameterised stack values (r12=entry, r13=user_rsp) landed at
+    // their known offsets from ctx.rsp (layout: r15,r14,r13,r12,rbp,rbx,...).
+    {
+        const uint64_t* s = (const uint64_t*)t->ctx.rsp;
+        if (s[2] != VMM_USER_STACK_TOP) fails++;   // r13 = user RSP
+        if (s[3] != TENTRY)             fails++;   // r12 = user RIP
+    }
+
+    // Teardown (mirror task_free_rcu's resource frees; this task was never
+    // scheduled/listed and has no signalfd subscribers).
+    kstack_free(t->kstack_top);
+    task_mm_release(t->mm_shared);
+    task_files_release(t->files_shared);
+    kfree(t->cwd);
+    unveil_free(&t->unveil);
+    kfree(t);
+
+    kprintf_atomic(fails ? "[task_init] SELF-TEST FAILED\n"
+                  : "[task_init] SELF-TEST PASSED (every task_t field initialised by elf_build_task)\n");
+}
+#endif
 
 // ── elf_read_buf ──────────────────────────────────────────────────────────
 // Shared read primitive used by every ELF load path (spawn, exec, kernel).

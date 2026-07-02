@@ -589,6 +589,12 @@ static void init_kthread(void) {
     extern void elf_phtab_bounds_selftest(void);
     elf_phtab_bounds_selftest();
 
+    // elf_build_task builds every task_t for the two ELF load paths; assert it
+    // sets EVERY field to its expected initial value (the drift safety net that
+    // makes deduping elf_load / elf_load_with_argv into elf_build_task safe).
+    extern void task_init_selftest(void);
+    task_init_selftest();
+
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
     // corrupts compositor framebuffers.  Allocate 8 blocks without
