@@ -206,8 +206,8 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         if (ph->p_flags & PF_W) prot_flags |= VMA_W;
         if (ph->p_flags & PF_X) prot_flags |= VMA_X;
 
-        virt_addr_t seg_start = (ph->p_vaddr + load_bias) & ~PAGE_MASK;
-        virt_addr_t seg_end   = (ph->p_vaddr + load_bias + ph->p_memsz + PAGE_MASK) & ~PAGE_MASK;
+        virt_addr_t seg_start = page_align_down(ph->p_vaddr + load_bias);
+        virt_addr_t seg_end   = page_align_up(ph->p_vaddr + load_bias + ph->p_memsz);
 
         if (backing_file) {
             // ── Lazy path: file-backed VMA, pages faulted in on demand ────
@@ -314,7 +314,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     }
 
     // Heap: starts after last segment, page-aligned.
-    virt_addr_t brk_start = (seg_end_max + PAGE_MASK) & ~PAGE_MASK;
+    virt_addr_t brk_start = page_align_up(seg_end_max);
     if (brk_start < VMM_USER_CODE_BASE) brk_start = VMM_USER_CODE_BASE + PAGE_SIZE;
     mm->brk_start = brk_start;
     mm->brk       = brk_start;

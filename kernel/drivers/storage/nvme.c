@@ -628,7 +628,7 @@ static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
     // Map enough space for all entries we intend to program.
     uint32_t map_bytes = 16u * tbl_size;
     // Round up to page so vmm_map_mmio is happy.
-    map_bytes = (map_bytes + 0xFFFu) & ~0xFFFu;
+    map_bytes = (uint32_t)page_align_up(map_bytes);
     s_msix_table = (volatile uint32_t*)
                    vmm_map_mmio(bar_phys + tbl_off, map_bytes);
     if (!s_msix_table) {
@@ -728,7 +728,7 @@ uint8_t nvme_init(void) {
     // the qid-0 doorbells).  The common small-stride case (QEMU/real devices,
     // DSTRD=0 -> extent 0x1208) stays within 0x2000 and is left unchanged.
     uint64_t db_extent = 0x1000ull + (2ull * MAX_CPUS + 1ull) * s_doorbell_stride + 4ull;
-    db_extent = (db_extent + 0xFFFull) & ~0xFFFull;   // round up to a page
+    db_extent = page_align_up(db_extent);             // round up to a page
     if (db_extent > NVME_BAR0_MAX_MAP) {
         kprintf("[nvme] CAP.DSTRD=%u needs a %u-byte doorbell region (> %u); refusing\n",
                 dstrd, (uint32_t)db_extent, (uint32_t)NVME_BAR0_MAX_MAP);

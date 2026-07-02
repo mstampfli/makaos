@@ -28,11 +28,11 @@ static io_uring_t* test_ring_create(uint32_t entries) {
     uint32_t cq_entries = sq_entries * 2;
 
     uint64_t hdrs = sizeof(io_sq_ring_hdr_t) + sizeof(io_cq_ring_hdr_t);
-    uint64_t sqes_off = (hdrs + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t sqes_off = page_align_up(hdrs);
     uint64_t sqes_bytes = sq_entries * sizeof(io_sqe_t);
-    uint64_t cqes_off = (sqes_off + sqes_bytes + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t cqes_off = page_align_up(sqes_off + sqes_bytes);
     uint64_t cqes_bytes = cq_entries * sizeof(io_cqe_t);
-    uint64_t total = (cqes_off + cqes_bytes + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t total = page_align_up(cqes_off + cqes_bytes);
 
     uint64_t pages = total >> PAGE_SHIFT;
     uint8_t order = 0; while ((1ULL << order) < pages) order++;

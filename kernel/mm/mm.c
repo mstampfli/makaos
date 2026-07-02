@@ -556,7 +556,7 @@ void mm_vma_trim_selftest(void) {
 // internally via mm_vma_add right after.)
 virt_addr_t mm_vma_find_free(mm_t* mm, size_t len) {
     if (!mm || !len) return 0;
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    len = page_align_up(len);
 
     spin_lock(&mm->vma_lock);
     virt_addr_t hint = mm->mmap_base;

@@ -82,7 +82,7 @@ ALWAYS_INLINE void tlb_do_flush(uint64_t start, uint64_t end) {
         tlb_flush_local_all();
         return;
     }
-    for (uint64_t va = start & ~PAGE_MASK; va < end; va += PAGE_SIZE)
+    for (uint64_t va = page_align_down(start); va < end; va += PAGE_SIZE)
         tlb_invlpg(va);
 }
 
@@ -144,7 +144,7 @@ void tlb_shootdown_drain(void) {
     while (rev) {
         tlb_flush_slot_t* slot = rev;
         rev = rev->next;
-        for (uint64_t va = slot->start & ~PAGE_MASK; va < slot->end;
+        for (uint64_t va = page_align_down(slot->start); va < slot->end;
              va += PAGE_SIZE)
             tlb_invlpg(va);
         __atomic_store_n(&slot->done, 1u, __ATOMIC_RELEASE);
