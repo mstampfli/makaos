@@ -208,12 +208,11 @@ void signal_send_pid_selftest(void) {
 // Boundary check: `addr` must be a canonical user address AND the
 // `len`-byte range starting there must stay in the low canonical half
 // [0, 2^47).  The non-canonical gap between 2^47 and HHDM_OFFSET
-// (0xFFFF800000000000) must also be rejected — any address there
+// (0xFFFF800000000000) must also be rejected -- any address there
 // #GPs the moment the CPU tries to ring-transition back to it via
 // iretq.  Using HHDM_OFFSET as the ceiling here would silently let
 // non-canonical pointers through and is the bug that produced the
-// Ctrl+C iretq #GP on makaterm.
-#define USER_ADDR_CEIL (1ULL << 47)
+// Ctrl+C iretq #GP on makaterm.  USER_ADDR_CEIL == 2^47 is in common.h.
 
 static inline int sig_user_range_ok(uint64_t addr, uint64_t len) {
     if (!addr) return 0;

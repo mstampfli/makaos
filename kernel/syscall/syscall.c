@@ -2295,9 +2295,9 @@ static inline int sigaction_addr_ok(uint64_t a) {
     // 0 = SIG_DFL, 1 = SIG_IGN — always allowed.
     if (a <= 1) return 1;
     // Real handler/restorer must live in the low canonical half:
-    // bits 47–63 all zero → a < 2^47.  Anything in the non-canonical
+    // bits 47-63 all zero -> a < 2^47.  Anything in the non-canonical
     // gap [2^47, HHDM_OFFSET) would #GP iretq at ring transition.
-    return a < (1ULL << 47);
+    return a < USER_ADDR_CEIL;
 }
 
 static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
@@ -2372,7 +2372,7 @@ static uint64_t sys_sigreturn(void) {
     // half is [0, 2^47); the non-canonical gap starts at 2^47.  Using
     // HHDM_OFFSET (2^47 OR'd with the kernel-half bit pattern) would
     // miss the whole gap and let a poisoned rip through.
-    if (frame.rip >= (1ULL << 47) || frame.rsp >= (1ULL << 47))
+    if (frame.rip >= USER_ADDR_CEIL || frame.rsp >= USER_ADDR_CEIL)
         return (uint64_t)-EINVAL;
 
     // Restore the user register context by rewriting the saved slots on
@@ -3602,8 +3602,7 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
 // memcpy #GP'd the kernel (writing a non-canonical address faults) instead
 // of cleanly returning -EFAULT.  An untrusted user pointer must never crash
 // the kernel: reject everything above the user ceiling (kernel AND the
-// non-canonical gap).
-#define USER_ADDR_MAX 0x00007FFFFFFFFFFFULL
+// non-canonical gap).  USER_ADDR_MAX / USER_ADDR_CEIL live in common.h.
 // PRIMITIVE (user (addr,len) range validation, category B -> ckd_add_u64 wrap guard).
 static inline int _access_ok(uint64_t addr, uint64_t len) {
     if (!addr) return 0;
@@ -3887,7 +3886,7 @@ void mmap_range_selftest(void) {
     static const struct { uint64_t addr, len; } bad[] = {
         { 0ULL,                          PAGE_SIZE },   // NULL addr
         { 0xFFFF800000000000ULL,         PAGE_SIZE },   // kernel higher half (the LPE)
-        { 0x0000800000000000ULL,         PAGE_SIZE },   // first non-canonical page
+        { USER_ADDR_CEIL,                PAGE_SIZE },   // first non-canonical page
         { 0xDEAD000000000000ULL,         PAGE_SIZE },   // non-canonical scribble
         { 0x0000000000401000ULL,         UINT64_MAX },  // len overflows page-round
         { USER_ADDR_MAX & ~PAGE_MASK,    2 * PAGE_SIZE},// end spills past the ceiling

@@ -1160,7 +1160,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             // the read so a bad RDI doesn't fault us.
             {
                 uint64_t rdi = g[6];
-                if (rdi >= 0x1000 && rdi < 0x800000000000ULL) {
+                if (rdi >= 0x1000 && rdi < USER_ADDR_CEIL) {
                     phys_addr_t pp = vmm_page_phys(vmm_pml4_get(), rdi & ~0xFFFULL);
                     if (pp != PMM_INVALID_ADDR) {
                         ser_str("\n  [RDI..+64]:");
@@ -1219,7 +1219,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             uint64_t* g = (uint64_t*)((uintptr_t)f + 5 * 8);
             uint64_t rbp = g[4];
             for (int i = 0; i < 24; i++) {
-                if (rbp < 0x1000 || rbp >= 0x800000000000ULL || (rbp & 7)) break;
+                if (rbp < 0x1000 || rbp >= USER_ADDR_CEIL || (rbp & 7)) break;
                 phys_addr_t bpg = vmm_page_phys(vmm_pml4_get(), rbp & ~0xFFFULL);
                 if (bpg == PMM_INVALID_ADDR) { ser_str("    (rbp unmapped)\n"); break; }
                 uint64_t saved = *(uint64_t*)((bpg + HHDM_OFFSET) + (rbp & 0xFF8ULL));

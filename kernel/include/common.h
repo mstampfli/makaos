@@ -169,6 +169,17 @@ static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
 #define PS_BIT      (1ULL << 7) // Page Size bit
 #define KERNEL_BASE_VIRT 0xFFFFFFFF80000000ULL
 
+// x86-64 user address space is [0, 2^47) under 4-level paging.  Everything at
+// or above 2^47 is either kernel or the non-canonical gap up to HHDM_OFFSET,
+// which must be rejected: a non-canonical pointer #GPs the instant the CPU
+// ring-transitions to it via iretq (the Ctrl+C makaterm crash).  Two spellings
+// of the ONE boundary -- use whichever reads naturally with the comparison:
+//   USER_ADDR_MAX  = last valid user byte     (inclusive; pair with >  or <=)
+//   USER_ADDR_CEIL = first non-canonical addr (exclusive; pair with >= or < )
+// Invariant: USER_ADDR_CEIL == USER_ADDR_MAX + 1 == 2^47.
+#define USER_ADDR_MAX  0x00007FFFFFFFFFFFULL
+#define USER_ADDR_CEIL 0x0000800000000000ULL
+
 #define NULL ((void*)0)
 
 typedef struct __attribute__((packed)) boot_info_t {
