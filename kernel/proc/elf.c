@@ -444,9 +444,12 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
         }
     }
 
-    // Allocate user-VA pointer arrays in kernel heap.
-    uint64_t* argv_va = (uint64_t*)kmalloc((argc + 1) * 8);
-    uint64_t* envp_va = (uint64_t*)kmalloc((envc + 1) * 8);
+    // Allocate user-VA pointer arrays in kernel heap.  Size in u64 so the
+    // (count+1)*8 can never wrap the u32 width (argc/envc are attacker-supplied
+    // via execve; the count can't actually reach 2^29 -- the argv array alloc
+    // fails first -- but computing the size in u64 removes the latent footgun).
+    uint64_t* argv_va = (uint64_t*)kmalloc(((uint64_t)argc + 1) * 8);
+    uint64_t* envp_va = (uint64_t*)kmalloc(((uint64_t)envc + 1) * 8);
     if (!argv_va || !envp_va) {
         if (argv_va) kfree(argv_va);
         if (envp_va) kfree(envp_va);
