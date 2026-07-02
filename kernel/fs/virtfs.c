@@ -1,6 +1,7 @@
 #include "virtfs.h"
 #include "acl.h"
 #include "errno.h"
+#include "kstr.h"    // str_eq (shared string utils; was local s_streq)
 #include "ext2.h"
 #include "sched.h"
 #include "rcu.h"     // rcu_read_lock around sched_find_pid
@@ -82,11 +83,6 @@ static const virtmount_t s_mounts[] = {
 
 // ── Internal helpers ─────────────────────────────────────────────────────
 
-static int s_streq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
-
 static const virtmount_t* find_mount(const char* path) {
     for (int i = 0; i < N_MOUNTS; i++) {
         const virtmount_t* m = &s_mounts[i];
@@ -131,7 +127,7 @@ static int virt_resolve(const char* path, const virtmount_t* m,
     }
 
     // /dev/<node>
-    if (s_streq(m->prefix, "/dev")) {
+    if (str_eq(m->prefix, "/dev")) {
         const dev_node_t* dn = dev_find_node(node_name);
         if (!dn) return -ENOENT;
         *out_uid  = dn->uid;
@@ -142,7 +138,7 @@ static int virt_resolve(const char* path, const virtmount_t* m,
     }
 
     // /proc — per-node permissions based on what's being accessed
-    if (s_streq(m->prefix, "/proc")) {
+    if (str_eq(m->prefix, "/proc")) {
         // /proc/self, /proc/<pid> — directories owned by the process
         // /proc/<pid>/<file> — files owned by the process
         // We need to figure out the pid to get its uid.

@@ -1,6 +1,7 @@
 #include "shmem.h"
 #include "pmm.h"
 #include "kheap.h"
+#include "kstr.h"    // str_eq (shared string utils; was local s_streq)
 #include "errno.h"
 #include "cred.h"
 #include "vfs.h"
@@ -31,11 +32,6 @@ static shmem_ns_table_t* s_namespace      = NULL;  // RCU-protected
 static spinlock_t        s_namespace_lock = SPINLOCK_INIT;
 
 // ── Internal helpers ─────────────────────────────────────────────────────
-
-static int s_streq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
 
 static uint32_t shm_hash_str(const char* s, uint32_t cap) {
     uint32_t h = 2166136261u;
@@ -284,7 +280,7 @@ shmem_t* shmem_ns_find(const char* name) {
         for (uint32_t n = 0; n < cap; n++) {
             shmem_t* shm = t->slots[i].shm;
             if (!shm) break;
-            if (s_streq(shm->name, name)) {
+            if (str_eq(shm->name, name)) {
                 if (shmem_tryget(shm)) result = shm;
                 break;
             }
@@ -309,7 +305,7 @@ int shmem_ns_insert(shmem_t* shm) {
         uint32_t i = shm_hash_str(shm->name, old_cap);
         for (uint32_t n = 0; n < old_cap; n++) {
             if (!old->slots[i].shm) break;
-            if (s_streq(old->slots[i].shm->name, shm->name)) {
+            if (str_eq(old->slots[i].shm->name, shm->name)) {
                 spin_unlock_irqrestore(&s_namespace_lock, flags);
                 return -EEXIST;
             }

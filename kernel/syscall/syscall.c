@@ -6,6 +6,7 @@
 #include "common.h"
 #include "checked.h"   // ckd_add_u64: overflow-safe add for the user-range guards
 #include "uaccess.h"   // _access_ok: the shared user (addr,len) range validator
+#include "kstr.h"      // str_lcpy: shared truncating NUL copy (was local strncpy_k)
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
@@ -4109,27 +4110,24 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
 
 // ── sys_uname ─────────────────────────────────────────────────────────────
 // uname(utsname*) → 0 or -errno
-static void strncpy_k(char* dst, const char* src, uint64_t n) {
-    uint64_t i = 0;
-    for (; i < n - 1 && src[i]; i++) dst[i] = src[i];
-    dst[i] = '\0';
-}
+// str_lcpy (the truncating NUL copy this used to hand-roll as strncpy_k) is in
+// kstr.h -- included at the top.
 
 static uint64_t sys_uname(uint64_t buf_ptr) {
     if (!buf_ptr) return (uint64_t)-EINVAL;
-    // Zero the whole struct first: strncpy_k copies only strlen+1 bytes per
+    // Zero the whole struct first: str_lcpy copies only strlen+1 bytes per
     // field (it does NOT zero-pad like POSIX strncpy), so without this the tail
     // of every 65-byte field after its NUL would carry stale kernel stack out to
     // userspace (~349 bytes of an unprivileged uname() info-leak).  Same
     // zero-then-fill discipline as sys_stat / sys_fstat.
     utsname_t u;
     __builtin_memset(&u, 0, sizeof(u));
-    strncpy_k(u.sysname,    "MakaOS",          65);
-    strncpy_k(u.nodename,   "makaos",          65);
-    strncpy_k(u.release,    "0.1.0",           65);
-    strncpy_k(u.version,    "#1 SMP",          65);
-    strncpy_k(u.machine,    "x86_64",          65);
-    strncpy_k(u.domainname, "(none)",          65);
+    str_lcpy(u.sysname,    "MakaOS",          65);
+    str_lcpy(u.nodename,   "makaos",          65);
+    str_lcpy(u.release,    "0.1.0",           65);
+    str_lcpy(u.version,    "#1 SMP",          65);
+    str_lcpy(u.machine,    "x86_64",          65);
+    str_lcpy(u.domainname, "(none)",          65);
     return (copy_to_user((void*)buf_ptr, &u, sizeof(u)) == 0) ? 0 : (uint64_t)-EFAULT;
 }
 

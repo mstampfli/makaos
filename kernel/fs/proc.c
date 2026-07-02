@@ -17,6 +17,7 @@
 #include "proc.h"
 #include "vfs.h"
 #include "kheap.h"
+#include "kstr.h"    // str_eq, str_len (shared string utils)
 #include "sched.h"
 #include "process.h"
 
@@ -45,14 +46,6 @@ static uint32_t str_to_uint(const char* s) {
     return v;
 }
 
-static int str_eq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
-
-static uint64_t str_len(const char* s) {
-    uint64_t n = 0; while (s[n]) n++; return n;
-}
 
 // ── membuf: a synthesized read-only vfs_file_t backed by a heap buffer ───
 //

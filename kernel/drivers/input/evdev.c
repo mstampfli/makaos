@@ -12,6 +12,7 @@
 #include "evdev.h"
 #include "input_core.h"
 #include "kheap.h"
+#include "kstr.h"    // str_lcpy (shared truncating copy for the device name)
 #include "sched.h"
 #include "process.h"
 #include "signal.h"
@@ -100,9 +101,7 @@ input_device_t* input_device_register(const char* name,
     spin_lock_init(&d->lock);
 
     d->event_nr   = s_next_event_nr++;
-    int i = 0;
-    for (; i < 79 && name && name[i]; i++) d->name[i] = name[i];
-    d->name[i] = '\0';
+    str_lcpy(d->name, name, sizeof(d->name));   // 80-byte buf, NUL-terminated, NULL-tolerant
     d->id.bustype = bustype;
     d->id.vendor  = vendor;
     d->id.product = product;

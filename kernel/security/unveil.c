@@ -1,12 +1,9 @@
 #include "unveil.h"
 #include "kheap.h"
 #include "errno.h"
+#include "kstr.h"    // str_len + str_lcpy (shared; were local s_strlen / s_strncpy)
 
-// ── String helpers (no libc in kernel) ───────────────────────────────────
-
-static uint32_t s_strlen(const char* s) {
-    uint32_t n = 0; while (s[n]) n++; return n;
-}
+// ── String helpers (no libc in kernel; str_len/str_lcpy from kstr.h) ──────
 
 static int s_strncmp(const char* a, const char* b, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
@@ -16,12 +13,6 @@ static int s_strncmp(const char* a, const char* b, uint32_t n) {
     return 0;
 }
 
-static void s_strncpy(char* dst, const char* src, uint32_t n) {
-    uint32_t i;
-    for (i = 0; i < n - 1 && src[i]; i++) dst[i] = src[i];
-    dst[i] = '\0';
-}
-
 // ── unveil_add ────────────────────────────────────────────────────────────
 
 int unveil_add(unveil_table_t* t, const char* path, uint8_t perms) {
@@ -29,7 +20,7 @@ int unveil_add(unveil_table_t* t, const char* path, uint8_t perms) {
     if (t->locked)      return -EPERM;
     if (path[0] != '/') return -EINVAL;
 
-    uint32_t plen = s_strlen(path);
+    uint32_t plen = str_len(path);
     if (plen == 0 || plen >= UNVEIL_PATH_MAX) return -ENAMETOOLONG;
 
     // Merge perms if path already exists — O(n) scan, acceptable since
@@ -53,7 +44,7 @@ int unveil_add(unveil_table_t* t, const char* path, uint8_t perms) {
     }
 
     t->entries[t->count].perms = perms;
-    s_strncpy(t->entries[t->count].path, path, UNVEIL_PATH_MAX);
+    str_lcpy(t->entries[t->count].path, path, UNVEIL_PATH_MAX);
     t->count++;
     return 0;
 }
@@ -64,10 +55,10 @@ int unveil_check(const unveil_table_t* t, const char* path, uint8_t need) {
     if (!t || !path) return 0;
     if (t->count == 0) return 1;   // empty table = full visibility
 
-    uint32_t plen = s_strlen(path);
+    uint32_t plen = str_len(path);
 
     for (uint32_t i = 0; i < t->count; i++) {
-        uint32_t elen = s_strlen(t->entries[i].path);
+        uint32_t elen = str_len(t->entries[i].path);
         if (plen < elen) continue;
         if (s_strncmp(path, t->entries[i].path, elen) != 0) continue;
         // Boundary check: prevents "/home/bob" matching "/home/bobby".

@@ -1,6 +1,7 @@
 #include "ext2.h"
 #include "ahci.h"
 #include "kheap.h"
+#include "kstr.h"    // str_len (shared string utils)
 #include "common.h"
 #include "smp.h"
 #include "seqlock.h"
@@ -953,13 +954,7 @@ uint8_t ext2_init(uint32_t part_lba) {
     return 1;
 }
 
-// ── String helpers ─────────────────────────────────────────────────────────
-
-static uint32_t str_len(const char* s) {
-    uint32_t n = 0;
-    while (s[n]) n++;
-    return n;
-}
+// str_len lives in kstr.h (shared string utils).
 
 // ── Block address resolution (direct + single indirect) ───────────────────
 
