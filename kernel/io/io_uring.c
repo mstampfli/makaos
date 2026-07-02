@@ -18,6 +18,7 @@
 #include "io_uring.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (intrusive CQ-overflow queue)
 #include "mm.h"
 #include "common.h"
 #include "process.h"
@@ -372,9 +373,8 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
             __atomic_store_n(&uring->cq_hdr->tail, tail + 1,
                               __ATOMIC_RELEASE);
 
-            uring->overflow_head = n->next;
-            if (!uring->overflow_head) uring->overflow_tail = NULL;
-            uring->overflow_count--;
+            FIFO_DEQUEUE_HEAD(uring->overflow_head, uring->overflow_tail,
+                              uring->overflow_count, n);
             kfree(n);
         }
         spin_unlock_irqrestore(&uring->overflow_lock, of);
@@ -412,10 +412,7 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
         n->cqe.flags     = cqe_flags;
 
         uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
-        if (uring->overflow_tail) uring->overflow_tail->next = n;
-        else                      uring->overflow_head = n;
-        uring->overflow_tail = n;
-        uring->overflow_count++;
+        FIFO_ENQUEUE_TAIL(uring->overflow_head, uring->overflow_tail, uring->overflow_count, n);
         spin_unlock_irqrestore(&uring->overflow_lock, of);
 
         uring->cq_hdr->overflow++;

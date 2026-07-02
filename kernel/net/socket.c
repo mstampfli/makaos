@@ -4,6 +4,7 @@
 #include "net.h"
 #include "skbuff.h"
 #include "common.h"
+#include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (intrusive udp_rx queue)
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
@@ -527,12 +528,7 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
             WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
         }
         spin_lock(&s->udp_rx_lock);
-        skb = s->udp_rx_head;
-        if (skb) {
-            s->udp_rx_head = skb->next;
-            if (!s->udp_rx_head) s->udp_rx_tail = 0;
-            s->udp_rx_count--;
-        }
+        FIFO_DEQUEUE_HEAD(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
         spin_unlock(&s->udp_rx_lock);
         if (skb) break;
         if (nonblock) return -EAGAIN;   // raced empty -> nothing to read
@@ -625,12 +621,7 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
             WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
         }
         spin_lock(&s->udp_rx_lock);
-        skb = s->udp_rx_head;
-        if (skb) {
-            s->udp_rx_head = skb->next;
-            if (!s->udp_rx_head) s->udp_rx_tail = 0;
-            s->udp_rx_count--;
-        }
+        FIFO_DEQUEUE_HEAD(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
         spin_unlock(&s->udp_rx_lock);
         if (skb) break;
         if (nonblock) return -EAGAIN;
@@ -727,7 +718,6 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     // limit under the lock (the unlocked pre-check could race the count).  The
     // skb is exclusively ours until linked; skb_free on a full queue and the
     // wakes stay OUTSIDE the lock.
-    skb->next = 0;
     spin_lock(&s->udp_rx_lock);
     if (s->udp_rx_count >= UDP_RX_QUEUE_MAX) {
         spin_unlock(&s->udp_rx_lock);
@@ -735,10 +725,7 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
         skb_free(skb);   // upper bound avoids unbounded memory growth
         return;
     }
-    if (s->udp_rx_tail) s->udp_rx_tail->next = skb;
-    else                s->udp_rx_head = skb;
-    s->udp_rx_tail = skb;
-    s->udp_rx_count++;
+    FIFO_ENQUEUE_TAIL(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
     spin_unlock(&s->udp_rx_lock);
 
     // Wake any task blocked in socket_recv / socket_recvfrom.

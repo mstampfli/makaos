@@ -1,6 +1,7 @@
 #include "unix_sock.h"
 #include "kheap.h"
 #include "errno.h"
+#include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (dgram + accept-backlog queues)
 #include "sched.h"
 #include "process.h"
 #include "smp.h"
@@ -1065,12 +1066,9 @@ vfs_file_t* unix_sock_accept(vfs_file_t* f) {
         // Re-check the head inside the lock (the wait condition was tested
         // unlocked, and another accepter may have drained it).
         spin_lock(&listener->lock);
-        unix_pending_t* pend = listener->backlog_head;
-        if (pend) {
-            listener->backlog_head = pend->next;
-            if (!listener->backlog_head) listener->backlog_tail = NULL;
-            listener->backlog_count--;
-        }
+        unix_pending_t* pend;
+        FIFO_DEQUEUE_HEAD(listener->backlog_head, listener->backlog_tail,
+                          listener->backlog_count, pend);
         spin_unlock(&listener->lock);
         if (!pend) continue;   // empty (spurious wake / lost the race) -> re-wait
 
@@ -1217,10 +1215,7 @@ int unix_sock_connect(vfs_file_t* f, const char* path) {
         rcu_read_unlock();
         return -ECONNREFUSED;
     }
-    if (target->backlog_tail) target->backlog_tail->next = pend;
-    else                      target->backlog_head = pend;
-    target->backlog_tail = pend;
-    target->backlog_count++;
+    FIFO_ENQUEUE_TAIL(target->backlog_head, target->backlog_tail, target->backlog_count, pend);
     s->state = UNIX_STATE_CONNECTING;
     spin_unlock(&target->lock);
 
@@ -1417,12 +1412,8 @@ int unix_sock_recv_ex(vfs_file_t* f, void* buf, uint32_t len, int nonblock) {
     // Dequeue under the per-socket lock (a 2nd receiver or a concurrent sendto
     // enqueue must not tear the list / double-pop).  Re-check the head inside.
     spin_lock(&s->lock);
-    unix_dgram_t* msg = s->dgram_head;
-    if (msg) {
-        s->dgram_head = msg->next;
-        if (!s->dgram_head) s->dgram_tail = NULL;
-        s->dgram_count--;
-    }
+    unix_dgram_t* msg;
+    FIFO_DEQUEUE_HEAD(s->dgram_head, s->dgram_tail, s->dgram_count, msg);
     spin_unlock(&s->lock);
     if (!msg) return 0;   // lost the race / spurious wake -> nothing to read
 
@@ -1486,10 +1477,7 @@ int unix_sock_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     // memory, which must never fault under a preempt-disabled spinlock; the
     // wakes touch rq_lock).
     spin_lock(&target->lock);
-    if (target->dgram_tail) target->dgram_tail->next = msg;
-    else                    target->dgram_head = msg;
-    target->dgram_tail = msg;
-    target->dgram_count++;
+    FIFO_ENQUEUE_TAIL(target->dgram_head, target->dgram_tail, target->dgram_count, msg);
     spin_unlock(&target->lock);
 
     // Wake receiver (blocking recv or poll).
