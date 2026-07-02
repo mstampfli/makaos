@@ -120,6 +120,15 @@ typedef struct {
     uint32_t dbc;      // byte count-1 (bits[21:0]), bit[31]=interrupt on completion
 } __attribute__((packed)) prdt_entry_t;  // 16 bytes
 
+// PRDT entries that fit one 4 KiB command table alongside the 128-byte header:
+// 128 + AHCI_PRDT_ENTRIES*16 = 128 + 3968 = 4096.  Single source of truth for
+// the table size, the build_prdt bound, and the self-test -- they must agree.
+#define AHCI_PRDT_ENTRIES  248u
+// Max 4 KiB pages a single user scatter-gather I/O can span: AHCI_DMA_SECTORS
+// (1024 sectors = 512 KiB = 128 pages) + 2 slack for a misaligned first_off that
+// straddles a page boundary.  Bounds the phys_pages/page_ptrs/pin_addrs arrays.
+#define AHCI_MAX_IO_PAGES  130u
+
 // Command table: one full 4KB page per slot.
 // Header (128 bytes) + 248 PRDT entries × 16 bytes = 128 + 3968 = 4096 bytes.
 // 248 entries × 4 KiB/entry = ~992 KiB max per NCQ command — more than enough
@@ -128,7 +137,7 @@ typedef struct {
     uint8_t      cfis[64];    // Command FIS (H2D)
     uint8_t      acmd[16];    // ATAPI command (unused)
     uint8_t      rsv[48];     // Reserved
-    prdt_entry_t prdt[248];   // Physical Region Descriptor Table
+    prdt_entry_t prdt[AHCI_PRDT_ENTRIES];   // Physical Region Descriptor Table
 } __attribute__((packed)) cmd_table_t;   // exactly 4096 bytes
 
 // ── Driver state ──────────────────────────────────────────────────────────
@@ -414,7 +423,7 @@ static uint32_t slot_alloc(void) {
 
 static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes) {
     uint32_t n = 0;
-    while (bytes > 0 && n < 248u) {
+    while (bytes > 0 && n < AHCI_PRDT_ENTRIES) {
         // Stay within the current 4 KiB page boundary.
         uint32_t off   = (uint32_t)(phys & (PAGE_SIZE - 1));
         uint32_t chunk = PAGE_SIZE - off;
@@ -841,17 +850,17 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
 static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
                                 uint32_t first_off, uint32_t count,
                                 uint8_t write) {
-    // Self-guard: the phys_pages[130] stack array below (and the 248-entry
-    // PRDT) must not be overrun by an over-large page count.  Callers already
-    // clamp (ahci_read_user rejects npages > 130), but the function must not
-    // trust its input -- fail cleanly instead of smashing the stack.
-    if (npages > 130u) return 0;
-    phys_addr_t phys_pages[130];
+    // Self-guard: the phys_pages[] stack array below (and the PRDT) must not be
+    // overrun by an over-large page count.  Callers already clamp (ahci_read_user
+    // rejects npages > AHCI_MAX_IO_PAGES), but the function must not trust its
+    // input -- fail cleanly instead of smashing the stack.
+    if (npages > AHCI_MAX_IO_PAGES) return 0;
+    phys_addr_t phys_pages[AHCI_MAX_IO_PAGES];
     for (uint32_t i = 0; i < npages; i++)
         phys_pages[i] = (phys_addr_t)((uint64_t)pages[i] - HHDM_OFFSET);
 
     uint32_t bytes;
-    if (!xfer_bytes_ok(count, 512u, 130u * PAGE_SIZE, &bytes)) return 0;  // <= npages cap
+    if (!xfer_bytes_ok(count, 512u, AHCI_MAX_IO_PAGES * PAGE_SIZE, &bytes)) return 0;  // <= npages cap
 
     // Serialize against every other submitter: at s_nslots=1 this path shares
     // slot 0's s_slot_done/result with ahci_submit_hhdm / ahci_read_multi, so
@@ -895,21 +904,22 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
 
     uint64_t va        = (uint64_t)user_buf;
     uint32_t first_off = (uint32_t)(va & 0xFFFu);
-    // npages <= 130  <=>  first_off + count*512 <= 130*PAGE_SIZE.  Form the length
-    // in u64 (xfer_bytes_ok) so a huge count cannot wrap u32 and fake a small npages
-    // that passes this bound while the DMA still moves the huge count -> overrun.
+    // npages <= AHCI_MAX_IO_PAGES  <=>  first_off + count*512 <= cap*PAGE_SIZE.
+    // Form the length in u64 (xfer_bytes_ok) so a huge count cannot wrap u32 and
+    // fake a small npages that passes this bound while the DMA still moves the
+    // huge count -> overrun.
     uint32_t total_bytes;
-    if (!xfer_bytes_ok(count, 512u, 130u * PAGE_SIZE - first_off, &total_bytes)) return 0;
+    if (!xfer_bytes_ok(count, 512u, AHCI_MAX_IO_PAGES * PAGE_SIZE - first_off, &total_bytes)) return 0;
     uint32_t npages    = (first_off + total_bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
 
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-    void* page_ptrs[130];
+    void* page_ptrs[AHCI_MAX_IO_PAGES];
     if (!vmm_get_user_pages(pml4, va, npages, page_ptrs)) return 0;
 
     // vmm_get_user_pages already pinned each frame UNDER its resolution
     // lock (closing the resolve→DMA recycle window).  We own those pins;
     // release them after the DMA completes.
-    phys_addr_t pin_addrs[130];
+    phys_addr_t pin_addrs[AHCI_MAX_IO_PAGES];
     for (uint32_t i = 0; i < npages; i++)
         pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
 
@@ -1207,18 +1217,18 @@ void xfer_bytes_ok_selftest(void) {
 // past prdt[247], off the end of the 4 KiB cmd_table_t.  Heap-allocated array
 // (250 entries = 4000 bytes is too big for the 8 KiB kstack).
 void ahci_build_prdt_selftest(void) {
-    prdt_entry_t* prdt = (prdt_entry_t*)kmalloc(250u * sizeof(prdt_entry_t));
+    prdt_entry_t* prdt = (prdt_entry_t*)kmalloc((AHCI_PRDT_ENTRIES + 2u) * sizeof(prdt_entry_t));
     if (!prdt) { kprintf("[ahci_prdt] FAIL alloc\n"); return; }
     int fails = 0;
     // One page from a page-aligned base -> exactly one entry, all consumed.
     if (build_prdt(prdt, 0x100000u, PAGE_SIZE) != 1u) fails++;
-    // Exactly 248 pages -> fills the table, all consumed.
-    if (build_prdt(prdt, 0x100000u, 248u * PAGE_SIZE) != 248u) fails++;
-    // 249 pages -> overflow: returns 0 AND never writes prdt[248] (canary proves
-    // the bound stopped the loop at entry 247, no OOB).
-    prdt[248].dba = 0xDEADBEEFu;
-    if (build_prdt(prdt, 0x100000u, 249u * PAGE_SIZE) != 0u) fails++;
-    if (prdt[248].dba != 0xDEADBEEFu) fails++;
+    // Exactly a full table -> fills the table, all consumed.
+    if (build_prdt(prdt, 0x100000u, AHCI_PRDT_ENTRIES * PAGE_SIZE) != AHCI_PRDT_ENTRIES) fails++;
+    // One page too many -> overflow: returns 0 AND never writes the entry one past
+    // the table (canary proves the bound stopped the loop at the last slot, no OOB).
+    prdt[AHCI_PRDT_ENTRIES].dba = 0xDEADBEEFu;
+    if (build_prdt(prdt, 0x100000u, (AHCI_PRDT_ENTRIES + 1u) * PAGE_SIZE) != 0u) fails++;
+    if (prdt[AHCI_PRDT_ENTRIES].dba != 0xDEADBEEFu) fails++;
     kfree(prdt);
     kprintf(fails ? "[ahci_prdt] SELF-TEST FAILED\n"
                   : "[ahci_prdt] SELF-TEST PASSED (PRDT bounded to 248, overflow signalled)\n");

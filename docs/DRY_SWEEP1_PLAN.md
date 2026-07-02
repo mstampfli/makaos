@@ -17,7 +17,7 @@ HIGH value, LOW risk:
 - U-virtio-cap find_virtio_cap PCI cap-walk + vcap_t + the 3-cap/3-BAR map block + virtio_pci_common_cfg_t/macros triplicated across virtio_net/gpu/input -> shared virtio_pci.{h,c}. F155 proved the dup (same NULL-deref fixed 3x).
 - U-vaddr      x86-64 canonical/2^47 user-VA boundary open-coded 30+ sites, 5 spellings, 2 CONFLICTING constant names -> one USER_ADDR_MAX/canonical helper. VERIFY the two constants have the same value (else picking one changes behavior = the real bug).
 - U-access-ok  sig_user_range_ok (signal.c) hand-reimplements _access_ok with a manual overflow check vs ckd_add_u64 -> expose _access_ok via a shared uaccess header, route signal.c through it. VERIFY the hand-roll is not weaker (would be a security drift).
-- U-ahci-const AHCI 248 PRDT / 130 page-cap bare literals (incl 4 stack-array dims) -> named #defines. Provably safe (rename).
+- U-ahci-const [F174 DONE] AHCI 248 PRDT / 130 page-cap literals -> AHCI_PRDT_ENTRIES/AHCI_MAX_IO_PAGES #defines (struct dim, build_prdt bound, 4 stack-array dims, xfer caps, selftest canary). Token-identical (248u/130u); build+boot verified.
 - U-fifo       intrusive singly-linked FIFO enqueue-tail/dequeue-head hand-rolled 4x (socket, io_uring, unix_sock) -> one helper.
 - U-strlcpy    4 hand-rolled truncating NUL copies + str_eq/s_streq 3x + str_to_uint dup -> shared string utils.
 MED/LOW:
@@ -34,5 +34,5 @@ MED/LOW:
 - U-dirname    syscall.c dirname split x4 -> route through ext2 path_split (VERIFY the syscall hand-rolls' parent[] cap vs path length).
 
 ## Real drift-bugs to VERIFY then fix (not mere dedup)
-- ext2 has two path walkers; the old one skips permission checks -- CONFIRM it is dead / not reachable on a perm-gated path, else it is an authz bypass.
+- ext2 two path walkers (F174 verified: NOT a bug, NOT a merge). path_to_inode (raw, no perm) is only an internal re-resolver; every userspace path syscall goes through fs_lookup -> ext2_lookup_path(cred) first (checks EXEC on every dir component), and the mutating ops re-check write via ext2_dir_write_ok(parent, cred) on the same inode they modify. open uses ext2_open_ino by the already-resolved inode; ext2_open(raw) only after a perm-aware fs_lookup on the parent. Merging the two would double-check or break path_to_inode's internal callers -> justified separation (DRY is not a religion).
 - tcp_send_rst checksum odd-byte omission (folded into U-checksum).
