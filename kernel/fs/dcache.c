@@ -158,6 +158,17 @@ static dentry_t* dentry_alloc(uint32_t parent_ino, const char* name,
     return d;
 }
 
+// Append an UNLINKED dentry at the LRU tail (mirror of lru_push_head_locked).
+// Caller holds g_dcache_wlock and has verified d is not already on the list.
+// Both put-to-LRU sites (dentry_free_cb, dcache_put) inlined this exact splice.
+static inline void lru_push_tail_locked(dentry_t* d) {
+    d->lru_next = NULL;
+    d->lru_prev = g_dcache_lru_tail;
+    if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d;
+    else                   g_dcache_lru_head = d;
+    g_dcache_lru_tail = d;
+}
+
 // RCU callback: actually free a dentry.  At this point no reader
 // can still be traversing it (grace period elapsed).
 static void dentry_free_cb(void* p) {
@@ -178,11 +189,7 @@ static void dentry_free_cb(void* p) {
             if (d->parent->lru_prev == NULL && d->parent->lru_next == NULL
                 && g_dcache_lru_head != d->parent
                 && g_dcache_lru_tail != d->parent) {
-                d->parent->lru_next = NULL;
-                d->parent->lru_prev = g_dcache_lru_tail;
-                if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d->parent;
-                else                   g_dcache_lru_head = d->parent;
-                g_dcache_lru_tail = d->parent;
+                lru_push_tail_locked(d->parent);
             }
             spin_unlock_irqrestore(&g_dcache_wlock, f);
         }
@@ -293,11 +300,7 @@ void dcache_put(dentry_t* d) {
         // Append to tail — cold.  Hits bump last_used_ns but don't
         // relink (would require the writer lock).  The shrinker
         // picks by last_used_ns among the LRU's candidates.
-        d->lru_next = NULL;
-        d->lru_prev = g_dcache_lru_tail;
-        if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d;
-        else                   g_dcache_lru_head = d;
-        g_dcache_lru_tail = d;
+        lru_push_tail_locked(d);
     }
     spin_unlock_irqrestore(&g_dcache_wlock, f);
 }
