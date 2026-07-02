@@ -1095,16 +1095,8 @@ uint8_t ahci_init(void) {
         //   bits[10:8] = 001 → (1u<<8)
         //   bits[7:0]  = vector
         {
-            uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                                    0x34u) & 0xFCu);
-            uint8_t msix_cap = 0, msi_cap = 0;
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                uint8_t  id = dw & 0xFFu;
-                if (id == 0x11u && !msix_cap) msix_cap = cap;
-                if (id == 0x05u && !msi_cap)  msi_cap  = cap;
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
-            }
+            uint8_t msix_cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
+            uint8_t msi_cap  = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
 
             int irq_armed = 0;
 

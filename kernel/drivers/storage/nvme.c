@@ -604,14 +604,7 @@ uint8_t nvme_write(uint64_t lba, const void* buf, uint32_t nlb) {
 // Returns 0 on failure; on success, `*out_tbl_size` gets the usable
 // entry count (for the caller to cap s_nr_ioq).
 static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
-    uint8_t cap = (uint8_t)(pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn,
-                                              0x34u) & 0xFCu);
-    uint8_t msix_cap = 0;
-    while (cap) {
-        uint32_t dw = pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn, cap);
-        if ((dw & 0xFF) == 0x11u) { msix_cap = cap; break; }
-        cap = (uint8_t)((dw >> 8) & 0xFCu);
-    }
+    uint8_t msix_cap = pci_find_cap(s_pci.bus, s_pci.dev, s_pci.fn, 0x11u);
     if (!msix_cap) {
         kprintf("[nvme] no MSI-X capability\n");
         return 0;

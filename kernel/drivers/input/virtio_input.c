@@ -335,13 +335,7 @@ int virtio_input_init(void) {
 
     // 5. MSI-X: entry 0 → VEC_VIRTIO_INPUT, bound to the event queue.
     {
-        uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dv, 0, 0x34u) & 0xFCu);
-        uint8_t msix_cap = 0;
-        while (cap) {
-            uint32_t dw = pci_cfg_read32(bus, dv, 0, cap);
-            if ((dw & 0xFFu) == 0x11u) { msix_cap = cap; break; }
-            cap = (uint8_t)((dw >> 8) & 0xFCu);
-        }
+        uint8_t msix_cap = pci_find_cap(bus, dv, 0, 0x11u);
         if (!msix_cap) { kprintf("[virtio-input] no MSI-X\n"); return 0; }
 
         uint32_t tbl_dw  = pci_cfg_read32(bus, dv, 0, msix_cap + 4u);

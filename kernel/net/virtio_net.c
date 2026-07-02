@@ -593,43 +593,27 @@ int virtio_net_init(void) {
     //   - Tell virtio which MSI-X vector serves queue 0 (and queue 1)
     //     via queue_select / queue_msix_vector
     {
-        uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                               0x34u) & 0xFCu);
-        uint8_t msix_cap = 0;
-        {
-            uint8_t c = cap;
-            while (c) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, c);
-                if ((dw & 0xFFu) == 0x11u) { msix_cap = c; break; }
-                c = (uint8_t)((dw >> 8) & 0xFCu);
-            }
-        }
+        uint8_t msix_cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
         if (!msix_cap) {
             // Fall back to legacy MSI if MSI-X is absent (very old QEMU).
-            cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                           0x34u) & 0xFCu);
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                if ((dw & 0xFFu) == 0x05u) {
-                    uint32_t mc = dw;
-                    uint64_t msi_addr = lapic_msi_addr();
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 4u,
-                                    (uint32_t)(msi_addr & 0xFFFFFFFFu));
-                    int is_64 = (int)((mc >> 23) & 1u);
-                    if (is_64) {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
-                                        (uint32_t)(msi_addr >> 32));
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 12u,
-                                        lapic_msi_data(VEC_VIRTIO_NET));
-                    } else {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
-                                        lapic_msi_data(VEC_VIRTIO_NET));
-                    }
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                    (mc & ~(0x7u << 20)) | (1u << 16));
-                    break;
+            uint8_t cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+            if (cap) {
+                uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
+                uint64_t msi_addr = lapic_msi_addr();
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 4u,
+                                (uint32_t)(msi_addr & 0xFFFFFFFFu));
+                int is_64 = (int)((mc >> 23) & 1u);
+                if (is_64) {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                    (uint32_t)(msi_addr >> 32));
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 12u,
+                                    lapic_msi_data(VEC_VIRTIO_NET));
+                } else {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                    lapic_msi_data(VEC_VIRTIO_NET));
                 }
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                                (mc & ~(0x7u << 20)) | (1u << 16));
             }
         } else {
             // MSI-X path.
