@@ -5557,12 +5557,19 @@ static uint64_t sys_link(uint64_t old_ptr, uint64_t new_ptr) {
 // The two-way invariant: bit set ⟺ ksec policy entry exists.
 #define S_ISUID_BIT 04000u
 
+// POSIX: a non-root chmod silently clears the setuid bit.  One source of truth
+// for chmod + fchmod so the strip rule cannot drift on a security-sensitive bit
+// (add any future setgid/sticky stripping here and both paths inherit it).
+static inline uint64_t chmod_strip_priv_bits(uint64_t mode) {
+    if (!cred_is_root(&g_current->cred))
+        mode &= ~(uint64_t)S_ISUID_BIT;
+    return mode;
+}
+
 static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
-    // Only root may set the setuid bit (POSIX: non-root chmod silently clears it).
-    if (!cred_is_root(&g_current->cred))
-        mode &= ~(uint64_t)S_ISUID_BIT;
+    mode = chmod_strip_priv_bits(mode);
 
     // TODO: call ext2_chmod(path, mode) when ext2 mode storage is implemented.
     // For now: if setuid bit is being set and caller is root, notify ksec.
@@ -5589,8 +5596,7 @@ static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
 
 static uint64_t sys_fchmod(uint64_t fd, uint64_t mode) {
     if (!g_current) return (uint64_t)-EBADF;
-    if (!cred_is_root(&g_current->cred))
-        mode &= ~(uint64_t)S_ISUID_BIT;
+    mode = chmod_strip_priv_bits(mode);
     (void)fd; (void)mode;
     // TODO: lookup path from fd->path, call ext2_chmod.
     return 0;
