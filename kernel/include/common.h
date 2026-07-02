@@ -156,6 +156,12 @@ static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
 #define PAGE_SHIFT 12  // 12 for 4KB, 21 for 2MB, 30 for 1GB
 #define PAGE_SIZE  (1ULL << PAGE_SHIFT)
 #define PAGE_MASK  (PAGE_SIZE - 1)
+
+// Round a byte address up / down to the nearest PAGE_SIZE boundary.  64-bit,
+// pow2 PAGE_SIZE.  One source of truth for the mm allocators (pmm + kheap each
+// hand-rolled an identical copy).
+static inline uint64_t page_align_up(uint64_t addr)   { return (addr + PAGE_MASK) & ~PAGE_MASK; }
+static inline uint64_t page_align_down(uint64_t addr) { return addr & ~PAGE_MASK; }
 #define VGA_ADDR 0xB8000ULL 
 #define UINT64_MAX ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 #define UINT32_MAX 0xFFFFFFFFU

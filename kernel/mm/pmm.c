@@ -80,13 +80,7 @@ static void** g_slab_heads;      // [frame_index] -> (void*)head_frame_index
 // registered, then read-only — no synchronisation needed.
 static slab_cache_t* g_slab_cache_head = NULL;
 
-static inline uint64_t align_down(uint64_t addr) {
-  return (addr & ~(PAGE_SIZE - 1));
-}
-
-static inline uint64_t align_up(uint64_t addr) {
-  return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-}
+// page_align_up / page_align_down live in common.h (shared with kheap).
 
 static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
   uint8_t* ptr = (uint8_t*)addr;
@@ -215,8 +209,8 @@ mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count) {
   uint64_t hole_idx_largest_base = PMM_INVALID_FRAME;
   uint64_t hole_size_largest = 0; // in frame indices
 
-  uintptr_t kernel_start_idx = align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT;
-  uintptr_t kernel_end_idx = align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT;
+  uintptr_t kernel_start_idx = page_align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT;
+  uintptr_t kernel_end_idx = page_align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT;
 
   for (uint32_t i = 0; i < count; i++) {
     e820_entry_t entry = map[i];
@@ -228,8 +222,8 @@ mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count) {
       g_phys_ceiling = end;
     }
 
-    uint64_t start = align_up(entry.base);
-    end = align_down(entry.base + entry.length);
+    uint64_t start = page_align_up(entry.base);
+    end = page_align_down(entry.base + entry.length);
 
     uint64_t start_idx = start >> PAGE_SHIFT;
     uint64_t end_idx = end >> PAGE_SHIFT;
@@ -345,19 +339,19 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   meta_size_bytes += g_total_frames * sizeof(slab_cache_t*);
   meta_size_bytes += g_total_frames * sizeof(void*);
 
-  uint64_t meta_frames = (align_up(meta_size_bytes) >> PAGE_SHIFT);
+  uint64_t meta_frames = (page_align_up(meta_size_bytes) >> PAGE_SHIFT);
 
   // ensure the chosen hole fits meta_frames
   {
-    uint64_t hole_start = align_up(survey.hole);
+    uint64_t hole_start = page_align_up(survey.hole);
     uint64_t hole_end = hole_start;
     uint64_t hole_size_frames = 0;
 
     for (uint32_t i = 0; i < count; i++) {
       if (map[i].type != 1) continue;
 
-      uint64_t start = align_up(map[i].base);
-      uint64_t end   = align_down(map[i].base + map[i].length);
+      uint64_t start = page_align_up(map[i].base);
+      uint64_t end   = page_align_down(map[i].base + map[i].length);
 
       if (hole_start < start || hole_start >= end) continue;
 
@@ -377,8 +371,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   uint64_t meta_frame_start_idx = (meta_phys >> PAGE_SHIFT);
   uint64_t meta_frame_end_idx   = meta_frame_start_idx + meta_frames;
 
-  uint64_t kernel_start_idx = (align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT);
-  uint64_t kernel_end_idx   = (align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT);
+  uint64_t kernel_start_idx = (page_align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT);
+  uint64_t kernel_end_idx   = (page_align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT);
 
   // carve: [coalesce]... [slab_trackers][slab_heads]
   uint64_t off = 0;
@@ -403,7 +397,7 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   g_slab_heads = (void**)(meta_virt + off);
   off += g_total_frames * sizeof(void*);
 
-  zero(meta_virt, align_up(meta_size_bytes));
+  zero(meta_virt, page_align_up(meta_size_bytes));
 
   // Initialize free lists
   for (uint8_t i = 0; i <= MAX_ORDER; i++) {
@@ -415,8 +409,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   for (uint32_t i = 0; i < count; i++) {
     if (map[i].type != 1) continue;
 
-    uint64_t start = align_up(map[i].base);
-    uint64_t end   = align_down(map[i].base + map[i].length);
+    uint64_t start = page_align_up(map[i].base);
+    uint64_t end   = page_align_down(map[i].base + map[i].length);
 
     if (start >= (g_total_frames << PAGE_SHIFT)) continue;
     if (end   >  (g_total_frames << PAGE_SHIFT)) end = (g_total_frames << PAGE_SHIFT);
@@ -1130,7 +1124,7 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size, uint8_t flags) {
 
   // Pre-compute objects per slab page for slab_pcpu promote/demote.
   // Mirrors the layout pmm_slab_grow_locked uses: header at offset 0,
-  // first slot at align_up(sizeof(header), slot_size), slots packed.
+  // first slot at page_align_up(sizeof(header), slot_size), slots packed.
   size_t   slab_bytes     = (size_t)PAGE_SIZE << cache->slab_order;
   uint64_t first_slot_off = align_up_to((uint64_t)sizeof(slab_header_t),
                                          (uint64_t)slot_size);

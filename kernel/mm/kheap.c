@@ -20,9 +20,7 @@ static const size_t g_kmalloc_sizes[KMALLOC_CACHE_COUNT] = {
     // to satisfy SLAB_MIN_OBJECTS=8, which is wasteful and often fails).
 };
 
-static inline uint64_t align_up(virt_addr_t addr) {
-    return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-}
+// page_align_up lives in common.h (shared with pmm).
 
 static inline size_t pick_cache_idx(size_t size) {
   for (size_t i = 0; i < KMALLOC_CACHE_COUNT; i++) {
@@ -39,7 +37,7 @@ static inline uint8_t size_to_order(size_t size) {
 
 void kheap_init(void) {
   // heap occupies all virtual space after the kernel image
-  g_kheap.base = align_up((virt_addr_t)__kernel_end);
+  g_kheap.base = page_align_up((virt_addr_t)__kernel_end);
   g_kheap.end  = 0xFFFFFFFFFFFFFFFFULL;
   g_kheap.cache_size_max = 2 * PAGE_SIZE;
 
@@ -137,7 +135,7 @@ void kheap_overflow_selftest(void) {
 //LEGACY
 /*
 void kheap_init(void) {
-  g_kheap.base = align_up((virt_addr_t)__kernel_end) + 4 * 1024;
+  g_kheap.base = page_align_up((virt_addr_t)__kernel_end) + 4 * 1024;
   g_kheap.end = g_kheap.base + 128ULL * 1024 * 1024;
 
   uint64_t* metadata = (uint64_t*)g_kheap.base; 
