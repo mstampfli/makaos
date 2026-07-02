@@ -1212,9 +1212,8 @@ enoexec:
 // Pure -> unit-tested (spawn_cred_allowed_selftest).
 static int spawn_cred_allowed(const cred_t* c, uint32_t uid, uint32_t gid) {
     if (cred_is_root(c)) return 1;                       // root: any creds
-    int uid_ok = (uid == c->ruid || uid == c->euid || uid == c->suid);
-    int gid_ok = (gid == c->rgid || gid == c->egid || gid == c->sgid ||
-                  cred_in_group(c, gid));
+    int uid_ok = cred_uid_is_one_of(c, uid);
+    int gid_ok = cred_gid_is_one_of(c, gid) || cred_in_group(c, gid);
     return uid_ok && gid_ok;
 }
 
@@ -4253,8 +4252,8 @@ static uint64_t sys_setreuid(uint64_t ruid, uint64_t euid) {
     // Root may set any combination.
     if (!cred_is_root(c)) {
         // Non-root: new_ruid must be in {ruid, euid}, new_euid must be in {ruid, euid, suid}.
-        int ruid_ok = (new_ruid == c->ruid || new_ruid == c->euid);
-        int euid_ok = (new_euid == c->ruid || new_euid == c->euid || new_euid == c->suid);
+        int ruid_ok = (new_ruid == c->ruid || new_ruid == c->euid);   // setreuid: {real,eff}
+        int euid_ok = cred_uid_is_one_of(c, new_euid);
         if (!ruid_ok || !euid_ok) return (uint64_t)-EPERM;
     }
     // If ruid changed or euid != old ruid, update suid.
@@ -4271,8 +4270,8 @@ static uint64_t sys_setregid(uint64_t rgid, uint64_t egid) {
     uint32_t new_rgid = (rgid == (uint64_t)-1) ? c->rgid : (uint32_t)rgid;
     uint32_t new_egid = (egid == (uint64_t)-1) ? c->egid : (uint32_t)egid;
     if (!cred_is_root(c)) {
-        int rgid_ok = (new_rgid == c->rgid || new_rgid == c->egid);
-        int egid_ok = (new_egid == c->rgid || new_egid == c->egid || new_egid == c->sgid);
+        int rgid_ok = (new_rgid == c->rgid || new_rgid == c->egid);   // setregid: {real,eff}
+        int egid_ok = cred_gid_is_one_of(c, new_egid);
         if (!rgid_ok || !egid_ok) return (uint64_t)-EPERM;
     }
     if (new_rgid != c->rgid || new_egid != c->rgid)
