@@ -419,15 +419,20 @@ int hda_init(void) {
     {
         uint32_t status = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x04u) >> 16;
         if (status & (1u << 4)) {
-            uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x34u) & 0xFCu);
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                uint8_t  id = (uint8_t)(dw & 0xFFu);
-                if (id == 0x05u)       // MSI
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 16));
-                else if (id == 0x11u)  // MSI-X
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 31));
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
+            // pci_find_cap is the bounded (48-hop) capability walk; the old
+            // hand-rolled `while (cap)` here had NO hop cap, so a cyclic
+            // capability chain would spin forever at init.  Disable MSI (0x05)
+            // and MSI-X (0x11) via two bounded lookups; the per-cap disable
+            // write stays.
+            uint8_t msi = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+            if (msi) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msi);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi, dw & ~(1u << 16));
+            }
+            uint8_t msix = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
+            if (msix) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix, dw & ~(1u << 31));
             }
         }
     }
@@ -545,34 +550,30 @@ int hda_init(void) {
     //     MSI bypasses the PIC and IOAPIC entirely.  The HDA controller writes
     //     a LAPIC-format message to memory when a stream completes.
     {
-        uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                               0x34u) & 0xFCu);
-        while (cap) {
-            uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-            if ((dw & 0xFFu) == 0x05u) {  // MSI capability
-                uint32_t mc = dw;
+        // Bounded MSI (0x05) capability lookup (was an unbounded `while (cap)`
+        // search that could spin forever on a cyclic capability chain).
+        uint8_t cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+        if (cap) {
+            uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
 
-                uint64_t msi_addr = lapic_msi_addr();
+            uint64_t msi_addr = lapic_msi_addr();
+            pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                            cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
+
+            int is_64bit = (int)((mc >> 23) & 1u);
+            if (is_64bit) {
                 pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
-
-                int is_64bit = (int)((mc >> 23) & 1u);
-                if (is_64bit) {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, (uint32_t)(msi_addr >> 32));
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 12u, lapic_msi_data(VEC_HDA_MSI));
-                } else {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, lapic_msi_data(VEC_HDA_MSI));
-                }
-
-                // Enable MSI, single message.
-                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                (mc & ~(0x7u << 20)) | (1u << 16));
-                break;
+                                cap + 8u, (uint32_t)(msi_addr >> 32));
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                cap + 12u, lapic_msi_data(VEC_HDA_MSI));
+            } else {
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                cap + 8u, lapic_msi_data(VEC_HDA_MSI));
             }
-            cap = (uint8_t)((dw >> 8) & 0xFCu);
+
+            // Enable MSI, single message.
+            pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                            (mc & ~(0x7u << 20)) | (1u << 16));
         }
 
         g_hda_irq = HDA_IRQ_SLOT;
