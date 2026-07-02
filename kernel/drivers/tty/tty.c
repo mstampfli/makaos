@@ -101,6 +101,15 @@ int tty_set_fg_pgrp(tty_t* tty, uint32_t pg) {
     return 0;
 }
 
+// POSIX job control: caller is a background process for this controlling tty.
+// One source of truth for the SIGTTIN (bg read) and SIGTTOU (bg write, +TOSTOP)
+// gates in tty.c and pty.c.
+int tty_is_background(const tty_t* tty) {
+    return g_current && tty->fg_pgid &&
+           g_current->sid == tty->session &&
+           g_current->pgid != tty->fg_pgid;
+}
+
 // ── Ring-buffer push/pop ──────────────────────────────────────────────────
 // PURE ring ops: the CALLER must hold tty->lock.  The ring is mutated from
 // several CPUs (producer, consumer(s), and tty_flush_input), so every access
@@ -351,9 +360,7 @@ static int64_t tty_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
 
     // POSIX: background process reading from its controlling tty → SIGTTIN.
     // Only applies when this tty is the process's controlling terminal.
-    if (g_current && tty->fg_pgid &&
-        g_current->sid == tty->session &&
-        g_current->pgid != tty->fg_pgid) {
+    if (tty_is_background(tty)) {
         signal_send(g_current, SIGTTIN);
         return -4; // -EINTR
     }
@@ -393,10 +400,7 @@ static int64_t tty_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     const uint8_t* src = (const uint8_t*)buf;
 
     // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
-    if (g_current && tty->fg_pgid &&
-        g_current->sid == tty->session &&
-        g_current->pgid != tty->fg_pgid &&
-        (tty->termios.c_lflag & TOSTOP)) {
+    if (tty_is_background(tty) && (tty->termios.c_lflag & TOSTOP)) {
         signal_send(g_current, SIGTTOU);
         return -4; // -EINTR
     }

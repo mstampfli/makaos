@@ -151,3 +151,9 @@ void tty_get_termios(tty_t* tty, termios_t* dst);
 // Returns 0, or -EPERM if the caller does not own the tty's session or the pgid
 // is not a process group in that session.
 int  tty_set_fg_pgrp(tty_t* tty, uint32_t pg);
+
+// POSIX job control: is the calling process in a BACKGROUND process group of
+// `tty` (its controlling terminal)?  True iff the tty has a foreground pgrp,
+// the caller owns this tty's session, and the caller's pgrp is not that
+// foreground one.  The single predicate behind the SIGTTIN / SIGTTOU checks.
+int  tty_is_background(const tty_t* tty);
