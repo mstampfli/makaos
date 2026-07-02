@@ -282,16 +282,18 @@ int virtfs_lookup(const char* path, const cred_t* cred, uint8_t need,
                 if (path[i] == '/') last_slash = i;
 
             if (last_slash > 0 && last_slash > n) {
-                // Nested path (e.g. /proc/1/fd/3) — resolve parent
+                // Nested path (e.g. /proc/1/fd/3) -- resolve parent via the
+                // shared bounded dirname split.  path_split returns NULL (and we
+                // skip the refinement) if the parent overruns `parent`; the old
+                // hand-rolled copy capped at 255 but wrote the NUL at the
+                // unbounded index last_slash -- an out-of-bounds stack write for
+                // a > 256-byte path.
                 char parent[256];
-                for (int i = 0; i < last_slash && i < 255; i++)
-                    parent[i] = path[i];
-                parent[last_slash] = '\0';
-
                 uint32_t puid, pgid;
                 uint16_t pmode;
                 int ptype;
-                if (virt_resolve(parent, m, &puid, &pgid, &pmode, &ptype) == 0) {
+                if (path_split(path, parent, sizeof(parent)) != NULL &&
+                    virt_resolve(parent, m, &puid, &pgid, &pmode, &ptype) == 0) {
                     acl_entry_t pacl[3];
                     acl_from_mode(pacl, puid, pgid, 0x4000 | pmode);
                     if (acl_check(pacl, 3, cred, ACL_PERM_READ | ACL_PERM_EXEC))

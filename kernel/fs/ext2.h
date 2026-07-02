@@ -169,11 +169,8 @@ int ext2_unlink(const char* path, const void* cred);
 // cred_t*) is checked for write+exec on BOTH resolved parent dirs.
 int ext2_rename(const char* src, const char* dst, const void* cred);
 
-// Split `path` into its parent directory (written to parent_out, a `cap`-byte
-// buffer -- the copy is BOUNDED, returns NULL if the parent does not fit) and
-// the basename (the returned suffix into `path`).  Root/no-slash -> parent "/".
-// Single source of truth for the parent-dir split the path syscalls hand-rolled.
-const char* path_split(const char* path, char* parent_out, uint32_t cap);
+// path_split (bounded parent-dir/basename split) moved to kstr.h -- it is a pure
+// string op shared by every filesystem, not an ext2 entry point.
 
 // Truncate or extend file at `path` to exactly `length` bytes.
 // Returns 1 on success, 0 on failure.

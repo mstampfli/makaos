@@ -2284,36 +2284,9 @@ static uint8_t dir_set_dotdot(uint32_t dir_ino_num, uint32_t new_parent_ino) {
 // in bounds REGARDLESS of buffer size (defense in depth).
 #define EXT2_PATH_MAX 512
 
-// Split `path` into its parent directory (written to parent_out, a `cap`-byte
-// buffer) and basename (the returned suffix).  Returns NULL if the parent does
-// not fit in `cap` bytes -- previously the copy had NO bound, so a path longer
-// than the caller's fixed buffer (reachable via open(O_CREAT) with a ~511-byte
-// path) overran the kernel stack and smashed the saved return address.
-const char* path_split(const char* path, char* parent_out, uint32_t cap) {
-    if (cap < 2) return NULL;            // need room for at least "/" + NUL
-    uint32_t len = str_len(path);
-    // Find last '/'.
-    int last_slash = -1;
-    for (int i = (int)len - 1; i >= 0; i--) {
-        if (path[i] == '/') { last_slash = i; break; }
-    }
-
-    if (last_slash <= 0) {
-        // Parent is "/".
-        parent_out[0] = '/';
-        parent_out[1] = '\0';
-        // Basename starts after '/' at position 0, or at 0 if no slash.
-        return (last_slash == 0) ? path + 1 : path;
-    }
-
-    // Bound the copy: we write parent_out[0..last_slash-1] + a NUL at
-    // [last_slash], so we need last_slash < cap.  Reject (NULL) otherwise;
-    // every caller already treats a NULL return as an error.
-    if ((uint32_t)last_slash >= cap) return NULL;
-    for (int i = 0; i < last_slash; i++) parent_out[i] = path[i];
-    parent_out[last_slash] = '\0';
-    return path + last_slash + 1;
-}
+// path_split (the single bounded dirname primitive) now lives in kstr.h next to
+// str_len/str_eq/str_lcpy so every filesystem shares the one bound (was here,
+// but virtfs hand-rolled its own copy and dropped the terminator bound).
 
 #ifdef MAKAOS_BOOT_SELFTESTS
 // Deterministic test of the physical block-number range checks that stop an
