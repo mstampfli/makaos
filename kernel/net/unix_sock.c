@@ -530,23 +530,16 @@ vfs_file_t* unix_sock_open(int type) {
     s->state = UNIX_STATE_UNCONNECTED;
     s->refcount = 1;   // the owning vfs_file_t holds the first reference
 
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(s); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
 
-    f->read        = unix_vfs_read;
-    f->write       = unix_vfs_write;
-    f->close       = unix_sock_close;
-    f->seek        = NULL;
-    f->poll           = unix_vfs_poll;
-    f->ioctl          = unix_sock_ioctl;
-    f->ctx            = s;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights      = 0xFFFFFFFF;
-    f->path[0]     = '\0';
+    f->read  = unix_vfs_read;
+    f->write = unix_vfs_write;
+    f->close = unix_sock_close;
+    f->poll  = unix_vfs_poll;
+    f->ioctl = unix_sock_ioctl;
+    f->ctx   = s;
+    f->rights = 0xFFFFFFFF;   // non-default: AF_UNIX fd carries all rights
 
     s->file = f;  // back-pointer for poll wakeups
 

@@ -1566,24 +1566,16 @@ static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
     fd->file_size = inode.i_size;
     fd->inode     = inode;
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // kmalloc+zero, waitq wired, refcount=1
     if (!f) { kfree(fd); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
 
-    f->read            = ext2_vfs_read;
-    f->write           = ext2_vfs_write;
-    f->seek            = ext2_vfs_seek;
-    f->pread           = ext2_vfs_pread;
-    f->close           = ext2_vfs_close;
-    f->poll            = NULL;
-    f->ioctl           = NULL;
-    f->ctx             = fd;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags           = 0;
-    f->refcount        = 1;
-    f->rights          = 0;
-    f->ino             = ino;
+    f->read  = ext2_vfs_read;
+    f->write = ext2_vfs_write;
+    f->seek  = ext2_vfs_seek;
+    f->pread = ext2_vfs_pread;
+    f->close = ext2_vfs_close;
+    f->ctx   = fd;
+    f->ino   = ino;
 
     uint32_t pi = 0;
     if (path)

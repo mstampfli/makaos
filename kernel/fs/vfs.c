@@ -26,9 +26,11 @@ uint32_t g_vga_col = 0;
 char g_cwd[256] = "/";
 
 // ── Helper: allocate and initialise a minimal vfs_file_t ─────────────────
-// Sets waitq → &_waitq, secondary_waitq = NULL, refcount = 1, rights = 0.
-// Caller fills in the function pointers and ctx.
-static vfs_file_t* vfs_alloc_file(void) {
+// kmalloc + zero, then wire the embedded waitq (waitq -> &_waitq +
+// wait_queue_init), secondary_waitq = NULL, refcount = 1, rights = 0.  Caller
+// fills in the function pointers, ctx and any per-fd fields.  Exported as the
+// single source of truth for the ~dozen fd sites that hand-rolled this.
+vfs_file_t* vfs_alloc_file(void) {
     vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
     if (!f) return NULL;
     __builtin_memset(f, 0, sizeof(*f));

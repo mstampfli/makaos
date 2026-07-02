@@ -88,6 +88,11 @@ static inline vfs_file_t* vfs_dup(vfs_file_t* f) {
     return f;
 }
 
+// Allocate a zeroed vfs_file_t with the embedded waitq wired (waitq=&_waitq +
+// wait_queue_init), secondary_waitq=NULL, refcount=1, rights=0.  The single
+// source of truth for the standard fd-alloc pattern; caller sets ops/ctx/etc.
+vfs_file_t* vfs_alloc_file(void);
+
 // Atomic tryget — bumps refcount only if it is currently > 0.  Returns
 // `f` on success, NULL if the object is being destroyed (count == 0) or
 // is a static object (also count == 0).  Used by fdget after an RCU

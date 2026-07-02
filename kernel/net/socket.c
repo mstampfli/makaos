@@ -289,27 +289,18 @@ vfs_file_t* socket_open(int domain, int type) {
         s->local_port = lport;
     }
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) {
         if (s->pcb) tcp_pcb_free(s->pcb);
         kfree(s);
         return 0;
     }
-    __builtin_memset(f, 0, sizeof(*f));
-
-    f->read        = sock_read;
-    f->write       = sock_write;
-    f->close       = sock_close;
-    f->seek        = sock_seek;
-    f->poll           = sock_poll;
-    f->ioctl          = NULL;
-    f->ctx            = s;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount       = 1;
-    f->rights         = 0;
-    f->path[0]        = '\0';
+    f->read  = sock_read;
+    f->write = sock_write;
+    f->close = sock_close;
+    f->seek  = sock_seek;
+    f->poll  = sock_poll;
+    f->ctx   = s;
 
     s->file = f;
     if (s->pcb) tcp_pcb_set_file(s->pcb, f);
@@ -408,22 +399,14 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     cs->pcb   = child_pcb;
     cs->bound = 1;
 
-    vfs_file_t* cf = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* cf = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!cf) { kfree(cs); tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
-    __builtin_memset(cf, 0, sizeof(*cf));
-    cf->read        = sock_read;
-    cf->write       = sock_write;
-    cf->close       = sock_close;
-    cf->seek        = sock_seek;
-    cf->poll           = sock_poll;
-    cf->ioctl          = NULL;
-    cf->ctx            = cs;
-    cf->waitq           = &cf->_waitq; wait_queue_init(cf->waitq);
-    cf->secondary_waitq = NULL;
-    cf->flags          = 0;
-    cf->refcount       = 1;
-    cf->rights         = 0;
-    cf->path[0]        = '\0';
+    cf->read  = sock_read;
+    cf->write = sock_write;
+    cf->close = sock_close;
+    cf->seek  = sock_seek;
+    cf->poll  = sock_poll;
+    cf->ctx   = cs;
 
     cs->file = cf;
     tcp_pcb_set_file(child_pcb, cf);
