@@ -1,5 +1,6 @@
 #include "unix_sock.h"
 #include "kheap.h"
+#include "uaccess.h"   // copy_to_user (shared decl)
 #include "errno.h"
 #include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (dgram + accept-backlog queues)
 #include "sched.h"
@@ -491,7 +492,6 @@ void unix_sock_close(vfs_file_t* self) {
 #define UNIX_FIONREAD 0x541b
 
 int64_t unix_sock_ioctl(vfs_file_t* f, uint64_t request, uint64_t arg) {
-    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
     if ((uint32_t)request == UNIX_FIONREAD) {

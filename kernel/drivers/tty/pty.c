@@ -6,6 +6,7 @@
 
 #include "pty.h"
 #include "tty.h"
+#include "uaccess.h"   // copy_from_user / copy_to_user (shared decls)
 #include "vfs.h"
 #include "errno.h"
 #include "kheap.h"
@@ -453,8 +454,6 @@ static void pty_slave_close(vfs_file_t* self) {
 // ioctl `arg` is a raw user pointer; reading/writing it directly (as the old
 // code did) was an arbitrary kernel read/write from any process that can open
 // /dev/ptmx or /dev/pts/N.  Route every get/set through these.
-extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
-extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 // Shared termios/winsize/pgrp ioctls.  Master and slave both act on the SAME
 // slave tty, so the get/set logic is identical -- one source of truth here

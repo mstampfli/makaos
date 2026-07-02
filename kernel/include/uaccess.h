@@ -32,3 +32,16 @@ static inline int _access_ok(uint64_t addr, uint64_t len) {
     }
     return 1;
 }
+
+// ── Safe user<->kernel copies (defined in kernel/syscall/syscall.c) ─────────
+// Each validates the user pointer via _access_ok + prefaults, so a kernel,
+// non-canonical, overflowing or unmapped pointer is rejected (return -EFAULT)
+// instead of faulting the kernel on a raw __builtin_memcpy.  Return 0 on
+// success, -EFAULT otherwise.  These prototypes were re-declared by hand in
+// ~8 drivers/subsystems; this is the single source of truth.
+int copy_from_user(void* dst, const void* src_u, uint64_t len);
+int copy_to_user(void* dst_u, const void* src, uint64_t len);
+
+// Validate a user buffer the kernel will dereference DIRECTLY (range-check +
+// prefault); returns 0 / -EFAULT.  Used by the io_uring and socket paths.
+int user_buf_check(uint64_t addr, uint64_t len);

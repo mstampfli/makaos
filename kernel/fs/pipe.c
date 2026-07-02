@@ -1,5 +1,6 @@
 #include "pipe.h"
 #include "kheap.h"
+#include "uaccess.h"   // copy_to_user (shared decl)
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
@@ -257,7 +258,6 @@ static int pipe_write_poll(vfs_file_t* self, int events) {
 // pipe is not a terminal — this also makes isatty() correctly return false).
 #define PIPE_FIONREAD 0x541b
 static int64_t pipe_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
-    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
     if ((uint32_t)request == PIPE_FIONREAD) {
         pipe_buf_t* p = (pipe_buf_t*)self->ctx;
         int navail = p ? (int)p->count : 0;

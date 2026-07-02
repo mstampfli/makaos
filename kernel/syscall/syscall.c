@@ -102,18 +102,11 @@ extern volatile uint16_t* g_vga;
 #define g_exec_pml4           (this_cpu()->exec_pml4)
 #define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
-// _access_ok is the shared user-range validator in uaccess.h (included above).
-// Safe user<->kernel copies (validate + prefault, return 0 / -EFAULT).
-// Declared here so every syscall above their definition can use them
-// instead of a raw __builtin_memcpy on an unvalidated user pointer.
-int copy_to_user(void* dst_u, const void* src, uint64_t len);
-int copy_from_user(void* dst, const void* src_u, uint64_t len);
-// Validate a user buffer the kernel will deref DIRECTLY (range-check rejects the
-// arbitrary-kernel-R/W LPE, then prefault rejects unmapped pointers).  Returns
-// 0 / -EFAULT.  Used by the socket recv/send/accept/connect/bind handlers, whose
-// data + sockaddr pointers were deref'd raw (defined near user_buf_prefault).
-int user_buf_check(uint64_t addr, uint64_t len);
-// Like user_buf_check but does NOT prefault (map+zero) absent pages -- it only
+// _access_ok, copy_from_user, copy_to_user and user_buf_check are all declared
+// in uaccess.h (included above) -- the single source of truth for the user-copy
+// family (defined below in this file).
+// user_buf_readable_ok is a syscall.c-local variant: like user_buf_check but
+// does NOT prefault (map+zero) absent pages -- it only
 // requires every page to have a VMA, so the caller's raw read demand-faults the
 // real content.  For READ-from-user direct-deref paths whose source may be
 // file-backed (write(2)'s data buffer), where prefault would zero-fill it.
@@ -689,7 +682,6 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // point touches user memory of the dying task.  Also called from the
 // signal-terminate path (kernel/proc/signal.c) for killed threads.
 void task_notify_cleartid(void) {
-    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
     if (!g_current || !g_current->cleartid_addr) return;
     uint64_t addr = g_current->cleartid_addr;
     g_current->cleartid_addr = 0;
@@ -1862,9 +1854,7 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     return (uint64_t)count;
 }
 
-// Forward declarations for copy helpers (defined later in this file).
-int copy_to_user(void* dst_u, const void* src, uint64_t len);
-int copy_from_user(void* dst, const void* src_u, uint64_t len);
+// copy_to_user / copy_from_user are declared in uaccess.h (defined below).
 
 // ── sys_stat ──────────────────────────────────────────────────────────────
 // stat(path_ptr, pathlen, stat_ptr) → 0 or -errno

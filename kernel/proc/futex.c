@@ -17,13 +17,13 @@
 
 #include "futex.h"
 #include "process.h"
+#include "uaccess.h"   // copy_from_user (shared decl)
 #include "sched.h"
 #include "signal.h"
 #include "cpu.h"
 #include "errno.h"
 
 extern uint64_t tsc_read_ns(void);
-extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 #define FUTEX_BUCKETS 256
 

@@ -13,6 +13,7 @@
 #include "input_core.h"
 #include "kheap.h"
 #include "kstr.h"    // str_lcpy (shared truncating copy for the device name)
+#include "uaccess.h" // copy_from_user / copy_to_user (shared decls)
 #include "sched.h"
 #include "process.h"
 #include "signal.h"
@@ -364,12 +365,10 @@ static void evdev_vfs_close(vfs_file_t* self) {
 
 static int copy_to_user_n(void* dst, const void* src, uint32_t n) {
     // copy_to_user is declared elsewhere; kernel linkage.
-    extern int copy_to_user(void* dst, const void* src, uint64_t n);
     return copy_to_user(dst, src, n);
 }
 
 static int copy_from_user_n(void* dst, const void* src, uint32_t n) {
-    extern int copy_from_user(void* dst, const void* src, uint64_t n);
     return copy_from_user(dst, src, n);
 }
 

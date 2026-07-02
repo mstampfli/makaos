@@ -17,6 +17,7 @@
 
 #include "io_uring.h"
 #include "pmm.h"
+#include "uaccess.h"   // copy_from_user / user_buf_check (shared decls)
 #include "vmm.h"
 #include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (intrusive CQ-overflow queue)
 #include "mm.h"
@@ -477,7 +478,6 @@ extern uint64_t sys_close(uint64_t fd);
 // canonical fdget (bumps refcount), stores in the ring's array.
 // Unregister vfs_closes each and frees the array.
 
-extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 int io_uring_register_impl(io_uring_t* uring, uint32_t op,
                             uint64_t arg_uptr, uint32_t nr_args) {
@@ -969,7 +969,6 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
             // sqe->addr/len are user-controlled (read straight from the SQE
             // ring); vfs_read writes DIRECTLY into this buffer, so a kernel
             // address here would be an arbitrary kernel write.  Validate it.
-            extern int user_buf_check(uint64_t addr, uint64_t len);
             if (user_buf_check(sqe->addr, sqe->len) != 0) {
                 uring_fdput(f); res = -EFAULT; break;
             }
@@ -989,7 +988,6 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
             if (!f) { res = -EBADF; break; }
             // Validate the user-controlled source buffer; vfs_write reads it
             // directly, so a kernel address here is an arbitrary kernel read.
-            extern int user_buf_check(uint64_t addr, uint64_t len);
             if (user_buf_check(sqe->addr, sqe->len) != 0) {
                 uring_fdput(f); res = -EFAULT; break;
             }
