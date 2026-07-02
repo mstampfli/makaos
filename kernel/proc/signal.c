@@ -5,6 +5,7 @@
 #include "common.h"
 #include "fb.h"
 #include "errno.h"   // ESRCH (signal_send_pid)
+#include "uaccess.h" // _access_ok: shared user-range validator (was sig_user_range_ok)
 
 // ── Saved user context access ────────────────────────────────────────────
 // The authoritative copy of a syscall's saved user registers lives on
@@ -205,22 +206,12 @@ void signal_send_pid_selftest(void) {
 // dump in serial.txt: bash at 0x47b27f (set_signal_handler, right
 // after the sigaction syscall), RIP=0 ifetch fault, every gpr zero
 // except RCX which holds the post-syscall instruction pointer.
-// Boundary check: `addr` must be a canonical user address AND the
-// `len`-byte range starting there must stay in the low canonical half
-// [0, 2^47).  The non-canonical gap between 2^47 and HHDM_OFFSET
-// (0xFFFF800000000000) must also be rejected -- any address there
-// #GPs the moment the CPU tries to ring-transition back to it via
-// iretq.  Using HHDM_OFFSET as the ceiling here would silently let
-// non-canonical pointers through and is the bug that produced the
-// Ctrl+C iretq #GP on makaterm.  USER_ADDR_CEIL == 2^47 is in common.h.
-
-static inline int sig_user_range_ok(uint64_t addr, uint64_t len) {
-    if (!addr) return 0;
-    if (addr >= USER_ADDR_CEIL) return 0;
-    if (addr + len < addr) return 0;               // wrap
-    if (addr + len > USER_ADDR_CEIL) return 0;
-    return 1;
-}
+// The sigframe window must stay in the low canonical user half [0, 2^47):
+// the non-canonical gap up to HHDM_OFFSET must be rejected too, else writing
+// there #GPs the kernel at the iretq ring-transition (the Ctrl+C makaterm
+// crash).  That is exactly _access_ok (uaccess.h) -- was a local
+// sig_user_range_ok that hand-reimplemented it; consolidated so the signal
+// path can never drift weaker than the syscall path.
 
 static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     // Per-task saved user context — survives mid-syscall CPU migration.
@@ -236,7 +227,7 @@ static void signal_setup_frame(int sig, k_sigaction_t* ka, uint64_t saved_rax) {
     // the user half.  If user_rsp is garbage (e.g. a buggy handler
     // clobbered it before raising another signal), writing the sigframe
     // would clobber kernel memory.  Kill the task with SIGSEGV instead.
-    if (!sig_user_range_ok(frame_base - 8, sizeof(sigframe_t) + 8)) {
+    if (!_access_ok(frame_base - 8, sizeof(sigframe_t) + 8)) {
         // Force-queue SIGKILL for the next delivery cycle.  We can't
         // kill the task inline from here — the terminate block below
         // is the only safe place (drops fds, reparents children,

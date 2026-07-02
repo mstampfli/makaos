@@ -5,6 +5,7 @@
 #include "pipe.h"
 #include "common.h"
 #include "checked.h"   // ckd_add_u64: overflow-safe add for the user-range guards
+#include "uaccess.h"   // _access_ok: the shared user (addr,len) range validator
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
@@ -100,8 +101,7 @@ extern volatile uint16_t* g_vga;
 #define g_exec_pml4           (this_cpu()->exec_pml4)
 #define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
-// Forward declaration — defined near copy_from/to_user below.
-static inline int _access_ok(uint64_t addr, uint64_t len);
+// _access_ok is the shared user-range validator in uaccess.h (included above).
 // Safe user<->kernel copies (validate + prefault, return 0 / -EFAULT).
 // Declared here so every syscall above their definition can use them
 // instead of a raw __builtin_memcpy on an unvalidated user pointer.
@@ -3595,25 +3595,9 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
     return ret;
 }
 
-// Top of the canonical low (user) half.  User pointers may ONLY live here.
-// Checking against HHDM_OFFSET alone let non-canonical addresses through —
-// anything in the 0x0000_8000_.. .. 0xffff_7fff_.. gap is < HHDM_OFFSET, so
-// e.g. a scribbled 0x0053004300530000 passed _access_ok and the subsequent
-// memcpy #GP'd the kernel (writing a non-canonical address faults) instead
-// of cleanly returning -EFAULT.  An untrusted user pointer must never crash
-// the kernel: reject everything above the user ceiling (kernel AND the
-// non-canonical gap).  USER_ADDR_MAX / USER_ADDR_CEIL live in common.h.
-// PRIMITIVE (user (addr,len) range validation, category B -> ckd_add_u64 wrap guard).
-static inline int _access_ok(uint64_t addr, uint64_t len) {
-    if (!addr) return 0;
-    if (addr > USER_ADDR_MAX) return 0;                      // kernel or non-canonical
-    if (len) {
-        uint64_t end;
-        if (!ckd_add_u64(addr, len, &end)) return 0;         // addr+len wraps u64
-        if (end - 1 > USER_ADDR_MAX) return 0;               // end past user ceiling
-    }
-    return 1;
-}
+// _access_ok (the user (addr,len) range validator) now lives in uaccess.h --
+// one source of truth shared with the signal path; see the header for the
+// non-canonical-gap rationale.
 
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
 // Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
