@@ -1,4 +1,5 @@
 #include "pmm.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "common.h"
 #include "smp.h"
 #include "rcu.h"      // Phase 5B: call_rcu for SLAB_TYPESAFE_BY_RCU

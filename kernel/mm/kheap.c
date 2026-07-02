@@ -120,14 +120,14 @@ void kheap_overflow_selftest(void) {
             kprintf("[kheap_test]   req=%lu: pre-fix(size+8) usable=%lu < req (was a bug); now usable=%lu\n",
                     (unsigned long)req, (unsigned long)old_usable, (unsigned long)usable);
         if (usable < req) {
-            kprintf("[kheap_test] FAIL req=%lu order=%u usable=%lu < req\n",
+            kprintf_atomic("[kheap_test] FAIL req=%lu order=%u usable=%lu < req\n",
                     (unsigned long)req, order, (unsigned long)usable);
             failed = 1;
         }
         for (size_t j = 0; j < req; j++) p[j] = (uint8_t)0xA5;  // exercise the full write
         kfree(p);
     }
-    kprintf(failed ? "[kheap_test] SELF-TEST FAILED (usable < requested)\n"
+    kprintf_atomic(failed ? "[kheap_test] SELF-TEST FAILED (usable < requested)\n"
                    : "[kheap_test] SELF-TEST PASSED (big-alloc usable >= requested)\n");
 }
 #endif

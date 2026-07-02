@@ -1,4 +1,5 @@
 #include "ksec.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "sched.h"
 #include "process.h"
 #include "kheap.h"
@@ -240,11 +241,11 @@ void ksec_exec_setuid_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         int got = ksec_exec_setuid_should_apply(c[i].su, c[i].agent, c[i].rc, c[i].v);
         if (got != c[i].want) {
-            kprintf("[ksec_setuid] FAIL i=%u got=%d want=%d\n", i, got, c[i].want);
+            kprintf_atomic("[ksec_setuid] FAIL i=%u got=%d want=%d\n", i, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ksec_setuid] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ksec_setuid] SELF-TEST FAILED\n"
                   : "[ksec_setuid] SELF-TEST PASSED (setuid-exec escalation fails closed)\n");
 }
 
@@ -276,7 +277,7 @@ void ksec_slot_selftest(void) {
     if (ksec_slot_find(20) != (ksec_slot_t*)0) fails++;
     a->seq = 0; c->seq = 0;   // clean the table back to all-free
     spin_unlock(&s_ksec_lock);
-    kprintf(fails ? "[ksec_slot] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ksec_slot] SELF-TEST FAILED\n"
                   : "[ksec_slot] SELF-TEST PASSED (per-seq slot claim/find/free)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */

@@ -599,9 +599,9 @@ static void init_kthread(void) {
         for (int i = 0; i < 8; i++) {
             got[i] = pmm_buddy_alloc(10);
             kprintf("[pmm10-test] alloc %d = 0x%lx\n", i, (unsigned long)got[i]);
-            if (!got[i]) { kprintf("[pmm10-test] FAIL: OOM at %d\n", i); break; }
+            if (!got[i]) { kprintf_atomic("[pmm10-test] FAIL: OOM at %d\n", i); break; }
             for (int j = 0; j < i; j++)
-                if (got[j] == got[i]) { dup = 1; kprintf("[pmm10-test] FAIL: dup alloc[%d]==alloc[%d]==0x%lx\n", j, i, (unsigned long)got[i]); }
+                if (got[j] == got[i]) { dup = 1; kprintf_atomic("[pmm10-test] FAIL: dup alloc[%d]==alloc[%d]==0x%lx\n", j, i, (unsigned long)got[i]); }
         }
         for (int i = 0; i < 8; i++) if (got[i]) pmm_buddy_free(got[i], 10);
         kprintf("[pmm10-test] %s\n", dup ? "FAILED" : "PASSED (all 8 order=10 allocs distinct)");

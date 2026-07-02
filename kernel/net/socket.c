@@ -1,4 +1,5 @@
 #include "socket.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "tcp.h"
 #include "udp.h"
 #include "net.h"
@@ -732,7 +733,7 @@ void sock_file_lifetime_selftest(void) {
     extern void kprintf(const char*, ...);
     int fails = 0;
     vfs_file_t* f = socket_open(AF_INET, SOCK_DGRAM);
-    if (!f) { kprintf("[sock_file_life] FAIL open\n"); return; }
+    if (!f) { kprintf_atomic("[sock_file_life] FAIL open\n"); return; }
     socket_t* s = (socket_t*)f->ctx;
     if (!s) {
         fails++;
@@ -745,9 +746,9 @@ void sock_file_lifetime_selftest(void) {
     // reader stays safe.  Must not crash / double-free.
     f->close(f);
     if (fails)
-        kprintf("[sock_file_life] SELF-TEST FAILED (%d)\n", fails);
+        kprintf_atomic("[sock_file_life] SELF-TEST FAILED (%d)\n", fails);
     else
-        kprintf("[sock_file_life] PASS (s->file backptr consistent, RCU-deferred free)\n");
+        kprintf_atomic("[sock_file_life] PASS (s->file backptr consistent, RCU-deferred free)\n");
 }
 
 // Guard for the F132 fix: socket_bind on a TCP socket must NOT free + realloc
@@ -762,7 +763,7 @@ void socket_bind_rebind_selftest(void) {
     // (1) Fresh CLOSED socket: bind rebinds the ephemeral pcb in place -- the
     // pcb pointer must NOT change (the old free+realloc changed it).
     vfs_file_t* f1 = socket_open(AF_INET, SOCK_STREAM);
-    if (!f1) { kprintf("[sock_bind] FAILED: open1\n"); return; }
+    if (!f1) { kprintf_atomic("[sock_bind] FAILED: open1\n"); return; }
     socket_t* s1 = (socket_t*)f1->ctx;
     struct tcp_pcb* pcb1 = s1->pcb;
     if (!pcb1)                        fails++;
@@ -774,7 +775,7 @@ void socket_bind_rebind_selftest(void) {
     // (2) A LISTENing socket (s->bound still 0, so the s->bound check does not
     // cover it): bind must be rejected with -EINVAL and leave the pcb untouched.
     vfs_file_t* f2 = socket_open(AF_INET, SOCK_STREAM);
-    if (!f2) { kprintf("[sock_bind] FAILED: open2\n"); return; }
+    if (!f2) { kprintf_atomic("[sock_bind] FAILED: open2\n"); return; }
     socket_t* s2 = (socket_t*)f2->ctx;
     socket_listen(f2);
     struct tcp_pcb* pcb2 = s2->pcb;
@@ -782,6 +783,6 @@ void socket_bind_rebind_selftest(void) {
     if (s2->pcb != pcb2)                   fails++;    // pcb unchanged (never freed)
     f2->close(f2);
 
-    kprintf(fails ? "[sock_bind] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[sock_bind] SELF-TEST FAILED\n"
                   : "[sock_bind] SELF-TEST PASSED (rebind in place; non-CLOSED bind rejected, pcb kept)\n");
 }

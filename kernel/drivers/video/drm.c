@@ -2677,12 +2677,12 @@ void drm_dumb_size_selftest(void) {
         int ok = (r == c[i].eret) &&
                  (r != 0 || (pitch == c[i].epitch && size == c[i].esize));
         if (!ok) {
-            kprintf("[drm_dumb] FAIL i=%u r=%d pitch=%lu size=%lu\n",
+            kprintf_atomic("[drm_dumb] FAIL i=%u r=%d pitch=%lu size=%lu\n",
                     i, r, (unsigned long)pitch, (unsigned long)size);
             fails++;
         }
     }
-    kprintf(fails ? "[drm_dumb] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[drm_dumb] SELF-TEST FAILED\n"
                   : "[drm_dumb] SELF-TEST PASSED (overflow-safe dumb size)\n");
 }
 
@@ -2713,12 +2713,12 @@ void drm_cursor_bytes_selftest(void) {
         bool ok = drm_cursor_bytes(c[i].w, c[i].h, c[i].backing, &b);
         int good = (ok == c[i].eok) && (!ok || b == c[i].ebytes);
         if (!good) {
-            kprintf("[drm_cursor] FAIL i=%u ok=%d bytes=%lu\n",
+            kprintf_atomic("[drm_cursor] FAIL i=%u ok=%d bytes=%lu\n",
                     i, (int)ok, (unsigned long)b);
             fails++;
         }
     }
-    kprintf(fails ? "[drm_cursor] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[drm_cursor] SELF-TEST FAILED\n"
                   : "[drm_cursor] SELF-TEST PASSED (overflow-safe cursor backing-size)\n");
 }
 
@@ -2739,11 +2739,11 @@ void drm_atomic_count_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         int got = drm_atomic_count_ok(c[i].count);
         if (got != c[i].want) {
-            kprintf("[drm_atomic] FAIL count=%u got=%d want=%d\n",
+            kprintf_atomic("[drm_atomic] FAIL count=%u got=%d want=%d\n",
                     c[i].count, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[drm_atomic] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[drm_atomic] SELF-TEST FAILED\n"
                   : "[drm_atomic] SELF-TEST PASSED (per-object prop count bounded)\n");
 }

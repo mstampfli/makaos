@@ -1,4 +1,5 @@
 #include "pipe.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "kheap.h"
 #include "uaccess.h"   // copy_to_user (shared decl)
 #include "sched.h"
@@ -319,20 +320,20 @@ void pipe_refcount_selftest(void) {
 
     int r1 = pipe_last_end_release(&oe);      // first close: 2 -> 1, NOT last
     if (r1 != 0 || oe != 1) {
-        kprintf("[pipe_refcount] FAIL first r=%d oe=%lu\n", r1, (unsigned long)oe);
+        kprintf_atomic("[pipe_refcount] FAIL first r=%d oe=%lu\n", r1, (unsigned long)oe);
         fails++;
     }
     int r2 = pipe_last_end_release(&oe);      // second close: 1 -> 0, IS last
     if (r2 != 1 || oe != 0) {
-        kprintf("[pipe_refcount] FAIL second r=%d oe=%lu\n", r2, (unsigned long)oe);
+        kprintf_atomic("[pipe_refcount] FAIL second r=%d oe=%lu\n", r2, (unsigned long)oe);
         fails++;
     }
     // Exactly one of the two returned "last" (r2 only) -> exactly one free.
     if (r1 + r2 != 1) {
-        kprintf("[pipe_refcount] FAIL not-exactly-one-last r1=%d r2=%d\n", r1, r2);
+        kprintf_atomic("[pipe_refcount] FAIL not-exactly-one-last r1=%d r2=%d\n", r1, r2);
         fails++;
     }
-    kprintf(fails ? "[pipe_refcount] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[pipe_refcount] SELF-TEST FAILED\n"
                   : "[pipe_refcount] SELF-TEST PASSED (single last-end release, no double free)\n");
 }
 
@@ -404,13 +405,13 @@ void pipe_race_selftest(void) {
     __atomic_store_n(&s_pr_read_total, 0u, __ATOMIC_RELEASE);
 
     if (pipe_create(&s_pr_r, &s_pr_w) != 0) {
-        kprintf("[pipe_race] FAIL pipe_create\n");
+        kprintf_atomic("[pipe_race] FAIL pipe_create\n");
         return;
     }
 
     task_t* wt = task_create_kthread(pr_writer_thread, pid_alloc());
     task_t* rt = task_create_kthread(pr_reader_thread, pid_alloc());
-    if (!wt || !rt) { kprintf("[pipe_race] FAIL spawn kthreads\n"); return; }
+    if (!wt || !rt) { kprintf_atomic("[pipe_race] FAIL spawn kthreads\n"); return; }
     sched_add(wt);
     sched_add(rt);
 
@@ -420,10 +421,10 @@ void pipe_race_selftest(void) {
     uint32_t fail = __atomic_load_n(&s_pr_fail, __ATOMIC_ACQUIRE);
     uint32_t got  = __atomic_load_n(&s_pr_read_total, __ATOMIC_ACQUIRE);
     if (!fail && got == PR_TOTAL) {
-        kprintf("[pipe_race] SELF-TEST PASSED (in-order, no lost/torn bytes, %u/%u)\n",
+        kprintf_atomic("[pipe_race] SELF-TEST PASSED (in-order, no lost/torn bytes, %u/%u)\n",
                 got, PR_TOTAL);
     } else {
-        kprintf("[pipe_race] SELF-TEST FAILED (fail=%u got=%u want=%u)\n",
+        kprintf_atomic("[pipe_race] SELF-TEST FAILED (fail=%u got=%u want=%u)\n",
                 fail, got, PR_TOTAL);
         for (;;) __asm__ volatile("cli; hlt");
     }

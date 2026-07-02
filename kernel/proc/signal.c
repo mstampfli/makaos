@@ -1,4 +1,5 @@
 #include "signal.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "process.h"
 #include "sched.h"
 #include "cpu.h"
@@ -167,7 +168,7 @@ void signal_perm_selftest(void) {
     if (!signal_may(&alice, &alice2)) f++;   // same uid
     if ( signal_may(&alice, &bob))    f++;   // cross uid -> denied
     if ( signal_may(&alice, &root))   f++;   // non-root cannot signal root
-    kprintf(f ? "[signal_perm] SELF-TEST FAILED\n"
+    kprintf_atomic(f ? "[signal_perm] SELF-TEST FAILED\n"
               : "[signal_perm] SELF-TEST PASSED (kill authz: root-any/self/same-uid; cross-uid denied)\n");
 }
 

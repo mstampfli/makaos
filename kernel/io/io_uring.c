@@ -16,6 +16,7 @@
 // (rounded up to order-3 buddy block = 8 pages).
 
 #include "io_uring.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pmm.h"
 #include "uaccess.h"   // copy_from_user / user_buf_check (shared decls)
 #include "vmm.h"
@@ -1240,12 +1241,12 @@ void io_uring_index_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         uint32_t got = io_ring_index(c[i].raw, c[i].entries);
         if (got != c[i].want || got >= c[i].entries) {
-            kprintf("[io_ring_idx] FAIL raw=0x%lx entries=%u got=%u want=%u\n",
+            kprintf_atomic("[io_ring_idx] FAIL raw=0x%lx entries=%u got=%u want=%u\n",
                     (unsigned long)c[i].raw, c[i].entries, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[io_ring_idx] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[io_ring_idx] SELF-TEST FAILED\n"
                   : "[io_ring_idx] SELF-TEST PASSED (trusted ring index, no user-mask OOB)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */

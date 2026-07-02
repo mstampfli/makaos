@@ -1,4 +1,5 @@
 #include "tss.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "vmm.h"
 #include "pmm.h"
 #include "cpu.h"     // g_cpus[], this_cpu(), cpu_id()

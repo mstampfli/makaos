@@ -49,14 +49,14 @@ void dcache_selftest(void) {
     dentry_t* neg = dcache_install(NULL, 2, name, nlen, nhash,
                                      DCACHE_NEGATIVE);
     if (!neg) {
-        kprintf("[dcache_test] FAILED: install negative returned NULL\n");
+        kprintf_atomic("[dcache_test] FAILED: install negative returned NULL\n");
         return;
     }
     dcache_put(neg);
 
     dentry_t* hit = dcache_lookup(2, name, nlen, nhash);
     if (!hit || hit->child_ino != DCACHE_NEGATIVE) {
-        kprintf("[dcache_test] FAILED: negative dentry not cached\n");
+        kprintf_atomic("[dcache_test] FAILED: negative dentry not cached\n");
         if (hit) dcache_put(hit);
         return;
     }
@@ -65,7 +65,7 @@ void dcache_selftest(void) {
     dcache_invalidate(2, name, nlen);
     dentry_t* post = dcache_lookup(2, name, nlen, nhash);
     if (post) {
-        kprintf("[dcache_test] FAILED: invalidate didn't remove dentry\n");
+        kprintf_atomic("[dcache_test] FAILED: invalidate didn't remove dentry\n");
         dcache_put(post);
         return;
     }
@@ -123,11 +123,11 @@ void dcache_selftest(void) {
     // making strict speedup thresholds flaky.  When CSPRNG or other
     // kthreads preempt, warm can even exceed cold.
     if (hit_bp < 8000) {
-        kprintf("[dcache_test] FAILED: hit rate %lu/10000 < 8000\n",
+        kprintf_atomic("[dcache_test] FAILED: hit rate %lu/10000 < 8000\n",
                 (uint64_t)hit_bp);
         return;
     }
-    kprintf("[dcache_test] SELF-TEST PASSED\n");
+    kprintf_atomic("[dcache_test] SELF-TEST PASSED\n");
 }
 
 // ── Audit T1: dcache resurrect-from-zero race regression test ───────────
@@ -217,9 +217,9 @@ void dcache_race_selftest(void) {
     dcache_shrink(0xFFFFFFFFu);   // final reclaim — must not fault on a freed slot
     kprintf("[dcache_race] child_ino corruptions observed: %u\n", corrupt);
     if (corrupt == 0) {
-        kprintf("[dcache_race] SELF-TEST PASSED (no resurrect-from-zero reuse)\n");
+        kprintf_atomic("[dcache_race] SELF-TEST PASSED (no resurrect-from-zero reuse)\n");
     } else {
-        kprintf("[dcache_race] SELF-TEST FAILED (%u corruptions)\n", corrupt);
+        kprintf_atomic("[dcache_race] SELF-TEST FAILED (%u corruptions)\n", corrupt);
         for (;;) __asm__ volatile("cli; hlt");
     }
 }
@@ -241,7 +241,7 @@ void dcache_held_invalidate_selftest(void) {
     int fails = 0;
 
     dentry_t* d = dcache_install(NULL, pino, name, nlen, nhash, cino);
-    if (!d) { kprintf("[dcache_held] FAILED: install returned NULL\n"); return; }
+    if (!d) { kprintf_atomic("[dcache_held] FAILED: install returned NULL\n"); return; }
     // A path walk holds a SECOND reference (refcount now 2).
     dentry_t* held = dcache_lookup(pino, name, nlen, nhash);
     if (held != d) fails++;
@@ -257,6 +257,6 @@ void dcache_held_invalidate_selftest(void) {
     dcache_put(held);
     dcache_put(d);
 
-    kprintf(fails ? "[dcache_held] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[dcache_held] SELF-TEST FAILED\n"
                   : "[dcache_held] SELF-TEST PASSED (held dentry survives invalidate, hash-unlinked)\n");
 }

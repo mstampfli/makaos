@@ -909,12 +909,12 @@ void nvme_cid_valid_selftest(void) {
     int fails = 0;
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         if (nvme_cid_valid(c[i].cid) != c[i].want) {
-            kprintf("[nvme_cid] FAIL cid=%u got=%d want=%d\n",
+            kprintf_atomic("[nvme_cid] FAIL cid=%u got=%d want=%d\n",
                     (unsigned)c[i].cid, nvme_cid_valid(c[i].cid), c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[nvme_cid] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[nvme_cid] SELF-TEST FAILED\n"
                   : "[nvme_cid] SELF-TEST PASSED (device completion-id bounds)\n");
 }
 
@@ -943,11 +943,11 @@ void nvme_lba_size_ok_selftest(void) {
         uint32_t sz = 0xDEADu;
         bool ok = nvme_lba_size_ok(c[i].lbads, &sz);
         if (ok != c[i].eok || (ok && sz != c[i].esize)) {
-            kprintf("[nvme_lbads] FAIL lbads=%u ok=%d sz=%u\n",
+            kprintf_atomic("[nvme_lbads] FAIL lbads=%u ok=%d sz=%u\n",
                     c[i].lbads, (int)ok, sz);
             fails++;
         }
     }
-    kprintf(fails ? "[nvme_lbads] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[nvme_lbads] SELF-TEST FAILED\n"
                   : "[nvme_lbads] SELF-TEST PASSED (valid 512..4096 LBA size, no UB shift)\n");
 }

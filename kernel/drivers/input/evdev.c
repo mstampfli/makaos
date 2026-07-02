@@ -10,6 +10,7 @@
 // Upstream libinput / libevdev / xf86-input-evdev work unmodified.
 
 #include "evdev.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "input_core.h"
 #include "kheap.h"
 #include "kstr.h"    // str_lcpy (shared truncating copy for the device name)
@@ -613,7 +614,7 @@ void evdev_ring_selftest(void) {
     if (!d || !c) {
         if (d) kfree(d);
         if (c) kfree(c);
-        kprintf("[evdev_ring] SELF-TEST FAILED (alloc)\n");
+        kprintf_atomic("[evdev_ring] SELF-TEST FAILED (alloc)\n");
         return;
     }
     __builtin_memset(d, 0, sizeof(*d));
@@ -639,7 +640,7 @@ void evdev_ring_selftest(void) {
         evs[0].type != EV_KEY || evs[0].code != KEY_A || evs[0].value != 1 ||
         evs[1].value != 0 || evs[2].code != KEY_B) {
         fails++;
-        kprintf("[evdev_ring] FAIL roundtrip got=%d\n", got);
+        kprintf_atomic("[evdev_ring] FAIL roundtrip got=%d\n", got);
     }
 
     // Lifetime: unlink + free under the lock (mirror evdev_vfs_close); proves no
@@ -650,11 +651,11 @@ void evdev_ring_selftest(void) {
     spin_unlock_irqrestore(&d->lock, flags);
     if (d->clients != (evdev_client_t*)0) {
         fails++;
-        kprintf("[evdev_ring] FAIL list not empty after unlink\n");
+        kprintf_atomic("[evdev_ring] FAIL list not empty after unlink\n");
     }
 
     kfree(c);
     kfree(d);
-    kprintf(fails ? "[evdev_ring] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[evdev_ring] SELF-TEST FAILED\n"
                   : "[evdev_ring] SELF-TEST PASSED (locked emit/drain + client unlink)\n");
 }

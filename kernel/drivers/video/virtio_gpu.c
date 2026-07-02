@@ -961,13 +961,13 @@ void vgpu_fb_bytes_selftest(void) {
         uint32_t got = 0xDEADBEEFu;
         bool ok = vgpu_fb_bytes(c[i].w, c[i].h, &got);
         if (ok != (c[i].want_ok != 0) || (ok && got != c[i].want_bytes)) {
-            kprintf("[vgpu_fbsz] FAIL %ux%u ok=%d want=%d bytes=0x%lx want=0x%lx\n",
+            kprintf_atomic("[vgpu_fbsz] FAIL %ux%u ok=%d want=%d bytes=0x%lx want=0x%lx\n",
                     c[i].w, c[i].h, ok, c[i].want_ok,
                     (unsigned long)got, (unsigned long)c[i].want_bytes);
             fails++;
         }
     }
-    kprintf(fails ? "[vgpu_fbsz] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[vgpu_fbsz] SELF-TEST FAILED\n"
                   : "[vgpu_fbsz] SELF-TEST PASSED (w*h*4 u64, no wrap, capped)\n");
 }
 #endif

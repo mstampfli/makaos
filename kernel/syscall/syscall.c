@@ -1229,7 +1229,7 @@ void tg_leader_selftest(void) {
     task_t* C = (task_t*)kmalloc(sizeof(task_t));   // a child forked by a thread
     if (!L || !T || !C) {
         if (L) kfree(L); if (T) kfree(T); if (C) kfree(C);
-        kprintf("[tgleader] SELF-TEST SKIP (no mem)\n"); return;
+        kprintf_atomic("[tgleader] SELF-TEST SKIP (no mem)\n"); return;
     }
     __builtin_memset(L, 0, sizeof(*L));
     __builtin_memset(T, 0, sizeof(*T));
@@ -1242,7 +1242,7 @@ void tg_leader_selftest(void) {
     rcu_read_lock();
     int lead_ok = (tg_leader(T) == L) && (tg_leader(L) == L);
     rcu_read_unlock();
-    if (!lead_ok) { kprintf("[tgleader] FAIL leader resolution\n"); fails++; }
+    if (!lead_ok) { kprintf_atomic("[tgleader] FAIL leader resolution\n"); fails++; }
 
     // "Thread T forks child C" -> anchored on the leader, not on T.
     rcu_read_lock();
@@ -1255,14 +1255,14 @@ void tg_leader_selftest(void) {
     task_t* z = task_children_reap(tg_leader(T), C->pid, &found);
     rcu_read_unlock();
     if (z != C || !found) {
-        kprintf("[tgleader] FAIL cross-thread reap z=%p found=%u\n",
+        kprintf_atomic("[tgleader] FAIL cross-thread reap z=%p found=%u\n",
                 (void*)z, (unsigned)found);
         fails++;
     }
 
     pid_ht_remove(L);
     kfree(L); kfree(T); kfree(C);
-    kprintf(fails ? "[tgleader] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tgleader] SELF-TEST FAILED\n"
                   : "[tgleader] SELF-TEST PASSED (any thread reaps any process-child)\n");
 }
 
@@ -1272,23 +1272,23 @@ void spawn_cred_allowed_selftest(void) {
     // Non-root caller holding only uid/gid 1000.
     cred_t u; __builtin_memset(&u, 0, sizeof(u));
     u.ruid = u.euid = u.suid = 1000; u.rgid = u.egid = u.sgid = 1000;
-    if (spawn_cred_allowed(&u, 0, 0))      { kprintf("[spawn_cred] FAIL u->0\n"); fails++; }   // deny escalation
-    if (spawn_cred_allowed(&u, 0, 1000))   { kprintf("[spawn_cred] FAIL u->uid0\n"); fails++; } // deny uid0 even if gid ok
-    if (spawn_cred_allowed(&u, 1000, 0))   { kprintf("[spawn_cred] FAIL u->gid0\n"); fails++; } // deny gid0
-    if (!spawn_cred_allowed(&u, 1000, 1000)){ kprintf("[spawn_cred] FAIL u->self\n"); fails++; }// allow own
+    if (spawn_cred_allowed(&u, 0, 0))      { kprintf_atomic("[spawn_cred] FAIL u->0\n"); fails++; }   // deny escalation
+    if (spawn_cred_allowed(&u, 0, 1000))   { kprintf_atomic("[spawn_cred] FAIL u->uid0\n"); fails++; } // deny uid0 even if gid ok
+    if (spawn_cred_allowed(&u, 1000, 0))   { kprintf_atomic("[spawn_cred] FAIL u->gid0\n"); fails++; } // deny gid0
+    if (!spawn_cred_allowed(&u, 1000, 1000)){ kprintf_atomic("[spawn_cred] FAIL u->self\n"); fails++; }// allow own
     // suid==0 (a setuid program that dropped euid) may spawn a uid0 child.
     cred_t s; __builtin_memset(&s, 0, sizeof(s));
     s.ruid = s.euid = 1000; s.suid = 0; s.rgid = s.egid = s.sgid = 1000;
-    if (!spawn_cred_allowed(&s, 0, 1000))  { kprintf("[spawn_cred] FAIL suid0->uid0\n"); fails++; }
+    if (!spawn_cred_allowed(&s, 0, 1000))  { kprintf_atomic("[spawn_cred] FAIL suid0->uid0\n"); fails++; }
     // Supplemental group membership allows that gid.
     cred_t g; __builtin_memset(&g, 0, sizeof(g));
     g.ruid = g.euid = g.suid = 1000; g.rgid = g.egid = g.sgid = 1000;
     g.supplemental[0] = 50; g.ngroups = 1;
-    if (!spawn_cred_allowed(&g, 1000, 50)) { kprintf("[spawn_cred] FAIL suppgrp\n"); fails++; }
+    if (!spawn_cred_allowed(&g, 1000, 50)) { kprintf_atomic("[spawn_cred] FAIL suppgrp\n"); fails++; }
     // Root caller may set anything.
     cred_t r; __builtin_memset(&r, 0, sizeof(r));   // all-zero = euid 0 = root
-    if (!spawn_cred_allowed(&r, 1234, 5678)){ kprintf("[spawn_cred] FAIL root->any\n"); fails++; }
-    kprintf(fails ? "[spawn_cred] SELF-TEST FAILED\n"
+    if (!spawn_cred_allowed(&r, 1234, 5678)){ kprintf_atomic("[spawn_cred] FAIL root->any\n"); fails++; }
+    kprintf_atomic(fails ? "[spawn_cred] SELF-TEST FAILED\n"
                   : "[spawn_cred] SELF-TEST PASSED (no spawn credential escalation)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */
@@ -3675,12 +3675,12 @@ void copy_user_selftest(void) {
     int fails = 0;
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         if (copy_from_user(buf, (const void*)bad[i], 16) == 0) {
-            kprintf("[copyuser_test] FAIL: copy_from_user accepted 0x%lx\n",
+            kprintf_atomic("[copyuser_test] FAIL: copy_from_user accepted 0x%lx\n",
                     (unsigned long)bad[i]);
             fails++;
         }
         if (copy_to_user((void*)bad[i], buf, 16) == 0) {
-            kprintf("[copyuser_test] FAIL: copy_to_user accepted 0x%lx\n",
+            kprintf_atomic("[copyuser_test] FAIL: copy_to_user accepted 0x%lx\n",
                     (unsigned long)bad[i]);
             fails++;
         }
@@ -3688,7 +3688,7 @@ void copy_user_selftest(void) {
         // the user-controlled sqe->addr; it must reject these the same way (the
         // kernel-address case is the arbitrary-kernel-R/W LPE guard).
         if (user_buf_check(bad[i], 16) == 0) {
-            kprintf("[copyuser_test] FAIL: user_buf_check accepted 0x%lx\n",
+            kprintf_atomic("[copyuser_test] FAIL: user_buf_check accepted 0x%lx\n",
                     (unsigned long)bad[i]);
             fails++;
         }
@@ -3697,12 +3697,12 @@ void copy_user_selftest(void) {
         // Skip bad[3] == NULL, which legitimately means "empty readfds".
         if (bad[i] != 0ULL &&
             sys_select(1, bad[i], 0, 0, 0) != (uint64_t)-EFAULT) {
-            kprintf("[copyuser_test] FAIL: sys_select accepted readfds 0x%lx\n",
+            kprintf_atomic("[copyuser_test] FAIL: sys_select accepted readfds 0x%lx\n",
                     (unsigned long)bad[i]);
             fails++;
         }
     }
-    kprintf(fails ? "[copyuser_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[copyuser_test] SELF-TEST FAILED\n"
                   : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
 }
 
@@ -3719,7 +3719,7 @@ void copy_user_strv_selftest(void) {
     char* out[4];
     uint32_t count = 99;
     uint8_t* scratch = (uint8_t*)kmalloc(64);
-    if (!scratch) { kprintf("[strv_test] SELF-TEST FAILED (alloc)\n"); return; }
+    if (!scratch) { kprintf_atomic("[strv_test] SELF-TEST FAILED (alloc)\n"); return; }
 
     static const uint64_t bad[] = {
         HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
@@ -3731,7 +3731,7 @@ void copy_user_strv_selftest(void) {
         out[0] = (char*)0x1;
         int rc = copy_user_strv(bad[i], out, 4, 16, scratch, &count);
         if (rc != -EFAULT || count != 0 || out[0] != NULL) {
-            kprintf("[strv_test] FAIL accepted bad vec 0x%lx rc=%d count=%u\n",
+            kprintf_atomic("[strv_test] FAIL accepted bad vec 0x%lx rc=%d count=%u\n",
                     (unsigned long)bad[i], rc, count);
             fails++;
         }
@@ -3740,12 +3740,12 @@ void copy_user_strv_selftest(void) {
     count = 99;
     if (copy_user_strv(0, out, 4, 16, scratch, &count) != 0 ||
         count != 0 || out[0] != NULL) {
-        kprintf("[strv_test] FAIL null vec not empty-ok\n");
+        kprintf_atomic("[strv_test] FAIL null vec not empty-ok\n");
         fails++;
     }
 
     kfree(scratch);
-    kprintf(fails ? "[strv_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[strv_test] SELF-TEST FAILED\n"
                   : "[strv_test] SELF-TEST PASSED (argv/envp vector rejects bad pointers)\n");
 }
 
@@ -3766,12 +3766,12 @@ void copy_path_user_selftest(void) {
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         int64_t r = copy_path_from_user(buf, (const void*)bad[i], sizeof(buf));
         if (r != -EFAULT) {
-            kprintf("[copypath_test] FAIL: accepted 0x%lx -> %d\n",
+            kprintf_atomic("[copypath_test] FAIL: accepted 0x%lx -> %d\n",
                     (unsigned long)bad[i], (int)r);
             fails++;
         }
     }
-    kprintf(fails ? "[copypath_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[copypath_test] SELF-TEST FAILED\n"
                   : "[copypath_test] SELF-TEST PASSED (bad path pointers rejected, no fault)\n");
 }
 
@@ -3798,22 +3798,22 @@ void syscall_user_ptr_selftest(void) {
         // if the fb is not up -- either way the bad pointer is never written).
         r = (int64_t)sys_fb_info(bad[i]);
         if (r != -EFAULT && r != -EIO) {
-            kprintf("[user_ptr_test] FAIL fb_info 0x%lx -> %d\n",
+            kprintf_atomic("[user_ptr_test] FAIL fb_info 0x%lx -> %d\n",
                     (unsigned long)bad[i], (int)r); fails++; }
         r = (int64_t)sys_nanosleep(bad[i], 0);
         if (r != -EFAULT) {
-            kprintf("[user_ptr_test] FAIL nanosleep 0x%lx -> %d\n",
+            kprintf_atomic("[user_ptr_test] FAIL nanosleep 0x%lx -> %d\n",
                     (unsigned long)bad[i], (int)r); fails++; }
         r = (int64_t)sys_shm_open(bad[i], 4, 0, 0);
         if (r != -EFAULT) {
-            kprintf("[user_ptr_test] FAIL shm_open 0x%lx -> %d\n",
+            kprintf_atomic("[user_ptr_test] FAIL shm_open 0x%lx -> %d\n",
                     (unsigned long)bad[i], (int)r); fails++; }
         r = (int64_t)sys_shm_unlink(bad[i], 4);
         if (r != -EFAULT) {
-            kprintf("[user_ptr_test] FAIL shm_unlink 0x%lx -> %d\n",
+            kprintf_atomic("[user_ptr_test] FAIL shm_unlink 0x%lx -> %d\n",
                     (unsigned long)bad[i], (int)r); fails++; }
     }
-    kprintf(fails ? "[user_ptr_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[user_ptr_test] SELF-TEST FAILED\n"
                   : "[user_ptr_test] SELF-TEST PASSED (raw user-ptr syscalls reject bad pointers)\n");
 }
 
@@ -3829,17 +3829,17 @@ void mmap_range_selftest(void) {
     // mmap_round_len: zero and page-rounding-overflow must return 0; legal
     // lengths round up to a page multiple.
     if (mmap_round_len(0) != 0) {
-        kprintf("[mmap_range_test] FAIL: round_len(0) accepted\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(0) accepted\n"); fails++; }
     if (mmap_round_len(UINT64_MAX) != 0) {
-        kprintf("[mmap_range_test] FAIL: round_len(UINT64_MAX) wrapped instead of 0\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(UINT64_MAX) wrapped instead of 0\n"); fails++; }
     if (mmap_round_len(UINT64_MAX - PAGE_MASK + 1) != 0) {
-        kprintf("[mmap_range_test] FAIL: round_len(just-overflowing) accepted\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(just-overflowing) accepted\n"); fails++; }
     if (mmap_round_len(1) != PAGE_SIZE) {
-        kprintf("[mmap_range_test] FAIL: round_len(1) != PAGE_SIZE\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(1) != PAGE_SIZE\n"); fails++; }
     if (mmap_round_len(PAGE_SIZE) != PAGE_SIZE) {
-        kprintf("[mmap_range_test] FAIL: round_len(PAGE_SIZE) changed it\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(PAGE_SIZE) changed it\n"); fails++; }
     if (mmap_round_len(PAGE_SIZE + 1) != 2 * PAGE_SIZE) {
-        kprintf("[mmap_range_test] FAIL: round_len(PAGE_SIZE+1) != 2 pages\n"); fails++; }
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(PAGE_SIZE+1) != 2 pages\n"); fails++; }
 
     // mmap_range_ok: every escape/overflow case must be rejected (0).
     static const struct { uint64_t addr, len; } bad[] = {
@@ -3853,7 +3853,7 @@ void mmap_range_selftest(void) {
     };
     for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
         if (mmap_range_ok(bad[i].addr, bad[i].len, NULL, NULL)) {
-            kprintf("[mmap_range_test] FAIL: range_ok accepted addr=0x%lx len=0x%lx\n",
+            kprintf_atomic("[mmap_range_test] FAIL: range_ok accepted addr=0x%lx len=0x%lx\n",
                     (unsigned long)bad[i].addr, (unsigned long)bad[i].len);
             fails++;
         }
@@ -3865,10 +3865,10 @@ void mmap_range_selftest(void) {
         uint64_t a = 0x0000000040000000ULL;   // 1GiB, well inside the user half
         if (!mmap_range_ok(a, PAGE_SIZE + 1, &olen, &oend) ||
             olen != 2 * PAGE_SIZE || oend != a + 2 * PAGE_SIZE) {
-            kprintf("[mmap_range_test] FAIL: rejected/miscomputed a legal range\n"); fails++; }
+            kprintf_atomic("[mmap_range_test] FAIL: rejected/miscomputed a legal range\n"); fails++; }
     }
 
-    kprintf(fails ? "[mmap_range_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[mmap_range_test] SELF-TEST FAILED\n"
                   : "[mmap_range_test] SELF-TEST PASSED (mmap/munmap range overflow + higher-half escape rejected)\n");
 }
 
@@ -3889,12 +3889,12 @@ void access_ok_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = _access_ok(c[i].addr, c[i].len);
         if (got != c[i].want) {
-            kprintf("[access_ok_test] FAIL addr=0x%lx len=0x%lx got=%d want=%d\n",
+            kprintf_atomic("[access_ok_test] FAIL addr=0x%lx len=0x%lx got=%d want=%d\n",
                     (unsigned long)c[i].addr, (unsigned long)c[i].len, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[access_ok_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[access_ok_test] SELF-TEST FAILED\n"
                   : "[access_ok_test] SELF-TEST PASSED (null/kernel/wrap/end-escape rejected)\n");
 }
 
@@ -3918,12 +3918,12 @@ void rename_under_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = path_dst_under_src(c[i].src, c[i].dst);
         if (got != c[i].want) {
-            kprintf("[rename_under] FAIL %s: src=%s dst=%s got=%d want=%d\n",
+            kprintf_atomic("[rename_under] FAIL %s: src=%s dst=%s got=%d want=%d\n",
                     c[i].d, c[i].src, c[i].dst, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[rename_under] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[rename_under] SELF-TEST FAILED\n"
                   : "[rename_under] SELF-TEST PASSED (dir-into-own-subtree rejected)\n");
 }
 #endif
@@ -4117,7 +4117,7 @@ void out_struct_zerofill_selftest(void) {
     extern void kprintf(const char*, ...);
     int fails = 0;
 
-    if (sizeof(ext2_entry_t) != 268) { kprintf("[out_zerofill] FAIL ext2_entry_t sz=%lu\n",
+    if (sizeof(ext2_entry_t) != 268) { kprintf_atomic("[out_zerofill] FAIL ext2_entry_t sz=%lu\n",
                                                (unsigned long)sizeof(ext2_entry_t)); fails++; }
     {
         ext2_entry_t e;
@@ -4130,7 +4130,7 @@ void out_struct_zerofill_selftest(void) {
         for (uint64_t i = 265; i < sizeof(e); i++) if (p[i]      != 0) { fails++; break; }  // 3 pad bytes
     }
 
-    if (sizeof(utsname_t) != 390) { kprintf("[out_zerofill] FAIL utsname_t sz=%lu\n",
+    if (sizeof(utsname_t) != 390) { kprintf_atomic("[out_zerofill] FAIL utsname_t sz=%lu\n",
                                             (unsigned long)sizeof(utsname_t)); fails++; }
     {
         utsname_t u;
@@ -4141,7 +4141,7 @@ void out_struct_zerofill_selftest(void) {
         for (uint64_t i = 0; i < 65; i++) if (u.machine[i] != 0) { fails++; break; }  // untouched field
     }
 
-    kprintf(fails ? "[out_zerofill] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[out_zerofill] SELF-TEST FAILED\n"
                   : "[out_zerofill] SELF-TEST PASSED (readdir/uname out-struct tail+padding zeroed)\n");
 }
 
@@ -5291,8 +5291,8 @@ void epoll_watch_refcount_selftest(void) {
     // A heap vfs_file_t with an embedded waitq + refcount 1 -- the UAF-prone
     // shape (its waitq memory would be freed on the last vfs_close).
     vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
-    if (!f) { kprintf("[epoll_pin] FAIL alloc\n");
-              kprintf("[epoll_pin] SELF-TEST FAILED\n"); return; }
+    if (!f) { kprintf_atomic("[epoll_pin] FAIL alloc\n");
+              kprintf_atomic("[epoll_pin] SELF-TEST FAILED\n"); return; }
     f->close = ep_test_file_close;
 
     epoll_state_t st;
@@ -5307,7 +5307,7 @@ void epoll_watch_refcount_selftest(void) {
 
     epoll_watch_register(&st, &w, f);          // pins f
     if (w.file != f || f->refcount != 2u) {
-        kprintf("[epoll_pin] FAIL register: file=%p rc=%lu\n",
+        kprintf_atomic("[epoll_pin] FAIL register: file=%p rc=%lu\n",
                 (void*)w.file, (unsigned long)f->refcount);
         fails++;
     }
@@ -5317,7 +5317,7 @@ void epoll_watch_refcount_selftest(void) {
     // w.wq1 dangling for the unregister below.
     vfs_close(f);                              // 2 -> 1, NOT freed
     if (f->refcount != 1u) {
-        kprintf("[epoll_pin] FAIL post-close rc=%lu (file freed under us)\n",
+        kprintf_atomic("[epoll_pin] FAIL post-close rc=%lu (file freed under us)\n",
                 (unsigned long)f->refcount);
         fails++;
     }
@@ -5326,7 +5326,7 @@ void epoll_watch_refcount_selftest(void) {
     // pin -> 1 -> 0 -> ep_test_file_close frees f.  (Do NOT touch f after.)
     epoll_watch_unregister(&w);
 
-    kprintf(fails ? "[epoll_pin] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[epoll_pin] SELF-TEST FAILED\n"
                   : "[epoll_pin] SELF-TEST PASSED (watched file pinned across close)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */

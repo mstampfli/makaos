@@ -4,6 +4,7 @@
 // Future ttys (serial, pty) slot in identically.
 
 #include "tty.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pty.h"
 #include "input_core.h"
 #include "errno.h"   // EPERM (tty_set_fg_pgrp)
@@ -669,7 +670,7 @@ void tty_rb_free_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         uint32_t got = rb_free(c[i].head, c[i].tail, 8u);
         if (got != c[i].want) {
-            kprintf("[tty_rbfree] FAIL head=%u tail=%u got=%u want=%u\n",
+            kprintf_atomic("[tty_rbfree] FAIL head=%u tail=%u got=%u want=%u\n",
                     c[i].head, c[i].tail, got, c[i].want);
             fails++;
         }
@@ -678,11 +679,11 @@ void tty_rb_free_selftest(void) {
     // line (TTY_LINE_BUF_SIZE-1 bytes incl. '\n') -- the size bump guarantees it.
     uint32_t empty_free = rb_free(0u, 0u, TTY_READ_BUF_SIZE);
     if (empty_free < (TTY_LINE_BUF_SIZE - 1u)) {
-        kprintf("[tty_rbfree] FAIL ring too small: free=%u < maxline=%u\n",
+        kprintf_atomic("[tty_rbfree] FAIL ring too small: free=%u < maxline=%u\n",
                 empty_free, (unsigned)(TTY_LINE_BUF_SIZE - 1u));
         fails++;
     }
-    kprintf(fails ? "[tty_rbfree] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tty_rbfree] SELF-TEST FAILED\n"
                   : "[tty_rbfree] SELF-TEST PASSED (ring free-slots + line fits)\n");
 }
 
@@ -698,7 +699,7 @@ void tty_rb_free_selftest(void) {
 void tty_ldisc_selftest(void) {
     extern void kprintf(const char*, ...);
     tty_t* t = (tty_t*)kmalloc(sizeof(tty_t));
-    if (!t) { kprintf("[tty_ldisc] SELF-TEST SKIP (no mem)\n"); return; }
+    if (!t) { kprintf_atomic("[tty_ldisc] SELF-TEST SKIP (no mem)\n"); return; }
     __builtin_memset(t, 0, sizeof(*t));
     spin_lock_init(&t->lock);
     wait_queue_init(&t->waitq);
@@ -715,7 +716,7 @@ void tty_ldisc_selftest(void) {
     tty_input_char(t, 'y'); tty_input_char(t, '\n');
     n = tty_ldisc_drain(t, buf, sizeof(buf));
     if (n != 4 || buf[0] != 'h' || buf[1] != 'e' || buf[2] != 'y' || buf[3] != '\n') {
-        kprintf("[tty_ldisc] FAIL canon n=%lu\n", (unsigned long)n); fails++;
+        kprintf_atomic("[tty_ldisc] FAIL canon n=%lu\n", (unsigned long)n); fails++;
     }
 
     // (B) tty_flush_input discards a pending (un-flushed) canonical line.
@@ -724,7 +725,7 @@ void tty_ldisc_selftest(void) {
     tty_input_char(t, 'z'); tty_input_char(t, '\n');   // fresh line "z\n"
     n = tty_ldisc_drain(t, buf, sizeof(buf));
     if (n != 2 || buf[0] != 'z' || buf[1] != '\n') {
-        kprintf("[tty_ldisc] FAIL flush-pending n=%lu\n", (unsigned long)n); fails++;
+        kprintf_atomic("[tty_ldisc] FAIL flush-pending n=%lu\n", (unsigned long)n); fails++;
     }
 
     // (C) Raw push lands in the ring; tty_flush_input then clears the ring.
@@ -733,17 +734,17 @@ void tty_ldisc_selftest(void) {
     tty_input_char(t, 'Q');
     n = tty_ldisc_drain(t, buf, sizeof(buf));          // raw VMIN=1 -> 1 byte
     if (n != 1 || buf[0] != 'Q') {
-        kprintf("[tty_ldisc] FAIL raw n=%lu\n", (unsigned long)n); fails++;
+        kprintf_atomic("[tty_ldisc] FAIL raw n=%lu\n", (unsigned long)n); fails++;
     }
     tty_input_char(t, 'R'); tty_input_char(t, 'S');    // two bytes queued
     tty_flush_input(t);                                // clear the ring
     n = tty_ldisc_drain(t, buf, sizeof(buf));          // ring empty -> 0
     if (n != 0) {
-        kprintf("[tty_ldisc] FAIL flush-ring n=%lu\n", (unsigned long)n); fails++;
+        kprintf_atomic("[tty_ldisc] FAIL flush-ring n=%lu\n", (unsigned long)n); fails++;
     }
 
     kfree(t);
-    kprintf(fails ? "[tty_ldisc] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tty_ldisc] SELF-TEST FAILED\n"
                   : "[tty_ldisc] SELF-TEST PASSED (locked push/drain/flush, no self-deadlock)\n");
 }
 
@@ -761,7 +762,7 @@ void tty_ldisc_selftest(void) {
 void tty_termios_snapshot_selftest(void) {
     extern void kprintf(const char*, ...);
     tty_t* t = (tty_t*)kmalloc(sizeof(tty_t));
-    if (!t) { kprintf("[tty_termios] SELF-TEST SKIP (no mem)\n"); return; }
+    if (!t) { kprintf_atomic("[tty_termios] SELF-TEST SKIP (no mem)\n"); return; }
     __builtin_memset(t, 0, sizeof(*t));
     spin_lock_init(&t->lock);
     wait_queue_init(&t->waitq);
@@ -783,7 +784,7 @@ void tty_termios_snapshot_selftest(void) {
     const uint8_t* ps = (const uint8_t*)&snap;
     for (unsigned i = 0; i < sizeof(termios_t); i++) {
         if (pa[i] != ps[i]) {
-            kprintf("[tty_termios] FAIL snapshot byte %u: %u != %u\n",
+            kprintf_atomic("[tty_termios] FAIL snapshot byte %u: %u != %u\n",
                     i, (unsigned)pa[i], (unsigned)ps[i]);
             fails++; break;
         }
@@ -799,7 +800,7 @@ void tty_termios_snapshot_selftest(void) {
     tty_get_termios(t, &snap);
     if (snap.c_lflag != 0 || snap.c_iflag != 0 || snap.c_line != 0 ||
         snap.c_cc[VMIN] != 3) {
-        kprintf("[tty_termios] FAIL republish stale lflag=%u iflag=%u\n",
+        kprintf_atomic("[tty_termios] FAIL republish stale lflag=%u iflag=%u\n",
                 (unsigned)snap.c_lflag, (unsigned)snap.c_iflag);
         fails++;
     }
@@ -814,7 +815,7 @@ void tty_termios_snapshot_selftest(void) {
     tty_input_char(t, 'h'); tty_input_char(t, 'i'); tty_input_char(t, '\n');
     uint64_t n = tty_ldisc_drain(t, buf, sizeof(buf));
     if (n != 3 || buf[0] != 'h' || buf[1] != 'i' || buf[2] != '\n') {
-        kprintf("[tty_termios] FAIL canon-after-publish n=%lu\n", (unsigned long)n);
+        kprintf_atomic("[tty_termios] FAIL canon-after-publish n=%lu\n", (unsigned long)n);
         fails++;
     }
 
@@ -828,11 +829,11 @@ void tty_termios_snapshot_selftest(void) {
     tty_input_char(t, 'Z');
     n = tty_ldisc_drain(t, buf, sizeof(buf));
     if (n != 1 || buf[0] != 'Z') {
-        kprintf("[tty_termios] FAIL raw-after-publish n=%lu\n", (unsigned long)n);
+        kprintf_atomic("[tty_termios] FAIL raw-after-publish n=%lu\n", (unsigned long)n);
         fails++;
     }
 
     kfree(t);
-    kprintf(fails ? "[tty_termios] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tty_termios] SELF-TEST FAILED\n"
                   : "[tty_termios] SELF-TEST PASSED (publish/snapshot consistent, ldisc obeys published mode)\n");
 }

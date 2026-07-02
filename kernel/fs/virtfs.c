@@ -1,4 +1,5 @@
 #include "virtfs.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "acl.h"
 #include "errno.h"
 #include "kstr.h"    // str_eq (shared string utils; was local s_streq)
@@ -242,12 +243,12 @@ void virtfs_is_virtual_selftest(void) {
     int fails = 0;
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         if (virtfs_is_virtual(c[i].path) != c[i].want) {
-            kprintf("[virtfs_unveil] FAIL \"%s\" got=%d want=%d\n",
+            kprintf_atomic("[virtfs_unveil] FAIL \"%s\" got=%d want=%d\n",
                     c[i].path, virtfs_is_virtual(c[i].path), c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[virtfs_unveil] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[virtfs_unveil] SELF-TEST FAILED\n"
                   : "[virtfs_unveil] SELF-TEST PASSED (mount boundary, no prefix bypass)\n");
 }
 

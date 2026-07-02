@@ -1,4 +1,5 @@
 #include "process.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pmm.h"
 #include "vmm.h"
 #include "mm.h"
@@ -151,11 +152,11 @@ void fd_table_clone_selftest(void) {
     task_files_t dst; __builtin_memset(&dst, 0, sizeof dst);
     spin_lock_init(&dst.lock); dst.refs = 1;
 
-    if (!fd_table_init(&src, 8)) { kprintf("[fd_clone] FAIL src init\n"); return; }
+    if (!fd_table_init(&src, 8)) { kprintf_atomic("[fd_clone] FAIL src init\n"); return; }
     src.ft->fd_table[0] = &fa; src.ft->fd_flags[0] = 7u;
     src.ft->fd_table[3] = &fb;
 
-    if (!fd_table_clone(&dst, &src)) { kprintf("[fd_clone] FAIL clone\n"); fails++; }
+    if (!fd_table_clone(&dst, &src)) { kprintf_atomic("[fd_clone] FAIL clone\n"); fails++; }
     else {
         if (dst.ft->cap != 8) fails++;
         if (dst.ft->fd_table[0] != &fa || dst.ft->fd_table[3] != &fb) fails++;  // same desc shared
@@ -166,7 +167,7 @@ void fd_table_clone_selftest(void) {
 
     if (dst.ft) { kfree(dst.ft->fd_table); kfree(dst.ft->fd_flags); kfree(dst.ft); }
     kfree(src.ft->fd_table); kfree(src.ft->fd_flags); kfree(src.ft);
-    kprintf(fails ? "[fd_clone] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[fd_clone] SELF-TEST FAILED\n"
                   : "[fd_clone] SELF-TEST PASSED (cap+slots+flags copied, refs bumped)\n");
 }
 

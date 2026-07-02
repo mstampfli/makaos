@@ -1193,13 +1193,13 @@ void xfer_bytes_ok_selftest(void) {
         uint32_t got = 0xDEADBEEFu;
         bool ok = xfer_bytes_ok(c[i].sectors, c[i].ssz, c[i].max, &got);
         if (ok != (c[i].want_ok != 0) || (ok && got != c[i].want_bytes)) {
-            kprintf("[ahci_xfer] FAIL sectors=0x%lx max=0x%lx ok=%d want=%d bytes=0x%lx want=0x%lx\n",
+            kprintf_atomic("[ahci_xfer] FAIL sectors=0x%lx max=0x%lx ok=%d want=%d bytes=0x%lx want=0x%lx\n",
                     (unsigned long)c[i].sectors, (unsigned long)c[i].max, ok, c[i].want_ok,
                     (unsigned long)got, (unsigned long)c[i].want_bytes);
             fails++;
         }
     }
-    kprintf(fails ? "[ahci_xfer] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ahci_xfer] SELF-TEST FAILED\n"
                   : "[ahci_xfer] SELF-TEST PASSED (sector-bytes u64, no wrap, bounded)\n");
 }
 
@@ -1210,7 +1210,7 @@ void xfer_bytes_ok_selftest(void) {
 // (250 entries = 4000 bytes is too big for the 8 KiB kstack).
 void ahci_build_prdt_selftest(void) {
     prdt_entry_t* prdt = (prdt_entry_t*)kmalloc((AHCI_PRDT_ENTRIES + 2u) * sizeof(prdt_entry_t));
-    if (!prdt) { kprintf("[ahci_prdt] FAIL alloc\n"); return; }
+    if (!prdt) { kprintf_atomic("[ahci_prdt] FAIL alloc\n"); return; }
     int fails = 0;
     // One page from a page-aligned base -> exactly one entry, all consumed.
     if (build_prdt(prdt, 0x100000u, PAGE_SIZE) != 1u) fails++;
@@ -1222,7 +1222,7 @@ void ahci_build_prdt_selftest(void) {
     if (build_prdt(prdt, 0x100000u, (AHCI_PRDT_ENTRIES + 1u) * PAGE_SIZE) != 0u) fails++;
     if (prdt[AHCI_PRDT_ENTRIES].dba != 0xDEADBEEFu) fails++;
     kfree(prdt);
-    kprintf(fails ? "[ahci_prdt] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ahci_prdt] SELF-TEST FAILED\n"
                   : "[ahci_prdt] SELF-TEST PASSED (PRDT bounded to 248, overflow signalled)\n");
 }
 #endif

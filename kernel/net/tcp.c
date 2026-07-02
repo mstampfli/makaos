@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "ipv4.h"
 #include "eth.h"
 #include "net.h"
@@ -1035,14 +1036,14 @@ void tcp_ring_consume_selftest(void) {
         uint32_t head = c[i].head0, used = c[i].used0;
         uint32_t ret = tcp_ring_consume(&head, &used, c[i].n, c[i].mask);
         if (head != c[i].ehead || used != c[i].eused || ret != c[i].eret) {
-            kprintf("[tcp_ring] FAIL i=%u head=%lu(want %lu) used=%lu(want %lu) ret=%lu(want %lu)\n",
+            kprintf_atomic("[tcp_ring] FAIL i=%u head=%lu(want %lu) used=%lu(want %lu) ret=%lu(want %lu)\n",
                     i, (unsigned long)head, (unsigned long)c[i].ehead,
                     (unsigned long)used, (unsigned long)c[i].eused,
                     (unsigned long)ret, (unsigned long)c[i].eret);
             fails++;
         }
     }
-    kprintf(fails ? "[tcp_ring] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_ring] SELF-TEST FAILED\n"
                   : "[tcp_ring] SELF-TEST PASSED (ring drain + underflow clamp)\n");
 }
 
@@ -1067,13 +1068,13 @@ void tcp_ring_reserve_selftest(void) {
                                         c[i].mask, &start);
         if (start != c[i].estart || tail != c[i].etail ||
             used != c[i].eused || ret != c[i].eret) {
-            kprintf("[tcp_reserve] FAIL i=%u start=%lu tail=%lu used=%lu ret=%lu\n",
+            kprintf_atomic("[tcp_reserve] FAIL i=%u start=%lu tail=%lu used=%lu ret=%lu\n",
                     i, (unsigned long)start, (unsigned long)tail,
                     (unsigned long)used, (unsigned long)ret);
             fails++;
         }
     }
-    kprintf(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
                   : "[tcp_reserve] SELF-TEST PASSED (ring reserve, clamp + wrap)\n");
 }
 
@@ -1099,12 +1100,12 @@ void tcp_tx_first_chunk_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         uint32_t got = tcp_tx_first_chunk(c[i].off, c[i].len);
         if (got != c[i].want || (uint64_t)c[i].off + got > TCP_TXBUF_SIZE) {
-            kprintf("[tcp_txwrap] FAIL off=%u len=%u got=%u want=%u\n",
+            kprintf_atomic("[tcp_txwrap] FAIL off=%u len=%u got=%u want=%u\n",
                     c[i].off, c[i].len, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[tcp_txwrap] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_txwrap] SELF-TEST FAILED\n"
                   : "[tcp_txwrap] SELF-TEST PASSED (tx-ring read never crosses the 64K wrap)\n");
 }
 
@@ -1118,36 +1119,36 @@ void tcp_accept_q_selftest(void) {
     extern void kprintf(const char*, ...);
     int fails = 0;
     tcp_pcb_t* lst = (tcp_pcb_t*)kmalloc(sizeof(tcp_pcb_t));
-    if (!lst) { kprintf("[tcp_accept] SELF-TEST SKIP (no mem)\n"); return; }
+    if (!lst) { kprintf_atomic("[tcp_accept] SELF-TEST SKIP (no mem)\n"); return; }
     __builtin_memset(lst, 0, sizeof(*lst));     // head = tail = count = 0
     tcp_pcb_t* mark[TCP_BACKLOG];
     for (unsigned i = 0; i < TCP_BACKLOG; i++)
         mark[i] = (tcp_pcb_t*)(uintptr_t)(0x1000u + i);  // identity-only markers
 
-    if (accept_q_pop(lst) != NULL) { kprintf("[tcp_accept] FAIL pop empty\n"); fails++; }
+    if (accept_q_pop(lst) != NULL) { kprintf_atomic("[tcp_accept] FAIL pop empty\n"); fails++; }
 
     // Fill to the backlog; one more must be rejected.
     for (unsigned i = 0; i < TCP_BACKLOG; i++)
-        if (!accept_q_push(lst, mark[i])) { kprintf("[tcp_accept] FAIL push %u\n", i); fails++; }
-    if (lst->accept_count != TCP_BACKLOG) { kprintf("[tcp_accept] FAIL count\n"); fails++; }
-    if (accept_q_push(lst, mark[0]))      { kprintf("[tcp_accept] FAIL push full\n"); fails++; }
+        if (!accept_q_push(lst, mark[i])) { kprintf_atomic("[tcp_accept] FAIL push %u\n", i); fails++; }
+    if (lst->accept_count != TCP_BACKLOG) { kprintf_atomic("[tcp_accept] FAIL count\n"); fails++; }
+    if (accept_q_push(lst, mark[0]))      { kprintf_atomic("[tcp_accept] FAIL push full\n"); fails++; }
 
     // Drain in FIFO order to empty.
     for (unsigned i = 0; i < TCP_BACKLOG; i++)
-        if (accept_q_pop(lst) != mark[i]) { kprintf("[tcp_accept] FAIL FIFO %u\n", i); fails++; }
+        if (accept_q_pop(lst) != mark[i]) { kprintf_atomic("[tcp_accept] FAIL FIFO %u\n", i); fails++; }
     if (lst->accept_count != 0 || accept_q_pop(lst) != NULL) {
-        kprintf("[tcp_accept] FAIL drained\n"); fails++; }
+        kprintf_atomic("[tcp_accept] FAIL drained\n"); fails++; }
 
     // Wrap-around: push+pop many times past the modulo boundary, stays FIFO.
     for (unsigned r = 0; r < TCP_BACKLOG * 3u; r++) {
         if (!accept_q_push(lst, mark[r % TCP_BACKLOG]) ||
             accept_q_pop(lst) != mark[r % TCP_BACKLOG]) {
-            kprintf("[tcp_accept] FAIL wrap r=%u\n", r); fails++; }
+            kprintf_atomic("[tcp_accept] FAIL wrap r=%u\n", r); fails++; }
     }
-    if (lst->accept_count != 0) { kprintf("[tcp_accept] FAIL wrap count\n"); fails++; }
+    if (lst->accept_count != 0) { kprintf_atomic("[tcp_accept] FAIL wrap count\n"); fails++; }
 
     kfree(lst);
-    kprintf(fails ? "[tcp_accept] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_accept] SELF-TEST FAILED\n"
                   : "[tcp_accept] SELF-TEST PASSED (accept-queue ring: FIFO, full, empty, wrap)\n");
 }
 
@@ -1165,7 +1166,7 @@ void tcp_listener_orphan_selftest(void) {
     if (!lst || !child) {
         if (lst)   tcp_pcb_free(lst);
         if (child) tcp_pcb_free(child);
-        kprintf("[tcp_orphan] SELF-TEST SKIP (no mem)\n");
+        kprintf_atomic("[tcp_orphan] SELF-TEST SKIP (no mem)\n");
         return;
     }
     lst->state      = TCP_LISTEN;
@@ -1176,7 +1177,7 @@ void tcp_listener_orphan_selftest(void) {
     tcp_pcb_free(lst);
     if (child->listener != NULL) {
         fails++;
-        kprintf("[tcp_orphan] FAIL child->listener not cleared on listener free\n");
+        kprintf_atomic("[tcp_orphan] FAIL child->listener not cleared on listener free\n");
     }
 
     // 2. Freeing an UNRELATED pcb must NOT clear a child's backpointer, and the
@@ -1188,12 +1189,12 @@ void tcp_listener_orphan_selftest(void) {
         tcp_pcb_free(other);                    // unrelated -> must not touch child
         if (child->listener != lst2) {
             fails++;
-            kprintf("[tcp_orphan] FAIL unrelated free cleared child->listener\n");
+            kprintf_atomic("[tcp_orphan] FAIL unrelated free cleared child->listener\n");
         }
         tcp_pcb_free(lst2);                      // matching -> must clear
         if (child->listener != NULL) {
             fails++;
-            kprintf("[tcp_orphan] FAIL second listener free did not clear\n");
+            kprintf_atomic("[tcp_orphan] FAIL second listener free did not clear\n");
         }
     } else {
         if (lst2)  tcp_pcb_free(lst2);
@@ -1201,7 +1202,7 @@ void tcp_listener_orphan_selftest(void) {
     }
 
     tcp_pcb_free(child);   // cleanup
-    kprintf(fails ? "[tcp_orphan] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_orphan] SELF-TEST FAILED\n"
                   : "[tcp_orphan] SELF-TEST PASSED (listener free orphans SYN_RCVD children)\n");
 }
 
@@ -1229,14 +1230,14 @@ void tcp_synreap_selftest(void) {
 
     // (A) an over-cap SYN_RCVD orphan (sock_file==NULL) gets reaped.
     tcp_pcb_t* orphan = tcp_pcb_alloc(0xFEED);
-    if (!orphan) { kprintf("[tcp_synreap] SELF-TEST SKIP (no mem)\n"); return; }
+    if (!orphan) { kprintf_atomic("[tcp_synreap] SELF-TEST SKIP (no mem)\n"); return; }
     orphan->state     = TCP_SYN_RCVD;
     orphan->sock_file = NULL;
     orphan->rexmit    = (uint8_t)(TCP_SYN_RCVD_MAX_RETRIES + 1u);   // over the cap
     tcp_timer_tick();                                               // reap-pass frees it
     if (tcp_pcb_on_list(orphan)) {
         fails++;
-        kprintf("[tcp_synreap] FAIL over-cap orphan not reaped\n");
+        kprintf_atomic("[tcp_synreap] FAIL over-cap orphan not reaped\n");
         tcp_pcb_free(orphan);   // not reaped -> free so the test does not leak
     }
 
@@ -1249,14 +1250,14 @@ void tcp_synreap_selftest(void) {
         tcp_timer_tick();
         if (!tcp_pcb_on_list(owned)) {
             fails++;
-            kprintf("[tcp_synreap] FAIL child with a socket was reaped\n");
+            kprintf_atomic("[tcp_synreap] FAIL child with a socket was reaped\n");
         } else {
             owned->sock_file = NULL;
             tcp_pcb_free(owned);              // cleanup
         }
     }
 
-    kprintf(fails ? "[tcp_synreap] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_synreap] SELF-TEST FAILED\n"
                   : "[tcp_synreap] SELF-TEST PASSED (over-cap SYN_RCVD half-open reaped, owned child kept)\n");
 }
 
@@ -1275,7 +1276,7 @@ void tcp_listener_drain_selftest(void) {
     extern void kprintf(const char*, ...);
     int fails = 0;
     tcp_pcb_t* lst = tcp_pcb_alloc(0xFFFB);
-    if (!lst) { kprintf("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    if (!lst) { kprintf_atomic("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
     lst->state = TCP_LISTEN;
 
     tcp_pcb_t* kids[TCP_BACKLOG];
@@ -1292,22 +1293,22 @@ void tcp_listener_drain_selftest(void) {
         if (!q) { tcp_pcb_free(c); break; }
         kids[n++] = c;
     }
-    if (n == 0) { tcp_pcb_free(lst); kprintf("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    if (n == 0) { tcp_pcb_free(lst); kprintf_atomic("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
     if (lst->accept_count != n) {
-        kprintf("[tcp_lstdrain] FAIL count %u != %u\n", lst->accept_count, n); fails++;
+        kprintf_atomic("[tcp_lstdrain] FAIL count %u != %u\n", lst->accept_count, n); fails++;
     }
 
     // Free the listener WITHOUT accepting -> the drain must RST + free every child.
     tcp_pcb_free(lst);
 
     if (lst->accept_count != 0) {
-        kprintf("[tcp_lstdrain] FAIL backlog not drained (%u left)\n", lst->accept_count); fails++;
+        kprintf_atomic("[tcp_lstdrain] FAIL backlog not drained (%u left)\n", lst->accept_count); fails++;
     }
     for (unsigned i = 0; i < n; i++)
         if (tcp_pcb_on_list(kids[i])) {
-            kprintf("[tcp_lstdrain] FAIL child %u leaked on s_pcb_head\n", i); fails++;
+            kprintf_atomic("[tcp_lstdrain] FAIL child %u leaked on s_pcb_head\n", i); fails++;
         }
 
-    kprintf(fails ? "[tcp_lstdrain] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[tcp_lstdrain] SELF-TEST FAILED\n"
                   : "[tcp_lstdrain] SELF-TEST PASSED (listener close drains + frees queued ESTABLISHED children)\n");
 }

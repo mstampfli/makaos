@@ -1,4 +1,5 @@
 #include "sched.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "process.h"
 #include "signal.h"
 #include "timer.h"

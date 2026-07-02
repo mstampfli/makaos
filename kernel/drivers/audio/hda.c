@@ -1,4 +1,5 @@
 #include "hda.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pci.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -615,11 +616,11 @@ void hda_node_scan_end_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         uint32_t e = hda_node_scan_end(c[i].start, c[i].count);
         if (e != c[i].end) {
-            kprintf("[hda_nodes] FAIL start=%u count=%u end=%u want=%u\n",
+            kprintf_atomic("[hda_nodes] FAIL start=%u count=%u end=%u want=%u\n",
                     c[i].start, c[i].count, e, c[i].end);
             fails++;
         }
     }
-    kprintf(fails ? "[hda_nodes] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[hda_nodes] SELF-TEST FAILED\n"
                   : "[hda_nodes] SELF-TEST PASSED (codec node scan bound clamps to u8 nid space, terminates)\n");
 }

@@ -1,4 +1,5 @@
 #include "unix_sock.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "kheap.h"
 #include "uaccess.h"   // copy_to_user (shared decl)
 #include "errno.h"
@@ -606,7 +607,7 @@ void unix_ns_str_selftest(void) {
     (void)ns_hash_str(a, 256);               // must return (capped), not run off
     b[UNIX_PATH_MAX - 1] = 'B';
     if (ns_streq(a, b)) fails++;             // differ only at the last byte
-    kprintf(fails ? "[unix_ns_str] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[unix_ns_str] SELF-TEST FAILED\n"
                   : "[unix_ns_str] SELF-TEST PASSED (bounded hash/streq, NUL-stop)\n");
 }
 

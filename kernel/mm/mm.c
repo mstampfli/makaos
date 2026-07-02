@@ -1,4 +1,5 @@
 #include "mm.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "shmem.h"
 #include "kheap.h"
 #include "vmm.h"

@@ -5,6 +5,7 @@
 // The master is a plain fd connected to the slave's I/O.
 
 #include "pty.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "tty.h"
 #include "uaccess.h"   // copy_from_user / copy_to_user (shared decls)
 #include "vfs.h"
@@ -542,7 +543,7 @@ void pty_ioctl_selftest(void) {
     extern void kprintf(const char*, ...);
     kprintf("[pty_ioctl_test] pty ioctls must reject bad user pointers\n");
     vfs_file_t* m = pty_open_master();
-    if (!m) { kprintf("[pty_ioctl_test] FAIL: pty_open_master\n"); return; }
+    if (!m) { kprintf_atomic("[pty_ioctl_test] FAIL: pty_open_master\n"); return; }
     static const uint64_t bad[] = {
         0xFFFF800000001000ULL,   // kernel HHDM address (the LPE case)
         0xDEAD000000000000ULL,   // non-canonical
@@ -556,14 +557,14 @@ void pty_ioctl_selftest(void) {
         for (unsigned j = 0; j < sizeof(reqs) / sizeof(reqs[0]); j++) {
             int64_t r = m->ioctl(m, reqs[j], bad[i]);
             if (r != -EFAULT) {
-                kprintf("[pty_ioctl_test] FAIL req=0x%lx addr=0x%lx -> %d\n",
+                kprintf_atomic("[pty_ioctl_test] FAIL req=0x%lx addr=0x%lx -> %d\n",
                         (unsigned long)reqs[j], (unsigned long)bad[i], (int)r);
                 fails++;
             }
         }
     }
     if (m->close) m->close(m);
-    kprintf(fails ? "[pty_ioctl_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[pty_ioctl_test] SELF-TEST FAILED\n"
                   : "[pty_ioctl_test] SELF-TEST PASSED (ioctls reject bad user pointers)\n");
 }
 #endif
@@ -756,7 +757,7 @@ void pty_lifetime_selftest(void) {
     int fails = 0;
     vfs_file_t* m = NULL; vfs_file_t* s = NULL;
     if (pty_alloc(&m, &s) != 0 || !m || !s) {
-        kprintf("[pty_life] SELF-TEST FAILED (alloc)\n");
+        kprintf_atomic("[pty_life] SELF-TEST FAILED (alloc)\n");
         return;
     }
     pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
@@ -765,7 +766,7 @@ void pty_lifetime_selftest(void) {
     // Fresh pair: master open, one slave ref.
     if (pty->master_open != 1 || pty->slave_open_count != 1) {
         fails++;
-        kprintf("[pty_life] FAIL fresh m=%d s=%d\n",
+        kprintf_atomic("[pty_life] FAIL fresh m=%d s=%d\n",
                 pty->master_open, pty->slave_open_count);
     }
 
@@ -775,7 +776,7 @@ void pty_lifetime_selftest(void) {
     vfs_file_t* claimed = pty_open_slave_by_index(idx);
     if (claimed != s || !pty->slave_claimed) {
         fails++;
-        kprintf("[pty_life] FAIL claim\n");
+        kprintf_atomic("[pty_life] FAIL claim\n");
     }
 
     // Close the master: master_open -> 0, but the slave is still open, so the
@@ -783,7 +784,7 @@ void pty_lifetime_selftest(void) {
     m->close(m);
     if (pty->master_open != 0 || pty->slave_open_count != 1) {
         fails++;
-        kprintf("[pty_life] FAIL after master close m=%d s=%d\n",
+        kprintf_atomic("[pty_life] FAIL after master close m=%d s=%d\n",
                 pty->master_open, pty->slave_open_count);
     }
 
@@ -793,10 +794,10 @@ void pty_lifetime_selftest(void) {
     s->close(s);
     if (pty_open_slave_by_index(idx) != NULL) {
         fails++;
-        kprintf("[pty_life] FAIL pty not unlinked after both ends closed\n");
+        kprintf_atomic("[pty_life] FAIL pty not unlinked after both ends closed\n");
     }
 
-    kprintf(fails ? "[pty_life] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[pty_life] SELF-TEST FAILED\n"
                   : "[pty_life] SELF-TEST PASSED (pair freed once, unlinked)\n");
 }
 
@@ -810,7 +811,7 @@ void pty_reopen_selftest(void) {
     int fails = 0;
     vfs_file_t* m = NULL; vfs_file_t* s = NULL;
     if (pty_alloc(&m, &s) != 0 || !m || !s) {
-        kprintf("[pty_reopen] SELF-TEST FAILED (alloc)\n");
+        kprintf_atomic("[pty_reopen] SELF-TEST FAILED (alloc)\n");
         return;
     }
     pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
@@ -833,7 +834,7 @@ void pty_reopen_selftest(void) {
     // Tear down: with the slave gone, closing the master frees the pty.
     m->close(m);
 
-    kprintf(fails ? "[pty_reopen] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[pty_reopen] SELF-TEST FAILED\n"
                   : "[pty_reopen] SELF-TEST PASSED (slave_file cleared on close, no reopen UAF)\n");
 }
 
@@ -849,7 +850,7 @@ void pty_master_ring_selftest(void) {
     int fails = 0;
     vfs_file_t* m = NULL; vfs_file_t* s = NULL;
     if (pty_alloc(&m, &s) != 0 || !m || !s) {
-        kprintf("[pty_mring] SELF-TEST FAILED (alloc)\n");
+        kprintf_atomic("[pty_mring] SELF-TEST FAILED (alloc)\n");
         return;
     }
     pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
@@ -870,12 +871,12 @@ void pty_master_ring_selftest(void) {
         if (out[k] != (uint8_t)exp[k]) match = 0;
     if (!match) {
         fails++;
-        kprintf("[pty_mring] FAIL roundtrip got=%lu\n", (unsigned long)got);
+        kprintf_atomic("[pty_mring] FAIL roundtrip got=%lu\n", (unsigned long)got);
     }
     // Ring is drained empty; a second drain returns 0 (head == tail).
     if (pty_master_drain(pty, out, sizeof(out)) != 0) {
         fails++;
-        kprintf("[pty_mring] FAIL ring not empty after drain\n");
+        kprintf_atomic("[pty_mring] FAIL ring not empty after drain\n");
     }
 
     // Tear down: close both ends (master then slave) so the pair is freed and
@@ -883,6 +884,6 @@ void pty_master_ring_selftest(void) {
     m->close(m);
     s->close(s);
 
-    kprintf(fails ? "[pty_mring] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[pty_mring] SELF-TEST FAILED\n"
                   : "[pty_mring] SELF-TEST PASSED (locked master-ring push/drain round-trip)\n");
 }

@@ -1,4 +1,5 @@
 #include "udp.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "ipv4.h"
 #include "eth.h"
 #include "net.h"
@@ -93,11 +94,11 @@ void udp_send_size_selftest(void) {
     for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         int r = udp_send_ex(0, 0x08080808u, 1234, 53, dummy, bad[i]);
         if (r != -EMSGSIZE) {
-            kprintf("[udp_size] FAIL len=%lu ret=%d (want -EMSGSIZE)\n",
+            kprintf_atomic("[udp_size] FAIL len=%lu ret=%d (want -EMSGSIZE)\n",
                     (unsigned long)bad[i], r);
             fails++;
         }
     }
-    kprintf(fails ? "[udp_size] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[udp_size] SELF-TEST FAILED\n"
                   : "[udp_size] SELF-TEST PASSED (oversize UDP rejected, no u16 wrap)\n");
 }

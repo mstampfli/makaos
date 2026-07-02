@@ -1,4 +1,5 @@
 #include "unveil.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "kheap.h"
 #include "errno.h"
 #include "kstr.h"    // str_len + str_lcpy (shared; were local s_strlen / s_strncpy)
@@ -83,7 +84,7 @@ void unveil_gate_selftest(void) {
 
     // Empty table -> everything visible regardless of the requested bits.
     if (!unveil_check(&t, "/etc/passwd", UNVEIL_READ)) {
-        kprintf("[unveil] FAIL empty-table should allow\n"); fails++;
+        kprintf_atomic("[unveil] FAIL empty-table should allow\n"); fails++;
     }
 
     // Grant /home/bob with read+write+create (no exec).
@@ -102,13 +103,13 @@ void unveil_gate_selftest(void) {
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         int got = unveil_check(&t, c[i].path, c[i].need);
         if (got != c[i].want) {
-            kprintf("[unveil] FAIL path=%s need=%u got=%d want=%d\n",
+            kprintf_atomic("[unveil] FAIL path=%s need=%u got=%d want=%d\n",
                     c[i].path, (unsigned)c[i].need, got, c[i].want);
             fails++;
         }
     }
     unveil_free(&t);
-    kprintf(fails ? "[unveil] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[unveil] SELF-TEST FAILED\n"
                   : "[unveil] SELF-TEST PASSED (prefix + boundary + perm bits)\n");
 }
 #endif

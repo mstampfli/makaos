@@ -1,4 +1,5 @@
 #include "ext2.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "ahci.h"
 #include "kheap.h"
 #include "kstr.h"    // str_len (shared string utils)
@@ -1638,12 +1639,12 @@ void ext2_readdir_clamp_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         uint32_t got = ext2_dirent_namelen_clamp(c[i].off, c[i].nlen, c[i].blk);
         if (got != c[i].want) {
-            kprintf("[ext2_readdir_test] FAIL off=%u nlen=%u blk=%u got=%u want=%u\n",
+            kprintf_atomic("[ext2_readdir_test] FAIL off=%u nlen=%u blk=%u got=%u want=%u\n",
                     c[i].off, c[i].nlen, c[i].blk, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_readdir_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_readdir_test] SELF-TEST FAILED\n"
                   : "[ext2_readdir_test] SELF-TEST PASSED (name clamped to block bounds)\n");
 }
 
@@ -1665,12 +1666,12 @@ void ext2_block_size_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         uint32_t got = ext2_block_size_checked(c[i].log);
         if (got != c[i].want || (got != 0 && got > EXT2_BLOCK_SIZE_MAX)) {
-            kprintf("[ext2_blksz_test] FAIL log=%u got=%u want=%u\n",
+            kprintf_atomic("[ext2_blksz_test] FAIL log=%u got=%u want=%u\n",
                     c[i].log, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_blksz_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_blksz_test] SELF-TEST FAILED\n"
                   : "[ext2_blksz_test] SELF-TEST PASSED (block size validated <= 4096)\n");
 }
 
@@ -1692,12 +1693,12 @@ void ext2_group_geom_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = ext2_group_geom_valid(c[i].bpg, c[i].ipg, c[i].bs);
         if ((got != 0) != (c[i].want != 0)) {
-            kprintf("[ext2_geom] FAIL bpg=%u ipg=%u bs=%u got=%d want=%u\n",
+            kprintf_atomic("[ext2_geom] FAIL bpg=%u ipg=%u bs=%u got=%d want=%u\n",
                     c[i].bpg, c[i].ipg, c[i].bs, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_geom] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_geom] SELF-TEST FAILED\n"
                   : "[ext2_geom] SELF-TEST PASSED (group geometry bounded to block_size*8)\n");
 }
 #endif
@@ -2329,7 +2330,7 @@ void ext2_block_valid_selftest(void) {
     for (unsigned i = 0; i < sizeof(b)/sizeof(b[0]); i++) {
         int got = ext2_block_in_range(b[i].blk, 1u, 100u);
         if (got != b[i].want) {
-            kprintf("[ext2_blkvalid] FAIL blk=%u got=%d want=%d\n",
+            kprintf_atomic("[ext2_blkvalid] FAIL blk=%u got=%d want=%d\n",
                     b[i].blk, got, b[i].want);
             fails++;
         }
@@ -2348,12 +2349,12 @@ void ext2_block_valid_selftest(void) {
     for (unsigned i = 0; i < sizeof(r)/sizeof(r[0]); i++) {
         int got = ext2_run_in_range(r[i].start, r[i].run, 1u, 100u);
         if (got != r[i].want) {
-            kprintf("[ext2_blkvalid] FAIL run start=%u run=%u got=%d want=%d\n",
+            kprintf_atomic("[ext2_blkvalid] FAIL run start=%u run=%u got=%d want=%d\n",
                     r[i].start, r[i].run, got, r[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_blkvalid] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_blkvalid] SELF-TEST FAILED\n"
                   : "[ext2_blkvalid] SELF-TEST PASSED (block + run range, overflow-safe)\n");
 }
 
@@ -2374,13 +2375,13 @@ void ext2_blk_lba_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         uint64_t got = ext2_blk_lba(c[i].part, c[i].blk, c[i].spb);
         if (got != c[i].want) {
-            kprintf("[ext2_blklba] FAIL part=0x%lx blk=0x%lx spb=%u got=0x%lx want=0x%lx\n",
+            kprintf_atomic("[ext2_blklba] FAIL part=0x%lx blk=0x%lx spb=%u got=0x%lx want=0x%lx\n",
                     (unsigned long)c[i].part, (unsigned long)c[i].blk, c[i].spb,
                     (unsigned long)got, (unsigned long)c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_blklba] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_blklba] SELF-TEST FAILED\n"
                   : "[ext2_blklba] SELF-TEST PASSED (64-bit LBA, no u32 wrap)\n");
 }
 
@@ -2405,12 +2406,12 @@ void ext2_inode_size_valid_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = ext2_inode_size_valid(c[i].isz, c[i].bsz);
         if (got != c[i].want) {
-            kprintf("[ext2_isz] FAIL isz=%u bsz=%u got=%d want=%d\n",
+            kprintf_atomic("[ext2_isz] FAIL isz=%u bsz=%u got=%d want=%d\n",
                     c[i].isz, c[i].bsz, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_isz] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_isz] SELF-TEST FAILED\n"
                   : "[ext2_isz] SELF-TEST PASSED (inode-size pow2 + range validation)\n");
 }
 
@@ -2433,12 +2434,12 @@ void ext2_dirent_in_block_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = ext2_dirent_in_block(c[i].off, c[i].rec, c[i].nlen, c[i].blk);
         if (got != (int)c[i].want) {
-            kprintf("[ext2_dirent] FAIL off=%u rec=%u nlen=%u got=%d want=%u\n",
+            kprintf_atomic("[ext2_dirent] FAIL off=%u rec=%u nlen=%u got=%d want=%u\n",
                     c[i].off, c[i].rec, c[i].nlen, got, c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[ext2_dirent] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_dirent] SELF-TEST FAILED\n"
                   : "[ext2_dirent] SELF-TEST PASSED (dirent rec_len/name_len bounds)\n");
 }
 
@@ -2509,28 +2510,28 @@ void ext2_path_split_selftest(void) {
     const char* b;
     b = path_split("/foo/bar", buf, sizeof(buf));        // normal split
     if (!b || !EQ(b,"bar") || !EQ(buf,"/foo")) {
-        kprintf("[ext2_pathsplit] FAIL normal b=%p\n", (void*)b); fails++; }
+        kprintf_atomic("[ext2_pathsplit] FAIL normal b=%p\n", (void*)b); fails++; }
 
     b = path_split("/a", buf, sizeof(buf));              // root parent
     if (!b || !EQ(b,"a") || !EQ(buf,"/")) {
-        kprintf("[ext2_pathsplit] FAIL root b=%p\n", (void*)b); fails++; }
+        kprintf_atomic("[ext2_pathsplit] FAIL root b=%p\n", (void*)b); fails++; }
 
     // "/abcdefg/x": last '/' at index 8, parent "/abcdefg" is 8 chars -> needs
     // 9 bytes (8 + NUL).  cap 9 fits exactly; cap 8 must reject.
     b = path_split("/abcdefg/x", buf, 9u);
     if (!b || !EQ(buf,"/abcdefg")) {
-        kprintf("[ext2_pathsplit] FAIL fit-9 b=%p\n", (void*)b); fails++; }
+        kprintf_atomic("[ext2_pathsplit] FAIL fit-9 b=%p\n", (void*)b); fails++; }
     b = path_split("/abcdefg/x", buf, 8u);
     if (b != (const char*)0) {                            // MUST reject, not overflow
-        kprintf("[ext2_pathsplit] FAIL overflow-8 not rejected\n"); fails++; }
+        kprintf_atomic("[ext2_pathsplit] FAIL overflow-8 not rejected\n"); fails++; }
 
     // The bug case: a parent far larger than cap must reject with no copy.
     b = path_split("/aaaaaaaaaaaaaaaaaaaa/x", buf, 8u);   // parent 20+ chars, cap 8
     if (b != (const char*)0) {
-        kprintf("[ext2_pathsplit] FAIL long-parent not rejected\n"); fails++; }
+        kprintf_atomic("[ext2_pathsplit] FAIL long-parent not rejected\n"); fails++; }
 
     #undef EQ
-    kprintf(fails ? "[ext2_pathsplit] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_pathsplit] SELF-TEST FAILED\n"
                   : "[ext2_pathsplit] SELF-TEST PASSED (parent bound, no stack overflow)\n");
 }
 #endif /* MAKAOS_BOOT_SELFTESTS */
@@ -3330,7 +3331,7 @@ void ext2_perm_op_selftest(void) {
     if (!path_to_inode("/__fsperm_t"))                     fails++;
     if (!ext2_unlink("/__fsperm_t", &root))               fails++;
 
-    kprintf(fails ? "[fs_permop] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[fs_permop] SELF-TEST FAILED\n"
                   : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rename via in-op perm check)\n");
 }
 
@@ -3369,7 +3370,7 @@ void ext2_pread_eof_selftest(void) {
             // return EXACTLY fsize bytes (not the full final block slack).
             int64_t got = f->pread(f, rbuf, fsize + s_block_size, 0);
             if (got != (int64_t)fsize) {
-                kprintf("[ext2_pread_eof] FAIL got=%ld want=%u (phantom tail past EOF)\n",
+                kprintf_atomic("[ext2_pread_eof] FAIL got=%ld want=%u (phantom tail past EOF)\n",
                         (long)got, fsize);
                 fails++;
             } else {
@@ -3382,6 +3383,6 @@ void ext2_pread_eof_selftest(void) {
     }
     kfree(wbuf);
     kfree(rbuf);
-    kprintf(fails ? "[ext2_pread_eof] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[ext2_pread_eof] SELF-TEST FAILED\n"
                   : "[ext2_pread_eof] SELF-TEST PASSED (pread clamps to i_size, no phantom tail past EOF)\n");
 }

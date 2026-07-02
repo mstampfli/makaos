@@ -141,9 +141,9 @@ void slab_pcpu_selftest(void) {
             (uint64_t)pcp_pct);
 
     if (slab_pct >= 9500) {
-        kprintf("[slab_test] SELF-TEST PASSED (slab hit rate >= 95%%)\n");
+        kprintf_atomic("[slab_test] SELF-TEST PASSED (slab hit rate >= 95%%)\n");
     } else {
-        kprintf("[slab_test] SELF-TEST FAILED: slab hit_rate=%lu/10000 < 9500\n",
+        kprintf_atomic("[slab_test] SELF-TEST FAILED: slab hit_rate=%lu/10000 < 9500\n",
                 (uint64_t)slab_pct);
     }
 }
@@ -177,14 +177,14 @@ void slab_typesafe_selftest(void) {
     for (int i = 0; i < 4; i++) {
         objs[i] = pmm_slab_alloc(&tc);
         if (!objs[i]) {
-            kprintf("[typesafe_test] FAILED: alloc returned NULL at i=%d\n", i);
+            kprintf_atomic("[typesafe_test] FAILED: alloc returned NULL at i=%d\n", i);
             return;
         }
     }
     // Which frame does obj[0] live in?  We poll pmm_is_slab_ptr.
     uint8_t before_shrink = pmm_is_slab_ptr(objs[0]);
     if (!before_shrink) {
-        kprintf("[typesafe_test] FAILED: is_slab_ptr=0 before free\n");
+        kprintf_atomic("[typesafe_test] FAILED: is_slab_ptr=0 before free\n");
         return;
     }
 
@@ -204,7 +204,7 @@ void slab_typesafe_selftest(void) {
     // our cache — pmm_is_slab_ptr must still return true for objs[0].
     uint8_t mid_shrink = pmm_is_slab_ptr(objs[0]);
     if (!mid_shrink) {
-        kprintf("[typesafe_test] FAILED: is_slab_ptr=0 before synchronize_rcu "
+        kprintf_atomic("[typesafe_test] FAILED: is_slab_ptr=0 before synchronize_rcu "
                 "(typesafe guarantee violated)\n");
         return;
     }
@@ -228,7 +228,7 @@ void slab_typesafe_selftest(void) {
     slab_cache_t* owner   = pmm_slab_cache_of(objs[0]);
     uint8_t       slabptr = pmm_is_slab_ptr(objs[0]);
     if (owner == &tc) {
-        kprintf("[typesafe_test] FAILED: frame still owned by tc after the grace "
+        kprintf_atomic("[typesafe_test] FAILED: frame still owned by tc after the grace "
                 "period (callback did not free our page)\n");
         return;
     }
@@ -240,5 +240,5 @@ void slab_typesafe_selftest(void) {
                        "cache (owner=%p tc=%p) -- benign reallocation\n",
                        (void*)owner, (void*)&tc);
     }
-    kprintf("[typesafe_test] SELF-TEST PASSED (defer -> grace -> reclaim)\n");
+    kprintf_atomic("[typesafe_test] SELF-TEST PASSED (defer -> grace -> reclaim)\n");
 }

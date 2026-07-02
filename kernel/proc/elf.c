@@ -67,7 +67,7 @@ void elf_phtab_bounds_selftest(void) {
     for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int got = elf_phtab_in_bounds(c[i].off, c[i].n, c[i].sz);
         if (got != c[i].want) {
-            kprintf("[elf_test] FAIL off=0x%lx n=%u sz=%lu got=%d want=%d\n",
+            kprintf_atomic("[elf_test] FAIL off=0x%lx n=%u sz=%lu got=%d want=%d\n",
                     (unsigned long)c[i].off, (unsigned)c[i].n,
                     (unsigned long)c[i].sz, got, c[i].want);
             fails++;
@@ -91,14 +91,14 @@ void elf_phtab_bounds_selftest(void) {
     for (unsigned i = 0; i < sizeof(s) / sizeof(s[0]); i++) {
         int got = elf_seg_range_ok(s[i].va, s[i].bias, s[i].msz, TOP);
         if (got != s[i].want) {
-            kprintf("[elf_test] FAIL seg va=0x%lx bias=0x%lx msz=0x%lx got=%d want=%d\n",
+            kprintf_atomic("[elf_test] FAIL seg va=0x%lx bias=0x%lx msz=0x%lx got=%d want=%d\n",
                     (unsigned long)s[i].va, (unsigned long)s[i].bias,
                     (unsigned long)s[i].msz, got, s[i].want);
             fails++;
         }
     }
 
-    kprintf(fails ? "[elf_test] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[elf_test] SELF-TEST FAILED\n"
                   : "[elf_test] SELF-TEST PASSED (phdr table + segment range bounds)\n");
 }
 #endif

@@ -1,4 +1,5 @@
 #include "virtio_net.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pci.h"
 #include "virtio_pci.h"   // shared virtio-PCI transport: caps, status bits, common_cfg, find_virtio_cap
 #include "vmm.h"
@@ -682,12 +683,12 @@ void virtio_desc_id_valid_selftest(void) {
     int fails = 0;
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         if (virtio_desc_id_valid(c[i].id) != c[i].want) {
-            kprintf("[virtio_descid] FAIL id=%lu got=%d want=%d\n",
+            kprintf_atomic("[virtio_descid] FAIL id=%lu got=%d want=%d\n",
                     (unsigned long)c[i].id, virtio_desc_id_valid(c[i].id), c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[virtio_descid] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[virtio_descid] SELF-TEST FAILED\n"
                   : "[virtio_descid] SELF-TEST PASSED (device desc-id bounds)\n");
 }
 
@@ -710,11 +711,11 @@ void virtio_rx_id_valid_selftest(void) {
     int fails = 0;
     for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
         if (virtio_rx_id_valid(c[i].id) != c[i].want) {
-            kprintf("[virtio_rxid] FAIL id=%lu got=%d want=%d\n",
+            kprintf_atomic("[virtio_rxid] FAIL id=%lu got=%d want=%d\n",
                     (unsigned long)c[i].id, virtio_rx_id_valid(c[i].id), c[i].want);
             fails++;
         }
     }
-    kprintf(fails ? "[virtio_rxid] SELF-TEST FAILED\n"
+    kprintf_atomic(fails ? "[virtio_rxid] SELF-TEST FAILED\n"
                   : "[virtio_rxid] SELF-TEST PASSED (rx-completion id bounded to populated buffers)\n");
 }
