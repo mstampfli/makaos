@@ -428,3 +428,47 @@ No feasible, in-scope bug remains: kernel self-tests pass, the desktop is verifi
 - 2026-07-02 - F200 (SWEEP 2 primitive-adoption audit, class g -- LAST adoption class): pci_find_cap adoption in hda FIXED an unbounded cap-walk DoS. F186 routed 6 MSI/MSI-X cap-walk sites (ahci x2, nvme, virtio_net x2, virtio_input) but SKIPPED hda; hda had the only two remaining hand-rolled 0x34-anchored walks in the tree, and BOTH used `while (cap) { ... cap = (dw>>8)&0xFC; }` with NO hop bound -- a cyclic PCI capability chain (cap A -> B -> A, craftable via a malicious/buggy device since `cap` is just a u8&0xFC with 64 possible values and no visited-set) spins the loop FOREVER at init -> boot-hang DoS. pci_find_cap (pci.h, F186) is the bounded 48-hop walk that fixes exactly this. FIXED both: (1) hda_init step 2 disable-MSI/MSI-X (was a single-pass walk disabling MSI 0x05 + MSI-X 0x11) -> two bounded pci_find_cap lookups (0x05 then 0x11), each doing the same per-cap disable write if found; (2) hda_init step 14 enable-MSI (was an unbounded search for 0x05, break on find) -> `cap = pci_find_cap(...,0x05); if (cap) { ...program addr/data at cap+4/+8/+12, enable at cap... }`. The per-driver MSI programming (the cap+N register writes) is UNCHANGED and stays per-driver (same boundary F186 set: adopt the FIND, keep the programming). Behavior-identical for a well-formed cap chain; bounded for a malformed one. Matches the ahci template (ahci.c uses pci_find_cap(...,0x11) + pci_find_cap(...,0x05) then programs). hda is now the 5th/last pci_find_cap adopter (virtio_input/hda/nvme/ahci/virtio_net). No other 0x34 cap walk remains in the tree. RUNTIME-VERIFIED: QEMU presents -device intel-hda, [initcall] hda runs -> hda_init passes pci_find and executes the bounded cap-walk live; clean boot (0 faults, reaches [evdev_ring]) proves pci_find_cap finds+programs the MSI cap without hanging or faulting. Built clean; 89 selftests PASSED, 0 FAILED/FAULT/PANIC/#PF/#GP; [hda_nodes] PASS + hda_init exercised; DHCP 10.0.2.15. SWEEP 2 adoption classes (b-g) COMPLETE; open follow-ups (vfs_anon_fd, elf_build_task+[task_init]) next.
 - 2026-07-02 - F201 (OPEN FOLLOW-UP 1): vfs_anon_fd(waitq) helper -- folded eventfd/signalfd/timerfd into the shared fd-alloc SSOT. F191/F192 routed ~25 fd-alloc sites through vfs_alloc_file() but SKIPPED these three because their poll/wake queue is an EXTERNAL field on the fd's state struct (f->waitq = &s->read_wq / &s->wq / &t->wq), not the file's embedded _waitq -- so each hand-rolled the kmalloc(vfs_file_t)+memset0+refcount=1 boilerplate. Extracted vfs_anon_fd(wait_queue_t* waitq) as the CORE allocator (kmalloc+zero+refcount=1, f->waitq = the external queue or NULL); vfs_alloc_file() now DELEGATES to vfs_anon_fd(NULL) then wires the embedded queue (waitq=&_waitq + wait_queue_init) -- so there is ONE kmalloc/zero/refcount mechanism and no drift. Routed all three _new() through vfs_anon_fd(&s->wq) (each already wait_queue_init's its external queue BEFORE the call, so the used queue is properly initialised; the file's embedded _waitq stays zeroed+unused exactly as before). eventfd keeps its secondary_waitq=&s->write_wq (POLLOUT) set after the alloc. Behavior-identical: no field wiring changed, only the boilerplate was centralised. The ~25 embedded-waitq vfs_alloc_file callers are UNCHANGED. NO bug found (all three were already correctly wired) -- pure DRY refactor. Built clean; 89 selftests PASSED, 0 FAILED/FAULT/PANIC/#PF/#GP; [eventfd-selftest] PASS (incl. poll + POLLOUT-wiring -> exercises f->waitq AND f->secondary_waitq) + [timerfd-selftest] + [timerfd_race] PASSED (concurrency storm on the external waitq) + [signalfd-selftest] PASS (poll wakeups) -> the external-waitq wiring is verified live; DHCP 10.0.2.15.
 - 2026-07-02 - F202 (OPEN FOLLOW-UP 2, LAST): elf_build_task() dedupe of elf_load / elf_load_with_argv + a new [task_init] selftest. F193 deferred this (exec-critical) pending a safety net; now landed WITH one. Read both functions in full: their task construction was BYTE-IDENTICAL for ~57 lines of task_t field init + the alloc/OOM/kstack/stack boilerplate; only THREE real differences (fd_table source, comm, r13 user RSP). Extracted `static task_t* elf_build_task(pml4, mm, pid, stdio, comm_name, entry, user_rsp)` capturing ALL the shared construction (kmalloc+memset0+OOM cleanup, task_mm_alloc, task_files_alloc, fd_table_init, the full field block, cred inherit, fxsave, kstack, comm basename, pledge/unveil, stack frame); the 3 differences are parameters. Unified cleanly because resolve_stdio(NULL,i) == tty_open(0) (elf_load passes stdio=NULL) and comm_name=NULL yields empty comm (elf_load) -- so BOTH callers collapse to elf_load_into [+ elf_setup_stack for argv] + one elf_build_task() call, behavior-IDENTICAL (no field wiring changed; verified the two old blocks matched line-for-line before extracting). elf_build_task takes ownership of pml4/mm and frees them (+ every partial resource) on any failure -- the OOM cleanup that both callers previously inlined identically. NO drift bug found (the two paths were already in sync -- the up-front memset0 the campaign added earlier is what kept them safe); pure refactor, but the exec-critical field init now has a real safety net. NEW [task_init] boot selftest (kernel/proc/elf.c, registered in main.c after [elf_test]): builds a task via elf_build_task with a fresh vmm_alloc_pml4+mm_create, asserts EVERY task_t field == expected initial value (pid/tgid/ppid=0/pgid/sid, state=READY, flags=0, all 8 list links NULL, mm_shared/files_shared/kstack_top/ctx.rsp non-null, fd_table[0..2] wired to tty0, the historically-drifting zeroed fields cleartid_addr/fs_base/wake_pending/last_ran_cpu/pf_disk/pf_cache/signalfd_head/on_cpu/syscall_a5-6/kthread_ctx, sigstate pending/blocked/frame + handlers[] all-zero, umask=022, exit_code=0, sleep_until_ns=0, mlfq 0, drm 0, cwd="/", comm empty, pledge=PLEDGE_ALL, and the two parameterised stack pushes r12=entry/r13=user_rsp at their known ctx.rsp offsets), then tears the task down (kstack_free + task_mm_release + task_files_release + kfree cwd + unveil_free + kfree, mirroring task_free_rcu). Gate count 89 -> 90. RUNTIME-VERIFIED both ways: [task_init] SELF-TEST PASSED + the LIVE exec path uses elf_build_task ([elf] lazy /bin/login + /bin/svcmgr demand-paged, [exec_mm] PASS, boot runs to completion). Built clean; 90 selftests PASSED, 0 FAILED/FAULT/PANIC/#PF/#GP; DHCP 10.0.2.15.
+
+## SWEEP 2 (PRIMITIVE-ADOPTION AUDIT) + FOLLOW-UPS COMPLETE (2026-07-02)
+
+Axis: not "what is duplicated" (that was sweep-1) but "where does code still
+hand-roll a check/op a built primitive already provides" -- one class per turn,
+each finding fixed-at-root or verified-clean, one commit/turn as mstampfli.
+
+Adoption classes (a-g):
+- F196 checked.h        -- AUDITED CLEAN (prior campaign guarded the real overflow
+                           sites w/ live selftests); + hardened elf argv/envp array
+                           sizing to u64 (latent footgun, not reachable).
+- F197 uaccess.h + ilist.h -- BOTH AUDITED CLEAN (every syscall-reachable user-ptr
+                           deref validates; every intrusive FIFO uses the macro);
+                           + page_align FIXED (8 shipped + 3 test open-codings routed
+                           to page_align_up/down).
+- F198 path_split       -- **FIXED a LATENT virtfs stack overflow** (hand-rolled
+                           dirname split wrote parent[last_slash]='\0' at an unbounded
+                           index past a 256B stack array; copy loop capped at 255 but
+                           the terminator did not). Fixed at root by promoting the
+                           bounded path_split SSOT to kstr.h + routing virtfs through
+                           it (also dropped the virtfs->ext2.h layering wart).
+- F199 kstr             -- ADOPTED (deleted 3 hand-rolled dups: unix_sock str_copy +
+                           ns_path_copy == str_lcpy, initcall ic_strcmp == str_eq;
+                           routed 6 sites). No overflow found; pure DRY.
+- F200 pci_find_cap     -- **FIXED an unbounded hda MSI cap-walk DoS** (two while(cap)
+                           loops with no hop cap -> a cyclic PCI capability chain hangs
+                           the boot at init). Adopted the bounded 48-hop pci_find_cap
+                           for both; hda was the last hand-rolled 0x34 walk.
+
+Open follow-ups:
+- F201 vfs_anon_fd      -- ADOPTED (extracted the external-waitq fd allocator;
+                           vfs_alloc_file delegates -> one mechanism; folded
+                           eventfd/signalfd/timerfd in). No bug; pure DRY.
+- F202 elf_build_task   -- ADOPTED (deduped elf_load / elf_load_with_argv's ~57-line
+                           identical task construction; 3 differences parameterised)
+                           LANDED WITH a new [task_init] selftest asserting every
+                           task_t field (gate 89 -> 90). No drift bug; the selftest is
+                           the exec-critical safety net.
+
+Net: 2 real bugs fixed at root (F198 virtfs stack overflow, F200 hda cap-walk DoS),
+3 clean audits (checked/uaccess/ilist), 5 clean adoptions (page_align, kstr,
+pci_find_cap, vfs_anon_fd, elf_build_task), 1 new safety-net selftest. Every unit
+built clean, gated (89 then 90 selftests, 0 faults, DHCP 10.0.2.15), committed +
+pushed as mstampfli. Campaign closed.
