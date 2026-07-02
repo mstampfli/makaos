@@ -281,44 +281,24 @@ int pipe_create(vfs_file_t** read_end, vfs_file_t** write_end) {
     p->reader_refs = 1;
     p->open_ends   = 2;   // read end + write end; last close frees p + both files
 
-    vfs_file_t* r = kmalloc(sizeof(vfs_file_t));
-    vfs_file_t* w = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* r = vfs_alloc_file();   // each: zeroed, waitq wired, refcount=1
+    vfs_file_t* w = vfs_alloc_file();
     if (!r || !w) {
         if (r) kfree(r);
         if (w) kfree(w);
         kfree(p);
         return -ENOMEM;
     }
-    __builtin_memset(r, 0, sizeof(*r));
-    __builtin_memset(w, 0, sizeof(*w));
+    r->read  = pipe_read;
+    r->close = pipe_read_close;
+    r->poll  = pipe_read_poll;
+    r->ioctl = pipe_ioctl;
+    r->ctx   = p;
 
-    r->read        = pipe_read;
-    r->write       = NULL;
-    r->seek        = NULL;
-    r->close       = pipe_read_close;
-    r->poll           = pipe_read_poll;
-    r->ioctl          = pipe_ioctl;
-    r->ctx            = p;
-    r->waitq           = &r->_waitq; wait_queue_init(r->waitq);
-    r->secondary_waitq = NULL;
-    r->flags          = 0;
-    r->refcount    = 1;
-    r->rights      = 0;
-    r->path[0]     = '\0';
-
-    w->read        = NULL;
-    w->write       = pipe_write;
-    w->seek        = NULL;
-    w->close       = pipe_write_close;
-    w->poll           = pipe_write_poll;
-    w->ioctl          = NULL;
-    w->ctx            = p;
-    w->waitq           = &w->_waitq; wait_queue_init(w->waitq);
-    w->secondary_waitq = NULL;
-    w->flags          = 0;
-    w->refcount    = 1;
-    w->rights      = 0;
-    w->path[0]     = '\0';
+    w->write = pipe_write;
+    w->close = pipe_write_close;
+    w->poll  = pipe_write_poll;
+    w->ctx   = p;
 
     p->read_file  = r;
     p->write_file = w;

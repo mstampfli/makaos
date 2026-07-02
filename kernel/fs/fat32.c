@@ -245,22 +245,11 @@ vfs_file_t* fat32_open(const char* name83) {
                 fd->file_size     = e->file_size;
                 fd->bytes_read    = 0;
 
-                vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
-                if (!f) { kfree(fd); return NULL; }   // OOM: guard the deref, free fd
-                __builtin_memset(f, 0, sizeof(*f));
-                f->read     = fat32_read;
-                f->write    = NULL;
-                f->close    = fat32_close;
-                f->seek     = NULL;
-                f->poll           = NULL;
-                f->ioctl          = NULL;
-                f->ctx            = fd;
-                f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-                f->secondary_waitq = NULL;
-                f->flags          = 0;
-                f->refcount    = 1;
-                f->rights   = 0;
-                f->path[0]  = '\0';
+                vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
+                if (!f) { kfree(fd); return NULL; }  // OOM: guard the deref, free fd
+                f->read  = fat32_read;
+                f->close = fat32_close;
+                f->ctx   = fd;
                 return f;
             }
         }

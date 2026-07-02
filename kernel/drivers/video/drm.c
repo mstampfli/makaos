@@ -1437,15 +1437,10 @@ static int drm_ioctl_prime_handle_to_fd(vfs_file_t* drm_f, uint64_t arg) {
     if (!find_dumb(c, a.handle)) return -ENOENT;
 
     // Allocate the PRIME vfs_file_t.
-    vfs_file_t* pf = (vfs_file_t*)kmalloc(sizeof(*pf));
+    vfs_file_t* pf = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!pf) return -ENOMEM;
-    __builtin_memset(pf, 0, sizeof(*pf));
-    pf->waitq = &pf->_waitq;
-    wait_queue_init(pf->waitq);
-    pf->secondary_waitq = NULL;
-    pf->close = drm_prime_close;
-    pf->refcount = 1;
-    pf->rights   = 0xFFFFFFFFu;
+    pf->close  = drm_prime_close;
+    pf->rights = 0xFFFFFFFFu;   // non-default: DRM PRIME fd carries all rights
 
     drm_prime_ctx_t* pc = (drm_prime_ctx_t*)kmalloc(sizeof(*pc));
     if (!pc) { kfree(pf); return -ENOMEM; }
@@ -2616,23 +2611,14 @@ vfs_file_t* vfs_drm_open(void) {
     c->next_dumb_handle = 1;
     c->next_fb_id       = 1;
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired (poll-ready), refcount=1
     if (!f) { kfree(c); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
-    // Initialize the poll waitq so epoll_ctl(ADD) on a DRM fd can
-    // register a watcher without dereferencing NULL.  vfs_file_init
-    // sets waitq = &_waitq + wait_queue_init; call it explicitly since
-    // we aren't going through the generic vfs_file_alloc path.
-    f->waitq = &f->_waitq;
-    wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
     f->ioctl    = drm_ioctl;
     f->read     = drm_read_op;
     f->poll     = drm_poll_op;
     f->close    = drm_close;
     f->ctx      = c;
-    f->refcount = 1;
-    f->rights   = 0xFFFFFFFFu;
+    f->rights   = 0xFFFFFFFFu;   // non-default: DRM fd carries all rights
     // Linux DRM major = 226, minor = 0 for card0.  Matches libudev's
     // advertised devnum so wlroots' fstat-then-udev cross-check
     // resolves.

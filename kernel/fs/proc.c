@@ -98,22 +98,12 @@ static vfs_file_t* membuf_open(uint8_t* buf, uint64_t size) {
     ctx->size = size;
     ctx->pos  = 0;
 
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(ctx); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
-    f->read     = membuf_read;
-    f->write    = NULL;  // read-only
-    f->close    = membuf_close;
-    f->seek     = membuf_seek;
-    f->poll           = NULL;
-    f->ioctl          = NULL;
-    f->ctx            = ctx;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0;
-    f->path[0]  = '\0';
+    f->read  = membuf_read;   // write stays NULL: read-only
+    f->close = membuf_close;
+    f->seek  = membuf_seek;
+    f->ctx   = ctx;
     return f;
 }
 

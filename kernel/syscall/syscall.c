@@ -5183,25 +5183,16 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     spin_lock_init(&state->lock);
     wait_queue_init(&state->wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(state->slots); kfree(state); return (uint64_t)-ENOMEM; }
-    __builtin_memset(f, 0, sizeof(*f));
-
-    f->read           = epoll_read;
-    f->write          = epoll_write;
-    f->close          = epoll_close;
-    f->seek           = epoll_seek;
-    f->poll           = epoll_poll;   // nested epoll: real readiness, not always-on
-    f->ioctl          = NULL;
-    f->ctx            = state;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    state->file_wq     = f->waitq;    // wake target for outer epolls (see epoll_we_t)
-    state->file        = f;           // for the RCU-deferred free (epoll_state_free_rcu)
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount       = 1;
-    f->rights         = 0;
-    f->path[0]        = '\0';
+    f->read  = epoll_read;
+    f->write = epoll_write;
+    f->close = epoll_close;
+    f->seek  = epoll_seek;
+    f->poll  = epoll_poll;   // nested epoll: real readiness, not always-on
+    f->ctx   = state;
+    state->file_wq = f->waitq;    // wake target for outer epolls (factory set waitq=&_waitq)
+    state->file    = f;           // for the RCU-deferred free (epoll_state_free_rcu)
 
     int64_t efd = fd_install(f);
     if (efd < 0) { epoll_close(f); return (uint64_t)(int64_t)efd; }
@@ -5314,14 +5305,10 @@ void epoll_watch_refcount_selftest(void) {
 
     // A heap vfs_file_t with an embedded waitq + refcount 1 -- the UAF-prone
     // shape (its waitq memory would be freed on the last vfs_close).
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kprintf("[epoll_pin] FAIL alloc\n");
               kprintf("[epoll_pin] SELF-TEST FAILED\n"); return; }
-    __builtin_memset(f, 0, sizeof(*f));
-    f->waitq = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->close    = ep_test_file_close;
-    f->refcount = 1;
+    f->close = ep_test_file_close;
 
     epoll_state_t st;
     __builtin_memset(&st, 0, sizeof(st));

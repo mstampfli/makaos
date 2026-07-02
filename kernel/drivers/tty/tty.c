@@ -449,24 +449,14 @@ vfs_file_t* tty_open(int idx) {
     if (!ctx) return NULL;
     ctx->tty = tty;
 
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(ctx); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
-
-    f->read     = tty_vfs_read;
-    f->write    = tty_vfs_write;
-    f->close    = tty_vfs_close;
-    f->seek     = NULL;   // ttys are not seekable
-    f->poll           = tty_vfs_poll;
-    f->ioctl          = NULL;  // tty0 ioctl handled by sys_ioctl fallback
-    f->ctx            = ctx;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = &tty->waitq;  // woken by ldisc when data arrives
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0;   // device fd: no rights enforcement (checked as open by kernel)
-    f->path[0]  = '\0';
-
+    f->read  = tty_vfs_read;
+    f->write = tty_vfs_write;
+    f->close = tty_vfs_close;
+    f->poll  = tty_vfs_poll;
+    f->ctx   = ctx;
+    f->secondary_waitq = &tty->waitq;  // non-default: woken by ldisc when data arrives
     return f;
 }
 

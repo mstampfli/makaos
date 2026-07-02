@@ -530,23 +530,13 @@ vfs_file_t* evdev_open_device(uint32_t event_nr) {
     c->dev      = d;
     c->clock_id = CLOCK_MONOTONIC_ID;
 
-    vfs_file_t* f = kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(c); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
-    f->read   = evdev_vfs_read;
-    f->write  = NULL;
-    f->close  = evdev_vfs_close;
-    f->seek   = NULL;
-    f->poll   = evdev_vfs_poll;
-    f->ioctl  = evdev_vfs_ioctl;
-    f->ctx    = c;
-    f->waitq  = &f->_waitq;
-    wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags    = 0;
-    f->refcount = 1;
-    f->rights   = 0;
-    f->path[0]  = '\0';
+    f->read  = evdev_vfs_read;
+    f->close = evdev_vfs_close;
+    f->poll  = evdev_vfs_poll;
+    f->ioctl = evdev_vfs_ioctl;
+    f->ctx   = c;
     // Linux input device major = 13, minor = 64 + event_nr.  Matches
     // what our libudev advertises via s_devices[] and what libinput's
     // fstat-then-udev_device_new_from_devnum cross-check expects.

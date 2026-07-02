@@ -411,23 +411,14 @@ void shmem_fd_close(vfs_file_t* self) {
 
 vfs_file_t* shmem_fd_create(shmem_t* shm) {
     if (!shm) return NULL;
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) return NULL;
-    __builtin_memset(f, 0, sizeof(*f));
 
-    f->read     = shmem_fd_read;
-    f->write    = shmem_fd_write;
-    f->close    = shmem_fd_close;
-    f->seek     = NULL;
-    f->poll           = NULL;
-    f->ioctl          = NULL;
-    f->ctx            = shm;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0xFFFFFFFF; // all rights — narrowed by restrict_fd if needed
-    f->path[0]  = '\0';
+    f->read  = shmem_fd_read;
+    f->write = shmem_fd_write;
+    f->close = shmem_fd_close;
+    f->ctx   = shm;
+    f->rights = 0xFFFFFFFF;   // non-default: all rights, narrowed by restrict_fd if needed
 
     shmem_ref(shm); // fd owns a reference
     return f;

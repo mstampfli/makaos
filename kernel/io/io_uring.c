@@ -309,7 +309,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
 
     // Allocate vfs_file_t for fd installation.  Uses kheap so the
     // caller can later fd_install it.
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) {
         // Teardown: user mapping, backing, uring.  The user VMA is
         // leaked for now (mm cleanup on task exit will free it).
@@ -317,15 +317,11 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
         pmm_buddy_free(phys, order);
         return NULL;
     }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = ring_read_stub;
     f->write = ring_write_stub;
     f->close = io_uring_close_file;
     f->ctx   = uring;
-    f->waitq = &f->_waitq;
-    wait_queue_init(&f->_waitq);
-    f->refcount = 1;
-    f->rights   = 0xFFFFFFFFu;
+    f->rights   = 0xFFFFFFFFu;   // non-default: io_uring fd carries all rights
 
     // Phase 8F: spawn SQPOLL kthread if requested.  The poller shares
     // the owner's mm + files so it can touch user buffers and fds.

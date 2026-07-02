@@ -644,25 +644,17 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     if (!mctx) { pty_free_struct(pty); return -12; } // ENOMEM
     mctx->pty = pty;
 
-    vfs_file_t* master = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* master = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!master) { kfree(mctx); pty_free_struct(pty); return -12; }
-    __builtin_memset(master, 0, sizeof(*master));
-
     master->read        = pty_master_read;
     master->write       = pty_master_write;
     master->close       = pty_master_close;
-    master->seek        = NULL;
     master->poll        = pty_master_poll;
     master->ioctl       = pty_master_ioctl;
     master->ctx         = mctx;
-    master->waitq           = &master->_waitq; wait_queue_init(master->waitq);
-    wait_queue_init(&pty->master_waitq);
+    wait_queue_init(&pty->master_waitq);        // pty-struct queues (not the vfs waitq)
     wait_queue_init(&pty->slave_drain_waitq);
-    master->secondary_waitq = &pty->master_waitq;  // woken by pty_master_push
-    master->flags       = 0;
-    master->refcount    = 1;
-    master->rights      = 0;
-    master->path[0]     = '\0';
+    master->secondary_waitq = &pty->master_waitq;  // non-default: woken by pty_master_push
 
     pty->master_file = master;  // kept for master close detection (slave EIO path)
 
@@ -671,26 +663,18 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     if (!sctx) { kfree(mctx); kfree(master); pty_free_struct(pty); return -12; }
     sctx->pty = pty;
 
-    vfs_file_t* slave = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* slave = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_struct(pty); return -12; }
-    __builtin_memset(slave, 0, sizeof(*slave));
-
     slave->read     = pty_slave_read;
     slave->write    = pty_slave_write;
     slave->close    = pty_slave_close;
-    slave->seek     = NULL;
     slave->poll     = pty_slave_poll;
-    slave->ioctl       = pty_slave_ioctl;
-    slave->ctx         = sctx;
-    slave->waitq           = &slave->_waitq; wait_queue_init(slave->waitq);
-    wait_queue_init(&pty->slave.waitq);
+    slave->ioctl    = pty_slave_ioctl;
+    slave->ctx      = sctx;
+    wait_queue_init(&pty->slave.waitq);         // pty-struct queue (not the vfs waitq)
     spin_lock_init(&pty->slave.lock);  // ldisc lock for the slave's ring + line buf
     spin_lock_init(&pty->master_lock); // serialises the master-output ring head/tail
-    slave->secondary_waitq = &pty->slave.waitq;  // woken by ldisc when data arrives
-    slave->flags       = 0;
-    slave->refcount    = 1;
-    slave->rights      = 0;
-    slave->path[0]     = '\0';
+    slave->secondary_waitq = &pty->slave.waitq;  // non-default: woken by ldisc when data arrives
 
     // Publish into the live PTY list now that the pair is fully built (head
     // insert under the lock; pairs with pty_unlink_locked on the close path).
