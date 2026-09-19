@@ -1,0 +1,31 @@
+[auto-repro] killing stale qemu + gdb + socat
+[auto-repro] launching QEMU (VNC display on :99, QMP + gdb stub)
+[auto-repro] waiting for QMP socket
+[auto-repro] waiting for /bin/login to load (boot done)
+[auto-repro] attaching GDB on kill: breakpoint (bg)
+[debug-pf] waiting for QEMU gdb stub on :1234 ...
+[debug-pf] attaching; breakpoint armed.  Log: /tmp/gdb-pf.log
+kmain () at kernel/main.c:650
+650	    for (;;)
+add symbol table from file "build/sysroot/usr/bin/dwl" at
+	.text_addr = 0x400000
+Breakpoint 1 at 0xffffffff8000c0e1: file kernel/mm/vmm.c, line 878.
+[py] login: typing 'root' + Enter
+[py] login: typing 'toor' + Enter
+[py] launching: typing 'dwl -s foot' + Enter
+[py] waiting 8s for dwl to come up
+[py] trigger #1: Alt+Shift+Return
+[py] trigger #2: Alt+Shift+Return (second attempt, in case dwl missed)
+[py] done
+[auto-repro] report:
+[auto-repro]   bash loaded:      1
+[auto-repro]   dwl loaded:       1
+[auto-repro]   foot loaded:      1
+[auto-repro]   serial PF-KILL:   0
+0
+[auto-repro]   gdb capture:      0
+0
+[auto-repro]   QEMU pid: 361276   (pkill qemu-system-x86 to stop)
+Cannot execute this command while the target is running.
+Use the "interrupt" command to stop the target
+and then try again.

@@ -1,0 +1,21 @@
+FC BUILD FAILED
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcstr.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcstr.c:87:10: fatal error: ../fc-case/fccase.h: No such file or directory
+   87 | #include "../fc-case/fccase.h"
+      |          ^~~~~~~~~~~~~~~~~~~~~
+compilation terminated.

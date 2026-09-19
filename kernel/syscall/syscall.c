@@ -328,6 +328,15 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
+        uint8_t match_ptmx   = (dev[0]=='p' && dev[1]=='t' && dev[2]=='m'
+                             && dev[3]=='x' && dev[4]=='\0');
+        int match_ptsn = -1;
+        if (dev[0]=='p' && dev[1]=='t' && dev[2]=='s' && dev[3]=='/'
+            && dev[4]>='0' && dev[4]<='9') {
+            int n=0, i=4;
+            while (dev[i]>='0' && dev[i]<='9') { n=n*10+(dev[i]-'0'); i++; }
+            if (dev[i]=='\0') match_ptsn = n;
+        }
         if      (match_tty)    f = tty_open(0);
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
@@ -340,6 +349,18 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_null)   f = vfs_null_open();
         else if (match_zero)   f = vfs_zero_open();
         else if (match_urnd)   f = vfs_urandom_open();
+        else if (match_ptmx)   {
+            extern int pty_open_ptmx(vfs_file_t** master);
+            vfs_file_t* m = NULL;
+            int pr = pty_open_ptmx(&m);
+            if (pr < 0) return (uint64_t)(int64_t)pr;
+            f = m;
+        }
+        else if (match_ptsn >= 0) {
+            extern vfs_file_t* pty_open_pts_slave(int index);
+            f = pty_open_pts_slave(match_ptsn);
+            if (!f) return (uint64_t)-ENOENT;
+        }
         else return (uint64_t)-ENOENT;
         // fall through to got_file
     }
@@ -4858,9 +4879,13 @@ typedef struct k_cmsghdr {
 
 extern int         unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len);
 extern int         unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len);
+extern int         unix_sock_recv_flags(vfs_file_t* f, void* buf, uint32_t len, int flags);
 extern int         unix_sock_sendfd(vfs_file_t* s, vfs_file_t* f, uint32_t r);
 extern vfs_file_t* unix_sock_recvfd(vfs_file_t* s);
+extern vfs_file_t* unix_sock_recvfd_nowait(vfs_file_t* s);
 extern int         is_unix_sock(vfs_file_t* f);
+
+#define MSG_DONTWAIT_FLAG 0x40   /* per-call O_NONBLOCK override for recvmsg */
 
 static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
@@ -4940,10 +4965,17 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
 
 static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
                                 uint64_t flags, uint64_t d) {
-    (void)flags; (void)d;
+    (void)d;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
     vfs_file_t* sock = fd_to_file(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+
+    /* MSG_DONTWAIT → per-call O_NONBLOCK.  dwl's epoll loop fires
+     * recvmsg with MSG_DONTWAIT expecting EAGAIN when the peer has no
+     * data queued; without this we block forever in the unix socket
+     * recv path and the compositor never re-enters epoll_wait. */
+    int recv_nonblock = (flags & MSG_DONTWAIT_FLAG) ? O_NONBLOCK : 0;
+    int sock_is_unix  = is_unix_sock(sock);
 
     k_msghdr_t mh;
     if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
@@ -4961,7 +4993,7 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
         if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
         while (n_inst < max_fds) {
-            vfs_file_t* rf = unix_sock_recvfd(sock);
+            vfs_file_t* rf = unix_sock_recvfd_nowait(sock);
             if (!rf) break;
             int64_t new_fd = fd_install(rf);
             if (new_fd < 0) { vfs_close(rf); break; }
@@ -4998,7 +5030,13 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
             if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
-            int r = sock->read(sock, bounce, chunk);
+            int r;
+            if (sock_is_unix) {
+                r = unix_sock_recv_flags(sock, bounce, (uint32_t)chunk,
+                                          recv_nonblock);
+            } else {
+                r = sock->read(sock, bounce, chunk);
+            }
             if (r < 0) {
                 // First read returning an error propagates; a later
                 // partial read returns bytes already gathered.

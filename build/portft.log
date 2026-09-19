@@ -1,0 +1,40 @@
+[port-freetype] installing headers into /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/freetype2
+[port-freetype] compiling 42 freetype sources with /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/truetype/truetype.c:22:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/truetype/ttgload.c: In function 'load_truetype_glyph':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/truetype/ttgload.c:1506:22: warning: storing the address of local variable 'inc_stream' in '*loader.stream' [-Wdangling-pointer=]
+ 1506 |       loader->stream = &inc_stream;
+      |       ~~~~~~~~~~~~~~~^~~~~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/truetype/ttgload.c:1439:21: note: 'inc_stream' declared here
+ 1439 |     FT_StreamRec    inc_stream;
+      |                     ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/truetype/ttgload.c:1425:35: note: 'loader' declared here
+ 1425 |   load_truetype_glyph( TT_Loader  loader,
+      |                        ~~~~~~~~~~~^~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/smooth.c:21:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c: In function 'gray_convert_glyph':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1886:20: warning: storing the address of local variable 'buffer' in '*worker.ycells' [-Wdangling-pointer=]
+ 1886 |     ras.ycells     = (PCell*)buffer;
+      |                    ^
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1868:14: note: 'buffer' declared here
+ 1868 |     TCell    buffer[FT_MAX_GRAY_POOL];
+      |              ^~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:316:33: note: 'worker' declared here
+  316 | #define RAS_ARG   gray_PWorker  worker
+      |                   ~~~~~~~~~~~~~~^~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1866:23: note: in expansion of macro 'RAS_ARG'
+ 1866 |   gray_convert_glyph( RAS_ARG )
+      |                       ^~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1879:26: warning: storing the address of local variable 'buffer' in '*worker.cell_null' [-Wdangling-pointer=]
+ 1879 |     ras.cell_null        = buffer + FT_MAX_GRAY_POOL - 1;
+      |                          ^
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1868:14: note: 'buffer' declared here
+ 1868 |     TCell    buffer[FT_MAX_GRAY_POOL];
+      |              ^~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:316:33: note: 'worker' declared here
+  316 | #define RAS_ARG   gray_PWorker  worker
+      |                   ~~~~~~~~~~~~~~^~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/freetype-2.13.3/src/smooth/ftgrays.c:1866:23: note: in expansion of macro 'RAS_ARG'
+ 1866 |   gray_convert_glyph( RAS_ARG )
+      |                       ^~~~~~~
+[port-freetype] done — 1011554 bytes → /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/lib/libfreetype.a

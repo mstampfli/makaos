@@ -714,19 +714,18 @@ int unix_sock_send(vfs_file_t* f, const void* buf, uint32_t len) {
 
 // ── unix_sock_recv ───────────────────────────────────────────────────────
 
-int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
+int unix_sock_recv_flags(vfs_file_t* f, void* buf, uint32_t len, int flags) {
     if (!f || !buf || !len) return -EINVAL;
     unix_sock_t* s = (unix_sock_t*)f->ctx;
     if (!s) return -EBADF;
     if (s->shutdown_rd) return 0; // EOF
 
+    int nonblock = (flags & O_NONBLOCK) || (f->flags & O_NONBLOCK);
+
     if (s->type == SOCK_STREAM) {
-        // Block until data available or peer disconnects.  Canonical
-        // Phase 9-6 pattern; commit-before-wake on the peer's send
-        // side (unix_sock_send calls unix_wake(peer) after cbuf_write).
         if (s->buf_count == 0) {
             if (s->state == UNIX_STATE_DISCONNECTED) return 0; // EOF
-            if (f->flags & O_NONBLOCK) return -EAGAIN;
+            if (nonblock) return -EAGAIN;
             WAIT_EVENT_HOOK(&s->waitq,
                             s->buf_count != 0
                                 || s->state == UNIX_STATE_DISCONNECTED,
@@ -748,7 +747,7 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
     // SOCK_DGRAM: dequeue one message.
     if (!s->dgram_head) {
         if (s->state == UNIX_STATE_DISCONNECTED) return 0;
-        if (f->flags & O_NONBLOCK) return -EAGAIN;
+        if (nonblock) return -EAGAIN;
         WAIT_EVENT_HOOK(&s->waitq,
                         s->dgram_head != NULL
                             || s->state == UNIX_STATE_DISCONNECTED,
@@ -769,6 +768,10 @@ int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
 
     kfree(msg);
     return (int)copy;
+}
+
+int unix_sock_recv(vfs_file_t* f, void* buf, uint32_t len) {
+    return unix_sock_recv_flags(f, buf, len, 0);
 }
 
 // ── unix_sock_sendto (SOCK_DGRAM) ───────────────────────────────────────
@@ -897,5 +900,22 @@ vfs_file_t* unix_sock_recvfd(vfs_file_t* sock) {
     anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
     anc->count--;
 
+    return file;
+}
+
+/* Non-blocking variant for the SCM_RIGHTS drain in sys_recvmsg.
+ * recvmsg must not hang on "waiting for more fds" after draining the
+ * queue — it's a concurrent inbox read, not a blocking receive. */
+vfs_file_t* unix_sock_recvfd_nowait(vfs_file_t* sock) {
+    if (!sock) return NULL;
+    unix_sock_t* s = (unix_sock_t*)sock->ctx;
+    if (!s) return NULL;
+    unix_ancillary_t* anc = &s->ancillary;
+    if (anc->count == 0) return NULL;
+    uint8_t idx = anc->head;
+    vfs_file_t* file = anc->files[idx];
+    anc->files[idx] = NULL;
+    anc->head = (anc->head + 1) % UNIX_ANCILLARY_MAX;
+    anc->count--;
     return file;
 }

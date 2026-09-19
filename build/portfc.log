@@ -1,0 +1,299 @@
+[port-fc] installing headers into /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/fontconfig
+[port-fc] compiling 28 fontconfig sources with /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/bin/x86_64-pc-makaos-gcc
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccache.c:23:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccache.c: In function 'lock_cache':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccache.c:498:13: warning: passing argument 1 of 'free' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+  498 |       free (lock);
+      |             ^~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:34:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/stdlib.h:17:18: note: expected 'void *' but argument is of type 'volatile FcMutex *' {aka 'volatile int *'}
+   17 | void  free(void* ptr);
+      |            ~~~~~~^~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccache.c: In function 'free_lock':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccache.c:525:11: warning: passing argument 1 of 'free' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+  525 |     free (lock);
+      |           ^~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/stdlib.h:17:18: note: expected 'void *' but argument is of type 'volatile FcMutex *' {aka 'volatile int *'}
+   17 | void  free(void* ptr);
+      |            ~~~~~~^~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcatomic.c:54:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcatomic.c:51:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccfg.c:27:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccfg.c: In function 'lock_config':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccfg.c:57:19: warning: passing argument 1 of 'free' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+   57 |             free (lock);
+      |                   ^~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:34:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/stdlib.h:17:18: note: expected 'void *' but argument is of type 'volatile FcMutex *' {aka 'volatile int *'}
+   17 | void  free(void* ptr);
+      |            ~~~~~~^~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccfg.c: In function 'free_lock':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccfg.c:84:15: warning: passing argument 1 of 'free' discards 'volatile' qualifier from pointer target type [-Wdiscarded-qualifiers]
+   84 |         free (lock);
+      |               ^~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/include/stdlib.h:17:18: note: expected 'void *' but argument is of type 'volatile FcMutex *' {aka 'volatile int *'}
+   17 | void  free(void* ptr);
+      |            ~~~~~~^~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccharset.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccharset.c: In function 'FcCharSetPutLeaf':
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccharset.c:202:18: warning: pointer 'leaves' may be used after 'realloc' [-Wuse-after-free]
+  202 |         distance = (char *) new_leaves - (char *) leaves;
+      |         ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccharset.c:187:22: note: call to 'realloc' here
+  187 |         new_leaves = realloc (leaves, alloced * sizeof (*leaves));
+      |                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fccompat.c:28:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcdbg.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcdefault.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcdir.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcformat.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcfreetype.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcfs.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcptrlist.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fchash.c:22:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcinit.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcinit.c:29:9: note: '#pragma message: Could not find any system to define atomic_int macros, library may NOT be thread-safe.'
+   29 | #pragma message("Could not find any system to define atomic_int macros, library may NOT be thread-safe.")
+      |         ^~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcinit.c:35:9: note: '#pragma message: To suppress these warnings, define FC_NO_MT.'
+   35 | #pragma message("To suppress these warnings, define FC_NO_MT.")
+      |         ^~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fclang.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fclist.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcmatch.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcmatrix.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcname.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcobjs.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcpat.c:23:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcrange.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcserialize.c:23:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcstat.c:23:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcstr.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcweight.c:23:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcxml.c:25:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:50,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/ftglue.h:46,
+                 from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/ftglue.c:11:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/fontconfig/fontconfig.h:58:9: warning: "FC_VERSION" redefined
+   58 | #define FC_VERSION      ((FC_MAJOR * 10000) + (FC_MINOR * 100) + (FC_REVISION))
+      |         ^~~~~~~~~~
+In file included from /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/src/fcint.h:29:
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/third_party/fontconfig-2.15.0/config.h:16:9: note: this is the location of the previous definition
+   16 | #define FC_VERSION               "2.15.0"
+      |         ^~~~~~~~~~
+[port-fc] done — 519242 bytes → /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/lib/libfontconfig.a

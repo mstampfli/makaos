@@ -256,6 +256,19 @@ static uint64_t s_heap_start = 0;
 static uint64_t s_heap_end   = 0;
 static block_hdr_t* s_free_list = NULL;
 
+/* Serialise malloc/free/realloc. Multi-threaded foot/wlroots race the
+ * bump allocator and corrupt each other's block headers, cascading
+ * into kernel #PF on subsequent user→kernel pointer dereferences. */
+static volatile unsigned int s_heap_lock = 0;
+static inline void heap_lock(void) {
+    while (__atomic_exchange_n(&s_heap_lock, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&s_heap_lock, __ATOMIC_RELAXED))
+            __asm__ volatile("pause");
+}
+static inline void heap_unlock(void) {
+    __atomic_store_n(&s_heap_lock, 0, __ATOMIC_RELEASE);
+}
+
 static int heap_grow(size_t need) {
     size_t new_end = s_heap_end + need + 4096;
     new_end = (new_end + 4095u) & ~4095u;
@@ -300,7 +313,7 @@ void* malloc(size_t size) {
     if (!size) size = 1; // POSIX: malloc(0) returns a unique valid pointer
     size = ALIGN8(size);
 
-    // Search free list for a fitting block.
+    heap_lock();
     block_hdr_t** pp = &s_free_list;
     while (*pp) {
         block_hdr_t* b = *pp;
@@ -308,12 +321,14 @@ void* malloc(size_t size) {
             *pp = b->next_free;
             b->free = 0;
             b->next_free = NULL;
+            heap_unlock();
             return (uint8_t*)b + HDR_SIZE;
         }
         pp = &b->next_free;
     }
 
     block_hdr_t* hdr = heap_alloc_raw(size);
+    heap_unlock();
     if (!hdr) return NULL;
     return (uint8_t*)hdr + HDR_SIZE;
 }
@@ -321,10 +336,12 @@ void* malloc(size_t size) {
 void free(void* ptr) {
     if (!ptr) return;
     block_hdr_t* hdr = (block_hdr_t*)((uint8_t*)ptr - HDR_SIZE);
-    if (hdr->magic != BLOCK_MAGIC || hdr->free) return;
+    heap_lock();
+    if (hdr->magic != BLOCK_MAGIC || hdr->free) { heap_unlock(); return; }
     hdr->free = 1;
     hdr->next_free = s_free_list;
     s_free_list = hdr;
+    heap_unlock();
 }
 
 void* realloc(void* ptr, size_t new_size) {

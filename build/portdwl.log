@@ -1,0 +1,18 @@
+[port-dwl] dwl already patched
+In function 'createmon',
+    inlined from 'createmon' at dwl.c:974:1:
+dwl.c:1004:25: warning: 'strncpy' specified bound 16 equals destination size [-Wstringop-truncation]
+ 1004 |                         strncpy(m->ltsymbol, m->lt[m->sellt]->symbol, LENGTH(m->ltsymbol));
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+dwl.c: In function 'arrange.part.0':
+dwl.c:503:9: warning: 'strncpy' specified bound 16 equals destination size [-Wstringop-truncation]
+  503 |         strncpy(m->ltsymbol, m->lt[m->sellt]->symbol, LENGTH(m->ltsymbol));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+dwl.c: In function 'setlayout':
+dwl.c:2365:9: warning: 'strncpy' specified bound 16 equals destination size [-Wstringop-truncation]
+ 2365 |         strncpy(selmon->ltsymbol, selmon->lt[selmon->sellt]->symbol, LENGTH(selmon->ltsymbol));
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: warning: _popcountsi2.o: missing .note.GNU-stack section implies executable stack
+/home/maka/dev/MakaOS/bootloader-kernel-in-NASM/toolchain/lib/gcc/x86_64-pc-makaos/14.2.0/../../../../x86_64-pc-makaos/bin/ld: NOTE: This behaviour is deprecated and will be removed in a future version of the linker
+[port-dwl] dwl.elf: 4594232 bytes
+[port-dwl] done — /home/maka/dev/MakaOS/bootloader-kernel-in-NASM/build/sysroot/usr/bin/dwl

@@ -445,6 +445,13 @@ static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg
         case 0x540D: // TIOCEXCL
         case 0x540A: // TIOCNXCL
             return 0;
+        case 0x80045430: { // TIOCGPTN — libc ptsname queries slave idx
+            uint32_t* out = (uint32_t*)arg;
+            *out = (uint32_t)ctx->pty->index;
+            return 0;
+        }
+        case 0x40045431:   // TIOCSPTLCK — slave is already unlocked
+            return 0;
         default:
             return -22; // EINVAL
     }
@@ -628,4 +635,36 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
     *master_out = master;
     *slave_out = slave;
     return 0;
+}
+
+/* /dev/ptmx open → allocate pair, return master only.  Slave lives on
+ * the pty_t and is opened via /dev/pts/<index>. */
+int pty_open_ptmx(vfs_file_t** master_out) {
+    vfs_file_t* m = NULL;
+    vfs_file_t* s = NULL;
+    int r = pty_alloc(&m, &s);
+    if (r < 0) return r;
+
+    pty_t* pty = (pty_t*)(((pty_slave_ctx_t*)s->ctx)->pty);
+    /* Stash slave on a well-known field so /dev/pts/<N> can find it.
+     * pty_alloc set slave_open_count=1 for sys_openpty callers; rebalance
+     * to 0 here so pty_open_pts_slave can transition 0→1 on first open. */
+    pty->slave_file = s;
+    pty->slave_open_count = 0;
+    s->refcount = 0;
+
+    *master_out = m;
+    return 0;
+}
+
+/* /dev/pts/<index> open → look up stashed slave and bump refcount. */
+vfs_file_t* pty_open_pts_slave(int index) {
+    for (pty_t* p = s_pty_head; p; p = p->next) {
+        if (p->index == index && p->slave_file && p->master_open) {
+            __atomic_fetch_add(&p->slave_file->refcount, 1u, __ATOMIC_ACQ_REL);
+            __atomic_fetch_add((int*)&p->slave_open_count, 1, __ATOMIC_ACQ_REL);
+            return p->slave_file;
+        }
+    }
+    return NULL;
 }

@@ -31,6 +31,8 @@ static const dev_node_t s_dev_nodes[] = {
     { "input/event1",  0, 0, 0660, FS_TYPE_CHAR },
     { "dri",           0, 0, 0755, FS_TYPE_DIR  },
     { "dri/card0",     0, 0, 0660, FS_TYPE_CHAR },
+    { "ptmx",          0, 0, 0666, FS_TYPE_CHAR },
+    { "pts",           0, 0, 0755, FS_TYPE_DIR  },
     { NULL, 0, 0, 0, 0 }
 };
 
@@ -113,6 +115,17 @@ static int virt_resolve(const char* path, const virtmount_t* m,
 
     // /dev/<node>
     if (s_streq(m->prefix, "/dev")) {
+        /* /dev/pts/<N>: dynamic pty slave — validated by open dispatcher. */
+        if (node_name[0]=='p' && node_name[1]=='t' && node_name[2]=='s'
+            && node_name[3]=='/' && node_name[4]>='0' && node_name[4]<='9') {
+            int i = 4;
+            while (node_name[i]>='0' && node_name[i]<='9') i++;
+            if (node_name[i] == '\0') {
+                *out_uid = 0; *out_gid = 0;
+                *out_mode = 0620; *out_type = FS_TYPE_CHAR;
+                return 0;
+            }
+        }
         const dev_node_t* dn = dev_find_node(node_name);
         if (!dn) return -ENOENT;
         *out_uid  = dn->uid;

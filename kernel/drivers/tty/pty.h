@@ -35,6 +35,7 @@ typedef struct pty {
     uint32_t     m_head;                        // master ring head (write position)
     uint32_t     m_tail;                        // master ring tail (read position)
     struct vfs_file_t* master_file;             // back-pointer for master poll wakeups
+    struct vfs_file_t* slave_file;              // stashed slave for /dev/pts/<N> open — NULL for sys_openpty pairs
     wait_queue_t master_waitq;                  // wait queue for master-side
                                                 // blocking reads + poll/epoll
     wait_queue_t slave_drain_waitq;             // wait queue for slave-side writers
@@ -50,6 +51,12 @@ typedef struct pty {
 // Caller installs them into the fd table.
 // Returns 0 on success, -errno on failure.
 int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out);
+
+// POSIX ptmx entry — allocate pair, return master only; slave reached via /dev/pts/<index>.
+int pty_open_ptmx(vfs_file_t** master_out);
+
+// POSIX pts/<N> entry — look up stashed slave vfs by index, bump refcount.
+vfs_file_t* pty_open_pts_slave(int index);
 
 // Called by slave's write_char to push output to master's read buffer.
 void pty_master_push(pty_t* pty, uint8_t c);
