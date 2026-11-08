@@ -7,7 +7,7 @@ notes are in `PHASE4_REDESIGN.md` (Phase 4 is landed).
 
 ## What MakaOS is
 
-A from-scratch x86_64 SMP kernel booting via UEFI. NASM bootloader, C
+A from-scratch x86_64 SMP kernel booting via UEFI. C UEFI bootloader, C
 kernel, userspace with bash 5.2 linked in, custom init (login + svcmgr),
 ext2, virtio-net, NVMe + AHCI, full TCP/IP stack. Competes with Linux as
 the design target — performance and scalability are hard constraints.
@@ -15,7 +15,7 @@ the design target — performance and scalability are hard constraints.
 ## What works today — verified
 
 ### Boot path
-- UEFI → NASM bootloader → kernel entry → BSS clear → serial → CPU feature
+- UEFI → BOOTX64.EFI → kernel entry → BSS clear → serial → CPU feature
   setup (NXE, PAT, SSE/SSE2, XSAVE) → early initcalls → timers → scheduler
   → subsys initcalls → login + svcmgr spawn.
 - All 4 APs come online via ACPI MADT + real-mode trampoline; scheduler

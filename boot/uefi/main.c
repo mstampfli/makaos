@@ -1,7 +1,7 @@
 /*
  * MakaOS UEFI Bootloader
  *
- * Replaces boot1.asm + boot2.asm + kernelLoader entirely.
+ * The only boot path (the old BIOS boot1/boot2 + kernelLoader chain is gone).
  * Compiled as a freestanding PE32+ executable for x86_64 UEFI.
  *
  * Flow:

@@ -9,8 +9,7 @@ wlroots/Wayland desktop stack, all booted and tested in QEMU.
 **Boot**
 - UEFI/OVMF boot (`boot/uefi`): a `BOOTX64.EFI` (clang COFF) collects the E820
   memory map and GOP framebuffer, installs a higher-half mapping, and hands off
-  to the kernel. A legacy second-stage C loader (`kernelLoader/`) with its own
-  AHCI/PMM/VMM is kept in-tree as well.
+  to the kernel. UEFI is the only boot path.
 
 **Kernel** (`kernel/`)
 - 4-way **SMP**: per-CPU runqueues, an MLFQ scheduler over a Chase-Lev
@@ -44,8 +43,7 @@ wlroots/Wayland desktop stack, all booted and tested in QEMU.
 ## Repository layout
 
 ```
-boot/           UEFI bootloader (boot/uefi) + early boot assets
-kernelLoader/   Legacy second-stage C loader (AHCI/ATA, early PMM/VMM)
+boot/           UEFI bootloader (boot/uefi -> BOOTX64.EFI)
 kernel/         mm, proc/sched, syscalls, signals, VFS/ext2, net stack,
                 drivers (AHCI / NVMe / virtio-gpu/-net/-input / HDA / PS-2)
 userland/       libc, pthreads, and apps; bash as /bin/sh

@@ -54,7 +54,7 @@ Current major subsystems and their public headers:
   inheritance.
 - **`kernel/ipc/`** — pipes, signals (including SIGPIPE delivery).
 - **`kernel/drivers/`** — hardware drivers.
-- **`boot/`** — NASM bootloader and early-boot C.
+- **`boot/`** — UEFI bootloader (`boot/uefi`, C, built as `BOOTX64.EFI`).
 
 **Dependencies** follow the general DAG rule (see `PRINCIPLES.md` §3).
 Notable constraints:
