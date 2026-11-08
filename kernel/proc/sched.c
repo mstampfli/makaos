@@ -1,4 +1,5 @@
 #include "sched.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "process.h"
 #include "signal.h"
 #include "timer.h"
@@ -482,6 +483,12 @@ void task_idx_tgid_walk(uint32_t tgid, void (*cb)(task_t*, void*), void* data) {
 // below are treated as read-only by every CPU's idle task.
 static task_mm_t    s_idle_mm    = { .pml4_phys = 0, .mm = NULL, .refs = 1 };
 static task_files_t s_idle_files = { .ft = NULL, .lock = SPINLOCK_INIT, .refs = 1 };
+// Shared, never-freed signal-disposition table for every per-CPU idle task.
+// Idle tasks are kernel threads that never receive signals, but every task
+// must have a non-NULL sighand (signal paths deref it).  refs=1 pins it; idle
+// tasks are permanent (never task_free_rcu'd), so it is never released.
+// BSS default = all handlers SIG_DFL.
+static sighand_t    s_idle_sighand = { .refs = 1 };
 
 extern void proc_trampoline(void);  // kernel/arch/x86_64/process_ctx_switch.asm
 
@@ -556,23 +563,27 @@ uint8_t sched_try_steal(cpu_t* self) {
                                      __ATOMIC_RELAXED);
 
                 // Push onto our own deque at the same MLFQ level.
-                // We're the owner here — chaselev_push is lock-free
-                // from our side and doesn't contend with thieves on
-                // OUR queue (there shouldn't be any at this moment
-                // since we just woke from idle).
-                if (!chaselev_push(&self->rq.levels[lvl], t)) {
-                    // Our own queue full — give the task back.
-                    // Pushing to victim again isn't easy from this
-                    // side (we're a thief w.r.t them), so enqueue
-                    // locally once space clears.  For now, re-try by
-                    // popping oldest and re-pushing victim — but at
-                    // 512 slots this is pathological.  Panic for now.
+                // We are the deque OWNER here, but the idle loop runs with
+                // IRQs enabled, and this CPU's sched_tick (timer IRQ) does
+                // owner-side chaselev_push (waking expired sleepers) and
+                // chaselev_pop (priority boost) on this SAME deque under
+                // rq_lock.  An unlocked push here would let a timer IRQ
+                // land mid-push and tear `bottom` -> a task lost or made
+                // dispatchable twice (two CPUs into one kstack).  Take the
+                // local rq_lock (irqsave) so the push is serialized with
+                // sched_tick and no same-CPU IRQ can interleave.
+                uint64_t pf = spin_lock_irqsave(&self->rq_lock);
+                uint8_t pushed = chaselev_push(&self->rq.levels[lvl], t);
+                if (pushed)
+                    __atomic_fetch_add(&self->rq.nr_running, 1,
+                                         __ATOMIC_RELAXED);
+                spin_unlock_irqrestore(&self->rq_lock, pf);
+                if (!pushed) {
+                    // Our own queue full — pathological at 512 slots.
                     extern void kprintf(const char*, ...);
                     kprintf("[sched] PANIC: steal-side rq overflow\n");
                     for (;;) __asm__ volatile("cli; hlt");
                 }
-                __atomic_fetch_add(&self->rq.nr_running, 1,
-                                     __ATOMIC_RELAXED);
                 took_any = 1;
             }
             if (took_any) break;      // stop at first productive level
@@ -650,6 +661,8 @@ void sched_init_idle_for_cpu(uint32_t id) {
         serial_hex_dbg((uint64_t)id);
         for (;;) __asm__ volatile("cli; hlt");
     }
+    // Drift-proof: zero the slab-poison task_t so unset members default to 0.
+    __builtin_memset(idle, 0, sizeof(*idle));
     __builtin_memset(idle, 0, sizeof(*idle));
     idle->pid          = 0;
     idle->tgid         = 0;
@@ -658,6 +671,7 @@ void sched_init_idle_for_cpu(uint32_t id) {
     idle->state        = TASK_RUNNING;
     idle->mm_shared    = &s_idle_mm;
     idle->files_shared = &s_idle_files;
+    idle->sighand      = &s_idle_sighand;
     idle->home_cpu     = id;
     idle->last_ran_cpu = id;
     __builtin_memcpy(idle->comm, "idle", 5);
@@ -1002,14 +1016,18 @@ task_t* task_children_reap(task_t* parent, uint32_t target_pid,
 // splice, updating each child's ppid in-flight.  Used by the exit
 // paths (sys_exit + signal.c fatal kill) to reparent orphans to init.
 //
-// Only the dying task walks its own children list here, so the drain
-// is a plain load — no race with itself.  The publish onto `to` is
-// the canonical CAS-prepend via task_child_add_chain.
+// The drain is an ATOMIC exchange, not a plain store: children are now
+// anchored on the thread-group LEADER (see tg_leader in syscall.c), so when a
+// leader exits, OTHER threads of the group can concurrently CAS-prepend onto
+// from->children (fork) -- a plain store would tear the lock-free Treiber
+// stack.  This restores the all-atomic invariant (every mutation of a children
+// list is a CAS/XCHG), matching task_child_add and task_children_clear.  The
+// publish onto `to` is the canonical CAS-prepend via task_child_add_chain.
 void task_children_reparent(task_t* from, task_t* to) {
     if (!from || !to || from == to) return;
 
-    task_t* chain = from->children;
-    from->children = NULL;
+    task_t* chain = __atomic_exchange_n(&from->children, (task_t*)NULL,
+                                        __ATOMIC_ACQ_REL);
     if (!chain) return;
 
     task_t* head = NULL;
@@ -1028,6 +1046,111 @@ void task_children_reparent(task_t* from, task_t* to) {
 
     task_child_add_chain(to, head, tail);
 }
+
+// Atomically clear a task's children list (the drained chain is discarded).
+// Used by the exit paths when there is no reparent target -- i.e. the dying
+// task IS init, or init is absent.  When the task is init, init->children is
+// the universal reparent target: other exiting tasks CAS-prepend their orphan
+// chains onto it from any CPU (task_child_add_chain).  A plain
+// `children = NULL` store would race those CAS prepends and tear the Treiber
+// stack -- dropping a just-reparented orphan chain (unreapable task_t + pid
+// leak) and leaving a dangling children pointer in a task about to be
+// RCU-freed.  The XCHG-drain (the same primitive task_children_reap uses) is
+// the single atomic claim the invariant requires.  (For a non-init task the
+// plain drain in task_children_reparent is correct -- only the dying task
+// touches its own list -- so this is only for the no-target / init case.)
+void task_children_clear(task_t* t) {
+    if (!t) return;
+    (void)__atomic_exchange_n(&t->children, (task_t*)NULL, __ATOMIC_ACQ_REL);
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// ── Scheduler liveness watchdog (SELFTESTS only) ───────────────────────────
+// Catches a scheduler STALL: a task is runnable (some CPU's nr_running > 0)
+// yet NO context switch has happened on ANY CPU for ~8 seconds.  In correct
+// operation that is impossible -- a runnable task is always picked within a
+// tick (sched_tick sets reschedule_pending on idle CPUs every tick) -- so it
+// fires only on the real "chaselev-class" freeze (a spawned kthread that never
+// runs while its waiter spins forever).  Driven from the timer IRQ, so it runs
+// even when task scheduling itself is wedged.
+//
+// LOW PERTURBATION by design: the body runs on exactly ONE CPU per ~1s cadence
+// (whichever CPU advances the shared tick counter through the gate), reads a
+// handful of per-CPU counters with no lock, and does NOTHING unless a genuine
+// permanent stall is present.  This is what lets it observe the heisenbug that
+// a gdbstub / heavyweight instrumentation suppresses.  On a stall it dumps every
+// CPU's scheduler state (current task, runqueue depth, reschedule/preempt flags,
+// sleep list) -- enough to localize the wedge: "cur=idle nr>0" is an enqueued-
+// but-never-picked task; "cur=<task> RUNNING" stuck is a wedged task; etc.
+#define SCHED_WD_GATE        0xFFFu   // act once per 4096 global ticks (~1s)
+#define SCHED_WD_STALL_HITS  8u       // ~8 consecutive stalled checks (~8s)
+static uint64_t s_wd_last_cs = 0;
+static uint32_t s_wd_stall    = 0;
+static uint32_t s_wd_dumped   = 0;
+
+static void sched_watchdog(uint64_t tick) {
+    if ((tick & SCHED_WD_GATE) != 0) return;
+
+    unsigned n = num_cpus();
+    uint64_t cs = 0, nr = 0;
+    unsigned busy = 0;   // a non-idle task is runnable OR currently running
+    for (unsigned i = 0; i < n; i++) {
+        // nonidle_switches (NOT context_switches): an idle CPU bumps
+        // context_switches on every idle-loop yield, so it never goes stable.
+        cs += __atomic_load_n(&g_cpus[i].nonidle_switches, __ATOMIC_RELAXED);
+        nr += __atomic_load_n(&g_cpus[i].rq.nr_running,     __ATOMIC_RELAXED);
+        // "busy" also covers a task STUCK RUNNING (wedged in a loop): it is a
+        // CPU's `current` (non-idle) but not on a runqueue, so nr_running can
+        // be 0.  Counting it here lets the watchdog catch that freeze too, not
+        // just the queued-but-never-scheduled kind.
+        task_t* cur = g_cpus[i].current;
+        if (cur && cur != g_cpus[i].idle) busy = 1;
+    }
+    if (nr > 0) busy = 1;
+    // Progress (a real task was scheduled) OR genuinely idle (all CPUs on the
+    // idle task with nothing runnable, e.g. the login prompt) -> not stalled.
+    if (cs != s_wd_last_cs || !busy) {
+        s_wd_last_cs = cs;
+        __atomic_store_n(&s_wd_stall, 0, __ATOMIC_RELAXED);
+        return;
+    }
+    if (__atomic_add_fetch(&s_wd_stall, 1, __ATOMIC_RELAXED) < SCHED_WD_STALL_HITS)
+        return;
+
+    // Single dumper (first CPU to cross the threshold wins the CAS).
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&s_wd_dumped, &expected, 1u, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
+
+    {
+    // kprintf_atomic (NOT serial_puts_dbg, which is a no-op unless
+    // KERNEL_DEBUG_SERIAL): whole-line-locked, IRQ-safe via serial_lock_irqsave.
+    extern void kprintf_atomic(const char* fmt, ...);
+    kprintf_atomic("\n[WD] SCHEDULER STALL: no forward progress ~8s (nonidle_cs=%lu nr_running=%lu)\n",
+                   cs, nr);
+    for (unsigned i = 0; i < n; i++) {
+        cpu_t*  ci  = &g_cpus[i];
+        task_t* cur = ci->current;
+        kprintf_atomic("[WD] cpu%u cur_pid=%u state=%u %s nr=%u resched=%u preempt=%u\n",
+                       i,
+                       cur ? cur->pid : 0xFFFFFFFFu,
+                       cur ? (unsigned)cur->state : 0xFFu,
+                       (cur == ci->idle) ? "IDLE" : "BUSY",
+                       (unsigned)__atomic_load_n(&ci->rq.nr_running, __ATOMIC_RELAXED),
+                       (unsigned)ci->reschedule_pending,
+                       (unsigned)ci->preempt_depth);
+        task_t* sp = ci->rq.sleep_head;
+        for (unsigned k = 0; sp && k < 16; k++, sp = sp->next)
+            kprintf_atomic("[WD]   sleep pid=%u state=%u wake_pending=%u home=%u last_ran=%u\n",
+                           sp->pid, (unsigned)sp->state, (unsigned)sp->wake_pending,
+                           (unsigned)sp->home_cpu, (unsigned)sp->last_ran_cpu);
+    }
+    kprintf_atomic("[WD] halting for capture\n");
+    }
+    for (;;) __asm__ volatile("cli; hlt");
+}
+#endif // MAKAOS_BOOT_SELFTESTS
 
 // ── sched_tick ────────────────────────────────────────────────────────────
 // Called from timer IRQ — only sets flags/counters, never touches the stack.
@@ -1062,6 +1185,11 @@ void sched_tick(void) {
     // the MLFQ-boost modulo test below fires on exactly one CPU per
     // interval instead of racing/skipping.
     uint64_t tick = __atomic_add_fetch(&s_tick_count, 1, __ATOMIC_RELAXED);
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+    // Liveness watchdog (no-op unless a real scheduler stall is present).
+    sched_watchdog(tick);
+#endif
 
     // Fallback for lost MSI-X: rescan AHCI completions every tick.
     // If an IRQ was swallowed, this catches it within ~1ms.
@@ -1183,6 +1311,33 @@ static void do_switch(uint8_t preempted) {
     cpu_rq_t* rq = &c->rq;
     task_t*   next;
 
+    // on_cpu handshake (clear side): the task this CPU switched away from in
+    // the PREVIOUS do_switch is, by now, fully off its kstack (its context_
+    // switch completed before this CPU could re-enter do_switch).  Clear its
+    // on_cpu with RELEASE so a remote sched_wake that observes on_cpu==0 also
+    // observes the task's fully-saved context before migrating it.  Doing it
+    // here (rather than just after context_switch) also covers tasks whose
+    // successor resumed via a trampoline (first run) instead of returning
+    // into do_switch.  RELAXED read: only this CPU writes switching_from.
+    //
+    // CRITICAL: NULL switching_from immediately after use.  It records a task we
+    // switched away from; that task can be TASK_DEAD and get RCU-reaped +
+    // kfree'd while this CPU sits idle (the idle loop advances RCU via
+    // rcu_note_qs WITHOUT re-entering do_switch, so a stale switching_from
+    // survives the grace period).  Its 1120-byte task_t is kmalloc class-2048 --
+    // the SAME class as irtree_l1_t (2048B) -- so the freed slot comes back as
+    // an inode-radix l1tab.  Re-reading the stale pointer here and storing
+    // on_cpu=0 (a byte at task_t offset 0x2f5) then clobbers l1tab+0x2f5 =
+    // leaves[94]+5 = bit 47 of a leaf pointer -> the deterministic bit-47 #GP.
+    // Clearing it once, here (while the task is still alive), closes the UAF.
+    {
+        task_t* so = c->switching_from;
+        if (so) {
+            __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+            c->switching_from = NULL;
+        }
+    }
+
     // ── Deferred preemption for mid-exit tasks ──────────────────────────
     //
     // A preempted (timer-triggered) switch MUST NOT yank a task off its
@@ -1252,6 +1407,23 @@ static void do_switch(uint8_t preempted) {
         next = c->idle;
     }
 
+    // on_cpu handshake (cross-CPU backstop): never context_switch INTO a task
+    // that is still marked on_cpu.  Such a task is still executing — finishing
+    // its own context_switch — on another CPU; the prime case is one that
+    // work-stealing pulled out of a remote rq before that CPU's next do_switch
+    // cleared on_cpu (sched_wake's migration guard alone does not cover the
+    // steal path).  Running it here puts two CPUs on one kstack and scribbles
+    // its saved-register frame — exactly the corruption the on_cpu handshake
+    // exists to prevent.  Defer it back onto our rq and run idle this round;
+    // on_cpu clears within a tick (its home CPU's next do_switch), after which
+    // we pick it up cleanly.  No-op for the common case (same-CPU re-dequeue,
+    // where on_cpu was already cleared at this do_switch's entry).
+    if (next != c->idle &&
+        __atomic_load_n(&next->on_cpu, __ATOMIC_ACQUIRE)) {
+        enqueue_on(rq, next);
+        next = c->idle;
+    }
+
     task_t* prev = c->current;
     if (prev != c->idle && prev->state == TASK_RUNNING) {
         if (preempted) {
@@ -1276,12 +1448,20 @@ static void do_switch(uint8_t preempted) {
 
     next->state = TASK_RUNNING;
     c->current  = next;     // g_current expands to this via the sched.h macro
+    // on_cpu handshake: mark the incoming task as on-CPU before the switch,
+    // and record the outgoing task so the incoming task can clear ITS on_cpu
+    // immediately after the switch completes (see below + sched_wake).  This
+    // is what lets sched_wake tell "SLEEPING but still on its kstack" apart
+    // from "fully switched out and safe to migrate".
+    __atomic_store_n(&next->on_cpu, 1u, __ATOMIC_RELAXED);
+    c->switching_from = prev;
     // Cache-affinity hint: remember where this task last ran so
     // sched_wake can route future wakes to the same CPU.  Plain
     // store — only the owning CPU reads this value with a relaxed
     // load, races are benign (stale ≤ one context switch window).
     next->last_ran_cpu = c->id;
     c->context_switches++;
+    if (next != c->idle) c->nonidle_switches++;   // forward-progress signal (watchdog)
 
     // Release the rq_lock BEFORE context_switch — holding it across
     // the switch deadlocks: the new task might try to take the same
@@ -1321,28 +1501,72 @@ static void do_switch(uint8_t preempted) {
     }
 
     // ── Phase 9-7 TLB shootdown bookkeeping ──────────────────────────────
-    // Update the per-mm cpumasks *before* touching CR3.  The mask is
-    // "CPUs whose CR3 currently points at this mm's pml4" — a pure
-    // accounting shadow of CR3.  Only user mms participate (kthreads
-    // run in whatever pml4 was previously loaded → lazy TLB; they hold
-    // no user mappings themselves, so any pending shootdown for a user
-    // mm need not target them).
+    // The per-mm cpu_mask is "CPUs whose CR3 currently points at this mm's
+    // pml4" -- a pure accounting shadow of CR3, read by tlb_flush_mm to pick
+    // its IPI targets.  Only user mms participate (kthreads run in whatever
+    // pml4 was previously loaded -> lazy TLB; they hold no user mappings, so a
+    // user-mm shootdown need not target them).
     //
-    // Clear prev's bit first: after context_switch writes CR3 for a
-    // different mm, this CPU's TLB for prev's user entries is gone
-    // (we don't use global pages, so mov-to-cr3 is a full flush).
-    // If prev's mm equals next's mm (two tasks sharing one address
-    // space, e.g. threads), context_switch will skip the CR3 write,
-    // and we set the same bit right back below — net no-op.
+    // Update the mask ONLY when the address space actually changes
+    // (prev->mm_shared != next->mm_shared).  Two threads sharing one
+    // task_mm_t have prev->mm_shared == next->mm_shared, so a clear-then-set
+    // would net to a no-op but open a transient window in which this CPU's bit
+    // reads 0 while CR3 still points at the mm -- a concurrent tlb_flush_mm
+    // could read the mask in that window and SKIP us, leaving a stale entry.
+    // Skipping the ops keeps the bit set throughout (strictly conservative --
+    // we never drop out of our own running mm's shootdown set) and saves two
+    // atomics on the hot thread-switch path.
+    //
+    // For a real address-space change we clear prev then set next here, BEFORE
+    // context_switch.  The brief clear..CR3-reload window for prev is safe
+    // because context_switch ALWAYS reloads CR3 when pml4_phys != 0 (true for
+    // every runtime mm; mov-to-cr3 is a full flush as we use no global pages),
+    // so prev's stale entries are gone before this CPU runs any code that could
+    // touch them -- and we never touch prev's mm again after switching to next.
+    // NOTE: context_switch does NOT skip the CR3 write for same-mm switches (it
+    // keys only on pml4_phys != 0); the same-mm safety above comes from NOT
+    // clearing the bit, not from a skipped reload.  If context_switch is ever
+    // changed to skip same-mm CR3 reloads, this skip-when-equal guard is what
+    // keeps the mask correct.
     uint32_t cpu_id = c->id;
-    if (prev->mm_shared && prev->mm_shared->mm)
-        task_mm_cpumask_clear(prev->mm_shared, cpu_id);
-    if (next->mm_shared && next->mm_shared->mm)
-        task_mm_cpumask_set(next->mm_shared, cpu_id);
+    if (prev->mm_shared != next->mm_shared) {
+        if (prev->mm_shared && prev->mm_shared->mm)
+            task_mm_cpumask_clear(prev->mm_shared, cpu_id);
+        if (next->mm_shared && next->mm_shared->mm)
+            task_mm_cpumask_set(next->mm_shared, cpu_id);
+    }
 
     context_switch(&prev->ctx, &next->ctx, next->mm_shared->pml4_phys);
 
-    signal_deliver_pending(0);
+    // on_cpu handshake (prompt clear): we are now the incoming task, resumed
+    // on this physical CPU.  Clear the on_cpu flag of whatever task was just
+    // switched away from here (recorded in switching_from before the switch).
+    // It has fully saved its context (context_switch completed before yielding
+    // to us), so it is provably off-CPU.  Doing it HERE — not only lazily at
+    // the next do_switch entry — is critical: when this CPU switches to idle
+    // and then has no work, it never re-enters do_switch, so the lazy clear
+    // would leave the previous task on_cpu==1 forever.  A remote sched_wake
+    // then perpetually defers that task (the do_switch on_cpu backstop) and it
+    // never runs — observed as sway's threaded init hanging mid-startup.
+    // Re-read this_cpu(): `c` may be stale if we migrated here; the physical
+    // CPU is unchanged across context_switch.  RELEASE pairs with the waker's
+    // ACQUIRE so it also sees our fully-saved context.  Fresh tasks that resume
+    // via a trampoline instead of here are still covered by the entry clear.
+    {
+        cpu_t* cc = this_cpu();
+        task_t* so = cc->switching_from;
+        if (so) {
+            __atomic_store_n(&so->on_cpu, 0u, __ATOMIC_RELEASE);
+            // NULL after use: prevents a later do_switch (post-idle) from
+            // re-reading this pointer once the task has been RCU-reaped and its
+            // class-2048 slot reused (e.g. as an inode-radix l1tab).  See the
+            // matching entry-clear above -- this is the write that otherwise
+            // clobbers bit 47 of a reused leaf pointer.
+            cc->switching_from = NULL;
+        }
+    }
+
+    signal_deliver_pending(0, 0);
 
     if (prev != c->idle && prev->state == TASK_DEAD)
         process_destroy(prev);
@@ -1470,6 +1694,19 @@ void sched_wake(task_t* proc) {
     // locally or drop the lock and re-acquire target's.
     cpu_t* target = home;
     unsigned n = num_cpus();
+    // ── on_cpu handshake (SMP correctness) ────────────────────────────────
+    // A task that called sched_sleep has set state=SLEEPING and dropped its
+    // rq_lock, but it is STILL executing on its CPU until its context_switch
+    // finishes (c->current is already advanced, but rsp is still on the
+    // sleeper's kstack).  If we migrate it to another CPU's runqueue here,
+    // that CPU can context_switch INTO it and run on its kstack while the
+    // original CPU is still using the same kstack — two CPUs on one stack,
+    // which scribbles the saved register frame (seen as garbage prev/c in
+    // do_switch).  on_cpu stays 1 across that window (cleared only AFTER the
+    // switch completes), so if it's still set, keep the task on its home CPU
+    // (same-CPU re-enqueue is serialized and safe); only migrate once it is
+    // provably off-CPU.
+    if (__atomic_load_n(&proc->on_cpu, __ATOMIC_ACQUIRE)) n = 0;
     if (n >= 2) {
         uint32_t home_load = __atomic_load_n(&home->rq.nr_running,
                                                __ATOMIC_RELAXED);

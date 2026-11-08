@@ -192,6 +192,21 @@ build_target_libs() {
         "${server_objs[@]}" "${common_objs[@]}"
     log "libwayland-client.a: $(stat -c%s "$SYSROOT/usr/lib/libwayland-client.a") bytes"
     log "libwayland-server.a: $(stat -c%s "$SYSROOT/usr/lib/libwayland-server.a") bytes"
+
+    # libwayland-egl: the client-side EGL window shim (wl_egl_window_create/
+    # resize/destroy/get_attached_size).  Mesa's EGL Wayland platform links it
+    # so GL/GLES *clients* (e.g. SDL3) can back a wl_surface with a GL context.
+    # One TU; its ABI to Mesa is wayland-egl-backend.h (in egl/).
+    log "cross-compiling libwayland-egl (client GL surface shim)"
+    local egl_o="$objdir/wayland-egl.o"
+    if [ "$WL_SRC/egl/wayland-egl.c" -nt "$egl_o" ]; then
+        "$CROSS_CC" "${cflags[@]}" -I "$WL_SRC/egl" \
+            -c "$WL_SRC/egl/wayland-egl.c" -o "$egl_o" \
+            || { log "FAIL compiling wayland-egl.c"; return 1; }
+    fi
+    rm -f "$SYSROOT/usr/lib/libwayland-egl.a"
+    "$CROSS_AR" rcs "$SYSROOT/usr/lib/libwayland-egl.a" "$egl_o"
+    log "libwayland-egl.a: $(stat -c%s "$SYSROOT/usr/lib/libwayland-egl.a") bytes"
 }
 
 install_headers() {
@@ -208,6 +223,9 @@ install_headers() {
     cp "$WL_SRC/protocol/wayland.xml"       "$SYSROOT/usr/share/wayland/"
     # wayland-cursor header
     cp "$WL_SRC/cursor/wayland-cursor.h"    "$SYSROOT/usr/include/"
+    # wayland-egl client headers (wl_egl_window_*) for GL/GLES clients
+    cp "$WL_SRC/egl/wayland-egl.h"          "$SYSROOT/usr/include/"
+    cp "$WL_SRC/egl/wayland-egl-core.h"     "$SYSROOT/usr/include/"
 }
 
 # ── libwayland-cursor — cursor-theme loader used by sway + GTK clients

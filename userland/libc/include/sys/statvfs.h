@@ -6,6 +6,9 @@
 
 #ifndef _MAKAOS_SYS_STATVFS_H
 #define _MAKAOS_SYS_STATVFS_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 // fsblkcnt_t / fsfilcnt_t come from sys/types.h.
@@ -30,4 +33,13 @@ struct statvfs {
 int statvfs(const char* path, struct statvfs* buf);
 int fstatvfs(int fd, struct statvfs* buf);
 
+
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define statvfs64  statvfs
+#define fstatvfs64 fstatvfs
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 #endif

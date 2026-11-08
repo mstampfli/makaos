@@ -217,27 +217,26 @@ float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
 double exp(double x) {
     if (x != x) return x;
     if (x > 709.78) return HUGE_VAL;
-    if (x < -745.1) return 0.0;
+    if (x < -745.13) return 0.0;
 
-    // x = n*ln2 + r, |r| <= ln2/2.
-    double fn = (double)(long long)(x * LOG2E + 0.5);
-    double r  = x - fn * LN2;
+    // x = k*ln2 + r, k = round-to-nearest(x/ln2), |r| <= ln2/2.  The rounding
+    // must be symmetric about zero -- truncating toward zero (the old bug)
+    // mis-reduces negative x and corrupts the result.
+    double kf = x * LOG2E;
+    int k = (int)(kf < 0.0 ? kf - 0.5 : kf + 0.5);
+    double r = x - (double)k * LN2;
 
-    // Minimax polynomial for (exp(r)-1)/r on [-ln2/2, ln2/2]:
-    double r2 = r * r;
-    double p = r2 * (5.00000000000000000000e-1
-               + r2 * (1.66666666666666019037e-1
-               + r2 * (4.16666666666664434e-2
-               + r2 * (8.33333333333232829e-3
-               + r2 * (1.38888888888888e-3
-               + r2 *  1.98412698413e-4)))));
-    double c = r - p;
-    double e = 1.0 + r - (r * c / (c - 2.0) - r);   // = exp(r) via Horner
+    // Taylor series for exp(r) on |r| <= ln2/2 (~0.347): 8 terms => ~1e-16.
+    double e = 1.0 + r*(1.0 + r*(0.5 + r*((1.0/6.0) + r*((1.0/24.0)
+             + r*((1.0/120.0) + r*((1.0/720.0) + r*((1.0/5040.0)
+             + r*(1.0/40320.0))))))));
 
-    // Scale by 2^n.
-    int n = (int)(long long)fn;
-    uint64_t bits = d2bits(e) + ((uint64_t)(n + 1023) << 52);
-    return bits2d(bits);
+    // Scale by 2^k with a double multiply (split so the denormal range works);
+    // adding k to e's exponent field directly overflows/borrows for k<0.
+    if (k > 1023) k = 1023;
+    if (k < -1074) return 0.0;
+    return e * bits2d((uint64_t)(k / 2 + 1023) << 52)
+             * bits2d((uint64_t)(k - k / 2 + 1023) << 52);
 }
 
 float expf(float x) { return (float)exp((double)x); }
@@ -251,11 +250,11 @@ double log(double x) {
 
     uint64_t bits = d2bits(x);
     int exp = (int)((bits >> 52) & 0x7FF) - 1023;
-    // Normalise mantissa to [0.5, 1.0):
-    bits = (bits & 0x000FFFFFFFFFFFFFULL) | 0x3FE0000000000000ULL;
-    double f = bits2d(bits);  // f in [0.5, 1.0)
-    // Adjust to [sqrt(2)/2, sqrt(2)] via: if f < 1/sqrt(2), double it.
-    if (f < 0.7071067811865476) { f *= 2.0; exp--; }
+    // Normalise mantissa to [1.0, 2.0) -- exp already holds that power of two.
+    bits = (bits & 0x000FFFFFFFFFFFFFULL) | 0x3FF0000000000000ULL;
+    double f = bits2d(bits);  // f in [1.0, 2.0)
+    // Adjust to [sqrt(2)/2, sqrt(2)] via: if f > sqrt(2), halve it.
+    if (f > 1.4142135623730951) { f *= 0.5; exp++; }
     // s = (f - 1) / (f + 1)
     double s = (f - 1.0) / (f + 1.0);
     double s2 = s * s;
@@ -304,6 +303,29 @@ double ldexp(double x, int e) {
     if (ex >= 0x7FF) return HUGE_VAL;
     bits = (bits & 0x800FFFFFFFFFFFFFULL) | ((uint64_t)ex << 52);
     return bits2d(bits);
+}
+float ldexpf(float x, int e) { return (float)ldexp((double)x, e); }
+
+// exp2 / exp2f: 2^x, built on pow (there is no dedicated hardware path here).
+double exp2(double x)  { return pow(2.0, x); }
+float  exp2f(float x)  { return powf(2.0f, x); }
+
+// fma / fmaf: multiply-add.  MakaOS targets baseline x86-64 (no guaranteed FMA3),
+// so this is the plain a*b+c form (one extra rounding vs a true fused op) --
+// matches what most soft-float and non-FMA builds use; adequate for the GLSL
+// constant folding and shader math that call it.
+double fma(double a, double b, double c)  { return a * b + c; }
+float  fmaf(float a, float b, float c)    { return a * b + c; }
+
+float frexpf(float x, int* ep) { return (float)frexp((double)x, ep); }
+long      lround(double x)     { return (long)round(x); }
+long      lroundf(float x)     { return (long)roundf(x); }
+long long llround(double x)    { return (long long)round(x); }
+long long llroundf(float x)    { return (long long)roundf(x); }
+float modff(float x, float* ip) {
+    double i; float r = (float)modf((double)x, &i);
+    if (ip) *ip = (float)i;
+    return r;
 }
 
 double frexp(double x, int* ep) {
@@ -423,6 +445,31 @@ float roundf(float x) {
     if (x >= 0.0f) return (float)floor((double)x + 0.5);
     return               (float)ceil ((double)x - 0.5);
 }
+
+// rint / nearbyint: round to nearest integer, ties to EVEN (the C default
+// FE_TONEAREST rounding mode).  This is NOT round() -- round() is ties-away.
+// Built on the existing trunc/fabs/fmod so it needs no SSE4.1 (matches this
+// file's no-__builtin, SSE2-friendly policy).  nearbyint == rint except it
+// must not raise FE_INEXACT; we don't track that flag, so they're identical.
+double rint(double x) {
+    double t = trunc(x);
+    double d = fabs(x - t);
+    if (d < 0.5) return t;
+    double away = t + (x < 0.0 ? -1.0 : 1.0);   // step toward +/-inf
+    if (d > 0.5) return away;
+    // Exactly halfway: pick whichever of {t, away} is even.
+    return (fmod(t, 2.0) == 0.0) ? t : away;
+}
+float rintf(float x) { return (float)rint((double)x); }
+double nearbyint(double x) { return rint(x); }
+float  nearbyintf(float x) { return rintf(x); }
+
+// lrint / llrint: rint() then convert to integer.  rint already produced an
+// integral value, so the cast is exact (no double-rounding).
+long      lrint(double x)   { return (long)rint(x); }
+long      lrintf(float x)   { return (long)rintf(x); }
+long long llrint(double x)  { return (long long)rint(x); }
+long long llrintf(float x)  { return (long long)rintf(x); }
 
 double fmin(double a, double b) { return a < b ? a : b; }
 double fmax(double a, double b) { return a > b ? a : b; }

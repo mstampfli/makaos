@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_SOCKET_H
 #define _MAKAOS_SYS_SOCKET_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // Address families
@@ -9,6 +13,7 @@
 #define AF_LOCAL   AF_UNIX   // POSIX alias
 #define AF_INET    2
 #define AF_INET6   10
+#define AF_PACKET  17   // low-level packet interface (Linux value)
 #define PF_UNSPEC  AF_UNSPEC
 #define PF_UNIX    AF_UNIX
 #define PF_LOCAL   AF_UNIX
@@ -36,6 +41,9 @@ struct ucred {
 
 // Socket options
 #define SOL_SOCKET   1
+#define SOL_RAW      255
+
+struct linger { int l_onoff; int l_linger; };
 #define SO_REUSEADDR 2
 #define SOMAXCONN    128
 // Timeouts — accepted by setsockopt, not yet enforced by the stack.
@@ -44,6 +52,7 @@ struct ucred {
 #define SO_TYPE      3
 #define SO_ERROR     4
 #define SO_KEEPALIVE 9
+#define SO_OOBINLINE 10
 #define SO_SNDBUF    7
 #define SO_RCVBUF    8
 #define SO_LINGER    13
@@ -59,6 +68,7 @@ struct ucred {
 // send/recv flags
 #define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
+#define MSG_OOB      0x01
 #define MSG_PEEK     0x02
 
 struct sockaddr {
@@ -140,5 +150,9 @@ int     getsockname(int fd, struct sockaddr* addr, socklen_t* len);
 int     getpeername(int fd, struct sockaddr* addr, socklen_t* len);
 ssize_t sendmsg(int fd, const struct msghdr* msg, int flags);
 ssize_t recvmsg(int fd, struct msghdr* msg, int flags);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SIGNAL_H
 #define _MAKAOS_SIGNAL_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // Signal numbers — match kernel.
@@ -60,6 +64,7 @@
 #define SA_NOCLDSTOP 0x00000001
 #define SA_NOCLDWAIT 0x00000002
 #define SA_SIGINFO   0x00000004
+#define SA_ONSTACK   0x08000000
 #define SA_RESTART   0x10000000
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
@@ -93,10 +98,75 @@ struct siginfo {
     int    si_value;
 };
 
+// si_code values (Linux/POSIX). Signal-source codes are shared across signals;
+// the rest are per-signal fault detail (SIGILL/SIGFPE/SIGSEGV/SIGBUS/SIGTRAP/
+// SIGCHLD), as decoded by portable signal handlers such as the JVM's.
+#define SI_USER     0
+#define SI_KERNEL   0x80
+#define SI_QUEUE    (-1)
+#define SI_TIMER    (-2)
+#define SI_MESGQ    (-3)
+#define SI_ASYNCIO  (-4)
+#define SI_SIGIO    (-5)
+#define SI_TKILL    (-6)
+
+#define ILL_ILLOPC 1
+#define ILL_ILLOPN 2
+#define ILL_ILLADR 3
+#define ILL_ILLTRP 4
+#define ILL_PRVOPC 5
+#define ILL_PRVREG 6
+#define ILL_COPROC 7
+#define ILL_BADSTK 8
+
+#define FPE_INTDIV 1
+#define FPE_INTOVF 2
+#define FPE_FLTDIV 3
+#define FPE_FLTOVF 4
+#define FPE_FLTUND 5
+#define FPE_FLTRES 6
+#define FPE_FLTINV 7
+#define FPE_FLTSUB 8
+
+#define SEGV_MAPERR 1
+#define SEGV_ACCERR 2
+
+#define BUS_ADRALN 1
+#define BUS_ADRERR 2
+#define BUS_OBJERR 3
+
+#define TRAP_BRKPT 1
+#define TRAP_TRACE 2
+
+#define CLD_EXITED    1
+#define CLD_KILLED    2
+#define CLD_DUMPED    3
+#define CLD_TRAPPED   4
+#define CLD_STOPPED   5
+#define CLD_CONTINUED 6
+
+// Alternate signal stack (sigaltstack).  Shared definition with <ucontext.h>
+// via the same guard so including both is safe.
+#ifndef _STACK_T_DEFINED
+#define _STACK_T_DEFINED
+typedef struct {
+    void*         ss_sp;
+    int           ss_flags;
+    unsigned long ss_size;
+} stack_t;
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#endif
+#ifndef MINSIGSTKSZ
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ    8192
+#endif
+
 int kill(pid_t pid, int sig);
 int raise(int sig);
 void (*signal(int sig, void (*handler)(int)))(int);
 int sigaction(int sig, const struct sigaction* act, struct sigaction* old);
+int sigaltstack(const stack_t* ss, stack_t* old_ss);
 int sigprocmask(int how, const sigset_t* set, sigset_t* old);
 int sigpending(sigset_t* set);
 int sigsuspend(const sigset_t* mask);
@@ -121,5 +191,9 @@ int sigwait(const sigset_t* set, int* sig);
 // Per-thread signal mask.  MakaOS has a single process-wide mask,
 // so this aliases sigprocmask.  Also declared in <pthread.h>.
 int pthread_sigmask(int how, const sigset_t* set, sigset_t* old);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

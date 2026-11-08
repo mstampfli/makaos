@@ -17,8 +17,12 @@
 #include "proc.h"
 #include "vfs.h"
 #include "kheap.h"
+#include "kstr.h"    // str_eq, str_len (shared string utils)
 #include "sched.h"
 #include "process.h"
+
+// POSIX-style /proc access gate: owner (same uid) or root only.
+extern int signal_may(const task_t* sender, const task_t* target);
 #include "mm.h"
 #include "common.h"
 #include "rcu.h"
@@ -42,14 +46,6 @@ static uint32_t str_to_uint(const char* s) {
     return v;
 }
 
-static int str_eq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
-
-static uint64_t str_len(const char* s) {
-    uint64_t n = 0; while (s[n]) n++; return n;
-}
 
 // ── membuf: a synthesized read-only vfs_file_t backed by a heap buffer ───
 //
@@ -102,22 +98,12 @@ static vfs_file_t* membuf_open(uint8_t* buf, uint64_t size) {
     ctx->size = size;
     ctx->pos  = 0;
 
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(ctx); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
-    f->read     = membuf_read;
-    f->write    = NULL;  // read-only
-    f->close    = membuf_close;
-    f->seek     = membuf_seek;
-    f->poll           = NULL;
-    f->ioctl          = NULL;
-    f->ctx            = ctx;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0;
-    f->path[0]  = '\0';
+    f->read  = membuf_read;   // write stays NULL: read-only
+    f->close = membuf_close;
+    f->seek  = membuf_seek;
+    f->ctx   = ctx;
     return f;
 }
 
@@ -286,22 +272,28 @@ static const proc_pid_file_t s_proc_pid_files[] = {
 // file so a concurrent close on the target can't free it under us.
 static vfs_file_t* proc_fd_open(task_t* t, const char* fd_str) {
     uint32_t n = str_to_uint(fd_str);
-    if (!t->files_shared) return NULL;
-    vfs_file_t* f;
+    vfs_file_t* f = NULL;
     rcu_read_lock();
-    fdtable_t* ft = __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE);
-    if (!ft || n >= ft->cap) { rcu_read_unlock(); return NULL; }
-    f = vfs_tryget(__atomic_load_n(&ft->fd_table[n], __ATOMIC_ACQUIRE));
+    // Snapshot files_shared ONCE under rcu: task_files_release RCU-defers the
+    // table struct free, so a non-NULL snapshot stays valid for this whole
+    // section (and a single load avoids a NULL-deref race vs a concurrent exit
+    // that unpublishes files_shared).
+    task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+    fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
+    if (ft && n < ft->cap)
+        f = vfs_tryget(__atomic_load_n(&ft->fd_table[n], __ATOMIC_ACQUIRE));
     rcu_read_unlock();
-    return f;  // already has +1 ref from tryget
+    return f;  // +1 ref from tryget, or NULL
 }
 
 // Readdir /proc/<pid>/fd/ — list open fd numbers as entry names.
 static int proc_fd_readdir(task_t* t, ext2_entry_t* out, int max) {
-    if (!t->files_shared) return 0;
     int count = 0;
     rcu_read_lock();
-    fdtable_t* ft = __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE);
+    // Snapshot files_shared ONCE under rcu (task_files_release RCU-defers the
+    // table free; a single load avoids a NULL-deref race vs a concurrent exit).
+    task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+    fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
     if (!ft) { rcu_read_unlock(); return 0; }
     for (uint32_t i = 0; i < ft->cap && count < max; i++) {
         if (!ft->fd_table[i]) continue;
@@ -437,39 +429,52 @@ vfs_file_t* proc_open(const char* path) {
     }
 
     if (!pid) return NULL;
+
+    // Hold rcu_read_lock across the lookup AND every dereference of `t`
+    // (proc_fd_open / the gen() snapshot) so a concurrent exit+task_destroy
+    // (RCU-deferred free via task_free_rcu) cannot free the task mid-use.  The
+    // generators snapshot into a heap buffer and proc_fd_open takes its own fd
+    // reference, so nothing referencing `t` outlives the section.  Single exit
+    // (open_out) guarantees the section is never leaked.
+    rcu_read_lock();
     task_t* t = sched_find_pid(pid);
-    if (!t) return NULL;
+    vfs_file_t* result = NULL;
+    if (!t) goto open_out;
+    if (!signal_may(g_current, t)) goto open_out;   // foreign task -> hidden (ENOENT)
 
     // after_pid: "" → /proc/<pid>/ directory (not openable as file)
     //            "/status", "/cmdline", "/maps" → file generators
     //            "/fd" → directory
     //            "/fd/<n>" → dup of fd n
+    if (!after_pid || after_pid[0] == '\0') goto open_out; // directory -> NULL
 
-    if (!after_pid || after_pid[0] == '\0') return NULL; // directory
+    {
+        const char* sub = after_pid + 1; // skip leading '/'
 
-    const char* sub = after_pid + 1; // skip leading '/'
+        // /proc/<pid>/fd/<n>
+        if (sub[0]=='f' && sub[1]=='d' && sub[2]=='/') {
+            result = proc_fd_open(t, sub + 3);
+            goto open_out;
+        }
 
-    // /proc/<pid>/fd/<n>
-    if (sub[0]=='f' && sub[1]=='d' && sub[2]=='/') {
-        return proc_fd_open(t, sub + 3);
-    }
+        // /proc/<pid>/fd  (directory — not a file)
+        if (sub[0]=='f' && sub[1]=='d' && sub[2]=='\0') goto open_out;
 
-    // /proc/<pid>/fd  (directory — not a file)
-    if (sub[0]=='f' && sub[1]=='d' && sub[2]=='\0') return NULL;
-
-    // /proc/<pid>/<known file>
-    for (int i = 0; s_proc_pid_files[i].suffix; i++) {
-        if (str_eq(sub, s_proc_pid_files[i].suffix)) {
-            uint64_t size = 0;
-            uint8_t* buf = s_proc_pid_files[i].gen(t, &size);
-            if (!buf) return NULL;
-            vfs_file_t* f = membuf_open(buf, size);
-            if (!f) { kfree(buf); return NULL; }
-            return f;
+        // /proc/<pid>/<known file>
+        for (int i = 0; s_proc_pid_files[i].suffix; i++) {
+            if (str_eq(sub, s_proc_pid_files[i].suffix)) {
+                uint64_t size = 0;
+                uint8_t* buf = s_proc_pid_files[i].gen(t, &size);
+                if (!buf) goto open_out;
+                result = membuf_open(buf, size);
+                if (!result) kfree(buf);
+                goto open_out;
+            }
         }
     }
-
-    return NULL; // unknown path
+open_out:
+    rcu_read_unlock();
+    return result;
 }
 
 int proc_readdir(const char* path, ext2_entry_t* out, int max) {
@@ -489,21 +494,33 @@ int proc_readdir(const char* path, ext2_entry_t* out, int max) {
     }
 
     if (!pid) return -1;
+
+    // rcu_read_lock spans the lookup and the readdir walk of `t` (which fills
+    // the caller's `out` array and does not store `t`) so a concurrent exit
+    // cannot free the task mid-walk.  Single exit (rd_out).
+    rcu_read_lock();
     task_t* t = sched_find_pid(pid);
-    if (!t) return -1;
+    int rc = -1;
+    if (!t) goto rd_out;
+    if (!signal_may(g_current, t)) goto rd_out;   // foreign task -> hidden (ENOENT)
 
     // /proc/<pid>  or  /proc/<pid>/
     if (!after_pid || after_pid[0] == '\0' ||
-        (after_pid[0] == '/' && after_pid[1] == '\0'))
-        return proc_pid_readdir(t, out, max);
+        (after_pid[0] == '/' && after_pid[1] == '\0')) {
+        rc = proc_pid_readdir(t, out, max);
+        goto rd_out;
+    }
 
-    const char* sub = after_pid + 1;
+    {
+        const char* sub = after_pid + 1;
 
-    // /proc/<pid>/fd/
-    if (sub[0]=='f' && sub[1]=='d' && (sub[2]=='/' || sub[2]=='\0'))
-        return proc_fd_readdir(t, out, max);
-
-    return -1;
+        // /proc/<pid>/fd/
+        if (sub[0]=='f' && sub[1]=='d' && (sub[2]=='/' || sub[2]=='\0'))
+            rc = proc_fd_readdir(t, out, max);
+    }
+rd_out:
+    rcu_read_unlock();
+    return rc;
 }
 
 int proc_stat(const char* path, struct stat* out) {
@@ -529,8 +546,17 @@ int proc_stat(const char* path, struct stat* out) {
     }
 
     if (!pid) return -1;
+
+    // rcu_read_lock spans the lookup, the `!t` liveness gate, and the only
+    // dereference of `t` (the fd/<n> branch reads t->files_shared) so a
+    // concurrent exit cannot free the task in the window.  Single exit
+    // (stat_out).  Branches that touch only `pid` still run under the section,
+    // which is harmless (no sleep).
+    rcu_read_lock();
     task_t* t = sched_find_pid(pid);
-    if (!t) return -1;
+    int rc = -1;
+    if (!t) goto stat_out;
+    if (!signal_may(g_current, t)) goto stat_out;   // foreign task -> hidden (ENOENT)
 
     // /proc/<pid>  (directory)
     if (!after_pid || after_pid[0] == '\0' ||
@@ -540,47 +566,49 @@ int proc_stat(const char* path, struct stat* out) {
         out->st_mode   = 0x41ED; // S_IFDIR | 0755
         out->st_nlink  = 2;
         out->st_blksize= 4096;
-        return 0;
+        rc = 0; goto stat_out;
     }
 
-    const char* sub = after_pid + 1;
+    {
+        const char* sub = after_pid + 1;
 
-    // /proc/<pid>/fd  or  /proc/<pid>/fd/
-    if (sub[0]=='f' && sub[1]=='d' && (sub[2]=='/' || sub[2]=='\0')) {
-        out->st_ino    = pid + 0x20000;
-        out->st_size   = 0;
-        out->st_mode   = 0x41ED; // S_IFDIR | 0755
-        out->st_nlink  = 2;
-        out->st_blksize= 4096;
-        return 0;
-    }
+        // /proc/<pid>/fd  or  /proc/<pid>/fd/
+        if (sub[0]=='f' && sub[1]=='d' && (sub[2]=='/' || sub[2]=='\0')) {
+            out->st_ino    = pid + 0x20000;
+            out->st_size   = 0;
+            out->st_mode   = 0x41ED; // S_IFDIR | 0755
+            out->st_nlink  = 2;
+            out->st_blksize= 4096;
+            rc = 0; goto stat_out;
+        }
 
-    // /proc/<pid>/fd/<n>
-    if (sub[0]=='f' && sub[1]=='d' && sub[2]=='/') {
-        uint32_t n = str_to_uint(sub + 3);
-        fdtable_t* ft = t->files_shared
-                        ? __atomic_load_n(&t->files_shared->ft, __ATOMIC_ACQUIRE)
-                        : NULL;
-        if (!ft || n >= ft->cap || !ft->fd_table[n]) return -1;
-        out->st_ino    = pid + 0x30000 + n;
-        out->st_size   = 0;
-        out->st_mode   = 0x81A4; // S_IFREG | 0644
-        out->st_nlink  = 1;
-        out->st_blksize= 4096;
-        return 0;
-    }
-
-    // /proc/<pid>/<known file>
-    for (int i = 0; s_proc_pid_files[i].suffix; i++) {
-        if (str_eq(sub, s_proc_pid_files[i].suffix)) {
-            out->st_ino    = pid + 0x10000 + (uint32_t)i;
-            out->st_size   = 0; // synthesized — size unknown without generating
+        // /proc/<pid>/fd/<n>
+        if (sub[0]=='f' && sub[1]=='d' && sub[2]=='/') {
+            uint32_t n = str_to_uint(sub + 3);
+            task_files_t* tf = __atomic_load_n(&t->files_shared, __ATOMIC_ACQUIRE);
+            fdtable_t* ft = tf ? __atomic_load_n(&tf->ft, __ATOMIC_ACQUIRE) : NULL;
+            if (!ft || n >= ft->cap || !ft->fd_table[n]) { rc = -1; goto stat_out; }
+            out->st_ino    = pid + 0x30000 + n;
+            out->st_size   = 0;
             out->st_mode   = 0x81A4; // S_IFREG | 0644
             out->st_nlink  = 1;
             out->st_blksize= 4096;
-            return 0;
+            rc = 0; goto stat_out;
+        }
+
+        // /proc/<pid>/<known file>
+        for (int i = 0; s_proc_pid_files[i].suffix; i++) {
+            if (str_eq(sub, s_proc_pid_files[i].suffix)) {
+                out->st_ino    = pid + 0x10000 + (uint32_t)i;
+                out->st_size   = 0; // synthesized — size unknown without generating
+                out->st_mode   = 0x81A4; // S_IFREG | 0644
+                out->st_nlink  = 1;
+                out->st_blksize= 4096;
+                rc = 0; goto stat_out;
+            }
         }
     }
-
-    return -1;
+stat_out:
+    rcu_read_unlock();
+    return rc;
 }

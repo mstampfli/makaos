@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_MMAN_H
 #define _MAKAOS_SYS_MMAN_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 #define PROT_NONE  0
@@ -13,6 +17,7 @@
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 #define MAP_ANON      MAP_ANONYMOUS
+#define MAP_NORESERVE 0x4000   // don't reserve swap; overcommit (advisory)
 
 #define MAP_FAILED ((void*)-1)
 
@@ -32,6 +37,7 @@ int   munmap(void* addr, size_t len);
 int   mprotect(void* addr, size_t len, int prot);
 int   madvise(void* addr, size_t len, int advice);
 int   msync(void* addr, size_t len, int flags);
+int   mincore(void* addr, size_t len, unsigned char* vec);
 
 // POSIX shared memory
 int shm_open(const char* name, int flags, mode_t mode);
@@ -47,5 +53,16 @@ int shm_unlink(const char* name);
 #define MFD_NOEXEC_SEAL   0x0008u
 #define MFD_EXEC          0x0010u
 int memfd_create(const char* name, unsigned int flags);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define mmap64 mmap
+#endif
 
 #endif

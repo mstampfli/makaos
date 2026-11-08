@@ -22,6 +22,7 @@ OBJCOPY="objcopy"
 # Built by scripts/build-toolchain.sh; falls back to host gcc if absent
 # (early-development convenience only — production path is the cross).
 USER_CC="$(pwd)/toolchain/bin/x86_64-pc-makaos-gcc"
+USER_CXX="$(pwd)/toolchain/bin/x86_64-pc-makaos-g++"   # for C++ ports (Mesa GL stack)
 if [ ! -x "$USER_CC" ]; then
   echo "[!] cross-toolchain missing — run scripts/build-toolchain.sh"
   echo "    falling back to host gcc for userland (legacy path)"
@@ -84,10 +85,52 @@ KERNEL_CFLAGS=(
   -Wno-missing-field-initializers
 )
 
+# Opt-in boot self-tests (chase-lev / slab+pcp stress / buddy uniqueness).
+# Gated off by default because the slab stress test used to trip the PMM
+# cross-CPU double-alloc (now fixed, mm/pcp 809127d).  Enable with
+# `SELFTESTS=1 bash build.sh` to run them at boot.
+if [ "${SELFTESTS:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_BOOT_SELFTESTS )
+  echo "[build] boot self-tests ENABLED (-DMAKAOS_BOOT_SELFTESTS)"
+fi
+
+# `CONSOLE_SERIAL=1 bash build.sh` mirrors userland console output to the
+# serial port — makes headless boots diagnosable and userland program/test
+# output capturable.  Off by default (would flood the serial under a desktop).
+if [ "${CONSOLE_SERIAL:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_CONSOLE_SERIAL )
+  echo "[build] console->serial mirror ENABLED (-DMAKAOS_CONSOLE_SERIAL)"
+fi
+# SIGTEST=1 runs /bin/sigtest at boot (JVM SA_SIGINFO signal-layer verification).
+if [ "${SIGTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_SIGTEST )
+  echo "[build] boot sigtest ENABLED (-DMAKAOS_SIGTEST)"
+fi
+# AVIANTEST=1 runs the Avian JVM at boot to execute Hello.class (first-light).
+if [ "${AVIANTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_AVIANTEST )
+  echo "[build] boot Avian first-light ENABLED (-DMAKAOS_AVIANTEST)"
+fi
+# JDKTEST=1 stages the cross-built OpenJDK Zero java.base image + runs
+# `/jdk/bin/java -version` at boot (behind -DMAKAOS_JDKTEST in main.c).
+if [ "${JDKTEST:-0}" = "1" ]; then
+  KERNEL_CFLAGS+=( -DMAKAOS_JDKTEST )
+  echo "[build] boot OpenJDK 'java -version' ENABLED (-DMAKAOS_JDKTEST)"
+fi
+
 # ── User compile flags ─────────────────────────────────────────────────────
+# -fPIE (position-independent) so every userland object -- libc especially --
+# can link into a PIE (ET_DYN) for the dynamic loader.  -fPIE, NOT -fPIC: the
+# main executable's own __thread TLS stays LOCAL-EXEC (TPOFF, resolved at link
+# time); -fPIC would default __thread to general-dynamic and pull in
+# __tls_get_addr (dynamic TLS -- a later phase).  PIE objects carry only
+# R_X86_64_RELATIVE (GOT/data, applied by the kernel loader) + TPOFF relocs, no
+# absolute R_X86_64_32/32S, so `ld -pie` accepts libc.a.  Apps still LINK as
+# static ET_EXEC via the gcc driver (-static); PIE codegen runs fine at a fixed
+# base, so this is transparent to them until they are linked -pie later.
 USER_CFLAGS=(
   -ffreestanding -m64 -mno-red-zone
-  -fno-pie -fno-pic -fno-plt
+  -fPIE -fno-plt
   -fno-stack-protector -fno-builtin
   -fno-asynchronous-unwind-tables -fno-unwind-tables
   -O0 -Wall -Wextra
@@ -142,14 +185,15 @@ SYSROOT_CFLAGS=(
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/fts.c" -o "$BUILD_DIR/user_fts.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/libc/dns.c"   -o "$BUILD_DIR/user_dns.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math.c" -o "$BUILD_DIR/user_math.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/libc/math_c99.c" -o "$BUILD_DIR/user_math_c99.o"
 
 # POSIX-header-aligned syscall wrapper files.  One file per header —
 # each provides link-resolvable extern symbols for sysroot consumers
 # (ports linked via -lc).  libc.h keeps its static-inline copies for
 # in-tree apps that include it directly.
 for src in unistd fcntl sys_stat sys_socket sys_eventfd sys_timerfd \
-           sys_signalfd sys_ioctl sys_time sys_file sys_epoll \
-           time arpa_inet string ctype makaos_input poll signal resolv \
+           sys_signalfd sys_ioctl sys_time sys_file sys_epoll sys_prctl sys_sysinfo sys_statfs sys_times sys_shm ifaddrs utmpx sched spawn sys_sendfile sys_inotify sys_xattr ssp jdk_compat glibc_compat \
+           time arpa_inet string ctype makaos_input poll select signal resolv \
            getopt wordexp tls; do
   "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
     -c "$USERLAND_DIR/libc/${src}.c" -o "$BUILD_DIR/user_${src}.o"
@@ -209,6 +253,7 @@ done
 ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_libc.o"    "$BUILD_DIR/user_stdio.o" \
    "$BUILD_DIR/user_dns.o"     "$BUILD_DIR/user_math.o" \
+   "$BUILD_DIR/user_math_c99.o" \
    "$BUILD_DIR/user_setjmp.o"  "$BUILD_DIR/user_pthread.o" \
    "$BUILD_DIR/user_pthread_tramp.o" \
    "$BUILD_DIR/user_dlfcn.o"    "$BUILD_DIR/user_locale.o" \
@@ -221,9 +266,10 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
    "$BUILD_DIR/user_sys_signalfd.o" "$BUILD_DIR/user_sys_ioctl.o" \
    "$BUILD_DIR/user_sys_time.o" "$BUILD_DIR/user_sys_file.o" \
    "$BUILD_DIR/user_sys_epoll.o" \
+   "$BUILD_DIR/user_sys_prctl.o" "$BUILD_DIR/user_sys_sysinfo.o" "$BUILD_DIR/user_sys_statfs.o" "$BUILD_DIR/user_sys_times.o" "$BUILD_DIR/user_sys_shm.o" "$BUILD_DIR/user_ifaddrs.o" "$BUILD_DIR/user_utmpx.o" "$BUILD_DIR/user_sched.o" "$BUILD_DIR/user_spawn.o" "$BUILD_DIR/user_sys_sendfile.o" "$BUILD_DIR/user_sys_inotify.o" "$BUILD_DIR/user_sys_xattr.o" "$BUILD_DIR/user_ssp.o" "$BUILD_DIR/user_jdk_compat.o" "$BUILD_DIR/user_glibc_compat.o" \
    "$BUILD_DIR/user_time.o" "$BUILD_DIR/user_arpa_inet.o" \
    "$BUILD_DIR/user_ctype.o" "$BUILD_DIR/user_makaos_input.o" \
-   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_signal.o" \
+   "$BUILD_DIR/user_poll.o" "$BUILD_DIR/user_select.o" "$BUILD_DIR/user_signal.o" \
    "$BUILD_DIR/user_resolv.o" "$BUILD_DIR/user_getopt.o" \
    "$BUILD_DIR/user_wordexp.o" "$BUILD_DIR/user_tls.o" \
    "$BUILD_DIR/user_wayland_egl_stub.o" \
@@ -237,8 +283,19 @@ ar rcs "$SYSROOT/usr/lib/libc.a" \
 # list user_entry.o explicitly in each link line.
 cp "$BUILD_DIR/user_entry.o" "$SYSROOT/usr/lib/crt0.o"
 
+# crtdso.o — supplies a hidden, self-referential __dso_handle for shared
+# objects built via `gcc -shared` (C++ static destructors reference it via
+# __cxa_atexit, and MakaOS links .so's with no crt fragments).  The cross-gcc
+# startfile spec selects crtdso.o for -shared and crt0.o otherwise.
+"$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" -fPIC \
+    -c "$USERLAND_DIR/libc/crtdso.c" -o "$SYSROOT/usr/lib/crtdso.o"
+
 # Default link script for sysroot users.
 cp "$USERLAND_DIR/link.ld" "$SYSROOT/usr/lib/makaos-link.ld"
+# PIE link script for sysroot users that link dynamic (-pie) executables via the
+# gcc driver -- e.g. the OpenJDK launchers.  The driver's specs reference this at
+# %R/usr/lib/link-pie.ld for the -pie case (see toolchain specs).
+cp "$USERLAND_DIR/link-pie.ld" "$SYSROOT/usr/lib/link-pie.ld"
 
 # ── mbedTLS (userspace port, sysroot-based) ────────────────────────────────
 # port-mbedtls.sh fetches the upstream tarball into build/third_party/,
@@ -290,11 +347,14 @@ USER_RT=(
     "$BUILD_DIR/user_ctype.o"
     "$BUILD_DIR/user_makaos_input.o"
     "$BUILD_DIR/user_poll.o"
+    "$BUILD_DIR/user_select.o"
     "$BUILD_DIR/user_signal.o"
     "$BUILD_DIR/user_arpa_inet.o"
     "$BUILD_DIR/user_string.o"
     "$BUILD_DIR/user_stdlib.o"
     "$BUILD_DIR/user_dlfcn.o"
+    "$BUILD_DIR/user_pthread.o"        # dlfcn's loader lock -> pthread_mutex_*
+    "$BUILD_DIR/user_pthread_tramp.o"  # pthread.o -> pthread_trampoline
     "$BUILD_DIR/user_locale.o"
     "$BUILD_DIR/user_langinfo.o"
     "$BUILD_DIR/user_assert.o"
@@ -316,6 +376,105 @@ USER_LINK="$USERLAND_DIR/link.ld"
    -o "$BUILD_DIR/user_hello.elf"
 "$OBJCOPY" -O binary "$BUILD_DIR/user_hello.elf" "$BUILD_DIR/user_hello.bin"
 
+# sigtest — verifies SA_SIGINFO delivery + ucontext RIP-redirect (JVM signal
+# layer).  Test-only: compiled + installed + boot-spawned only under SIGTEST=1.
+if [ "${SIGTEST:-0}" = "1" ]; then
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/sigtest/sigtest.c" -o "$BUILD_DIR/user_sigtest.o"
+# Link the fresh in-tree pthread objects (they carry the new pthread_kill +
+# sched_yield); the linker pulls the rest from the toolchain libc archive.
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_sigtest.o" \
+   "$BUILD_DIR/user_pthread.o" "$BUILD_DIR/user_pthread_tramp.o" \
+   -o "$BUILD_DIR/user_sigtest.elf"
+fi
+
+# virgltest -- drives the virtio-gpu 3D render-node uAPI (/dev/dri/renderD128)
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/virgltest/virgltest.c" -o "$BUILD_DIR/user_virgltest.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_virgltest.o" \
+   -o "$BUILD_DIR/user_virgltest.elf"
+
+# gltest -- first light through the ported Mesa GL stack (EGL + GLES2 + gbm +
+# the static virgl gallium driver).  Only build it if the Mesa libs are ported
+# into the sysroot (scripts/port-mesa.sh); otherwise skip cleanly.
+GL_L="$SYSROOT/usr/lib"
+if [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
+    # Compile against the sysroot public + Mesa headers only (NOT userland/libc,
+    # whose internal size_t typedef conflicts with the ABI stddef.h).
+    "$USER_CC" -ffreestanding -m64 -mno-red-zone -fno-pie -fno-pic -fno-plt \
+        -fno-stack-protector -fno-builtin -O0 -Wall -isystem "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/gltest/gltest.c" -o "$BUILD_DIR/user_gltest.o"
+    # Link with g++ (libstdc++ for Mesa's C++), the megadriver + Mesa archives in
+    # one group (they cross-reference), libffi after wayland, allow-multiple-def
+    # for the math functions Mesa ships that MakaOS's libc also provides.
+    # -s (strip) + --gc-sections: the unstripped static Mesa binary is ~80 MB
+    # (mostly debug info); stripped it is ~15 MB.
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+        "$BUILD_DIR/user_gltest.o" \
+        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
+        "$GL_L/dri/virtio_gpu_dri.so" \
+        "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+        "$GL_L/libdrm.a" "$GL_L/libexpat.a" \
+        "$GL_L/libwayland-client.a" "$GL_L/libwayland-server.a" "$GL_L/libffi.a" \
+        -Wl,--end-group \
+        "$GL_L/libz.a" -lm -lpthread \
+        -o "$BUILD_DIR/user_gltest.elf"
+    echo "[build] gltest linked against the static Mesa GL stack"
+fi
+
+# glfwtest -- GLFW-Wayland smoke test (the windowing path Minecraft's LWJGL needs).
+# Links the ported GLFW static lib on top of the same Mesa GL stack as gltest,
+# plus the Wayland client libs GLFW's backend uses (cursor + egl-window + xkb).
+# Built only if GLFW is ported (scripts/port-glfw.sh) and the Mesa libs exist.
+if [ -f "$GL_L/libglfw3.a" ] && [ -f "$GL_L/libEGL.a" ] && [ -f "$GL_L/dri/virtio_gpu_dri.so" ]; then
+    # PIE + --export-dynamic so the wayland/EGL/GLES/xkb symbols GLFW resolves via
+    # its dlopen fallback (dlsym(RTLD_DEFAULT,...) -- MakaOS ships those libs static,
+    # not as dlopen-able .so) live in glfwtest's own dynamic symbol table.
+    # --whole-archive forces those symbols in (GLFW references them only through
+    # dlsym'd pointers, so they would not otherwise be pulled). libwayland-server.a
+    # resolves the server-side symbols the whole-archived EGL wayland-drm pulls in.
+    "$USER_CC" -fPIE -ffreestanding -m64 -mno-red-zone \
+        -fno-stack-protector -fno-builtin -O0 -Wall -isystem "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/glfwtest/glfwtest.c" -o "$BUILD_DIR/user_glfwtest.o"
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -pie -Wl,--export-dynamic -s \
+        "$BUILD_DIR/user_glfwtest.o" \
+        -Wl,--allow-multiple-definition \
+        -Wl,--whole-archive \
+            "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
+            "$GL_L/libxkbcommon.a" "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" \
+        -Wl,--no-whole-archive \
+        -Wl,--start-group \
+            "$GL_L/libglfw3.a" "$GL_L/dri/virtio_gpu_dri.so" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+            "$GL_L/libdrm.a" "$GL_L/libexpat.a" "$GL_L/libffi.a" "$GL_L/libwayland-server.a" \
+        -Wl,--end-group \
+        "$GL_L/libz.a" -lm -lpthread \
+        -o "$BUILD_DIR/user_glfwtest.elf"
+    echo "[build] glfwtest linked (PIE+export-dynamic) against GLFW-Wayland + Mesa GL"
+
+    # libglfw.so -- a self-contained MakaOS shared lib for LWJGL (Minecraft) to
+    # dlopen from the JVM. Whole-archives GLFW + the wayland/EGL/GLES/xkb symbols
+    # (exported in its own dynsym so GLFW's dlsym(RTLD_DEFAULT,...) fallback finds
+    # them) + Mesa/virgl; only libc stays undefined (resolved at load against the
+    # java process). --hash-style=both so MakaOS's loader reads DT_HASH.
+    # GLX proc-loader shim (glXGetProcAddress -> Mesa eglGetProcAddress) so LWJGL
+    # can resolve the full desktop-GL entry-point set from this same Mesa state.
+    "$USER_CC" --sysroot="$SYSROOT" -m64 -mno-red-zone -fPIC -O2 \
+        -c "$USERLAND_DIR/gl/gl_glx_shim.c" -o "$BUILD_DIR/gl_glx_shim.o"
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -shared -fPIC \
+        -Wl,--hash-style=both -Wl,-soname,libglfw.so -Wl,--allow-multiple-definition \
+        "$BUILD_DIR/gl_glx_shim.o" \
+        -Wl,--whole-archive \
+            "$GL_L/libglfw3.a" \
+            "$GL_L/libwayland-client.a" "$GL_L/libwayland-cursor.a" "$GL_L/libwayland-egl.a" \
+            "$GL_L/libxkbcommon.a" "$GL_L/libEGL.a" "$GL_L/libGLESv2.a" \
+        -Wl,--no-whole-archive \
+        -Wl,--start-group \
+            "$GL_L/dri/virtio_gpu_dri.so" "$GL_L/libgbm.a" "$GL_L/libglapi.a" \
+            "$GL_L/libdrm.a" "$GL_L/libexpat.a" "$GL_L/libffi.a" "$GL_L/libwayland-server.a" \
+            "$GL_L/libz.a" \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/libglfw.so"
+    echo "[build] libglfw.so (self-contained Wayland GLFW for LWJGL) built"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/helloraw/helloraw.c" -o "$BUILD_DIR/user_helloraw.o"
 ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
    -o "$BUILD_DIR/user_helloraw.elf"
@@ -325,6 +484,13 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_posix1.o" \
    -o "$BUILD_DIR/user_test_posix1.elf"
 
+# unixsock_test — isolates which AF_UNIX/epoll syscall wl_display_add_socket_auto hangs on
+if [ -f "$USERLAND_DIR/apps/unixsock_test/unixsock_test.c" ]; then
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/unixsock_test/unixsock_test.c" -o "$BUILD_DIR/user_unixsock_test.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_unixsock_test.o" \
+   -o "$BUILD_DIR/user_unixsock_test.elf"
+fi
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/test_io_uring/test_io_uring.c" -o "$BUILD_DIR/user_test_io_uring.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_test_io_uring.o" \
    -o "$BUILD_DIR/user_test_io_uring.elf"
@@ -333,28 +499,201 @@ ld -nostdlib -T "$USER_LINK" --entry=_start "$BUILD_DIR/user_helloraw.o" \
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_smp_test.o" \
    -o "$BUILD_DIR/user_smp_test.elf"
 
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/heapalias/heapalias.c" -o "$BUILD_DIR/user_heapalias.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_heapalias.o" \
+   -o "$BUILD_DIR/user_heapalias.elf"
+
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -c "$USERLAND_DIR/apps/makaclock/makaclock.c" -o "$BUILD_DIR/user_makaclock.o"
+"$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_makaclock.o" \
+   -o "$BUILD_DIR/user_makaclock.elf"
+
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -msse2 -c "$USERLAND_DIR/apps/tone/tone.c" -o "$BUILD_DIR/user_tone.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_tone.o" \
    -o "$BUILD_DIR/user_tone.elf"
 
-# ── sdl3_hello — end-to-end SDL3 smoke test ──────────────────────────
-# Links against the sysroot-installed libSDL3.a + its Wayland/xkbcommon
-# deps + libc/libm/libpthread.  Uses -nostartfiles + crt0.o like every
-# other sysroot-linked app so argv/argc are populated correctly.
-if [ -f "$SYSROOT/usr/lib/libSDL3.a" ]; then
+# ── pietest -- PIE self-relocation smoke test (dynamic-loader Phase 0/1) ──
+# Linked via ld DIRECTLY: gcc's driver forces -static (overriding -pie -> ET_EXEC),
+# but ld -pie yields a proper ET_DYN + PT_DYNAMIC + R_X86_64_RELATIVE that the
+# kernel ELF loader relocates at load time.  Freestanding, no libc.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/pietest/pietest.c" -o "$BUILD_DIR/user_pietest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -pie --export-dynamic -e _start \
+   --build-id=none "$BUILD_DIR/user_pietest.o" -o "$BUILD_DIR/user_pietest.elf"
+
+# ── piehello -- Phase 0 milestone: a REAL libc program as a static PIE ────
+# Compiled -fPIE (via USER_CFLAGS) and linked with crt0 (_entry) + the now-PIC
+# libc.a via `ld -pie` directly (gcc's driver forces -static -T fixed-base
+# makaos-link.ld -> ET_EXEC).  We use link-pie.ld (base-0 ET_DYN, the stock -pie
+# layout + libc's __tdata_end/__tbss_end TLS symbols) so PT_DYNAMIC carries the
+# RELATIVE relocs the kernel applies and crt0's TLS/init_array symbols resolve.
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+   -c "$USERLAND_DIR/apps/piehello/piehello.c" -o "$BUILD_DIR/user_piehello.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+   --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+   "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_piehello.o" \
+   --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+   -o "$BUILD_DIR/user_piehello.elf"
+
+# ── dlopen (dynamic loader Phase 2) ──────────────────────────────────────
+# libdso.so: a no-import shared object built with `ld -shared` (stock -shared
+# script produces ET_DYN + SysV HASH + dynsym).  dltest: a PIE that dlopen()s
+# it via the real libc loader, dlsym()s + calls into it, then dlclose()s.
+# libdso2.so: a dependency of libdso.so (soname libdso2.so -> DT_NEEDED).
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsotest2/dsotest2.c" -o "$BUILD_DIR/user_dsotest2.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   -soname libdso2.so --build-id=none "$BUILD_DIR/user_dsotest2.o" -o "$BUILD_DIR/libdso2.so"
+# libdso.so: links against libdso2.so -> gets a DT_NEEDED the loader must satisfy.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsotest/dsotest.c" -o "$BUILD_DIR/user_dsotest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   --build-id=none "$BUILD_DIR/user_dsotest.o" "$BUILD_DIR/libdso2.so" -o "$BUILD_DIR/libdso.so"
+# libdsobad.so: imports a strong undefined symbol -> dlopen must reject it.
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/dsobad/dsobad.c" -o "$BUILD_DIR/user_dsobad.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   --build-id=none "$BUILD_DIR/user_dsobad.o" -o "$BUILD_DIR/libdsobad.so"
+# libtlsdso.so: has a __thread var -> general-dynamic TLS (__tls_get_addr + DTPMOD64).
+"$USER_CC" -fPIC -ffreestanding -m64 -mno-red-zone -fno-stack-protector \
+   -c "$USERLAND_DIR/apps/tlsdso/tlsdso.c" -o "$BUILD_DIR/user_tlsdso.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -shared -m elf_x86_64_makaos \
+   --build-id=none "$BUILD_DIR/user_tlsdso.o" -o "$BUILD_DIR/libtlsdso.so"
+"$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+   -c "$USERLAND_DIR/apps/dltest/dltest.c" -o "$BUILD_DIR/user_dltest.o"
+"$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+   --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+   "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_dltest.o" \
+   --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+   -o "$BUILD_DIR/user_dltest.elf"
+
+# ── SDL3 apps ────────────────────────────────────────────────────────
+# libSDL3.a now uses the static-EGL path (no dlopen; SDL_egl.o references the
+# EGL entry points directly), so EVERY SDL video app pulls SDL_egl.o and must
+# link the full static Mesa stack via g++ (libstdc++ for Mesa's C++) + crt0.o
+# (argv + .init_array for Mesa's C++ ctors).  One shared link recipe:
+link_sdl_app() {   # $1 = basename: build/user_$1.o -> build/user_$1.elf
+    "$USER_CXX" --sysroot="$SYSROOT" -m64 -mno-red-zone -no-pie -s \
+        -nostartfiles -Wl,--build-id=none \
+        "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_$1.o" \
+        -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--start-group \
+        "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" \
+        -lSDL3 \
+        -lEGL -lGLESv2 -lGLESv1_CM -lgbm -lglapi \
+        -lwayland-egl -lwayland-client -lwayland-cursor -lwayland-server \
+        -lxkbcommon -lffi -lexpat -ldrm \
+        -lc -lm -lrt -lpthread -ldl -lz \
+        -Wl,--end-group \
+        -o "$BUILD_DIR/user_$1.elf"
+}
+
+# sdl3_hello -- end-to-end SDL3 smoke test (software renderer via wl_shm).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
     "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
         -I "$SYSROOT/usr/include" \
         -c "$USERLAND_DIR/apps/sdl3_hello/sdl3_hello.c" \
         -o "$BUILD_DIR/user_sdl3_hello.o"
-    "$USER_CC" "${USER_CFLAGS[@]}" --sysroot="$SYSROOT" \
-        -nostartfiles -Wl,--build-id=none \
-        "$SYSROOT/usr/lib/crt0.o" \
-        "$BUILD_DIR/user_sdl3_hello.o" \
-        -Wl,--start-group \
-        -lSDL3 -lwayland-client -lwayland-cursor -lxkbcommon -lffi \
-        -lc -lm -lrt -lpthread -ldl \
-        -Wl,--end-group \
-        -o "$BUILD_DIR/user_sdl3_hello.elf"
+    link_sdl_app sdl3_hello
+fi
+
+# ── sdl3_gl -- SDL3 GLES2/EGL (Wayland-EGL -> Mesa -> virgl) smoke test ───────
+# Proves client-side hardware GL: a GLES2 context whose buffer sway composites
+# via linux-dmabuf.  Needs the full static Mesa stack (megadriver + EGL/GLES2/
+# gbm/glapi) in addition to SDL3, so it links via g++ (libstdc++ for Mesa's C++)
+# with --allow-multiple-definition (Mesa ships math symbols libc also provides)
+# and crt0.o (argv + .init_array for Mesa's C++ global ctors), like gltest.
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_gl/sdl3_gl.c" \
+        -o "$BUILD_DIR/user_sdl3_gl.o"
+    link_sdl_app sdl3_gl
+    echo "[build] sdl3_gl linked against SDL3 + the static Mesa GL stack"
+fi
+
+# sdl3_gl3 -- DESKTOP GL 3.3 core smoke test (proves virgl exposes desktop GL,
+# not just GLES2 -- i.e. no GL4ES translation layer needed for legacy/core GL).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_gl3/sdl3_gl3.c" \
+        -o "$BUILD_DIR/user_sdl3_gl3.o"
+    link_sdl_app sdl3_gl3
+    echo "[build] sdl3_gl3 (desktop GL 3.3 core) linked"
+fi
+
+# ── sdl3_audio -- end-to-end SDL3 audio smoke test (native /dev/dsp backend) ──
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+        -I "$SYSROOT/usr/include" \
+        -c "$USERLAND_DIR/apps/sdl3_audio/sdl3_audio.c" \
+        -o "$BUILD_DIR/user_sdl3_audio.o"
+    link_sdl_app sdl3_audio
+fi
+
+# Ensure the toolchain's libstdc++/libsupc++ are PIC (a from-source toolchain may
+# have built them non-PIC).  Self-guards: a no-op if already PIC.  PIC C++ links
+# fine into the static -no-pie apps too, so this is the ONE C++ runtime.  Only
+# bother when the Mesa/SDL stack is present (i.e. GL builds are live).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    SYSROOT="$SYSROOT" bash "$(pwd)/scripts/build-libstdcxx-pic.sh" || \
+        echo "[build] WARNING: PIC libstdc++ retrofit failed; libSDL3.so may not link"
+fi
+
+# ── libSDL3.so + sdltest -- the real dynamic-loader milestone (Phase 5) ──────
+# A SELF-CONTAINED shared object: SDL3 (whole-archive) + the whole Mesa GL stack
+# + wayland + the (now PIC) C++ runtime (libstdc++/supc++/gcc), importing ONLY
+# libc from the host exe.  sdltest is a PIE that dlopen()s it and calls SDL entry
+# points -- proving the loader on a real 83 MB object with ~26k relocs, deps
+# folded in, and cross-module general-dynamic TLS (libc's errno).
+if [ -f "$SYSROOT/usr/lib/libSDL3.a" ] && [ -f "$SYSROOT/usr/lib/dri/virtio_gpu_dri.so" ]; then
+    echo "[build] linking libSDL3.so (self-contained shared object)"
+    bash "$(pwd)/scripts/link-libsdl3-so.sh" "$BUILD_DIR/libSDL3.so"
+    # sdltest PIE provides libc (+ the errno TLS var) to the .so via
+    # --export-dynamic; whole-archive libc.a so EVERY symbol libSDL3.so imports
+    # is present in the exe's exported .dynsym (RTLD_NOW resolves them all).
+    "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+        -c "$USERLAND_DIR/apps/sdltest/sdltest.c" -o "$BUILD_DIR/user_sdltest.o"
+    "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+        --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+        "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_sdltest.o" \
+        --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
+        -o "$BUILD_DIR/user_sdltest.elf"
+    echo "[build] sdltest PIE linked (dlopen libSDL3.so)"
+
+    # sdl2-compat (libSDL2.a) + sdl2test: the SDL2 API over SDL3.  sdl2-compat
+    # loads libSDL3.so.0 at runtime via dlopen+dlsym (unmodified upstream path,
+    # now that the loader exists), so an SDL2 program reaches SDL3 with no hack.
+    SYSROOT="$SYSROOT" bash "$(pwd)/scripts/port-sdl2-compat.sh"
+    if [ -f "$SYSROOT/usr/lib/libSDL2.a" ]; then
+        "$USER_CC" "${USER_CFLAGS[@]}" -D_REENTRANT -isystem "$SYSROOT/usr/include" \
+            "${USER_INCLUDES[@]}" \
+            -c "$USERLAND_DIR/apps/sdl2test/sdl2test.c" -o "$BUILD_DIR/user_sdl2test.o"
+        "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+            --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+            "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_sdl2test.o" \
+            "$SYSROOT/usr/lib/libSDL2.a" \
+            --whole-archive "$SYSROOT/usr/lib/libc.a" --no-whole-archive \
+            -o "$BUILD_DIR/user_sdl2test.elf"
+        echo "[build] sdl2test PIE linked (SDL2 -> sdl2-compat -> dlopen libSDL3)"
+    fi
+
+    # DarkPlaces engine (Xonotic): a PIE that links sdl2-compat (libSDL2.a) +
+    # the codec libs and dlopens libSDL3.so.0 at runtime for video/GL/input.
+    if [ -f "$SYSROOT/usr/lib/libSDL2.a" ] && [ -d "$(pwd)/build/third_party/darkplaces" ]; then
+        SYSROOT="$SYSROOT" bash "$(pwd)/scripts/port-darkplaces.sh" || \
+            echo "[build] WARNING: DarkPlaces build failed"
+        # dplaunch: forces SDL's offscreen video driver + basedir, execs
+        # darkplaces (autologin can't pass args/env) -- headless GL bring-up.
+        if [ -f "$BUILD_DIR/darkplaces_build/darkplaces.elf" ]; then
+            "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
+                -c "$USERLAND_DIR/apps/dplaunch/dplaunch.c" -o "$BUILD_DIR/user_dplaunch.o"
+            "$(pwd)/toolchain/bin/x86_64-pc-makaos-ld" -m elf_x86_64_makaos -pie \
+                --export-dynamic -e _entry --build-id=none -T "$USERLAND_DIR/link-pie.ld" \
+                "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_dplaunch.o" \
+                --start-group "$SYSROOT/usr/lib/libc.a" --end-group \
+                -o "$BUILD_DIR/user_dplaunch.elf"
+        fi
+    fi
 fi
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/shell" -c "$USERLAND_DIR/apps/shell/shell.c" -o "$BUILD_DIR/user_shell.o"
@@ -619,7 +958,16 @@ stat -c "%n %s" \
 echo "[+] Creating disk image (GPT + ESP + ext2)"
 
 EXT2_LBA=4096
-EXT2_SECTORS=786432  # 384 MiB — room for the DE stack (sway+swaybar+swaybg+tofi) + xkb tree
+EXT2_SECTORS=1048576  # 512 MiB — DE stack (sway+swaybar+swaybg+tofi) + xkb tree + the 83 MB libSDL3.so
+# JDKTEST stages the ~55 MB exploded OpenJDK java.base image (6437 class files +
+# libjvm.so); grow the rootfs to 1 GiB so it fits with headroom.
+if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ]; then EXT2_SECTORS=2097152; fi  # 1 GiB
+# MCTEST stages the full exploded JDK (180 MB) + Minecraft client/libs/assets
+# (~715 MB) + writable gameDir; grow the rootfs to 3 GiB. Default mke2fs inode
+# ratio (16 KiB) gives ~196k inodes for ~30k files -- ample.
+if [ "${MCTEST:-0}" = "1" ]; then EXT2_SECTORS=6291456; fi  # 3 GiB
+# Stress test needs the big-fs conditions (384 block groups, high inodes) where
+# the leaves[] corruption reproduced.
 ESP_START=2048
 ESP_END=4095
 
@@ -685,6 +1033,7 @@ SHADOW_EOF
 # Directories: root-owned, 0755 (rwxr-xr-x) except /root (0700) and /tmp (1777).
 debugfs -w "$BUILD_DIR/ext2.img" <<'DEBUGFS_EOF' > /dev/null 2>&1
 mkdir bin
+mkdir lib
 mkdir etc
 mkdir etc/services
 mkdir home
@@ -696,6 +1045,7 @@ DEBUGFS_EOF
 # Set directory permissions (type bits: 0040000 = directory).
 ext2_setperm "$BUILD_DIR/ext2.img" /         0040755 0 0      # / root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /bin      0040755 0 0      # /bin root:root rwxr-xr-x
+ext2_setperm "$BUILD_DIR/ext2.img" /lib      0040755 0 0      # /lib root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /etc      0040755 0 0      # /etc root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /home     0040755 0 0      # /home root:root rwxr-xr-x
 ext2_setperm "$BUILD_DIR/ext2.img" /tmp      0041777 0 0      # /tmp root:root rwxrwxrwx + sticky
@@ -714,10 +1064,41 @@ ext2_setperm "$BUILD_DIR/ext2.img" /etc/passwd 0100644 0 0
 debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/shadow etc/shadow" > /dev/null 2>&1 || true
 ext2_setperm "$BUILD_DIR/ext2.img" /etc/shadow 0100600 0 0
 
+# Optional auto-login (test/kiosk only, agetty -a analog).  `AUTOLOGIN=1 bash
+# build.sh` installs /etc/autologin so login starts a session without an
+# interactive prompt — lets the headless boot-test harness reach the
+# compositor deterministically without blind console keystrokes.  Default
+# builds omit the file, so normal boots still prompt for credentials.
+# Format: "user" or "user:command" (command replaces the login shell).
+if [ "${AUTOLOGIN:-0}" = "1" ]; then
+  printf '%s\n' "${AUTOLOGIN_SPEC:-root:/bin/sway}" > "$BUILD_DIR/etc_stage/autologin"
+  debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/autologin etc/autologin" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /etc/autologin 0100600 0 0
+  echo "[build] AUTOLOGIN enabled: /etc/autologin = ${AUTOLOGIN_SPEC:-root:/bin/sway}"
+fi
+
 # Put a secret file in /root to test permission enforcement
 echo "root's secret — maka cannot read this" > "$BUILD_DIR/etc_stage/root_secret.txt"
 debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/etc_stage/root_secret.txt root/secret.txt" > /dev/null 2>&1 || true
 ext2_setperm "$BUILD_DIR/ext2.img" /root/secret.txt 0100600 0 0
+
+# Quake shareware data for DarkPlaces (DarkPlaces-Quake / gamedir id1): install
+# build/quake-id1/pak0.pak (staged by scripts/fetch-quake-shareware.sh) so
+# `dplaunch` has content to render.  Absent unless fetched -- default images ship
+# without it.  Run headless via scripts/run-gl.sh (autologin root:/bin/dplaunch).
+if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
+  debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /root/id1" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /root/id1 0040755 0 0
+  debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/quake-id1/pak0.pak root/id1/pak0.pak" > /dev/null 2>&1 || true
+  ext2_setperm "$BUILD_DIR/ext2.img" /root/id1/pak0.pak 0100644 0 0
+  echo "[build] installed Quake shareware pak0.pak at /root/id1 (DarkPlaces data)"
+  # Optional loose autoexec.cfg (diagnostic cvars etc.) if present.
+  if [ -f "$BUILD_DIR/quake-id1/autoexec.cfg" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "rm /root/id1/autoexec.cfg" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/quake-id1/autoexec.cfg root/id1/autoexec.cfg" > /dev/null 2>&1 || true
+    ext2_setperm "$BUILD_DIR/ext2.img" /root/id1/autoexec.cfg 0100644 0 0
+  fi
+fi
 
 echo "[+] /etc/passwd and /etc/shadow installed"
 
@@ -748,6 +1129,31 @@ ext2_install_bin() {
     ext2_setperm "$img" "/$dst" 0100755 0 0
 }
 
+# ext2_install_tree <img> <src_dir> <dst_prefix>
+# Recursively stage a host directory tree into the ext2 image under /<dst_prefix>
+# using ONE debugfs session (mkdir every subdir parent-first, then write every
+# file).  Far faster than per-file debugfs invocations for large trees (the JDK's
+# 6437-file java.base module).  dst_prefix has no leading slash.
+ext2_install_tree() {
+    local img="$1" src="$2" dstpref="$3"
+    src="$(cd "$src" && pwd)"   # absolutize for debugfs `write`
+    local script; script="$(mktemp)"
+    {
+        echo "mkdir /$dstpref"
+        ( cd "$src" && find . -mindepth 1 -type d | LC_ALL=C sort ) \
+            | sed "s|^\./|mkdir /$dstpref/|"
+        # -L: follow symlinks so a symlink-to-file (e.g. lib/jvm.cfg) is reported
+        # as -type f and `write` copies its target's content.
+        ( cd "$src" && find -L . -type f ) \
+            | while IFS= read -r f; do
+                  rel="${f#./}"
+                  printf 'write %s/%s /%s/%s\n' "$src" "$rel" "$dstpref" "$rel"
+              done
+    } > "$script"
+    debugfs -w "$img" -f "$script" > /dev/null 2>&1 || true
+    rm -f "$script"
+}
+
 if [ -f "$BUILD_DIR/user_test_vmalloc.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_vmalloc.elf" bin/vmalloc
 fi
@@ -757,11 +1163,150 @@ fi
 if [ -f "$BUILD_DIR/user_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_hello.elf" bin/hello
 fi
+if [ "${SIGTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/user_sigtest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sigtest.elf" bin/sigtest
+fi
+# Avian JVM first-light (AVIANTEST=1): install the cross-built avian VM +
+# classpath.jar + Hello.class, spawned at boot by main.c (behind MAKAOS_AVIANTEST).
+if [ "${AVIANTEST:-0}" = "1" ] && [ -f "$BUILD_DIR/avian-app/avian" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/avian-app/avian" bin/avian
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /avian" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/classpath.jar avian/classpath.jar" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/avian-app/Hello.class avian/Hello.class" > /dev/null 2>&1 || true
+    echo "[build] Avian JVM installed: /bin/avian + /avian/{classpath.jar,Hello.class}"
+fi
+# OpenJDK Zero java.base (JDKTEST=1): stage the exploded runtime image at /jdk so
+# `/jdk/bin/java -version` runs at boot.  Only bin/java + lib/ + the java.base
+# exploded classes are staged (not the full images/ tree with every module).
+if [ "${JDKTEST:-0}" = "1" ] || [ "${LWJGLTEST:-0}" = "1" ] || [ "${MCTEST:-0}" = "1" ]; then
+    # JDK_VARIANT=server selects the tiered C1+C2 JIT VM; default zero (interpreter).
+    JDK_IMG="build/third_party/openjdk17u/build/linux-x86_64-${JDK_VARIANT:-zero}-release/jdk"
+    if [ -x "$JDK_IMG/bin/java" ]; then
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk"         > /dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/bin"     > /dev/null 2>&1 || true
+        debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /jdk/modules" > /dev/null 2>&1 || true
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$JDK_IMG/bin/java" jdk/bin/java
+        ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/lib"                jdk/lib
+        # The JDK's libzip.so is linked against system zlib (libz.so.1), needed
+        # by java.util.zip.Inflater -> reading ANY jar (client.jar, libraries).
+        # The zlib port only builds libz.a (static); build a SHARED libz.so.1
+        # from the same pinned, already-PIC sources with the MakaOS cross-gcc and
+        # stage it at /lib/libz.so.1 (the loader's search path).
+        ZLIB_SRC_DIR="$BUILD_DIR/third_party/zlib-1.3.1"
+        if [ -d "$ZLIB_SRC_DIR" ] && [ -x "$USER_CC" ]; then
+            "$USER_CC" -shared -O2 -fPIC -DHAVE_HIDDEN -DZ_HAVE_UNISTD_H \
+                -Wl,-soname,libz.so.1 -o "$BUILD_DIR/libz.so.1" \
+                "$ZLIB_SRC_DIR"/adler32.c "$ZLIB_SRC_DIR"/compress.c "$ZLIB_SRC_DIR"/crc32.c \
+                "$ZLIB_SRC_DIR"/deflate.c "$ZLIB_SRC_DIR"/gzclose.c "$ZLIB_SRC_DIR"/gzlib.c \
+                "$ZLIB_SRC_DIR"/gzread.c "$ZLIB_SRC_DIR"/gzwrite.c "$ZLIB_SRC_DIR"/infback.c \
+                "$ZLIB_SRC_DIR"/inffast.c "$ZLIB_SRC_DIR"/inflate.c "$ZLIB_SRC_DIR"/inftrees.c \
+                "$ZLIB_SRC_DIR"/trees.c "$ZLIB_SRC_DIR"/uncompr.c "$ZLIB_SRC_DIR"/zutil.c \
+                2>/dev/null && ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libz.so.1" lib/libz.so.1 \
+                && echo "[build] libz.so.1 (shared zlib for the JDK) staged at /lib" \
+                || echo "[build] warn: libz.so.1 build/stage failed -- jar reads will fail"
+        fi
+        # conf/ holds java.security (JCA provider list + policy) which the
+        # security subsystem loads on first crypto/SecureRandom use -- Minecraft
+        # (and any ResourceBundle/locale path) needs it, or class init cascades
+        # into NoClassDefFoundError: sun.security.jca.Providers.
+        [ -d "$JDK_IMG/conf" ] && ext2_install_tree "$BUILD_DIR/ext2.img" "$JDK_IMG/conf" jdk/conf
+        # Stage every built exploded module (java.base, jdk.unsupported for
+        # sun.misc.Unsafe which LWJGL/Minecraft need, and any others built).
+        for moddir in "$JDK_IMG/modules"/*/; do
+            [ -d "$moddir" ] || continue
+            ext2_install_tree "$BUILD_DIR/ext2.img" "$moddir" "jdk/modules/$(basename "$moddir")"
+        done
+        [ -f "$JDK_IMG/release" ] && debugfs -w "$BUILD_DIR/ext2.img" -R "write $JDK_IMG/release /jdk/release" > /dev/null 2>&1 || true
+        # Hello.class -- the `java Hello` demo (allocates a multi-hundred-MB heap
+        # to exercise the high-RAM support). Compiled from the tracked source by
+        # the host JDK 17 to Java-17 bytecode, which the cross-built VM runs.
+        HELLO_SRC="$USERLAND_DIR/apps/jdktest/Hello.java"
+        HOST_JAVAC="/usr/lib/jvm/java-17-openjdk-amd64/bin/javac"
+        mkdir -p "$BUILD_DIR/jdktest"
+        if [ -f "$HELLO_SRC" ] && [ -x "$HOST_JAVAC" ]; then
+            "$HOST_JAVAC" -d "$BUILD_DIR/jdktest" "$HELLO_SRC" || echo "[build] warn: Hello.java compile failed"
+        fi
+        [ -f "$BUILD_DIR/jdktest/Hello.class" ] && \
+            debugfs -w "$BUILD_DIR/ext2.img" -R "write $BUILD_DIR/jdktest/Hello.class /jdk/Hello.class" > /dev/null 2>&1 || true
+        echo "[build] OpenJDK java.base staged at /jdk (bin/java + lib + modules/java.base + Hello.class)"
+    else
+        echo "[build] JDKTEST=1 but $JDK_IMG/bin/java missing -- run 'make java.base' first"
+    fi
+fi
+# LWJGLTEST=1: stage /lwjgl (LWJGL jars + prebuilt core/opengl natives + our
+# Wayland libglfw.so + HelloWindow.class) and autostart the JVM under sway so
+# LWJGL opens a GLFW window on MakaOS. Needs /jdk (staged above) + AUTOLOGIN sway.
+if [ "${LWJGLTEST:-0}" = "1" ] && [ -d "$BUILD_DIR/lwjgl" ] && [ -f "$BUILD_DIR/libglfw.so" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /lwjgl" > /dev/null 2>&1 || true
+    for f in lwjgl-3.3.3.jar lwjgl-glfw-3.3.3.jar lwjgl-opengl-3.3.3.jar HelloWindow.class; do
+        [ -f "$BUILD_DIR/lwjgl/$f" ] && debugfs -w "$BUILD_DIR/ext2.img" -R \
+            "write $BUILD_DIR/lwjgl/$f /lwjgl/$(basename "$f")" > /dev/null 2>&1 || true
+    done
+    # The .so's must be +x: MakaOS requires a file be executable to mmap it PROT_EXEC.
+    # ext2_install_bin stages with 0100755.
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/lwjgl/natives/liblwjgl.so"        lwjgl/liblwjgl.so
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/lwjgl/natives/liblwjgl_opengl.so" lwjgl/liblwjgl_opengl.so
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libglfw.so"                       lwjgl/libglfw.so
+    echo "[build] LWJGL staged at /lwjgl (jars + core natives + our libglfw.so + HelloWindow.class)"
+fi
+# MCTEST=1: stage a full Minecraft install under /mc (client.jar + library jars +
+# extracted LWJGL natives + assets) and a writable gameDir. Our Wayland libglfw.so
+# is substituted for LWJGL's bundled X11/Wayland one. Needs scripts/fetch-minecraft.sh
+# to have populated build/mc/<version> first, and /jdk (staged above) + AUTOLOGIN sway.
+MC_VER="${MC_VER:-1.20.4}"
+MC_SRC="$BUILD_DIR/mc/$MC_VER"
+if [ "${MCTEST:-0}" = "1" ] && [ -f "$MC_SRC/client.jar" ] && [ -f "$BUILD_DIR/libglfw.so" ]; then
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc"        > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/natives" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/game"   > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir /mc/game/tmp" > /dev/null 2>&1 || true
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $MC_SRC/client.jar /mc/client.jar" > /dev/null 2>&1 || true
+    # McLaunch: a thin launcher that loads net.minecraft.client.main.Main
+    # reflectively and prints the full throwable chain itself -- the stock java
+    # launcher masks a main-class load failure behind its localized error path.
+    MCLAUNCH_SRC="$USERLAND_DIR/apps/mclaunch/McLaunch.java"
+    HOST_JAVAC17="/usr/lib/jvm/java-17-openjdk-amd64/bin/javac"
+    [ -x "$HOST_JAVAC17" ] || HOST_JAVAC17="$(command -v javac)"
+    mkdir -p "$BUILD_DIR/mc/mclaunch"
+    if [ -f "$MCLAUNCH_SRC" ] && [ -n "$HOST_JAVAC17" ]; then
+        rm -rf "$BUILD_DIR/mc/mclaunch"; mkdir -p "$BUILD_DIR/mc/mclaunch"
+        "$HOST_JAVAC17" --release 17 -d "$BUILD_DIR/mc/mclaunch" "$MCLAUNCH_SRC" 2>/dev/null || echo "[build] warn: McLaunch compile failed"
+    fi
+    # McLaunch is in package makaos.launch -> makaos/launch/McLaunch.class.
+    [ -d "$BUILD_DIR/mc/mclaunch/makaos" ] && \
+        ext2_install_tree "$BUILD_DIR/ext2.img" "$BUILD_DIR/mc/mclaunch/makaos" mc/makaos
+    ext2_install_tree "$BUILD_DIR/ext2.img" "$MC_SRC/libraries" mc/libraries
+    ext2_install_tree "$BUILD_DIR/ext2.img" "$MC_SRC/assets"    mc/assets
+    # Natives must be +x (MakaOS requires +x to mmap PROT_EXEC). Stage every
+    # extracted LWJGL native EXCEPT the bundled libglfw.so, then drop in ours.
+    for so in "$MC_SRC/natives"/*.so; do
+        base="$(basename "$so")"
+        [ "$base" = "libglfw.so" ] && continue
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$so" "mc/natives/$base"
+    done
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libglfw.so" mc/natives/libglfw.so
+    echo "[build] Minecraft $MC_VER staged at /mc (client + $(ls "$MC_SRC/libraries" | wc -l) libs + natives + assets)"
+fi
+if [ -f "$BUILD_DIR/user_virgltest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_virgltest.elf" bin/virgltest
+    echo "[+] virgltest ELF installed at bin/virgltest (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_gltest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_gltest.elf" bin/gltest
+    echo "[+] gltest ELF installed at bin/gltest (static Mesa GL stack)"
+fi
+if [ -f "$BUILD_DIR/user_glfwtest.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_glfwtest.elf" bin/glfwtest
+    echo "[+] glfwtest ELF installed at bin/glfwtest (GLFW-Wayland smoke test)"
+fi
 if [ -f "$BUILD_DIR/user_helloraw.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_helloraw.elf" bin/helloraw
 fi
 if [ -f "$BUILD_DIR/user_test_posix1.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_posix1.elf" bin/test_posix1
+fi
+if [ -f "$BUILD_DIR/user_unixsock_test.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_unixsock_test.elf" bin/unixsock_test
 fi
 if [ -f "$BUILD_DIR/user_test_io_uring.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_test_io_uring.elf" bin/test_io_uring
@@ -770,12 +1315,55 @@ if [ -f "$BUILD_DIR/user_smp_test.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_smp_test.elf" bin/smp_test
     echo "[+] smp_test ELF installed at bin/smp_test (root:root 0755)"
 fi
+if [ -f "$BUILD_DIR/user_heapalias.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_heapalias.elf" bin/heapalias
+    echo "[+] heapalias ELF installed at bin/heapalias (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_makaclock.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_makaclock.elf" bin/makaclock
+    echo "[+] makaclock ELF installed at bin/makaclock (root:root 0755)"
+fi
 if [ -f "$BUILD_DIR/user_tone.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_tone.elf" bin/tone
+    [ -f "$BUILD_DIR/user_pietest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_pietest.elf" bin/pietest
+    [ -f "$BUILD_DIR/user_piehello.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_piehello.elf" bin/piehello
+    [ -f "$BUILD_DIR/libdso.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso.so" lib/libdso.so
+    [ -f "$BUILD_DIR/libdso2.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdso2.so" lib/libdso2.so
+    [ -f "$BUILD_DIR/libdsobad.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libdsobad.so" lib/libdsobad.so
+    [ -f "$BUILD_DIR/libtlsdso.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libtlsdso.so" lib/libtlsdso.so
+    [ -f "$BUILD_DIR/user_dltest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dltest.elf" bin/dltest
+    # libSDL3 at its standard runtime soname /lib/libSDL3.so.0 (0755 so the loader
+    # may map its text PROT_EXEC) -- the name sdl2-compat + sdltest dlopen.  (No
+    # symlinks in the ext2, and two 83 MB copies won't fit, so one file, .0 name.)
+    [ -f "$BUILD_DIR/libSDL3.so" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/libSDL3.so" lib/libSDL3.so.0
+    [ -f "$BUILD_DIR/user_sdltest.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdltest.elf" bin/sdltest
+    [ -f "$BUILD_DIR/user_sdl2test.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl2test.elf" bin/sdl2test
+    [ -f "$BUILD_DIR/darkplaces_build/darkplaces.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/darkplaces_build/darkplaces.elf" bin/darkplaces
+    [ -f "$BUILD_DIR/user_dplaunch.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_dplaunch.elf" bin/dplaunch
 fi
 if [ -f "$BUILD_DIR/user_sdl3_hello.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_hello.elf" bin/sdl3_hello
+    [ -f "$BUILD_DIR/user_sdl3_gl.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_gl.elf" bin/sdl3_gl
+    [ -f "$BUILD_DIR/user_sdl3_gl3.elf" ] && \
+        ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_gl3.elf" bin/sdl3_gl3
     echo "[+] sdl3_hello ELF installed at bin/sdl3_hello (root:root 0755)"
+fi
+if [ -f "$BUILD_DIR/user_sdl3_audio.elf" ]; then
+    ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_sdl3_audio.elf" bin/sdl3_audio
+    echo "[+] sdl3_audio ELF installed at bin/sdl3_audio (root:root 0755)"
 fi
 if [ -f "$BUILD_DIR/user_shell.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_shell.elf" bin/shell
@@ -829,6 +1417,17 @@ if [ -f "$BUILD_DIR/user_bash.elf" ]; then
     # everything we've hit so far.)
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/sh
     echo "[+] sh (bash) installed at bin/sh (root:root 0755)"
+else
+    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "[build] !! WARNING: build/user_bash.elf is MISSING — /bin/bash AND /bin/sh"
+    echo "[build] !! will NOT be installed.  /etc/passwd makes /bin/bash root's login"
+    echo "[build] !! shell, so login WILL FAIL ('login: failed to exec session' loop"
+    echo "[build] !! / stuck after login).  build/user_bash.elf is git-untracked since"
+    echo "[build] !! b00dfe2 and built from \$BASH_SRC (default /tmp/bash-5.2), which is"
+    echo "[build] !! ephemeral.  Fix: restore the prebuilt ELF from git ->"
+    echo "[build] !!   git show f260b18:build/user_bash.elf > build/user_bash.elf"
+    echo "[build] !! (or re-provide the bash source tree at \$BASH_SRC and rebuild)."
+    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
@@ -881,16 +1480,114 @@ if [ -f "$SYSROOT/usr/bin/sway" ]; then
     # point the wallpaper at the installed asset (swaybg loads it); route
     # $menu through tofi-run → swaymsg exec (no xargs on the image — sh -c
     # evaluates the $(...) at keypress time).
-    sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* — disabled on MakaOS (no glob in wordexp yet)|' \
+    # The default status_command shells out to `date` and `sleep`, which the
+    # image doesn't ship (no coreutils).  A bash clock loop can't substitute:
+    # this bash build has no working `printf '%()T'` (errors → exit 2) and no
+    # `read -t` timeout, and it block-buffers builtin output to a pipe — so the
+    # loop either exits (swaybar then renders red "[error reading from status
+    # command]") or busy-fork-storms a subshell-per-tick (#GP).
+    # A native helper, /bin/makaclock (userland/apps/makaclock), formats UTC
+    # time, one unbuffered write(2)/s, nanosleep, never exits.  status_command
+    # is wired to it.  The earlier "text status destabilizes the bar" was the
+    # kernel pipe_read O_NONBLOCK bug (swaybar's getline blocked forever on the
+    # status pipe) — fixed in kernel/fs/pipe.c, so a live text status is safe.
+    # The explicit `font pango:DejaVu Sans Mono` below avoids the unreliable
+    # generic "monospace" fontconfig match (which renders the bar text as tofu).
+    # Also bind Alt+Return (Mod1) to the terminal, in addition to the default
+    # Super+Return.  When MakaOS runs in a window under a host desktop, the host
+    # WM globally grabs the Super/Windows key for its own launcher, so it never
+    # reaches the guest and $mod+Return silently does nothing.  Alt is not
+    # grabbed that way, so Alt+Return always reaches sway.  Both bindings coexist.
+    sed -e 's|^include /etc/sway/config.d/\*|# include /etc/sway/config.d/* -- disabled on MakaOS (no glob in wordexp yet)|' \
         -e 's|^output \* bg .*|output * bg /usr/share/backgrounds/sway/wallpaper.png fill|' \
+        -e '/bindsym .mod+Return exec .term/a\    bindsym Mod1+Return exec $term' \
+        -e '/bindsym .mod+Return exec .term/a\    bindsym Mod1+s exec /bin/sdl3_hello' \
         -e 's|^set \$menu .*|set $menu swaymsg exec -- $(ls /bin \| tofi --font /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf)|' \
+        -e 's|^[[:space:]]*status_command .*|    status_command /bin/makaclock|' \
+        -e 's|^[[:space:]]*font .*|    font pango:DejaVu Sans Mono 11|' \
+        -e '/^bar {/a\    font pango:DejaVu Sans Mono 11' \
         "$SYSROOT/etc/sway/config" > "$BUILD_DIR/etc_stage/sway_config"
+    # Swiss keyboard: load a PRECOMPILED keymap directly (xkb_file) instead of
+    # letting the guest's cross-built libxkbcommon walk /usr/share/X11/xkb at
+    # runtime.  The RMLVO tree-walk (rules -> includes -> many files) is the
+    # fragile in-guest path: the simple "us" layout compiles from names, but
+    # "ch" (more includes + level3) does not, leaving sway with a NULL keymap
+    # and a dead keyboard.  scripts/configs/ch.xkb is a self-contained keymap
+    # compiled on the host, so in-guest sway only fopen()s and parses one file
+    # (the parser already works -- it compiled "us").  Installed at
+    # /etc/keymap.xkb below; applies to every keyboard.
+    printf 'input type:keyboard xkb_file /etc/keymap.xkb\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    # Launch DarkPlaces (Quake) with Mod1+d; auto-launch it on startup when the
+    # Quake data is present so the desktop boots straight into the game.
+    printf 'bindsym Mod1+d exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    # GLFW-Wayland smoke test: Mod1+g launches it; GLFWTEST=1 also autostarts it
+    # so a headless run-gl.sh boot proves the window/GL-context path unattended.
+    if [ -f "$BUILD_DIR/user_glfwtest.elf" ]; then
+        printf 'bindsym Mod1+g exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
+        [ "${GLFWTEST:-0}" = "1" ] && printf 'exec /bin/glfwtest\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
+    # LWJGL window test: autostart the JVM under sway (needs WAYLAND_DISPLAY) so
+    # LWJGL -> our libglfw.so -> Mesa/virgl opens a window. -Dorg.lwjgl.glfw.libname
+    # points LWJGL at our Wayland GLFW instead of its bundled X11 one.
+    if [ "${LWJGLTEST:-0}" = "1" ]; then
+        LWJGL_CP="/lwjgl/lwjgl-3.3.3.jar:/lwjgl/lwjgl-glfw-3.3.3.jar:/lwjgl/lwjgl-opengl-3.3.3.jar:/lwjgl"
+        # -Dos.name=Linux: LWJGL's Platform.get() only knows Linux/Windows/macOS;
+        # our JVM reports os.name=MakaOS, so present as Linux (we ARE linux-ABI).
+        # -Dorg.lwjgl.opengl.libname=/lwjgl/libglfw.so: LWJGL resolves desktop-GL
+        # entry points from the SAME .so GLFW made the context current in (one
+        # Mesa/glapi instance); its glXGetProcAddress shim forwards to Mesa's
+        # eglGetProcAddress, which knows the full GL 4.x set.
+        printf 'exec /jdk/bin/java -Dos.name=Linux -Dorg.lwjgl.librarypath=/lwjgl -Dorg.lwjgl.glfw.libname=/lwjgl/libglfw.so -Dorg.lwjgl.opengl.libname=/lwjgl/libglfw.so -cp %s HelloWindow\n' \
+            "$LWJGL_CP" >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
+    # Minecraft: autostart the client under sway. Classpath is client.jar + every
+    # library jar; natives (incl. our libglfw.so) come from /mc/natives. Offline
+    # dummy credentials; gameDir + java.io.tmpdir point at the writable /mc/game.
+    if [ "${MCTEST:-0}" = "1" ] && [ -f "$MC_SRC/client.jar" ]; then
+        MC_CP="/mc"
+        MC_CP="$MC_CP:/mc/client.jar"
+        # Exclude the LWJGL *-natives-*.jar (they hold only .so's): on the classpath
+        # LWJGL tries to EXTRACT them to a temp dir (which fails on MakaOS -- deep
+        # mkdir + unset user.name = I/O error). Off the classpath, LWJGL loads the
+        # natives directly from java.library.path=/mc/natives instead.
+        for j in "$MC_SRC"/libraries/*.jar; do
+            case "$(basename "$j")" in *-natives-*.jar) continue;; esac
+            MC_CP="$MC_CP:/mc/libraries/$(basename "$j")"
+        done
+        MC_AIDX="$(sed -n 's/^assetIndex=//p' "$MC_SRC/launch.txt" 2>/dev/null)"; MC_AIDX="${MC_AIDX:-12}"
+        # -XX:TieredStopAtLevel=1: run C1 only (no C2).  History: C1 originally
+        #   SIGSEGV'd (LinearScan/BlockBegin) -- but that was the sys_brk remove+add
+        #   heap-corruption bug trashing the C1 compiler's C-heap, NOT a C1 bug; with
+        #   the brk fix (in-place heap grow) C1 runs clean.  C2 (-XX:-TieredCompilation)
+        #   still DETERMINISTICALLY miscompiles java.util.HashMap.resize on MakaOS (a
+        #   real C2-codegen bug, kernel clean), so cap at C1: far faster than -Xint and
+        #   crash-free.  (Requires the libc sscanf %[...] scanset fix so HotSpot's -XX:
+        #   parser works, AND the syscall()/futex __syscall_ret fix so WaitBarrier's
+        #   FUTEX_WAIT sees -1/errno instead of a raw -EAGAIN.)
+        # -Djdk.lang.Process.launchMechanism=vfork: the default POSIX_SPAWN path
+        #   execs /jdk/lib/jspawnhelper, which PF-KILLs (RIP=0) on MakaOS; vfork
+        #   spawns directly so oshi's hardware probes fail cleanly (IOException)
+        #   instead of wedging the JVM.
+        # -Djava.security.egd=file:/dev/./urandom: seed SecureRandom from the
+        #   kernel CSPRNG.  Without it (and before /dev/random existed) SecureRandom
+        #   fell back to the ThreadedSeedGenerator software-entropy collector, which
+        #   stalled MC's bootstrap for MINUTES.  The kernel now also exposes
+        #   /dev/random (== urandom), so getInstanceStrong() no longer blocks either.
+        printf 'exec /jdk/bin/java -XX:TieredStopAtLevel=1 -Djava.security.egd=file:/dev/./urandom -Djdk.lang.Process.launchMechanism=vfork -Xmx2g -Dos.name=Linux -Duser.name=mc -Duser.home=/mc/game -Djava.awt.headless=true -Djava.io.tmpdir=/mc/game/tmp -Djava.library.path=/mc/natives -Djna.boot.library.path=/mc/natives -Djna.nounpack=true -Dorg.lwjgl.librarypath=/mc/natives -Dorg.lwjgl.glfw.libname=/mc/natives/libglfw.so -Dorg.lwjgl.opengl.libname=/mc/natives/libglfw.so -cp %s makaos.launch.McLaunch --username Player --version %s --gameDir /mc/game --assetsDir /mc/assets --assetIndex %s --uuid 00000000000000000000000000000000 --accessToken 0 --userType legacy --versionType release\n' \
+            "$MC_CP" "$MC_VER" "$MC_AIDX" >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
+    if [ -f "$BUILD_DIR/quake-id1/pak0.pak" ]; then
+        printf 'exec /bin/dplaunch\n' >> "$BUILD_DIR/etc_stage/sway_config"
+    fi
     debugfs -w "$BUILD_DIR/ext2.img" -R "mkdir etc/sway" > /dev/null 2>&1 || true
     debugfs -w "$BUILD_DIR/ext2.img" \
         -R "write $BUILD_DIR/etc_stage/sway_config etc/sway/config" > /dev/null 2>&1 || true
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway        0040755 0 0
     ext2_setperm "$BUILD_DIR/ext2.img" /etc/sway/config 0100644 0 0
-    echo "[+] sway + swaymsg installed (+ /etc/sway/config)"
+    # Precompiled Swiss (ch) keymap that /etc/sway/config's xkb_file points at.
+    debugfs -w "$BUILD_DIR/ext2.img" -R "write $SCRIPT_DIR/scripts/configs/ch.xkb etc/keymap.xkb" > /dev/null 2>&1 || true
+    ext2_setperm "$BUILD_DIR/ext2.img" /etc/keymap.xkb 0100644 0 0
+    echo "[+] sway + swaymsg installed (+ /etc/sway/config + /etc/keymap.xkb)"
 
     # ── Desktop environment components ────────────────────────────────
     # swaybar (taskbar) + swaynag, swaybg (wallpaper daemon), tofi
@@ -1175,7 +1872,7 @@ qemu-system-x86_64 \
   -accel kvm \
   -cpu host \
   -smp 4 \
-  -m 256M \
+  -m 1024M \
   -nodefaults \
   -no-user-config \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

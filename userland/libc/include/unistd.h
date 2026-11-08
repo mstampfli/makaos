@@ -47,17 +47,37 @@ int     isatty(int fd);
 long   sysconf(int name);
 // confstr — string-valued runtime queries (just _CS_PATH for foot).
 size_t confstr(int name, char* buf, size_t len);
+// pathconf/fpathconf — per-path configurable limits.
+long pathconf(const char* path, int name);
+long fpathconf(int fd, int name);
+#define _PC_LINK_MAX          0
+#define _PC_MAX_CANON         1
+#define _PC_MAX_INPUT         2
+#define _PC_NAME_MAX          3
+#define _PC_PATH_MAX          4
+#define _PC_PIPE_BUF          5
+#define _PC_CHOWN_RESTRICTED  6
+#define _PC_NO_TRUNC          7
+#define _PC_VDISABLE          8
 #define _CS_PATH 0
+#define _CS_GNU_LIBC_VERSION       2
+#define _CS_GNU_LIBPTHREAD_VERSION 3
 // _SC_* names — only the subset foot / harfbuzz probe today.
 #define _SC_NPROCESSORS_CONF  10
 #define _SC_NPROCESSORS_ONLN  11
 #define _SC_PAGESIZE          30
 #define _SC_PAGE_SIZE         _SC_PAGESIZE
+#define _SC_PHYS_PAGES        85
+#define _SC_AVPHYS_PAGES      86
 #define _SC_CLK_TCK           2
+#define _SC_GETPW_R_SIZE_MAX  70
+#define _SC_GETGR_R_SIZE_MAX  71
 #define _SC_OPEN_MAX          4
+#define _SC_IOV_MAX           60
 int     ftruncate(int fd, off_t len);
 int     truncate(const char* path, off_t len);
 int     fsync(int fd);
+void    sync(void);
 int     fdatasync(int fd);
 
 // Path ops
@@ -78,8 +98,11 @@ ssize_t pwrite(int fd, const void* buf, size_t n, off_t off);
 
 // Process
 pid_t  fork(void);
+pid_t  vfork(void);
 pid_t  getpid(void);
 pid_t  getppid(void);
+int    gettid(void);               // calling thread's kernel task id
+long   syscall(long number, ...);  // Linux-number compat shim (see sys/syscall.h)
 int    execve(const char* path, char* const argv[], char* const envp[]);
 int    execv(const char* path, char* const argv[]);
 int    execvp(const char* file, char* const argv[]);
@@ -134,6 +157,16 @@ int mknod(const char* path, unsigned mode, unsigned dev);
 
 #ifdef __cplusplus
 }
+#endif
+
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define lseek64     lseek
+#define pread64     pread
+#define pwrite64    pwrite
+#define ftruncate64 ftruncate
 #endif
 
 #endif

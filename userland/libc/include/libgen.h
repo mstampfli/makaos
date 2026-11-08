@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_LIBGEN_H
 #define _MAKAOS_LIBGEN_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // POSIX basename / dirname.  Both modify the passed buffer on Linux;
 // our impls match that contract so libinput's path-manipulation calls
@@ -9,4 +12,7 @@
 char* basename(char* path);
 char* dirname (char* path);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

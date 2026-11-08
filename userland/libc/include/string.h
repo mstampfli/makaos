@@ -18,12 +18,15 @@ void*  memmove(void* dst, const void* src, size_t n);
 void*  memset(void* dst, int c, size_t n);
 int    memcmp(const void* a, const void* b, size_t n);
 void*  memchr(const void* s, int c, size_t n);
+void*  memccpy(void* dest, const void* src, int c, size_t n);
 
 // C strings
 size_t strlen(const char* s);
 size_t strnlen(const char* s, size_t max);
 int    strcmp(const char* a, const char* b);
 int    strncmp(const char* a, const char* b, size_t n);
+int    strcoll(const char* a, const char* b);          // "C" locale: == strcmp
+size_t strxfrm(char* dst, const char* src, size_t n);  // "C" locale: plain copy
 // strcasecmp/strncasecmp come from <strings.h> above — declaring them
 // twice trips ports that compile -Werror=redundant-decls (pango).
 char*  strcpy(char* dst, const char* src);
@@ -43,6 +46,7 @@ char*  strstr(const char* haystack, const char* needle);
 char*  strpbrk(const char* s, const char* accept);
 size_t strspn(const char* s, const char* accept);
 size_t strcspn(const char* s, const char* reject);
+char*  strsep(char** stringp, const char* delim);
 char*  strtok(char* s, const char* delim);
 char*  strtok_r(char* s, const char* delim, char** saveptr);
 char*  strdup(const char* s);

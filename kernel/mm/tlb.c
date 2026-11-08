@@ -82,7 +82,7 @@ ALWAYS_INLINE void tlb_do_flush(uint64_t start, uint64_t end) {
         tlb_flush_local_all();
         return;
     }
-    for (uint64_t va = start & ~PAGE_MASK; va < end; va += PAGE_SIZE)
+    for (uint64_t va = page_align_down(start); va < end; va += PAGE_SIZE)
         tlb_invlpg(va);
 }
 
@@ -144,7 +144,7 @@ void tlb_shootdown_drain(void) {
     while (rev) {
         tlb_flush_slot_t* slot = rev;
         rev = rev->next;
-        for (uint64_t va = slot->start & ~PAGE_MASK; va < slot->end;
+        for (uint64_t va = page_align_down(slot->start); va < slot->end;
              va += PAGE_SIZE)
             tlb_invlpg(va);
         __atomic_store_n(&slot->done, 1u, __ATOMIC_RELEASE);
@@ -240,8 +240,15 @@ static void tlb_flush_common(task_mm_t* mm, uint64_t start, uint64_t end) {
     // cost as Linux.  Bounded: critical sections are short and the
     // receiver work is O(pages invalidated), so max latency is small.
     for (uint32_t i = 0; i < slot_idx; i++) {
-        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE))
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE)) {
+            // Drain OUR incoming shootdown queue while we wait for remote ACKs.
+            // If two CPUs shoot down concurrently and each waits on the other,
+            // relying on interrupt delivery alone can wedge when one is briefly
+            // IRQ-off (in an IPI handler); processing by hand here guarantees
+            // forward progress.  tlb_shootdown_drain is lock-free.
+            tlb_shootdown_drain();
             cpu_relax();
+        }
     }
 
     preempt_enable();
@@ -254,4 +261,55 @@ void tlb_flush_range(task_mm_t* mm, uint64_t start, uint64_t end) {
 void tlb_flush_mm(task_mm_t* mm) {
     // end == 0 → full flush marker the receiver honours.
     tlb_flush_common(mm, 0, 0);
+}
+
+// ── tlb_flush_kernel_range ─────────────────────────────────────────────────
+//
+// Shoot down a KERNEL higher-half VA range on EVERY online CPU.  The mm-scoped
+// path above can't be used for shared kernel mappings (kstack slots, etc.):
+// those live in PML4[511], inherited by every process, so no single mm owns
+// them and any CPU may hold a stale entry.  We therefore target all CPUs
+// unconditionally rather than reading an mm cpumask.  Same descriptor / IPI /
+// ACK-wait protocol as tlb_flush_common; same SEQ_CST fence so the caller's
+// PTE teardown is globally visible before any remote CPU re-walks.
+void tlb_flush_kernel_range(uint64_t start, uint64_t end) {
+    preempt_disable();
+
+    uint32_t me  = this_cpu()->id;
+    int self_hit = 0;
+
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    tlb_flush_slot_t* my_slots = s_send_slots[me];
+    uint32_t slot_idx = 0;
+
+    for (uint32_t cpu = 0; cpu < g_num_cpus; cpu++) {
+        if (cpu == me) { self_hit = 1; continue; }
+
+        tlb_flush_slot_t* s = &my_slots[slot_idx++];
+        s->start = start;
+        s->end   = end;
+        s->done  = 0;
+        s->next  = NULL;
+        tlb_queue_push(cpu, s);
+
+        lapic_send_ipi(g_cpus[cpu].apic_id, VEC_IPI_TLB_FLUSH);
+    }
+
+    if (self_hit)
+        tlb_do_flush(start, end);
+
+    for (uint32_t i = 0; i < slot_idx; i++) {
+        while (!__atomic_load_n(&my_slots[i].done, __ATOMIC_ACQUIRE)) {
+            // Drain OUR incoming shootdown queue while we wait for remote ACKs.
+            // If two CPUs shoot down concurrently and each waits on the other,
+            // relying on interrupt delivery alone can wedge when one is briefly
+            // IRQ-off (in an IPI handler); processing by hand here guarantees
+            // forward progress.  tlb_shootdown_drain is lock-free.
+            tlb_shootdown_drain();
+            cpu_relax();
+        }
+    }
+
+    preempt_enable();
 }

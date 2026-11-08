@@ -131,6 +131,8 @@
 #define SYS_FUTEX             114 // futex(uaddr, op, val, timeout_ns) → see futex.h
 #define SYS_SET_FS            115 // set_fs(addr) — userspace TLS base (MSR_FS_BASE)
 #define SYS_SET_CLEARTID      116 // set_cleartid(addr) — kernel stores 1 + futex-wakes on exit
+#define SYS_RMDIR             117 // rmdir(path_ptr, pathlen) -> 0 or -errno (empty dir only)
+#define SYS_SIGALTSTACK       118 // sigaltstack(new_stack_t*, old_stack_t*) -> 0 or -errno
 
 // signalfd flags (Linux-compatible).
 #define SFD_CLOEXEC  0x0002
@@ -214,6 +216,11 @@ typedef struct {
     uint8_t perms;    // UNVEIL_READ | UNVEIL_WRITE | UNVEIL_EXEC | UNVEIL_CREATE
 } spawn_unveil_entry_t;
 
+// Upper bound on SPAWN_ATTR_UNVEIL entries.  nunveil is attacker-controlled, so
+// the kernel-side copy buffer is bounded (at 257 bytes/entry this is ~64 KiB).
+// Real unveil sets are a handful of paths; an over-cap request is rejected.
+#define SPAWN_UNVEIL_MAX  256u
+
 // spawn_attr_t — ~32 bytes; unveil entries are a separate user pointer so the
 // struct is always kstack-safe regardless of how many unveil entries are passed.
 typedef struct {
@@ -282,6 +289,11 @@ typedef struct {
 #define TIOCGPTN    0x80045430  // get pty number
 #define TIOCSPTLCK  0x40045431  // lock/unlock pty
 #define TIOCGSERIAL 0x541E   // get serial info (stub)
+// MakaOS private: hand the terminal to a uid for the duration of one login
+// session, and REVOKE every fd opened under the previous owner (vhangup).
+// Root only.  `arg` is the new owner uid; 0 returns it to root.  This is what
+// lets /dev/tty0 + /dev/tty belong to the logged-in user and to nobody else.
+#define TIOCSCONSOWN 0x54F0  // set console owner uid + revoke stale fds
 #define TIOCSTI     0x5412   // insert char into input queue
 
 // ── termios c_iflag bits ──────────────────────────────────────────────────

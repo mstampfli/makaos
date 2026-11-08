@@ -5,8 +5,11 @@
 // The master is a plain fd connected to the slave's I/O.
 
 #include "pty.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "tty.h"
+#include "uaccess.h"   // copy_from_user / copy_to_user (shared decls)
 #include "vfs.h"
+#include "errno.h"
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
@@ -54,15 +57,24 @@
 static pty_t* s_pty_head = NULL;
 static uint32_t s_next_pty_index = 0;  // monotonically increasing /dev/pts/N
 
+// Serializes the PTY pair lifetime: the s_pty_head list (insert/unlink/walk),
+// s_next_pty_index, and the open-count decision in pty_master_close /
+// pty_slave_close.  Without it two concurrent closes (master on one CPU, slave
+// on another, fd table shared via CLONE_FILES) both observe "the peer's count
+// is 0" and both kfree(pty) -> double-free / UAF; and a concurrent
+// open-by-index / ctty walk could deref a node being unlinked.  The close wakes
+// run UNDER this lock so a non-freer closer's wake of the peer's embedded waitq
+// cannot race the freer's free (the freer is always the SECOND closer to take
+// the lock, so the first's wake completes before the second frees).
+static spinlock_t s_pty_lock = SPINLOCK_INIT;
+
 pty_t* pty_list_head(void) { return s_pty_head; }
 
-// Remove pty from s_pty_head and free it.  Called when both master_open==0
-// and slave_open_count==0.
-// pty_t contains multiple wait_queue_t heads (master_waitq,
-// slave_drain_waitq, slave.waitq) that may still be referenced by
-// a concurrent wait_queue_wake_all drainer on another CPU — kfree is
-// RCU-deferred so the real free happens after every drainer completes.
-static void pty_free_locked(pty_t* pty) {
+// Unlink pty from s_pty_head.  Caller MUST hold s_pty_lock.  Pairs with the
+// locked insert in pty_alloc; once unlinked no walker (open-by-index / ctty
+// lookup, also under the lock) can observe it, so the caller can free it after
+// releasing the lock.
+static void pty_unlink_locked(pty_t* pty) {
     if (s_pty_head == pty) {
         s_pty_head = pty->next;
     } else {
@@ -70,6 +82,12 @@ static void pty_free_locked(pty_t* pty) {
             if (p->next == pty) { p->next = pty->next; break; }
         }
     }
+    pty->next = NULL;
+}
+
+// Free a pty struct (already unlinked, or never linked -- alloc error path).
+// No lock needed: the object is unreachable from s_pty_head.
+static void pty_free_struct(pty_t* pty) {
     serial_puts_dbg("[pty] free idx=");
     serial_hex_dbg((uint64_t)(uint32_t)pty->index);
     if (pty->master_buf) kfree(pty->master_buf);
@@ -99,11 +117,14 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
 
     if (!pty->master_open) return;  // master closed, discard output
 
-    // Push into master ring buffer
+    // Push into master ring buffer under master_lock so a concurrent
+    // master_read drain (other CPU) cannot race the head/tail update.
+    spin_lock(&pty->master_lock);
     if (!mb_full(pty)) {
         pty->master_buf[pty->m_head] = c;
         pty->m_head = mb_next(pty->m_head);
     }
+    spin_unlock(&pty->master_lock);
     // Full ring: drop is no longer expected for the normal single-byte
     // echo path.  The batched pty_slave_write_buf applies real flow
     // control instead; this per-byte fallback is only used for line-
@@ -115,7 +136,9 @@ static void pty_slave_write_char(tty_t* tty, uint8_t c) {
 }
 
 // Push one OPOST'd byte into the master ring.  Returns 1 on success,
-// 0 if the ring is full (caller must block or give up).
+// 0 if the ring is full (caller must block or give up).  The CALLER must
+// hold pty->master_lock (mirrors the tty rd_push "caller holds the lock"
+// contract); pty_slave_write_buf takes it around the whole push phase.
 static inline int pty_master_push_byte(pty_t* pty, uint8_t c) {
     if (mb_full(pty)) return 0;
     pty->master_buf[pty->m_head] = c;
@@ -143,8 +166,10 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
 
     uint64_t i = 0;
     while (i < len) {
-        // Phase 1: push as much as fits without blocking.
+        // Phase 1: push as much as fits without blocking, under
+        // master_lock so the head update cannot race a master_read drain.
         int pushed_any = 0;
+        spin_lock(&pty->master_lock);
         while (i < len) {
             uint8_t c = buf[i];
             if (opost_onlcr && c == '\n') {
@@ -166,6 +191,7 @@ static void pty_slave_write_buf(tty_t* tty, const uint8_t* buf, uint64_t len) {
             i++;
             pushed_any = 1;
         }
+        spin_unlock(&pty->master_lock);
 
         // Wake the master reader so it can start draining.
         if (pushed_any) {
@@ -193,6 +219,21 @@ typedef struct {
     pty_t* pty;
 } pty_master_ctx_t;
 
+// Drain up to len bytes from the master ring into out, under master_lock
+// (mirrors tty_ldisc_drain).  out is a sys_read buffer whose pages were
+// prefaulted by user_buf_prefault before read() was called, so the copy
+// under the spinlock cannot fault.  Returns the number of bytes drained.
+static uint64_t pty_master_drain(pty_t* pty, uint8_t* out, uint64_t len) {
+    uint64_t got = 0;
+    spin_lock(&pty->master_lock);
+    while (got < len && !mb_empty(pty)) {
+        out[got++] = pty->master_buf[pty->m_tail];
+        pty->m_tail = mb_next(pty->m_tail);
+    }
+    spin_unlock(&pty->master_lock);
+    return got;
+}
+
 // Master read: get slave's output
 static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
@@ -210,16 +251,12 @@ static int64_t pty_master_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (mb_empty(pty) && !pty->slave_open_count) return 0; // EOF
     WAIT_EVENT_HOOK(&pty->master_waitq,
                     !mb_empty(pty) || !pty->slave_open_count,
-                    if (signal_has_actionable(&g_current->sigstate))
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                         return -4 /*EINTR*/;);
     if (mb_empty(pty)) return 0;  // woke on EOF
 
-    uint8_t* out = (uint8_t*)buf;
-    uint64_t got = 0;
-    while (got < len && !mb_empty(pty)) {
-        out[got++] = pty->master_buf[pty->m_tail];
-        pty->m_tail = mb_next(pty->m_tail);
-    }
+    // Drain under master_lock via the shared helper (mirrors tty_ldisc_drain).
+    uint64_t got = pty_master_drain(pty, (uint8_t*)buf, len);
     // Backpressure: if we drained anything, wake slave writers that
     // might be blocked waiting for ring space.
     if (got) wait_queue_wake_all(&pty->slave_drain_waitq);
@@ -271,22 +308,22 @@ static void pty_master_close(vfs_file_t* self) {
         pty_slave_close(sf);
     }
 
+    // Flip master_open, wake the slave-side waiters (blocking readers/writers,
+    // poll/epoll), and decide the free -- all UNDER s_pty_lock so a concurrent
+    // pty_slave_close cannot double-free, and so this wake of the slave waitqs
+    // cannot race that closer's free of the pty (the freer is whichever closer
+    // takes the lock SECOND, so the other's wake has already completed).
+    spin_lock(&s_pty_lock);
     pty->master_open = 0;
-
-    // Wake any slave reader (they'll get EOF / EIO).  Blocking readers
-    // sleep on slave.waitq, poll/epoll waiters too — one wake_all
-    // fires both.
     wait_queue_wake_all(&pty->slave.waitq);
-    // Also wake any slave writer blocked on a full ring — they'll
-    // notice master_open == 0 and bail out.
     wait_queue_wake_all(&pty->slave_drain_waitq);
+    int do_free = (pty->slave_open_count == 0);
+    if (do_free) pty_unlink_locked(pty);
+    spin_unlock(&s_pty_lock);
 
     kfree(ctx);
     kfree(self);
-
-    // If both sides are now closed, free the pty struct.
-    if (pty->slave_open_count == 0)
-        pty_free_locked(pty);
+    if (do_free) pty_free_struct(pty);
 }
 
 // ── Slave fd VFS operations ─────────────────────────────────────────────
@@ -305,9 +342,7 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     if (!ctx->pty->master_open) return -5; // -EIO
 
     // POSIX: background process reading from its controlling tty → SIGTTIN.
-    if (g_current && tty->fg_pgid &&
-        g_current->sid == tty->session &&
-        g_current->pgid != tty->fg_pgid) {
+    if (tty_is_background(tty)) {
         signal_send(g_current, SIGTTIN);
         return -4; // -EINTR
     }
@@ -315,25 +350,17 @@ static int64_t pty_slave_read(vfs_file_t* self, void* buf, uint64_t len) {
     uint8_t* out = (uint8_t*)buf;
     uint64_t got = 0;
 
-    uint32_t vmin = (tty->termios.c_lflag & ICANON) ? 1
-                  : tty->termios.c_cc[VMIN];
-    if (vmin == 0) vmin = 1;
-
     if (tty->rd_head == tty->rd_tail && !ctx->pty->master_open) return 0; // EOF
     WAIT_EVENT_HOOK(&tty->waitq,
                     tty->rd_head != tty->rd_tail || !ctx->pty->master_open,
-                    if (signal_has_actionable(&g_current->sigstate))
+                    if (signal_has_actionable(&g_current->sigstate, g_current->sighand))
                         return -4 /*EINTR*/;);
     if (tty->rd_head == tty->rd_tail) return 0;  // woke on EOF
 
-    while (got < len) {
-        if (tty->rd_head == tty->rd_tail) break;
-        uint8_t c = tty->read_buf[tty->rd_head];
-        tty->rd_head = (tty->rd_head + 1) & (TTY_READ_BUF_SIZE - 1);
-        out[got++] = c;
-        if ((tty->termios.c_lflag & ICANON) && c == '\n') break;
-        if (!(tty->termios.c_lflag & ICANON) && got >= vmin) break;
-    }
+    // Drain under the slave tty's lock via the shared cooked-byte path -- the
+    // same locked drain /dev/tty uses, so the ring is never popped lock-free
+    // from two places (dup-shared slave fds can have concurrent readers).
+    got = tty_ldisc_drain(tty, out, len);
 
     PTT1("slave_read.return", "got", got);
     return (int64_t)got;
@@ -346,10 +373,7 @@ static int64_t pty_slave_write(vfs_file_t* self, const void* buf, uint64_t len) 
     if (!ctx->pty->master_open) return -5; // EIO
 
     // POSIX: background process writing to its controlling tty → SIGTTOU (if TOSTOP).
-    if (g_current && tty->fg_pgid &&
-        g_current->sid == tty->session &&
-        g_current->pgid != tty->fg_pgid &&
-        (tty->termios.c_lflag & TOSTOP)) {
+    if (tty_is_background(tty) && (tty->termios.c_lflag & TOSTOP)) {
         signal_send(g_current, SIGTTOU);
         return -4; // -EINTR
     }
@@ -391,17 +415,28 @@ static void pty_slave_close(vfs_file_t* self) {
     pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
     pty_t* pty = ctx->pty;
 
+    // Decrement, wake master-side waiters (EOF), and decide the free, all under
+    // s_pty_lock (see pty_master_close): serialises the free decision against a
+    // concurrent master close and orders this wake before any free.
+    spin_lock(&s_pty_lock);
     pty->slave_open_count--;
-
-    // Wake every master-side waiter so they observe EOF.
     wait_queue_wake_all(&pty->master_waitq);
+    int do_free = (pty->slave_open_count == 0 && !pty->master_open);
+    if (do_free) {
+        pty_unlink_locked(pty);
+    } else if (pty->slave_file == self) {
+        // Master is still open, but the SHARED slave vfs_file_t (self) is freed
+        // just below.  Clear the cached pointer + claim flag under the lock so a
+        // later /dev/pts/N open sees NULL and does NOT resurrect this freed file
+        // via a raw refcount bump -- the reopen-after-slave-close use-after-free.
+        pty->slave_file    = NULL;
+        pty->slave_claimed = 0;
+    }
+    spin_unlock(&s_pty_lock);
 
     kfree(ctx);
     kfree(self);
-
-    // If both sides are now closed, free the pty struct.
-    if (pty->slave_open_count == 0 && !pty->master_open)
-        pty_free_locked(pty);
+    if (do_free) pty_free_struct(pty);
 }
 
 // ── Master ioctl ─────────────────────────────────────────────────────────
@@ -411,107 +446,63 @@ static void pty_slave_close(vfs_file_t* self) {
 // console-tty fallback that accidentally signals the *console's* fg_pgid —
 // which killed makaterm with SIGWINCH on every resize.
 
-static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
-    pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
-    tty_t* tty = &ctx->pty->slave;
+// Safe user<->kernel copies (validate + prefault, return 0 / -EFAULT).  The
+// ioctl `arg` is a raw user pointer; reading/writing it directly (as the old
+// code did) was an arbitrary kernel read/write from any process that can open
+// /dev/ptmx or /dev/pts/N.  Route every get/set through these.
 
+// Shared termios/winsize/pgrp ioctls.  Master and slave both act on the SAME
+// slave tty, so the get/set logic is identical -- one source of truth here
+// instead of two drifting copies.  Returns 0, -EFAULT (bad user `arg`), or
+// -EINVAL (request not handled here; the caller handles its unique ioctls).
+static int64_t pty_tty_ioctl_common(tty_t* tty, uint64_t request, uint64_t arg) {
     switch (request) {
         case 0x5401: { // TCGETS
-            termios_t* out = (termios_t*)arg;
-            *out = tty->termios;
-            return 0;
+            // Snapshot under tty->lock into a stack local, then copy out -- so a
+            // concurrent TCSET* cannot hand userland a half-updated struct, and
+            // copy_to_user (which can fault) never touches the live termios.
+            termios_t snap;
+            tty_get_termios(tty, &snap);
+            return copy_to_user((void*)arg, &snap, sizeof(snap)) ? -EFAULT : 0;
         }
         case 0x5402: // TCSETS
         case 0x5403: // TCSETSW
         case 0x5404: { // TCSETSF
-            const termios_t* in = (const termios_t*)arg;
-            tty->termios = *in;
+            // Land the user copy in a stack local FIRST (copy_from_user can
+            // fault, so it must not run under tty->lock), then publish the
+            // whole struct atomically-w.r.t-readers via tty_set_termios.  A bad
+            // user pointer fails BEFORE any mutation -- no half-set termios.
+            termios_t tmp;
+            if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)))
+                return -EFAULT;
+            tty_set_termios(tty, &tmp);
             if (request == 0x5404) tty_flush_input(tty);
             return 0;
         }
         case 0x540F: { // TIOCGPGRP
-            uint32_t* out = (uint32_t*)arg;
-            *out = tty->fg_pgid;
-            return 0;
+            // Snapshot to a local: copy_to_user must not read the LIVE fg_pgid
+            // (a concurrent TIOCSPGRP write could be in flight).
+            uint32_t pg = __atomic_load_n(&tty->fg_pgid, __ATOMIC_ACQUIRE);
+            return copy_to_user((void*)arg, &pg, sizeof(pg)) ? -EFAULT : 0;
         }
         case 0x5410: { // TIOCSPGRP
-            const uint32_t* in = (const uint32_t*)arg;
-            tty->fg_pgid = *in;
-            return 0;
+            // copy_from_user directly INTO the live fg_pgid could tear it (its
+            // memcpy(len=4) may lower byte-wise) under a concurrent reader
+            // (Ctrl-C / SIGWINCH signal routing).  Land in a local, then publish
+            // with one aligned atomic store.  fg_pgid is a single word, so no
+            // tty->lock is needed (unlike the multi-word termios snapshot).
+            uint32_t pg;
+            if (copy_from_user(&pg, (const void*)arg, sizeof(pg))) return -EFAULT;
+            return tty_set_fg_pgrp(tty, pg);   // authorized set (SSOT in tty.c)
         }
-        case 0x5413: { // TIOCGWINSZ
-            winsize_t* out = (winsize_t*)arg;
-            *out = tty->winsize;
-            return 0;
-        }
-        case 0x5414: { // TIOCSWINSZ
-            const winsize_t* in = (const winsize_t*)arg;
-            tty->winsize = *in;
-            // Notify the foreground pgroup on the slave side so the child
-            // shell can reflow. Never signal the master's own pgroup.
-            if (tty->fg_pgid)
-                signal_send_pgrp(tty->fg_pgid, SIGWINCH);
-            return 0;
-        }
-        case 0x5425: // TCSBRK
-        case 0x540B: // TCXONC
-        case 0x540C: // TCFLSH
-        case 0x540D: // TIOCEXCL
-        case 0x540A: // TIOCNXCL
-            return 0;
-        case 0x80045430: { // TIOCGPTN — slave index for ptsname()
-            uint32_t* out = (uint32_t*)arg;
-            *out = (uint32_t)ctx->pty->index;
-            return 0;
-        }
-        default:
-            return -22; // EINVAL
-    }
-}
-
-// ── Slave ioctl ──────────────────────────────────────────────────────────
-
-static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
-    pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
-    tty_t* tty = &ctx->pty->slave;
-
-    switch (request) {
-        case 0x5401: { // TCGETS
-            termios_t* out = (termios_t*)arg;
-            *out = tty->termios;
-            return 0;
-        }
-        case 0x5402: // TCSETS
-        case 0x5403: // TCSETSW
-        case 0x5404: { // TCSETSF
-            const termios_t* in = (const termios_t*)arg;
-            tty->termios = *in;
-            if (request == 0x5404) tty_flush_input(tty);
-            return 0;
-        }
-        case 0x540F: { // TIOCGPGRP
-            uint32_t* out = (uint32_t*)arg;
-            *out = tty->fg_pgid;
-            return 0;
-        }
-        case 0x5410: { // TIOCSPGRP
-            const uint32_t* in = (const uint32_t*)arg;
-            tty->fg_pgid = *in;
-            return 0;
-        }
-        case 0x5413: { // TIOCGWINSZ
-            winsize_t* out = (winsize_t*)arg;
-            *out = tty->winsize;
-            return 0;
-        }
-        case 0x5414: { // TIOCSWINSZ
-            const winsize_t* in = (const winsize_t*)arg;
-            tty->winsize = *in;
-            // TODO: send SIGWINCH to fg_pgid
-            return 0;
-        }
-        case 0x540E: // TIOCSCTTY
-            tty_set_ctty(tty);
+        case 0x5413: // TIOCGWINSZ
+            return copy_to_user((void*)arg, &tty->winsize, sizeof(tty->winsize))
+                   ? -EFAULT : 0;
+        case 0x5414: // TIOCSWINSZ
+            if (copy_from_user(&tty->winsize, (const void*)arg, sizeof(tty->winsize)))
+                return -EFAULT;
+            // Notify the foreground pgroup so the child shell can reflow.
+            if (tty->fg_pgid) signal_send_pgrp(tty->fg_pgid, SIGWINCH);
             return 0;
         case 0x5425: // TCSBRK
         case 0x540B: // TCXONC
@@ -520,9 +511,63 @@ static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg)
         case 0x540A: // TIOCNXCL
             return 0;  // acknowledged, no-op
         default:
-            return -22; // EINVAL
+            return -EINVAL;
     }
 }
+
+static int64_t pty_master_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    pty_master_ctx_t* ctx = (pty_master_ctx_t*)self->ctx;
+    if (request == 0x80045430) { // TIOCGPTN -- master-only: slave index for ptsname()
+        uint32_t n = (uint32_t)ctx->pty->index;
+        return copy_to_user((void*)arg, &n, sizeof(n)) ? -EFAULT : 0;
+    }
+    return pty_tty_ioctl_common(&ctx->pty->slave, request, arg);
+}
+
+// ── Slave ioctl ──────────────────────────────────────────────────────────
+
+static int64_t pty_slave_ioctl(vfs_file_t* self, uint64_t request, uint64_t arg) {
+    pty_slave_ctx_t* ctx = (pty_slave_ctx_t*)self->ctx;
+    if (request == 0x540E) { // TIOCSCTTY -- slave-only
+        tty_set_ctty(&ctx->pty->slave);
+        return 0;
+    }
+    return pty_tty_ioctl_common(&ctx->pty->slave, request, arg);
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Audit fix: pty ioctls dereferenced the raw user `arg` (arbitrary kernel R/W
+// LPE).  Verify every termios/winsize/pgrp/ptn ioctl now rejects a bad user
+// pointer (kernel / non-canonical / NULL) with -EFAULT instead of touching it.
+void pty_ioctl_selftest(void) {
+    extern void kprintf(const char*, ...);
+    kprintf("[pty_ioctl_test] pty ioctls must reject bad user pointers\n");
+    vfs_file_t* m = pty_open_master();
+    if (!m) { kprintf_atomic("[pty_ioctl_test] FAIL: pty_open_master\n"); return; }
+    static const uint64_t bad[] = {
+        0xFFFF800000001000ULL,   // kernel HHDM address (the LPE case)
+        0xDEAD000000000000ULL,   // non-canonical
+        0ULL,                    // NULL
+    };
+    static const uint64_t reqs[] = {
+        0x5401, 0x5402, 0x540F, 0x5410, 0x5413, 0x5414, 0x80045430,
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        for (unsigned j = 0; j < sizeof(reqs) / sizeof(reqs[0]); j++) {
+            int64_t r = m->ioctl(m, reqs[j], bad[i]);
+            if (r != -EFAULT) {
+                kprintf_atomic("[pty_ioctl_test] FAIL req=0x%lx addr=0x%lx -> %d\n",
+                        (unsigned long)reqs[j], (unsigned long)bad[i], (int)r);
+                fails++;
+            }
+        }
+    }
+    if (m->close) m->close(m);
+    kprintf_atomic(fails ? "[pty_ioctl_test] SELF-TEST FAILED\n"
+                  : "[pty_ioctl_test] SELF-TEST PASSED (ioctls reject bad user pointers)\n");
+}
+#endif
 
 // ── pty_alloc — create a new PTY pair ────────────────────────────────────
 
@@ -539,12 +584,14 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     pty->master_open = 1;
     pty->slave_open_count = 1;
+    // Allocate the /dev/pts index under the lock (advances a global counter).
+    // The pty is linked into s_pty_head at the END of alloc, once fully built,
+    // so a concurrent open-by-index / ctty walk never observes a half-built node
+    // and an alloc-error path just frees it (it was never linked).
+    spin_lock(&s_pty_lock);
     pty->index = (int)(s_next_pty_index++);
+    spin_unlock(&s_pty_lock);
     int idx = pty->index;
-
-    // Link into the live PTY list (head insert).
-    pty->next = s_pty_head;
-    s_pty_head = pty;
 
     serial_puts_dbg("[pty] alloc idx=");
     serial_hex_dbg((uint64_t)(uint32_t)idx);
@@ -595,54 +642,47 @@ int pty_alloc(vfs_file_t** master_out, vfs_file_t** slave_out) {
 
     // Create master vfs_file_t
     pty_master_ctx_t* mctx = kmalloc(sizeof(pty_master_ctx_t));
-    if (!mctx) { pty_free_locked(pty); return -12; } // ENOMEM
+    if (!mctx) { pty_free_struct(pty); return -12; } // ENOMEM
     mctx->pty = pty;
 
-    vfs_file_t* master = kmalloc(sizeof(vfs_file_t));
-    if (!master) { kfree(mctx); pty_free_locked(pty); return -12; }
-    __builtin_memset(master, 0, sizeof(*master));
-
+    vfs_file_t* master = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
+    if (!master) { kfree(mctx); pty_free_struct(pty); return -12; }
     master->read        = pty_master_read;
     master->write       = pty_master_write;
     master->close       = pty_master_close;
-    master->seek        = NULL;
     master->poll        = pty_master_poll;
     master->ioctl       = pty_master_ioctl;
     master->ctx         = mctx;
-    master->waitq           = &master->_waitq; wait_queue_init(master->waitq);
-    wait_queue_init(&pty->master_waitq);
+    wait_queue_init(&pty->master_waitq);        // pty-struct queues (not the vfs waitq)
     wait_queue_init(&pty->slave_drain_waitq);
-    master->secondary_waitq = &pty->master_waitq;  // woken by pty_master_push
-    master->flags       = 0;
-    master->refcount    = 1;
-    master->rights      = 0;
-    master->path[0]     = '\0';
+    master->secondary_waitq = &pty->master_waitq;  // non-default: woken by pty_master_push
 
     pty->master_file = master;  // kept for master close detection (slave EIO path)
 
     // Create slave vfs_file_t
     pty_slave_ctx_t* sctx = kmalloc(sizeof(pty_slave_ctx_t));
-    if (!sctx) { kfree(mctx); kfree(master); pty_free_locked(pty); return -12; }
+    if (!sctx) { kfree(mctx); kfree(master); pty_free_struct(pty); return -12; }
     sctx->pty = pty;
 
-    vfs_file_t* slave = kmalloc(sizeof(vfs_file_t));
-    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_locked(pty); return -12; }
-    __builtin_memset(slave, 0, sizeof(*slave));
-
+    vfs_file_t* slave = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
+    if (!slave) { kfree(mctx); kfree(sctx); kfree(master); pty_free_struct(pty); return -12; }
     slave->read     = pty_slave_read;
     slave->write    = pty_slave_write;
     slave->close    = pty_slave_close;
-    slave->seek     = NULL;
     slave->poll     = pty_slave_poll;
-    slave->ioctl       = pty_slave_ioctl;
-    slave->ctx         = sctx;
-    slave->waitq           = &slave->_waitq; wait_queue_init(slave->waitq);
-    wait_queue_init(&pty->slave.waitq);
-    slave->secondary_waitq = &pty->slave.waitq;  // woken by ldisc when data arrives
-    slave->flags       = 0;
-    slave->refcount    = 1;
-    slave->rights      = 0;
-    slave->path[0]     = '\0';
+    slave->ioctl    = pty_slave_ioctl;
+    slave->ctx      = sctx;
+    wait_queue_init(&pty->slave.waitq);         // pty-struct queue (not the vfs waitq)
+    spin_lock_init(&pty->slave.lock);  // ldisc lock for the slave's ring + line buf
+    spin_lock_init(&pty->master_lock); // serialises the master-output ring head/tail
+    slave->secondary_waitq = &pty->slave.waitq;  // non-default: woken by ldisc when data arrives
+
+    // Publish into the live PTY list now that the pair is fully built (head
+    // insert under the lock; pairs with pty_unlink_locked on the close path).
+    spin_lock(&s_pty_lock);
+    pty->next = s_pty_head;
+    s_pty_head = pty;
+    spin_unlock(&s_pty_lock);
 
     *master_out = master;
     *slave_out = slave;
@@ -666,18 +706,184 @@ vfs_file_t* pty_open_master(void) {
 }
 
 vfs_file_t* pty_open_slave_by_index(int n) {
+    // Walk + claim under s_pty_lock so the lookup cannot race a concurrent
+    // close that unlinks/frees the node, and the slave_claimed flip / refcount
+    // bump is atomic w.r.t. the close-side open-count decision.
+    vfs_file_t* result = NULL;
+    spin_lock(&s_pty_lock);
     for (pty_t* p = s_pty_head; p; p = p->next) {
         if (p->index != n) continue;
-        if (!p->slave_file) return NULL;
+        // slave_file is NULL when the pair is not fully built yet OR when the
+        // slave was closed while the master stayed open (pty_slave_close clears
+        // it now).  Either way there is no live slave file to hand out -> NULL.
+        if (!p->slave_file) break;
         if (!p->slave_claimed) {
             // First open consumes the initial reference taken by
             // pty_alloc (slave_open_count is already 1).
             p->slave_claimed = 1;
-            return p->slave_file;
+            result = p->slave_file;
+        } else {
+            // Additional opens share the same vfs_file -- dup semantics.
+            // vfs_tryget (not a raw refcount bump) fails -> NULL if the file is
+            // mid-teardown (refcount already 0), closing the last-close-vs-open
+            // race instead of resurrecting a dying object.
+            result = vfs_tryget(p->slave_file);
         }
-        // Additional opens share the same vfs_file — dup semantics.
-        __atomic_fetch_add(&p->slave_file->refcount, 1, __ATOMIC_RELAXED);
-        return p->slave_file;
+        break;
     }
-    return NULL;
+    spin_unlock(&s_pty_lock);
+    return result;
+}
+
+// Controlling-tty lookup: return the slave tty whose session == sid, walked
+// under s_pty_lock so it cannot deref a node a concurrent close is unlinking.
+tty_t* pty_find_ctty_slave(uint32_t sid) {
+    tty_t* result = NULL;
+    spin_lock(&s_pty_lock);
+    for (pty_t* p = s_pty_head; p; p = p->next) {
+        if (p->slave.session == sid) { result = &p->slave; break; }
+    }
+    spin_unlock(&s_pty_lock);
+    return result;
+}
+
+// Deterministic PTY pair-lifetime selftest (the s_pty_lock fix): a pair is
+// freed exactly once -- only after BOTH ends close -- and unlinked from the
+// live list.  Single-threaded here (the concurrent master-vs-slave double-free
+// is closed by s_pty_lock -> code-proof); runs in a kthread, driving the close
+// hooks directly on the vfs_file_t pair.
+void pty_lifetime_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf_atomic("[pty_life] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+    int idx = pty->index;
+
+    // Fresh pair: master open, one slave ref.
+    if (pty->master_open != 1 || pty->slave_open_count != 1) {
+        fails++;
+        kprintf_atomic("[pty_life] FAIL fresh m=%d s=%d\n",
+                pty->master_open, pty->slave_open_count);
+    }
+
+    // Park + claim the slave (the /dev/pts-open path) so it is a real open slave
+    // rather than an unclaimed handle the master would release on its own.
+    pty->slave_file = s;
+    vfs_file_t* claimed = pty_open_slave_by_index(idx);
+    if (claimed != s || !pty->slave_claimed) {
+        fails++;
+        kprintf_atomic("[pty_life] FAIL claim\n");
+    }
+
+    // Close the master: master_open -> 0, but the slave is still open, so the
+    // pty must NOT be freed yet (deref below is safe).
+    m->close(m);
+    if (pty->master_open != 0 || pty->slave_open_count != 1) {
+        fails++;
+        kprintf_atomic("[pty_life] FAIL after master close m=%d s=%d\n",
+                pty->master_open, pty->slave_open_count);
+    }
+
+    // Close the slave: slave_open_count -> 0 with the master already closed ->
+    // the pty is freed and unlinked.  Do NOT deref pty after this; verify it is
+    // gone from the live list by index lookup.
+    s->close(s);
+    if (pty_open_slave_by_index(idx) != NULL) {
+        fails++;
+        kprintf_atomic("[pty_life] FAIL pty not unlinked after both ends closed\n");
+    }
+
+    kprintf_atomic(fails ? "[pty_life] SELF-TEST FAILED\n"
+                  : "[pty_life] SELF-TEST PASSED (pair freed once, unlinked)\n");
+}
+
+// Deterministic check of the reopen-after-slave-close UAF fix: when the slave
+// is closed while the master stays OPEN, the shared slave vfs_file_t is freed,
+// so pty->slave_file must be CLEARED (not left dangling at the freed file) and a
+// subsequent /dev/pts/N reopen must return NULL -- never resurrect the freed
+// object with a raw refcount bump (the old __atomic_fetch_add UAF).
+void pty_reopen_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf_atomic("[pty_reopen] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+    int idx = pty->index;
+
+    // Park + claim the slave (the /dev/pts-open path).
+    pty->slave_file = s;
+    if (pty_open_slave_by_index(idx) != s || !pty->slave_claimed) fails++;
+
+    // Close the slave with the master STILL open: the pty survives, but the
+    // shared slave vfs_file_t is freed.  Do NOT deref `s` after this.
+    s->close(s);
+    if (pty->slave_file != NULL)     fails++;   // dangling pointer cleared (the fix)
+    if (pty->slave_claimed != 0)     fails++;
+    if (pty->slave_open_count != 0)  fails++;
+
+    // Reopen must return NULL, never a resurrected freed file.
+    if (pty_open_slave_by_index(idx) != NULL) fails++;
+
+    // Tear down: with the slave gone, closing the master frees the pty.
+    m->close(m);
+
+    kprintf_atomic(fails ? "[pty_reopen] SELF-TEST FAILED\n"
+                  : "[pty_reopen] SELF-TEST PASSED (slave_file cleared on close, no reopen UAF)\n");
+}
+
+// Deterministic master-ring selftest (the master_lock fix): drive the producer
+// (slave write_char + write_buf) and the consumer (pty_master_drain), all of
+// which now take master_lock, and verify the ring round-trips with no self-
+// deadlock.  The concurrent producer-vs-consumer race is not deterministically
+// reproducible -> this proves the locked single-threaded discipline; code-proof
+// covers the cross-CPU case (master_lock makes the head/tail mutations atomic,
+// mirroring tty->lock over the slave input ring).
+void pty_master_ring_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* m = NULL; vfs_file_t* s = NULL;
+    if (pty_alloc(&m, &s) != 0 || !m || !s) {
+        kprintf_atomic("[pty_mring] SELF-TEST FAILED (alloc)\n");
+        return;
+    }
+    pty_t* pty = ((pty_master_ctx_t*)m->ctx)->pty;
+
+    // Producer A: per-byte path (locked push).
+    pty_slave_write_char(&pty->slave, 'h');
+    pty_slave_write_char(&pty->slave, 'i');
+    // Producer B: batched path (locked Phase-1 push); 5 bytes fit, no block.
+    pty_slave_write_buf(&pty->slave, (const uint8_t*)"there", 5);
+
+    // Consumer: drain via the locked helper -- expect "hithere".
+    uint8_t out[8];
+    __builtin_memset(out, 0, sizeof(out));
+    uint64_t got = pty_master_drain(pty, out, sizeof(out));
+    const char* exp = "hithere";
+    int match = (got == 7);
+    for (uint64_t k = 0; match && k < 7; k++)
+        if (out[k] != (uint8_t)exp[k]) match = 0;
+    if (!match) {
+        fails++;
+        kprintf_atomic("[pty_mring] FAIL roundtrip got=%lu\n", (unsigned long)got);
+    }
+    // Ring is drained empty; a second drain returns 0 (head == tail).
+    if (pty_master_drain(pty, out, sizeof(out)) != 0) {
+        fails++;
+        kprintf_atomic("[pty_mring] FAIL ring not empty after drain\n");
+    }
+
+    // Tear down: close both ends (master then slave) so the pair is freed and
+    // unlinked, exactly like pty_lifetime_selftest.
+    m->close(m);
+    s->close(s);
+
+    kprintf_atomic(fails ? "[pty_mring] SELF-TEST FAILED\n"
+                  : "[pty_mring] SELF-TEST PASSED (locked master-ring push/drain round-trip)\n");
 }

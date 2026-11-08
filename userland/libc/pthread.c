@@ -135,15 +135,27 @@ static int self_tid(void) {
     return g_self_tid;
 }
 
+// pthread_getcpuclockid: MakaOS has one system clock; per-thread CPU time is
+// not separated, so hand back CLOCK_THREAD_CPUTIME_ID (routed to that clock).
+int pthread_getcpuclockid(pthread_t tid, clockid_t* clk) {
+    (void)tid;
+    if (clk) *clk = CLOCK_THREAD_CPUTIME_ID;
+    return 0;
+}
+
 // ── Thread lifecycle ─────────────────────────────────────────────────
 
 int pthread_attr_init(pthread_attr_t* a) {
     if (!a) return EINVAL;
     a->kind          = 0;
-    a->stack_size    = 1024 * 1024;           // 1 MiB default — fontconfig's
-                                              // XML parse blew through 256K
-                                              // (no guard pages yet: overflow
-                                              // scribbled the neighbour map)
+    a->stack_size    = 8 * 1024 * 1024;       // 8 MiB default — glibc parity.
+                                              // Was 1 MiB (bumped from 256K for
+                                              // fontconfig); glibc-ABI software
+                                              // assumes ~8 MiB and overflows
+                                              // less: HotSpot's C1 compiler
+                                              // thread (LinearScan deep frames)
+                                              // SIGSEGV'd under Minecraft on the
+                                              // 1 MiB default.
     a->stack         = NULL;
     a->detachstate   = PTHREAD_CREATE_JOINABLE;
     a->schedpolicy   = 0;  // SCHED_OTHER
@@ -162,6 +174,35 @@ int pthread_attr_getstacksize(const pthread_attr_t* a, size_t* sz) {
 int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz) {
     if (!a || !stack || sz < 16 * 1024) return EINVAL;
     a->stack = stack; a->stack_size = sz; return 0;
+}
+int pthread_attr_getstack(const pthread_attr_t* a, void** stackaddr, size_t* sz) {
+    if (!a || !stackaddr || !sz) return EINVAL;
+    *stackaddr = a->stack;      // lowest address of the stack mapping
+    *sz = a->stack_size;
+    return 0;
+}
+int pthread_attr_getguardsize(const pthread_attr_t* a, size_t* sz) {
+    if (!a || !sz) return EINVAL;
+    *sz = 0;                    // MakaOS threads carry no separate guard region
+    return 0;
+}
+int pthread_attr_setguardsize(pthread_attr_t* a, size_t sz) {
+    (void)sz;                   // no separate guard region; accept and ignore
+    if (!a) return EINVAL;
+    return 0;
+}
+// pthread_getattr_np: recover a live thread's attributes (glibc extension the
+// JVM uses to locate a thread's stack). We report the stack the thread was
+// created with; the primordial thread is handled by its caller before this
+// (its descriptor has no libc-managed stack).
+int pthread_getattr_np(pthread_t t, pthread_attr_t* a) {
+    if (!t || !a) return EINVAL;
+    pthread_attr_init(a);
+    a->stack       = t->stack;
+    a->stack_size  = t->stack_size;
+    a->detachstate = (t->state == PT_DETACHED) ? PTHREAD_CREATE_DETACHED
+                                               : PTHREAD_CREATE_JOINABLE;
+    return 0;
 }
 int pthread_attr_setdetachstate(pthread_attr_t* a, int state) {
     if (!a) return EINVAL;
@@ -211,7 +252,7 @@ int pthread_create(pthread_t* tid_out, const pthread_attr_t* attr,
                     void* (*start)(void*), void* arg) {
     if (!tid_out || !start) return EINVAL;
 
-    size_t stack_size = attr ? attr->stack_size : 1024 * 1024;
+    size_t stack_size = attr ? attr->stack_size : 8 * 1024 * 1024;  // 8 MiB default (glibc parity)
     void*  stack      = attr ? attr->stack      : NULL;
     if (!stack) {
         stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
@@ -381,6 +422,29 @@ int pthread_cancel(pthread_t t) {
     return (int)__syscall_ret(syscall2(SYS_KILL, (uint64_t)tid, 9 /* SIGKILL */));
 }
 
+// pthread_kill — deliver signal `sig` to the specific thread `t`.  Like
+// pthread_cancel, this targets the thread's kernel tid: kill(pid>0) is
+// thread-directed in MakaOS (pid == tid), so no separate tgkill syscall is
+// needed.  A JVM's stop-the-world GC uses this to signal a specific mutator
+// thread and read/edit its ucontext in the SA_SIGINFO handler (see the kernel
+// signal-delivery layer).  POSIX: returns 0 or a positive errno (NOT -1/errno),
+// and sig==0 performs existence checking only (no signal sent).
+//
+// Note: an async signal to a purely CPU-bound target thread is delivered on
+// that thread's next kernel entry/exit (syscall return or preemption re-entry),
+// not instantly mid-userland-loop -- the standard MakaOS async-signal timing.
+int pthread_kill(pthread_t t, int sig) {
+    struct __pthread* d = (struct __pthread*)t;
+    if (!d) return ESRCH;
+    if (sig < 0 || sig > 31) return EINVAL;          // valid signals are 1..31
+    int tid = __atomic_load_n(&d->tid, __ATOMIC_ACQUIRE);
+    if (tid <= 0) return ESRCH;
+    if (sig == 0)                                    // existence check only
+        return __atomic_load_n(&d->done, __ATOMIC_ACQUIRE) ? ESRCH : 0;
+    long r = (long)syscall2(SYS_KILL, (uint64_t)tid, (uint64_t)(unsigned)sig);
+    return r < 0 ? (int)-r : 0;                      // POSIX: positive errno
+}
+
 // ── Mutex ────────────────────────────────────────────────────────────
 
 int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a) {
@@ -547,6 +611,45 @@ int pthread_cond_broadcast(pthread_cond_t* c) {
 int pthread_condattr_init(pthread_condattr_t* a)          { if (!a) return EINVAL; a->clock = CLOCK_REALTIME; return 0; }
 int pthread_condattr_destroy(pthread_condattr_t* a)       { (void)a; return 0; }
 int pthread_condattr_setclock(pthread_condattr_t* a, clockid_t clk) { if (!a) return EINVAL; a->clock = (int)clk; return 0; }
+
+// ── Barrier ──────────────────────────────────────────────────────────
+// Standard generation-counter barrier: the last arrival bumps `gen` and
+// broadcasts, releasing exactly the cohort that was waiting on that gen.
+// The gen guard makes a spurious cond wakeup, and immediate barrier reuse,
+// both safe -- a waiter only leaves when its own generation has advanced.
+int pthread_barrier_init(pthread_barrier_t* b, const pthread_barrierattr_t* a,
+                         unsigned count) {
+    (void)a;
+    if (!b || count == 0) return EINVAL;
+    pthread_mutex_init(&b->m, 0);
+    pthread_cond_init(&b->c, 0);
+    b->count = count;
+    b->waiting = 0;
+    b->gen = 0;
+    return 0;
+}
+int pthread_barrier_destroy(pthread_barrier_t* b) {
+    if (!b) return EINVAL;
+    pthread_mutex_destroy(&b->m);
+    pthread_cond_destroy(&b->c);
+    return 0;
+}
+int pthread_barrier_wait(pthread_barrier_t* b) {
+    if (!b) return EINVAL;
+    pthread_mutex_lock(&b->m);
+    unsigned g = b->gen;
+    if (++b->waiting == b->count) {
+        b->gen++;                       // release this cohort, arm the next
+        b->waiting = 0;
+        pthread_cond_broadcast(&b->c);
+        pthread_mutex_unlock(&b->m);
+        return PTHREAD_BARRIER_SERIAL_THREAD;   // exactly one thread gets this
+    }
+    while (g == b->gen)
+        pthread_cond_wait(&b->c, &b->m);
+    pthread_mutex_unlock(&b->m);
+    return 0;
+}
 
 // ── Once ─────────────────────────────────────────────────────────────
 
@@ -732,7 +835,40 @@ int pthread_setcanceltype(int type, int* oldtype) {
 }
 void pthread_testcancel(void) { }
 
+// pthread_atfork: register fork handlers.  fork() (unistd.c) runs the `prepare`
+// handlers in REVERSE registration order before the fork, and the `parent` /
+// `child` handlers in FORWARD order after it (POSIX).  jemalloc + the JVM
+// register these to lock their allocator arenas across the fork and reset them
+// in the child; without running them, a fork under allocator contention leaves
+// the child's arenas locked -> deadlock/abort on first native alloc.
+#define ATFORK_MAX 32
+static struct { void (*prep)(void); void (*parent)(void); void (*child)(void); } s_atfork[ATFORK_MAX];
+static volatile unsigned char s_atfork_lock = 0;
+static int s_atfork_n = 0;
+
 int pthread_atfork(void (*prep)(void), void (*parent)(void), void (*child)(void)) {
-    (void)prep; (void)parent; (void)child;
+    while (__atomic_test_and_set(&s_atfork_lock, __ATOMIC_ACQUIRE)) sched_yield();
+    if (s_atfork_n < ATFORK_MAX) {
+        s_atfork[s_atfork_n].prep   = prep;
+        s_atfork[s_atfork_n].parent = parent;
+        s_atfork[s_atfork_n].child  = child;
+        s_atfork_n++;
+    }
+    __atomic_clear(&s_atfork_lock, __ATOMIC_RELEASE);
     return 0;
+}
+// Invoked by fork().  No locking: fork serializes the process (all other threads
+// are quiesced by the syscall's address-space copy); concurrent registration
+// during a fork is not a supported use.
+void __run_atfork_prepare(void) {
+    for (int i = s_atfork_n - 1; i >= 0; i--)
+        if (s_atfork[i].prep) s_atfork[i].prep();
+}
+void __run_atfork_parent(void) {
+    for (int i = 0; i < s_atfork_n; i++)
+        if (s_atfork[i].parent) s_atfork[i].parent();
+}
+void __run_atfork_child(void) {
+    for (int i = 0; i < s_atfork_n; i++)
+        if (s_atfork[i].child) s_atfork[i].child();
 }

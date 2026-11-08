@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_STAT_H
 #define _MAKAOS_SYS_STAT_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <time.h>
 
@@ -39,6 +43,12 @@
 #define S_IRWXG (S_IRGRP|S_IWGRP|S_IXGRP)
 #define S_IRWXO (S_IROTH|S_IWOTH|S_IXOTH)
 
+// BSD-compatibility aliases (glibc exposes these under __USE_MISC); used by
+// portable code such as OpenJDK's attachListener_linux.cpp.
+#define S_IREAD  S_IRUSR
+#define S_IWRITE S_IWUSR
+#define S_IEXEC  S_IXUSR
+
 // Layout MUST match kernel stat_t in kernel/syscall/syscall.h — the
 // kernel writes this struct directly via SYS_STAT / SYS_FSTAT, so any
 // reorder silently breaks S_ISDIR / S_ISREG checks on valid inodes.
@@ -73,5 +83,19 @@ int mkdir(const char* path, mode_t mode);
 int chmod(const char* path, mode_t mode);
 int fchmod(int fd, mode_t mode);
 mode_t umask(mode_t mask);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define stat64    stat
+#define fstat64   fstat
+#define lstat64   lstat
+#define fstatat64 fstatat
+#endif
 
 #endif

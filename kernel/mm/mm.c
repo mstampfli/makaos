@@ -1,4 +1,5 @@
 #include "mm.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "shmem.h"
 #include "kheap.h"
 #include "vmm.h"
@@ -198,6 +199,61 @@ vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr) {
     return NULL;
 }
 
+// Every page in [addr, addr+len) backed by a VMA?  See the header comment: this
+// is the no-map, file-safe alternative to a prefault for validating a user
+// buffer the kernel will raw-deref for READING.  It does NOT close the TOCTOU
+// vs a concurrent munmap between this check and the caller's raw read -- that
+// residual needs a fault-fixup table (recorded follow-up).
+int mm_range_has_vmas(mm_t* mm, uint64_t addr, uint64_t len) {
+    if (!len) return 1;                          // empty range is trivially ok
+    if (!mm)  return 0;
+    uint64_t addr_end = addr + len;
+    if (addr_end < addr) return 0;               // addr+len wraps u64
+    virt_addr_t page   = addr & ~(virt_addr_t)0xFFF;
+    uint64_t    npages = ((addr_end - 1) >> 12) - (addr >> 12) + 1;
+    for (uint64_t i = 0; i < npages; i++, page += 0x1000) {
+        rcu_read_lock();
+        int have = (mm_vma_find(mm, page) != NULL);
+        rcu_read_unlock();
+        if (!have) return 0;                     // a page with no VMA -> -EFAULT
+    }
+    return 1;
+}
+
+// Deterministic selftest for mm_range_has_vmas (the F67 fix core): two VMAs with
+// a gap, exercising fully-inside, straddle-into-gap, in-gap, mid-page, len==0,
+// NULL mm, and the addr+len wrap.  Pure -- a constructed mm, no real faults.
+void mm_range_has_vmas_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    vma_t v2 = { .start = 0x20000, .end = 0x21000, .next = NULL };
+    vma_t v1 = { .start = 0x10000, .end = 0x12000, .next = &v2 };
+    mm_t m; __builtin_memset(&m, 0, sizeof(m)); m.vmas = &v1;
+
+    struct { uint64_t a, l; int want; const char* d; } cs[] = {
+        { 0x10000, 0x1000, 1, "page fully in v1" },
+        { 0x10000, 0x2000, 1, "both pages of v1" },
+        { 0x10800, 0x800,  1, "mid-page within v1" },
+        { 0x11FFF, 0x2,    0, "straddles v1 end into gap" },
+        { 0x12000, 0x8,    0, "in the gap (no VMA)" },
+        { 0x1F000, 0x8,    0, "in the gap before v2" },
+        { 0x20000, 0x1000, 1, "page fully in v2" },
+        { 0x10000, 0,      1, "len 0 trivially ok" },
+        { 0xFFFFFFFFFFFFF000ULL, 0x2000, 0, "addr+len wraps" },
+    };
+    for (unsigned i = 0; i < sizeof(cs) / sizeof(cs[0]); i++) {
+        int got = mm_range_has_vmas(&m, cs[i].a, cs[i].l);
+        if (got != cs[i].want) { fails++;
+            kprintf_atomic("[mm_range_vmas] FAIL %s: got %d want %d\n",
+                           cs[i].d, got, cs[i].want); }
+    }
+    if (mm_range_has_vmas(NULL, 0x10000, 0x1000) != 0) { fails++;
+        kprintf_atomic("[mm_range_vmas] FAIL null mm\n"); }
+
+    kprintf_atomic(fails ? "[mm_range_vmas] SELF-TEST FAILED\n"
+                         : "[mm_range_vmas] PASS (per-page VMA backing for raw-deref user reads)\n");
+}
+
 // ── mm_destroy ────────────────────────────────────────────────────────────
 // Frees all VMA descriptors and the mm_t itself.
 // Called at last task_mm_t unref — by that point there are no threads
@@ -262,17 +318,32 @@ mm_t* mm_clone(const mm_t* src) {
         snap[i].start       = v->start;
         snap[i].end         = v->end;
         snap[i].flags       = v->flags;
-        snap[i].shmem       = v->shmem;
         snap[i].shmem_pgoff = v->shmem_pgoff;
-        snap[i].file        = v->file;
         snap[i].file_off    = v->file_off;
         snap[i].file_len    = v->file_len;
+        // PIN the backing objects HERE, under the SAME rcu_read_lock that keeps
+        // the src VMA alive, via tryget -- NOT a raw pointer snapshot followed by
+        // a shmem_ref/vfs_dup in a later, separate rcu section.  A concurrent
+        // sibling munmap of this VMA defers its free (vma_free_rcu ->
+        // shmem_unref/vfs_close); a raw snapshot then ref'd AFTER rcu_read_unlock
+        // could increment the refcount of an already-freed object.  tryget bumps
+        // the ref while the object is still live (mirrors the fault path /
+        // vmm_clone_user_ex), and fails (->NULL) cleanly if it is mid-teardown.
+        snap[i].shmem = (v->shmem && shmem_tryget(v->shmem)) ? v->shmem : NULL;
+        snap[i].file  = v->file ? vfs_tryget(v->file) : NULL;
     }
     rcu_read_unlock();
     uint32_t cnt = i;
 
     for (uint32_t k = 0; k < cnt; k++) {
         if (!mm_vma_add(dst, snap[k].start, snap[k].end, snap[k].flags)) {
+            // OOM: snap[0..k-1] were handed to dst VMAs (mm_destroy releases
+            // their refs); snap[k..cnt-1] are still pinned only by snap -- drop
+            // those refs here so the tryget'd backing objects are not leaked.
+            for (uint32_t j = k; j < cnt; j++) {
+                if (snap[j].shmem) shmem_unref(snap[j].shmem);
+                if (snap[j].file)  vfs_close(snap[j].file);
+            }
             kfree(snap);
             mm_destroy(dst);
             return NULL;
@@ -281,22 +352,45 @@ mm_t* mm_clone(const mm_t* src) {
             rcu_read_lock();
             vma_t* dv = mm_vma_find(dst, snap[k].start);
             if (dv) {
-                if (snap[k].shmem) {
-                    dv->shmem       = snap[k].shmem;
-                    dv->shmem_pgoff = snap[k].shmem_pgoff;
-                    shmem_ref(snap[k].shmem);
-                }
-                if (snap[k].file) {
-                    dv->file     = vfs_dup(snap[k].file);
-                    dv->file_off = snap[k].file_off;
-                    dv->file_len = snap[k].file_len;
-                }
+                // The ref was already taken by tryget in the snapshot above;
+                // hand it to the dst VMA (mm_destroy will release it).
+                dv->shmem       = snap[k].shmem;
+                dv->shmem_pgoff = snap[k].shmem_pgoff;
+                dv->file        = snap[k].file;
+                dv->file_off    = snap[k].file_off;
+                dv->file_len    = snap[k].file_len;
+            } else {
+                // Should not happen (we just added this VMA); release the pinned
+                // refs rather than leak them.
+                if (snap[k].shmem) shmem_unref(snap[k].shmem);
+                if (snap[k].file)  vfs_close(snap[k].file);
             }
             rcu_read_unlock();
         }
     }
     kfree(snap);
     return dst;
+}
+
+// ── vma_backing_advance ────────────────────────────────────────────────────
+// Advance a VMA's file + shmem backing offsets by `delta` bytes trimmed off
+// the FRONT (low address) of the VMA, so a demand fault on the remaining
+// region still resolves to the correct page.  The fault path keys the backing
+// off (page - vma->start) -- file:  src_off = file_off + (page - start); shmem:
+// pg_idx = (page - start)/PAGE_SIZE + shmem_pgoff -- so when start moves up by
+// delta the backing offset must move up by the same delta.  `delta` is a whole
+// number of pages (munmap ranges and VMA bounds are page-aligned).  Shared by
+// the in-place front-trim (Case 3) and the right-split fragment (Case 4) so the
+// two paths cannot drift.  shmem_pgoff is advanced unconditionally (it is 0 and
+// unused for non-shmem VMAs, matching the split's unconditional math);
+// file_off/file_len only matter when file-backed, and file_len clamps at 0 once
+// the whole file-backed extent has been trimmed away (the rest is BSS zero-fill).
+static void vma_backing_advance(vma_t* v, uint64_t delta) {
+    v->shmem_pgoff += (uint32_t)(delta / PAGE_SIZE);
+    if (v->file) {
+        v->file_off += delta;
+        v->file_len = (v->file_len > delta) ? (v->file_len - delta) : 0;
+    }
 }
 
 // ── mm_vma_remove ─────────────────────────────────────────────────────────
@@ -344,25 +438,20 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
             right->end         = v->end;
             right->flags       = v->flags;
             right->next        = v->next;   // private init
+            // Carry the backing over from v, then advance it by the trimmed-off
+            // head (end - v->start) through the shared helper, so the split
+            // fragment and the in-place front-trim (Case 3) use ONE offset
+            // mechanism and cannot drift.  kmalloc memory is NOT zeroed, so
+            // every field is written explicitly: leaving file uninitialized
+            // gave the fragment a GARBAGE vfs_file_t pointer and the next fault
+            // did disk I/O through a wild function pointer.
             right->shmem       = v->shmem;
-            right->shmem_pgoff = v->shmem_pgoff +
-                (uint32_t)((end - v->start) / PAGE_SIZE);
+            right->shmem_pgoff = v->shmem_pgoff;
             if (right->shmem) shmem_ref(right->shmem);
-            // File backing: kmalloc memory is NOT zeroed — leaving these
-            // uninitialized gave the right fragment a GARBAGE vfs_file_t
-            // pointer; the next fault on it did disk I/O through wild
-            // function pointers.  Carry the backing over with its own
-            // reference and a file offset advanced by the split.
-            if (v->file) {
-                right->file     = vfs_dup(v->file);
-                right->file_off = v->file_off + (end - v->start);
-                right->file_len = (v->file_len > (end - v->start))
-                                  ? v->file_len - (end - v->start) : 0;
-            } else {
-                right->file     = NULL;
-                right->file_off = 0;
-                right->file_len = 0;
-            }
+            right->file        = v->file ? vfs_dup(v->file) : NULL;
+            right->file_off    = v->file_off;
+            right->file_len    = v->file_len;
+            vma_backing_advance(right, end - v->start);
             // Publish right, then shrink v.  A concurrent reader sees
             // either {v covers [v->start, old_end)} or
             // {v covers [v->start, start), right covers [end, old_end)} —
@@ -374,16 +463,89 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
             continue;
         }
         if (v->start < start) {
-            // Case 2: right edge overlap — shrink end.
+            // Case 2: right edge overlap -- shrink end.  start (and so the
+            // backing offset, which is keyed off start) is unchanged; the
+            // smaller end naturally bounds later faults, so no backing fixup.
             v->end = start;
         } else {
-            // Case 3: left edge overlap — shrink start.
+            // Case 3: left edge overlap -- shrink start.  Advance the file +
+            // shmem backing by the trimmed-off head BEFORE moving start (the
+            // same offset math Case 4 applies to its split fragment), so a
+            // later demand fault on the remaining region resolves to the
+            // correct page instead of one (end - v->start) bytes too early.
+            vma_backing_advance(v, end - v->start);
             v->start = end;
         }
         pp = &v->next;
     }
     spin_unlock(&mm->vma_lock);
     return did_work;
+}
+
+// ── mm_vma_remove front-trim selftest ──────────────────────────────────────
+// Deterministic check that a left-edge (front) munmap advances a VMA's file +
+// shmem backing offsets in lockstep with vma->start, so demand faults on the
+// remaining region map the correct page.  Covers the bug where Case 3 moved
+// start but left file_off/file_len/shmem_pgoff stale, plus the shared
+// vma_backing_advance helper (clamp + anonymous no-op).  Single-threaded: this
+// is an offset-math bug, not a concurrency one.
+void mm_vma_trim_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+
+    // Helper math: file-backed front-trim of 2 pages advances file + shmem.
+    {
+        vma_t v; __builtin_memset(&v, 0, sizeof(v));
+        v.file = (struct vfs_file_t*)0x1;   // sentinel: helper only tests != NULL
+        v.file_off = 0x8000; v.file_len = 0x4000; v.shmem_pgoff = 7;
+        vma_backing_advance(&v, 0x2000);
+        if (v.file_off != 0x8000 + 0x2000) fails++;
+        if (v.file_len != 0x4000 - 0x2000) fails++;
+        if (v.shmem_pgoff != 7u + (0x2000u / PAGE_SIZE)) fails++;
+    }
+    // Helper math: file_len underflow clamps to 0 when the whole file-backed
+    // extent is trimmed off (the remainder is BSS zero-fill).
+    {
+        vma_t v; __builtin_memset(&v, 0, sizeof(v));
+        v.file = (struct vfs_file_t*)0x1;
+        v.file_off = 0; v.file_len = 0x1000;
+        vma_backing_advance(&v, 0x4000);    // delta > file_len
+        if (v.file_len != 0) fails++;
+        if (v.file_off != 0x4000) fails++;
+    }
+    // Helper math: anonymous VMA (no file) keeps file_off/file_len at 0 and
+    // still advances shmem_pgoff (matches the split's unconditional math).
+    {
+        vma_t v; __builtin_memset(&v, 0, sizeof(v));
+        v.file = NULL; v.shmem_pgoff = 2;
+        vma_backing_advance(&v, 0x3000);
+        if (v.shmem_pgoff != 2u + (0x3000u / PAGE_SIZE)) fails++;
+        if (v.file_off != 0 || v.file_len != 0) fails++;
+    }
+    // Real path: mm_vma_remove front-trim must hit Case 3 and advance backing.
+    // A stack VMA is safe -- Case 3 trims in place (no free / no call_rcu).
+    {
+        vma_t v; __builtin_memset(&v, 0, sizeof(v));
+        v.start = 0x10000; v.end = 0x14000;            // 4 pages
+        v.next = NULL;
+        v.file = (struct vfs_file_t*)0x1;              // never dereferenced in Case 3
+        v.file_off = 0x40000; v.file_len = 0x4000;
+        v.shmem = NULL; v.shmem_pgoff = 0;
+        mm_t m; __builtin_memset(&m, 0, sizeof(m));
+        spin_lock_init(&m.vma_lock); m.vmas = &v;
+        uint8_t did = mm_vma_remove(&m, 0x10000, 0x12000);   // trim first 2 pages
+        if (!did) fails++;
+        if (v.start != 0x12000) fails++;               // start advanced
+        if (v.end != 0x14000) fails++;                 // end unchanged
+        if (v.file_off != 0x40000 + 0x2000) fails++;   // backing advanced in lockstep
+        if (v.file_len != 0x4000 - 0x2000) fails++;
+        // m.vmas still == &v (in-place trim, no free) -- nothing to clean up.
+    }
+
+    if (fails)
+        kprintf_atomic("[mm_vma_trim] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[mm_vma_trim] PASS (front-munmap advances file+shmem backing)\n");
 }
 
 // ── mm_vma_find_free ──────────────────────────────────────────────────────
@@ -394,7 +556,7 @@ uint8_t mm_vma_remove(mm_t* mm, virt_addr_t start, virt_addr_t end) {
 // internally via mm_vma_add right after.)
 virt_addr_t mm_vma_find_free(mm_t* mm, size_t len) {
     if (!mm || !len) return 0;
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    len = page_align_up(len);
 
     spin_lock(&mm->vma_lock);
     virt_addr_t hint = mm->mmap_base;

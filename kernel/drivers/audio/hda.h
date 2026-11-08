@@ -23,6 +23,13 @@ int hda_init(void);
 // Blocks when the DMA ring is full.  Returns bytes written (== len).
 int hda_write(const void* buf, uint32_t len);
 
+// Poll predicate for /dev/dsp POLLOUT: returns nonzero when the software
+// FIFO has room for at least a typical playback buffer (>= half the FIFO),
+// so a subsequent hda_write() of that size lands without blocking.  Backs
+// f->poll on /dev/dsp; the matching wake source is irq_waitq(g_hda_irq),
+// the queue the DMA-completion ISR drains as it frees FIFO space.
+int hda_poll_writable(void);
+
 // IRQ handler — called from irq_stubs.asm.
 void hda_irq_handler(void);
 

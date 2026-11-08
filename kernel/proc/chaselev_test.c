@@ -127,9 +127,9 @@ void chaselev_selftest(void) {
             CHASELEV_TEST_N - found, dups);
 
     if (found == CHASELEV_TEST_N && dups == 0 && pushed == CHASELEV_TEST_N) {
-        kprintf("[chaselev] SELF-TEST PASSED\n");
+        kprintf_atomic("[chaselev] SELF-TEST PASSED\n");
     } else {
-        kprintf("[chaselev] SELF-TEST FAILED\n");
+        kprintf_atomic("[chaselev] SELF-TEST FAILED\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
 }

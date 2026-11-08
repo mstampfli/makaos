@@ -31,6 +31,14 @@
 // Larger rings allow more in-flight packets; 256 is the standard value.
 #define VIRTQ_SIZE  256u
 
+// Number of RX packet buffers we actually allocate and post (one per RX
+// descriptor we hand the device).  SINGLE SOURCE OF TRUTH: the alloc loop, the
+// refill loop, AND the rx-completion id bound all use this, so the validation
+// can never disagree with how many s_rx_bufs[] entries are populated.  A device
+// reporting an RX completion id >= this (an id we never posted) would index an
+// uninitialized buffer (NULL source / phys 0); we reject it.
+#define VIRTQ_NUM_RX_BUFS  (VIRTQ_SIZE / 2u)
+
 // Initialise the virtio-net device.
 // Returns 1 on success, 0 if no device found or init failed.
 int virtio_net_init(void);

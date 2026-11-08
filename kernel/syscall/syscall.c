@@ -4,11 +4,26 @@
 #include "rcu.h"
 #include "pipe.h"
 #include "common.h"
+#include "checked.h"   // ckd_add_u64: overflow-safe add for the user-range guards
+#include "uaccess.h"   // _access_ok: the shared user (addr,len) range validator
+#include "extable.h"   // _ASM_EXTABLE: fault-safe user copy via the fixup table
+#include "kstr.h"      // str_lcpy: shared truncating NUL copy (was local strncpy_k)
 #include "sched.h"
 #include "signal.h"
 #include "process.h"
 #include "log.h"
 #include "trace.h"
+
+/* Loud per-fault bring-up traces, OFF by default (log.h per-subsystem gate
+ * convention) so they never drown userspace serial.  -D<NAME>=1 to re-enable.
+ *   DEMAND_PAGING: [pf] cache-warmth + [elf] lazy exec header timing.
+ *   SOCKET:        [socket-dbg] every socket() domain/type/proto. */
+#ifndef CONFIG_DEBUG_DEMAND_PAGING
+#define CONFIG_DEBUG_DEMAND_PAGING 0
+#endif
+#ifndef CONFIG_DEBUG_SOCKET
+#define CONFIG_DEBUG_SOCKET 0
+#endif
 
 /* ── Syscall tracing helpers ─────────────────────────────────────────
  *
@@ -99,8 +114,76 @@ extern volatile uint16_t* g_vga;
 #define g_exec_pml4           (this_cpu()->exec_pml4)
 #define g_signal_in_syscall   (this_cpu()->signal_in_syscall)
 
-// Forward declaration — defined near copy_from/to_user below.
-static inline int _access_ok(uint64_t addr, uint64_t len);
+// _access_ok, copy_from_user, copy_to_user and user_buf_check are all declared
+// in uaccess.h (included above) -- the single source of truth for the user-copy
+// family (defined below in this file).
+// user_buf_readable_ok is a syscall.c-local variant: like user_buf_check but
+// does NOT prefault (map+zero) absent pages -- it only
+// requires every page to have a VMA, so the caller's raw read demand-faults the
+// real content.  For READ-from-user direct-deref paths whose source may be
+// file-backed (write(2)'s data buffer), where prefault would zero-fill it.
+int user_buf_readable_ok(uint64_t addr, uint64_t len);
+// Safe NUL-terminated path copy from user space (built on copy_from_user, no
+// raw deref).  Returns length, -EFAULT (bad pointer), or -ENAMETOOLONG.
+static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz);
+
+// Resolve `src` against `cwd` into `out` (outsz bytes): an absolute src (leading
+// '/') is copied verbatim; a relative src becomes cwd + '/' + src.  Always
+// NUL-terminated and bounded to outsz-1.  The single relative-path builder the
+// path syscalls (open/stat/access/chdir/exec/readdir/truncate/...) each used to
+// hand-roll identically.  Caps match the old per-call code for a 512-byte out.
+static void resolve_at_path(char* out, uint32_t outsz,
+                            const char* cwd, const char* src) {
+    if (outsz == 0) return;
+    uint32_t j = 0;
+    if (src[0] != '/') {
+        // cwd prefix, leaving room for a '/' separator + src + NUL.
+        for (uint32_t k = 0; cwd[k] && j + 2 < outsz; k++) out[j++] = cwd[k];
+        if (j > 0 && out[j-1] != '/' && j + 1 < outsz) out[j++] = '/';
+    }
+    for (uint32_t k = 0; src[k] && j + 1 < outsz; k++) out[j++] = src[k];
+    out[j] = '\0';
+}
+
+// ── mmap_round_len / mmap_range_ok ────────────────────────────────────────
+// Overflow-safe primitives for the user-controlled (addr, len) of the VMA
+// range syscalls (mmap / munmap / MAP_FIXED replace).  WITHOUT them, the
+// page-rounding `len = (len + PAGE_MASK) & ~PAGE_MASK` wraps to 0 (or a tiny
+// value) for len > UINT64_MAX - PAGE_MASK, and `addr + len` walks past the
+// canonical user ceiling — letting a MAP_FIXED at a higher-half address drive
+// mm_unmap_range_flush_free into the kernel/HHDM page tables (PML4[256..511]
+// are shared into every process), where it would unmap a live kernel PTE and
+// pmm_ref_dec a live kernel frame → kernel memory corruption / LPE.
+//
+// mmap_round_len: round `len_in` up to a whole number of pages, rejecting the
+// wrapping add.  Returns the rounded length, or 0 if zero/overflowing (callers
+// treat 0 as EINVAL).  Single source of truth for the rounding — both the
+// addr==0 "kernel picks" mmap path and the addr-present path round through it.
+// PRIMITIVE (user length page-rounding, category B -> ckd_add_u64 overflow guard).
+static inline uint64_t mmap_round_len(uint64_t len_in) {
+    if (!len_in) return 0;
+    uint64_t rounded;
+    if (!ckd_add_u64(len_in, PAGE_MASK, &rounded)) return 0;   // reject before the wrap
+    return rounded & ~(uint64_t)PAGE_MASK;
+}
+
+// mmap_range_ok: validate that an EXPLICIT user range [addr, addr+rounded_len)
+// is page-aligned and lies strictly in the user half.  On success writes the
+// rounded length to *out_len and the EXCLUSIVE end to *out_end.  NULL / kernel
+// / non-canonical addr and any wrap are rejected via the shared _access_ok
+// predicate.  Use only when `addr` is caller-supplied (MAP_FIXED, addr hint,
+// munmap) — not the addr==0 path, which _access_ok rejects by design.  Pure
+// (no globals) → unit-testable.  Returns 1 if valid, 0 otherwise.
+static inline int mmap_range_ok(uint64_t addr, uint64_t len_in,
+                                uint64_t* out_len, uint64_t* out_end) {
+    uint64_t len = mmap_round_len(len_in);
+    if (!len) return 0;
+    if (addr & PAGE_MASK) return 0;           // explicit addr must be page-aligned
+    if (!_access_ok(addr, len)) return 0;     // NULL/kernel/non-canonical/overflow
+    if (out_len) *out_len = len;
+    if (out_end) *out_end = addr + len;       // no wrap: guaranteed by _access_ok
+    return 1;
+}
 
 // ── MSR helpers ───────────────────────────────────────────────────────────
 #define MSR_EFER    0xC0000080
@@ -123,7 +206,6 @@ static inline uint64_t rdmsr(uint32_t msr) {
 // Forward declarations for the fd-lookup fast path (defined further down).
 static vfs_file_t* fdget(uint64_t fd);
 static void        fdput(vfs_file_t* f);
-static vfs_file_t* fd_to_file(uint64_t fd);
 
 // ── syscall_init ──────────────────────────────────────────────────────────
 void syscall_init(void) {
@@ -141,6 +223,19 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (f->rights != 0 && !rights_check(f->rights, RIGHT_WRITE)) {
         fdput(f); return (uint64_t)-EACCES;
     }
+    // A direct-deref write_op (sock_write -> tcp_send reads buf raw) would read
+    // from a KERNEL address if buf is unvalidated -- write(sockfd, KADDR, n) leaks
+    // kernel memory onto the wire.  Validate buf: the range is user (rejects
+    // kernel/non-canonical/overflowing pointers, the arbitrary-read LPE guard)
+    // AND every page has a VMA, so a raw read of an unmapped-but-in-range pointer
+    // (p=mmap(...); munmap(p); write(1,p,16)) returns -EFAULT here instead of
+    // taking an unresolvable kernel-mode #PF that panics the kernel.  We do NOT
+    // prefault: a write READS the buffer, so mapping+zeroing absent pages would
+    // corrupt a file-backed source (a .rodata string would read as zeros); an
+    // absent valid page (VMA present) is demand-paged correctly by the raw read.
+    if (len && user_buf_readable_ok(buf, len) != 0) {
+        fdput(f); return (uint64_t)-EFAULT;
+    }
     int64_t r = vfs_write(f, (const void*)buf, len);
     fdput(f);
     if (r < 0) return (uint64_t)r;
@@ -154,23 +249,38 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
 //
 // Must be called while the process's PML4 is active in CR3 (i.e. inside a
 // syscall handler, before any address-space switch).
-static void user_buf_prefault(virt_addr_t addr, size_t len) {
-    if (!len || !g_current) return;
+// Returns 0 if the whole range is backed by user VMAs (and now mapped), or
+// -1 if any page has NO VMA / can't be backed.  Callers writing into the
+// range (copy_to_user etc.) MUST treat -1 as -EFAULT: a bad user pointer
+// (e.g. a scribbled cleartid_addr 0x0000680073006900 — canonical but
+// unmapped) would otherwise #PF in the subsequent memcpy and panic the
+// kernel ("kernel #PF unrecoverable") instead of failing cleanly.
+static int user_buf_prefault(virt_addr_t addr, size_t len) {
+    if (!len || !g_current) return 0;
     mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
-    if (!mm) return;
+    if (!mm) return 0;
 
-    virt_addr_t page = addr & ~(virt_addr_t)0xFFF;
-    virt_addr_t end  = (addr + len + 0xFFF) & ~(virt_addr_t)0xFFF;
-    phys_addr_t pml4 = vmm_current_pml4();  // current CR3 = this process's PML4
+    // Page span [addr, addr+len), computed WITHOUT overflow.  A huge len would
+    // wrap the old `end = addr+len+0xFFF` below `page`, so the loop ran zero times
+    // and returned 0 ("ok") while validating NOTHING -- letting a prefault-only
+    // caller (sys_read, the blit path) deref an unvalidated kernel pointer, e.g.
+    // read(sockfd, KADDR, ~0ull) wrote a datagram to KADDR (write-what-where).
+    // Reject a wrapping addr+len, then iterate by PAGE COUNT so the bound can
+    // never overflow.  For a valid range this covers the identical page set.
+    uint64_t addr_end;
+    if (!ckd_add_u64(addr, len, &addr_end)) return -1;            // addr+len wraps
+    virt_addr_t page   = addr & ~(virt_addr_t)0xFFF;
+    uint64_t    npages = ((addr_end - 1) >> 12) - (addr >> 12) + 1;
+    phys_addr_t pml4   = vmm_current_pml4();  // current CR3 = this process's PML4
 
-    for (; page < end; page += 0x1000) {
+    for (uint64_t i = 0; i < npages; i++, page += 0x1000) {
         // Walk VMA list under RCU — snapshot the flags we need, then
         // drop the reader before touching page tables.
         uint32_t vma_flags;
         rcu_read_lock();
         {
             vma_t* vma = mm_vma_find(mm, page);
-            if (!vma) { rcu_read_unlock(); continue; }
+            if (!vma) { rcu_read_unlock(); return -1; }  // no VMA → bad pointer
             vma_flags = vma->flags;
         }
         rcu_read_unlock();
@@ -198,17 +308,62 @@ static void user_buf_prefault(virt_addr_t addr, size_t len) {
         }
 
     map_page:;
-        // Allocate a frame, zero it, map it with the VMA's permissions.
+        // A FILE-BACKED page (text/rodata/data) must hold its on-disk content,
+        // NOT zeros.  The old code allocated a zeroed anon frame here for EVERY
+        // absent page, which silently corrupted file-backed pages whenever a
+        // syscall prefaulted a buffer that overlapped one: e.g. read(2)/blit
+        // callers zero-mapped a rodata/data page, so bash's format strings and
+        // variable names ("BASH_COMPAT", ...) read back empty and cascaded into
+        // bogus startup errors.  Delegate to the single source of truth for
+        // populating a page, the demand-fault handler, by touching the page in
+        // the process's own address space (CR3 is the caller's here).  isr14
+        // loads it from the page cache / disk, honours the BSS clamp and
+        // permissions, and maps a writable file VMA as a private R/W copy; a
+        // read touch is enough because the copy that follows uses the resulting
+        // mapping.  If the VMA exists (checked above) the fault resolves or the
+        // task is killed on OOM: either way we never install wrong content.
+        if (vma_flags & VMA_FILE) {
+            (void)*(volatile uint8_t*)page;   // fault in the real content
+            continue;
+        }
+
+        // Anonymous page: there is no backing store, so a freshly zeroed frame
+        // IS the correct content (a new zero page, about to be written into or
+        // read as zero).  Allocate + zero the frame OUTSIDE the lock, then
+        // install it under mm->vma_lock with a presence re-check -- EXACTLY as
+        // the demand-fault handler does (vmm.c isr14).  A user-PML4 structural
+        // mutation (vmm_page_map -> vmm_pte_get may allocate intermediate PT
+        // pages) MUST be serialized by vma_lock (the vmm.c invariant: "User
+        // PML4s are serialized by their per-mm vma_lock").  The old unlocked
+        // map here raced isr14 / a sibling thread's fault on the SAME page
+        // tables -> torn PTE / a leaf installed into an orphaned intermediate
+        // table -> the page read back UNMAPPED -> vfs_read #PF -> the syscall
+        // returned a spurious -EFAULT.  This surfaced as intermittent "Bad
+        // address" reading class files once the JVM's JIT compiler threads ran
+        // concurrent mmap/fault traffic; it never fired under -Xint (no
+        // concurrent PT mutators).  Alloc-before-lock + locked presence re-check
+        // makes the fast path lock-free and the slow path race-free.
         phys_addr_t frame = pmm_buddy_alloc(0);
-        if (frame == PMM_INVALID_ADDR) break;  // OOM — abort prefault
+        if (frame == PMM_INVALID_ADDR) return -1;  // OOM — can't back the range
 
         // Zero the full page (512 × 8 bytes = 4096).
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
-        if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
-            pmm_buddy_free(frame, 0);
+        int lost = 0, failed = 0;
+        spin_lock(&mm->vma_lock);
+        if (vmm_page_phys(pml4, page) != PMM_INVALID_ADDR) {
+            lost = 1;                               // a racer backed it first
+        } else if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma_flags))) {
+            failed = 1;                             // OOM installing a PT page
+        }
+        spin_unlock(&mm->vma_lock);
+        if (lost || failed) {
+            pmm_buddy_free(frame, 0);               // release the now-unused frame
+            if (failed) return -1;
+            continue;                               // racer's mapping is valid
         }
     }
+    return 0;
 }
 
 // ── sys_read ──────────────────────────────────────────────────────────────
@@ -219,10 +374,28 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     if (f->rights != 0 && !rights_check(f->rights, RIGHT_READ)) {
         fdput(f); return (uint64_t)-EACCES;
     }
-    user_buf_prefault((virt_addr_t)buf, (size_t)len);
+    if (user_buf_prefault((virt_addr_t)buf, (size_t)len) != 0) {
+        fdput(f); return (uint64_t)-EFAULT;
+    }
     int64_t r = vfs_read(f, (void*)buf, len);
     fdput(f);
     return (uint64_t)r;
+}
+
+// ── unveil gate (shared by every path syscall) ────────────────────────────
+// OpenBSD-style: once a process has unveil()'d anything, a path outside its
+// visible set is treated as if it does not exist.  `path` MUST already be
+// absolute AND normalized (normalize_path) so a trailing `..` cannot escape the
+// visible prefix.  Returns 1 = allowed, 0 = denied (the caller returns -ENOENT,
+// like sys_open, so a hidden path is indistinguishable from a missing one).
+// No rules (count == 0) -> full visibility; the virtual mounts (/dev,/proc) are
+// exempt.  ONE helper so every path syscall enforces unveil identically --
+// previously only sys_open did, so unlink/rename/mkdir/rmdir/truncate/exec
+// bypassed the sandbox entirely.
+static int unveil_ok(const char* path, uint8_t need) {
+    if (!g_current || g_current->unveil.count == 0) return 1;
+    if (virtfs_is_virtual(path)) return 1;
+    return unveil_check(&g_current->unveil, path, need);
 }
 
 // ── sys_open ──────────────────────────────────────────────────────────────
@@ -235,10 +408,9 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     // Copy null-terminated path from user space (max 511 to leave room for cwd prefix).
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
+    int64_t rl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (rl < 0) return (uint64_t)rl;
+    uint64_t i = (uint64_t)rl;
     if (i == 0) return (uint64_t)-EINVAL;
 
     /* Log the path for traced comms — the generic syscall_dispatch
@@ -251,29 +423,24 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
 
     // Resolve relative paths: prepend cwd if path does not start with '/'.
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0;
-        while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        // Ensure cwd ends with '/'.
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     vfs_file_t* f = NULL;
 
     // ── Permission check + existence test via unified fs_lookup ──────────
     // Covers both virtfs (/proc, /dev) and ext2 in one call.
     // fsn.inode_nr is the already-resolved ext2 inode — no second lookup needed.
-    uint8_t open_need = ACL_PERM_READ;
+    // POSIX: the access mode alone decides what is required.  O_WRONLY must
+    // NOT demand read permission (a 0222 file is legitimately write-only), and
+    // O_RDONLY must not demand write.  This was previously "READ, plus WRITE
+    // when writing", which is only harmless while the ext2 side of fs_lookup
+    // ignores `need` entirely -- it does not any more.
+    uint8_t open_need;
     {
         int oflags_acc = (int)(flags & 3);
-        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) open_need |= ACL_PERM_WRITE;
+        if      (oflags_acc == O_WRONLY) open_need = ACL_PERM_WRITE;
+        else if (oflags_acc == O_RDWR)   open_need = ACL_PERM_READ | ACL_PERM_WRITE;
+        else                             open_need = ACL_PERM_READ;
     }
     fs_node_t fsn;
     int fsr = fs_lookup(path, &g_current->cred, open_need, &fsn);
@@ -288,6 +455,22 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         if (path[0]=='/' && path[1]=='t' && path[2]=='m' && path[3]=='p')
             kprintf("[open-dbg] %s ENOENT flags=0x%x\n", path, (uint32_t)flags);
         return (uint64_t)-ENOENT;
+    }
+
+    // ── unveil gate -- BEFORE any open or create ─────────────────────────
+    // A path outside the unveil set is "as if it does not exist", like every
+    // other path syscall (which all gate right after fs_lookup).  This MUST run
+    // before ext2_create below: checking only at got_file (after the create) let
+    // a confined process CREATE a file outside its unveiled subtree -- the create
+    // ran, then the late check denied + closed the fd but left the file on disk
+    // (sandbox escape on the create side).  path is normalized by fs_lookup;
+    // virtual mounts (/dev,/proc) and the no-rules case are exempt inside unveil_ok.
+    {
+        uint8_t need_u = UNVEIL_READ;
+        int oacc = (int)(flags & 3);
+        if (oacc == O_WRONLY || oacc == O_RDWR) need_u |= UNVEIL_WRITE;
+        if (flags & O_CREAT)                    need_u |= UNVEIL_CREATE;
+        if (!unveil_ok(path, need_u)) return (uint64_t)-ENOENT;
     }
 
     // Virtual path — dispatch to backend; permission already checked by fs_lookup.
@@ -313,6 +496,14 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_zero   = (dev[0]=='z' && dev[1]=='e' && dev[2]=='r' && dev[3]=='o' && dev[4]=='\0');
         uint8_t match_urnd   = (dev[0]=='u' && dev[1]=='r' && dev[2]=='a' && dev[3]=='n'
                              && dev[4]=='d' && dev[5]=='o' && dev[6]=='m' && dev[7]=='\0');
+        // /dev/random: same non-blocking kernel CSPRNG as /dev/urandom (modern
+        // Linux never blocks it once seeded).  Without a /dev/random, Java's
+        // default securerandom.source=file:/dev/random and SecureRandom.
+        // getInstanceStrong() (NativePRNGBlocking) fall back to the glacial
+        // ThreadedSeedGenerator -- which stalled Minecraft's bootstrap for many
+        // minutes waiting on software entropy.
+        uint8_t match_rnd    = (dev[0]=='r' && dev[1]=='a' && dev[2]=='n' && dev[3]=='d'
+                             && dev[4]=='o' && dev[5]=='m' && dev[6]=='\0');
         // /dev/input/event<N>: parse the decimal number so every
         // registered input_device_t gets its own node, not just event0.
         int match_eventn = -1;
@@ -326,6 +517,10 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         uint8_t match_dri0   = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
                              && dev[4]=='c' && dev[5]=='a' && dev[6]=='r' && dev[7]=='d'
                              && dev[8]=='0' && dev[9]=='\0');
+        uint8_t match_render = (dev[0]=='d' && dev[1]=='r' && dev[2]=='i' && dev[3]=='/'
+                             && dev[4]=='r' && dev[5]=='e' && dev[6]=='n' && dev[7]=='d'
+                             && dev[8]=='e' && dev[9]=='r' && dev[10]=='D' && dev[11]=='1'
+                             && dev[12]=='2' && dev[13]=='8' && dev[14]=='\0');  // renderD128
         uint8_t match_ptmx   = (dev[0]=='p' && dev[1]=='t' && dev[2]=='m'
                              && dev[3]=='x' && dev[4]=='\0');
         // /dev/pts/<N>: claim the slave side of an existing pty.
@@ -336,11 +531,19 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
             while (dev[i] >= '0' && dev[i] <= '9') { n = n*10 + (dev[i]-'0'); i++; }
             if (dev[i] == '\0') match_ptsn = n;
         }
-        if      (match_tty)    f = tty_open(0);
+        // /dev/tty is the CALLER'S controlling terminal (POSIX), not a second
+        // hardcoded door onto the console -- as a 0666 alias for tty_open(0) it
+        // completely bypassed /dev/tty0's 0620.  Now that a spawned child stays
+        // in its parent's session (see sys_spawn), a login session's processes
+        // resolve this to the console they are actually on, and a process
+        // outside any session gets -ENXIO rather than the console.
+        if      (match_tty)  { f = tty_open_ctty();
+                               if (!f) return (uint64_t)-ENXIO; }
         else if (match_tty0)   f = tty_open(0);
         else if (match_kbdraw) f = vfs_kbdraw_open();
         else if (match_eventn >= 0) { extern vfs_file_t* evdev_open_device(uint32_t); f = evdev_open_device((uint32_t)match_eventn); }
         else if (match_dri0)   { extern vfs_file_t* vfs_drm_open(void); f = vfs_drm_open(); }
+        else if (match_render) { extern vfs_file_t* vfs_drm_render_open(void); f = vfs_drm_render_open(); }
         else if (match_ptmx)   { extern vfs_file_t* pty_open_master(void); f = pty_open_master(); }
         else if (match_ptsn >= 0) { extern vfs_file_t* pty_open_slave_by_index(int); f = pty_open_slave_by_index(match_ptsn); }
         else if (match_kbd)    f = vfs_kbd_open();
@@ -350,6 +553,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         else if (match_null)   f = vfs_null_open();
         else if (match_zero)   f = vfs_zero_open();
         else if (match_urnd)   f = vfs_urandom_open();
+        else if (match_rnd)    f = vfs_urandom_open();  // /dev/random == CSPRNG, non-blocking
         else return (uint64_t)-ENOENT;
         // fall through to got_file
     }
@@ -365,12 +569,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         } else {
             // fsr == -ENOENT && O_CREAT: check write+exec on parent directory.
             char parent[512];
-            uint64_t plen = 0;
-            while (path[plen]) plen++;
-            uint64_t slash = plen;
-            while (slash > 0 && path[slash] != '/') slash--;
-            if (slash == 0) { parent[0] = '/'; parent[1] = '\0'; }
-            else { __builtin_memcpy(parent, path, slash); parent[slash] = '\0'; }
+            if (!path_split(path, parent, sizeof(parent))) return (uint64_t)-ENAMETOOLONG;
             // Use fs_lookup for the parent too — avoids a raw ext2_lookup_path.
             fs_node_t par_fsn;
             int par_r = fs_lookup(parent, &g_current->cred,
@@ -382,7 +581,7 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
         if (!f && (flags & O_CREAT)) {
             mode &= ~(uint64_t)g_current->umask;
             (void)mode;
-            if (!ext2_create(path)) return (uint64_t)-EIO;
+            if (!ext2_create(path, &g_current->cred)) return (uint64_t)-EIO;
             f = ext2_open(path);
         }
     }
@@ -390,24 +589,26 @@ uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) {
     if (!f) return (uint64_t)-ENOENT;
 
 got_file:
-    // ── unveil check ─────────────────────────────────────────────────────
-    // Paths not in the unveil table return ENOENT (as if they don't exist).
-    // /dev/ and /proc/ are exempt (virtual, always accessible via this path).
-    if (g_current->unveil.count > 0 &&
-        !(path[1]=='d' && path[2]=='e' && path[3]=='v') &&
-        !(path[1]=='p' && path[2]=='r' && path[3]=='o' && path[4]=='c')) {
-        uint8_t need_u = UNVEIL_READ;
-        int oflags_acc = (int)(flags & 3);
-        if (oflags_acc == O_WRONLY || oflags_acc == O_RDWR) need_u |= UNVEIL_WRITE;
-        if (flags & O_CREAT)                                 need_u |= UNVEIL_CREATE;
-        if (!unveil_check(&g_current->unveil, path, need_u)) {
-            vfs_close(f);
-            return (uint64_t)-ENOENT;
-        }
-    }
+    // unveil was gated BEFORE any open/create above (see the note there).  The
+    // single boundary-correct unveil_ok (uses virtfs_is_virtual, not a hand-rolled
+    // prefix test) hid the path if it was outside the visible set, so a confined
+    // process can neither read nor CREATE outside its unveiled subtree.
 
     // ── Stamp fd rights from open flags ───────────────────────────────────
-    f->rights = rights_from_oflags((int)(flags & 3), 0 /* exec_ok: not checked here */);
+    // exec_ok grants RIGHT_EXEC | RIGHT_MMAP_X (needed to mmap PROT_EXEC, e.g.
+    // dlopen mapping a .so's text).  Deny by default (ASVS V4): grant it ONLY
+    // when the caller is authorized to EXECUTE this object -- its own ACL,
+    // checked against the caller's cred, exactly like fs_lookup's read/write
+    // check.  A non-executable data file (no x bit) therefore can never be
+    // mapped executable, and W^X still blocks W+X.  Only for real ext2 files
+    // resolved above; devices / newly O_CREAT'd files get no exec right.
+    int exec_ok = 0;
+    if (fsr == 0 && !fsn.is_virtual) {
+        acl_entry_t _acl[3];
+        acl_from_mode(_acl, fsn.uid, fsn.gid, fsn.mode);
+        exec_ok = acl_check(_acl, 3, &g_current->cred, ACL_PERM_EXEC);
+    }
+    f->rights = rights_from_oflags((int)(flags & 3), exec_ok);
 
     // Enforce access mode: strip write for O_RDONLY (belt-and-suspenders).
     if ((flags & 3) == O_RDONLY) f->write = NULL;
@@ -468,6 +669,10 @@ uint64_t sys_close(uint64_t fd) {
 //   - new_brk < brk: shrink heap — remove VMA pages above new_brk
 //     and unmap+free them.
 // Returns new brk on success, (uint64_t)-1 on error.
+// Forward decl: the shared unmap -> cross-CPU flush -> free primitive (defined
+// with sys_munmap below) -- brk shrink must use it, not free-before-flush.
+static void mm_unmap_range_flush_free(task_mm_t* mm_shared, phys_addr_t pml4,
+                                      mm_t* mm, virt_addr_t addr, virt_addr_t end);
 static uint64_t sys_brk(uint64_t new_brk_raw) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
 
@@ -491,45 +696,55 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
     if (new_brk == old_brk) return old_brk;
 
     if (new_brk > old_brk) {
-        // ── Grow heap ─────────────────────────────────────────────────────
-        // Rather than remove+add (which races readers and loses flags),
-        // ask mm_vma_remove to drop the old heap VMA (deferred free via
-        // call_rcu) and then mm_vma_add to install the enlarged one.
+        // ── Grow heap (IN PLACE) ──────────────────────────────────────────
+        // Extend the existing heap VMA's ->end under mm->vma_lock.  NEVER
+        // remove+add: the old code dropped the heap VMA (mm_vma_remove) and
+        // then re-added an enlarged one (mm_vma_add), leaving a WINDOW in which
+        // no VMA covered the heap at all.  A sibling thread reading into a heap
+        // buffer during that window hit mm_vma_find()==NULL in user_buf_prefault
+        // and the read(2) returned a spurious -EFAULT -- the intermittent "Bad
+        // address" reading class files, triggered once the JVM's JIT compiler
+        // threads ran concurrent malloc()/brk() while the main thread read.
+        // An in-place end bump is race-free: a concurrent reader observes either
+        // the old (smaller) or the new (larger) end, and every address in the
+        // pre-existing range stays covered throughout.
         virt_addr_t heap_vma_start = mm->brk_start;
         virt_addr_t vma_end = (new_brk + PAGE_MASK) & ~PAGE_MASK;
 
-        // mm_vma_remove takes mm->vma_lock internally.
-        extern uint8_t mm_vma_remove(mm_t*, virt_addr_t, virt_addr_t);
-        // We need to know the old end to pass it in.  Read it under RCU.
-        virt_addr_t old_end = 0;
-        rcu_read_lock();
-        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
-            if (v->start == heap_vma_start) { old_end = v->end; break; }
+        int extended = 0, overlap = 0;
+        spin_lock(&mm->vma_lock);
+        vma_t* heap = NULL;
+        for (vma_t* v = mm->vmas; v; v = v->next) {
+            if (v->start == heap_vma_start) { heap = v; continue; }
+            // Any OTHER VMA overlapping [heap_start, vma_end) blocks the grow.
+            if (heap_vma_start < v->end && vma_end > v->start) overlap = 1;
         }
-        rcu_read_unlock();
-        if (old_end)
-            mm_vma_remove(mm, heap_vma_start, old_end);
+        if (!overlap && heap) {
+            if (vma_end > heap->end) heap->end = vma_end;  // in-place, race-free
+            extended = 1;
+        }
+        spin_unlock(&mm->vma_lock);
 
-        if (!mm_vma_add(mm, heap_vma_start, vma_end, VMA_R | VMA_W | VMA_ANON))
-            return (uint64_t)-ENOMEM;
+        if (overlap) return (uint64_t)-ENOMEM;
+        if (!extended) {
+            // First grow (no heap VMA yet): install it fresh.
+            if (!mm_vma_add(mm, heap_vma_start, vma_end, VMA_R | VMA_W | VMA_ANON))
+                return (uint64_t)-ENOMEM;
+        }
 
         mm->brk = new_brk;
         return new_brk;
     }
 
     // ── Shrink heap ───────────────────────────────────────────────────────
-    // Unmap and free physical frames in [new_brk, old_brk).
-    // Use pmm_ref_dec (CoW-aware): frame only freed when refcount→0.
     phys_addr_t pml4 = vmm_current_pml4();
-    for (virt_addr_t page = new_brk; page < old_brk; page += PAGE_SIZE) {
-        phys_addr_t frame;
-        if (vmm_page_unmap(pml4, page, &frame))
-            pmm_ref_dec(frame);
-    }
-
-    // Shrink or remove the heap VMA.  Under mm->vma_lock so mutation
-    // is serialised with concurrent mmap/munmap on the same address space.
     virt_addr_t heap_vma_start = mm->brk_start;
+
+    // 1. Shrink/remove the heap VMA FIRST, under mm->vma_lock (serialised with
+    //    concurrent mmap/munmap).  Doing the metadata first means a concurrent
+    //    fault from a sibling thread in [new_brk, old_brk) finds no VMA and
+    //    SIGSEGVs (correct -- it is past the new brk) instead of demand-paging a
+    //    fresh frame into a range we are about to tear down.
     spin_lock(&mm->vma_lock);
     vma_t** pp = &mm->vmas;
     while (*pp) {
@@ -550,11 +765,15 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 
     mm->brk = new_brk;
 
-    // Remote CPUs running other threads of this process may still hold
-    // TLB entries for pages we just freed.  Flush them before returning
-    // so a stale translation doesn't allow a racing thread to read/write
-    // memory that's already been handed back to the buddy allocator.
-    tlb_flush_range(g_current->mm_shared, new_brk, old_brk);
+    // 2. Unmap + free the physical frames with the CORRECT ordering: unmap
+    //    (local invlpg) -> cross-CPU TLB shootdown -> free, via the shared
+    //    primitive sys_munmap / MAP_FIXED use.  The previous code freed each
+    //    frame (pmm_ref_dec) inside the loop and only flushed AFTER -- so a
+    //    sibling THREAD_SHARE_MM thread on another CPU kept a stale WRITABLE TLB
+    //    entry and could write into a frame already handed back to the buddy
+    //    allocator and reused/zero-filled for a new owner (cross-owner UAF write
+    //    / LPE).  flush-before-free closes that window.
+    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, new_brk, old_brk);
     return new_brk;
 }
 
@@ -574,7 +793,6 @@ static uint64_t sys_brk(uint64_t new_brk_raw) {
 // point touches user memory of the dying task.  Also called from the
 // signal-terminate path (kernel/proc/signal.c) for killed threads.
 void task_notify_cleartid(void) {
-    extern int copy_to_user(void* dst_u, const void* src, uint64_t len);
     if (!g_current || !g_current->cleartid_addr) return;
     uint64_t addr = g_current->cleartid_addr;
     g_current->cleartid_addr = 0;
@@ -597,50 +815,36 @@ static uint64_t sys_exit(uint64_t code) {
         if (g_init_task && g_init_task != g_current) {
             task_children_reparent(g_current, g_init_task);
         } else {
-            g_current->children = NULL;
+            // We ARE init (or init is absent): init->children is concurrently
+            // CAS-prepended from other CPUs, so drain it ATOMICALLY -- a plain
+            // store would tear the lock-free Treiber stack.
+            task_children_clear(g_current);
         }
 
         // Drop the fd table now so peers (pipes, sockets, ttys) see EOF
-        // immediately rather than at reap time.
-        if (g_current->files_shared) {
-            task_files_release(g_current->files_shared);
-            g_current->files_shared = NULL;
-        }
+        // immediately rather than at reap time.  task_drop_files unpublishes
+        // files_shared (RELEASE) BEFORE the RCU-deferred release so a
+        // /proc/<pid>/fd reader cannot race the free -- one shared mechanism with
+        // the fatal-signal terminate path so the order cannot drift.
+        task_drop_files(g_current);
 
         // Log page-cache stats for demand-paged (VMA_FILE) processes.
         if (g_current->pf_disk || g_current->pf_cache) {
             uint32_t total = g_current->pf_disk + g_current->pf_cache;
             uint32_t pct   = total ? (g_current->pf_cache * 100u / total) : 0u;
-            kprintf("[pf] %s: %u disk  %u cache  (%u%% warm)\n",
-                    g_current->comm,
-                    g_current->pf_disk, g_current->pf_cache, pct);
+            if (CONFIG_DEBUG_DEMAND_PAGING)
+                kprintf("[pf] %s: %u disk  %u cache  (%u%% warm)\n",
+                        g_current->comm,
+                        g_current->pf_disk, g_current->pf_cache, pct);
         }
 
-        g_current->exit_code = (int32_t)(int)code;
-
-        // A pthread (TASK_FLAG_THREAD) is NOT a child anyone wait()s on —
-        // userland joins via the futex 'done' word (SYS_SET_CLEARTID,
-        // already signalled above), not sys_wait.  So a thread must NOT
-        // become a wait()-able zombie (it would linger forever — a kernel
-        // task-struct + pid leak per thread) and must NOT send SIGCHLD to
-        // the PROCESS's parent (a font thread exiting would spuriously
-        // wake dwl's child reaper).  Self-reap instead: TASK_DEAD is
-        // collected by the idle reaper right after we switch away, which
-        // refcount-releases the shared mm/files (task_free_rcu).
-        if (g_current->flags & TASK_FLAG_THREAD) {
-            g_current->state = TASK_DEAD;     // idle reaper frees it
-        } else {
-            g_current->state = TASK_ZOMBIE;
-            sched_add_zombie(g_current);
-
-            // Wake parent and deliver SIGCHLD so it can reap background
-            // jobs.  Skip zombie parents (they can't handle anything any
-            // more).  signal_send unconditionally calls sched_wake under
-            // the target rq_lock, so no racy state check is needed.
-            task_t* parent = sched_find_pid(g_current->ppid);
-            if (parent && parent->state != TASK_ZOMBIE)
-                signal_send(parent, SIGCHLD);
-        }
+        // Set exit code + disposition via the one shared mechanism (also used
+        // by the fatal-signal terminate path): a pthread (TASK_FLAG_THREAD) is
+        // joined via the CLEARTID futex (already signalled above), not
+        // wait()ed, so it self-reaps as TASK_DEAD instead of lingering as a
+        // zombie (a per-thread task-struct + pid leak) and does NOT SIGCHLD the
+        // process parent; a leader becomes a wait()-able zombie + SIGCHLDs it.
+        task_set_exit_state(g_current, (int32_t)(int)code);
     }
     sched_yield();
     for (;;) __asm__ volatile("hlt");
@@ -651,17 +855,29 @@ static uint64_t sys_exit(uint64_t code) {
 static int s_bcast_sig = 0;
 static void kill_bcast_cb(task_t* t, void* data) {
     (void)data;
-    if (!(t->flags & TASK_FLAG_KTHREAD) && t->state != TASK_ZOMBIE)
+    if (!(t->flags & TASK_FLAG_KTHREAD) && t->state != TASK_ZOMBIE &&
+        signal_may(g_current, t))   // authorize: broadcast hits only signalable tasks
         signal_send(t, s_bcast_sig);
 }
 
 // ── sys_kill ──────────────────────────────────────────────────────────────
+// Top of the POSIX realtime signal range userspace declares (SIGRTMAX in
+// <signal.h>). MakaOS has no per-task RT delivery (NSIG=32); operations on
+// [NSIG, SIGRTMAX_COMPAT] are accepted as benign no-ops rather than EINVAL so
+// glibc-style callers that treat a failure as fatal (OpenJDK's NIO NativeThread)
+// keep working. Proper fix: 64-bit signal masks (docs/SCALABILITY_DEBT.md).
+#define SIGRTMAX_COMPAT 63
+
 // kill(pid, sig): send signal `sig` to the task with the given pid.
 // pid > 0: send to the task with that pid.
 // pid == 0: send to all tasks in the caller's thread group.
 // pid == -1: broadcast to all tasks (except idle/kernel threads).
 static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     int sig = (int)(int64_t)sig_raw;
+    // RT signals (>= NSIG, <= SIGRTMAX): accepted but undeliverable (no per-task
+    // RT delivery yet). Report success so senders -- e.g. NativeThread.signal()
+    // pthread_kill'ing the NIO interrupt signal -- do not error. See sys_sigaction.
+    if (sig >= NSIG && sig <= SIGRTMAX_COMPAT) return 0;
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
 
     int64_t pid = (int64_t)pid_raw;
@@ -669,20 +885,22 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     if (pid > 0) {
         // O(1) lookup via the pid hash table.  Zombies are kept in
         // pid_ht until fully reaped, but kill() on a zombie is an
-        // error (ESRCH) — the task is semantically dead.
-        task_t* target = ((int64_t)g_current->pid == pid)
-                         ? g_current
-                         : sched_find_pid((uint32_t)pid);
-        if (!target || target->state == TASK_ZOMBIE)
-            return (uint64_t)-ESRCH;
-        signal_send(target, sig);
-        return 0;
+        // error (ESRCH) — the task is semantically dead.  Sending to
+        // another task goes through signal_send_pid, which does the
+        // lookup + delivery under rcu_read_lock so the target cannot be
+        // freed in the window (sched_find_pid alone returns a bare
+        // pointer with no such guarantee).
+        if ((int64_t)g_current->pid == pid) {
+            signal_send(g_current, sig);    // self: cannot be freed
+            return 0;
+        }
+        return (uint64_t)signal_send_pid_user(g_current, (uint32_t)pid, sig);  // 0/-ESRCH/-EPERM
     }
 
     if (pid == 0) {
         // POSIX: signal the CALLER'S PROCESS GROUP (not thread group).
         if (!g_current) return (uint64_t)-ESRCH;
-        signal_send_pgrp(g_current->pgid, sig);
+        signal_send_pgrp_user(g_current, g_current->pgid, sig);
         return 0;
     }
 
@@ -692,7 +910,7 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
         // (foot does exactly this).  This case used to fall through
         // to the -1 broadcast below, SIGHUP'ing every process on the
         // system — login, svcmgr and net included.
-        signal_send_pgrp((uint32_t)(-pid), sig);
+        signal_send_pgrp_user(g_current, (uint32_t)(-pid), sig);
         return 0;
     }
 
@@ -702,6 +920,21 @@ static uint64_t sys_kill(uint64_t pid_raw, uint64_t sig_raw) {
     s_bcast_sig = sig;
     sched_for_each(kill_bcast_cb, NULL);
     return 0;
+}
+
+// Resolve the thread-group LEADER (the task whose pid == tgid) for child-list
+// anchoring.  A process's children live on ONE list -- the leader's -- so a
+// child forked by ANY thread is reapable by wait() in ANY thread of the group
+// (POSIX), instead of being stranded on the forking thread's private list.
+// MUST be called inside rcu_read_lock: pid_ht_find is RCU-protected, and the
+// caller's read section is what keeps the returned leader pinned across the
+// subsequent task_child_add / task_children_reap (no use-after-free, the
+// F16/F17 pattern).  Single-threaded (tgid == pid) or a missing leader falls
+// back to `t` itself, so it can never return a dangling pointer.
+static task_t* tg_leader(task_t* t) {
+    if (t->tgid == t->pid) return t;
+    task_t* l = pid_ht_find(t->tgid);
+    return l ? l : t;
 }
 
 // ── sys_fork ──────────────────────────────────────────────────────────────
@@ -722,9 +955,81 @@ static uint64_t sys_fork(void) {
                               kf->r14,
                               kf->r15);
     if (!child) return (uint64_t)-ENOMEM;
-    task_child_add(g_current, child);
+    rcu_read_lock();
+    task_child_add(tg_leader(g_current), child);   // anchor on the thread-group leader
+    rcu_read_unlock();
     sched_add(child);
     return (uint64_t)child->pid;
+}
+
+// Safely copy a user NULL-terminated vector of string pointers (argv/envp) into
+// freshly kmalloc'd kernel strings.  The vector pointer AND every element string
+// pointer are validated through copy_from_user / copy_path_from_user (which
+// range-check via _access_ok and VMA-back the read), so a kernel, non-canonical,
+// unmapped, or wrapping pointer returns -EFAULT instead of being raw-derefed --
+// a raw deref of an unmapped element would take an unresolvable kernel-mode #PF
+// and PANIC the kernel, and a kernel-address element would copy KERNEL memory
+// into the child's argv (an unprivileged info leak / LPE).  On success fills
+// out[0..*count-1] (each kmalloc'd, caller frees) and out[*count] = NULL; on ANY
+// error frees what it allocated, leaves out empty + NULL-terminated, and returns
+// -errno.  `max` elements, `arglen` bytes/string incl NUL, `scratch` a
+// caller-provided arglen-byte buffer (kept OFF the 8KiB kernel stack).
+static int copy_user_strv(uint64_t uvec, char** out, uint32_t max,
+                          uint32_t arglen, uint8_t* scratch, uint32_t* count) {
+    *count = 0;
+    out[0] = NULL;
+    if (!uvec) return 0;                          // no argv/envp: empty vector
+    int rc = 0;
+    for (uint32_t i = 0; i < max; i++) {
+        uint64_t ustr = 0;
+        // Read element i of the pointer array (validated 8-byte copy).
+        if (copy_from_user(&ustr, (const void*)(uvec + (uint64_t)i * 8), 8) != 0) {
+            rc = -EFAULT; goto fail;
+        }
+        if (!ustr) break;                         // NULL terminator
+        // Bounded NUL-terminated copy of the string the element points at
+        // (validates ustr; -EFAULT for a bad pointer, -ENAMETOOLONG if too long).
+        int64_t n = copy_path_from_user((char*)scratch, (const void*)ustr, arglen);
+        if (n < 0) { rc = (int)n; goto fail; }    // -EFAULT or -ENAMETOOLONG
+        char* ks = kmalloc((uint64_t)n + 1);
+        if (!ks) { rc = -ENOMEM; goto fail; }
+        __builtin_memcpy(ks, scratch, (uint64_t)n);
+        ks[n] = '\0';
+        out[*count] = ks;
+        (*count)++;
+        out[*count] = NULL;                       // keep the vector NULL-terminated
+    }
+    return 0;
+fail:
+    for (uint32_t i = 0; i < *count; i++) kfree(out[i]);
+    *count = 0;
+    out[0] = NULL;
+    return rc;
+}
+
+extern void signal_send_group(uint32_t tgid, int sig);
+
+// exec address-space teardown decision.  Sole owner of the task_mm_t
+// (refs == 1, the single-threaded common case) frees the old pml4 in place;
+// a SHARED mm (refs > 1, a multithreaded process) must NOT free the old pml4
+// out from under sibling threads still running on it -- it detaches onto a
+// fresh mm and lets the refcount free the old one when the siblings exit.
+static inline int exec_mm_sole_owner(uint32_t refs) { return refs == 1u; }
+
+// Deterministic check of the exec teardown threshold: ONLY refs==1 takes the
+// in-place free-old-pml4 path; refs>=2 (any sibling thread) takes the detach +
+// kill + refcount-defer path that prevents the cross-domain page-table UAF.
+void exec_mm_teardown_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    if (exec_mm_sole_owner(1) != 1) fails++;   // sole owner -> free in place
+    if (exec_mm_sole_owner(2) != 0) fails++;   // one sibling -> must NOT free
+    if (exec_mm_sole_owner(8) != 0) fails++;   // many siblings -> must NOT free
+    if (exec_mm_sole_owner(0) != 0) fails++;   // defensive (refs==0 impossible)
+    if (fails)
+        kprintf_atomic("[exec_mm] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[exec_mm] PASS (only sole-owner frees old pml4 in place)\n");
 }
 
 // ── sys_exec (execve) ─────────────────────────────────────────────────────
@@ -745,80 +1050,64 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
 
     // ── Copy path from user space ─────────────────────────────────────────
     char path[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t plen = 0;
-    while (plen < 511 && upath[plen]) { path[plen] = upath[plen]; plen++; }
-    path[plen] = '\0';
+    int64_t epl = copy_path_from_user(path, (const void*)path_ptr, sizeof(path));
+    if (epl < 0) return (uint64_t)epl;
+    uint64_t plen = (uint64_t)epl;
     if (plen == 0) return (uint64_t)-EINVAL;
 
     // Resolve relative path using cwd.
     char resolved[512];
-    if (path[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) resolved[j] = cwd[j];
-        if (j > 0 && resolved[j-1] != '/') resolved[j++] = '/';
-        for (uint64_t k = 0; path[k] && j < 511; k++, j++) resolved[j] = path[k];
-        resolved[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= plen; k++) resolved[k] = path[k];
-    }
+    resolve_at_path(resolved, sizeof(resolved), g_current->cwd, path);
+    normalize_path(resolved);
+    if (!unveil_ok(resolved, UNVEIL_EXEC)) return (uint64_t)-ENOENT;   // sandbox
 
     // ── Copy argv from user space (up to 256 args, 4KiB each) ────────────
     #define MAX_ARGS  256
     #define MAX_ARG_LEN 4096
-    char* k_argv[MAX_ARGS + 1];
-    uint32_t argc = 0;
-    if (argv_ptr) {
-        const uint64_t* uargv = (const uint64_t*)argv_ptr;
-        while (argc < MAX_ARGS) {
-            uint64_t ustr = uargv[argc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_argv[argc++] = ks;
-        }
-    }
-    k_argv[argc] = NULL;
-
-    // ── Copy envp from user space (up to 512 vars) ────────────────────────
     #define MAX_ENVS 512
+    char* k_argv[MAX_ARGS + 1];
     char* k_envp[MAX_ENVS + 1];
-    uint32_t envc = 0;
-    if (envp_ptr) {
-        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
-        while (envc < MAX_ENVS) {
-            uint64_t ustr = uenvp[envc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_envp[envc++] = ks;
+    uint32_t argc = 0, envc = 0;
+    // Validate + copy argv/envp through the shared safe primitive: it rejects a
+    // kernel/unmapped/non-canonical array or element pointer with -EFAULT rather
+    // than raw-dereferencing it (which would PANIC the kernel on an unmapped
+    // page or copy KERNEL memory into the child's argv).  One arglen-byte
+    // scratch, kmalloc'd off the 8KiB kernel stack, reused for every string.
+    {
+        uint8_t* strv_scratch = (uint8_t*)kmalloc(MAX_ARG_LEN);
+        if (!strv_scratch) goto oom;
+        int srv = copy_user_strv(argv_ptr, k_argv, MAX_ARGS, MAX_ARG_LEN,
+                                 strv_scratch, &argc);
+        if (srv == 0)
+            srv = copy_user_strv(envp_ptr, k_envp, MAX_ENVS, MAX_ARG_LEN,
+                                 strv_scratch, &envc);
+        kfree(strv_scratch);
+        if (srv != 0) {
+            // copy_user_strv freed its own partial vector (and reset its count);
+            // free the other one (argv may be fully built if envp failed).
+            for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            return (uint64_t)(int64_t)srv;
         }
     }
-    k_envp[envc] = NULL;
 
     // ── Execute permission check (path-aware walk + exec bit) ────────────
     int exec_err = 0;
     uint32_t exec_ino = ext2_lookup_path(resolved, &g_current->cred, &exec_err);
     if (!exec_ino) { if (exec_err) return (uint64_t)(int64_t)exec_err; goto enoent; }
+    // Hoisted: carried to the post-commit point where the setuid escalation is
+    // applied (so a failed load never escalates).  0xFFFFFFFF = no escalation.
+    uint32_t setuid_uid = 0xFFFFFFFFu;
     {
         ext2_inode_t exec_inode;
         if (!ext2_read_inode(exec_ino, &exec_inode)) goto enoent;
         inode_perm_t exec_ip = {
             .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
-            .mode = exec_inode.i_mode & 0x1FF,
+            // Full low-12 mode so vfs_check_exec sees the setuid bit (04000);
+            // acl_from_mode only reads the low 9, so the perm check is unaffected.
+            .mode = exec_inode.i_mode & 0xFFF,
             .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
         };
-        uint32_t setuid_uid = 0xFFFFFFFFu;
         if (vfs_check_exec(&exec_ip, &g_current->cred, &setuid_uid) != 0)
             goto enoent;
     }
@@ -841,8 +1130,9 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     int64_t hdr_n = f->read(f, hdr_buf, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (hdr_n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr_buf); vfs_close(f); goto enoexec; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            resolved, (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                resolved, (uint32_t)((t1 - t0) / 1000u));
 
     phys_addr_t new_pml4;
     mm_t*       new_mm;
@@ -906,26 +1196,82 @@ static uint64_t sys_exec(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
     // upper-half mappings (vmm_alloc_pml4 copied PML4[256..511]), so the
     // kernel keeps running across the switch and the remaining exec code
     // touches only kernel state — never the old lower-half image.
-    phys_addr_t old_pml4 = g_current->mm_shared->pml4_phys;
-    mm_t*       old_mm   = g_current->mm_shared->mm;
+    // MULTITHREADED exec (sibling THREAD_SHARE_MM threads share this task_mm_t
+    // and run on other CPUs with CR3 == old_pml4): the in-place swap + direct
+    // free below would change the address space out from under them AND return
+    // their page tables to the buddy allocator while their hardware walkers
+    // still walk them -- a cross-domain use-after-free / LPE.  POSIX requires
+    // exec to terminate every OTHER thread first.  We do NOT spin waiting for
+    // them to die: a killed sibling drops its mm ref only in task_free_rcu
+    // (after a grace period), and g_current spinning in this syscall could
+    // stall that grace period -> deadlock.  Instead, when we are not the sole
+    // owner, detach onto a FRESH task_mm_t and let the OLD one be freed by its
+    // refcount once the (now SIGKILL'd) siblings exit -- old_pml4 stays live
+    // while any sibling references it, so there is no UAF and no wait.
+    if (!exec_mm_sole_owner(__atomic_load_n(&g_current->mm_shared->refs,
+                                            __ATOMIC_ACQUIRE))) {
+        task_mm_t* fresh = task_mm_alloc(new_pml4, new_mm);
+        if (!fresh) {
+            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0); mm_destroy(new_mm);
+            return (uint64_t)-ENOMEM;
+        }
+        // SIGKILL every thread in the group; sig_group_visit also targets
+        // g_current, so clear our OWN pending SIGKILL -- we are the surviving
+        // thread and must complete the exec.  (tgid/leader identity is left as
+        // is: for the common leader-exec case g_current is already its group's
+        // sole survivor; a non-leader exec leaving a tgid pointing at the
+        // reaped leader is a benign residual -- the full POSIX leader-switch is
+        // future work, see docs/SCALABILITY_DEBT.md.)
+        signal_send_group(g_current->tgid, SIGKILL);
+        __atomic_and_fetch(&g_current->sigstate.pending,
+                           ~(1u << (SIGKILL - 1)), __ATOMIC_ACQ_REL);
+        task_mm_t* old_shared = g_current->mm_shared;
+        g_current->mm_shared  = fresh;
+        vmm_switch(new_pml4);   // CR3 = new_pml4 on THIS cpu
+        // Drop OUR ref on the old shared mm.  Siblings still hold refs, so this
+        // does NOT free old_pml4 here; task_mm_release frees it once the last
+        // SIGKILL'd sibling exits (refs -> 0).  No direct free, no spin.
+        task_mm_release(old_shared);
+    } else {
+        phys_addr_t old_pml4 = g_current->mm_shared->pml4_phys;
+        mm_t*       old_mm   = g_current->mm_shared->mm;
 
-    g_current->mm_shared->pml4_phys = new_pml4;
-    g_current->mm_shared->mm        = new_mm;
-    vmm_switch(new_pml4);   // CR3 = new_pml4; old hierarchy now unreferenced
+        g_current->mm_shared->pml4_phys = new_pml4;
+        g_current->mm_shared->mm        = new_mm;
+        vmm_switch(new_pml4);   // CR3 = new_pml4; old hierarchy now unreferenced
 
-    vmm_free_user_ex(old_pml4, old_mm);   // safe: no CPU walks old_pml4 now
-    pmm_buddy_free(old_pml4, 0);
-    mm_destroy(old_mm);
+        vmm_free_user_ex(old_pml4, old_mm);   // safe: sole owner, no CPU walks old_pml4 now
+        pmm_buddy_free(old_pml4, 0);
+        mm_destroy(old_mm);
+    }
 
-    // Reset signal handlers to SIG_DFL (POSIX: exec clears custom handlers).
+    // ── setuid-on-exec ────────────────────────────────────────────────────
+    // The exec is now COMMITTED (new address space installed, old freed), so a
+    // failed load can no longer leave an escalated process.  Apply any setuid
+    // escalation -- ksec-mediated and fail-closed (no agent / deny -> no
+    // change).  Capture the requester's identity from the PRE-escalation cred.
+    {
+        uint32_t cuid = g_current->cred.euid, cgid = g_current->cred.egid;
+        ksec_exec_setuid(&g_current->cred, setuid_uid, exec_ino,
+                         g_current->pid, cuid, cgid);
+    }
+
+    // Reset signal handlers to SIG_DFL (POSIX: exec clears CAUGHT handlers but
+    // keeps SIG_IGN dispositions).  Operate on the shared sighand in place: after
+    // execve the process is single-threaded (sibling stacks vanish with the old
+    // address space, and those threads self-reap, dropping their sighand refs).
     for (int si = 0; si < NSIG; si++) {
-        if (g_current->sigstate.handlers[si].sa_handler > SIG_IGN)
-            g_current->sigstate.handlers[si].sa_handler = SIG_DFL;
-        g_current->sigstate.handlers[si].sa_mask  = 0;
-        g_current->sigstate.handlers[si].sa_flags = 0;
+        if (g_current->sighand->handlers[si].sa_handler > SIG_IGN)
+            g_current->sighand->handlers[si].sa_handler = SIG_DFL;
+        g_current->sighand->handlers[si].sa_mask  = 0;
+        g_current->sighand->handlers[si].sa_flags = 0;
     }
     // Unblock all signals (POSIX: exec resets the signal mask).
     g_current->sigstate.blocked = 0;
+    // Disable the alternate signal stack (POSIX: execve removes it; its memory
+    // belonged to the torn-down image anyway).
+    g_current->sigstate.altstack_sp   = NULL;
+    g_current->sigstate.altstack_size = 0;
 
     // Drop the pre-exec TLS pointer — those addresses belong to the
     // torn-down image.  The new image's crt0 installs fresh TLS via
@@ -978,6 +1324,101 @@ enoexec:
 }
 
 // ── sys_spawn ─────────────────────────────────────────────────────────────
+// May the caller spawn a child running as (uid, gid)?  Root may set any creds;
+// a non-root caller may only request uids/gids it ALREADY holds -- the same
+// down-only rule cred_setuid/cred_setgid enforce, so the single permission
+// model can't be bypassed by routing a privilege change through spawn().
+// Without this gate SPAWN_ATTR_CRED applied the attacker-supplied uid/gid
+// verbatim, letting any process spawn a euid==0 (root) child -- a trivial LPE.
+// Pure -> unit-tested (spawn_cred_allowed_selftest).
+static int spawn_cred_allowed(const cred_t* c, uint32_t uid, uint32_t gid) {
+    if (cred_is_root(c)) return 1;                       // root: any creds
+    int uid_ok = cred_uid_is_one_of(c, uid);
+    int gid_ok = cred_gid_is_one_of(c, gid) || cred_in_group(c, gid);
+    return uid_ok && gid_ok;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic check that a child forked by one thread is reapable by another
+// thread of the SAME process: tg_leader resolves any thread to the group leader
+// (pid == tgid) via the pid hash, so task_child_add (fork) and
+// task_children_reap (wait) both target ONE shared children list.  Builds fake
+// task_t's (a leader, a second thread, a zombie child), registers the leader so
+// pid_ht_find resolves it, and asserts the child "thread T forked" is reaped
+// when "thread T waits".  Synthetic high pids -- no other code references them,
+// so pid_ht_remove + kfree has no concurrent RCU reader.
+void tg_leader_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    task_t* L = (task_t*)kmalloc(sizeof(task_t));   // thread-group leader
+    task_t* T = (task_t*)kmalloc(sizeof(task_t));   // a second thread of L's group
+    task_t* C = (task_t*)kmalloc(sizeof(task_t));   // a child forked by a thread
+    if (!L || !T || !C) {
+        if (L) kfree(L); if (T) kfree(T); if (C) kfree(C);
+        kprintf_atomic("[tgleader] SELF-TEST SKIP (no mem)\n"); return;
+    }
+    __builtin_memset(L, 0, sizeof(*L));
+    __builtin_memset(T, 0, sizeof(*T));
+    __builtin_memset(C, 0, sizeof(*C));
+    L->pid = 0x7F100u; L->tgid = 0x7F100u;          // leader: pid == tgid
+    T->pid = 0x7F101u; T->tgid = 0x7F100u;          // thread in L's group
+    C->pid = 0x7F200u; C->tgid = 0x7F200u; C->state = TASK_ZOMBIE; C->child_next = NULL;
+    pid_ht_insert(L);                               // so pid_ht_find(tgid) -> L
+
+    rcu_read_lock();
+    int lead_ok = (tg_leader(T) == L) && (tg_leader(L) == L);
+    rcu_read_unlock();
+    if (!lead_ok) { kprintf_atomic("[tgleader] FAIL leader resolution\n"); fails++; }
+
+    // "Thread T forks child C" -> anchored on the leader, not on T.
+    rcu_read_lock();
+    task_child_add(tg_leader(T), C);
+    rcu_read_unlock();
+
+    // "Thread T (any group thread) waits" -> reaps from the leader's list.
+    uint8_t found = 0;
+    rcu_read_lock();
+    task_t* z = task_children_reap(tg_leader(T), C->pid, &found);
+    rcu_read_unlock();
+    if (z != C || !found) {
+        kprintf_atomic("[tgleader] FAIL cross-thread reap z=%p found=%u\n",
+                (void*)z, (unsigned)found);
+        fails++;
+    }
+
+    pid_ht_remove(L);
+    kfree(L); kfree(T); kfree(C);
+    kprintf_atomic(fails ? "[tgleader] SELF-TEST FAILED\n"
+                  : "[tgleader] SELF-TEST PASSED (any thread reaps any process-child)\n");
+}
+
+void spawn_cred_allowed_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // Non-root caller holding only uid/gid 1000.
+    cred_t u; __builtin_memset(&u, 0, sizeof(u));
+    u.ruid = u.euid = u.suid = 1000; u.rgid = u.egid = u.sgid = 1000;
+    if (spawn_cred_allowed(&u, 0, 0))      { kprintf_atomic("[spawn_cred] FAIL u->0\n"); fails++; }   // deny escalation
+    if (spawn_cred_allowed(&u, 0, 1000))   { kprintf_atomic("[spawn_cred] FAIL u->uid0\n"); fails++; } // deny uid0 even if gid ok
+    if (spawn_cred_allowed(&u, 1000, 0))   { kprintf_atomic("[spawn_cred] FAIL u->gid0\n"); fails++; } // deny gid0
+    if (!spawn_cred_allowed(&u, 1000, 1000)){ kprintf_atomic("[spawn_cred] FAIL u->self\n"); fails++; }// allow own
+    // suid==0 (a setuid program that dropped euid) may spawn a uid0 child.
+    cred_t s; __builtin_memset(&s, 0, sizeof(s));
+    s.ruid = s.euid = 1000; s.suid = 0; s.rgid = s.egid = s.sgid = 1000;
+    if (!spawn_cred_allowed(&s, 0, 1000))  { kprintf_atomic("[spawn_cred] FAIL suid0->uid0\n"); fails++; }
+    // Supplemental group membership allows that gid.
+    cred_t g; __builtin_memset(&g, 0, sizeof(g));
+    g.ruid = g.euid = g.suid = 1000; g.rgid = g.egid = g.sgid = 1000;
+    g.supplemental[0] = 50; g.ngroups = 1;
+    if (!spawn_cred_allowed(&g, 1000, 50)) { kprintf_atomic("[spawn_cred] FAIL suppgrp\n"); fails++; }
+    // Root caller may set anything.
+    cred_t r; __builtin_memset(&r, 0, sizeof(r));   // all-zero = euid 0 = root
+    if (!spawn_cred_allowed(&r, 1234, 5678)){ kprintf_atomic("[spawn_cred] FAIL root->any\n"); fails++; }
+    kprintf_atomic(fails ? "[spawn_cred] SELF-TEST FAILED\n"
+                  : "[spawn_cred] SELF-TEST PASSED (no spawn credential escalation)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
+
 // spawn(path_ptr, argv_ptr, envp_ptr, stdio_ptr, attr_ptr) → child pid, -errno.
 //
 // Loads an ELF from the given absolute ext2 path into a brand-new address
@@ -1001,54 +1442,39 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
 
     // ── Copy path ─────────────────────────────────────────────────────────
     char path[256];
-    const char* upath = (const char*)path_ptr;
-    uint64_t plen = 0;
-    while (plen < 255 && upath[plen]) { path[plen] = upath[plen]; plen++; }
-    path[plen] = '\0';
+    int64_t spl = copy_path_from_user(path, (const void*)path_ptr, sizeof(path));
+    if (spl < 0) return (uint64_t)spl;
+    uint64_t plen = (uint64_t)spl;
     if (plen == 0) return (uint64_t)-EINVAL;
 
     // ── Copy argv (up to 64 args) ─────────────────────────────────────────
     #define SPAWN_MAX_ARGS 64
     #define SPAWN_MAX_ARG_LEN 512
-    char* k_argv[SPAWN_MAX_ARGS + 1];
-    uint32_t argc = 0;
-    if (argv_ptr) {
-        const uint64_t* uargv = (const uint64_t*)argv_ptr;
-        while (argc < SPAWN_MAX_ARGS) {
-            uint64_t ustr = uargv[argc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom_argv;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_argv[argc++] = ks;
-        }
-    }
-    k_argv[argc] = NULL;
-    // If caller passed no argv, synthesise {path, NULL}.
-    if (argc == 0) { k_argv[0] = path; k_argv[1] = NULL; argc = 1; }
-
-    // ── Copy envp (up to 64 vars) ─────────────────────────────────────────
     #define SPAWN_MAX_ENVS 64
+    char* k_argv[SPAWN_MAX_ARGS + 1];
     char* k_envp[SPAWN_MAX_ENVS + 1];
-    uint32_t envc = 0;
-    if (envp_ptr) {
-        const uint64_t* uenvp = (const uint64_t*)envp_ptr;
-        while (envc < SPAWN_MAX_ENVS) {
-            uint64_t ustr = uenvp[envc];
-            if (!ustr) break;
-            const char* s = (const char*)ustr;
-            uint64_t l = 0; while (l < SPAWN_MAX_ARG_LEN && s[l]) l++;
-            char* ks = kmalloc(l + 1);
-            if (!ks) goto oom_envp;
-            __builtin_memcpy(ks, s, l);
-            ks[l] = '\0';
-            k_envp[envc++] = ks;
+    uint32_t argc = 0, envc = 0;
+    // Validate + copy argv/envp through the shared safe primitive (same as
+    // sys_exec): a kernel/unmapped/non-canonical array or element pointer is
+    // rejected with -EFAULT, never raw-dereferenced.  One scratch off the kstack.
+    {
+        uint8_t* strv_scratch = (uint8_t*)kmalloc(SPAWN_MAX_ARG_LEN);
+        if (!strv_scratch) return (uint64_t)-ENOMEM;
+        int srv = copy_user_strv(argv_ptr, k_argv, SPAWN_MAX_ARGS,
+                                 SPAWN_MAX_ARG_LEN, strv_scratch, &argc);
+        if (srv == 0)
+            srv = copy_user_strv(envp_ptr, k_envp, SPAWN_MAX_ENVS,
+                                 SPAWN_MAX_ARG_LEN, strv_scratch, &envc);
+        kfree(strv_scratch);
+        if (srv != 0) {
+            for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            return (uint64_t)(int64_t)srv;
         }
     }
-    k_envp[envc] = NULL;
+    // If caller passed no argv, synthesise {path, NULL}.  k_argv[0] is then NOT
+    // a kmalloc'd copy, so the oom_argv cleanup is guarded by `if (argv_ptr)`.
+    if (argc == 0) { k_argv[0] = path; k_argv[1] = NULL; argc = 1; }
     // Default env if caller passed nothing.
     const char* def_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", "PWD=/", NULL };
     const char* const* final_envp = envc ? (const char* const*)k_envp : def_envp;
@@ -1057,8 +1483,35 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // stdio_ptr points to int[3]; 0 = open tty0 for all.
     int stdio[3] = { -1, -1, -1 }; // default: inherit
     if (stdio_ptr) {
-        const int* us = (const int*)stdio_ptr;
-        stdio[0] = us[0]; stdio[1] = us[1]; stdio[2] = us[2];
+        // copy_from_user, not a raw us[i] deref: a kernel/non-canonical/unmapped
+        // stdio_ptr would otherwise read kernel ints or panic the kernel.  Free
+        // the arg/env copies on a bad pointer (argv synth -> guarded like oom_argv).
+        if (copy_from_user(stdio, (const void*)stdio_ptr, sizeof(stdio)) != 0) {
+            for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+            if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+            return (uint64_t)-EFAULT;
+        }
+    }
+
+    // ── Read + pre-validate spawn_attr BEFORE creating the child ──────────
+    // Read the attr ONCE here (so the credential check and its later
+    // application use the SAME copy -- no TOCTOU where the user flips a.uid
+    // between check and apply) and reject an unentitled SPAWN_ATTR_CRED request
+    // before any child resources are allocated (so a denial needs no teardown).
+    // A malformed attr pointer is ignored (have_attr stays 0), matching the
+    // prior lenient behaviour for the non-cred attrs.
+    spawn_attr_t a;
+    __builtin_memset(&a, 0, sizeof(a));
+    int have_attr = 0;
+    // copy_from_user (validate + VMA-back), not _access_ok + raw memcpy: an
+    // in-range but UNMAPPED attr_ptr passes a range check then #PF-panics in the
+    // memcpy.  A bad pointer leaves have_attr=0 (attr ignored), as before.
+    if (attr_ptr && copy_from_user(&a, (const void*)attr_ptr,
+                                   sizeof(spawn_attr_t)) == 0) {
+        have_attr = 1;
+        if ((a.flags & SPAWN_ATTR_CRED) &&
+            !spawn_cred_allowed(&g_current->cred, a.uid, a.gid))
+            goto bad_cred;   // unprivileged request for creds it does not hold
     }
 
     // ── Launch ────────────────────────────────────────────────────────────
@@ -1078,15 +1531,26 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // Wire parent-child relationship so waitpid works correctly.
     child->ppid = g_current->pid;
 
-    // ── Apply spawn_attr if provided ──────────────────────────────────────
-    // spawn_attr_t is now ~32 bytes (unveil is a separate pointer), so it's
-    // safe to copy directly onto the kernel stack.
-    if (attr_ptr) {
-        if (!_access_ok(attr_ptr, sizeof(spawn_attr_t))) goto bad_attr;
-        spawn_attr_t a;
-        __builtin_memcpy(&a, (const void*)attr_ptr, sizeof(spawn_attr_t));
+    // POSIX: a spawned child stays in its parent's SESSION and process GROUP.
+    // Only setsid()/setpgid() may move it.  elf_exec_from_ext2 defaults a fresh
+    // task to sid = pgid = pid, which is right for the kernel-launched init
+    // tasks (they genuinely do start their own sessions) but wrong for every
+    // spawn from userland, and it had two consequences:
+    //   * no child ever shared login's session, so NOTHING on the system had a
+    //     controlling terminal and /dev/tty could not resolve to one;
+    //   * setsid() always failed -EPERM, because its "already a process group
+    //     leader" guard is pid == pgid and that was true for every task.
+    // Set before sched_add(): task_idx_insert() indexes the task by pgid/sid,
+    // so these must be final before it is published.
+    child->sid  = g_current->sid;
+    child->pgid = g_current->pgid;
 
+    // ── Apply spawn_attr if provided ──────────────────────────────────────
+    // `a` was read + pre-validated above (single read -> no TOCTOU); apply it
+    // here now that the child exists.
+    if (have_attr) {
         if (a.flags & SPAWN_ATTR_CRED) {
+            // Pre-validated by spawn_cred_allowed before the child was created.
             child->cred.ruid = a.uid;
             child->cred.euid = a.uid;
             child->cred.suid = a.uid;
@@ -1103,18 +1567,25 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
         }
         if ((a.flags & SPAWN_ATTR_UNVEIL) && a.nunveil && a.unveil) {
             uint32_t n = a.nunveil;
-            uint64_t uptr = (uint64_t)(uintptr_t)a.unveil;
-            if (!_access_ok(uptr, (uint64_t)n * sizeof(spawn_unveil_entry_t)))
-                goto bad_attr;
-            // Copy unveil entries one page-safe chunk at a time — each entry
-            // is 257 bytes; kmalloc the whole array then walk it.
-            spawn_unveil_entry_t* ue = kmalloc((uint64_t)n * sizeof(spawn_unveil_entry_t));
+            if (n > SPAWN_UNVEIL_MAX) goto bad_attr;   // bound the attacker-sized copy
+            uint64_t bytes = (uint64_t)n * sizeof(spawn_unveil_entry_t);
+            // copy_from_user (validate + VMA-back), not _access_ok + raw memcpy:
+            // an in-range but UNMAPPED a.unveil pointer passes the range check
+            // then #PF-panics in the memcpy -- an unprivileged kernel DoS.  This
+            // mirrors the spawn_attr copy above; copy_from_user returns -EFAULT
+            // for a bad pointer instead of faulting in kernel mode.
+            spawn_unveil_entry_t* ue = kmalloc(bytes);
             if (!ue) goto bad_attr;
-            __builtin_memcpy(ue, a.unveil, (uint64_t)n * sizeof(spawn_unveil_entry_t));
+            if (copy_from_user(ue, a.unveil, bytes) != 0) { kfree(ue); goto bad_attr; }
             unveil_free(&child->unveil);
             unveil_init(&child->unveil);
-            for (uint32_t i = 0; i < n; i++)
+            for (uint32_t i = 0; i < n; i++) {
+                // path[] is fully user-controlled and may carry no NUL; force
+                // termination so unveil_add's strlen cannot over-read past the
+                // entry into adjacent heap (the buffer is n * 257 bytes).
+                ue[i].path[sizeof(ue[i].path) - 1] = '\0';
                 unveil_add(&child->unveil, ue[i].path, ue[i].perms);
+            }
             unveil_lock(&child->unveil);
             kfree(ue);
         }
@@ -1125,13 +1596,22 @@ static uint64_t sys_spawn(uint64_t path_ptr, uint64_t argv_ptr,
     // give the terminal to the child's process group immediately.
     // This is what a proper shell does after fork+exec: tcsetpgrp(tty, child_pgid).
     // Without this, bash detects it's not in the foreground and spins on SIGTTOU.
-    if (!stdio_ptr || (((const int*)stdio_ptr)[0] == -1)) {
+    // Use the validated kernel snapshot stdio[0], NOT a second raw read of the
+    // user pointer: stdio[] already holds the copy_from_user'd specs (and the
+    // {-1,-1,-1} default when stdio_ptr is NULL), so stdio[0]==-1 covers both
+    // the NULL and the inherit case.  The old `((const int*)stdio_ptr)[0]`
+    // re-fetched user memory across the wide elf_exec window -- a sibling thread
+    // could munmap the page (raw #PF -> unprivileged kernel panic) or flip the
+    // value (TOCTOU vs the snapshot the child was actually built from).
+    if (stdio[0] == -1) {
         tty_t* tty = tty_get_ctty();
         if (!tty) tty = &g_tty0;
         tty->fg_pgid = child->pgid;
     }
 
-    task_child_add(g_current, child);
+    rcu_read_lock();
+    task_child_add(tg_leader(g_current), child);   // anchor on the thread-group leader
+    rcu_read_unlock();
     sched_add(child);
 
     for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
@@ -1143,6 +1623,13 @@ oom_envp:
 oom_argv:
     if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
     return (uint64_t)-ENOMEM;
+
+bad_cred:
+    // SPAWN_ATTR_CRED requested creds the caller is not entitled to.  No child
+    // was created yet, so just free the arg/env copies and fail.
+    for (uint32_t i = 0; i < envc; i++) kfree(k_envp[i]);
+    if (argv_ptr) for (uint32_t i = 0; i < argc; i++) kfree(k_argv[i]);
+    return (uint64_t)-EPERM;
 }
 
 // ── sys_thread ────────────────────────────────────────────────────────────
@@ -1152,9 +1639,18 @@ oom_argv:
 // The caller must allocate the thread's user stack and pass its top.
 static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flags) {
     if (!g_current) return (uint64_t)-EINVAL;
+    extern int user_task_over_cap(void);
+    if (user_task_over_cap()) return (uint64_t)-EAGAIN;   // RLIMIT_NPROC (fork-bomb guard)
 
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) return (uint64_t)-ENOMEM;
+    // Zero-then-init, matching task_fork / task_create_user / task_create_kthread
+    // (process.c:252/286/417).  sys_thread sets its fields individually below;
+    // without this, any task_t field NOT explicitly set here inherits slab
+    // garbage -- a pointer field (e.g. a list head added later) would then be a
+    // wild pointer.  This is the single constructor that diverged from the
+    // invariant; the memset restores it.
+    __builtin_memset(t, 0, sizeof(*t));
 
     t->pid = pid_alloc();
     if (!t->pid) { kfree(t); return (uint64_t)-ENOMEM; }
@@ -1169,7 +1665,11 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         // CoW clone: pass mm so private pages are CoW-shared, not deep-copied.
         if (!vmm_clone_user_ex(new_pml4, g_current->mm_shared->pml4_phys,
                                g_current->mm_shared->mm)) {
-            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
+            // mm-aware free: the clone shares the spawner's VMA_MMIO frames into
+            // new_pml4 WITHOUT a per-PTE pmm ref, so pass the spawner's mm so
+            // vmm_free_user_ex skips them (an unconditional dec would UAF the
+            // spawner's live device frame).
+            vmm_free_user_ex(new_pml4, g_current->mm_shared->mm); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
         // Same CoW-vs-stale-TLB shootdown as task_fork — see
@@ -1183,7 +1683,9 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
         task_mm_t* tmm = task_mm_alloc(new_pml4, new_mm);
         if (!tmm) {
             if (new_mm) mm_destroy(new_mm);
-            vmm_free_user(new_pml4); pmm_buddy_free(new_pml4, 0);
+            // mm-aware free (spawner's mm identifies the MMIO PTEs the clone
+            // shared without a ref) so the dec cannot UAF a live device frame.
+            vmm_free_user_ex(new_pml4, g_current->mm_shared->mm); pmm_buddy_free(new_pml4, 0);
             pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
         }
         t->mm_shared = tmm;
@@ -1196,11 +1698,12 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     } else {
         task_files_t* files = task_files_alloc();
         if (!files) { task_mm_release(t->mm_shared); pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM; }
-        fdtable_t* src = g_current->files_shared->ft;
-        fd_table_init(files, src->cap);
-        fdtable_t* dst = files->ft;
-        for (uint32_t i = 0; i < src->cap; i++)
-            dst->fd_table[i] = vfs_dup(src->fd_table[i]);
+        // Clone under the source lock (see fd_table_clone): a sibling thread
+        // closing an fd concurrently must not let us vfs_dup a freed file.
+        if (!fd_table_clone(files, g_current->files_shared)) {
+            task_files_release(files); task_mm_release(t->mm_shared);
+            pid_free(t->pid); kfree(t); return (uint64_t)-ENOMEM;
+        }
         t->files_shared = files;
     }
 
@@ -1220,13 +1723,24 @@ static uint64_t sys_thread(uint64_t entry_ptr, uint64_t stack_top, uint64_t flag
     t->mlfq_level       = 0;
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending = 0;
-    // spawn() creates a fresh program image — SIG_DFL everywhere, empty
-    // mask.  SIG_DFL == 0, so a memset of handlers[] is the init.  Not
-    // doing this left handlers[] as slab garbage, which later faulted
-    // iretq with a non-canonical rip on first signal delivery.
     t->sigstate.blocked = 0;
     t->sigstate.sigframe_rsp = 0;
-    __builtin_memset(t->sigstate.handlers, 0, sizeof(t->sigstate.handlers));
+    // Signal dispositions (POSIX: per-process).  A pthread (shares the address
+    // space) SHARES the process's disposition table so a handler any thread
+    // installs is visible to all -- the JVM depends on this.  A non-SHARE_MM
+    // thread is a fresh process-like image, so it gets a private COPY (fork-like).
+    if (flags & THREAD_SHARE_MM) {
+        t->sighand = g_current->sighand;
+        __atomic_add_fetch(&t->sighand->refs, 1, __ATOMIC_RELAXED);
+    } else {
+        t->sighand = sighand_copy(g_current->sighand);
+        if (!t->sighand) {
+            task_files_release(t->files_shared);
+            task_mm_release(t->mm_shared);
+            pid_free(t->pid); kfree(t);
+            return (uint64_t)-ENOMEM;
+        }
+    }
     t->exit_code        = 0;
     t->sleep_until_ns   = 0;
     // Threads inherit the spawner's TLS pointer only as a placeholder —
@@ -1305,7 +1819,11 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
         // (x86 TSO plus the lock-chain through sched_wake/sched_sleep
         // gives us sequential consistency on every wake cycle).
         uint8_t  found = 0;
-        task_t*  zombie = task_children_reap(g_current, target_pid, &found);
+        // Reap from the thread-group leader's list so ANY thread can reap a
+        // child forked by ANY thread.  RCU pins the leader across the drain.
+        rcu_read_lock();
+        task_t*  zombie = task_children_reap(tg_leader(g_current), target_pid, &found);
+        rcu_read_unlock();
 
         if (zombie) {
             // Also remove from the home CPU's zombie list (locked
@@ -1324,12 +1842,18 @@ static uint64_t sys_wait(uint64_t pid_arg, uint64_t status_ptr, uint64_t options
             if (tty && tty->fg_pgid == child_pgid)
                 tty->fg_pgid = g_current->pgid;
 
-            if (status_ptr) {
-                int* sp = (int*)(uintptr_t)status_ptr;
-                *sp = (int)((code & 0xFF) << 8);
-            }
-
+            // Write the exit status through copy_to_user, never a raw store to
+            // the user-supplied pointer: a kernel/non-canonical status_ptr was
+            // an arbitrary-kernel-WRITE (LPE) of an attacker-influenced byte, or
+            // a #PF panic.  `code` is already a kernel local, and the zombie is
+            // committed-reaped (sched_reap_zombie ran), so destroy it first --
+            // a bad pointer must not leave it unreaped+leaked -- then copy out.
+            int kstatus = (int)((code & 0xFF) << 8);
             process_destroy(zombie);
+            if (status_ptr &&
+                copy_to_user((void*)(uintptr_t)status_ptr, &kstatus,
+                             sizeof(kstatus)) != 0)
+                return (uint64_t)-EFAULT;
             return (uint64_t)child_pid;
         }
 
@@ -1384,29 +1908,45 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (!raw || !path) { kfree(raw); kfree(path); return (uint64_t)-ENOMEM; }
 
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) {
+        kfree(raw); kfree(path); return (uint64_t)-EFAULT;
+    }
     raw[pathlen] = '\0';
 
-    if (raw[0] != '/') {
-        const char* cwd = g_current ? g_current->cwd : "/";
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    // resolve_at_path's bound is the DESTINATION buffer's byte size.  `path` is
+    // a kmalloc'd pointer here, so sizeof(path) is 8 (a pointer), NOT the 512
+    // the buffer was allocated with -- that truncated every resolved path to 7
+    // bytes, so any readdir on a path longer than that (e.g. fontconfig
+    // scanning /usr/share/fonts/truetype/dejavu -> "/usr/sh") hit a bogus dir
+    // and returned nothing: ports found zero fonts and rendered tofu.  Pass the
+    // real allocation size.  (The stack-array callers correctly get sizeof.)
+    resolve_at_path(path, 512, g_current ? g_current->cwd : "/", raw);
     kfree(raw);
 
     ext2_entry_t* kbuf = kmalloc(max_entries * sizeof(ext2_entry_t));
     if (!kbuf) { kfree(path); return (uint64_t)-ENOMEM; }
+    // Zero the whole buffer BEFORE the directory fillers run: each filler writes
+    // only name[0..nlen]+NUL plus inode_num/size/is_dir, so the name[] tail and
+    // the 3 trailing pad bytes of every ext2_entry_t would otherwise stay as
+    // stale kmalloc heap and be shipped to userspace by the copy_to_user below
+    // (an unprivileged kernel-heap info-leak on any readable directory).  Zeroing
+    // at this single copy-out owner covers all fillers (ext2/proc/dev/injected).
+    __builtin_memset(kbuf, 0, max_entries * sizeof(ext2_entry_t));
 
     int count;
     {
         fs_node_t fsn;
         int fsr = fs_lookup(path, &g_current->cred, ACL_PERM_READ | ACL_PERM_EXEC, &fsn);
+        // unveil sandbox: a directory outside the unveiled set must be
+        // indistinguishable from one that does not exist, exactly as sys_stat
+        // does -- otherwise readdir leaks its entries (names + inode#/size) even
+        // though open/stat on them are blocked.  fs_lookup normalized `path`
+        // (collapsed `..`) above, so this cannot be bypassed with a trailing
+        // `..`.  UNVEIL_READ is the documented permission for readdir.  Checked
+        // before the fsr result so existence is not leaked either.  (No-op when
+        // no unveil is active: unveil_ok allows everything until the first
+        // unveil() call.)  Covers ext2, /proc and /dev uniformly, like sys_stat.
+        if (!unveil_ok(path, UNVEIL_READ)) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
         if (fsr != 0) { kfree(kbuf); kfree(path); return (uint64_t)(int64_t)fsr; }
         if (fsn.type != FS_TYPE_DIR) { kfree(kbuf); kfree(path); return (uint64_t)-ENOTDIR; }
 
@@ -1447,16 +1987,16 @@ static uint64_t sys_readdir(uint64_t path_ptr, uint64_t pathlen,
     if (count < 0) { kfree(kbuf); kfree(path); return (uint64_t)-ENOENT; }
 
     ext2_entry_t* ubuf = (ext2_entry_t*)buf_ptr;
-    __builtin_memcpy(ubuf, kbuf, (uint64_t)count * sizeof(ext2_entry_t));
+    if (copy_to_user(ubuf, kbuf, (uint64_t)count * sizeof(ext2_entry_t)) != 0) {
+        kfree(kbuf); kfree(path); return (uint64_t)-EFAULT;
+    }
 
     kfree(kbuf);
     kfree(path);
     return (uint64_t)count;
 }
 
-// Forward declarations for copy helpers (defined later in this file).
-int copy_to_user(void* dst_u, const void* src, uint64_t len);
-int copy_from_user(void* dst, const void* src_u, uint64_t len);
+// copy_to_user / copy_from_user are declared in uaccess.h (defined below).
 
 // ── sys_stat ──────────────────────────────────────────────────────────────
 // stat(path_ptr, pathlen, stat_ptr) → 0 or -errno
@@ -1466,21 +2006,11 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     raw[pathlen] = '\0';
 
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     struct stat kst;
     __builtin_memset(&kst, 0, sizeof(kst));
@@ -1488,11 +2018,12 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t pathlen, uint64_t stat_ptr)
     fs_node_t fsn;
     // stat needs no permission on the file itself — only parent dir traversal,
     // which ext2_lookup_path already checks on every component.
-    int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);
+    int fsr = fs_lookup(path, &g_current->cred, 0, &fsn);   // normalizes path in place
+    if (!unveil_ok(path, UNVEIL_READ)) return (uint64_t)-ENOENT;   // sandbox: hide
     if (fsr != 0) {
         // TEMP: trace xkb lookup failures so we can see why dwl's keymap init fails.
         if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r')
-            kprintf("[stat-dbg] %s -> %d\n", path, fsr);
+            kprintf_atomic("[stat-dbg] %s -> %d\n", path, fsr);  // atomic: no 4-CPU interleave garble
         return (uint64_t)(int64_t)fsr;
     }
 
@@ -1525,16 +2056,14 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(path, upath, pathlen);
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
+    normalize_path(path);   // collapse .. before the unveil check + the op
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;  // sandbox
 
     // Check write permission on the file's parent directory.
-    // Find parent path.
-    uint64_t last = 0;
-    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') last = i;
     char parent[256];
-    if (last == 0) { parent[0] = '/'; parent[1] = '\0'; }
-    else { __builtin_memcpy(parent, path, last); parent[last] = '\0'; }
+    if (!path_split(path, parent, sizeof(parent))) return (uint64_t)-ENAMETOOLONG;
 
     int ul_err = 0;
     uint32_t par_ino = ext2_lookup_path(parent, &g_current->cred, &ul_err);
@@ -1549,7 +2078,21 @@ static uint64_t sys_unlink(uint64_t path_ptr, uint64_t pathlen) {
     int upr = vfs_check_perm(&par_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (upr != 0) return (uint64_t)(int64_t)upr;
 
-    return ext2_unlink(path) ? 0 : (uint64_t)-ENOENT;
+    return ext2_unlink(path, &g_current->cred) ? 0 : (uint64_t)-ENOENT;
+}
+
+// Is `dst` a path strictly INSIDE `src` (a proper descendant)?  Both must be
+// normalized absolute paths.  rename(src, dst) is then forbidden (POSIX EINVAL):
+// moving a directory into its own subtree detaches that subtree into an
+// unreachable cycle (mv /a /a/b -> /a/b -> /a -> /a/b ...).  The trailing '/'
+// guard keeps siblings apart: "/abc" is NOT under "/ab".  An exact match (dst ==
+// src) is NOT "under" -- a self / hard-link rename is a no-op handled by the
+// same-inode check in ext2_rename.  Pure -> unit-tested.
+static int path_dst_under_src(const char* src, const char* dst) {
+    uint64_t i = 0;
+    while (src[i] && dst[i] && src[i] == dst[i]) i++;
+    // src fully consumed (a prefix of dst) and dst continues with "/..." -> under
+    return src[i] == '\0' && dst[i] == '/';
 }
 
 // ── sys_rename ────────────────────────────────────────────────────────────
@@ -1562,17 +2105,24 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     char src[256], dst[256];
     const char* usrc = (const char*)src_ptr;
     const char* udst = (const char*)dst_ptr;
-    __builtin_memcpy(src, usrc, srclen);
+    // copy_from_user (not a raw memcpy) so a bad/kernel user pointer can't fault
+    // the kernel or read kernel memory into the path buffer.
+    if (copy_from_user(src, usrc, srclen) != 0) return (uint64_t)-EFAULT;
     src[srclen] = '\0';
-    __builtin_memcpy(dst, udst, dstlen);
+    if (copy_from_user(dst, udst, dstlen) != 0) return (uint64_t)-EFAULT;
     dst[dstlen] = '\0';
+    normalize_path(src);
+    normalize_path(dst);
+    // Refuse to move a directory into its own subtree (mv /a /a/b): it would
+    // detach the subtree into an unreachable cycle.  POSIX EINVAL.
+    if (path_dst_under_src(src, dst)) return (uint64_t)-EINVAL;
+    // Sandbox: both endpoints must be unveiled for directory-entry change.
+    if (!unveil_ok(src, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
+    if (!unveil_ok(dst, UNVEIL_CREATE)) return (uint64_t)-ENOENT;
 
     // Require write+exec on src parent directory.
-    uint64_t src_last = 0;
-    for (uint64_t i = 0; i < srclen; i++) if (src[i] == '/') src_last = i;
     char src_parent[256];
-    if (src_last == 0) { src_parent[0] = '/'; src_parent[1] = '\0'; }
-    else { __builtin_memcpy(src_parent, src, src_last); src_parent[src_last] = '\0'; }
+    if (!path_split(src, src_parent, sizeof(src_parent))) return (uint64_t)-ENAMETOOLONG;
 
     int rn_err = 0;
     uint32_t sp_ino = ext2_lookup_path(src_parent, &g_current->cred, &rn_err);
@@ -1587,7 +2137,7 @@ static uint64_t sys_rename(uint64_t src_ptr, uint64_t srclen,
     int spr = vfs_check_perm(&sp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (spr != 0) return (uint64_t)(int64_t)spr;
 
-    return ext2_rename(src, dst) ? 0 : (uint64_t)-ENOENT;
+    return ext2_rename(src, dst, &g_current->cred) ? 0 : (uint64_t)-ENOENT;
 }
 
 // ── sys_getcwd ────────────────────────────────────────────────────────────
@@ -1659,7 +2209,7 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t buflen) {
     if (cwdlen > buflen) return (uint64_t)-ERANGE;
 
     char* ubuf = (char*)buf_ptr;
-    __builtin_memcpy(ubuf, cwd, cwdlen);
+    if (copy_to_user(ubuf, cwd, cwdlen) != 0) return (uint64_t)-EFAULT;
     return buf_ptr;
 }
 
@@ -1670,22 +2220,12 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char raw[512];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(raw, upath, pathlen);
+    if (copy_from_user(raw, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     raw[pathlen] = '\0';
 
     // Resolve relative paths against cwd.
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= pathlen; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     // Unified lookup — covers both virtfs and ext2.
     {
@@ -1694,17 +2234,13 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t pathlen) {
         if (fsr != 0) return (uint64_t)(int64_t)fsr;
         if (fsn.type != FS_TYPE_DIR) return (uint64_t)-ENOTDIR;
         if (fsn.is_virtual) {
-            uint32_t len = 0;
-            while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
-            g_current->cwd[len] = '\0';
+            str_lcpy(g_current->cwd, path, KPATH_MAX);
             return 0;
         }
     }
 
     // ext2: fs_lookup already verified existence, type, and permissions.
-    uint32_t len = 0;
-    while (len < KPATH_MAX - 1 && path[len]) { g_current->cwd[len] = path[len]; len++; }
-    g_current->cwd[len] = '\0';
+    str_lcpy(g_current->cwd, path, KPATH_MAX);
     return 0;
 }
 
@@ -1715,15 +2251,14 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
 
     char path[256];
     const char* upath = (const char*)path_ptr;
-    __builtin_memcpy(path, upath, pathlen);
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;   // sandbox
 
     // Require write+exec on parent directory.
-    uint64_t mk_last = 0;
-    for (uint64_t i = 0; i < pathlen; i++) if (path[i] == '/') mk_last = i;
     char mk_parent[256];
-    if (mk_last == 0) { mk_parent[0] = '/'; mk_parent[1] = '\0'; }
-    else { __builtin_memcpy(mk_parent, path, mk_last); mk_parent[mk_last] = '\0'; }
+    if (!path_split(path, mk_parent, sizeof(mk_parent))) return (uint64_t)-ENAMETOOLONG;
 
     int mk_err = 0;
     uint32_t mkp_ino = ext2_lookup_path(mk_parent, &g_current->cred, &mk_err);
@@ -1738,7 +2273,40 @@ static uint64_t sys_mkdir(uint64_t path_ptr, uint64_t pathlen) {
     int mkpr = vfs_check_perm(&mkp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
     if (mkpr != 0) return (uint64_t)(int64_t)mkpr;
 
-    return ext2_mkdir(path) ? 0 : (uint64_t)-EIO;
+    return ext2_mkdir(path, &g_current->cred) ? 0 : (uint64_t)-EIO;
+}
+
+// ── sys_rmdir ─────────────────────────────────────────────────────────────
+// rmdir(path_ptr, pathlen) -> 0 or -errno.  Removes an EMPTY directory.
+static uint64_t sys_rmdir(uint64_t path_ptr, uint64_t pathlen) {
+    if (!g_current || pathlen == 0 || pathlen > 255) return (uint64_t)-EINVAL;
+
+    char path[256];
+    const char* upath = (const char*)path_ptr;
+    if (copy_from_user(path, upath, pathlen) != 0) return (uint64_t)-EFAULT;
+    path[pathlen] = '\0';
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_CREATE)) return (uint64_t)-ENOENT;   // sandbox
+
+    // Require write+exec on the parent directory (ext2_rmdir re-checks on the
+    // resolved parent_ino to close the path-TOCTOU, as mkdir/unlink do).
+    char rd_parent[256];
+    if (!path_split(path, rd_parent, sizeof(rd_parent))) return (uint64_t)-ENAMETOOLONG;
+
+    int rd_err = 0;
+    uint32_t rdp_ino = ext2_lookup_path(rd_parent, &g_current->cred, &rd_err);
+    if (!rdp_ino) return rd_err ? (uint64_t)(int64_t)rd_err : (uint64_t)-ENOENT;
+    ext2_inode_t rdp_inode;
+    if (!ext2_read_inode(rdp_ino, &rdp_inode)) return (uint64_t)-ENOENT;
+    inode_perm_t rdp_ip = {
+        .uid = rdp_inode.i_uid, .gid = rdp_inode.i_gid,
+        .mode = rdp_inode.i_mode & 0x1FF,
+        .inode_nr = rdp_ino, .dev = 0, .nosuid = 0,
+    };
+    int rdpr = vfs_check_perm(&rdp_ip, &g_current->cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+    if (rdpr != 0) return (uint64_t)(int64_t)rdpr;
+
+    return ext2_rmdir(path, &g_current->cred) ? 0 : (uint64_t)-EIO;
 }
 
 // ── sys_dup ───────────────────────────────────────────────────────────────
@@ -1786,7 +2354,6 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
 // ── sys_pipe ──────────────────────────────────────────────────────────────
 static uint64_t sys_pipe(uint64_t fds_ptr) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
-    int* fds = (int*)(uintptr_t)fds_ptr;
 
     vfs_file_t* r;
     vfs_file_t* w;
@@ -1805,11 +2372,28 @@ static uint64_t sys_pipe(uint64_t fds_ptr) {
         }
     }
     spin_unlock(&tf->lock);
-    fds[0] = rfd;
-    fds[1] = wfd;
+    // Copy the fd pair out via copy_to_user, never a raw store to fds_ptr: a
+    // kernel/non-canonical pointer was an arbitrary-kernel-WRITE / #PF.  Mirror
+    // socketpair -- both ends are installed, so close them via their fds on a
+    // copyout failure rather than leaking the slots + pipe refs.
+    int kfds[2] = { rfd, wfd };
+    if (copy_to_user((void*)(uintptr_t)fds_ptr, kfds, sizeof(kfds)) != 0) {
+        sys_close((uint64_t)rfd);
+        sys_close((uint64_t)wfd);
+        return (uint64_t)-EFAULT;
+    }
     return 0;
 fail:
-    vfs_close(r);
+    // The read end may already be INSTALLED in the fd table (rfd >= 0) -- the
+    // grow can fail while searching for the WRITE slot, after r was installed.
+    // Closing it with a bare vfs_close would free it (via the pipe refcount)
+    // while fd_table[rfd] still points at it, so a later sys_close / process
+    // exit double-frees r.  Mirror socketpair: close an INSTALLED end via its fd
+    // (sys_close clears the slot AND drops the ref), an un-installed end
+    // directly.  The write end is never installed on this path (its branch
+    // breaks out of the loop before any grow), so vfs_close(w) is always right.
+    if (rfd >= 0) sys_close((uint64_t)rfd);
+    else          vfs_close(r);
     vfs_close(w);
     return (uint64_t)-ENFILE;
 }
@@ -1818,6 +2402,9 @@ fail:
 static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
     vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
+    if (f->rights != 0 && !rights_check(f->rights, RIGHT_SEEK)) {
+        fdput(f); return (uint64_t)-EACCES;
+    }
     if (!f->seek) { fdput(f); return (uint64_t)-EINVAL; }
     int64_t r = f->seek(f, (int64_t)offset, (int)(int64_t)whence);
     fdput(f);
@@ -1840,16 +2427,38 @@ static inline int sigaction_addr_ok(uint64_t a) {
     // 0 = SIG_DFL, 1 = SIG_IGN — always allowed.
     if (a <= 1) return 1;
     // Real handler/restorer must live in the low canonical half:
-    // bits 47–63 all zero → a < 2^47.  Anything in the non-canonical
+    // bits 47-63 all zero -> a < 2^47.  Anything in the non-canonical
     // gap [2^47, HHDM_OFFSET) would #GP iretq at ring transition.
-    return a < (1ULL << 47);
+    return a < USER_ADDR_CEIL;
 }
 
+// SIGRTMAX -- the top of the POSIX realtime range userspace declares (see
+// <signal.h>). MakaOS has no per-task RT delivery (NSIG=32), but a handler
+// install / send on an RT signal must be a benign NO-OP, not an EINVAL error:
+// glibc-style code (OpenJDK's sun.nio.ch.NativeThread installs a handler on
+// SIGRTMAX-2 for blocking-I/O interruption) treats a sigaction failure as fatal
+// and its static initializer throws, taking down VM boot. Accepting the install
+// (with no slot, so it is never delivered) degrades gracefully: Thread.interrupt
+// of a blocked NIO op is a no-op, everything else proceeds. Proper fix would be
+// 64-bit signal masks (see docs/SCALABILITY_DEBT.md).
 static uint64_t sys_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr) {
+    if (sig >= NSIG && sig <= SIGRTMAX_COMPAT) {
+        // RT signal: report "was SIG_DFL", accept the new action, deliver never.
+        if (oldact_ptr) {
+            k_sigaction_t z; __builtin_memset(&z, 0, sizeof z);
+            if (copy_to_user((void*)oldact_ptr, &z, sizeof z) != 0) return (uint64_t)-EFAULT;
+        }
+        return 0;
+    }
     if (sig < 1 || sig >= NSIG) return (uint64_t)-EINVAL;
-    if (sig == SIGKILL || sig == SIGSEGV) return (uint64_t)-EINVAL;
+    // POSIX: only SIGKILL and SIGSTOP are uncatchable.  SIGSEGV/SIGBUS/SIGFPE/
+    // SIGILL/SIGTRAP ARE catchable — a JVM installs a SIGSEGV handler for its
+    // null-check / safepoint and a SIGFPE handler for integer div-by-zero.
+    // Synchronous-fault delivery to those handlers is handled by
+    // signal_deliver_fault (build the frame from the exception trap frame).
+    if (sig == SIGKILL || sig == SIGSTOP) return (uint64_t)-EINVAL;
 
-    k_sigaction_t* ka = &g_current->sigstate.handlers[sig];
+    k_sigaction_t* ka = &g_current->sighand->handlers[sig];
 
     if (oldact_ptr) {
         k_sigaction_t snap = *ka;  // atomic-enough copy for !SMP-writer
@@ -1885,8 +2494,10 @@ static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_
         if (copy_from_user(&set, (const void*)set_ptr, sizeof(set)) != 0)
             return (uint64_t)-EFAULT;
         set &= ~(1u << (SIGKILL - 1));  // SIGKILL can never be blocked
-        if (how == SIG_BLOCK)        *blocked |= set;
-        else if (how == SIG_UNBLOCK) *blocked &= ~set;
+        // Atomic RMW: a cross-CPU signal_send (SIGKILL unblock) writes this
+        // same word, so a non-atomic |=/&= here could lose its clear.
+        if (how == SIG_BLOCK)        atomic_or(blocked, set);
+        else if (how == SIG_UNBLOCK) atomic_and(blocked, ~set);
         else if (how == SIG_SETMASK) *blocked = set;
         else return (uint64_t)-EINVAL;
     }
@@ -1896,10 +2507,52 @@ static uint64_t sys_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_
 // ── sys_sigreturn ─────────────────────────────────────────────────────────
 // Called by the restorer trampoline after a signal handler returns.
 // Restores the interrupted user context from the sigframe saved on the stack.
+//
+// force_align_arg_pointer: the syscall entry enters C with rsp 8 bytes off the
+// SysV 16-byte boundary (it pushes an odd number of registers), so without this
+// the aligned(16) `frame` local lands 8-aligned and the FXRSTOR below #GP's.
+// The attribute makes GCC realign the stack (`and rsp,-16`) on entry.  noinline
+// so the attribute is not lost to inlining into the syscall wrapper.
+__attribute__((force_align_arg_pointer, noinline))
 static uint64_t sys_sigreturn(void) {
     uint64_t frame_base = g_current->sigstate.sigframe_rsp;
 
     if (!frame_base) return (uint64_t)-EINVAL;
+
+    // SA_SIGINFO delivery: restore FROM the rt_sigframe's ucontext, so a handler
+    // that edited uc.uc_mcontext.gregs (a JVM advancing REG_RIP past a faulting
+    // instruction, or changing REG_RSP) resumes with those values.
+    if (g_current->sigstate.siginfo_frame) {
+        k_rt_sigframe_t rf;
+        if (copy_from_user(&rf, (const void*)frame_base, sizeof(rf)) != 0)
+            return (uint64_t)-EFAULT;
+        long long* g = rf.uc.uc_mcontext.gregs;
+        uint64_t rip = (uint64_t)g[KREG_RIP], rsp = (uint64_t)g[KREG_RSP];
+        if (rip >= USER_ADDR_CEIL || rsp >= USER_ADDR_CEIL)
+            return (uint64_t)-EINVAL;
+        syscall_kframe_t* kf = SYSCALL_KFRAME(g_current);
+        kf->rip = rip; kf->rsp = rsp;
+        kf->rflags = ((uint64_t)g[KREG_EFL] & 0xCD5) | 0x202;
+        kf->rbp = (uint64_t)g[KREG_RBP]; kf->rbx = (uint64_t)g[KREG_RBX];
+        kf->r12 = (uint64_t)g[KREG_R12]; kf->r13 = (uint64_t)g[KREG_R13];
+        kf->r14 = (uint64_t)g[KREG_R14]; kf->r15 = (uint64_t)g[KREG_R15];
+        kf->rdi = (uint64_t)g[KREG_RDI]; kf->rsi = (uint64_t)g[KREG_RSI];
+        kf->rdx = (uint64_t)g[KREG_RDX]; kf->r10 = (uint64_t)g[KREG_R10];
+        kf->r8  = (uint64_t)g[KREG_R8];  kf->r9  = (uint64_t)g[KREG_R9];
+        g_current->sigstate.blocked =
+            (uint32_t)rf.uc.uc_sigmask & ~(1u << (SIGKILL - 1));
+        g_current->sigstate.sigframe_rsp  = 0;
+        g_current->sigstate.siginfo_frame = 0;
+        // fxrstor needs a 16-aligned operand; rf.uc.__fpregs_mem sits at an
+        // 8-misaligned offset within the frame, so bounce it through an aligned
+        // local (this function carries force_align_arg_pointer, so the local is
+        // truly 16-aligned).  Sanitize MXCSR (reserved bits would #GP fxrstor).
+        uint8_t fpbuf[512] __attribute__((aligned(16)));
+        __builtin_memcpy(fpbuf, rf.uc.__fpregs_mem, sizeof(fpbuf));
+        *(uint32_t*)(fpbuf + 24) &= 0x0000FFBFu;
+        __asm__ volatile("fxrstor %0" : : "m"(fpbuf));
+        return (uint64_t)g[KREG_RAX];
+    }
 
     // Copy the sigframe out of user space with full validation.  If we
     // dereferenced the user pointer directly, a corrupted sigframe_rsp
@@ -1915,7 +2568,7 @@ static uint64_t sys_sigreturn(void) {
     // half is [0, 2^47); the non-canonical gap starts at 2^47.  Using
     // HHDM_OFFSET (2^47 OR'd with the kernel-half bit pattern) would
     // miss the whole gap and let a poisoned rip through.
-    if (frame.rip >= (1ULL << 47) || frame.rsp >= (1ULL << 47))
+    if (frame.rip >= USER_ADDR_CEIL || frame.rsp >= USER_ADDR_CEIL)
         return (uint64_t)-EINVAL;
 
     // Restore the user register context by rewriting the saved slots on
@@ -1934,11 +2587,82 @@ static uint64_t sys_sigreturn(void) {
     kf->r13    = frame.r13;
     kf->r14    = frame.r14;
     kf->r15    = frame.r15;
+    // Caller-saved arg registers (clobbered by the handler) — restore so the
+    // interrupted code resumes with the exact register state it had.
+    kf->rdi    = frame.rdi;
+    kf->rsi    = frame.rsi;
+    kf->rdx    = frame.rdx;
+    kf->r10    = frame.r10;
+    kf->r8     = frame.r8;
+    kf->r9     = frame.r9;
 
     // Restore the signal mask that was active before the handler ran.
     // SIGKILL must never be masked.
     g_current->sigstate.blocked = frame.blocked & ~(1u << (SIGKILL - 1));
     g_current->sigstate.sigframe_rsp = 0;
+
+    // Restore the interrupted FPU/SSE state saved by signal_setup_frame.
+    // FXRSTOR needs a 16-byte-aligned operand.  `frame` is a stack local, but
+    // the syscall entry does NOT keep the SysV 16-byte stack boundary (it pushes
+    // an odd number of registers), so this function is entered 8-off and frame
+    // -- hence frame.fpu -- lands only 8-aligned, which #GP's FXRSTOR.  Observed:
+    // any return from an async signal handler (bash SIGINT, and compositor
+    // clients taking SIGWINCH/SIGCHLD/timers -- a real desktop-stability bug).
+    // The function carries force_align_arg_pointer (see its definition) so GCC
+    // emits an `and rsp,-16` prologue that makes the stack -- and frame.fpu --
+    // truly aligned.  A hand-aligned buffer does NOT work: the compiler folds
+    // the alignment away, trusting the (violated) ABI.
+    // Sanitize MXCSR first: reserved bits set would themselves #GP FXRSTOR (a
+    // userland-triggerable DoS); mask to the architecturally writable bits.
+    *(uint32_t*)(frame.fpu + 24) &= 0x0000FFBFu;   // MXCSR is at FXSAVE off 24
+    __asm__ volatile("fxrstor %0" : : "m"(frame.fpu));
+    // Return the interrupted syscall's rax so the resumed code sees the
+    // original return value rather than sigreturn's own (this becomes rax
+    // on the sigreturn syscall's exit path).
+    return frame.rax;
+}
+
+// ── sys_sigaltstack ────────────────────────────────────────────────────────
+// sigaltstack(new_ss, old_ss): set and/or query the per-thread alternate signal
+// stack.  A handler installed with SA_ONSTACK runs on this stack instead of the
+// interrupted one -- required to catch SIGSEGV from a stack overflow, when the
+// normal stack is unusable (the JVM relies on this for StackOverflowError).
+#define SIG_MINSTKSZ 2048UL   // POSIX MINSIGSTKSZ floor for a usable alt stack
+static uint64_t sys_sigaltstack(uint64_t new_ptr, uint64_t old_ptr) {
+    if (!g_current) return (uint64_t)-EINVAL;
+    sigstate_t* ss = &g_current->sigstate;
+    // Are we currently executing on the alt stack?  (caller's user rsp within it)
+    uint64_t caller_rsp = SYSCALL_KFRAME(g_current)->rsp;
+    uint64_t asp = (uint64_t)ss->altstack_sp, asz = ss->altstack_size;
+    int on_stack = asp && (caller_rsp >= asp && caller_rsp < asp + asz);
+
+    if (old_ptr) {
+        k_stack_t old;
+        old.ss_sp    = ss->altstack_sp;
+        old.ss_size  = ss->altstack_size;
+        old.ss_flags = asp ? (on_stack ? SS_ONSTACK : 0) : SS_DISABLE;
+        if (copy_to_user((void*)old_ptr, &old, sizeof(old)) != 0)
+            return (uint64_t)-EFAULT;
+    }
+    if (new_ptr) {
+        // POSIX: the alt stack cannot be changed or disabled while a handler is
+        // currently running on it.
+        if (on_stack) return (uint64_t)-EPERM;
+        k_stack_t ns;
+        if (copy_from_user(&ns, (const void*)new_ptr, sizeof(ns)) != 0)
+            return (uint64_t)-EFAULT;
+        if (ns.ss_flags & SS_DISABLE) {
+            ss->altstack_sp   = NULL;
+            ss->altstack_size = 0;
+        } else {
+            if (ns.ss_flags & ~(SS_ONSTACK | SS_DISABLE)) return (uint64_t)-EINVAL;
+            if (ns.ss_size < SIG_MINSTKSZ)                return (uint64_t)-ENOMEM;
+            uint64_t nsp = (uint64_t)ns.ss_sp;
+            if (!nsp || !_access_ok(nsp, ns.ss_size))     return (uint64_t)-EFAULT;
+            ss->altstack_sp   = ns.ss_sp;
+            ss->altstack_size = ns.ss_size;
+        }
+    }
     return 0;
 }
 
@@ -2018,13 +2742,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 
     mm_t* mm = g_current->mm_shared->mm;
 
-    // Round len up to page boundary.
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    // Round len up to page boundary (overflow-safe; rejects a len that would
+    // wrap the page-rounding add to 0).
+    len = mmap_round_len(len);
+    if (!len) return (uint64_t)-EINVAL;
     uint32_t npages = (uint32_t)(len / PAGE_SIZE);
 
     virt_addr_t vaddr;
     if (flags & MAP_FIXED) {
-        if (!addr || (addr & PAGE_MASK)) return (uint64_t)-EINVAL;
+        // MAP_FIXED maps EXACTLY at addr: the whole [addr, addr+len) range
+        // must be page-aligned and inside the user half.  Without this an
+        // addr in the kernel/HHDM higher half (shared into every process's
+        // PML4[256..511]) would drive the unmap+free path below straight
+        // through live kernel page tables.
+        if (!mmap_range_ok(addr, len, NULL, NULL)) return (uint64_t)-EINVAL;
         phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
         // MAP_FIXED replaces any existing mapping in [addr, addr+len) —
         // unmap → cross-CPU flush → free, same ordering as munmap.  The
@@ -2033,13 +2764,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
         mm_vma_remove(mm, addr, addr + len);
         vaddr = addr;
     } else if (addr) {
+        // Non-fixed addr is a HINT.  Honour it only if [addr, addr+len) is a
+        // valid, unmapped user-half range; otherwise fall back to a
+        // kernel-chosen placement.  A kernel/non-canonical hint must never
+        // become `vaddr` (it would install a user VMA over the shared higher
+        // half), so reject it here and let mm_vma_find_free pick instead.
         addr &= ~PAGE_MASK;
-        uint8_t free_hint = 1;
-        rcu_read_lock();
-        for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
-            if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
+        uint8_t free_hint = mmap_range_ok(addr, len, NULL, NULL);
+        if (free_hint) {
+            rcu_read_lock();
+            for (vma_t* v = rcu_dereference(mm->vmas); v; v = rcu_dereference(v->next)) {
+                if (addr < v->end && addr + len > v->start) { free_hint = 0; break; }
+            }
+            rcu_read_unlock();
         }
-        rcu_read_unlock();
         vaddr = free_hint ? addr : mm_vma_find_free(mm, len);
     } else {
         vaddr = mm_vma_find_free(mm, len);
@@ -2119,6 +2857,21 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                         (uint32_t)f->rights);
             fdput(f); return (uint64_t)-EACCES;
         }
+        // Enforce the mmap-specific rights, distinct from read()/write(): a fd
+        // restricted from mapping -- especially PROT_EXEC, i.e. executing code
+        // from a fd it may only read -- must be denied even when RIGHT_READ is
+        // present.  Without this, RIGHT_MMAP_R/W/X were defined but never checked.
+        // PROT_WRITE: a MAP_SHARED writable mapping modifies the file, so it
+        // needs RIGHT_MMAP_W; a MAP_PRIVATE (COW) writable mapping never touches
+        // the file (writes go to private frames), so read-map access is enough
+        // -- exactly as POSIX allows PROT_WRITE|MAP_PRIVATE on a read-only fd,
+        // which is how a loader maps a .so's data segment (dlopen).
+        if (f->rights != 0 &&
+            (((prot & PROT_READ)  && !rights_check(f->rights, RIGHT_MMAP_R)) ||
+             ((prot & PROT_WRITE) && !rights_check(f->rights, is_shared ? RIGHT_MMAP_W : RIGHT_MMAP_R)) ||
+             ((prot & PROT_EXEC)  && !rights_check(f->rights, RIGHT_MMAP_X)))) {
+            fdput(f); return (uint64_t)-EACCES;
+        }
         // Snapshot file size at mmap time — standard POSIX semantics.
         // Pages within [off, off+file_sz-off) get demand-paged from ext2;
         // pages past EOF are zero-filled (BSS-like).
@@ -2159,33 +2912,25 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             vfs_file_t* f = fdget(fd);
             if (!f) goto fail_unmap;
 
-            // DRM dumb-buffer mmap: resolve offset → contiguous backing,
-            // install PTEs eagerly.  No VMA accounting for free/rcu —
-            // the buffer's phys is owned by drm.c's per-fd dumb list
-            // and freed via DESTROY_DUMB / drm_close.
-            extern int64_t drm_resolve_dumb_mmap(vfs_file_t*, uint64_t,
-                                                   uint64_t, phys_addr_t*,
-                                                   uint64_t*);
+            // DRM buffer mmap: install PTEs for the object's scatter-gather
+            // backing.  ZERO faults -- the pages are already resident (shmem_
+            // create_dma).  No VMA accounting for free/rcu: the backing is owned
+            // by drm.c's per-fd dumb/res3d objects (shmem) and freed via
+            // DESTROY_DUMB / drm_close, not by VMA refs.
+            extern int64_t drm_mmap_backing(vfs_file_t*, uint64_t, uint64_t,
+                                            phys_addr_t, virt_addr_t, uint64_t);
             extern int drm_is_drm_file(vfs_file_t*);
             if (drm_is_drm_file(f)) {
-                phys_addr_t dphys = 0;
-                uint64_t    dlen  = 0;
-                int64_t rc = drm_resolve_dumb_mmap(f, off, len, &dphys, &dlen);
-                if (rc != 0) { fdput(f); goto fail_unmap; }
-
-                // Mark the VMA as a direct physical mapping.  Without
-                // VMA_MMIO, fork()'s COW clone treated this like a
-                // private anon mapping: the parent's first post-fork
-                // pixel write COPIED the framebuffer page and every
-                // render after that landed in the copy while the GPU
-                // kept scanning the original — dwl forking to spawn
-                // foot turned its first swapchain buffer permanently
-                // black (and the cursor buffer invisible).  VMA_MMIO
-                // makes the clone share the PTEs and the teardown /
-                // munmap paths leave the pages alone: their lifetime
-                // is owned by drm.c's dumb/fb structures, not by VMA
-                // refs (so no pmm_ref_inc here either — the old ref
-                // leaked on every teardown skip).
+                // Mark the VMA as a direct physical mapping.  Without VMA_MMIO,
+                // fork()'s COW clone treated this like a private anon mapping:
+                // the parent's first post-fork pixel write COPIED the framebuffer
+                // page and every render after that landed in the copy while the
+                // GPU kept scanning the original — dwl forking to spawn foot
+                // turned its first swapchain buffer permanently black (and the
+                // cursor invisible).  VMA_MMIO makes the clone share the PTEs and
+                // the teardown / munmap paths leave the pages alone: their
+                // lifetime is owned by drm.c's dumb/fb structures (the shmem
+                // backing), not by VMA refs (so no pmm_ref here either).
                 {
                     extern vma_t* mm_vma_find(mm_t*, virt_addr_t);
                     spin_lock(&mm->vma_lock);
@@ -2195,11 +2940,8 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                 }
                 uint64_t pte = mm_vma_pte_flags(vma_flags);
                 phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-                for (uint64_t i = 0; i < npages; i++) {
-                    if (!vmm_page_map(pml4, vaddr + i * 4096u,
-                                       dphys + i * 4096u, pte)) {
-                        fdput(f); goto fail_unmap;
-                    }
+                if (drm_mmap_backing(f, off, len, pml4, vaddr, pte) != 0) {
+                    fdput(f); goto fail_unmap;
                 }
                 fdput(f);
                 return vaddr;
@@ -2220,15 +2962,22 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
             // Attach shmem backing under the writer lock so concurrent
             // page-fault readers on other CPUs see the shmem fields
             // atomically rather than in two torn halves.
+            int attached = 0;
             spin_lock(&mm->vma_lock);
             for (vma_t* v = mm->vmas; v; v = v->next) {
                 if (v->start == vaddr) {
                     v->shmem       = shm;
                     v->shmem_pgoff = pg_off;
+                    attached = 1;
                     break;
                 }
             }
             spin_unlock(&mm->vma_lock);
+            // A concurrent same-mm munmap / MAP_FIXED replace can remove the VMA
+            // between mm_vma_add above and this relock; then no VMA takes the ref
+            // we just shmem_ref'd and munmap never sees it -> permanent leak.
+            // Drop it here so the only owner is the VMA (when found) or nobody.
+            if (!attached) shmem_unref(shm);
         } else {
             // MAP_SHARED | MAP_ANONYMOUS: create a new anonymous shmem.
             shm = shmem_create(npages,
@@ -2237,15 +2986,20 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot,
                                0600);
             if (!shm) goto fail_unmap;
 
+            int attached = 0;
             spin_lock(&mm->vma_lock);
             for (vma_t* v = mm->vmas; v; v = v->next) {
                 if (v->start == vaddr) {
                     v->shmem       = shm;
                     v->shmem_pgoff = 0;
+                    attached = 1;
                     break;
                 }
             }
             spin_unlock(&mm->vma_lock);
+            // VMA concurrently removed (see the named-fd path): destroy the
+            // orphaned anonymous shmem (its only ref) instead of leaking it.
+            if (!attached) shmem_unref(shm);
         }
     }
 
@@ -2260,10 +3014,14 @@ fail_unmap:
 // ── sys_munmap ────────────────────────────────────────────────────────────
 static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     if (!g_current || !g_current->mm_shared->mm) return (uint64_t)-EINVAL;
-    if (!addr || (addr & PAGE_MASK))              return (uint64_t)-EINVAL;
-    if (!len)                                     return (uint64_t)-EINVAL;
 
-    len = (len + PAGE_MASK) & ~PAGE_MASK;
+    // Validate + page-round the user range in one overflow-safe step.  This
+    // rejects a misaligned/NULL addr, a len that overflows page-rounding, and
+    // — critically — any [addr, addr+len) that escapes the user half, so an
+    // unmap can never walk the shared kernel/HHDM page tables and free a live
+    // kernel frame.
+    uint64_t end;
+    if (!mmap_range_ok(addr, len, &len, &end)) return (uint64_t)-EINVAL;
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
     mm_t* mm = g_current->mm_shared->mm;
 
@@ -2272,10 +3030,10 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len) {
     // held one ref — dropping it lets the frame free once the shmem
     // object and every other mapper have also released it.
     // unmap → cross-CPU flush → free (see mm_unmap_range_flush_free).
-    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, addr + len);
+    mm_unmap_range_flush_free(g_current->mm_shared, pml4, mm, addr, end);
 
     // Remove VMA descriptors covering the range (this also unrefs shmem).
-    mm_vma_remove(mm, addr, addr + len);
+    mm_vma_remove(mm, addr, end);
     return 0;
 }
 
@@ -2294,10 +3052,12 @@ static uint64_t sys_shm_open(uint64_t name_ptr, uint64_t namelen,
     if (!g_current || !name_ptr) { serial_puts_dbg("[shm_open] EINVAL\n"); return (uint64_t)-EINVAL; }
     if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
 
-    // Copy name from userspace.
+    // Copy name from userspace via copy_from_user, never a raw memcpy of an
+    // unvalidated pointer (a kernel/non-canonical name_ptr was a kernel READ +
+    // a #PF panic).  namelen is already bounded to SHMEM_NAME_MAX above.
     char name[SHMEM_NAME_MAX + 1];
-    const char* uname = (const char*)name_ptr;
-    __builtin_memcpy(name, uname, namelen);
+    if (copy_from_user(name, (const void*)(uintptr_t)name_ptr, namelen) != 0)
+        return (uint64_t)-EFAULT;
     name[namelen] = '\0';
 
     // POSIX: name must start with '/' and contain no embedded slashes.
@@ -2407,9 +3167,11 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
     if (!g_current || !name_ptr) return (uint64_t)-EINVAL;
     if (namelen == 0 || namelen > SHMEM_NAME_MAX) return (uint64_t)-ENAMETOOLONG;
 
+    // copy_from_user, never a raw memcpy of an unvalidated pointer (kernel READ
+    // + #PF).  namelen is bounded to SHMEM_NAME_MAX above.
     char name[SHMEM_NAME_MAX + 1];
-    const char* uname = (const char*)name_ptr;
-    __builtin_memcpy(name, uname, namelen);
+    if (copy_from_user(name, (const void*)(uintptr_t)name_ptr, namelen) != 0)
+        return (uint64_t)-EFAULT;
     name[namelen] = '\0';
 
     if (name[0] != '/') return (uint64_t)-EINVAL;
@@ -2446,10 +3208,14 @@ static uint64_t sys_shm_unlink(uint64_t name_ptr, uint64_t namelen) {
 static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     (void)rem_ptr;
     if (!req_ptr) return (uint64_t)-EINVAL;
-    k_timespec_t* req = (k_timespec_t*)req_ptr;
-    if (req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return (uint64_t)-EINVAL;
+    // Copy the timespec in via copy_from_user, never a raw deref: a kernel/
+    // non-canonical req_ptr was a kernel READ oracle and a #PF panic (DoS).
+    k_timespec_t req;
+    if (copy_from_user(&req, (const void*)(uintptr_t)req_ptr, sizeof(req)) != 0)
+        return (uint64_t)-EFAULT;
+    if (req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL) return (uint64_t)-EINVAL;
 
-    uint64_t sleep_ns = req->tv_sec * 1000000000ULL + req->tv_nsec;
+    uint64_t sleep_ns = req.tv_sec * 1000000000ULL + req.tv_nsec;
     if (!sleep_ns) return 0;
 
     uint64_t wake_ns = tsc_read_ns() + sleep_ns;
@@ -2492,7 +3258,8 @@ static uint64_t sys_fb_blit(uint64_t src_ptr, uint64_t src_w,
     // a huge or overflowing rect would prefault/read arbitrary user range.
     if (src_w > 16384 || src_h > 16384) return (uint64_t)-EINVAL;
 
-    user_buf_prefault(src_ptr, (uint64_t)src_w * src_h * 4);
+    if (user_buf_prefault(src_ptr, (uint64_t)src_w * src_h * 4) != 0)
+        return (uint64_t)-EFAULT;
     const uint32_t* src   = (const uint32_t*)src_ptr;
     uint32_t*       fb    = (uint32_t*)g_fb.base_virt;
     uint32_t        dw    = g_fb.width;
@@ -2533,13 +3300,19 @@ typedef struct {
 static uint64_t sys_fb_info(uint64_t ptr) {
     if (!ptr) return (uint64_t)-EINVAL;
     if (!g_fb.base_virt) return (uint64_t)-EIO;
-    user_fb_info_t* info = (user_fb_info_t*)ptr;
-    info->phys   = g_fb.base_virt - HHDM_OFFSET;
-    info->width  = g_fb.width;
-    info->height = g_fb.height;
-    info->pitch  = g_fb.pitch;
-    info->bpp    = g_fb.bpp;
-    return 0;
+    // Fill a kernel-local struct and copy_to_user it, never a raw store through
+    // the user pointer (a kernel/non-canonical `ptr` was an arbitrary 24-byte
+    // kernel WRITE incl. a phys addr, or a #PF).  memset first so no
+    // uninitialized stack padding leaks to userland.
+    user_fb_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
+    info.phys   = g_fb.base_virt - HHDM_OFFSET;
+    info.width  = g_fb.width;
+    info.height = g_fb.height;
+    info.pitch  = g_fb.pitch;
+    info.bpp    = g_fb.bpp;
+    return copy_to_user((void*)(uintptr_t)ptr, &info, sizeof(info)) == 0
+           ? 0 : (uint64_t)-EFAULT;
 }
 
 // ── sys_fb_map ────────────────────────────────────────────────────────────
@@ -2586,31 +3359,39 @@ static uint64_t sys_openpty(uint64_t user_fds) {
     // Install into fd table
     int64_t mfd = fd_install(master);
     if (mfd < 0) {
-        master->close(master);
-        slave->close(slave);
+        // Neither end is installed (master's fd_install failed, slave not yet
+        // attempted): each is owned by its local ref, so vfs_close drops it
+        // atomically -- freeing the pty_t (via ->close at rc->0) AND the
+        // vfs_file_t.  A bare ->close() force-runs the pty teardown and LEAKS
+        // the vfs_file_t.
+        vfs_close(master);
+        vfs_close(slave);
         return (uint64_t)mfd;
     }
 
     int64_t sfd = fd_install(slave);
     if (sfd < 0) {
-        // Close master fd
-        task_files_t* tf0 = g_current->files_shared;
-        spin_lock(&tf0->lock); tf0->ft->fd_table[mfd] = NULL; spin_unlock(&tf0->lock);
-        master->close(master);
-        slave->close(slave);
+        // master is INSTALLED (published in the shared fd table): release it via
+        // sys_close, which clears the slot AND drops the ref through vfs_close,
+        // freeing only at rc->0 -- so a CLONE_FILES sibling that grabbed mfd in
+        // the window keeps it alive instead of a use-after-free.  slave was never
+        // installed -> vfs_close.  (The old manual slot-NULL + ->close() bypassed
+        // the atomic refcount and force-freed the pty_t under any sibling ref.)
+        sys_close((uint64_t)mfd);
+        vfs_close(slave);
         return (uint64_t)sfd;
     }
 
     // Copy fds to userspace
     int fds[2] = { (int)mfd, (int)sfd };
     if (copy_to_user((void*)user_fds, fds, sizeof(fds)) != 0) {
-        task_files_t* tf0 = g_current->files_shared;
-        spin_lock(&tf0->lock);
-        tf0->ft->fd_table[mfd] = NULL;
-        tf0->ft->fd_table[sfd] = NULL;
-        spin_unlock(&tf0->lock);
-        master->close(master);
-        slave->close(slave);
+        // Both ends are installed: release each via its fd so the slot-clear and
+        // the ref-drop are one atomic vfs_close (freeing only at rc->0).  A
+        // sibling thread holding either just-installed fd keeps the pty alive;
+        // the old manual slot-NULL + ->close() force-freed the pty_t and UAF'd
+        // the sibling's ref.
+        sys_close((uint64_t)mfd);
+        sys_close((uint64_t)sfd);
         return (uint64_t)-EFAULT;
     }
 
@@ -2620,7 +3401,27 @@ static uint64_t sys_openpty(uint64_t user_fds) {
 // ── Socket syscalls ───────────────────────────────────────────────────────
 
 // Helper: allocate the lowest available fd ≥ 3 and assign f to it.
-static int64_t fd_install(vfs_file_t* f) {
+// Install `f` into the lowest free fd (>= 3) of the current task.
+//
+// OWNERSHIP CONTRACT (single, consistent rule -- do not deviate per caller):
+//   success (>= 0): fd_install takes ownership of `f` (it lives in the table).
+//   failure (< 0):  ownership STAYS WITH THE CALLER, which MUST close `f`.
+// fd_install NEVER closes `f` itself.  Previously it closed `f` on the
+// table-grow path but not the !g_current path, so callers couldn't tell who
+// owned `f`: ~10 of them closed on failure (double-free with the grow path)
+// while 4 relied on fd_install closing (leak on the !g_current path).  One rule
+// kills both bug classes -- every call site now closes `f` on the negative
+// branch, and fd_install closes it on none.
+// Install f at the lowest free fd >= 3 AND set its close-on-exec flag, BOTH in
+// the SAME tf->lock critical section, so the fd and its FD_CLOEXEC bit are
+// published together.  Setting cloexec as a SEPARATE unlocked step (the old
+// sys_socket_inner did) raced a sibling thread's fd_table_grow: the grow
+// COW-copies fd_flags under the lock and RCU-publishes a new table, so a plain
+// post-install store could land in the OLD (pending-free) table and be lost --
+// the fd then survived exec (an fd leak across exec).  Also explicitly writes
+// fd_flags[fd] (rather than relying on the slot already being 0), so a reused
+// slot can never carry a stale flag.  fd_flags is uint32_t here (FD_CLOEXEC).
+static int64_t fd_install_cloexec(vfs_file_t* f, int cloexec) {
     if (!g_current) return -EBADF;
     task_files_t* tf = g_current->files_shared;
     spin_lock(&tf->lock);
@@ -2628,17 +3429,19 @@ static int64_t fd_install(vfs_file_t* f) {
         if (fd >= tf->ft->cap) {
             if (!fd_table_grow(tf)) {
                 spin_unlock(&tf->lock);
-                vfs_close(f);
-                return -ENFILE;
+                return -ENFILE;          // caller still owns f and will close it
             }
         }
         if (!tf->ft->fd_table[fd]) {
             tf->ft->fd_table[fd] = f;
+            tf->ft->fd_flags[fd] = cloexec ? FD_CLOEXEC : 0u;
             spin_unlock(&tf->lock);
             return (int64_t)fd;
         }
     }
 }
+
+static int64_t fd_install(vfs_file_t* f) { return fd_install_cloexec(f, 0); }
 
 // fdget: look up an open file description by fd.  On success the returned
 // vfs_file_t has been ref-bumped via vfs_tryget — the caller MUST pair the
@@ -2674,23 +3477,13 @@ static vfs_file_t* fdget(uint64_t fd) {
 // close-on-last-ref runs the driver teardown; safe to pass NULL.
 static void fdput(vfs_file_t* f) { vfs_close(f); }
 
-// Compat wrapper for a handful of callers that still want the old,
-// un-ref-bumped semantics — used only inside writer-lock critical
-// sections where the task_files_t.lock already prevents a concurrent
-// teardown.  New code should use fdget/fdput.
-static vfs_file_t* fd_to_file(uint64_t fd) {
-    if (!g_current || !g_current->files_shared) return NULL;
-    fdtable_t* ft = __atomic_load_n(&g_current->files_shared->ft, __ATOMIC_ACQUIRE);
-    if (!ft || fd >= ft->cap) return NULL;
-    return ft->fd_table[fd];
-}
-
 // socket(domain, type, proto) → fd or -errno
 static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto);
 static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t proto) {
     uint64_t r = sys_socket_inner(domain, type, proto);
-    kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
-            (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
+    if (CONFIG_DEBUG_SOCKET)
+        kprintf("[socket-dbg] domain=%u type=%u proto=%u -> %ld\n",
+                (uint32_t)domain, (uint32_t)type, (uint32_t)proto, (int64_t)r);
     return r;
 }
 static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto) {
@@ -2725,14 +3518,14 @@ static uint64_t sys_socket_inner(uint64_t domain, uint64_t type, uint64_t proto)
     #define MK_SOCK_NONBLOCK 0x00800
     if (type & MK_SOCK_NONBLOCK)
         f->flags |= O_NONBLOCK;
-    int64_t fd = fd_install(f);
-    if (fd >= 0 && (type & MK_SOCK_CLOEXEC)) {
-        task_files_t* tf = g_current->files_shared;
-        if (tf && tf->ft && (uint64_t)fd < tf->ft->cap)
-            tf->ft->fd_flags[fd] = FD_CLOEXEC;
-    }
+    // Install the fd AND its close-on-exec flag atomically under tf->lock.  The
+    // old code set FD_CLOEXEC as a separate unlocked store after fd_install,
+    // which a sibling fd_table_grow could drop into the freed old table (the fd
+    // then survived exec).  fd_install_cloexec sets both in one locked step.
+    int64_t fd = fd_install_cloexec(f, (type & MK_SOCK_CLOEXEC) != 0);
+    if (fd < 0) { vfs_close(f); return (uint64_t)fd; }   // install failed -> we own f
     serial_puts_dbg("[socket] fd="); serial_hex_dbg((uint64_t)fd);
-    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
+    return (uint64_t)fd;
 }
 
 // Helper: is this vfs_file_t a unix socket?
@@ -2740,116 +3533,161 @@ static inline int is_unix_sock(vfs_file_t* f) {
     return f && f->close == unix_sock_close;
 }
 
+// Copy a user sockaddr_un into a kernel buffer and GUARANTEE sun_path is NUL-
+// terminated.  The AF_UNIX namespace hash/compare (ns_hash_str/ns_streq) and the
+// debug prints walk sun_path as a C-string; reading it straight out of user
+// memory let a sun_path with no NUL in its 108 bytes run past the validated
+// struct into the next (possibly unmapped) page -> kernel #PF (DoS).  Copying +
+// NUL-capping here means every downstream walk is over a bounded kernel string.
+// Returns 0 or -EFAULT.
+static int copy_sockaddr_un_from_user(sockaddr_un_t* ksa, uint64_t addr_ptr) {
+    if (copy_from_user(ksa, (const void*)(uintptr_t)addr_ptr, sizeof(*ksa)) != 0)
+        return -EFAULT;
+    ksa->sun_path[sizeof(ksa->sun_path) - 1] = '\0';
+    return 0;
+}
+
 // bind(fd, sockaddr*, addrlen) → 0 or -errno
 static uint64_t sys_bind(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close() on
+    // the shared fd table cannot free it under us mid-op.  fdput on every exit.
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
-    if (!addr_ptr) return (uint64_t)-EINVAL;
+    uint64_t ret;
+    if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
-        serial_puts_dbg("[bind] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
-        int r = unix_sock_bind(f, sa->sun_path);
+        sockaddr_un_t ksa;
+        if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+        if (ksa.sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
+        serial_puts_dbg("[bind] unix path="); serial_puts_dbg(ksa.sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_bind(f, ksa.sun_path);
         serial_puts_dbg("[bind] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
+    if (user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
-    if (!sa) return (uint64_t)-EINVAL;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
-    int r = socket_bind(f, port);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_bind(f, port);
+out:
+    fdput(f);
+    return ret;
 }
 
 // listen(fd, backlog) → 0 or -errno
 static uint64_t sys_listen(uint64_t fd, uint64_t backlog) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     if (is_unix_sock(f)) {
         serial_puts_dbg("[listen] unix backlog="); serial_hex_dbg(backlog);
         int r = unix_sock_listen(f, (int)backlog);
         serial_puts_dbg("[listen] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
     (void)backlog;
-    int r = socket_listen(f);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_listen(f);
+out:
+    fdput(f);
+    return ret;
 }
 
 // accept(fd, sockaddr*, addrlen*) → new fd or -errno
 uint64_t sys_accept(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)addrlen_ptr;
-    vfs_file_t* f = fd_to_file(fd);
+    // fdget pins the LISTENER across the blocking accept: a sibling thread's
+    // close(fd) on the shared table would otherwise free it under our sleep
+    // (the accept loop derefs the listener across sched_sleep).  fdput on exit.
+    vfs_file_t* f = fdget(fd);
     if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
 
     if (is_unix_sock(f)) {
         serial_puts_dbg("[accept] unix waiting...\n");
         vfs_file_t* cf = unix_sock_accept(f);
-        if (!cf) { serial_puts_dbg("[accept] failed\n"); return (uint64_t)-ECONNABORTED; }
+        if (!cf) { serial_puts_dbg("[accept] failed\n"); ret = (uint64_t)-ECONNABORTED; goto out; }
         int64_t nfd = fd_install(cf);
+        if (nfd < 0) { vfs_close(cf); ret = (uint64_t)nfd; goto out; }   // we own cf on failure
         serial_puts_dbg("[accept] new fd="); serial_hex_dbg((uint64_t)nfd);
-        return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+        ret = (uint64_t)nfd; goto out;
     }
 
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     sockaddr_in_t* peer = (sockaddr_in_t*)addr_ptr;
     vfs_file_t* cf = socket_accept(f, peer);
     if (!cf) {
         // Non-blocking accept: no ready child. Otherwise a real failure.
-        if (f->flags & O_NONBLOCK) return (uint64_t)-EAGAIN;
-        return (uint64_t)-ECONNABORTED;
+        ret = (f->flags & O_NONBLOCK) ? (uint64_t)-EAGAIN : (uint64_t)-ECONNABORTED;
+        goto out;
     }
     if (peer) {
         // Convert port back to network byte order for userspace.
         peer->sin_port = (uint16_t)((peer->sin_port >> 8) | (peer->sin_port << 8));
     }
     int64_t nfd = fd_install(cf);
-    return (nfd < 0) ? (uint64_t)nfd : (uint64_t)nfd;
+    if (nfd < 0) { vfs_close(cf); ret = (uint64_t)nfd; goto out; }   // we own cf on failure
+    ret = (uint64_t)nfd;
+out:
+    fdput(f);
+    return ret;
 }
 
 // connect(fd, sockaddr*, addrlen) → 0 or -errno
 uint64_t sys_connect(uint64_t fd, uint64_t addr_ptr, uint64_t addrlen) {
     (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin across the blocking connect (sibling close)
     if (!f) return (uint64_t)-EBADF;
-    if (!addr_ptr) return (uint64_t)-EINVAL;
+    uint64_t ret;
+    if (!addr_ptr) { ret = (uint64_t)-EINVAL; goto out; }
 
     if (is_unix_sock(f)) {
-        const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
-        if (sa->sun_family != AF_UNIX) return (uint64_t)-EINVAL;
-        serial_puts_dbg("[connect] unix path="); serial_puts_dbg(sa->sun_path); serial_putc_dbg('\n');
-        int r = unix_sock_connect(f, sa->sun_path);
+        sockaddr_un_t ksa;
+        if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
+        if (ksa.sun_family != AF_UNIX) { ret = (uint64_t)-EINVAL; goto out; }
+        serial_puts_dbg("[connect] unix path="); serial_puts_dbg(ksa.sun_path); serial_putc_dbg('\n');
+        int r = unix_sock_connect(f, ksa.sun_path);
         serial_puts_dbg("[connect] result="); serial_hex_dbg((uint64_t)(int64_t)r);
-        return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)r; goto out;
     }
 
+    if (user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     uint16_t port = (uint16_t)((sa->sin_port >> 8) | (sa->sin_port << 8));
-    int r = socket_connect(f, sa->sin_addr, port);
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)socket_connect(f, sa->sin_addr, port);
+out:
+    fdput(f);
+    return ret;
 }
 
 // sendto(fd, buf, len, flags, addr, addrlen) → bytes or -errno
 uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                              uint64_t flags, uint64_t addr_ptr, uint64_t addrlen) {
     (void)flags; (void)addrlen;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fdget(fd);   // pin across the (possibly blocking) send
+    if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
+    if (!buf_ptr || !len) { ret = (uint64_t)-EINVAL; goto out; }
+    // buf_ptr + the sockaddr are deref'd DIRECTLY below; validate them like the
+    // rest of the kernel (an unchecked buf_ptr is an arbitrary-kernel-read leak).
+    if (user_buf_readable_ok(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
 
     if (is_unix_sock(f)) {
         if (addr_ptr) {
-            const sockaddr_un_t* sa = (const sockaddr_un_t*)addr_ptr;
+            sockaddr_un_t ksa;
+            if (copy_sockaddr_un_from_user(&ksa, addr_ptr) != 0) { ret = (uint64_t)-EFAULT; goto out; }
             int r = unix_sock_sendto(f, (const void*)buf_ptr, (uint32_t)len,
-                                      sa->sun_path);
-            return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+                                      ksa.sun_path);
+            ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
         }
         int r = unix_sock_send(f, (const void*)buf_ptr, (uint32_t)len);
-        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+        ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
     }
 
+    if (addr_ptr && user_buf_readable_ok(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     const sockaddr_in_t* sa = (const sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -2859,21 +3697,30 @@ uint64_t sys_sendto(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     } else {
         r = socket_send(f, (const void*)buf_ptr, (uint32_t)len);
     }
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)r;
+out:
+    fdput(f);
+    return ret;
 }
 
 // recvfrom(fd, buf, len, flags, addr, addrlen*) → bytes or -errno
 uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
                                uint64_t flags, uint64_t addr_ptr, uint64_t addrlen_ptr) {
     (void)flags; (void)addrlen_ptr;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !buf_ptr || !len) return (uint64_t)-EINVAL;
+    vfs_file_t* f = fdget(fd);   // pin across the blocking recv (sibling close)
+    if (!f) return (uint64_t)-EBADF;
+    uint64_t ret;
+    if (!buf_ptr || !len) { ret = (uint64_t)-EINVAL; goto out; }
+    // The recv data is written DIRECTLY into buf_ptr (tcp_recv_data: dst[i]=...);
+    // an unchecked buf_ptr is an arbitrary-kernel-WRITE LPE.  Validate + prefault.
+    if (user_buf_check(buf_ptr, len) != 0) { ret = (uint64_t)-EFAULT; goto out; }
 
     if (is_unix_sock(f)) {
         int r = unix_sock_recv(f, (void*)buf_ptr, (uint32_t)len);
-        return (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r;
+        ret = (r < 0) ? (uint64_t)(int64_t)r : (uint64_t)r; goto out;
     }
 
+    if (addr_ptr && user_buf_check(addr_ptr, sizeof(sockaddr_in_t)) != 0) { ret = (uint64_t)-EFAULT; goto out; }
     sockaddr_in_t* sa = (sockaddr_in_t*)addr_ptr;
     int r;
     if (sa) {
@@ -2882,35 +3729,61 @@ uint64_t sys_recvfrom(uint64_t fd, uint64_t buf_ptr, uint64_t len,
     } else {
         r = socket_recv(f, (void*)buf_ptr, (uint32_t)len);
     }
-    return (uint64_t)(int64_t)r;
+    ret = (uint64_t)(int64_t)r;
+out:
+    fdput(f);
+    return ret;
 }
 
 // setsockopt(fd, level, optname, optval*, optlen) → 0 or -errno
 static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                                 uint64_t val_ptr, uint64_t vallen) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
+    // Bounce optval into a kernel buffer so socket_setsockopt never derefs the
+    // raw user pointer: the SO_BROADCAST handler did *(const int*)optval, so a
+    // kernel/non-canonical optval was a #PF/#GP DoS + a 1-bit kernel-read
+    // oracle.  No socket option needs more than a few bytes.  Declared before
+    // any goto so the is_unix_sock skip does not jump over an initializer.
+    uint8_t kopt[128];
+    const void* kvp = NULL;
+    uint64_t ret;
     if (is_unix_sock(f)) {
         // Unix sockets: accept everything silently (no options honoured yet).
-        return 0;
+        ret = 0; goto out;
     }
-    int r = socket_setsockopt(f, (int)level, (int)opt,
-                               (const void*)val_ptr, (uint32_t)vallen);
-    return (uint64_t)(int64_t)r;
+    if (val_ptr) {
+        if (vallen > sizeof(kopt)) { ret = (uint64_t)-EINVAL; goto out; }
+        if (copy_from_user(kopt, (const void*)(uintptr_t)val_ptr, vallen) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
+        kvp = kopt;
+    }
+    ret = (uint64_t)(int64_t)socket_setsockopt(f, (int)level, (int)opt,
+                                               kvp, (uint32_t)vallen);
+out:
+    fdput(f);
+    return ret;
 }
 
 // getpeerpid(fd) → pid of peer on AF_UNIX SOCK_STREAM conn, or -errno.
 // Kernel-trusted — stamped at accept()/connect(). The compositor uses this
 // to SIGKILL an unresponsive client after the user force-closes its window.
 static uint64_t sys_getpeerpid(uint64_t fd) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the deref (sibling close)
     if (!f) return (uint64_t)-EBADF;
-    if (!is_unix_sock(f)) return (uint64_t)-ENOTSOCK;
-    unix_sock_t* s = (unix_sock_t*)f->ctx;
-    if (!s) return (uint64_t)-EBADF;
-    if (s->state != UNIX_STATE_CONNECTED) return (uint64_t)-ENOTCONN;
-    if (s->peer_pid == 0) return (uint64_t)-ENOTCONN;
-    return (uint64_t)s->peer_pid;
+    uint64_t ret;
+    if (!is_unix_sock(f)) { ret = (uint64_t)-ENOTSOCK; goto out; }
+    {
+        unix_sock_t* s = (unix_sock_t*)f->ctx;
+        if (!s) { ret = (uint64_t)-EBADF; goto out; }
+        else if (s->state != UNIX_STATE_CONNECTED) ret = (uint64_t)-ENOTCONN;
+        else if (s->peer_pid == 0) ret = (uint64_t)-ENOTCONN;
+        else ret = (uint64_t)s->peer_pid;
+    }
+out:
+    fdput(f);
+    return ret;
 }
 
 // net_ifconfig(ifcfg_t*, len) → 0 or -errno
@@ -2954,39 +3827,394 @@ static uint64_t sys_net_mac(uint64_t out_ptr) {
 
 // shutdown(fd, how) → 0 or -errno
 static uint64_t sys_shutdown(uint64_t fd, uint64_t how) {
-    vfs_file_t* f = fd_to_file(fd);
+    vfs_file_t* f = fdget(fd);   // pin the socket across the op (sibling close)
     if (!f) return (uint64_t)-EBADF;
-
+    uint64_t ret;
     if (is_unix_sock(f))
-        return (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
-
-    int r = socket_shutdown(f, (int)how);
-    return (uint64_t)(int64_t)r;
+        ret = (uint64_t)(int64_t)unix_sock_shutdown(f, (int)how);
+    else
+        ret = (uint64_t)(int64_t)socket_shutdown(f, (int)how);
+    fdput(f);
+    return ret;
 }
 
-static inline int _access_ok(uint64_t addr, uint64_t len) {
-    if (!addr) return 0;
-    if (addr >= HHDM_OFFSET) return 0;
-    if (len && (addr + len) < addr) return 0;       // overflow
-    if (len && (addr + len) > HHDM_OFFSET) return 0;
-    return 1;
-}
+// _access_ok (the user (addr,len) range validator) now lives in uaccess.h --
+// one source of truth shared with the signal path; see the header for the
+// non-canonical-gap rationale.
 
 // ── Helper: copy bytes from user to kernel safely ─────────────────────────
 // Returns 0 on success, -EFAULT if the pointer is bad or in kernel space.
+// Fault-safe byte copy for kernel<->user transfers.  The `rep movsb` is
+// registered in the fault-fixup table (extable.h): if it faults on a bad or
+// racing user page that the page-fault handler cannot resolve, the handler
+// resumes execution at label 2 instead of panicking, leaving RCX = bytes not
+// yet copied.  Returns the number of bytes NOT copied (0 == full success).
+// This is what closes the "concurrent munmap between the access check and the
+// access itself still faults" residual documented on the prefault helpers.
+static uint64_t __attribute__((noinline))
+__uaccess_copy(void* dst, const void* src, uint64_t len) {
+    uint64_t not_copied;
+    __asm__ volatile(
+        "1: rep movsb\n\t"
+        "2:\n\t"
+        _ASM_EXTABLE(1b, 2b)
+        : "=c"(not_copied), "+D"(dst), "+S"(src)
+        : "0"(len)
+        : "memory", "cc");
+    return not_copied;
+}
+
 int copy_from_user(void* dst, const void* src_u, uint64_t len) {
     if (!_access_ok((uint64_t)src_u, len)) return -EFAULT;
-    user_buf_prefault((virt_addr_t)src_u, len);
-    __builtin_memcpy(dst, src_u, len);
+    if (user_buf_prefault((virt_addr_t)src_u, len) != 0) return -EFAULT;
+    if (__uaccess_copy(dst, src_u, len) != 0) return -EFAULT;
     return 0;
+}
+
+// ── Safe NUL-terminated path copy ─────────────────────────────────────────
+// Copies a user path into dst (size dstsz) up to dstsz-1 chars + a NUL.  Unlike
+// the old raw `while (upath[i]) ...` deref -- which #PF-panicked the kernel on a
+// kernel/non-canonical/unmapped path pointer (a trivial DoS) -- every byte is
+// read through copy_from_user (_access_ok + VMA-checked prefault).  The string
+// length is unknown up front, so it copies one page-bounded chunk at a time and
+// stops at the NUL; a chunk never straddles into the next page, so a path that
+// ends in a mapped page never forces a read of an unmapped following page.
+// Returns the length (>= 0), -EFAULT for a bad pointer, or -ENAMETOOLONG if no
+// NUL appears within dstsz-1 bytes (no silent truncation onto a wrong file).
+static int64_t copy_path_from_user(char* dst, const void* uptr, uint64_t dstsz) {
+    if (!dst || dstsz == 0) return -EINVAL;
+    if (!uptr) return -EFAULT;
+    uint64_t max = dstsz - 1;          // reserve the last byte for the NUL
+    uint64_t off = 0;
+    while (off < max) {
+        uint64_t addr      = (uint64_t)uptr + off;
+        uint64_t page_left = PAGE_SIZE - (addr & (PAGE_SIZE - 1));
+        uint64_t chunk     = max - off;
+        if (chunk > page_left) chunk = page_left;
+        if (copy_from_user(dst + off, (const void*)addr, chunk) != 0)
+            return -EFAULT;
+        for (uint64_t k = 0; k < chunk; k++)
+            if (dst[off + k] == '\0') return (int64_t)(off + k);  // length
+        off += chunk;
+    }
+    dst[max] = '\0';
+    return -ENAMETOOLONG;
 }
 
 int copy_to_user(void* dst_u, const void* src, uint64_t len) {
     if (!_access_ok((uint64_t)dst_u, len)) return -EFAULT;
-    user_buf_prefault((virt_addr_t)dst_u, len);
-    __builtin_memcpy(dst_u, src, len);
+    if (user_buf_prefault((virt_addr_t)dst_u, len) != 0) return -EFAULT;
+    if (__uaccess_copy(dst_u, src, len) != 0) return -EFAULT;
     return 0;
 }
+
+// Validate a user buffer that the kernel will read/write DIRECTLY (not via
+// copy_*_user) -- e.g. io_uring OP_READ/OP_WRITE hand sqe->addr straight to
+// vfs_read/vfs_write.  Range-check rejects kernel / non-canonical / overflowing
+// pointers (the arbitrary-kernel-R/W LPE guard, mm-independent); the prefault
+// then rejects unmapped user pointers (which would otherwise #PF + panic in the
+// direct memcpy) -- it is a no-op for kernel threads with no user mm.  Must be
+// called with the submitter's PML4 active.  Returns 0 or -EFAULT.
+int user_buf_check(uint64_t addr, uint64_t len) {
+    if (!_access_ok(addr, len)) return -EFAULT;
+    if (user_buf_prefault((virt_addr_t)addr, (size_t)len) != 0) return -EFAULT;
+    return 0;
+}
+
+// Validate a user buffer the kernel will raw-deref for READING (write(2)'s data
+// buffer).  _access_ok rejects kernel/non-canonical/overflowing pointers (the
+// arbitrary-kernel-read LPE guard); then EVERY page must have a VMA so the raw
+// read demand-faults cleanly instead of taking an unresolvable kernel-mode #PF
+// that panics the whole kernel ("kernel #PF unrecoverable") on an unmapped-but-
+// in-range pointer -- e.g. p=mmap(...); munmap(p); write(1,p,16).  Unlike
+// user_buf_check / copy_from_user it does NOT prefault: a prefault MAPS+ZEROS
+// absent pages, which for a READ source corrupts a file-backed page (a .rodata
+// string literal would read as zeros) -- the exact reason write() could not just
+// adopt the prefault.  Returns 0 or -EFAULT.  Residual: a concurrent munmap
+// between this check and the raw read still faults (needs a fault-fixup table).
+int user_buf_readable_ok(uint64_t addr, uint64_t len) {
+    if (!_access_ok(addr, len)) return -EFAULT;
+    if (!len || !g_current) return 0;
+    mm_t* mm = g_current->mm_shared ? g_current->mm_shared->mm : NULL;
+    if (!mm) return 0;                           // kernel thread: no user mm
+    return mm_range_has_vmas(mm, addr, len) ? 0 : -EFAULT;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Audit fix: sys_readdir/stat/unlink/getcwd/chdir/mkdir used raw
+// __builtin_memcpy on unvalidated user pointers -> kernel-fault DoS, and the
+// readdir/getcwd *writes* were arbitrary kernel writes (pass a kernel address
+// as the output buffer).  They now route through copy_from_user/copy_to_user.
+// Verify those primitives REJECT bad pointers (kernel, non-canonical, past the
+// user ceiling, NULL) with -EFAULT instead of faulting / touching the address.
+static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
+                            uint64_t eset_ptr, uint64_t tv_ptr);  // fwd: selftest below
+
+void copy_user_selftest(void) {
+    kprintf("[copyuser_test] copy_from/to_user must reject bad pointers\n");
+    char buf[32];
+    __builtin_memset(buf, 0xA5, sizeof buf);
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+        0ULL,                          // NULL
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (copy_from_user(buf, (const void*)bad[i], 16) == 0) {
+            kprintf_atomic("[copyuser_test] FAIL: copy_from_user accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+        if (copy_to_user((void*)bad[i], buf, 16) == 0) {
+            kprintf_atomic("[copyuser_test] FAIL: copy_to_user accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+        // user_buf_check is the validation io_uring OP_READ/OP_WRITE now use on
+        // the user-controlled sqe->addr; it must reject these the same way (the
+        // kernel-address case is the arbitrary-kernel-R/W LPE guard).
+        if (user_buf_check(bad[i], 16) == 0) {
+            kprintf_atomic("[copyuser_test] FAIL: user_buf_check accepted 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+        // sys_select must reject a bad (non-NULL) readfds pointer with -EFAULT
+        // instead of dereferencing it (the arbitrary-kernel-read it used to do).
+        // Skip bad[3] == NULL, which legitimately means "empty readfds".
+        if (bad[i] != 0ULL &&
+            sys_select(1, bad[i], 0, 0, 0) != (uint64_t)-EFAULT) {
+            kprintf_atomic("[copyuser_test] FAIL: sys_select accepted readfds 0x%lx\n",
+                    (unsigned long)bad[i]);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[copyuser_test] SELF-TEST FAILED\n"
+                  : "[copyuser_test] SELF-TEST PASSED (bad pointers rejected by copy_*_user + user_buf_check + sys_select)\n");
+}
+
+// copy_user_strv (the exec/spawn argv/envp vector copier) must reject a
+// kernel/non-canonical/past-ceiling vector pointer with -EFAULT and count 0,
+// before dereferencing it -- not raw-read it (which would leak kernel memory
+// into the child or panic on an unmapped page).  A NULL vector is the
+// legitimate "no argv" case -> empty + NULL-terminated.  (The success path and
+// per-element string validation need a live user mm, so they are code-proof via
+// copy_from_user/copy_path_from_user + clean boot, where every exec copies a
+// real argv.)
+void copy_user_strv_selftest(void) {
+    int fails = 0;
+    char* out[4];
+    uint32_t count = 99;
+    uint8_t* scratch = (uint8_t*)kmalloc(64);
+    if (!scratch) { kprintf_atomic("[strv_test] SELF-TEST FAILED (alloc)\n"); return; }
+
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        count = 99;
+        out[0] = (char*)0x1;
+        int rc = copy_user_strv(bad[i], out, 4, 16, scratch, &count);
+        if (rc != -EFAULT || count != 0 || out[0] != NULL) {
+            kprintf_atomic("[strv_test] FAIL accepted bad vec 0x%lx rc=%d count=%u\n",
+                    (unsigned long)bad[i], rc, count);
+            fails++;
+        }
+    }
+    // NULL vector: the legitimate "no argv/envp" case.
+    count = 99;
+    if (copy_user_strv(0, out, 4, 16, scratch, &count) != 0 ||
+        count != 0 || out[0] != NULL) {
+        kprintf_atomic("[strv_test] FAIL null vec not empty-ok\n");
+        fails++;
+    }
+
+    kfree(scratch);
+    kprintf_atomic(fails ? "[strv_test] SELF-TEST FAILED\n"
+                  : "[strv_test] SELF-TEST PASSED (argv/envp vector rejects bad pointers)\n");
+}
+
+// copy_path_from_user replaced the raw `while (upath[i])` path derefs in
+// open/exec/spawn/access/truncate.  The old loops #PF-panicked the kernel on a
+// kernel/non-canonical/unmapped path pointer; the helper must REJECT those with
+// -EFAULT instead.  (The valid-copy path is exercised by every exec/open/stat
+// at boot, so a clean boot to login proves correct copy + NUL + length.)
+void copy_path_user_selftest(void) {
+    char buf[64];
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+        0ULL,                          // NULL
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        int64_t r = copy_path_from_user(buf, (const void*)bad[i], sizeof(buf));
+        if (r != -EFAULT) {
+            kprintf_atomic("[copypath_test] FAIL: accepted 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[copypath_test] SELF-TEST FAILED\n"
+                  : "[copypath_test] SELF-TEST PASSED (bad path pointers rejected, no fault)\n");
+}
+
+// Audit fix (BUG-TYPE SCAN #3): sys_wait/sys_pipe/sys_fb_info/sys_nanosleep/
+// sys_shm_open/sys_shm_unlink dereferenced the user-supplied pointer DIRECTLY
+// (raw `*(T*)uptr` store/read) -- an arbitrary-kernel-WRITE LPE (wait/pipe/
+// fb_info), a kernel-read oracle, or a #PF panic on a kernel/non-canonical
+// pointer.  Each now routes through copy_from_user/copy_to_user.  Verify the
+// side-effect-free handlers reject a kernel/non-canonical pointer with -EFAULT
+// instead of touching it.  (sys_wait needs a zombie and sys_pipe installs fds,
+// so both are covered by the heavy boot exercise -- every shell pipeline calls
+// pipe(), every waitpid hits the status path -- plus the code-proof, rather
+// than driven here where they would churn fd/zombie state.)
+void syscall_user_ptr_selftest(void) {
+    static const uint64_t bad[] = {
+        HHDM_OFFSET + 0x1000ULL,       // kernel HHDM address (the LPE case)
+        0xDEAD000000000000ULL,         // non-canonical
+        USER_ADDR_MAX + 0x1000ULL,     // just past the user ceiling
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        int64_t r;
+        // fb_info writes a struct out; a kernel ptr must yield -EFAULT (or -EIO
+        // if the fb is not up -- either way the bad pointer is never written).
+        r = (int64_t)sys_fb_info(bad[i]);
+        if (r != -EFAULT && r != -EIO) {
+            kprintf_atomic("[user_ptr_test] FAIL fb_info 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_nanosleep(bad[i], 0);
+        if (r != -EFAULT) {
+            kprintf_atomic("[user_ptr_test] FAIL nanosleep 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_shm_open(bad[i], 4, 0, 0);
+        if (r != -EFAULT) {
+            kprintf_atomic("[user_ptr_test] FAIL shm_open 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+        r = (int64_t)sys_shm_unlink(bad[i], 4);
+        if (r != -EFAULT) {
+            kprintf_atomic("[user_ptr_test] FAIL shm_unlink 0x%lx -> %d\n",
+                    (unsigned long)bad[i], (int)r); fails++; }
+    }
+    kprintf_atomic(fails ? "[user_ptr_test] SELF-TEST FAILED\n"
+                  : "[user_ptr_test] SELF-TEST PASSED (raw user-ptr syscalls reject bad pointers)\n");
+}
+
+// Audit fix: sys_mmap/sys_munmap page-rounded a user `len` with a wrapping
+// add and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
+// munmap) at a higher-half address drove the unmap+free path through the
+// shared kernel/HHDM page tables → live-kernel-frame free / LPE.  Verify the
+// pure helpers reject the wrap + escape cases and accept legal ranges.
+void mmap_range_selftest(void) {
+    kprintf("[mmap_range_test] mmap_round_len + mmap_range_ok must reject overflow/escape\n");
+    int fails = 0;
+
+    // mmap_round_len: zero and page-rounding-overflow must return 0; legal
+    // lengths round up to a page multiple.
+    if (mmap_round_len(0) != 0) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(0) accepted\n"); fails++; }
+    if (mmap_round_len(UINT64_MAX) != 0) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(UINT64_MAX) wrapped instead of 0\n"); fails++; }
+    if (mmap_round_len(UINT64_MAX - PAGE_MASK + 1) != 0) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(just-overflowing) accepted\n"); fails++; }
+    if (mmap_round_len(1) != PAGE_SIZE) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(1) != PAGE_SIZE\n"); fails++; }
+    if (mmap_round_len(PAGE_SIZE) != PAGE_SIZE) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(PAGE_SIZE) changed it\n"); fails++; }
+    if (mmap_round_len(PAGE_SIZE + 1) != 2 * PAGE_SIZE) {
+        kprintf_atomic("[mmap_range_test] FAIL: round_len(PAGE_SIZE+1) != 2 pages\n"); fails++; }
+
+    // mmap_range_ok: every escape/overflow case must be rejected (0).
+    static const struct { uint64_t addr, len; } bad[] = {
+        { 0ULL,                          PAGE_SIZE },   // NULL addr
+        { 0xFFFF800000000000ULL,         PAGE_SIZE },   // kernel higher half (the LPE)
+        { USER_ADDR_CEIL,                PAGE_SIZE },   // first non-canonical page
+        { 0xDEAD000000000000ULL,         PAGE_SIZE },   // non-canonical scribble
+        { 0x0000000000401000ULL,         UINT64_MAX },  // len overflows page-round
+        { USER_ADDR_MAX & ~PAGE_MASK,    2 * PAGE_SIZE},// end spills past the ceiling
+        { 0x0000000000401001ULL,         PAGE_SIZE },   // misaligned addr
+    };
+    for (unsigned i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        if (mmap_range_ok(bad[i].addr, bad[i].len, NULL, NULL)) {
+            kprintf_atomic("[mmap_range_test] FAIL: range_ok accepted addr=0x%lx len=0x%lx\n",
+                    (unsigned long)bad[i].addr, (unsigned long)bad[i].len);
+            fails++;
+        }
+    }
+
+    // A legal user mapping must be accepted with the rounded len + exclusive end.
+    {
+        uint64_t olen = 0, oend = 0;
+        uint64_t a = 0x0000000040000000ULL;   // 1GiB, well inside the user half
+        if (!mmap_range_ok(a, PAGE_SIZE + 1, &olen, &oend) ||
+            olen != 2 * PAGE_SIZE || oend != a + 2 * PAGE_SIZE) {
+            kprintf_atomic("[mmap_range_test] FAIL: rejected/miscomputed a legal range\n"); fails++; }
+    }
+
+    kprintf_atomic(fails ? "[mmap_range_test] SELF-TEST FAILED\n"
+                  : "[mmap_range_test] SELF-TEST PASSED (mmap/munmap range overflow + higher-half escape rejected)\n");
+}
+
+// _access_ok now folds its addr+len wrap guard onto ckd_add_u64.  The mmap test
+// reaches _access_ok only INDIRECTLY (mmap_round_len pre-filters huge lengths),
+// so it never hits the wrap branch -- exercise every branch directly here.
+void access_ok_selftest(void) {
+    kprintf("[access_ok_test] _access_ok must reject null/kernel/wrap/end-escape\n");
+    int fails = 0;
+    struct { uint64_t addr, len; int want; } c[] = {
+        { 0,                         PAGE_SIZE,     0 },  // NULL addr
+        { 1,                         0,             1 },  // valid ptr, zero len
+        { USER_ADDR_MAX + 1,         PAGE_SIZE,     0 },  // first kernel/non-canon byte
+        { USER_ADDR_MAX,             UINT64_MAX,    0 },  // addr+len WRAPS u64 (wrap branch)
+        { USER_ADDR_MAX - PAGE_SIZE, 2 * PAGE_SIZE, 0 },  // end-1 past ceiling, no wrap
+        { 0x0000000040000000ULL,     PAGE_SIZE,     1 },  // a legal user range
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = _access_ok(c[i].addr, c[i].len);
+        if (got != c[i].want) {
+            kprintf_atomic("[access_ok_test] FAIL addr=0x%lx len=0x%lx got=%d want=%d\n",
+                    (unsigned long)c[i].addr, (unsigned long)c[i].len, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[access_ok_test] SELF-TEST FAILED\n"
+                  : "[access_ok_test] SELF-TEST PASSED (null/kernel/wrap/end-escape rejected)\n");
+}
+
+// path_dst_under_src gates rename: a directory may not be moved into its own
+// subtree.  Verify the descendant cases match and siblings / equal / ancestor /
+// unrelated do NOT (the '/' boundary must keep "/abc" out of "/ab").
+void rename_under_selftest(void) {
+    int fails = 0;
+    struct { const char* src; const char* dst; int want; const char* d; } c[] = {
+        { "/a",     "/a/b",    1, "child" },
+        { "/a",     "/a/b/c",  1, "grandchild" },
+        { "/ab",    "/ab/c",   1, "child (longer name)" },
+        { "/a",     "/a",      0, "equal -> not under" },
+        { "/ab",    "/abc",    0, "sibling sharing a prefix" },
+        { "/a/b",   "/a/bc",   0, "sibling sharing a prefix (deep)" },
+        { "/a/b",   "/a",      0, "dst is the ancestor" },
+        { "/a",     "/b",      0, "unrelated" },
+        { "/a/b/c", "/a/b/c2", 0, "sibling at depth" },
+        { "/foo",   "/foo/foo",1, "name repeated under itself" },
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = path_dst_under_src(c[i].src, c[i].dst);
+        if (got != c[i].want) {
+            kprintf_atomic("[rename_under] FAIL %s: src=%s dst=%s got=%d want=%d\n",
+                    c[i].d, c[i].src, c[i].dst, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[rename_under] SELF-TEST FAILED\n"
+                  : "[rename_under] SELF-TEST PASSED (dir-into-own-subtree rejected)\n");
+}
+#endif
 
 // ── sys_fcntl ─────────────────────────────────────────────────────────────
 // fcntl(fd, cmd, arg) → varies
@@ -3106,23 +4334,10 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
-
+    int64_t arl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (arl < 0) return (uint64_t)arl;
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
 
     // Unified lookup for both virtfs and ext2.
     {
@@ -3133,7 +4348,8 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
         // F_OK (amode==0): existence check only — no permission needed on the file itself.
         // The path walk in ext2_lookup_path checks exec on parent dirs, which is correct.
         fs_node_t fsn;
-        int fsr = fs_lookup(path, &g_current->cred, ac_need, &fsn);
+        int fsr = fs_lookup(path, &g_current->cred, ac_need, &fsn);   // normalizes path
+        if (!unveil_ok(path, UNVEIL_READ)) return (uint64_t)-ENOENT;   // sandbox: hide
         if (fsr != 0) return (uint64_t)(int64_t)fsr;
         if (fsn.is_virtual) return 0; // already fully checked
     }
@@ -3144,22 +4360,65 @@ static uint64_t sys_access(uint64_t path_ptr, uint64_t amode) {
 
 // ── sys_uname ─────────────────────────────────────────────────────────────
 // uname(utsname*) → 0 or -errno
-static void strncpy_k(char* dst, const char* src, uint64_t n) {
-    uint64_t i = 0;
-    for (; i < n - 1 && src[i]; i++) dst[i] = src[i];
-    dst[i] = '\0';
-}
+// str_lcpy (the truncating NUL copy this used to hand-roll as strncpy_k) is in
+// kstr.h -- included at the top.
 
 static uint64_t sys_uname(uint64_t buf_ptr) {
     if (!buf_ptr) return (uint64_t)-EINVAL;
+    // Zero the whole struct first: str_lcpy copies only strlen+1 bytes per
+    // field (it does NOT zero-pad like POSIX strncpy), so without this the tail
+    // of every 65-byte field after its NUL would carry stale kernel stack out to
+    // userspace (~349 bytes of an unprivileged uname() info-leak).  Same
+    // zero-then-fill discipline as sys_stat / sys_fstat.
     utsname_t u;
-    strncpy_k(u.sysname,    "MakaOS",          65);
-    strncpy_k(u.nodename,   "makaos",          65);
-    strncpy_k(u.release,    "0.1.0",           65);
-    strncpy_k(u.version,    "#1 SMP",          65);
-    strncpy_k(u.machine,    "x86_64",          65);
-    strncpy_k(u.domainname, "(none)",          65);
+    __builtin_memset(&u, 0, sizeof(u));
+    str_lcpy(u.sysname,    "MakaOS",          65);
+    str_lcpy(u.nodename,   "makaos",          65);
+    str_lcpy(u.release,    "0.1.0",           65);
+    str_lcpy(u.version,    "#1 SMP",          65);
+    str_lcpy(u.machine,    "x86_64",          65);
+    str_lcpy(u.domainname, "(none)",          65);
     return (copy_to_user((void*)buf_ptr, &u, sizeof(u)) == 0) ? 0 : (uint64_t)-EFAULT;
+}
+
+// Deterministic guard for the SCAN #10 info-leak fixes (F124 sys_readdir,
+// F125 sys_uname): an out struct copied to userspace must carry NO stale bytes
+// in its name/string tail or compiler padding.  This PINS the struct sizes (so
+// a future field-add that creates uncovered padding fails here instead of
+// silently leaking) and verifies the fixes' zero-before-fill leaves every
+// non-written byte zero.  (The live guard that the handlers actually zero is
+// code-proof + boot: svcmgr's opendir/readdir of /etc/services exercises
+// sys_readdir every boot.)
+void out_struct_zerofill_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    if (sizeof(ext2_entry_t) != 268) { kprintf_atomic("[out_zerofill] FAIL ext2_entry_t sz=%lu\n",
+                                               (unsigned long)sizeof(ext2_entry_t)); fails++; }
+    {
+        ext2_entry_t e;
+        __builtin_memset(&e, 0xAA, sizeof(e));   // stale heap
+        __builtin_memset(&e, 0,    sizeof(e));   // the F124 fix: zero before fill
+        e.name[0] = 'a'; e.name[1] = '\0';
+        e.inode_num = 42; e.size = 7; e.is_dir = 1;
+        const uint8_t* p = (const uint8_t*)&e;
+        for (uint64_t i = 2;   i < 256;       i++) if (e.name[i] != 0) { fails++; break; }  // name tail
+        for (uint64_t i = 265; i < sizeof(e); i++) if (p[i]      != 0) { fails++; break; }  // 3 pad bytes
+    }
+
+    if (sizeof(utsname_t) != 390) { kprintf_atomic("[out_zerofill] FAIL utsname_t sz=%lu\n",
+                                            (unsigned long)sizeof(utsname_t)); fails++; }
+    {
+        utsname_t u;
+        __builtin_memset(&u, 0xAA, sizeof(u));   // stale stack
+        __builtin_memset(&u, 0,    sizeof(u));   // the F125 fix: zero before fill
+        u.sysname[0] = 'M'; u.sysname[1] = '\0';
+        for (uint64_t i = 2; i < 65; i++) if (u.sysname[i] != 0) { fails++; break; }  // field tail
+        for (uint64_t i = 0; i < 65; i++) if (u.machine[i] != 0) { fails++; break; }  // untouched field
+    }
+
+    kprintf_atomic(fails ? "[out_zerofill] SELF-TEST FAILED\n"
+                  : "[out_zerofill] SELF-TEST PASSED (readdir/uname out-struct tail+padding zeroed)\n");
 }
 
 // ── sys_umask ─────────────────────────────────────────────────────────────
@@ -3254,8 +4513,8 @@ static uint64_t sys_setreuid(uint64_t ruid, uint64_t euid) {
     // Root may set any combination.
     if (!cred_is_root(c)) {
         // Non-root: new_ruid must be in {ruid, euid}, new_euid must be in {ruid, euid, suid}.
-        int ruid_ok = (new_ruid == c->ruid || new_ruid == c->euid);
-        int euid_ok = (new_euid == c->ruid || new_euid == c->euid || new_euid == c->suid);
+        int ruid_ok = (new_ruid == c->ruid || new_ruid == c->euid);   // setreuid: {real,eff}
+        int euid_ok = cred_uid_is_one_of(c, new_euid);
         if (!ruid_ok || !euid_ok) return (uint64_t)-EPERM;
     }
     // If ruid changed or euid != old ruid, update suid.
@@ -3272,8 +4531,8 @@ static uint64_t sys_setregid(uint64_t rgid, uint64_t egid) {
     uint32_t new_rgid = (rgid == (uint64_t)-1) ? c->rgid : (uint32_t)rgid;
     uint32_t new_egid = (egid == (uint64_t)-1) ? c->egid : (uint32_t)egid;
     if (!cred_is_root(c)) {
-        int rgid_ok = (new_rgid == c->rgid || new_rgid == c->egid);
-        int egid_ok = (new_egid == c->rgid || new_egid == c->egid || new_egid == c->sgid);
+        int rgid_ok = (new_rgid == c->rgid || new_rgid == c->egid);   // setregid: {real,eff}
+        int egid_ok = cred_gid_is_one_of(c, new_egid);
         if (!rgid_ok || !egid_ok) return (uint64_t)-EPERM;
     }
     if (new_rgid != c->rgid || new_egid != c->rgid)
@@ -3314,9 +4573,14 @@ static uint64_t sys_unveil(uint64_t path_ptr, uint64_t pathlen, uint64_t perms) 
     if (!g_current) return (uint64_t)-EINVAL;
     if (pathlen == 0 || pathlen >= UNVEIL_PATH_MAX) return (uint64_t)-EINVAL;
     char path[UNVEIL_PATH_MAX];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i;
-    for (i = 0; i < pathlen; i++) path[i] = upath[i];
+    // Read the path through copy_from_user (range-check + prefault), never a raw
+    // deref of path_ptr: the old `path[i] = upath[i]` loop took an unrecoverable
+    // kernel #PF (panic = unprivileged DoS) on an unmapped/kernel/non-canonical
+    // path_ptr, and copied KERNEL memory into path for a kernel-half pointer
+    // (info-exposure into the unveil entry).  pathlen is already bounded to
+    // [1, UNVEIL_PATH_MAX), so the copy and the NUL terminator stay in bounds.
+    if (copy_from_user(path, (const void*)path_ptr, pathlen) != 0)
+        return (uint64_t)-EFAULT;
     path[pathlen] = '\0';
     int r = unveil_add(&g_current->unveil, path, (uint8_t)perms);
     if (r != 0) return (uint64_t)(int64_t)r;
@@ -3383,8 +4647,9 @@ static uint64_t sys_recvfd(uint64_t sock_fd) {
     if (!received) { serial_puts_dbg("[recvfd] NULL\n"); return (uint64_t)-EAGAIN; }
 
     int64_t fd = fd_install(received);
+    if (fd < 0) { vfs_close(received); return (uint64_t)fd; }   // we own received on failure
     serial_puts_dbg("[recvfd] fd="); serial_hex_dbg((uint64_t)fd);
-    return (fd < 0) ? (uint64_t)fd : (uint64_t)fd;
+    return (uint64_t)fd;
 }
 
 // ── sys_register_policy_agent ─────────────────────────────────────────────
@@ -3429,25 +4694,49 @@ static uint64_t sys_setpgid(uint64_t pid_arg, uint64_t pgid_arg) {
     uint32_t pid  = pid_arg  ? (uint32_t)pid_arg  : g_current->pid;
     uint32_t pgid = pgid_arg ? (uint32_t)pgid_arg : pid;
 
+    // Hold rcu_read_lock across the lookup AND the field mutation: a task
+    // found via sched_find_pid is otherwise a bare pointer that a concurrent
+    // exit+task_destroy (RCU-deferred free) could free mid-update.
+    rcu_read_lock();
     task_t* t = (pid == g_current->pid) ? g_current : sched_find_pid(pid);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-
-    // Can't change pgid of a session leader.
-    if (t->pid == t->sid) return (uint64_t)-EPERM;
-
-    // Move between pgid hash buckets atomically w.r.t. signal delivery.
-    task_idx_pgid_changing(t);
-    t->pgid = pgid;
-    task_idx_pgid_changed(t);
-    return 0;
+    uint64_t ret;
+    if (!t || t->state == TASK_ZOMBIE) {
+        ret = (uint64_t)-ESRCH;
+    } else if (t != g_current && t->ppid != g_current->pid) {
+        ret = (uint64_t)-EPERM;          // POSIX: setpgid only on self or a child
+    } else if (t->sid != g_current->sid) {
+        ret = (uint64_t)-EPERM;          // target must be in the caller's session
+    } else if (t->pid == t->sid) {
+        ret = (uint64_t)-EPERM;          // can't change pgid of a session leader
+    } else {
+        // Move between pgid hash buckets atomically w.r.t. signal delivery.
+        task_idx_pgid_changing(t);
+        t->pgid = pgid;
+        task_idx_pgid_changed(t);
+        ret = 0;
+    }
+    rcu_read_unlock();
+    return ret;
 }
 
-static uint64_t sys_getpgid(uint64_t pid_arg) {
-    if (pid_arg == 0) return (uint64_t)g_current->pgid;
+// Shared getpgid/getsid: pid_arg==0 means the caller's own group/session;
+// otherwise resolve the pid under RCU (the field is read INSIDE the rcu
+// section so the task can't be freed under us) and return -ESRCH for a
+// missing or zombie task.  want_sid picks sid over pgid -- the ONLY
+// difference between the two syscalls (both are unrestricted POSIX reads).
+static uint64_t pgid_sid_lookup(uint64_t pid_arg, int want_sid) {
+    if (pid_arg == 0)
+        return (uint64_t)(want_sid ? g_current->sid : g_current->pgid);
+    rcu_read_lock();
     task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-    return (uint64_t)t->pgid;
+    uint64_t r = (!t || t->state == TASK_ZOMBIE)
+                 ? (uint64_t)-ESRCH
+                 : (uint64_t)(want_sid ? t->sid : t->pgid);
+    rcu_read_unlock();
+    return r;
 }
+
+static uint64_t sys_getpgid(uint64_t pid_arg) { return pgid_sid_lookup(pid_arg, 0); }
 
 static uint64_t sys_getpgrp(void) {
     return (uint64_t)g_current->pgid;
@@ -3470,12 +4759,7 @@ static uint64_t sys_setsid(void) {
     return (uint64_t)g_current->sid;
 }
 
-static uint64_t sys_getsid(uint64_t pid_arg) {
-    if (pid_arg == 0) return (uint64_t)g_current->sid;
-    task_t* t = sched_find_pid((uint32_t)pid_arg);
-    if (!t || t->state == TASK_ZOMBIE) return (uint64_t)-ESRCH;
-    return (uint64_t)t->sid;
-}
+static uint64_t sys_getsid(uint64_t pid_arg)  { return pgid_sid_lookup(pid_arg, 1); }
 
 // ── tcgetpgrp / tcsetpgrp ─────────────────────────────────────────────────
 static uint64_t sys_tcgetpgrp(uint64_t fd) {
@@ -3489,8 +4773,9 @@ static uint64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgid) {
     (void)fd;
     tty_t* tty = tty_get_ctty();
     if (!tty) tty = &g_tty0;
-    tty->fg_pgid = (uint32_t)pgid;
-    return 0;
+    // Authorized set (SSOT): the console/tcsetpgrp path used to set fg_pgid with
+    // NO check -> a foreign-session process could hijack console Ctrl-C/Z/\.
+    return (uint64_t)(int64_t)tty_set_fg_pgrp(tty, (uint32_t)pgid);
 }
 
 // ── sys_ioctl ─────────────────────────────────────────────────────────────
@@ -3504,6 +4789,12 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     // behaviour when the slot is empty.
     vfs_file_t* f = fdget(fd);
     if (f) {
+        // Enforce the fd's RIGHT_IOCTL capability (rights==0 = unrestricted
+        // device/kernel fd, exempt).  restrict_fd/sendfd can drop this bit;
+        // without the check the downgrade was a silent no-op.
+        if (f->rights != 0 && !rights_check(f->rights, RIGHT_IOCTL)) {
+            fdput(f); return (uint64_t)-EACCES;
+        }
         if (f->ioctl) {
             uint64_t r = (uint64_t)f->ioctl(f, request, arg);
             fdput(f);
@@ -3537,20 +4828,34 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
         uint32_t pg = 0;
         if (copy_from_user(&pg, (const void*)arg, sizeof(pg)) != 0)
             return (uint64_t)-EFAULT;
-        tty->fg_pgid = pg;
+        return (uint64_t)(int64_t)tty_set_fg_pgrp(tty, pg);   // authorized (SSOT)
+    }
+    case TCGETS: {
+        // Snapshot under tty->lock, then copy out: never hand userland a struct
+        // torn by a concurrent TCSET*, and keep copy_to_user off the live one.
+        termios_t snap;
+        tty_get_termios(tty, &snap);
+        return (copy_to_user((void*)arg, &snap, sizeof(snap)) == 0)
+               ? 0 : (uint64_t)-EFAULT;
+    }
+    case TCSETS:
+    case TCSETSW: {
+        // Copy into a stack local first (copy_from_user can fault; tty->lock is
+        // a preempt-disabled spinlock), then publish under the lock so a
+        // concurrent lock-free termios reader never sees a half-written struct.
+        termios_t tmp;
+        if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)) != 0)
+            return (uint64_t)-EFAULT;
+        tty_set_termios(tty, &tmp);
         return 0;
     }
-    case TCGETS:
-        return (copy_to_user((void*)arg, &tty->termios, sizeof(tty->termios)) == 0)
-               ? 0 : (uint64_t)-EFAULT;
-    case TCSETS:
-    case TCSETSW:
-        return (copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios)) == 0)
-               ? 0 : (uint64_t)-EFAULT;
     case TCSETSF: {
-        int r = copy_from_user(&tty->termios, (const void*)arg, sizeof(tty->termios));
+        termios_t tmp;
+        if (copy_from_user(&tmp, (const void*)arg, sizeof(tmp)) != 0)
+            return (uint64_t)-EFAULT;  // bad pointer: do not mutate or flush
+        tty_set_termios(tty, &tmp);
         tty_flush_input(tty);
-        return (r == 0) ? 0 : (uint64_t)-EFAULT;
+        return 0;
     }
     case TCSBRK:
     case TCXONC:
@@ -3563,12 +4868,38 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg) {
     case TIOCSCTTY:
         tty_set_ctty(tty);
         return 0;
-    case TIOCGSERIAL:
-        if (arg) {
-            uint8_t* p = (uint8_t*)arg;
-            __builtin_memset(p, 0, 60);
+    case TIOCSCONSOWN: {
+        // Session handover: only root (login) may re-own the terminal.
+        if (!cred_is_root(&g_current->cred)) return (uint64_t)-EPERM;
+        tty_set_owner(tty, (uint32_t)arg);
+        // tty_set_owner revoked EVERY fd on this tty, including the caller's
+        // own console handles.  The caller IS the session manager, so re-validate
+        // its handles -- otherwise login would hang up on itself and could never
+        // print the next prompt.
+        task_files_t* tfo = g_current->files_shared;
+        if (tfo) {
+            spin_lock(&tfo->lock);
+            for (uint32_t i = 0; i < tfo->ft->cap; i++) {
+                vfs_file_t* cf = tfo->ft->fd_table[i];
+                if (cf && tty_file_is(cf, tty)) tty_fd_resync(cf);
+            }
+            spin_unlock(&tfo->lock);
         }
         return 0;
+    }
+    case TIOCGSERIAL: {
+        // Stub: report an all-zero serial_struct (60 bytes).  arg is a raw user
+        // pointer -- a raw memset here was an arbitrary-kernel-address 60-byte
+        // zero-write (LPE: zero a cred/funcptr/lock) and a #PF panic on an unmapped
+        // target.  Route through copy_to_user (_access_ok + prefault) like every
+        // sibling case above, so a kernel/non-canonical/unmapped arg fails -EFAULT.
+        if (arg) {
+            uint8_t zero[60] = {0};
+            if (copy_to_user((void*)arg, zero, sizeof(zero)) != 0)
+                return (uint64_t)-EFAULT;
+        }
+        return 0;
+    }
     default:
         return (uint64_t)-EINVAL;
     }
@@ -3603,21 +4934,30 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     if (!g_current) return (uint64_t)-EINVAL;
     if (nfds > FD_SETSIZE) return (uint64_t)-EINVAL;
 
+    // Read the input fd_sets through copy_from_user (== _access_ok + prefault).
+    // A raw deref of rset_ptr/wset_ptr/eset_ptr would be an arbitrary kernel
+    // read (a kernel address makes the selected bits observable in the returned
+    // output sets) and a kernel-fault DoS on a bad pointer -- the input twin of
+    // sys_poll's already-hardened copy_from_user path.  NULL = empty set.
     fd_set_t rset, wset, eset;
     fd_set_t rout, wout, eout;
-    for (int i = 0; i < (int)(FD_SETSIZE/64); i++) {
-        rset.bits[i] = rset_ptr ? ((fd_set_t*)rset_ptr)->bits[i] : 0;
-        wset.bits[i] = wset_ptr ? ((fd_set_t*)wset_ptr)->bits[i] : 0;
-        eset.bits[i] = eset_ptr ? ((fd_set_t*)eset_ptr)->bits[i] : 0;
-        rout.bits[i] = wout.bits[i] = eout.bits[i] = 0;
-    }
+    if (rset_ptr) { if (copy_from_user(&rset, (const void*)rset_ptr, sizeof(rset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&rset, 0, sizeof(rset));
+    if (wset_ptr) { if (copy_from_user(&wset, (const void*)wset_ptr, sizeof(wset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&wset, 0, sizeof(wset));
+    if (eset_ptr) { if (copy_from_user(&eset, (const void*)eset_ptr, sizeof(eset)) != 0) return (uint64_t)-EFAULT; }
+    else __builtin_memset(&eset, 0, sizeof(eset));
+    __builtin_memset(&rout, 0, sizeof(rout));
+    __builtin_memset(&wout, 0, sizeof(wout));
+    __builtin_memset(&eout, 0, sizeof(eout));
 
     // Determine timeout in nanoseconds (NULL = infinite).
     int sel_infinite = 1;
     uint64_t timeout_ns = 0;
     if (tv_ptr) {
         k_timeval_t tv;
-        copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv));
+        if (copy_from_user(&tv, (const void*)tv_ptr, sizeof(tv)) != 0)
+            return (uint64_t)-EFAULT;   // was: ignored -> used uninitialized tv
         timeout_ns = (uint64_t)tv.tv_sec * 1000000000ULL
                    + (uint64_t)tv.tv_usec * 1000ULL;
         sel_infinite = 0;
@@ -3627,23 +4967,39 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
     uint64_t deadline = sel_infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // Pin buffer: one vfs_file_t* slot per fd, reused each iteration.  fdget
+    // bumps each polled file's refcount (or returns NULL if closed/dying), so
+    // neither the readiness scan nor the wait-queue registration below can
+    // deref/register on a file a sibling thread (THREAD_SHARE_FILES) frees via
+    // close() -- close synchronously kfree's the eventfd/timerfd/pipe state
+    // INCLUDING its embedded waitq, which our wait_group_cleanup would otherwise
+    // walk after the free (use-after-free).  epoll pins its watched file the
+    // same way (F60); poll/select did not.
+    vfs_file_t** sel_pin =
+        (vfs_file_t**)kmalloc((nfds ? nfds : 1) * sizeof(vfs_file_t*));
+    if (!sel_pin) return (uint64_t)-ENOMEM;
+
     do {
+        // Pin every fd referenced by the set for this iteration.
+        for (uint32_t fd = 0; fd < nfds; fd++)
+            sel_pin[fd] = (FD_ISSET(fd, &rset) || FD_ISSET(fd, &wset) ||
+                           FD_ISSET(fd, &eset)) ? fdget(fd) : NULL;
+
         count = 0;
-        task_files_t* files = g_current->files_shared;
         for (uint32_t fd = 0; fd < nfds; fd++) {
-            vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+            vfs_file_t* f = sel_pin[fd];   // pinned (NULL if closed)
             if (FD_ISSET(fd, &rset) && fd_is_readable(f)) {
                 rout.bits[fd/64] |= (1ULL << (fd%64)); count++;
             }
             if (FD_ISSET(fd, &wset) && fd_is_writable(f)) {
                 wout.bits[fd/64] |= (1ULL << (fd%64)); count++;
             }
-            if (FD_ISSET(fd, &eset)) {
-                // No exceptional conditions in our model.
-            }
+            // eset: no exceptional conditions in our model.
         }
-        if (count > 0) break;
-        if (!sel_infinite && timeout_ns == 0) break;
+        if (count > 0 || (!sel_infinite && timeout_ns == 0)) {
+            for (uint32_t fd = 0; fd < nfds; fd++) fdput(sel_pin[fd]);
+            break;
+        }
 
         // 2*nfds worst case (primary + secondary waitq per fd).  Allocate
         // both the task_we_t[] and wait_queue_t*[] in one buffer.
@@ -3658,9 +5014,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             wait_group_init(&wg, wes, wqs, sel_nslots);
 
             for (uint32_t fd = 0; fd < nfds; fd++) {
-                if (!FD_ISSET(fd, &rset) && !FD_ISSET(fd, &wset) &&
-                    !FD_ISSET(fd, &eset)) continue;
-                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+                vfs_file_t* f = sel_pin[fd];
                 if (!f) continue;
                 wait_group_add(&wg, f->waitq, g_current);
                 wait_group_add(&wg, f->secondary_waitq, g_current);
@@ -3669,8 +5023,7 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             // Re-check after registering — close race between first check and add.
             int sel_recheck = 0;
             for (uint32_t fd = 0; fd < nfds && !sel_recheck; fd++) {
-                vfs_file_t* f = (fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-                if (!f) continue;
+                vfs_file_t* f = sel_pin[fd];
                 if ((FD_ISSET(fd, &rset) && fd_is_readable(f)) ||
                     (FD_ISSET(fd, &wset) && fd_is_writable(f))) sel_recheck = 1;
             }
@@ -3682,7 +5035,11 @@ static uint64_t sys_select(uint64_t nfds, uint64_t rset_ptr, uint64_t wset_ptr,
             wait_group_cleanup(&wg);
             kfree(sel_buf);
         }
+        // Unpin every file pinned this iteration (fdput(NULL) is safe).
+        for (uint32_t fd = 0; fd < nfds; fd++) fdput(sel_pin[fd]);
     } while (sel_infinite || tsc_read_ns() < deadline);
+
+    kfree(sel_pin);
 
     // Write back output sets.
     if (rset_ptr) copy_to_user((void*)rset_ptr, &rout, sizeof(rout));
@@ -3698,34 +5055,62 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
     if (!g_current || !fds_ptr) return (uint64_t)-EINVAL;
     if (nfds > 1024) return (uint64_t)-EINVAL;
 
-    pollfd_t* ufds = (pollfd_t*)fds_ptr;
-    task_files_t* files = g_current->files_shared;
-
     int infinite = (timeout_ms == (uint64_t)-1);
     uint64_t timeout_ns = infinite ? 0 : (timeout_ms * 1000000ULL);
     extern uint64_t tsc_read_ns(void);
     uint64_t deadline = infinite ? UINT64_MAX : (tsc_read_ns() + timeout_ns);
     int count = 0;
 
+    // Copy the user pollfd array into a kernel buffer instead of dereferencing
+    // the user pointer directly.  copy_from_user validates the whole range
+    // (_access_ok + prefault), so a bad/kernel/non-canonical fds pointer now
+    // returns -EFAULT rather than faulting the kernel, or worse granting an
+    // arbitrary kernel read/write through the fds pointer (up to nfds*8).  The
+    // copy also keeps the per-iteration re-poll off the user pointer.
+    pollfd_t* kfds = NULL;
+    uint64_t  fds_bytes = nfds * sizeof(pollfd_t);
+    if (nfds > 0) {
+        kfds = (pollfd_t*)kmalloc(fds_bytes);
+        if (!kfds) return (uint64_t)-ENOMEM;
+        if (copy_from_user(kfds, (const void*)fds_ptr, fds_bytes) != 0) {
+            kfree(kfds);
+            return (uint64_t)-EFAULT;
+        }
+    }
+
+    // Pin buffer: one vfs_file_t* slot per pollfd entry, reused each iteration.
+    // fdget keeps each polled file alive across the readiness scan + waitq
+    // registration so a sibling close() cannot free the embedded waitq under our
+    // wait_group_cleanup (use-after-free).  See sys_select / epoll (F60).
+    vfs_file_t** p_pin =
+        (vfs_file_t**)kmalloc((nfds ? nfds : 1) * sizeof(vfs_file_t*));
+    if (!p_pin) { if (kfds) kfree(kfds); return (uint64_t)-ENOMEM; }
+
     do {
+        // Pin every polled fd for this iteration (NULL = closed/dying -> POLLNVAL).
+        for (uint64_t i = 0; i < nfds; i++)
+            p_pin[i] = (kfds[i].fd >= 0) ? fdget((uint64_t)kfds[i].fd) : NULL;
+
         count = 0;
         for (uint64_t i = 0; i < nfds; i++) {
-            ufds[i].revents = 0;
-            int fd = ufds[i].fd;
+            kfds[i].revents = 0;
+            int fd = kfds[i].fd;
             if (fd < 0) continue;
-            vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
-            if (!f) { ufds[i].revents = POLLNVAL; count++; continue; }
+            vfs_file_t* f = p_pin[i];
+            if (!f) { kfds[i].revents = POLLNVAL; count++; continue; }
 
             uint16_t rev = 0;
-            if ((ufds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
-            if ((ufds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
+            if ((kfds[i].events & POLLIN)  && fd_is_readable(f))  rev |= POLLIN;
+            if ((kfds[i].events & POLLOUT) && fd_is_writable(f)) rev |= POLLOUT;
             // POLLHUP and POLLERR are always reported, regardless of the
             // caller's events mask (POSIX requirement).
             if (fd_has_hup(f)) rev |= POLLHUP;
-            if (rev) { ufds[i].revents = rev; count++; }
+            if (rev) { kfds[i].revents = rev; count++; }
         }
-        if (count > 0) break;
-        if (timeout_ms == 0) break;
+        if (count > 0 || timeout_ms == 0) {
+            for (uint64_t i = 0; i < nfds; i++) fdput(p_pin[i]);
+            break;
+        }
 
         uint32_t p_nslots = (uint32_t)nfds * 2;
         size_t   p_bytes  = p_nslots * (sizeof(task_we_t) + sizeof(wait_queue_t*));
@@ -3738,10 +5123,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             wait_group_init(&wg, wes, wqs, p_nslots);
 
             for (uint64_t i = 0; i < nfds; i++) {
-                int fd = ufds[i].fd;
-                if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->ft->cap)
-                                ? files->ft->fd_table[fd] : NULL;
+                vfs_file_t* f = p_pin[i];
                 if (!f) continue;
                 wait_group_add(&wg, f->waitq, g_current);
                 wait_group_add(&wg, f->secondary_waitq, g_current);
@@ -3749,14 +5131,12 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
 
             // Re-check after registering — close race between first check and add.
             int recheck = 0;
-            for (uint64_t i = 0; i < nfds; i++) {
-                int fd = ufds[i].fd;
-                if (fd < 0) continue;
-                vfs_file_t* f = ((uint32_t)fd < files->ft->cap) ? files->ft->fd_table[fd] : NULL;
+            for (uint64_t i = 0; i < nfds && !recheck; i++) {
+                vfs_file_t* f = p_pin[i];
                 if (!f) continue;
-                if (((ufds[i].events & POLLIN)  && fd_is_readable(f)) ||
-                    ((ufds[i].events & POLLOUT) && fd_is_writable(f)) ||
-                    fd_has_hup(f)) { recheck = 1; break; }
+                if (((kfds[i].events & POLLIN)  && fd_is_readable(f)) ||
+                    ((kfds[i].events & POLLOUT) && fd_is_writable(f)) ||
+                    fd_has_hup(f)) recheck = 1;
             }
             if (!recheck) {
                 g_current->sleep_until_ns = infinite ? 0 : deadline;
@@ -3766,8 +5146,18 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms) {
             wait_group_cleanup(&wg);
             kfree(p_buf);
         }
+        // Unpin every file pinned this iteration (fdput(NULL) is safe).
+        for (uint64_t i = 0; i < nfds; i++) fdput(p_pin[i]);
     } while (infinite || tsc_read_ns() < deadline);
 
+    kfree(p_pin);
+
+    // Publish the resulting revents back to user space (best-effort: the array
+    // was already validated on the way in via copy_from_user).
+    if (nfds > 0) {
+        copy_to_user((void*)fds_ptr, kfds, fds_bytes);
+        kfree(kfds);
+    }
     return (uint64_t)(int64_t)count;
 }
 
@@ -3814,6 +5204,13 @@ typedef struct {
     // the next wake walks into our RCU-freed w → #GP.
     wait_queue_t* wq1;
     wait_queue_t* wq2;
+    // Pinned reference to the watched vfs_file_t (vfs_tryget at register,
+    // vfs_close at unregister).  Without it, closing the watched fd before
+    // the epoll fd freed an fd whose waitq is EMBEDDED in the object (pipe
+    // f->_waitq, eventfd s->read_wq, unix sock, pty master_waitq) -- so wq1/wq2
+    // dangled into freed memory and epoll_we_remove walked it (UAF).  Holding
+    // the ref keeps the file (and its embedded waitq) alive until we unlink.
+    struct vfs_file_t* file;
 } epoll_watch_t;
 
 typedef struct {
@@ -3836,6 +5233,12 @@ typedef struct {
     // call f->poll, or kmalloc while holding it (though we still avoid
     // copy_to_user under the lock to minimise hold time).
     spinlock_t      lock;
+    // Back-pointer to the epoll fd's own vfs_file_t (the one whose _waitq is
+    // file_wq).  Used by epoll_state_free_rcu so the deferred free reclaims the
+    // file in the SAME grace period as the state -- a watched fd's IRQ-context
+    // epoll_wake_func derefs both (ewe->epoll_wq/p_has_ready into the state,
+    // ewe->file_wq into this file), so neither may be freed synchronously.
+    struct vfs_file_t* file;
 } epoll_state_t;
 
 // Hash table helpers.  Key = fd (int32_t, always ≥ 0).
@@ -3886,6 +5289,12 @@ static int ep_grow(epoll_state_t* st, uint32_t new_cap) {
 // Register/unregister persistent epoll_we_t entries on the watched fd's queues.
 static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
                                   vfs_file_t* f) {
+    // Pin the watched file for the watch's lifetime so its (possibly embedded)
+    // waitq cannot be freed while our entries are linked on it.  vfs_tryget
+    // CAS-bumps from non-zero; if the file is concurrently being closed it
+    // returns NULL and we register nothing (the watch stays inert until DEL).
+    w->file = vfs_tryget(f);
+    if (!w->file) { w->wq1 = NULL; w->wq2 = NULL; w->has_entry2 = 0; return; }
     epoll_we_init(&w->entry, &state->wq, &state->has_ready, state->file_wq);
     epoll_we_add(f->waitq, &w->entry);
     w->wq1 = f->waitq;
@@ -3900,17 +5309,16 @@ static void epoll_watch_register(epoll_state_t* state, epoll_watch_t* w,
     }
 }
 
-static void epoll_watch_unregister(epoll_watch_t* w, vfs_file_t* f) {
-    // Use the saved waitq pointers, not f->waitq — f may already be
-    // freed if the target fd was closed before the epoll fd.  Without
-    // this, our entries stay linked on global waitqs (g_mouse_waitq,
-    // pty master_waitq, …) and the next wake walks freed-w memory.
-    (void)f;
+static void epoll_watch_unregister(epoll_watch_t* w) {
+    // Use the saved waitq pointers (wq1/wq2), which are valid because the
+    // pinned file (w->file) kept the embedded waitq alive.  Then drop the pin
+    // -- freeing the file only now, after our entries are unlinked.
     if (w->wq1)                  epoll_we_remove(w->wq1, &w->entry);
     if (w->has_entry2 && w->wq2) epoll_we_remove(w->wq2, &w->entry2);
     w->wq1 = NULL;
     w->wq2 = NULL;
     w->has_entry2 = 0;
+    if (w->file) { vfs_close(w->file); w->file = NULL; }
 }
 
 // RCU free helper for epoll_watch_t.  An epoll_watch_t's entry/entry2
@@ -3923,9 +5331,23 @@ static void epoll_watch_free_rcu(void* data) {
     kfree(data);
 }
 
-// RCU free helper for epoll_state_t (closing epoll fd).  The state is
-// referenced by every epoll_we_t as `ewe->p_has_ready = &state->has_ready`
-// and `ewe->epoll_wq = &state->wq`.  A concurrent wait_queue_wake_all
+// RCU free helper for epoll_state_t + its slots + the epoll vfs_file_t.  Every
+// epoll_we_t holds `ewe->p_has_ready = &state->has_ready`, `ewe->epoll_wq =
+// &state->wq` (both inside the state) and `ewe->file_wq = &state->file->_waitq`
+// (inside the file).  A concurrent wait_queue_wake_all on another CPU -- an
+// IRQ-context wake from a watched fd, drained as an RCU reader inside
+// epoll_wake_func -- derefs these AFTER epoll_close unregisters the watches, so
+// freeing them synchronously is a use-after-free (and a controllable indirect
+// call through the freed waitq chain).  Defer all three to a grace period, the
+// same way epoll_watch_free_rcu defers the watch, so the wake drainer has left
+// its RCU reader section before the memory is reclaimed.
+static void epoll_state_free_rcu(void* data) {
+    epoll_state_t* state = (epoll_state_t*)data;
+    kfree(state->slots);
+    if (state->file) kfree(state->file);
+    kfree(state);
+}
+
 // VFS ops for the epoll fd itself.
 static int64_t epoll_read (vfs_file_t* self, void* buf, uint64_t len) {
     (void)self; (void)buf; (void)len; return (int64_t)-EINVAL;
@@ -3974,9 +5396,18 @@ static int epoll_poll(vfs_file_t* self, int events) {
     for (uint32_t i = 0; i < st->cap && !ready; i++) {
         epoll_watch_t* w = st->slots[i];
         if (!w || w == EPOLL_DELETED) continue;
-        vfs_file_t* f = ((uint32_t)w->fd < files->ft->cap)
-                        ? files->ft->fd_table[w->fd] : NULL;
-        if (!f) { ready = 1; break; }   // dangling fd → EPOLLERR|EPOLLHUP pending
+        // Poll the PINNED watched file (w->file), never the raw fd_table entry:
+        // a concurrent close() on another thread of a shared files table could
+        // free the fd_table file under f->poll() (a UAF / freed-fnptr call).
+        // w->file is held by a vfs_tryget pin and cannot be freed during this
+        // scan (epoll_watch_unregister, which drops the pin, runs under
+        // state->lock).  fd_table[w->fd] is read only as a POINTER VALUE (never
+        // dereferenced) to detect that the fd no longer maps to our file
+        // (closed/reused) -> dangling fd.
+        vfs_file_t* cur = ((uint32_t)w->fd < files->ft->cap)
+                          ? files->ft->fd_table[w->fd] : NULL;
+        vfs_file_t* f = w->file;
+        if (!f || cur != f) { ready = 1; break; }   // dangling fd → EPOLLERR|EPOLLHUP pending
         if (f->poll) {
             if (((w->events & EPOLLIN)  && f->poll(f, POLLIN))  ||
                 ((w->events & EPOLLOUT) && f->poll(f, POLLOUT)) ||
@@ -3993,21 +5424,24 @@ static int epoll_poll(vfs_file_t* self, int events) {
     return ready;
 }
 static void epoll_close(vfs_file_t* self) {
-    if (self->ctx) {
-        epoll_state_t* state = (epoll_state_t*)self->ctx;
-        task_files_t* files = g_current ? g_current->files_shared : NULL;
+    epoll_state_t* state = self->ctx ? (epoll_state_t*)self->ctx : NULL;
+    if (state) {
         for (uint32_t i = 0; i < state->cap; i++) {
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
-            vfs_file_t* f = (files && (uint32_t)w->fd < files->ft->cap)
-                            ? files->ft->fd_table[w->fd] : NULL;
-            epoll_watch_unregister(w, f);
+            epoll_watch_unregister(w);   // uses w->file pin, not a fresh lookup
             call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
         }
-        kfree(state->slots);
-        kfree(state);
+        // state->slots, state, AND self are still referenced by any in-flight
+        // epoll_wake_func (ewe->p_has_ready/epoll_wq point into state,
+        // ewe->file_wq into self) running as an RCU reader on another CPU.
+        // Unregister above stopped NEW wakes; defer the free of all three
+        // (self via state->file) to a grace period so the drainer finishes
+        // first -- a synchronous kfree here would be a cross-CPU UAF.
+        call_rcu_expedited(epoll_state_free_rcu, state);
+    } else {
+        kfree(self);   // no epoll state -> nothing holds self's waitq
     }
-    kfree(self);
 }
 
 // epoll_create1(flags) → fd or -errno
@@ -4029,24 +5463,16 @@ static uint64_t sys_epoll_create(uint64_t flags) {
     spin_lock_init(&state->lock);
     wait_queue_init(&state->wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) { kfree(state->slots); kfree(state); return (uint64_t)-ENOMEM; }
-    __builtin_memset(f, 0, sizeof(*f));
-
-    f->read           = epoll_read;
-    f->write          = epoll_write;
-    f->close          = epoll_close;
-    f->seek           = epoll_seek;
-    f->poll           = epoll_poll;   // nested epoll: real readiness, not always-on
-    f->ioctl          = NULL;
-    f->ctx            = state;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    state->file_wq     = f->waitq;    // wake target for outer epolls (see epoll_we_t)
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount       = 1;
-    f->rights         = 0;
-    f->path[0]        = '\0';
+    f->read  = epoll_read;
+    f->write = epoll_write;
+    f->close = epoll_close;
+    f->seek  = epoll_seek;
+    f->poll  = epoll_poll;   // nested epoll: real readiness, not always-on
+    f->ctx   = state;
+    state->file_wq = f->waitq;    // wake target for outer epolls (factory set waitq=&_waitq)
+    state->file    = f;           // for the RCU-deferred free (epoll_state_free_rcu)
 
     int64_t efd = fd_install(f);
     if (efd < 0) { epoll_close(f); return (uint64_t)(int64_t)efd; }
@@ -4058,41 +5484,52 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
                                uint64_t event_ptr) {
     if (!g_current) return (uint64_t)-EINVAL;
 
-    vfs_file_t* ef = fd_to_file(epfd);
-    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the epoll file so a sibling thread's
+    // close(epfd) cannot epoll_close()->kfree the eventpoll struct under
+    // us mid-op (the switch holds state across kmalloc and registration).
+    // fdput on every exit via the single goto out.
+    vfs_file_t* ef = fdget(epfd);
+    if (!ef) return (uint64_t)-EBADF;
+    if (ef->close != epoll_close) { fdput(ef); return (uint64_t)-EBADF; }
     epoll_state_t* state = (epoll_state_t*)ef->ctx;
+    int32_t tfd = (int32_t)fd;
+    task_files_t* files = g_current->files_shared;
+    uint64_t ret;
 
     epoll_event_t ev;
     if (op != EPOLL_CTL_DEL) {
-        if (!event_ptr) return (uint64_t)-EINVAL;
-        if (copy_from_user(&ev, (const void*)event_ptr, sizeof(ev)) != 0)
-            return (uint64_t)-EFAULT;
+        if (!event_ptr) { ret = (uint64_t)-EINVAL; goto out; }
+        if (copy_from_user(&ev, (const void*)event_ptr, sizeof(ev)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
     }
 
-    int32_t tfd = (int32_t)fd;
-    task_files_t* files = g_current->files_shared;
-
     spin_lock(&state->lock);
-    uint64_t ret;
     switch (op) {
     case EPOLL_CTL_ADD: {
         if (ep_find(state, tfd) < state->cap) { ret = (uint64_t)-EEXIST; break; }
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
+        // fdget pins the watched fd so a sibling close(tfd) cannot free+reuse
+        // it in the window before epoll_watch_register's vfs_tryget; fdput
+        // after register, which takes its own independent w->file ref.
+        vfs_file_t* wf = fdget(tfd);
         if (!wf) { ret = (uint64_t)-EBADF; break; }
         // Grow if at 75% load.
         if (state->count * 4u >= state->cap * 3u) {
-            if (ep_grow(state, state->cap * 2u) < 0) { ret = (uint64_t)-ENOMEM; break; }
+            if (ep_grow(state, state->cap * 2u) < 0) {
+                fdput(wf); ret = (uint64_t)-ENOMEM; break;
+            }
         }
         epoll_watch_t* w = (epoll_watch_t*)kmalloc(sizeof(epoll_watch_t));
-        if (!w) { ret = (uint64_t)-ENOMEM; break; }
+        if (!w) { fdput(wf); ret = (uint64_t)-ENOMEM; break; }
         w->fd         = tfd;
         w->events     = ev.events;
         w->data       = ev.data;
         w->has_entry2 = 0;
         w->wq1        = NULL;
         w->wq2        = NULL;
-        epoll_watch_register(state, w, wf);
+        w->file       = NULL;
+        epoll_watch_register(state, w, wf);   // takes its own w->file ref
+        fdput(wf);                            // drop our pin; the watch holds its own
         ep_ht_insert_raw(state->slots, state->cap, w);
         state->count++;
         ret = 0;
@@ -4102,9 +5539,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
-        epoll_watch_unregister(w, wf);
+        epoll_watch_unregister(w);   // uses w->file pin, drops it
         state->slots[idx] = EPOLL_DELETED;
         state->count--;
         call_rcu_expedited(epoll_watch_free_rcu, w);  // user-syscall latency
@@ -4115,12 +5550,16 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         uint32_t idx = ep_find(state, tfd);
         if (idx >= state->cap) { ret = (uint64_t)-ENOENT; break; }
         epoll_watch_t* w = state->slots[idx];
-        vfs_file_t* wf = ((uint32_t)tfd < files->ft->cap)
-                         ? files->ft->fd_table[tfd] : NULL;
-        epoll_watch_unregister(w, wf);
+        // fdget pins the watched fd across the re-register (same reason as ADD);
+        // NULL (tfd closed/dying) just leaves the watch unregistered, as before.
+        vfs_file_t* wf = fdget(tfd);
+        epoll_watch_unregister(w);   // drops the old pin + entries
         w->events = ev.events;
         w->data   = ev.data;
-        if (wf) epoll_watch_register(state, w, wf);
+        if (wf) {
+            epoll_watch_register(state, w, wf);   // takes its own w->file ref
+            fdput(wf);                            // drop our pin
+        }
         ret = 0;
         break;
     }
@@ -4129,8 +5568,63 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
         break;
     }
     spin_unlock(&state->lock);
+out:
+    fdput(ef);
     return ret;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the epoll watched-file pin (the UAF fix): a watched
+// file whose waitq is EMBEDDED in the object (like eventfd/pipe) must survive
+// the user's close() while an epoll watch is registered, so unregister's
+// epoll_we_remove operates on valid memory.  Mirrors pipe/unix refcount tests.
+static void ep_test_file_close(vfs_file_t* self) { kfree(self); }
+
+void epoll_watch_refcount_selftest(void) {
+    int fails = 0;
+
+    // A heap vfs_file_t with an embedded waitq + refcount 1 -- the UAF-prone
+    // shape (its waitq memory would be freed on the last vfs_close).
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
+    if (!f) { kprintf_atomic("[epoll_pin] FAIL alloc\n");
+              kprintf_atomic("[epoll_pin] SELF-TEST FAILED\n"); return; }
+    f->close = ep_test_file_close;
+
+    epoll_state_t st;
+    __builtin_memset(&st, 0, sizeof(st));
+    wait_queue_init(&st.wq);
+    st.file_wq  = &st.wq;
+    st.has_ready = 0;
+
+    epoll_watch_t w;
+    __builtin_memset(&w, 0, sizeof(w));
+    w.fd = 7; w.events = 0; w.wq1 = NULL; w.wq2 = NULL; w.has_entry2 = 0; w.file = NULL;
+
+    epoll_watch_register(&st, &w, f);          // pins f
+    if (w.file != f || f->refcount != 2u) {
+        kprintf_atomic("[epoll_pin] FAIL register: file=%p rc=%lu\n",
+                (void*)w.file, (unsigned long)f->refcount);
+        fails++;
+    }
+
+    // The user closes the watched fd while the watch is live.  The pin must
+    // keep f (and its embedded waitq) alive -- pre-fix this freed f and left
+    // w.wq1 dangling for the unregister below.
+    vfs_close(f);                              // 2 -> 1, NOT freed
+    if (f->refcount != 1u) {
+        kprintf_atomic("[epoll_pin] FAIL post-close rc=%lu (file freed under us)\n",
+                (unsigned long)f->refcount);
+        fails++;
+    }
+
+    // Unregister unlinks our entry from the still-valid waitq, then drops the
+    // pin -> 1 -> 0 -> ep_test_file_close frees f.  (Do NOT touch f after.)
+    epoll_watch_unregister(&w);
+
+    kprintf_atomic(fails ? "[epoll_pin] SELF-TEST FAILED\n"
+                  : "[epoll_pin] SELF-TEST PASSED (watched file pinned across close)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
 
 // epoll_wait(epfd, events_ptr, maxevents, timeout_ms) → count or -errno
 static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
@@ -4138,12 +5632,17 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     if (!g_current) return (uint64_t)-EINVAL;
     if (!events_ptr || maxevents == 0 || maxevents > 1024) return (uint64_t)-EINVAL;
 
-    vfs_file_t* ef = fd_to_file(epfd);
-    if (!ef || ef->close != epoll_close) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the epoll file so a sibling thread's
+    // close(epfd) cannot epoll_close()->kfree the eventpoll struct while
+    // we sleep on state->wq below.  fdput on every exit via goto out.
+    vfs_file_t* ef = fdget(epfd);
+    if (!ef) return (uint64_t)-EBADF;
+    if (ef->close != epoll_close) { fdput(ef); return (uint64_t)-EBADF; }
     epoll_state_t* state = (epoll_state_t*)ef->ctx;
 
     task_files_t* files = g_current->files_shared;
     epoll_event_t* uevents = (epoll_event_t*)events_ptr;
+    uint64_t ret;
 
     int infinite = (timeout_ms == (uint64_t)-1);
     extern uint64_t tsc_read_ns(void);
@@ -4158,7 +5657,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     // above, so the allocation is at most 16 KiB.
     epoll_event_t* kevents = (epoll_event_t*)kmalloc(
         (uint64_t)maxevents * sizeof(epoll_event_t));
-    if (!kevents) return (uint64_t)-ENOMEM;
+    if (!kevents) { ret = (uint64_t)-ENOMEM; goto out; }
 
     // One task_we_t on the epoll's own wq — stack allocated, zero per-wakeup alloc.
     task_we_t task_we;
@@ -4170,10 +5669,14 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
             epoll_watch_t* w = state->slots[i];
             if (!w || w == EPOLL_DELETED) continue;
             int32_t wfd = w->fd;
-
-            vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
-                            ? files->ft->fd_table[wfd] : NULL;
-            if (!f) {
+            // Poll the PINNED w->file (UAF-safe under state->lock), never the
+            // raw fd_table entry which a concurrent close could free under
+            // f->poll().  fd_table[wfd] is read only as a pointer value to
+            // detect that the fd was closed/reused (no longer maps to our file).
+            vfs_file_t* cur = ((uint32_t)wfd < files->ft->cap)
+                              ? files->ft->fd_table[wfd] : NULL;
+            vfs_file_t* f = w->file;
+            if (!f || cur != f) {
                 kevents[count].events = EPOLLERR | EPOLLHUP;
                 kevents[count].data   = w->data;
                 count++;
@@ -4243,9 +5746,12 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
                 epoll_watch_t* w = state->slots[i];
                 if (!w || w == EPOLL_DELETED) continue;
                 int32_t wfd = w->fd;
-                vfs_file_t* f = ((uint32_t)wfd < files->ft->cap)
-                                ? files->ft->fd_table[wfd] : NULL;
-                if (!f || !f->poll) continue;
+                // Poll the pinned w->file (UAF-safe); fd_table[wfd] read only as
+                // a pointer value to detect close/reuse (see the primary scan).
+                vfs_file_t* cur = ((uint32_t)wfd < files->ft->cap)
+                                  ? files->ft->fd_table[wfd] : NULL;
+                vfs_file_t* f = w->file;
+                if (!f || cur != f || !f->poll) continue;
                 uint32_t mask = w->events;
                 if ((mask & EPOLLIN)  && f->poll(f, POLLIN))  ep_recheck = 1;
                 if ((mask & EPOLLOUT) && f->poll(f, POLLOUT)) ep_recheck = 1;
@@ -4266,12 +5772,14 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
     if (count > 0) {
         if (copy_to_user(uevents, kevents,
                           (uint64_t)count * sizeof(epoll_event_t)) != 0) {
-            kfree(kevents);
-            return (uint64_t)-EFAULT;
+            ret = (uint64_t)-EFAULT; goto out;
         }
     }
-    kfree(kevents);
-    return (uint64_t)(int64_t)count;
+    ret = (uint64_t)(int64_t)count;
+out:
+    if (kevents) kfree(kevents);
+    fdput(ef);
+    return ret;
 }
 
 // ── sys_readlink ──────────────────────────────────────────────────────────
@@ -4287,7 +5795,12 @@ static uint64_t sys_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t bufsz
     const char* target = "/bin/bash";
     uint64_t tlen = 0; while (target[tlen]) tlen++;
     if (tlen > bufsz) tlen = bufsz;
-    copy_to_user((void*)buf_ptr, target, tlen);
+    // Propagate a faulted destination as -EFAULT instead of reporting a
+    // successful byte count: a caller passing a bad/unmapped buf must not
+    // believe the link was written.  (len==0 still succeeds: _access_ok and
+    // the prefault are no-ops for a zero-length copy, so bufsz==0 returns 0.)
+    if (copy_to_user((void*)buf_ptr, target, tlen) != 0)
+        return (uint64_t)-EFAULT;
     (void)upath;
     return (uint64_t)tlen;
 }
@@ -4311,22 +5824,27 @@ static uint64_t sys_link(uint64_t old_ptr, uint64_t new_ptr) {
 // The two-way invariant: bit set ⟺ ksec policy entry exists.
 #define S_ISUID_BIT 04000u
 
+// POSIX: a non-root chmod silently clears the setuid bit.  One source of truth
+// for chmod + fchmod so the strip rule cannot drift on a security-sensitive bit
+// (add any future setgid/sticky stripping here and both paths inherit it).
+static inline uint64_t chmod_strip_priv_bits(uint64_t mode) {
+    if (!cred_is_root(&g_current->cred))
+        mode &= ~(uint64_t)S_ISUID_BIT;
+    return mode;
+}
+
 static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
 
-    // Only root may set the setuid bit (POSIX: non-root chmod silently clears it).
-    if (!cred_is_root(&g_current->cred))
-        mode &= ~(uint64_t)S_ISUID_BIT;
+    mode = chmod_strip_priv_bits(mode);
 
     // TODO: call ext2_chmod(path, mode) when ext2 mode storage is implemented.
     // For now: if setuid bit is being set and caller is root, notify ksec.
     if ((mode & S_ISUID_BIT) && cred_is_root(&g_current->cred) &&
         ksec_agent_present()) {
-        char raw[512]; const char* upath = (const char*)path_ptr;
-        uint64_t i = 0;
-        while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-        raw[i] = '\0';
-
+        // (No path copy here: the ksec SETUID_BIT request sends inode/dev, not
+        // the path string -- the old raw user-pointer copy was dead code AND a
+        // #PF-panic-on-bad-pointer hazard, so it is removed.)
         ksec_request_t req = {0};
         req.seq        = ksec_next_seq();
         req.op         = KSEC_OP_SETUID_BIT;
@@ -4345,8 +5863,7 @@ static uint64_t sys_chmod(uint64_t path_ptr, uint64_t mode) {
 
 static uint64_t sys_fchmod(uint64_t fd, uint64_t mode) {
     if (!g_current) return (uint64_t)-EBADF;
-    if (!cred_is_root(&g_current->cred))
-        mode &= ~(uint64_t)S_ISUID_BIT;
+    mode = chmod_strip_priv_bits(mode);
     (void)fd; (void)mode;
     // TODO: lookup path from fd->path, call ext2_chmod.
     return 0;
@@ -4367,22 +5884,12 @@ static uint64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid) {
 static uint64_t sys_truncate(uint64_t path_ptr, uint64_t length) {
     if (!g_current || !path_ptr) return (uint64_t)-EINVAL;
     char raw[512];
-    const char* upath = (const char*)path_ptr;
-    uint64_t i = 0;
-    while (i < 511 && upath[i]) { raw[i] = upath[i]; i++; }
-    raw[i] = '\0';
+    int64_t trl = copy_path_from_user(raw, (const void*)path_ptr, sizeof(raw));
+    if (trl < 0) return (uint64_t)trl;
     char path[512];
-    if (raw[0] != '/') {
-        const char* cwd = g_current->cwd;
-        uint64_t clen = 0; while (cwd[clen]) clen++;
-        uint64_t j = 0;
-        for (; j < clen && j < 510; j++) path[j] = cwd[j];
-        if (j > 0 && path[j-1] != '/') path[j++] = '/';
-        for (uint64_t k = 0; raw[k] && j < 511; k++, j++) path[j] = raw[k];
-        path[j] = '\0';
-    } else {
-        for (uint64_t k = 0; k <= i; k++) path[k] = raw[k];
-    }
+    resolve_at_path(path, sizeof(path), g_current->cwd, raw);
+    normalize_path(path);
+    if (!unveil_ok(path, UNVEIL_WRITE)) return (uint64_t)-ENOENT;   // sandbox
     // Require write permission on the file itself.
     int tr_err = 0;
     uint32_t tr_ino = ext2_lookup_path(path, &g_current->cred, &tr_err);
@@ -4434,7 +5941,10 @@ static uint64_t sys_times(uint64_t buf_ptr) {
 
     if (buf_ptr) {
         tms_t tms = { ticks, 0, 0, 0 };
-        copy_to_user((void*)buf_ptr, &tms, sizeof(tms));
+        // A faulted tms* destination must be -EFAULT, not a bogus tick count
+        // reported as success.  times(NULL) is still valid (skips the copy).
+        if (copy_to_user((void*)buf_ptr, &tms, sizeof(tms)) != 0)
+            return (uint64_t)-EFAULT;
     }
     return ticks;
 }
@@ -4553,6 +6063,9 @@ static uint64_t w_sys_chdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
 static uint64_t w_sys_mkdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)c; (void)d; return sys_mkdir(a, b);
 }
+static uint64_t w_sys_rmdir(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_rmdir(a, b);
+}
 static uint64_t w_sys_lseek(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d; return sys_lseek(a, b, c);
 }
@@ -4571,8 +6084,16 @@ static uint64_t w_sys_sigaction(uint64_t a, uint64_t b, uint64_t c, uint64_t d) 
 static uint64_t w_sys_sigprocmask(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)d; return sys_sigprocmask(a, b, c);
 }
+// force_align_arg_pointer on the WRAPPER: sys_sigreturn inlines into here (it is
+// tiny), so the realign attribute must live on this address-taken function (in
+// the dispatch table -> cannot itself be inlined away) or the `and rsp,-16`
+// prologue is never emitted and the inlined FXRSTOR #GP's on the 8-off stack.
+__attribute__((force_align_arg_pointer))
 static uint64_t w_sys_sigreturn(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)a; (void)b; (void)c; (void)d; return sys_sigreturn();
+}
+static uint64_t w_sys_sigaltstack(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)c; (void)d; return sys_sigaltstack(a, b);
 }
 static uint64_t w_sys_mmap(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return sys_mmap(a, b, c, d, g_syscall_arg5, g_syscall_arg6);
@@ -4729,6 +6250,12 @@ static uint64_t w_sys_tcsetpgrp(uint64_t a, uint64_t b, uint64_t c, uint64_t d) 
 }
 static uint64_t w_sys_reboot(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)a; (void)b; (void)c; (void)d;
+    // Resetting the machine is privileged (Linux gates it on CAP_SYS_BOOT).
+    // Unguarded, any unprivileged process could reset the box on demand -- a
+    // denial of service on its own, and the second stage of the /etc/passwd
+    // escalation chain (tamper with the user database, then reboot to make
+    // login re-read it).
+    if (!g_current || !cred_is_root(&g_current->cred)) return (uint64_t)-EPERM;
     outb(0x64, 0xFE);
     for (;;) __asm__ volatile("cli; hlt");
     return 0;
@@ -4982,16 +6509,27 @@ static uint64_t w_sys_timerfd_create(uint64_t clockid, uint64_t flags,
 static uint64_t w_sys_timerfd_settime(uint64_t fd, uint64_t flags,
                                        uint64_t new_ptr, uint64_t old_ptr) {
     if (!new_ptr) return (uint64_t)-EINVAL;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the timerfd so a sibling close(fd) cannot
+    // kfree its state under timerfd_settime (timerfd_close_op frees the
+    // state and file immediately, no RCU).  fdput on every exit via goto out.
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (!timerfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
+    uint64_t ret;
+    int rc;
     k_itimerspec_t kn, ko;
-    if (copy_from_user(&kn, (void*)new_ptr, sizeof(kn)) != 0)
-        return (uint64_t)-EFAULT;
-    int rc = timerfd_settime(f, (int)flags, &kn, old_ptr ? &ko : NULL);
-    if (rc != 0) return (uint64_t)rc;
-    if (old_ptr && copy_to_user((void*)old_ptr, &ko, sizeof(ko)) != 0)
-        return (uint64_t)-EFAULT;
-    return 0;
+    if (copy_from_user(&kn, (void*)new_ptr, sizeof(kn)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    rc = timerfd_settime(f, (int)flags, &kn, old_ptr ? &ko : NULL);
+    if (rc != 0) { ret = (uint64_t)rc; goto out; }
+    if (old_ptr && copy_to_user((void*)old_ptr, &ko, sizeof(ko)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = 0;
+out:
+    fdput(f);
+    return ret;
 }
 
 // ── sys_signalfd ─────────────────────────────────────────────────────
@@ -5061,9 +6599,14 @@ static uint64_t w_sys_signalfd(uint64_t fd_u, uint64_t mask_ptr,
     uint32_t mask = (uint32_t)(mask64 & 0xFFFFFFFFu);
 
     if ((int64_t)fd_u >= 0) {
-        vfs_file_t* f = fd_to_file(fd_u);
-        if (!f || !signalfd_is(f)) return (uint64_t)-EBADF;
+        // fdget (not fd_to_file): pin the signalfd so a sibling close(fd_u)
+        // cannot kfree its state under signalfd_update (signalfd_close_op
+        // frees the state and file immediately, no RCU).
+        vfs_file_t* f = fdget(fd_u);
+        if (!f) return (uint64_t)-EBADF;
+        if (!signalfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
         int rc = signalfd_update(f, mask);
+        fdput(f);
         return rc < 0 ? (uint64_t)rc : (uint64_t)fd_u;
     }
     vfs_file_t* f = signalfd_new(mask, (uint32_t)flags);
@@ -5108,6 +6651,13 @@ typedef struct k_cmsghdr {
 // Maximum fds in a single SCM_RIGHTS cmsg.  Matches Linux SCM_MAX_FD.
 #define SCM_MAX_FD 253
 
+// Per-chunk size for the sendmsg/recvmsg iov bounce buffer.  The buffer
+// is kmalloc'd, never placed on the kernel stack: KSTACK is 8 KiB and a
+// 4 KiB stack buffer plus the blocking send/recv call chain risks an
+// overflow (F68 class).  The per-CPU slab makes the per-call alloc cheap,
+// and the buffer cannot be per-CPU because it is held across a sleep.
+#define MSG_BOUNCE_SZ 4096
+
 // Per-call nonblocking I/O (Linux value).  libwayland leaves its fds
 // BLOCKING and passes MSG_DONTWAIT on every sendmsg/recvmsg — ignoring
 // it blocked compositors inside the kernel on the first empty read.
@@ -5127,42 +6677,66 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     (void)d;
     int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
-    vfs_file_t* sock = fd_to_file(fd_u);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close()
+    // on the shared fd table cannot free it while we block in the send.
+    // fdput on every exit via the single goto out.
+    vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+    uint64_t ret;
+    // Large scratch buffers are kmalloc'd (freed at out), never on the
+    // 8 KiB kstack.  Declared before the first goto out so out's kfree
+    // never sees an indeterminate pointer.  fds_buf is ~1 KiB, bounce 4 KiB.
+    int32_t* fds_buf = NULL;
+    uint8_t* bounce  = NULL;
 
     k_msghdr_t mh;
-    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
 
     // ── Pass fds in any SCM_RIGHTS cmsg before sending payload so the
     //    receiver sees them in correct order (Linux semantics). ─────
     if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)) {
-        if (!is_unix_sock(sock)) return (uint64_t)-EINVAL;
+        if (!is_unix_sock(sock)) { ret = (uint64_t)-EINVAL; goto out; }
         uint64_t off = 0;
         while (off + sizeof(k_cmsghdr_t) <= mh.msg_controllen) {
             k_cmsghdr_t ch;
             if (copy_from_user(&ch, (void*)(mh.msg_control + off),
-                                sizeof(ch)) != 0)
-                return (uint64_t)-EFAULT;
+                                sizeof(ch)) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
             if (ch.cmsg_len < sizeof(k_cmsghdr_t) ||
-                off + ch.cmsg_len > mh.msg_controllen)
-                return (uint64_t)-EINVAL;
+                off + ch.cmsg_len > mh.msg_controllen) {
+                ret = (uint64_t)-EINVAL; goto out;
+            }
             if (ch.cmsg_level == SOL_SOCKET && ch.cmsg_type == SCM_RIGHTS) {
                 uint64_t data_off  = off + K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
                 uint64_t data_len  = ch.cmsg_len - K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
                 uint64_t n_fds     = data_len / sizeof(int32_t);
-                if (n_fds > SCM_MAX_FD) return (uint64_t)-EINVAL;
-                // Pull all fds out atomically — if any lookup fails we
-                // abort before queuing any.
-                int32_t fds_buf[SCM_MAX_FD];
+                if (n_fds > SCM_MAX_FD) { ret = (uint64_t)-EINVAL; goto out; }
+                // Pull all fds out atomically -- if any lookup fails we
+                // abort before queuing any.  fds_buf is kmalloc'd once
+                // (reused across cmsgs), freed at out.
+                if (!fds_buf) {
+                    fds_buf = kmalloc(SCM_MAX_FD * sizeof(int32_t));
+                    if (!fds_buf) { ret = (uint64_t)-ENOMEM; goto out; }
+                }
                 if (copy_from_user(fds_buf, (void*)(mh.msg_control + data_off),
-                                    n_fds * sizeof(int32_t)) != 0)
-                    return (uint64_t)-EFAULT;
+                                    n_fds * sizeof(int32_t)) != 0) {
+                    ret = (uint64_t)-EFAULT; goto out;
+                }
                 for (uint64_t i = 0; i < n_fds; i++) {
-                    vfs_file_t* tf = fd_to_file(fds_buf[i]);
-                    if (!tf) return (uint64_t)-EBADF;
+                    // fdget pins the passed fd so unix_sock_sendfd's vfs_dup
+                    // cannot race a sibling close(fds_buf[i]): vfs_dup bumps
+                    // refcount only if it is already > 0, so an unpinned file
+                    // mid-teardown would resurrect freed memory or queue a
+                    // dangling ancillary pointer. The ancillary holds its own
+                    // independent dup ref; fdput drops only our transient pin.
+                    vfs_file_t* tf = fdget(fds_buf[i]);
+                    if (!tf) { ret = (uint64_t)-EBADF; goto out; }
                     int r = unix_sock_sendfd(sock, tf, tf->rights);
-                    if (r < 0) return (uint64_t)(int64_t)r;
+                    fdput(tf);
+                    if (r < 0) { ret = (uint64_t)(int64_t)r; goto out; }
                 }
             }
             off += K_CMSG_ALIGN(ch.cmsg_len);
@@ -5174,24 +6748,29 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
         k_iovec_t iv;
         if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
-                            sizeof(iv)) != 0)
-            return (uint64_t)-EFAULT;
+                            sizeof(iv)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
         if (!iv.iov_len) continue;
-        // Bounce via a small stack buffer — avoids pinning the user page
-        // and avoids any kmalloc in the hot path for typical wayland
-        // message sizes (<4 KiB).
-        uint8_t bounce[4096];
+        // Bounce through a kmalloc'd buffer (off the 8 KiB kstack -- see
+        // MSG_BOUNCE_SZ).  Allocated once per call on the first non-empty
+        // iov chunk, reused for the rest of the gather, freed at out.
+        if (!bounce) {
+            bounce = kmalloc(MSG_BOUNCE_SZ);
+            if (!bounce) { ret = (uint64_t)-ENOMEM; goto out; }
+        }
         uint64_t done = 0;
         while (done < iv.iov_len) {
             uint64_t chunk = iv.iov_len - done;
-            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
+            if (chunk > MSG_BOUNCE_SZ) chunk = MSG_BOUNCE_SZ;
             if (copy_from_user(bounce, (void*)(iv.iov_base + done),
-                                chunk) != 0)
-                return (uint64_t)-EFAULT;
+                                chunk) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
             int w = unix_sock_send_ex(sock, bounce, (uint32_t)chunk, nonblock);
             if (w < 0) {
-                if (total > 0) return total;   // partial send wins
-                return (uint64_t)(int64_t)w;
+                if (total > 0) { ret = total; goto out; }   // partial send wins
+                ret = (uint64_t)(int64_t)w; goto out;
             }
             if (w == 0) break;
             done  += (uint64_t)w;
@@ -5199,7 +6778,12 @@ static uint64_t w_sys_sendmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if ((uint64_t)w < chunk) break;
         }
     }
-    return total;
+    ret = total;
+out:
+    if (bounce) kfree(bounce);
+    if (fds_buf) kfree(fds_buf);
+    fdput(sock);
+    return ret;
 }
 
 static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
@@ -5207,31 +6791,91 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
     (void)d;
     int nonblock = (flags & MSG_DONTWAIT) != 0;
     if (!mhdr_ptr) return (uint64_t)-EFAULT;
-    vfs_file_t* sock = fd_to_file(fd_u);
+    // fdget (not fd_to_file): pin the socket so a sibling thread's close()
+    // on the shared fd table cannot free it while we block in the recv.
+    // fdput on every exit via the single goto out.
+    vfs_file_t* sock = fdget(fd_u);
     if (!sock) return (uint64_t)-EBADF;
+    uint64_t ret;
+    // Large scratch buffers are kmalloc'd (freed at out), never on the
+    // 8 KiB kstack.  Declared before the first goto out so out's kfree
+    // never sees an indeterminate pointer.  inst_fds ~1 KiB, bounce 4 KiB.
+    int32_t* inst_fds = NULL;
+    uint8_t* bounce   = NULL;
 
     k_msghdr_t mh;
-    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
+    if (copy_from_user(&mh, (void*)mhdr_ptr, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
 
-    // ── Drain any pending fds into a single SCM_RIGHTS cmsg ────────
-    // We dequeue up to the userland-sized control buffer.  Any fd
+    // ── Gather payload FIRST ───────────────────────────────────────
+    // Draining fds before the payload let a recvmsg hand back an fd with
+    // ZERO data: sendmsg enqueues each fd one step ahead of its bytes
+    // (fd-before-payload, Linux order), so a reader racing that gap took the
+    // fd but read no data and returned 0.  libwayland reads len==0 as an
+    // orderly close and tore foot's Wayland socket down ("Broken pipe" on the
+    // keymap fd sway hands every keyboard client).  Read the data first; fds
+    // are then delivered only alongside the bytes they ride with, and a
+    // no-data poll returns EAGAIN with the fds left queued for later.
+    uint64_t total = 0;
+    for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
+        k_iovec_t iv;
+        if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
+                            sizeof(iv)) != 0) {
+            ret = (uint64_t)-EFAULT; goto out;
+        }
+        if (!iv.iov_len) continue;
+        if (!bounce) {
+            bounce = kmalloc(MSG_BOUNCE_SZ);
+            if (!bounce) { ret = (uint64_t)-ENOMEM; goto out; }
+        }
+        uint64_t done = 0;
+        while (done < iv.iov_len) {
+            uint64_t chunk = iv.iov_len - done;
+            if (chunk > MSG_BOUNCE_SZ) chunk = MSG_BOUNCE_SZ;
+            int r = is_unix_sock(sock)
+                    ? unix_sock_recv_ex(sock, bounce, chunk, nonblock)
+                    : (int)sock->read(sock, bounce, chunk);
+            if (r < 0) {
+                // No bytes yet: propagate EAGAIN/error and leave any queued
+                // fds untouched for a later call that also carries their data.
+                if (total == 0) { ret = (uint64_t)(int64_t)r; goto out; }
+                goto done_gather;   // partial gather already made progress
+            }
+            if (r == 0) goto done_gather;   // orderly EOF
+            if (copy_to_user((void*)(iv.iov_base + done), bounce,
+                              (uint64_t)r) != 0) {
+                ret = (uint64_t)-EFAULT; goto out;
+            }
+            done  += (uint64_t)r;
+            total += (uint64_t)r;
+            if ((uint64_t)r < chunk) goto done_gather;
+        }
+    }
+done_gather:;
+    // ── Drain pending fds into a single SCM_RIGHTS cmsg ─────────────
+    // ONLY when we are returning payload: an fd handed back with 0 bytes
+    // reads as EOF to libwayland (see above).  Over-draining an fd whose
+    // message's bytes arrive in a later recvmsg is fine -- fds ride a FIFO
+    // and libwayland pops them per fd-bearing message in order.  Any fd
     // installed here must be closed if we later fault on copyout.
     uint64_t cmsg_written = 0;
-    int32_t  inst_fds[SCM_MAX_FD];
     uint64_t n_inst = 0;
-    if (mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
+    if (total > 0 && mh.msg_control && mh.msg_controllen >= sizeof(k_cmsghdr_t)
         && is_unix_sock(sock)) {
         uint64_t hdr_pad = K_CMSG_ALIGN(sizeof(k_cmsghdr_t));
         uint64_t max_fds = (mh.msg_controllen - hdr_pad) / sizeof(int32_t);
         if (max_fds > SCM_MAX_FD) max_fds = SCM_MAX_FD;
         while (n_inst < max_fds) {
             // Non-blocking drain: take only what is already queued.
-            // The blocking recvfd here parked the caller until an fd
-            // ARRIVED — on a connection that never passes fds, that
-            // is forever, with payload sitting unread.
             vfs_file_t* rf = unix_sock_recvfd_nb(sock);
             if (!rf) break;
+            if (!inst_fds) {
+                inst_fds = kmalloc(SCM_MAX_FD * sizeof(int32_t));
+                if (!inst_fds) {
+                    vfs_close(rf); ret = (uint64_t)-ENOMEM; goto out;
+                }
+            }
             int64_t new_fd = fd_install(rf);
             if (new_fd < 0) { vfs_close(rf); break; }
             inst_fds[n_inst++] = (int32_t)new_fd;
@@ -5244,56 +6888,26 @@ static uint64_t w_sys_recvmsg(uint64_t fd_u, uint64_t mhdr_ptr,
             if (copy_to_user((void*)mh.msg_control, &ch, sizeof(ch)) != 0
                 || copy_to_user((void*)(mh.msg_control + hdr_pad),
                                  inst_fds, n_inst * sizeof(int32_t)) != 0) {
-                // Faulted mid-write → close everything we installed
-                // so the fd table isn't leaked.
                 for (uint64_t i = 0; i < n_inst; i++)
                     (void)sys_close((uint64_t)(int)inst_fds[i]);
-                return (uint64_t)-EFAULT;
+                ret = (uint64_t)-EFAULT; goto out;
             }
             cmsg_written = ch.cmsg_len;
         }
     }
 
-    // ── Gather payload into msg_iov ────────────────────────────────
-    uint64_t total = 0;
-    for (uint64_t i = 0; i < mh.msg_iovlen; i++) {
-        k_iovec_t iv;
-        if (copy_from_user(&iv, (void*)(mh.msg_iov + i * sizeof(iv)),
-                            sizeof(iv)) != 0)
-            return (uint64_t)-EFAULT;
-        if (!iv.iov_len) continue;
-        uint8_t bounce[4096];
-        uint64_t done = 0;
-        while (done < iv.iov_len) {
-            uint64_t chunk = iv.iov_len - done;
-            if (chunk > sizeof(bounce)) chunk = sizeof(bounce);
-            int r = is_unix_sock(sock)
-                    ? unix_sock_recv_ex(sock, bounce, chunk, nonblock)
-                    : (int)sock->read(sock, bounce, chunk);
-            if (r < 0) {
-                // First read returning an error propagates; a later
-                // partial read returns bytes already gathered.  A
-                // drained SCM_RIGHTS cmsg counts as progress — return
-                // it with 0 payload rather than erroring it away.
-                if (total == 0 && n_inst == 0) return (uint64_t)(int64_t)r;
-                goto done_gather;
-            }
-            if (r == 0) goto done_gather;
-            if (copy_to_user((void*)(iv.iov_base + done), bounce,
-                              (uint64_t)r) != 0)
-                return (uint64_t)-EFAULT;
-            done  += (uint64_t)r;
-            total += (uint64_t)r;
-            if ((uint64_t)r < chunk) goto done_gather;
-        }
-    }
-done_gather:
     // Write back msg_controllen so caller knows how much we used.
     mh.msg_controllen = cmsg_written;
     mh.msg_flags      = 0;
-    if (copy_to_user((void*)mhdr_ptr, &mh, sizeof(mh)) != 0)
-        return (uint64_t)-EFAULT;
-    return total;
+    if (copy_to_user((void*)mhdr_ptr, &mh, sizeof(mh)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = total;
+out:
+    if (bounce) kfree(bounce);
+    if (inst_fds) kfree(inst_fds);
+    fdput(sock);
+    return ret;
 }
 
 // ── sys_socketpair ──────────────────────────────────────────────────
@@ -5311,13 +6925,19 @@ static uint64_t w_sys_socketpair(uint64_t domain, uint64_t type,
     if (rc != 0) return (uint64_t)rc;
 
     int64_t fd0 = fd_install(pair[0]);
+    // fd_install never closes on failure -> we still own pair[0]/pair[1].
     if (fd0 < 0) { vfs_close(pair[0]); vfs_close(pair[1]); return (uint64_t)fd0; }
     int64_t fd1 = fd_install(pair[1]);
-    if (fd1 < 0) { vfs_close(pair[1]); /* leak fd0 table slot */ return (uint64_t)fd1; }
+    // pair[0] is installed at fd0 now -> close it via its fd so its slot frees;
+    // pair[1] never installed -> close it directly.
+    if (fd1 < 0) { sys_close((uint64_t)fd0); vfs_close(pair[1]); return (uint64_t)fd1; }
 
     int kfds[2] = { (int)fd0, (int)fd1 };
     if (copy_to_user((void*)fds_ptr, kfds, sizeof(kfds)) != 0) {
-        // Best-effort: close both if copyout fails.
+        // Both fds are installed; close both so the copyout failure doesn't leak
+        // them (the slots and the underlying socket refs).
+        sys_close((uint64_t)fd0);
+        sys_close((uint64_t)fd1);
         return (uint64_t)-EFAULT;
     }
     return 0;
@@ -5327,14 +6947,23 @@ static uint64_t w_sys_timerfd_gettime(uint64_t fd, uint64_t out_ptr,
                                        uint64_t c, uint64_t d) {
     (void)c; (void)d;
     if (!out_ptr) return (uint64_t)-EINVAL;
-    vfs_file_t* f = fd_to_file(fd);
-    if (!f || !timerfd_is(f)) return (uint64_t)-EBADF;
+    // fdget (not fd_to_file): pin the timerfd so a sibling close(fd) cannot
+    // kfree its state under timerfd_gettime (close frees immediately, no RCU).
+    vfs_file_t* f = fdget(fd);
+    if (!f) return (uint64_t)-EBADF;
+    if (!timerfd_is(f)) { fdput(f); return (uint64_t)-EBADF; }
+    uint64_t ret;
+    int rc;
     k_itimerspec_t ks;
-    int rc = timerfd_gettime(f, &ks);
-    if (rc != 0) return (uint64_t)rc;
-    if (copy_to_user((void*)out_ptr, &ks, sizeof(ks)) != 0)
-        return (uint64_t)-EFAULT;
-    return 0;
+    rc = timerfd_gettime(f, &ks);
+    if (rc != 0) { ret = (uint64_t)rc; goto out; }
+    if (copy_to_user((void*)out_ptr, &ks, sizeof(ks)) != 0) {
+        ret = (uint64_t)-EFAULT; goto out;
+    }
+    ret = 0;
+out:
+    fdput(f);
+    return ret;
 }
 
 // 4-arg handlers that already match the uniform signature — used directly.
@@ -5367,6 +6996,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_GETCWD]              = w_sys_getcwd,
     [SYS_CHDIR]               = w_sys_chdir,
     [SYS_MKDIR]               = w_sys_mkdir,
+    [SYS_RMDIR]               = w_sys_rmdir,
     [SYS_LSEEK]               = w_sys_lseek,
     [SYS_GETPPID]             = w_sys_getppid,
     [SYS_DUP]                 = w_sys_dup,
@@ -5375,6 +7005,7 @@ static const sys_handler_t s_syscall_table[128] = {
     [SYS_SIGACTION]           = w_sys_sigaction,
     [SYS_SIGPROCMASK]         = w_sys_sigprocmask,
     [SYS_SIGRETURN]           = w_sys_sigreturn,
+    [SYS_SIGALTSTACK]         = w_sys_sigaltstack,
     [SYS_MMAP]                = w_sys_mmap,
     [SYS_MUNMAP]              = w_sys_munmap,
     [SYS_NANOSLEEP]           = w_sys_nanosleep,
@@ -5542,7 +7173,7 @@ uint64_t native_syscall_dispatch(uint64_t nr, uint64_t arg1, uint64_t arg2,
     // Deliver any pending signals on the syscall return path.  This is
     // the one site that may set up a user signal frame — we own this
     // task's SYSCALL_KFRAME and are about to return through it.
-    signal_deliver_pending(1);
+    signal_deliver_pending(1, ret);
     return ret;
 }
 

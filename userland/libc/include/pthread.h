@@ -16,6 +16,12 @@
 // sched_get_priority_{min,max}.  Match glibc for compatibility.
 #include <sched.h>
 
+// C linkage in C++: libstdc++'s gthr-posix layer calls pthread_* from C++ TUs;
+// without this the calls would be name-mangled and miss libc.a's C symbols.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // pthread_t is a pointer to the thread's descriptor (struct __pthread,
 // defined privately in pthread.c) — the handle IS the object, glibc/NPTL
 // style, so join/detach/kill/equal need NO lookup table.  Opaque to apps.
@@ -32,6 +38,8 @@ typedef struct {
 // Detach state
 #define PTHREAD_CREATE_JOINABLE 0
 #define PTHREAD_CREATE_DETACHED 1
+
+#define PTHREAD_STACK_MIN 16384   // minimum thread stack (bytes)
 
 typedef struct {
     volatile int locked;            // 0 = free, 1 = held
@@ -76,12 +84,28 @@ typedef struct { int kind; } pthread_rwlockattr_t;
 
 typedef struct { volatile int flag; } pthread_spinlock_t;
 
+// ── Barrier ──────────────────────────────────────────────────────────
+// Generation-counter barrier over the existing mutex+cond (see pthread.c).
+typedef struct {
+    pthread_mutex_t m;
+    pthread_cond_t  c;
+    unsigned        count;    // threads required to trip the barrier
+    unsigned        waiting;  // threads currently blocked at it
+    unsigned        gen;      // bumped each trip so cohorts never mix
+} pthread_barrier_t;
+typedef struct { int unused; } pthread_barrierattr_t;
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+
 // ── Attr ─────────────────────────────────────────────────────────────
 int pthread_attr_init(pthread_attr_t* a);
 int pthread_attr_destroy(pthread_attr_t* a);
 int pthread_attr_setstacksize(pthread_attr_t* a, size_t sz);
 int pthread_attr_getstacksize(const pthread_attr_t* a, size_t* sz);
 int pthread_attr_setstack(pthread_attr_t* a, void* stack, size_t sz);
+int pthread_attr_getstack(const pthread_attr_t* a, void** stackaddr, size_t* sz);
+int pthread_attr_getguardsize(const pthread_attr_t* a, size_t* sz);
+int pthread_attr_setguardsize(pthread_attr_t* a, size_t sz);
+int pthread_getattr_np(pthread_t t, pthread_attr_t* a);
 int pthread_attr_setdetachstate(pthread_attr_t* a, int state);
 int pthread_attr_getdetachstate(const pthread_attr_t* a, int* state);
 int pthread_attr_setschedpolicy(pthread_attr_t* a, int policy);
@@ -99,6 +123,7 @@ void pthread_exit(void* retval) __attribute__((__noreturn__));
 pthread_t pthread_self(void);
 int  pthread_equal(pthread_t a, pthread_t b);
 int  pthread_cancel(pthread_t tid);
+int  pthread_kill(pthread_t tid, int sig);   // thread-directed signal (0 = existence check)
 
 // ── Mutex ────────────────────────────────────────────────────────────
 int pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a);
@@ -125,6 +150,12 @@ int pthread_cond_broadcast(pthread_cond_t* c);
 int pthread_condattr_init(pthread_condattr_t* a);
 int pthread_condattr_destroy(pthread_condattr_t* a);
 int pthread_condattr_setclock(pthread_condattr_t* a, clockid_t clk);
+
+// ── Barrier ──────────────────────────────────────────────────────────
+int pthread_barrier_init(pthread_barrier_t* b, const pthread_barrierattr_t* a,
+                         unsigned count);
+int pthread_barrier_destroy(pthread_barrier_t* b);
+int pthread_barrier_wait(pthread_barrier_t* b);
 
 // ── Once ─────────────────────────────────────────────────────────────
 int pthread_once(pthread_once_t* once, void (*init)(void));
@@ -175,5 +206,10 @@ int pthread_getname_np(pthread_t tid, char* name, size_t n);
 // that probe for real-time priorities don't explode at link time.
 int pthread_setschedparam(pthread_t tid, int policy, const struct sched_param* p);
 int pthread_getschedparam(pthread_t tid, int* policy, struct sched_param* p);
+int pthread_getcpuclockid(pthread_t tid, clockid_t* clock_id);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

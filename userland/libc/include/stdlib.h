@@ -6,6 +6,8 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <alloca.h>   // glibc exposes alloca() via <stdlib.h>; portable code
+                      // (Mesa's c99_alloca.h) relies on that. Match it.
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -43,6 +45,7 @@ __attribute__((__noreturn__)) void exit(int status);
 __attribute__((__noreturn__)) void _Exit(int status);
 __attribute__((__noreturn__)) void abort(void);
 int  atexit(void (*fn)(void));
+int  getloadavg(double loadavg[], int nelem);
 int  system(const char* cmd);
 
 // Random (CSPRNG-backed via /dev/urandom)
@@ -105,6 +108,13 @@ int   grantpt(int fd);
 int   unlockpt(int fd);
 char* ptsname(int fd);
 int   ptsname_r(int fd, char* buf, size_t len);
+
+// C99/C11 additions the host libstdc++ <cstdlib> (used when cross-building C++
+// against this sysroot, e.g. OpenJDK HotSpot's x86 code generators) expects to
+// find in <stdlib.h>.
+long double strtold(const char* s, char** endptr);
+int         at_quick_exit(void (*func)(void));
+void        quick_exit(int status) __attribute__((__noreturn__));
 
 #ifdef __cplusplus
 }

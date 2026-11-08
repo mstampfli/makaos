@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_THREADS_H
 #define _MAKAOS_THREADS_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // C11 <threads.h> implemented as a thin shim over pthread.  fcft
 // (and thus foot) uses the C11 API for its font-cache mutex + call-
 // once; glibc provides this header too, musl only under _GNU_SOURCE.
@@ -65,4 +68,7 @@ int  tss_set     (tss_t key, void* val);
 
 void call_once   (once_flag* flag, void (*fn)(void));
 
+#ifdef __cplusplus
+}
+#endif
 #endif

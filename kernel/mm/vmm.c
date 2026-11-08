@@ -14,6 +14,19 @@
 // Set by vmm_init(); used by vmm_alloc_pml4() to clone kernel entries.
 static phys_addr_t g_kernel_pml4 = 0;
 
+// Serializes structural mutations of the SHARED kernel PML4 (the upper-half
+// page tables every process inherits).  User PML4s are serialized by their
+// per-mm vma_lock, but kernel-PML4 mutators have no such owner: kstack_alloc/
+// kstack_free hammer it from every CPU on each task create/reap, and IRQ-
+// context kheap demand-paging maps into it too.  Unlocked, the concurrent
+// page-table walk in vmm_page_map/vmm_page_unmap raced -> a torn PTE handed
+// the same frame to two owners / freed one frame twice ([pmm] DOUBLE-ALLOC +
+// DOUBLE-BUDDY-FREE caller=kstack_free under fork+exec churn -> userland heap
+// corruption, e.g. swaybar/pango).  IRQ-save because kheap faults take it from
+// interrupt context.  Taken ONLY for the kernel PML4, so user-fault
+// scalability (per-mm vma_lock) is unaffected.  See docs/LOCKS.md.
+static spinlock_t g_kpml4_lock = SPINLOCK_INIT;
+
 // ── Index extraction (9 bits per level) ──────────────────────────────────
 // A 64-bit canonical virtual address is split as:
 //   [63:48] sign extension (must mirror bit 47)
@@ -115,19 +128,61 @@ phys_addr_t vmm_kernel_pml4_get(void) {
 // Pages are mapped uncacheable (PCD+PWT) so device register reads/writes are
 // not buffered or reordered by the CPU cache.
 #define MMIO_VIRT_BASE 0xFFFF900000000000ULL
+// End of the private MMIO VA window (1 TiB above the base; the next used kernel
+// VA is the HHDM far below and the kernel image far above, so this window is
+// collision-free).  vmm_map_mmio bump-allocates within [BASE, END); a
+// reservation that would cross END fails rather than running into adjacent
+// kernel VA.  1 TiB dwarfs the total device-BAR footprint (a few hundred KiB),
+// so this ceiling never fires at real device counts -- it just makes exhaustion
+// an explicit failure instead of a silent overrun.
+#define MMIO_VIRT_END  0xFFFF910000000000ULL
 static virt_addr_t s_mmio_next = MMIO_VIRT_BASE;
 
 virt_addr_t vmm_map_mmio(phys_addr_t phys, uint64_t bytes) {
     uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    virt_addr_t base = s_mmio_next;
+    uint64_t span  = pages * PAGE_SIZE;
+    // Reserve a disjoint [base, base+span) lock-free: __atomic_fetch_add hands
+    // each caller a unique span even if two run concurrently.  Every caller today
+    // is a boot-serial initcall on the BSP (run_dag is single-threaded; the APs
+    // are parked), so the old plain read-then-bump was LATENT-unsafe, not an
+    // active bug -- this makes the cursor safe-by-construction for any future
+    // AP / hot-plug / deferred-probe caller.  Bound it so it can never run past
+    // the window (overflow-safe form: never compute base + span).
+    virt_addr_t base = (virt_addr_t)__atomic_fetch_add(&s_mmio_next, span,
+                                                       __ATOMIC_RELAXED);
+    if (base >= MMIO_VIRT_END || span > MMIO_VIRT_END - base) {
+        extern void kprintf(const char*, ...);
+        kprintf("[vmm] MMIO window exhausted (base=%lx span=%lx)\n",
+                (unsigned long)base, (unsigned long)span);
+        return 0;   // caller gets NULL -> a detectable fault, not a silent overrun
+    }
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_PCD | PAGE_PWT;
     for (uint64_t i = 0; i < pages; i++) {
-        vmm_page_map(g_kernel_pml4,
-                     base + i * PAGE_SIZE,
-                     phys + i * PAGE_SIZE,
-                     flags);
+        if (!vmm_page_map(g_kernel_pml4,
+                          base + i * PAGE_SIZE,
+                          phys + i * PAGE_SIZE,
+                          flags)) {
+            // OOM allocating an intermediate page-table page.  The old code
+            // ignored this and returned base, leaving a HOLE in the kernel MMIO
+            // window reported as fully mapped -- a later device-register access
+            // to the unmapped page takes an unrecoverable kernel #PF (panic),
+            // and if that VA is ever reused with a foreign PTE it touches the
+            // wrong physical page.  Clear the [0..i) PTEs already mapped (device
+            // phys, not owned here -- just drop the mappings) and fail with NULL,
+            // exactly as the window-exhaustion path above and vmm_map_physical_
+            // user (F148) do.  The bump-reserved VA span is abandoned (never
+            // reused; the 1 TiB window dwarfs all device BARs) and the pages were
+            // never accessed, so no TLB shootdown is needed.
+            extern void kprintf(const char*, ...);
+            kprintf("[vmm] MMIO map OOM at page %lu/%lu (phys=%lx vaddr=%lx)\n",
+                    (unsigned long)i, (unsigned long)pages,
+                    (unsigned long)phys, (unsigned long)base);
+            phys_addr_t old;
+            for (uint64_t j = 0; j < i; j++)
+                vmm_page_unmap(g_kernel_pml4, base + j * PAGE_SIZE, &old);
+            return 0;
+        }
     }
-    s_mmio_next += pages * PAGE_SIZE;
     return base;
 }
 
@@ -154,10 +209,23 @@ virt_addr_t vmm_map_physical_user(mm_t* mm, phys_addr_t pml4_phys,
     uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_PWT | PAGE_NX;
     uint64_t npages = len / PAGE_SIZE;
     for (uint64_t i = 0; i < npages; i++) {
-        vmm_page_map(pml4_phys,
-                     vaddr + i * PAGE_SIZE,
-                     phys  + i * PAGE_SIZE,
-                     flags);
+        if (!vmm_page_map(pml4_phys,
+                          vaddr + i * PAGE_SIZE,
+                          phys  + i * PAGE_SIZE,
+                          flags)) {
+            // OOM allocating an intermediate PT page: a hole here would be
+            // reported as a mapped range, and a later user access to the hole
+            // demand-faults a ZEROED anon frame over the device buffer (silent
+            // display/DMA corruption).  Unmap the [0..i) pages already mapped
+            // (device phys, not owned here -- just clear the PTEs), drop the
+            // VMA, and fail.  The user never receives vaddr, so no TLB shootdown
+            // is needed (the pages were never accessed).
+            phys_addr_t old;
+            for (uint64_t j = 0; j < i; j++)
+                vmm_page_unmap(pml4_phys, vaddr + j * PAGE_SIZE, &old);
+            mm_vma_remove(mm, vaddr, vaddr + len);
+            return 0;
+        }
     }
     return vaddr;
 }
@@ -212,25 +280,41 @@ uint8_t vmm_page_map(phys_addr_t pml4_phys, virt_addr_t vaddr,
     uint64_t inter = PAGE_PRESENT | PAGE_WRITABLE;
     if (flags & PAGE_USER) inter |= PAGE_USER;
 
-    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 1, inter);
-    if (!pte) return 0;
+    int klock = (pml4_phys == g_kernel_pml4 && g_kernel_pml4 != 0);
+    uint64_t kf = 0;
+    if (klock) kf = spin_lock_irqsave(&g_kpml4_lock);
 
-    *pte = (paddr & PAGE_ADDR_MASK) | flags;
-    invlpg(vaddr);
-    return 1;
+    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 1, inter);
+    uint8_t ok = 0;
+    if (pte) {
+        *pte = (paddr & PAGE_ADDR_MASK) | flags;
+        invlpg(vaddr);
+        ok = 1;
+    }
+
+    if (klock) spin_unlock_irqrestore(&g_kpml4_lock, kf);
+    return ok;
 }
 
 // Unmap one 4KiB page.  Optionally returns the old physical address.
 // Does NOT free the physical frame.
 uint8_t vmm_page_unmap(phys_addr_t pml4_phys, virt_addr_t vaddr,
                        phys_addr_t* out_paddr) {
-    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 0, 0);
-    if (!pte || !(*pte & PAGE_PRESENT)) return 0;
+    int klock = (pml4_phys == g_kernel_pml4 && g_kernel_pml4 != 0);
+    uint64_t kf = 0;
+    if (klock) kf = spin_lock_irqsave(&g_kpml4_lock);
 
-    if (out_paddr) *out_paddr = *pte & PAGE_ADDR_MASK;
-    *pte = 0;
-    invlpg(vaddr);
-    return 1;
+    pte_t* pte = vmm_pte_get(pml4_phys, vaddr, 0, 0);
+    uint8_t ret = 0;
+    if (pte && (*pte & PAGE_PRESENT)) {
+        if (out_paddr) *out_paddr = *pte & PAGE_ADDR_MASK;
+        *pte = 0;
+        invlpg(vaddr);
+        ret = 1;
+    }
+
+    if (klock) spin_unlock_irqrestore(&g_kpml4_lock, kf);
+    return ret;
 }
 
 phys_addr_t vmm_page_phys(phys_addr_t pml4_phys, virt_addr_t vaddr) {
@@ -259,9 +343,13 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
     // pins) still referenced.  That frame came back as the next
     // thread's stack while AHCI wrote font-file bytes into it.
     extern mm_t* task_get_mm(void* task);
+    extern task_mm_t* task_get_mm_shared(void* task);
     mm_t* lock_mm = g_current ? task_get_mm(g_current) : NULL;
+    int      cow_broke = 0;   // a CoW frame-swap happened -> shoot down siblings
+    uint32_t ret       = count;
 
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t i;   // function-scope: the failure index drives the unpin cleanup at out:
+    for (i = 0; i < count; i++) {
         virt_addr_t va = (uaddr & ~0xFFFULL) + (uint64_t)i * PAGE_SIZE;
 
         if (lock_mm) spin_lock(&lock_mm->vma_lock);
@@ -275,15 +363,18 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
                 phys_addr_t nf = pmm_buddy_alloc(0);
                 if (nf == PMM_INVALID_ADDR) {
                     if (lock_mm) spin_unlock(&lock_mm->vma_lock);
-                    return 0;
+                    ret = 0; goto out;
                 }
                 uint8_t* s = (uint8_t*)(phys + HHDM_OFFSET);
                 uint8_t* d = (uint8_t*)(nf + HHDM_OFFSET);
                 __builtin_memcpy(d, s, PAGE_SIZE);
                 *pte = nf | leaf;
-                invlpg(va);
+                invlpg(va);                 // LOCAL CPU only -- siblings flushed below
                 pmm_ref_dec(phys);
                 out[i] = (void*)(nf + HHDM_OFFSET);
+                cow_broke = 1;              // PTE swapped to nf; a sibling on
+                                            // another CPU may still cache the old
+                                            // (phys, RO) entry -> shoot it down at out:
             } else if (!(*pte & PAGE_WRITABLE) && pmm_ref_get(phys) == 1) {
                 // Sole owner, still marked RO from old CoW — re-enable write.
                 *pte |= PAGE_WRITABLE;
@@ -304,14 +395,14 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             // install under it with a presence re-check (a concurrent
             // isr14 fault may install first — use its frame).
             phys_addr_t frame = pmm_buddy_alloc(0);
-            if (frame == PMM_INVALID_ADDR) return 0;
+            if (frame == PMM_INVALID_ADDR) { ret = 0; goto out; }
             __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
             if (lock_mm) spin_lock(&lock_mm->vma_lock);
             pte = vmm_pte_get(pml4_phys, va, 1, inter);
             if (!pte) {
                 if (lock_mm) spin_unlock(&lock_mm->vma_lock);
                 pmm_buddy_free(frame, 0);
-                return 0;
+                ret = 0; goto out;
             }
             if (*pte & PAGE_PRESENT) {
                 phys_addr_t have = *pte & PAGE_ADDR_MASK;
@@ -327,7 +418,31 @@ uint32_t vmm_get_user_pages(phys_addr_t pml4_phys, virt_addr_t uaddr,
             }
         }
     }
-    return count;
+out:
+    // A CoW frame-swap above (*pte = nf) changed the translation for EVERY
+    // thread sharing this address space (THREAD_SHARE_MM), but each iteration
+    // only did a LOCAL invlpg.  A sibling on another CPU may still cache the
+    // pre-swap (old phys, RO) entry and, once the CoW co-owner frees + recycles
+    // that frame, read freed memory (cross-process use-after-free read).  Shoot
+    // the pinned span down on every CPU of this mm -- AFTER releasing every
+    // per-page vma_lock (a target spinning on vma_lock with IRQs off would
+    // deadlock the IPI-ack wait, the same rule as isr14_page_fault's CoW break).
+    // One batched range flush covers all swapped pages.  The rc==1 widen-only
+    // branch sets no flag (a stale RO entry just causes a harmless re-fault).
+    if (cow_broke && lock_mm && g_current)
+        tlb_flush_range(task_get_mm_shared(g_current), uaddr & ~0xFFFULL,
+                        (uaddr & ~0xFFFULL) + (uint64_t)count * PAGE_SIZE);
+    // Mid-loop failure: unpin the frames already pinned in iterations [0..i).
+    // Each completed iteration pinned its frame (the DMA-target commit); the
+    // caller only unpins on SUCCESS, and pmm_ref_dec refuses to free a pinned
+    // frame, so without this a partial resolution leaks those pins PERMANENTLY
+    // (an unprivileged read into a multi-page user buffer that OOMs mid-pin
+    // would exhaust memory).  Unpin only drops the DMA pin count -- the frames
+    // stay mapped (their PTE ref keeps them alive), so this is not a free.
+    if (ret == 0)
+        for (uint32_t j = 0; j < i; j++)
+            pmm_unpin((phys_addr_t)((uint64_t)out[j] - HHDM_OFFSET));
+    return ret;
 }
 
 // Allocate a physical frame, map it at vaddr in the CURRENT address space.
@@ -483,6 +598,21 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                 for (int si = 0; si < 512; si++) {
                     if (!(src_pt[si] & PAGE_PRESENT)) continue;
 
+                    // Serialize this PTE's read-decide-write against the
+                    // CoW-break fault handler, which makes the same decision
+                    // (`rc = pmm_ref_get(); if (rc == 1) *pte |= WRITABLE; else
+                    // copy`) under src_mm->vma_lock.  Without this lock, a
+                    // sibling thread of the parent faulting this page after we
+                    // set it read-only (below) but before our pmm_ref_inc reads
+                    // rc==1, takes the "sole owner -> just make writable, no
+                    // copy" branch -> parent + child then share a WRITABLE frame
+                    // (the child sees the parent's writes) with a refcount of 2
+                    // that one side thinks is 1 -> later double pmm_ref_dec frees
+                    // a still-mapped frame (UAF).  Held per-PTE (not across the
+                    // whole walk) so concurrent faults on other pages still make
+                    // progress.  src_mm is NULL only on the legacy no-mm path.
+                    if (src_mm) spin_lock(&src_mm->vma_lock);
+
                     phys_addr_t src_frame = src_pt[si] & PAGE_ADDR_MASK;
                     uint64_t leaf_flags = src_pt[si] & ~PAGE_ADDR_MASK;
 
@@ -494,6 +624,9 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     // shmem frames are refcounted RAM, so the child's
                     // PTE is a new reference — bump it.  MMIO (device
                     // memory) is not buddy RAM and carries no refcount.
+                    // (Already under vma_lock here, so the VMA list is stable;
+                    // the rcu_read_lock is kept, nested + harmless, so the
+                    // lookup's synchronization is unchanged.)
                     int is_shared = 0, is_shmem = 0;
                     if (src_mm) {
                         rcu_read_lock();
@@ -506,6 +639,7 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     if (is_shared) {
                         if (is_shmem) pmm_ref_inc(src_frame);  // child PTE ref
                         dst_pt[si] = src_frame | leaf_flags;
+                        if (src_mm) spin_unlock(&src_mm->vma_lock);
                         continue;
                     }
 
@@ -513,13 +647,17 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     // Pinned frame → deep-copy (DMA in flight, parent keeps exclusive).
                     if (!src_mm || pmm_pin_get(src_frame) > 0) {
                         phys_addr_t dst_frame = pmm_buddy_alloc(0);
-                        if (dst_frame == PMM_INVALID_ADDR) return 0;
+                        if (dst_frame == PMM_INVALID_ADDR) {
+                            if (src_mm) spin_unlock(&src_mm->vma_lock);
+                            return 0;
+                        }
 
                         uint8_t* s = (uint8_t*)(src_frame + HHDM_OFFSET);
                         uint8_t* d = (uint8_t*)(dst_frame + HHDM_OFFSET);
                         __builtin_memcpy(d, s, PAGE_SIZE);
 
                         dst_pt[si] = dst_frame | leaf_flags;
+                        if (src_mm) spin_unlock(&src_mm->vma_lock);
                         continue;
                     }
 
@@ -532,6 +670,7 @@ uint8_t vmm_clone_user_ex(phys_addr_t dst_pml4, phys_addr_t src_pml4,
                     dst_pt[si] = src_frame | cow_flags;   // child:  same frame, read-only
 
                     pmm_ref_inc(src_frame);               // shared: rc 1→2
+                    if (src_mm) spin_unlock(&src_mm->vma_lock);
                 }
             }
         }
@@ -591,14 +730,6 @@ static void ser_str(const char* s) {
     for (; *s; s++) { while (!(inb(0x3F8+5) & 0x20)) {} outb(0x3F8, (uint8_t)*s); }
 }
 
-static void kill_current(void) {
-    extern void signal_send(struct task_t* t, int sig);
-    extern void signal_deliver_pending(int);
-    if (g_current) signal_send(g_current, 11); // SIGSEGV = 11
-    signal_deliver_pending(0);
-    for (;;) __asm__ volatile("cli; hlt");
-}
-
 void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     virt_addr_t fault_addr;
     __asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
@@ -609,6 +740,11 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
     uint8_t is_reserved = (ec >> 3) & 1;
     uint8_t is_ifetch   = (ec >> 4) & 1;
     (void)f;
+
+    // Record the fault address so a resulting SIGSEGV/SIGBUS delivers it as
+    // siginfo.si_addr (JVM null-checks read it).  Harmless if the fault resolves
+    // via demand-paging/CoW -- it is only consumed when a signal is delivered.
+    if (is_user && g_current) g_current->sigstate.fault_addr = fault_addr;
 
     // Reserved-bit violation: always unrecoverable.
     if (is_reserved) goto kernel_panic;
@@ -791,11 +927,9 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                 }
                 uint8_t* dst = (uint8_t*)(clean_frame + HHDM_OFFSET);
                 __builtin_memset(dst, 0, PAGE_SIZE);
-                if (pg_off < vma_file_len) {
+                uint64_t bytes = vma_file_page_span(pg_off, vma_file_len);
+                if (bytes) {
                     uint64_t src_off = vma_file_off + pg_off;
-                    uint64_t bytes   = PAGE_SIZE;
-                    if (pg_off + bytes > vma_file_len)
-                        bytes = vma_file_len - pg_off;
                     // pread: positional read — no seek position shared with other
                     // CPUs using the same vfs_file_t (lazy-loaded ELF VMAs).
                     int64_t pread_rc;
@@ -855,9 +989,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
                         uint8_t* ra_dst = (uint8_t*)(ra_frame + HHDM_OFFSET);
                         __builtin_memset(ra_dst, 0, PAGE_SIZE);
                         uint64_t ra_src_off = vma_file_off + ra_pg_off;
-                        uint64_t ra_bytes   = PAGE_SIZE;
-                        if (ra_pg_off + ra_bytes > vma_file_len)
-                            ra_bytes = vma_file_len - ra_pg_off;
+                        uint64_t ra_bytes   = vma_file_page_span(ra_pg_off, vma_file_len);
                         int64_t ra_rc;
                         if (vma_file->pread)
                             ra_rc = vma_file->pread(vma_file, ra_dst, ra_bytes, ra_src_off);
@@ -951,6 +1083,14 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
 
     kill:
     {
+        // Fast path: a catchable, unblocked SIGSEGV handler is installed (e.g. a
+        // JVM null-check / safepoint).  Deliver silently by redirecting the trap
+        // frame into the handler and iretq — do NOT print the PF-KILL banner
+        // below (this is not a kill, and such faults can be extremely frequent).
+        if (signal_fault_deliverable((struct task_t*)g_current, SIGSEGV)) {
+            signal_deliver_fault(SIGSEGV, f);
+            return;
+        }
         // Hold the serial lock for the whole banner — otherwise other
         // CPUs' klog_emit writes (sys:DEBUG, drm:DEBUG, …) byte-
         // interleave into the PF-KILL block and the dump becomes
@@ -1021,7 +1161,7 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             // the read so a bad RDI doesn't fault us.
             {
                 uint64_t rdi = g[6];
-                if (rdi >= 0x1000 && rdi < 0x800000000000ULL) {
+                if (rdi >= 0x1000 && rdi < USER_ADDR_CEIL) {
                     phys_addr_t pp = vmm_page_phys(vmm_pml4_get(), rdi & ~0xFFFULL);
                     if (pp != PMM_INVALID_ADDR) {
                         ser_str("\n  [RDI..+64]:");
@@ -1069,6 +1209,31 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
             }
         }
 
+        // ── User frame-pointer backtrace ──────────────────────────────────
+        // On a stack overflow RSP sits below the mapped stack, so STACK@RSP
+        // is useless; the RBP frames near the bottom are still mapped.  Walk
+        // the %rbp chain ([rbp]=saved rbp, [rbp+8]=return addr) and print
+        // return addresses — a runaway recursion shows the same call site
+        // repeating.  Symbolize offline against the faulting binary.
+        ser_str("  BT@RBP (ret addrs):\n");
+        {
+            uint64_t* g = (uint64_t*)((uintptr_t)f + 5 * 8);
+            uint64_t rbp = g[4];
+            for (int i = 0; i < 24; i++) {
+                if (rbp < 0x1000 || rbp >= USER_ADDR_CEIL || (rbp & 7)) break;
+                phys_addr_t bpg = vmm_page_phys(vmm_pml4_get(), rbp & ~0xFFFULL);
+                if (bpg == PMM_INVALID_ADDR) { ser_str("    (rbp unmapped)\n"); break; }
+                uint64_t saved = *(uint64_t*)((bpg + HHDM_OFFSET) + (rbp & 0xFF8ULL));
+                uint64_t ra_va = rbp + 8;
+                phys_addr_t rpg = vmm_page_phys(vmm_pml4_get(), ra_va & ~0xFFFULL);
+                if (rpg == PMM_INVALID_ADDR) break;
+                uint64_t ra = *(uint64_t*)((rpg + HHDM_OFFSET) + (ra_va & 0xFF8ULL));
+                ser_str("    ret="); ser_hex64(ra);
+                if (saved <= rbp) break;   // chain must climb toward the top
+                rbp = saved;
+            }
+        }
+
         // ── Instruction bytes at faulting RIP ─────────────────────────────
         ser_str("  CODE@RIP:\n");
         {
@@ -1084,8 +1249,12 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         }
         ser_str("===== END PF-KILL =====\n\n");
         serial_unlock_irqrestore(__pfkill_rf);
-        kill_current();
-        return;
+        // Genuine crash: no catchable handler installed -> terminate.
+        // signal_deliver_fault takes the force-default terminate path (logs the
+        // [signal] terminate line, reaps fds/children, zombifies) and does not
+        // return.  The trailing halt is belt-and-suspenders.
+        signal_deliver_fault(SIGSEGV, f);
+        for (;;) __asm__ volatile("cli; hlt");
     }
     }
 
@@ -1095,12 +1264,30 @@ void isr14_page_fault(interrupt_frame_t* f, uint64_t ec) {
         phys_addr_t frame = pmm_buddy_alloc(0);
         if (frame == PMM_INVALID_ADDR) goto kernel_panic;
         __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
-        vmm_page_map(g_kernel_pml4, fault_addr & ~PAGE_MASK, frame, VMM_KDATA);
+        if (!vmm_page_map(g_kernel_pml4, fault_addr & ~PAGE_MASK, frame, VMM_KDATA)) {
+            // vmm_page_map OOM'd on an intermediate page-table page: the leaf is
+            // neither mapped nor freed.  Free it (no leak) and panic
+            // deterministically -- returning here would leave the fault
+            // unresolved, so the access re-faults and leaks another leaf each
+            // pass until the buddy is exhausted.
+            pmm_buddy_free(frame, 0);
+            goto kernel_panic;
+        }
         return;
     }
 
 kernel_panic:
     {
+        /* Fault-fixup: was the faulting instruction a sanctioned user access
+         * (copy_to/from_user, signal-frame build) registered in __ex_table?
+         * If so this is a bad or racing user pointer, NOT a kernel bug --
+         * resume at the fixup landing pad (which unwinds to -EFAULT) instead
+         * of panicking.  This is what stops userland from taking down the
+         * whole kernel with an unmapped/racing buffer or signal-frame page. */
+        extern uint64_t extable_fixup(uint64_t rip);
+        uint64_t fix = extable_fixup(f->ip);
+        if (fix) { f->ip = fix; return; }
+
         /* Short banner via the local serial path — we need at least
          * CR2 visible before we hand off, in case panic_from_exception
          * itself has a bug in this context. */

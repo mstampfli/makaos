@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_NETINET_IN_H
 #define _MAKAOS_NETINET_IN_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/socket.h>
 #include <stdint.h>
@@ -53,6 +56,7 @@ uint32_t ntohl(uint32_t v);
 #define INET_ADDRSTRLEN   16
 #define INET6_ADDRSTRLEN  46
 #define IPPROTO_IPV6      41
+#define IPPROTO_ICMPV6    58
 
 extern const struct in6_addr in6addr_any;        // ::
 extern const struct in6_addr in6addr_loopback;   // ::1
@@ -91,15 +95,49 @@ extern const struct in6_addr in6addr_loopback;   // ::1
 // IPv4 class/multicast tests (host byte order input).
 #define IN_MULTICAST(a)  ((((in_addr_t)(a)) & 0xF0000000) == 0xE0000000)
 
+#define IP_TOS              1
 #define IP_TTL              2
 #define IPV6_UNICAST_HOPS   16
 
 // Multicast socket options (accepted, ignored by the stack).
+#define IP_MULTICAST_IF     32
 #define IP_MULTICAST_TTL    33
 #define IP_MULTICAST_LOOP   34
 #define IP_ADD_MEMBERSHIP   35
 #define IP_DROP_MEMBERSHIP  36
+#define IPV6_CHECKSUM        7
+#define IPV6_MULTICAST_IF   17
+#define IPV6_ADD_MEMBERSHIP 20
+#define IPV6_DROP_MEMBERSHIP 21
+
+// Source-specific multicast (Linux values + structures).
+#define IP_UNBLOCK_SOURCE         37
+#define IP_BLOCK_SOURCE           38
+#define IP_ADD_SOURCE_MEMBERSHIP  39
+#define IP_DROP_SOURCE_MEMBERSHIP 40
+#define MCAST_JOIN_GROUP          42
+#define MCAST_BLOCK_SOURCE        43
+#define MCAST_UNBLOCK_SOURCE      44
+#define MCAST_LEAVE_GROUP         45
+#define MCAST_JOIN_SOURCE_GROUP   46
+#define MCAST_LEAVE_SOURCE_GROUP  47
+
+struct ip_mreq_source {
+    struct in_addr imr_multiaddr;
+    struct in_addr imr_interface;
+    struct in_addr imr_sourceaddr;
+};
+struct group_req {
+    uint32_t                gr_interface;
+    struct sockaddr_storage gr_group;
+};
+struct group_source_req {
+    uint32_t                gsr_interface;
+    struct sockaddr_storage gsr_group;
+    struct sockaddr_storage gsr_source;
+};
 #define IPV6_MULTICAST_HOPS 18
+#define IPV6_TCLASS         67
 #define IPV6_MULTICAST_LOOP 19
 #define IPV6_JOIN_GROUP     20
 #define IPV6_LEAVE_GROUP    21
@@ -119,4 +157,7 @@ struct ipv6_mreq {
     unsigned int    ipv6mr_interface;
 };
 
+#ifdef __cplusplus
+}
+#endif
 #endif

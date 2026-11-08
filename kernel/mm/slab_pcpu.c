@@ -238,7 +238,11 @@ void* slab_pcpu_alloc(size_t cls_in) {
     uint8_t  cls = (uint8_t)cls_in;
     uint64_t off = cpu_slot_off(cls);
 
-    // Lockless fast-path: cmpxchg16b pop.
+    // Lockless fast-path: cmpxchg16b pop.  The single-word cmpxchg makes the
+    // POP safe under migration on its own: a steal between the load and the CAS
+    // fails the {head,tid} compare on the new CPU and we retry.  (Unlike
+    // slab_pcpu_free, there is no second per-CPU word to keep coherent, so no
+    // preempt pin is needed here.)
     //
     // LOAD16 cpu_slot[cls] → snap = {freelist, tid}
     // if freelist == NULL: slow refill
@@ -285,15 +289,26 @@ void slab_pcpu_free(void* ptr) {
     uint64_t slot_off = cpu_slot_off(cls);
     uint64_t slab_off = cpu_slab_off(cls);
 
-    // Fast path: push to cpu_slot if h is THIS CPU's cpu_slab[cls].
+    // Fast path: push to cpu_slot IFF this object's page h is THIS CPU's
+    // cpu_slab[cls].  The check reads cpu_slab; the push writes cpu_slot -- two
+    // DIFFERENT per-CPU words that MUST be evaluated on the SAME CPU.  If a
+    // work-stealing migration lands between the `cpu_slab == h` check and the
+    // cpu_slot load, the load+cmpxchg run entirely on the NEW CPU against ITS
+    // slot (so the cmpxchg SUCCEEDS -- it is NOT a tid mismatch, contrary to the
+    // old comment which only reasoned about a migration between the load and the
+    // cmpxchg) and push h's object onto a CPU whose cpu_slab is a DIFFERENT
+    // page.  That object then rides the wrong page's freelist through
+    // park/drain, drifting slab accounting until a page is released with a live
+    // object -- surfaced as a use-after-free #GP in the RCU-typed inode-radix
+    // leaf cache under work-stealing, and as slab-header bytes scribbled into a
+    // buddy free frame.
     //
-    // The cpu_slab read AND the cmpxchg both resolve via %gs at
-    // instruction execution, so a migration between them either
-    //  (a) leaves the new CPU's cpu_slab also == h (if h happens to
-    //      be CPU_ACTIVE on the new CPU too — vanishingly unlikely)
-    //  (b) leaves them mismatched, and our cmpxchg fails on tid
-    //      → retry; loop re-reads cpu_slab on the new CPU and falls
-    //      through to remote_free.
+    // Pin to one CPU with preempt_disable (NOT cli): the task cannot be stolen
+    // while preempt is off, so the check and the push evaluate on one CPU --
+    // while IRQs stay ENABLED, so the IPI-based pcp drain is never delayed.  The
+    // cmpxchg still guards against an IRQ-time slab free re-entering on this
+    // same CPU.  The remote_free fallback is per-PAGE and needs no pin.
+    preempt_disable();
     for (;;) {
         slab_header_t* active = (slab_header_t*)this_cpu_read_ptr_at(slab_off);
         if (active != h) break;
@@ -304,12 +319,12 @@ void slab_pcpu_free(void* ptr) {
         if (this_cpu_cmpxchg16b_at(slot_off, &snap_lo, &snap_hi,
                                     (uint64_t)ptr, snap_hi + 1)) {
             this_cpu()->slab_mag_hits[cls]++;
+            preempt_enable();
             return;
         }
-        // CAS failed: tid mismatch.  Re-read cpu_slab and retry — a
-        // genuine migration will fall out of the loop on the next
-        // iteration when active != h.
+        // CAS failed: an IRQ-time slab free on THIS cpu bumped tid -- retry.
     }
+    preempt_enable();
 
     // Phase 5A: page isn't THIS CPU's cpu_slab — lockless push to
     // the per-page remote_free Treiber stack.  Drained under

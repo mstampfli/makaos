@@ -158,6 +158,17 @@ static dentry_t* dentry_alloc(uint32_t parent_ino, const char* name,
     return d;
 }
 
+// Append an UNLINKED dentry at the LRU tail (mirror of lru_push_head_locked).
+// Caller holds g_dcache_wlock and has verified d is not already on the list.
+// Both put-to-LRU sites (dentry_free_cb, dcache_put) inlined this exact splice.
+static inline void lru_push_tail_locked(dentry_t* d) {
+    d->lru_next = NULL;
+    d->lru_prev = g_dcache_lru_tail;
+    if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d;
+    else                   g_dcache_lru_head = d;
+    g_dcache_lru_tail = d;
+}
+
 // RCU callback: actually free a dentry.  At this point no reader
 // can still be traversing it (grace period elapsed).
 static void dentry_free_cb(void* p) {
@@ -178,11 +189,7 @@ static void dentry_free_cb(void* p) {
             if (d->parent->lru_prev == NULL && d->parent->lru_next == NULL
                 && g_dcache_lru_head != d->parent
                 && g_dcache_lru_tail != d->parent) {
-                d->parent->lru_next = NULL;
-                d->parent->lru_prev = g_dcache_lru_tail;
-                if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d->parent;
-                else                   g_dcache_lru_head = d->parent;
-                g_dcache_lru_tail = d->parent;
+                lru_push_tail_locked(d->parent);
             }
             spin_unlock_irqrestore(&g_dcache_wlock, f);
         }
@@ -212,6 +219,11 @@ static inline void lru_push_head_locked(dentry_t* d) {
 
 // ── Lookup (hot path) ───────────────────────────────────────────────
 
+// Sentinel refcount value meaning "the shrinker has claimed this dentry for
+// free; do not resurrect it."  refcount is otherwise a small holder count
+// (0 = reclaimable), so the top of the range is safe to reserve.
+#define DCACHE_REF_DYING 0xFFFFFFFFu
+
 dentry_t* dcache_lookup(uint32_t parent_ino, const char* name,
                          uint32_t name_len, uint32_t name_hash) {
     rcu_read_lock();
@@ -229,11 +241,24 @@ dentry_t* dcache_lookup(uint32_t parent_ino, const char* name,
             d->name_hash  == name_hash  &&
             d->name_len   == name_len   &&
             dname_eq(d, name, name_len)) {
-            // Hit.  Bump refcount so the caller keeps it alive after
-            // rcu_read_unlock.  atomic_fetch_add is cheap; only
-            // contested if many CPUs simultaneously look up the
-            // same path (bash startup etc), and even then no lock.
-            __atomic_fetch_add(&d->refcount, 1u, __ATOMIC_ACQ_REL);
+            // Hit.  Bump refcount via CAS so we never resurrect a dentry
+            // the shrinker has already claimed for free (refcount ==
+            // DCACHE_REF_DYING).  A bare fetch_add could raise 0->1 on a
+            // dentry the shrinker decided to free from its 0 snapshot,
+            // leaving it referenced / on the LRU yet queued for RCU free
+            // -> use-after-free.  The CAS makes "claim for free" (shrinker)
+            // and "resurrect" (here) mutually exclusive on the refcount.
+            uint32_t rc = __atomic_load_n(&d->refcount, __ATOMIC_ACQUIRE);
+            while (rc != DCACHE_REF_DYING &&
+                   !__atomic_compare_exchange_n(&d->refcount, &rc, rc + 1u, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                ;  // cmpxchg reloads rc on failure; retry
+            if (rc == DCACHE_REF_DYING) {
+                // Being reclaimed — skip it and keep walking the chain
+                // (a fresh dentry for the same key may have been installed).
+                d = (dentry_t*)rcu_dereference(d->hash_next);
+                continue;
+            }
 
             // Update LRU age — relaxed store, pure hint.  Not a
             // full LRU bump (which requires g_dcache_wlock); the
@@ -275,11 +300,7 @@ void dcache_put(dentry_t* d) {
         // Append to tail — cold.  Hits bump last_used_ns but don't
         // relink (would require the writer lock).  The shrinker
         // picks by last_used_ns among the LRU's candidates.
-        d->lru_next = NULL;
-        d->lru_prev = g_dcache_lru_tail;
-        if (g_dcache_lru_tail) g_dcache_lru_tail->lru_next = d;
-        else                   g_dcache_lru_head = d;
-        g_dcache_lru_tail = d;
+        lru_push_tail_locked(d);
     }
     spin_unlock_irqrestore(&g_dcache_wlock, f);
 }
@@ -378,13 +399,24 @@ dentry_t* dcache_install(dentry_t* parent, uint32_t parent_ino,
     dentry_t* existing = bucket_find_locked(tbl, b, parent_ino, name,
                                              name_len, name_hash);
     if (existing) {
+        // Take the caller's reference on `existing` UNDER g_dcache_wlock,
+        // BEFORE releasing it.  The shrinker claims a dentry for free by
+        // CAS'ing its refcount 0 -> DCACHE_REF_DYING AND unlinking it ALL
+        // under this same lock (dcache_shrink), so a still-linked entry found
+        // here is never DYING and cannot be claimed while we hold the lock --
+        // the bump and the shrinker's claim are mutually exclusive.  The old
+        // code bumped AFTER the unlock: the shrinker could CAS 0 -> DYING and
+        // RCU-free `existing` in that gap, and the bare fetch_add then wrapped
+        // DYING (0xFFFFFFFF) -> 0 on a freed slot = use-after-free.  (Unlike
+        // the lock-free dcache_lookup, install holds the lock, so the lock --
+        // not a DYING-aware CAS -- is the serialization here.)
+        __atomic_fetch_add(&existing->refcount, 1u, __ATOMIC_ACQ_REL);
         spin_unlock_irqrestore(&g_dcache_wlock, f);
         // Dispose of our candidate; it was never visible.
         if (d->name_ext) kfree(d->name_ext);
         if (parent) __atomic_fetch_sub(&parent->refcount, 1u,
                                          __ATOMIC_ACQ_REL);
         pmm_slab_free(d);
-        __atomic_fetch_add(&existing->refcount, 1u, __ATOMIC_ACQ_REL);
         return existing;
     }
 
@@ -421,6 +453,34 @@ static void dentry_unlink_and_free_locked(dcache_table_t* tbl, dentry_t* d) {
     call_rcu_head(&d->rcu_head, dentry_free_cb, d);
 }
 
+// Invalidate (writer holds g_dcache_wlock): make future lookups miss, and free
+// the dentry -- but ONLY if no path walk currently holds it.  The old code
+// call_rcu-freed UNCONDITIONALLY, so a dentry that dcache_lookup handed out
+// (refcount-pinned, NOT rcu-pinned -- dcache_lookup rcu_read_unlocks before
+// returning) could be freed while its holder still read child_ino + dcache_put'd
+// it -> a freed read + a freed refcount-- WRITE into a reused SLAB_TYPESAFE_BY_RCU
+// slot (cascading dentry UAF + LRU corruption).  Mirror the shrinker's discipline:
+// CAS refcount 0 -> DYING claims an UNREFERENCED dentry (the serialization point
+// vs a concurrent dcache_put's last-ref LRU-add) and frees it immediately, as
+// before.  If the CAS fails the dentry is HELD: do NOT free it -- just unlink it
+// from the hash (the invalidate's real purpose: future lookups miss and
+// re-resolve), and let the holder's final dcache_put return it to the LRU at
+// refcount 0, where the shrinker reclaims it later via its own 0 -> DYING CAS.
+static void dentry_invalidate_locked(dcache_table_t* tbl, dentry_t* d) {
+    uint32_t expect = 0;
+    if (__atomic_compare_exchange_n(&d->refcount, &expect, DCACHE_REF_DYING,
+                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        dentry_unlink_and_free_locked(tbl, d);   // unreferenced: free now, as before
+        return;
+    }
+    // Held by a path walk -- hash-unlink only, never free here.
+    uint32_t b = dcache_bucket(d->parent_ino, d->name_hash, tbl->cap);
+    dentry_t** pp = &tbl->buckets[b];
+    while (*pp && *pp != d) pp = &(*pp)->hash_next;
+    if (*pp) rcu_assign_pointer(*pp, d->hash_next);
+    __atomic_fetch_add(&s_stat_invalidations, 1u, __ATOMIC_RELAXED);
+}
+
 void dcache_invalidate(uint32_t parent_ino, const char* name,
                         uint32_t name_len) {
     uint32_t name_hash = dcache_name_hash(name, name_len);
@@ -430,7 +490,7 @@ void dcache_invalidate(uint32_t parent_ino, const char* name,
     uint32_t b = dcache_bucket(parent_ino, name_hash, tbl->cap);
     dentry_t* d = bucket_find_locked(tbl, b, parent_ino, name,
                                       name_len, name_hash);
-    if (d) dentry_unlink_and_free_locked(tbl, d);
+    if (d) dentry_invalidate_locked(tbl, d);
     spin_unlock_irqrestore(&g_dcache_wlock, f);
 }
 
@@ -444,7 +504,7 @@ void dcache_invalidate_subtree(uint32_t dir_ino) {
         while (d) {
             dentry_t* next = d->hash_next;
             if (d->parent_ino == dir_ino) {
-                dentry_unlink_and_free_locked(tbl, d);
+                dentry_invalidate_locked(tbl, d);
             }
             d = next;
         }
@@ -461,10 +521,14 @@ uint32_t dcache_shrink(uint32_t max) {
     dcache_table_t* tbl = g_dcache_table;
     while (evicted < max && g_dcache_lru_head) {
         dentry_t* d = g_dcache_lru_head;
-        // Refcount could have been bumped between put and shrink;
-        // re-check.  If > 0, skip (pull off LRU — it shouldn't
-        // be there if refcount went up, but be defensive).
-        if (__atomic_load_n(&d->refcount, __ATOMIC_ACQUIRE) != 0) {
+        // Claim the dentry for free by CAS'ing refcount 0 -> DYING.  This
+        // is the serialization point with the lock-free dcache_lookup: if a
+        // looker resurrected it (CAS'd 0 -> 1) first, our CAS fails and we
+        // just pull it off the LRU and skip -- never freeing a dentry a
+        // looker holds (which would leave a freed slot on the LRU / hash).
+        uint32_t expect = 0;
+        if (!__atomic_compare_exchange_n(&d->refcount, &expect, DCACHE_REF_DYING,
+                                         0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             lru_unlink_locked(d);
             continue;
         }

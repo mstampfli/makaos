@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_NETDB_H
 #define _MAKAOS_NETDB_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/socket.h>
 #include <netinet/in.h>
 
@@ -75,5 +79,9 @@ struct servent* getservbyport(int port, const char* proto);
 int gethostbyname_ipv4(const char* name, uint32_t* out_ip_be);
 int getaddrinfo_ipv4(const char* host, uint16_t port,
                       struct sockaddr_in* out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_LANGINFO_H
 #define _MAKAOS_LANGINFO_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <locale.h>
 
@@ -61,4 +64,7 @@ typedef int nl_item;
 
 char* nl_langinfo(nl_item item);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

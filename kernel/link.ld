@@ -14,6 +14,13 @@ SECTIONS
 
     .rodata : ALIGN(4096) {
         *(.rodata*)
+        /* Fault-fixup (exception) table -- folded into .rodata so the raw
+         * binary's `-j .rodata` already carries it; delimited for the
+         * page-fault handler's extable_fixup() lookup. */
+        . = ALIGN(8);
+        __start___ex_table = .;
+        KEEP(*(__ex_table))
+        __stop___ex_table = .;
     }
     . = ALIGN(4096);
 

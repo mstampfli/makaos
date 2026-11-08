@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_FNMATCH_H
 #define _MAKAOS_FNMATCH_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define FNM_NOMATCH  1
 #define FNM_PATHNAME 0x01
@@ -8,4 +11,7 @@
 
 int fnmatch(const char* pattern, const char* string, int flags);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

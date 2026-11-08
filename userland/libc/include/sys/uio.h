@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYS_UIO_H
 #define _MAKAOS_SYS_UIO_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 #include <sys/types.h>
@@ -17,4 +20,7 @@ struct iovec {
 ssize_t readv(int fd, const struct iovec* iov, int iovcnt);
 ssize_t writev(int fd, const struct iovec* iov, int iovcnt);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

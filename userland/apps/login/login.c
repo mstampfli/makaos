@@ -20,6 +20,7 @@
 
 #define PASSWD_PATH  "/etc/passwd"
 #define SHADOW_PATH  "/etc/shadow"
+#define AUTOLOGIN_PATH "/etc/autologin"
 #define MAX_USERS    32
 #define MAX_LINE     256
 
@@ -178,9 +179,148 @@ static int read_password(char* buf, int max) {
     return n;
 }
 
+// ── Session start — drop creds, set env, exec the session, wait ───────────
+// Shared by the interactive and auto-login paths so the two cannot drift.
+// `cmd_override`, when non-NULL, is exec'd in place of pw->shell (auto-login
+// uses it to launch a compositor directly).  Returns the session's exit
+// status, or -1 if it could not be spawned.
+static int start_session(passwd_entry_t* pw, const char* username,
+                         const char* cmd_override) {
+    // ── Terminal ownership for THIS session ─────────────────────────
+    // Hand /dev/tty0 (and therefore /dev/tty) to the user who is logging in,
+    // and revoke every fd another session left open on it.  Without this the
+    // console belonged permanently to root while /dev/tty was world-open, so
+    // any user's leftover background process could read the console -- i.e.
+    // the next person's keystrokes, root's password included.
+    // Root-only ioctl, so it must happen BEFORE we hand out credentials.
+    ioctl(0, TIOCSCONSOWN, (void*)(uint64_t)pw->uid);
+
+    // Claim the console as this session's controlling terminal.  The session
+    // child inherits our sid (spawn keeps a child in its parent's session), so
+    // it and its descendants resolve /dev/tty to this console; a process that
+    // is not in our session resolves nothing and gets -ENXIO.
+    ioctl(0, TIOCSCTTY, (void*)0);
+
+    // ── Change to home directory ─────────────────────────────────────
+    if (chdir(pw->home) < 0) {
+        // Fall back to / if home doesn't exist yet.
+        chdir("/");
+    }
+
+    // ── Clear screen before session ──────────────────────────────────
+    write(1, "\f", 1);
+
+    // ── Print welcome ────────────────────────────────────────────────
+    write(1, "Welcome, ", 9);
+    write(1, username, s_strlen(username));
+    write(1, "!\n", 2);
+
+    // ── Exec session as this user ────────────────────────────────────
+    // spawn inherits our (now-dropped) credentials via cred_copy in
+    // elf_exec_from_ext2.  The child runs as uid=pw->uid.
+    //
+    // Build a minimal env.  POSIX + systemd consumers like foot / fcft
+    // look up HOME and USER immediately on startup (foot:conf.c:374 reads
+    // $XDG_CONFIG_HOME then $HOME, fcft parses $XDG_CACHE_HOME for its font
+    // cache).  Without these set every wayland client can't find its config
+    // directory and falls back to defaults that require further machinery.
+    // Set the canonical four so downstream consumers find what they expect.
+    char env_home[128 + 5];
+    char env_user[32  + 5];
+    char env_shell[128 + 6];
+    s_strcpy(env_home,  "HOME=",  sizeof(env_home));
+    s_strcpy(env_home  + 5,  pw->home, sizeof(env_home)  - 5);
+    s_strcpy(env_user,  "USER=",  sizeof(env_user));
+    s_strcpy(env_user  + 5,  username, sizeof(env_user)  - 5);
+    s_strcpy(env_shell, "SHELL=", sizeof(env_shell));
+    s_strcpy(env_shell + 6,  pw->shell, sizeof(env_shell) - 6);
+    const char* shell_env[] = {
+        env_home,
+        env_user,
+        env_shell,
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "TERM=xterm-256color",
+        "LANG=C.UTF-8",
+        "XDG_RUNTIME_DIR=/tmp",
+        // NOTE: the Swiss layout is NOT set via XKB_DEFAULT_LAYOUT here.
+        // That drives from_names(ch), whose keymap contains exotic level3/4
+        // keysyms (long-s, capital-sharp-s, bullet) that the guest
+        // libxkbcommon re-serializes as UXXXX tokens its own parser then
+        // rejects -- so every wayland CLIENT (foot) ends up with a NULL
+        // keymap and dead keys, even though the compositor's bindings work.
+        // Instead sway loads a precompiled, UXXXX-free keymap via
+        // `input type:keyboard xkb_file /etc/keymap.xkb` (see build.sh). If
+        // xkb_file ever fails, the fallback is a parseable US layout, not a
+        // dead keyboard.
+        // Force wlroots' SOFTWARE cursor: our virtio-gpu can't make a legacy HW
+        // cursor DUMB buffer a GLES2 render target, so wlroots renders the cursor
+        // sprite into an empty buffer -> invisible pointer.  The software cursor
+        // composites into the main frame (which renders correctly), so it shows.
+        "WLR_NO_HARDWARE_CURSORS=1",
+        (char*)0,
+    };
+    const char* prog = cmd_override ? cmd_override : pw->shell;
+    const char* sh_argv[] = { prog, (char*)0 };
+    int inherit_stdio[3] = { -1, -1, -1 };
+
+    // Apply the user's credentials to the CHILD, not to ourselves.  login used
+    // to call setgid/setuid on its own process and then spawn; that is a one-way
+    // door -- after the first non-root session login was permanently uid 1000,
+    // so it could no longer read /etc/shadow (making every later login fall into
+    // the "no shadow entry" branch) nor setuid(0) for a root login, and it never
+    // checked those calls for failure.  spawn() applies uid/gid atomically to the
+    // child while login stays root and stays able to manage the next session.
+    spawn_attr_t at;
+    __builtin_memset(&at, 0, sizeof(at));
+    at.flags = SPAWN_ATTR_CRED;
+    at.uid   = pw->uid;
+    at.gid   = pw->gid;
+
+    int pid = spawn(prog, sh_argv, shell_env, inherit_stdio, &at);
+    if (pid < 0) {
+        write(1, "login: failed to exec session\n", 30);
+        ioctl(0, TIOCSCONSOWN, (void*)0);   // release the terminal again
+        return -1;
+    }
+
+    // Wait for the session to exit.
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    // Reclaim the foreground process group.  A shell that sets up job control
+    // puts itself in its own group and calls tcsetpgrp(), which leaves US in
+    // the background -- and a background read on the controlling terminal
+    // returns -EINTR (after SIGTTIN), so the next login prompt could never read
+    // a keystroke.  Job control only became reachable once sessions were
+    // inherited, so this could not bite before.
+    tcsetpgrp(0, getpgrp());
+
+    // Session over: take the terminal back and revoke every fd the session
+    // left behind, so nothing it spawned can keep reading the console.
+    ioctl(0, TIOCSCONSOWN, (void*)0);
+    return status;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────
 
+// Ignore the job-control signals the terminal generates.  The session child
+// inherits our process group, so a Ctrl-C / Ctrl-\ / Ctrl-Z at the console is
+// delivered to the whole group -- us included.  Real login and getty ignore
+// these for exactly this reason: the shell handles them, and the thing that
+// owns the console must not be killed by a keystroke typed into it.
+static void ignore_job_control_signals(void) {
+    struct_sigaction sa;
+    int i;
+    const int sigs[] = { SIGINT, SIGQUIT, SIGTSTP, SIGTTIN, SIGTTOU };
+    for (i = 0; i < 5; i++) {
+        __builtin_memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sigaction(sigs[i], &sa, (struct_sigaction*)0);
+    }
+}
+
 int main(void) {
+    ignore_job_control_signals();
     ioctl(0, TCFLSH, (void*)0);  // flush stale input (phantom keystrokes from BIOS/UEFI)
     write(1, "\f", 1);  // clear screen on entry
 
@@ -201,6 +341,33 @@ int main(void) {
         return 1;
     }
     foreach_line(shadow_buf, parse_shadow_line, (void*)0);
+
+    // ── Auto-login (kiosk / test, agetty -a analog) ────────────────────────
+    // If /etc/autologin exists, start a session for the named user without an
+    // interactive prompt.  One line: "username" or "username:command" (command
+    // replaces the login shell).  Used by the headless boot-test harness to
+    // reach the compositor deterministically without blind console keystrokes.
+    // Absent from the normal image build, so default boots still prompt.
+    static char autologin_buf[256];
+    if (read_file(AUTOLOGIN_PATH, autologin_buf, sizeof(autologin_buf)) >= 0) {
+        char* nl = autologin_buf;
+        while (*nl && *nl != '\n') nl++;
+        *nl = '\0';
+        char* al_cmd = (char*)0;
+        char* c = autologin_buf;
+        while (*c && *c != ':') c++;
+        if (*c == ':') { *c = '\0'; al_cmd = c + 1; }
+        if (autologin_buf[0]) {
+            passwd_entry_t* pw = find_passwd(autologin_buf);
+            if (pw) {
+                // Re-launch the session if it exits (kiosk behavior).  Safe
+                // for the uid=0 case the harness uses (setuid(0) is a no-op,
+                // so each relaunch re-drops cleanly).
+                for (;;) start_session(pw, autologin_buf, al_cmd);
+            }
+        }
+        // Misconfigured autologin (no such user) falls through to prompts.
+    }
 
     // Login loop — retry on bad credentials.
     char username[64];
@@ -227,81 +394,20 @@ int main(void) {
             continue;
         }
 
-        // Check password.
+        // Check password.  FAIL CLOSED: a user with no /etc/shadow entry can
+        // never authenticate.  This used to fall through and admit them with no
+        // password "in case shadow is misconfigured" -- which is exactly the
+        // state login put itself in after one non-root session (it had dropped
+        // to that uid and could no longer read the 0600 shadow file), so the
+        // next prompt accepted ANY username with ANY password.
         shadow_entry_t* sh = find_shadow(username);
-        if (sh) {
-            if (s_strcmp(sh->password, password) != 0) {
-                write(1, "Login incorrect.\n", 17);
-                continue;
-            }
-        }
-        // If no shadow entry: allow login without password (not recommended,
-        // but lets root in even if shadow is misconfigured).
-
-        // ── Credentials drop ────────────────────────────────────────────
-        // Order matters: setgid BEFORE setuid (once uid != 0 we may lose
-        // the ability to setgid to arbitrary groups).
-        setgid(pw->gid);
-        setgroups(0, (uint32_t*)0);   // clear supplemental groups
-        setuid(pw->uid);
-
-        // ── Change to home directory ─────────────────────────────────────
-        if (chdir(pw->home) < 0) {
-            // Fall back to / if home doesn't exist yet.
-            chdir("/");
+        if (!sh || s_strcmp(sh->password, password) != 0) {
+            write(1, "Login incorrect.\n", 17);
+            continue;
         }
 
-        // ── Clear screen before shell ────────────────────────────────────
-        write(1, "\f", 1);
-
-        // ── Print welcome ────────────────────────────────────────────────
-        write(1, "Welcome, ", 9);
-        write(1, username, s_strlen(username));
-        write(1, "!\n", 2);
-
-        // ── Exec shell as this user ──────────────────────────────────────
-        // spawn inherits our (now-dropped) credentials via cred_copy in
-        // elf_exec_from_ext2.  The child shell runs as uid=pw->uid.
-        //
-        // Build a minimal env for the shell.  POSIX + systemd consumers
-        // like foot / fcft look up HOME and USER immediately on startup
-        // (foot:conf.c:374 reads $XDG_CONFIG_HOME then $HOME, fcft
-        // parses $XDG_CACHE_HOME for its font cache).  Without these
-        // set every wayland client can't find its config directory and
-        // falls back to defaults that require further machinery (e.g.
-        // foot falls back to getpwuid(getuid()), which fails on our
-        // libc and drops the shell back to "sh").  Set the canonical
-        // four so downstream consumers find what they expect.
-        char env_home[128 + 5];
-        char env_user[32  + 5];
-        char env_shell[128 + 6];
-        s_strcpy(env_home,  "HOME=",  sizeof(env_home));
-        s_strcpy(env_home  + 5,  pw->home, sizeof(env_home)  - 5);
-        s_strcpy(env_user,  "USER=",  sizeof(env_user));
-        s_strcpy(env_user  + 5,  username, sizeof(env_user)  - 5);
-        s_strcpy(env_shell, "SHELL=", sizeof(env_shell));
-        s_strcpy(env_shell + 6,  pw->shell, sizeof(env_shell) - 6);
-        const char* shell_env[] = {
-            env_home,
-            env_user,
-            env_shell,
-            "PATH=/usr/local/bin:/usr/bin:/bin",
-            "TERM=xterm-256color",
-            "LANG=C.UTF-8",
-            "XDG_RUNTIME_DIR=/tmp",
-            (char*)0,
-        };
-        const char* sh_argv[] = { pw->shell, (char*)0 };
-        int inherit_stdio[3] = { -1, -1, -1 };
-        int pid = spawn(pw->shell, sh_argv, shell_env, inherit_stdio, NULL);
-        if (pid < 0) {
-            write(1, "login: failed to exec shell\n", 28);
-            return 1;
-        }
-
-        // Wait for shell to exit, then re-show login prompt.
-        int status = 0;
-        waitpid(pid, &status, 0);
+        // ── Start the user's session (shared with the auto-login path) ───
+        start_session(pw, username, (const char*)0);
 
         // Re-read databases for next login (they may have changed).
         s_npasswd = 0; s_nshadow = 0;

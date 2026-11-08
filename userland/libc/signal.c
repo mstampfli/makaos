@@ -58,6 +58,15 @@ int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {
                  (uint64_t)set, (uint64_t)oldset));
 }
 
+// sigaltstack — set/query the alternate signal stack.  The kernel stack_t
+// layout { void* ss_sp; int ss_flags; unsigned long ss_size; } matches ours,
+// so the structs pass through unchanged.  Used with SA_ONSTACK so a handler
+// (e.g. a JVM's SIGSEGV) can run on a fresh stack during a stack overflow.
+int sigaltstack(const stack_t* ss, stack_t* old_ss) {
+    return (int)__syscall_ret(
+        syscall2(SYS_SIGALTSTACK, (uint64_t)ss, (uint64_t)old_ss));
+}
+
 int sigemptyset(sigset_t* s) { if (!s) { errno = EINVAL; return -1; } *s = 0;   return 0; }
 int sigfillset(sigset_t* s)  { if (!s) { errno = EINVAL; return -1; } *s = ~0ul; return 0; }
 

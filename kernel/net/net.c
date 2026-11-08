@@ -8,28 +8,14 @@
 #include "sched.h"
 #include "irq_wait.h"
 #include "common.h"
+#include "kprintf.h"   // kprintf_atomic: whole-line-locked serial output (see below)
 #include "tsc.h"
 
 extern void sched_yield(void);
 
-// ── Serial helpers (inline, no serial.h needed) ───────────────────────────
-
-static void ser_putc(char c) {
-    while (!(inb(0x3F8 + 5) & 0x20));
-    outb(0x3F8, (uint8_t)c);
-}
-static void ser_puts(const char* s) {
-    for (; *s; s++) ser_putc(*s);
-}
-static void ser_put_dec(uint32_t v) {
-    if (v >= 10) ser_put_dec(v / 10);
-    ser_putc((char)('0' + v % 10));
-}
-static void ser_put_hex8(uint8_t v) {
-    static const char h[] = "0123456789abcdef";
-    ser_putc(h[v >> 4]);
-    ser_putc(h[v & 0xF]);
-}
+// Serial logging goes through kprintf_atomic (whole-line serial lock) so net
+// log lines never interleave with the concurrent SMP kprintf output.  The old
+// hand-rolled ser_putc wrote to COM1 unlocked and shredded lines mid-word.
 
 // ── IP configuration ──────────────────────────────────────────────────────
 // All values stored and returned in network byte order (big-endian).
@@ -77,19 +63,16 @@ void net_set_config(uint32_t our_ip_be, uint32_t gw_be, uint32_t mask_be) {
     // Broadcast = (ip & mask) | ~mask
     s_bcast  = (our_ip_be & mask_be) | (~mask_be);
 
-    // Log to serial so headless test runs can grep this line.
+    // Log to serial so headless test runs can grep this line.  kprintf_atomic
+    // emits the WHOLE line under the serial lock: this runs concurrently with
+    // the SMP selftest kprintf storm, and the old char-by-char ser_putc path
+    // was unlocked, so the line got shredded mid-word and the grep gate
+    // intermittently missed it (the interface was configured either way).
     uint8_t* ip = (uint8_t*)&s_our_ip;
     uint8_t* gw = (uint8_t*)&s_gw_ip;
-    ser_puts("[net] ifconfig IP ");
-    ser_put_dec(ip[0]); ser_putc('.');
-    ser_put_dec(ip[1]); ser_putc('.');
-    ser_put_dec(ip[2]); ser_putc('.');
-    ser_put_dec(ip[3]);
-    ser_puts(" GW ");
-    ser_put_dec(gw[0]); ser_putc('.');
-    ser_put_dec(gw[1]); ser_putc('.');
-    ser_put_dec(gw[2]); ser_putc('.');
-    ser_put_dec(gw[3]); ser_putc('\n');
+    kprintf_atomic("[net] ifconfig IP %u.%u.%u.%u GW %u.%u.%u.%u\n",
+                   (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3],
+                   (unsigned)gw[0], (unsigned)gw[1], (unsigned)gw[2], (unsigned)gw[3]);
 }
 
 uint32_t net_get_dns(uint32_t* out, uint32_t max) {
@@ -105,9 +88,11 @@ void net_set_dns(const uint32_t* servers, uint32_t count) {
 }
 
 // ── Net receive thread ────────────────────────────────────────────────────
-// Wakes on virtio RX IRQ, drains the ring, dispatches each frame.
-// Also fires tcp_timer_tick() every ~10 wakeups (loose timer, ±200 ms is fine
-// since TCP RTO minimum is 1 s).
+// Wakes on virtio RX IRQ, drains the ring, dispatches each frame.  The TCP
+// retransmit/reap timer runs on the dedicated net_tcp_timer_thread ONLY, so
+// tcp_timer_tick keeps a single writer (its snd_nxt/rexmit/rto_deadline updates
+// are lockless -- see tcp.c).  This thread must NOT also call it: doing so ran
+// tcp_timer_tick from two threads and raced a pcb's sequence accounting.
 
 // TCP timer thread: fires tcp_timer_tick() roughly every 200 ms so
 // retransmits and TIME_WAIT expiry don't depend on incoming traffic.
@@ -120,18 +105,11 @@ static void net_tcp_timer_thread(void) {
 }
 
 static void net_rx_thread(void) {
-    uint32_t tick = 0;
-
     for (;;) {
         // Drain the entire RX ring before sleeping.
         skbuff_t* skb;
         while (virtio_net_rx_poll(&skb))
             eth_recv(skb);
-
-        if (++tick >= 10u) {
-            tick = 0;
-            tcp_timer_tick();
-        }
 
         // Sleep until the virtio-net MSI fires.
         // The IRQ handler calls irq_notify(g_virtio_net_irq) on RX so we
@@ -148,31 +126,21 @@ static void net_rx_thread(void) {
 
 int net_init(void) {
     if (!virtio_net_init()) {
-        ser_puts("[net] no virtio-net device\n");
+        kprintf_atomic("[net] no virtio-net device\n");
         return 0;
     }
 
-    // Print our IP config.
+    // Print our IP config.  Atomic whole-line output (see net_set_config).
     uint8_t* ip = (uint8_t*)&s_our_ip;
     uint8_t* gw = (uint8_t*)&s_gw_ip;
-    ser_puts("[net] IP ");
-    ser_put_dec(ip[0]); ser_putc('.');
-    ser_put_dec(ip[1]); ser_putc('.');
-    ser_put_dec(ip[2]); ser_putc('.');
-    ser_put_dec(ip[3]);
-    ser_puts(" GW ");
-    ser_put_dec(gw[0]); ser_putc('.');
-    ser_put_dec(gw[1]); ser_putc('.');
-    ser_put_dec(gw[2]); ser_putc('.');
-    ser_put_dec(gw[3]); ser_putc('\n');
+    kprintf_atomic("[net] IP %u.%u.%u.%u GW %u.%u.%u.%u\n",
+                   (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3],
+                   (unsigned)gw[0], (unsigned)gw[1], (unsigned)gw[2], (unsigned)gw[3]);
 
     const uint8_t* mac = virtio_net_mac();
-    ser_puts("[net] MAC ");
-    for (int i = 0; i < 6; i++) {
-        ser_put_hex8(mac[i]);
-        if (i < 5) ser_putc(':');
-    }
-    ser_putc('\n');
+    kprintf_atomic("[net] MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+                   (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
 
     // Gratuitous ARP — prime neighbours' caches.
     arp_announce();
@@ -180,7 +148,7 @@ int net_init(void) {
     // Spawn the RX dispatch kernel thread.
     task_t* t = task_create_kthread(net_rx_thread, pid_alloc());
     if (!t) {
-        ser_puts("[net] rx thread alloc failed\n");
+        kprintf_atomic("[net] rx thread alloc failed\n");
         return 0;
     }
     sched_add(t);
@@ -193,6 +161,6 @@ int net_init(void) {
     if (tt) sched_add(tt);
 
     s_ready = 1;
-    ser_puts("[net] ready\n");
+    kprintf_atomic("[net] ready\n");
     return 1;
 }

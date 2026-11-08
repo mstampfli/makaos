@@ -85,6 +85,16 @@ ALWAYS_INLINE void preempt_enable(void) {
     if (!nonzero) sched_preempt();
 }
 
+// Leave a preempt-disabled section WITHOUT the resched check preempt_enable
+// does -- for IRQ / timer-tick / atomic-completion contexts where a context
+// switch is forbidden.  Single source of truth for the bare per-CPU decrement
+// that ~10 such paths used to open-code as `this_cpu()->preempt_depth--`.
+// Caller guarantees balance (paired with a preceding preempt_disable), so no
+// zero-guard -- identical to the hand-rolled decrement it replaces.
+ALWAYS_INLINE void preempt_enable_no_resched(void) {
+    (void)this_cpu_dec_u32_nonzero(preempt_depth);
+}
+
 // Returns non-zero if preemption is currently disabled on this CPU.
 ALWAYS_INLINE int preempt_disabled(void) {
     return this_cpu_read_u32(preempt_depth) > 0;

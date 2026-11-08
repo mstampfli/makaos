@@ -56,6 +56,7 @@ int vdprintf(int fd, const char* fmt, va_list ap);
 int scanf(const char* fmt, ...);
 int fscanf(FILE* f, const char* fmt, ...);
 int sscanf(const char* s, const char* fmt, ...);
+int vsscanf(const char* s, const char* fmt, va_list ap);
 
 // Stream I/O
 FILE*  fopen(const char* path, const char* mode);

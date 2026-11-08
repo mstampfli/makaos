@@ -58,6 +58,19 @@ static inline int cred_is_root(const cred_t* c) {
     return c->euid == 0;
 }
 
+// True iff `uid` (resp. `gid`) is one of the process's real / effective / saved
+// IDs -- the POSIX seteuid()/setegid() eligibility test for a non-root process,
+// also the uid/gid membership half of spawn_cred_allowed.  One source of truth
+// so the 3-slot set can't drift (a dropped slot is a privilege bug).  NOTE:
+// setuid()/setgid() deliberately use a DIFFERENT 2-slot {real,saved} set, so
+// they do NOT use these.
+static inline int cred_uid_is_one_of(const cred_t* c, uint32_t uid) {
+    return uid == c->ruid || uid == c->euid || uid == c->suid;
+}
+static inline int cred_gid_is_one_of(const cred_t* c, uint32_t gid) {
+    return gid == c->rgid || gid == c->egid || gid == c->sgid;
+}
+
 // POSIX setuid() rules (no escalation — in-slot only).
 // Returns 0 on success, -1 if the transition is outside the three slots
 // (caller must then ask ksec).
@@ -77,7 +90,7 @@ static inline int cred_setuid(cred_t* c, uint32_t uid) {
 // POSIX seteuid() rules.
 static inline int cred_seteuid(cred_t* c, uint32_t euid) {
     if (c->euid == 0) { c->euid = euid; return 0; }
-    if (euid == c->ruid || euid == c->suid || euid == c->euid) {
+    if (cred_uid_is_one_of(c, euid)) {
         c->euid = euid;
         return 0;
     }
@@ -99,7 +112,7 @@ static inline int cred_setgid(cred_t* c, uint32_t gid) {
 
 static inline int cred_setegid(cred_t* c, uint32_t egid) {
     if (c->euid == 0) { c->egid = egid; return 0; }
-    if (egid == c->rgid || egid == c->sgid || egid == c->egid) {
+    if (cred_gid_is_one_of(c, egid)) {
         c->egid = egid;
         return 0;
     }

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_IO_URING_H
 #define _MAKAOS_IO_URING_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // MakaOS io_uring — Linux-compatible layouts for direct drop-in.
 //
 // Structures MUST stay ABI-identical to kernel/io/io_uring.h.
@@ -83,4 +86,7 @@ int io_uring_enter(int ring_fd, unsigned to_submit, unsigned min_complete,
                     unsigned flags, const void* sig);
 int io_uring_register(int ring_fd, unsigned op, const void* arg, unsigned n);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -1,0 +1,70 @@
+--- a/src/cairo-recording-surface.c
++++ b/src/cairo-recording-surface.c
+@@ -187,8 +187,23 @@
+ static cairo_status_t
+ bbtree_add (struct bbtree *bbt,
+ 	    cairo_command_header_t *header,
+-	    const cairo_box_t *box)
++	    const cairo_box_t *box,
++	    int depth)
+ {
++    /* MakaOS: bound the recursion.  cairo's bbtree_add has no depth
++     * guard; a degenerate insert pattern (monotonically expanding
++     * extents) recursed ~175K deep and overflowed the 8MB user stack
++     * (swaybar PF-KILL, <5000 commands).  Past the cap, chain the
++     * command at this node instead of recursing — correct, just a
++     * slightly less-selective replay index. */
++    if (depth > 2000) {
++	cairo_command_header_t *last = header;
++	while (last->chain)
++	    last = last->chain;
++	last->chain = bbt->chain;
++	bbt->chain = header;
++	return CAIRO_STATUS_SUCCESS;
++    }
+     if (box->p1.x < bbt->extents.p1.x || box->p1.y < bbt->extents.p1.y ||
+ 	box->p2.x > bbt->extents.p2.x || box->p2.y > bbt->extents.p2.y)
+     {
+@@ -199,14 +214,14 @@
+ 		    if (unlikely (bbt->left == NULL))
+ 			return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+ 		} else
+-		    bbtree_add (bbt->left, bbt->chain, &bbt->extents);
++		    bbtree_add (bbt->left, bbt->chain, &bbt->extents, depth + 1);
+ 	    } else {
+ 		if (bbt->right == NULL) {
+ 		    bbt->right = bbtree_new (&bbt->extents, bbt->chain);
+ 		    if (unlikely (bbt->right == NULL))
+ 			return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+ 		} else
+-		    bbtree_add (bbt->right, bbt->chain, &bbt->extents);
++		    bbtree_add (bbt->right, bbt->chain, &bbt->extents, depth + 1);
+ 	    }
+ 
+ 	    bbt->chain = NULL;
+@@ -235,14 +250,14 @@
+ 	    if (unlikely (bbt->left == NULL))
+ 		return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+ 	} else
+-	    return bbtree_add (bbt->left, header, box);
++	    return bbtree_add (bbt->left, header, box, depth + 1);
+     } else {
+ 	if (bbt->right == NULL) {
+ 	    bbt->right = bbtree_new (box, header);
+ 	    if (unlikely (bbt->right == NULL))
+ 		return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+ 	} else
+-	    return bbtree_add (bbt->right, header, box);
++	    return bbtree_add (bbt->right, header, box, depth + 1);
+     }
+ 
+     return CAIRO_STATUS_SUCCESS;
+@@ -357,7 +372,7 @@
+ 	cairo_box_t box;
+ 
+ 	_cairo_box_from_rectangle (&box, &header->extents);
+-	status = bbtree_add (&surface->bbtree, header, &box);
++	status = bbtree_add (&surface->bbtree, header, &box, 0);
+ 	if (unlikely (status))
+ 	    goto cleanup;
+     }

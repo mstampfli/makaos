@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYS_EPOLL_H
 #define _MAKAOS_SYS_EPOLL_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stdint.h>
 
@@ -43,4 +46,7 @@ int epoll_wait(int epfd, struct epoll_event* evs, int max, int timeout);
 int epoll_pwait(int epfd, struct epoll_event* evs, int max, int timeout,
                 const sigset_t* sigmask);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

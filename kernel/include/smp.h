@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "spinlock_types.h"   // spinlock_t / ticket_lock_t (also used by cpu.h)
 
 // ── SMP primitives ───────────────────────────────────────────────────────
 //
@@ -76,22 +77,35 @@ ALWAYS_INLINE void cpu_relax(void) {
     __asm__ volatile("pause" ::: "memory");
 }
 
+// preempt.h -> cpu.h for preempt_disable/preempt_enable_no_resched below.
+// Safe now that cpu.h takes its spinlock_t from spinlock_types.h rather than
+// from smp.h (so there is no smp.h <-> cpu.h cycle).  Placed after the atomics
+// so smp.h's own primitives are defined before cpu.h is pulled in.
+#include "preempt.h"
+
 // ── Spinlocks ────────────────────────────────────────────────────────────
 // Basic test-and-set spinlock with a pause-based backoff.  Correct under
 // SMP, trivially correct under UP (just sets a byte).  Keep critical
 // sections tiny — holding a spinlock across I/O is a bug.
-
-typedef struct {
-    volatile uint32_t locked;  // 0 = free, 1 = held
-} spinlock_t;
-
-#define SPINLOCK_INIT { 0 }
+// (spinlock_t / SPINLOCK_INIT are defined in spinlock_types.h.)
+//
+// A spinlock section is NON-PREEMPTIBLE by construction: spin_lock raises
+// preempt_depth and spin_unlock lowers it.  This makes the whole class of
+// "lock holder gets context-switched out mid-section, then the waiter spins
+// forever" deadlocks unrepresentable -- including the subtle one where a wake
+// inside the section (rcu_read_unlock -> preempt_enable -> sched_preempt)
+// would otherwise switch the holder away.  spin_unlock uses the no_resched
+// variant because spin_unlock_irqrestore runs in ISR context where a context
+// switch is forbidden; any deferred preemption is taken at the next tick.
+// (Sleeping while holding a spinlock is already a panic in sched_sleep, so
+// this cannot strand a preempt-disabled task across a sleep.)
 
 ALWAYS_INLINE void spin_lock_init(spinlock_t* l) {
     atomic_store_relaxed(&l->locked, 0u);
 }
 
 ALWAYS_INLINE void spin_lock(spinlock_t* l) {
+    preempt_disable();
     for (;;) {
         // Fast path: try to grab the lock.  Acquire ordering pairs with
         // the release in spin_unlock.
@@ -105,13 +119,18 @@ ALWAYS_INLINE void spin_lock(spinlock_t* l) {
 }
 
 ALWAYS_INLINE int spin_trylock(spinlock_t* l) {
+    preempt_disable();
     uint32_t zero = 0;
-    return __atomic_compare_exchange_n(&l->locked, &zero, 1u, 0,
-                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+    if (__atomic_compare_exchange_n(&l->locked, &zero, 1u, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return 1;                     // acquired -- stays preempt-disabled
+    preempt_enable_no_resched();      // failed -- do not leak the disable
+    return 0;
 }
 
 ALWAYS_INLINE void spin_unlock(spinlock_t* l) {
     atomic_store_rel(&l->locked, 0u);
+    preempt_enable_no_resched();
 }
 
 // IRQ-safe: save flags, disable IRQs, then take the lock.  Returns the
@@ -134,13 +153,7 @@ ALWAYS_INLINE void spin_unlock_irqrestore(spinlock_t* l, uint64_t flags) {
 // takes a ticket, then waits for the "now serving" counter to reach it.
 // Slightly slower than spin_lock on the uncontended path, but guarantees
 // every waiter eventually gets the lock.
-
-typedef struct {
-    volatile uint32_t head;   // next ticket to issue
-    volatile uint32_t tail;   // currently serving
-} ticket_lock_t;
-
-#define TICKET_LOCK_INIT { 0, 0 }
+// (ticket_lock_t / TICKET_LOCK_INIT are defined in spinlock_types.h.)
 
 ALWAYS_INLINE void ticket_lock_init(ticket_lock_t* t) {
     atomic_store_relaxed(&t->head, 0u);
@@ -148,19 +161,19 @@ ALWAYS_INLINE void ticket_lock_init(ticket_lock_t* t) {
 }
 
 ALWAYS_INLINE void ticket_lock(ticket_lock_t* t) {
+    preempt_disable();   // a ticket lock is a spinlock: non-preemptible section
     uint32_t my = atomic_add(&t->head, 1u);
     while (atomic_load_acq(&t->tail) != my) cpu_relax();
 }
 
 ALWAYS_INLINE void ticket_unlock(ticket_lock_t* t) {
     atomic_store_rel(&t->tail, atomic_load_relaxed(&t->tail) + 1u);
+    preempt_enable_no_resched();
 }
 
 // ── CPU count ────────────────────────────────────────────────────────────
-// Upper bound on the number of CPUs the kernel is compiled to support.
-// Per-CPU arrays are sized to this.  Raising it only costs BSS — no
-// architectural change is needed.
-#define MAX_CPUS 64
+// MAX_CPUS lives in common.h (leaf) so cpu.h/tss.h can size per-CPU tables
+// without a smp.h -> preempt.h -> cpu.h -> tss.h -> smp.h cycle.
 
 // ── Convenience for legacy code ──────────────────────────────────────────
 // Declares a per-CPU array of size MAX_CPUS and provides percpu_get(name)

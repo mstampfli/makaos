@@ -16,8 +16,11 @@
 // (rounded up to order-3 buddy block = 8 pages).
 
 #include "io_uring.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pmm.h"
+#include "uaccess.h"   // copy_from_user / user_buf_check (shared decls)
 #include "vmm.h"
+#include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (intrusive CQ-overflow queue)
 #include "mm.h"
 #include "common.h"
 #include "process.h"
@@ -33,11 +36,20 @@ extern uint64_t tsc_read_ns(void);
 
 #define IO_URING_MIN_ENTRIES 1u
 #define IO_URING_MAX_ENTRIES 4096u
+// Cap on the CQ-overflow list length.  A ring whose CQ is full spills extra
+// completions onto a kmalloc'd singly-linked list; an unprivileged ring that
+// never reaps its CQ would otherwise grow it without bound (kernel-memory DoS).
+// Past the cap, completions drop + bump the user-visible overflow counter (the
+// same last-resort behavior as the OOM branch).  ~96 KiB max overflow per ring.
+#define IO_URING_OVERFLOW_MAX 4096u
 
 // Forward declarations for helpers used across phases.
 static int     io_sqp_spawn(io_uring_t* uring);
 static int     io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe);
-static int     io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+// Consumes the chain at *phead and posts exactly one CQE per SQE; on a failure
+// to enqueue it completes the whole chain with error CQEs.  Returns void: the
+// caller has nothing to post or advance afterward.
+static void    io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
                                      uint32_t user_tail, uint32_t mask);
 static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe);
 
@@ -49,6 +61,22 @@ static uint32_t round_pow2_u32(uint32_t v) {
     v |= v >> 8; v |= v >> 16;
     return v + 1;
 }
+
+// Pure: mask a raw ring counter to a valid index.  For power-of-two `entries`
+// the result is always in [0, entries) regardless of the raw value.  Unit-tested.
+static inline uint32_t io_ring_index(uint32_t raw, uint32_t entries) {
+    return raw & (entries - 1u);
+}
+
+// Kernel-TRUSTED ring index masks.  sq_entries/cq_entries are set by setup from
+// round_pow2_u32(...) clamped to IO_URING_MAX_ENTRIES -- powers of two, stored
+// in the kernel io_uring_t, NEVER user-writable.  Index sqes[]/cqes[] with
+// these.  NEVER use sq_hdr->ring_mask / cq_hdr->ring_mask for indexing: those
+// live in the user-mapped ring header (vmm_map_physical_user, VMA_R|W|USER) and
+// a malicious process can overwrite them to 0xFFFFFFFF, turning `idx & mask`
+// into an unmasked OOB sqe read / attacker-controlled OOB cqe write.
+static inline uint32_t io_sq_mask(const io_uring_t* u) { return u->sq_entries - 1u; }
+static inline uint32_t io_cq_mask(const io_uring_t* u) { return u->cq_entries - 1u; }
 
 // Compute total backing bytes for given entries.  Page-aligned.
 static uint64_t compute_layout(uint32_t sq_entries, uint32_t cq_entries,
@@ -85,18 +113,45 @@ void io_uring_close_file(struct vfs_file_t* f) {
     if (!f) return;
     io_uring_t* uring = (io_uring_t*)f->ctx;
     if (uring) {
-        // Phase 8E: stop the worker.  Set worker_stop then wake so
-        // the worker exits its wait loop and transitions to TASK_DEAD.
-        // We do NOT wait for the worker here — it'll reap itself via
-        // the scheduler's normal zombie path.
-        if (uring->worker) {
-            __atomic_store_n(&uring->worker_stop, 1u, __ATOMIC_RELEASE);
-            wait_queue_wake_all(&uring->wq_waitq);
-        }
-        // Phase 8F: stop the SQPOLL kthread similarly.
-        if (uring->sqp_task) {
+        // Phase 8E/8F: stop AND JOIN the worker + SQPOLL kthreads before
+        // we free anything.  Both kthreads dereference `uring` (the Treiber
+        // queue, the SQ/CQ ring, owner_task, the backing pages) right up
+        // until they observe their stop flag and exit.  Freeing `uring` or
+        // pmm_buddy_free()ing the backing while a kthread is still draining
+        // is a use-after-free: the freed slab/pages get reused (commonly as
+        // page tables or another task_mm_t), and the dangling kthread then
+        // walks a garbage work-chain / reads a poisoned descriptor — which
+        // surfaced as a non-deterministic #PF/#GP on a corrupt mm_shared in
+        // do_switch / the page-fault handler under the io_uring bench.
+        //
+        // Each kthread publishes *_done as its LAST act before TASK_DEAD, so
+        // once we observe it set, the kthread provably touches `uring` no
+        // more and it is safe to free.  We re-wake every spin to close the
+        // park-after-stop lost-wakeup window, and sched_yield so the kthread
+        // (typically on another CPU) makes progress.  close()/task-exit both
+        // run in process context, so yielding here is safe.
+        // Stop + JOIN the SQPOLL kthread FIRST.  It is the only io_wq-worker
+        // spawn site that runs WITHOUT an fd ref (io_uring_enter holds an fdget
+        // ref, so it cannot race this last-ref-drop close); until SQPOLL is
+        // provably dead it can still io_wq_ensure_worker() on an IOSQE_ASYNC SQE
+        // and publish uring->worker AFTER we read it -- an orphaned worker that
+        // never sees worker_stop and then UAFs the freed ring.  Joining SQPOLL
+        // first makes uring->worker stable before we decide to stop/join it.
+        if (uring->sqp_task)
             __atomic_store_n(&uring->sqp_stop, 1u, __ATOMIC_RELEASE);
+        while (uring->sqp_task &&
+               !__atomic_load_n(&uring->sqp_done, __ATOMIC_ACQUIRE)) {
             wait_queue_wake_all(&uring->sqp_waitq);
+            sched_yield();
+        }
+        // SQPOLL is dead now -> read uring->worker with acquire (observes a
+        // worker SQPOLL may have published just before exiting), then stop+join.
+        if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&uring->worker_stop, 1u, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&uring->worker_done, __ATOMIC_ACQUIRE)) {
+            wait_queue_wake_all(&uring->wq_waitq);
+            sched_yield();
         }
         // Phase 8G: release fixed files.
         if (uring->fixed_files) {
@@ -105,12 +160,55 @@ void io_uring_close_file(struct vfs_file_t* f) {
             kfree(uring->fixed_files);
             uring->fixed_files = NULL;
         }
-        // Free backing pages.  The user mapping will have been torn
-        // down already by task exit (task_mm_release walks all VMAs).
-        // We only own the phys pages here.
+        // ── Unmap the backing from the owner's address space BEFORE we
+        // return its physical pages to the buddy allocator.  On an explicit
+        // close(2) — the common case — the user VMA is still live (it is
+        // only auto-torn-down at task exit).  Freeing the pages first lets
+        // the buddy re-hand them out (as a kstack, page table, or a fresh
+        // ring's backing) while the stale user mapping still aliases them:
+        // a use-after-free that scribbles the reused victim.  io_uring_create
+        // even memset()s a freshly allocated backing to zero — so a reused
+        // page that is now a live kstack gets a saved register zeroed, which
+        // surfaced as a NULL cpu_t in do_switch (and as a poisoned task_mm_t).
+        //
+        // We can only touch the mapping from the owning address space.
+        // close(2) and task-exit fd cleanup both run in it (g_current's mm is
+        // the one the ring was created in), which covers every real caller.
+        // If some other AS closes an inherited ring fd we skip the unmap and
+        // leak the mapping rather than risk freeing live, aliased pages.
+        uint64_t npg = uring->backing_bytes >> PAGE_SHIFT;
+        if (uring->user_vaddr && uring->owner_mm && g_current &&
+            g_current->mm_shared &&
+            g_current->mm_shared->mm == uring->owner_mm) {
+            extern uint8_t mm_vma_remove(struct mm_t*, uint64_t, uint64_t);
+            extern void tlb_flush_range(task_mm_t*, uint64_t, uint64_t);
+            phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
+            for (uint64_t i = 0; i < npg; i++) {
+                phys_addr_t fr = 0;
+                vmm_page_unmap(pml4, uring->user_vaddr + i * PAGE_SIZE, &fr);
+            }
+            mm_vma_remove(uring->owner_mm, uring->user_vaddr,
+                          uring->user_vaddr + uring->backing_bytes);
+            tlb_flush_range(g_current->mm_shared, uring->user_vaddr,
+                            uring->user_vaddr + uring->backing_bytes);
+            uring->user_vaddr = 0;
+        }
+        // Drain any pending CQ-overflow nodes -- the drain-on-post path is the
+        // ONLY other freer and it only runs while the ring is open, so a ring
+        // closed with a non-empty overflow list would leak every node.  The
+        // SQPOLL + worker kthreads are joined above and the fd is gone, so no
+        // poster races this (the overflow_lock is taken for symmetry).
+        {
+            uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
+            struct io_overflow_cqe* n = uring->overflow_head;
+            while (n) { struct io_overflow_cqe* nx = n->next; kfree(n); n = nx; }
+            uring->overflow_head = uring->overflow_tail = NULL;
+            uring->overflow_count = 0;
+            spin_unlock_irqrestore(&uring->overflow_lock, of);
+        }
+        // Now that no mapping aliases them, return the backing pages.
         uint8_t order = 0;
-        uint64_t pages = uring->backing_bytes >> PAGE_SHIFT;
-        while ((1ULL << order) < pages) order++;
+        while ((1ULL << order) < npg) order++;
         pmm_buddy_free(uring->backing_phys, order);
         kfree(uring);
     }
@@ -160,14 +258,18 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
     uring->worker = NULL;
     uring->wq_head = NULL;
     uring->worker_stop = 0;
+    uring->worker_done = 0;
+    spin_lock_init(&uring->worker_lock);
     uring->sqp_task = NULL;
     uring->sqp_stop = 0;
+    uring->sqp_done = 0;
     uring->sqp_idle_ms = kparams->sq_thread_idle ? kparams->sq_thread_idle : 1000;
     uring->fixed_files    = NULL;
     uring->fixed_files_nr = 0;
     spin_lock_init(&uring->fixed_files_lock);
     uring->overflow_head = NULL;
     uring->overflow_tail = NULL;
+    uring->overflow_count = 0;
     spin_lock_init(&uring->overflow_lock);
 
     // Kernel-side HHDM aliases — read/write these directly, no fault.
@@ -208,7 +310,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
 
     // Allocate vfs_file_t for fd installation.  Uses kheap so the
     // caller can later fd_install it.
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) {
         // Teardown: user mapping, backing, uring.  The user VMA is
         // leaked for now (mm cleanup on task exit will free it).
@@ -216,15 +318,11 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
         pmm_buddy_free(phys, order);
         return NULL;
     }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = ring_read_stub;
     f->write = ring_write_stub;
     f->close = io_uring_close_file;
     f->ctx   = uring;
-    f->waitq = &f->_waitq;
-    wait_queue_init(&f->_waitq);
-    f->refcount = 1;
-    f->rights   = 0xFFFFFFFFu;
+    f->rights   = 0xFFFFFFFFu;   // non-default: io_uring fd carries all rights
 
     // Phase 8F: spawn SQPOLL kthread if requested.  The poller shares
     // the owner's mm + files so it can touch user buffers and fds.
@@ -256,7 +354,7 @@ struct vfs_file_t* io_uring_create(uint32_t entries,
 void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
                         int32_t res, uint32_t cqe_flags) {
     uint64_t f = spin_lock_irqsave(&uring->cq_lock);
-    uint32_t mask = uring->cq_hdr->ring_mask;
+    uint32_t mask = io_cq_mask(uring);   // TRUSTED count, not the user-writable header
 
     // Drain any pending overflow entries that now fit.
     if (uring->overflow_head) {
@@ -273,8 +371,8 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
             __atomic_store_n(&uring->cq_hdr->tail, tail + 1,
                               __ATOMIC_RELEASE);
 
-            uring->overflow_head = n->next;
-            if (!uring->overflow_head) uring->overflow_tail = NULL;
+            FIFO_DEQUEUE_HEAD(uring->overflow_head, uring->overflow_tail,
+                              uring->overflow_count, n);
             kfree(n);
         }
         spin_unlock_irqrestore(&uring->overflow_lock, of);
@@ -284,9 +382,19 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
     uint32_t head = __atomic_load_n(&uring->cq_hdr->head, __ATOMIC_ACQUIRE);
 
     if ((tail - head) >= uring->cq_entries) {
-        // CQ still full — push onto overflow list instead of
-        // dropping.  Bump the user-visible overflow counter as a
-        // hint (userspace can monitor it to throttle submissions).
+        // CQ still full -- push onto the overflow list instead of dropping.
+        // BUT cap the list: a ring that never reaps its CQ would otherwise grow
+        // it without bound (kernel-memory DoS).  Past the cap, drop + count
+        // (the same last-resort behavior as the OOM branch below); userspace
+        // sees cq_hdr->overflow and reaps.
+        if (uring->overflow_count >= IO_URING_OVERFLOW_MAX) {
+            uring->cq_hdr->overflow++;
+            spin_unlock_irqrestore(&uring->cq_lock, f);
+            wait_queue_wake_all(&uring->waitq);
+            return;
+        }
+        // Bump the user-visible overflow counter as a hint (userspace can
+        // monitor it to throttle submissions).
         struct io_overflow_cqe* n = (struct io_overflow_cqe*)
             kmalloc(sizeof(*n));
         if (!n) {
@@ -302,9 +410,7 @@ void io_uring_post_cqe(io_uring_t* uring, uint64_t user_data,
         n->cqe.flags     = cqe_flags;
 
         uint64_t of = spin_lock_irqsave(&uring->overflow_lock);
-        if (uring->overflow_tail) uring->overflow_tail->next = n;
-        else                      uring->overflow_head = n;
-        uring->overflow_tail = n;
+        FIFO_ENQUEUE_TAIL(uring->overflow_head, uring->overflow_tail, uring->overflow_count, n);
         spin_unlock_irqrestore(&uring->overflow_lock, of);
 
         uring->cq_hdr->overflow++;
@@ -369,7 +475,6 @@ extern uint64_t sys_close(uint64_t fd);
 // canonical fdget (bumps refcount), stores in the ring's array.
 // Unregister vfs_closes each and frees the array.
 
-extern int copy_from_user(void* dst, const void* src_u, uint64_t len);
 
 int io_uring_register_impl(io_uring_t* uring, uint32_t op,
                             uint64_t arg_uptr, uint32_t nr_args) {
@@ -451,11 +556,23 @@ int io_uring_register_impl(io_uring_t* uring, uint32_t op,
 static vfs_file_t* sqe_fdget(io_uring_t* uring, const io_sqe_t* sqe) {
     if (sqe->flags & IOSQE_FIXED_FILE) {
         uint32_t idx = (uint32_t)sqe->fd;
-        if (idx >= uring->fixed_files_nr) return NULL;
-        vfs_file_t* f = uring->fixed_files[idx];
-        return vfs_tryget(f);       // bump ref; fixed_files holds a
-                                    // stable ref, so tryget always
-                                    // succeeds unless under teardown
+        // Hold fixed_files_lock across the (nr, array[idx]) read AND the
+        // tryget.  This runs on the io_wq worker kthread concurrently with the
+        // owner task's IORING_UNREGISTER_FILES, which swaps fixed_files->NULL /
+        // nr->0 under this lock and THEN (outside it) vfs_close's each file and
+        // kfree's the array.  Without the lock the worker can read a freed
+        // array, see a torn nr-vs-array, or tryget a file whose backing object
+        // unregister already freed (a UAF / freed-function-pointer call via the
+        // file's vtable).  Under the lock we read a consistent table and
+        // vfs_tryget pins the file (its own ref) BEFORE unregister can drop the
+        // ring's ref, so the file cannot be freed under us; and we never index
+        // the array after unregister NULLed it (nr is 0 then -> return NULL).
+        uint64_t fl = spin_lock_irqsave(&uring->fixed_files_lock);
+        vfs_file_t* f = (idx < uring->fixed_files_nr) ? uring->fixed_files[idx]
+                                                      : (vfs_file_t*)NULL;
+        f = f ? vfs_tryget(f) : NULL;
+        spin_unlock_irqrestore(&uring->fixed_files_lock, fl);
+        return f;
     }
     return uring_fdget(sqe->fd);
 }
@@ -482,12 +599,15 @@ static void io_sqp_kthread_entry(void) {
 
     for (;;) {
         if (__atomic_load_n(&uring->sqp_stop, __ATOMIC_ACQUIRE)) {
+            // Last touch of `uring`: publish done so io_uring_close_file can
+            // safely free it (see the join in io_uring_close_file).
+            __atomic_store_n(&uring->sqp_done, 1u, __ATOMIC_RELEASE);
             g_current->state = TASK_DEAD;
             sched_yield();
             return;
         }
 
-        uint32_t mask = uring->sq_hdr->ring_mask;
+        uint32_t mask = io_sq_mask(uring);   // TRUSTED count, not the user header
         uint32_t user_tail = __atomic_load_n(&uring->sq_hdr->tail, __ATOMIC_ACQUIRE);
         uint32_t head      = uring->sq_hdr->head;
 
@@ -503,7 +623,11 @@ static void io_sqp_kthread_entry(void) {
             while (head != user_tail) {
                 const io_sqe_t* sqe = &uring->sqes[head & mask];
                 if (sqe->flags & IOSQE_ASYNC) {
-                    io_wq_enqueue(uring, sqe);
+                    // On enqueue failure (no worker / wq_work_alloc OOM) the SQE
+                    // is still consumed below; post an error CQE so the slot
+                    // completes -- else a GETEVENTS waiter on min_complete hangs.
+                    int r = io_wq_enqueue(uring, sqe);
+                    if (r < 0) io_uring_post_cqe(uring, sqe->user_data, r, 0);
                 } else {
                     dispatch_one(uring, sqe);
                 }
@@ -610,6 +734,9 @@ static void io_wq_worker_entry(void) {
 
         if (!chain) {
             if (__atomic_load_n(&uring->worker_stop, __ATOMIC_ACQUIRE)) {
+                // Last touch of `uring`: publish done so io_uring_close_file
+                // can safely free it (see the join in io_uring_close_file).
+                __atomic_store_n(&uring->worker_done, 1u, __ATOMIC_RELEASE);
                 g_current->state = TASK_DEAD;
                 sched_yield();
                 return;
@@ -662,11 +789,25 @@ static void io_wq_worker_entry(void) {
 // created on first async-flagged op.  Shares mm_shared + files_shared
 // with the ring's owner task so it can touch user buffers and fds.
 static int io_wq_ensure_worker(io_uring_t* uring) {
-    if (uring->worker) return 0;
+    if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE)) return 0;
     if (!uring->owner_task) return -EINVAL;
 
+    // Serialise the check-create-publish: two concurrent consumers (a non-SQPOLL
+    // ring driven by two threads sharing its fd) would both observe worker==NULL
+    // and each spawn a kthread; the second store would orphan the first, and
+    // io_uring_close_file joins only the published worker -> the orphan runs on
+    // and touches the freed `uring` (use-after-free).  Double-checked locking:
+    // re-test under the lock so exactly ONE worker is ever created.  Held only
+    // on the first async op; task_create_kthread / sched_add do not sleep and
+    // never take this lock, so no sleep-under-spinlock and no cycle.
+    spin_lock(&uring->worker_lock);
+    if (__atomic_load_n(&uring->worker, __ATOMIC_ACQUIRE)) {
+        spin_unlock(&uring->worker_lock);
+        return 0;
+    }
+
     task_t* t = task_create_kthread(io_wq_worker_entry, pid_alloc());
-    if (!t) return -ENOMEM;
+    if (!t) { spin_unlock(&uring->worker_lock); return -ENOMEM; }
 
     // Swap the freshly-allocated kernel mm/files for the owner's.
     // refs++ keeps them alive for the worker's lifetime; release the
@@ -682,10 +823,13 @@ static int io_wq_ensure_worker(io_uring_t* uring) {
     if (t->mm_shared)    __atomic_add_fetch(&t->mm_shared->refs, 1, __ATOMIC_RELAXED);
     if (t->files_shared) __atomic_add_fetch(&t->files_shared->refs, 1, __ATOMIC_RELAXED);
 
-    // Stash the ring pointer so the worker can find it.
+    // Stash the ring pointer so the worker can find it.  Publish uring->worker
+    // with RELEASE so io_uring_close_file's ACQUIRE read (after it has joined
+    // SQPOLL, this worker's spawner) is guaranteed to observe it and join it.
     t->kthread_ctx = uring;
-    uring->worker = t;
+    __atomic_store_n(&uring->worker, t, __ATOMIC_RELEASE);
     sched_add(t);
+    spin_unlock(&uring->worker_lock);
     return 0;
 }
 
@@ -711,32 +855,62 @@ static int io_wq_enqueue(io_uring_t* uring, const io_sqe_t* sqe) {
     return 0;
 }
 
+// A chain could not be enqueued: complete + CONSUME the whole chain starting at
+// *phead.  Posts one CQE per SQE -- the head op gets `err`, each linked follower
+// gets -ECANCELED (mirroring the sync path's IO_LINK-failure cancel at the
+// dispatch loop) -- and advances *phead past the chain.  This preserves the
+// SQE:CQE 1:1 invariant: without it, an ENOMEM mid-submit consumed SQEs with no
+// CQE, hanging a thread blocked in io_uring_enter(GETEVENTS) on min_complete.
+static void io_wq_chain_fail(io_uring_t* uring, uint32_t* phead,
+                             uint32_t user_tail, uint32_t mask, int err) {
+    int first = 1;
+    while (*phead != user_tail) {
+        const io_sqe_t* sqe = &uring->sqes[*phead & mask];
+        io_uring_post_cqe(uring, sqe->user_data, first ? err : -ECANCELED, 0);
+        first = 0;
+        uint8_t flags = sqe->flags;
+        (*phead)++;
+        if (!(flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) break;
+    }
+}
+
 // Enqueue an SQE and any following IO_LINK/IO_HARDLINK SQEs as one
 // chained work item.  *phead is advanced past the whole chain.
 // The worker walks chain_next sequentially with IO_LINK cancel
-// semantics (see worker loop).
-static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
+// semantics (see worker loop).  On any failure to enqueue (no worker, or a
+// mid-build OOM) the chain is completed with error CQEs and consumed, so the
+// caller never has to post or advance -- and no completion is ever lost.
+static void io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
                                  uint32_t user_tail, uint32_t mask) {
     int r = io_wq_ensure_worker(uring);
-    if (r < 0) return r;
+    if (r < 0) {
+        // No worker -> the whole chain cannot run; complete + consume it.
+        io_wq_chain_fail(uring, phead, user_tail, mask, r);
+        return;
+    }
 
-    // Build the chain by following IO_LINK / IO_HARDLINK flags.
+    // Build the chain into a LOCAL cursor; *phead is committed only once the
+    // whole chain is built (success) or by io_wq_chain_fail (failure) -- never
+    // left half-advanced past freed-but-uncompleted SQEs (the old bug).
+    uint32_t h = *phead;
     io_wq_work_t* first = NULL;
     io_wq_work_t* tail  = NULL;
 
     for (;;) {
-        if (*phead == user_tail) break;
-        const io_sqe_t* sqe = &uring->sqes[*phead & mask];
+        if (h == user_tail) break;
+        const io_sqe_t* sqe = &uring->sqes[h & mask];
 
         io_wq_work_t* w = wq_work_alloc();
         if (!w) {
-            // Partial-failure cleanup: free what we've built.
+            // Partial-build OOM: free what we built, then complete + consume
+            // the WHOLE chain from the original *phead with error CQEs.
             while (first) {
                 io_wq_work_t* n = first->chain_next;
                 wq_work_free(first);
                 first = n;
             }
-            return -ENOMEM;
+            io_wq_chain_fail(uring, phead, user_tail, mask, -ENOMEM);
+            return;
         }
         w->sqe        = *sqe;
         w->uring      = uring;
@@ -746,12 +920,12 @@ static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
         tail = w;
 
         uint8_t flags = sqe->flags;
-        (*phead)++;
+        h++;
         // End of chain when this SQE has neither IO_LINK nor IO_HARDLINK.
         if (!(flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK))) break;
     }
 
-    if (!first) return 0;
+    if (!first) { *phead = h; return; }
 
     // Push the head onto the worker's Treiber stack.  The chain_next
     // links the rest; worker walks both dimensions.
@@ -762,14 +936,24 @@ static int io_wq_enqueue_chain(io_uring_t* uring, uint32_t* phead,
     } while (!__atomic_compare_exchange_n(&uring->wq_head, &old, first,
                                             0, __ATOMIC_RELEASE,
                                             __ATOMIC_RELAXED));
+    *phead = h;   // commit the chain's advancement only after a successful push
     wait_queue_wake_all(&uring->wq_waitq);
-    return 0;
 }
 
 // Returns the op result; does NOT post a CQE (caller does).
 // Split from dispatch_one so linked-chain logic can decide whether
 // to cancel the rest of the chain based on res < 0 + IO_LINK flag.
 static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
+    // The SQE lives in the user-WRITABLE mmap'd ring (uring->sqes[], mapped
+    // VMA_R|W|USER); the sync and SQPOLL dispatch paths pass a LIVE pointer into
+    // it.  Snapshot it ONCE into a kernel-local copy and read only that, so a
+    // concurrent user write cannot change addr/len/fd between user_buf_check
+    // (validation) and vfs_read/vfs_write (use) -- a double-fetch TOCTOU that is
+    // otherwise an arbitrary kernel read/write (LPE), trivially reachable via
+    // SQPOLL.  The async io_wq path already snapshots into w->sqe; this makes
+    // every dispatch path single-fetch.  io_sqe_t is 64 bytes -- safe on stack.
+    io_sqe_t snap = *sqe;
+    sqe = &snap;
     int32_t res = -EINVAL;
     switch (sqe->opcode) {
         case IORING_OP_NOP:
@@ -779,6 +963,12 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
         case IORING_OP_READ: {
             vfs_file_t* f = sqe_fdget(uring, sqe);
             if (!f) { res = -EBADF; break; }
+            // sqe->addr/len are user-controlled (read straight from the SQE
+            // ring); vfs_read writes DIRECTLY into this buffer, so a kernel
+            // address here would be an arbitrary kernel write.  Validate it.
+            if (user_buf_check(sqe->addr, sqe->len) != 0) {
+                uring_fdput(f); res = -EFAULT; break;
+            }
             // Use pread-with-offset if the driver supports it (avoids
             // racy seek+read on shared fds); else fall back to
             // sequential read at the fd's current pos.
@@ -793,6 +983,11 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
         case IORING_OP_WRITE: {
             vfs_file_t* f = sqe_fdget(uring, sqe);
             if (!f) { res = -EBADF; break; }
+            // Validate the user-controlled source buffer; vfs_write reads it
+            // directly, so a kernel address here is an arbitrary kernel read.
+            if (user_buf_check(sqe->addr, sqe->len) != 0) {
+                uring_fdput(f); res = -EFAULT; break;
+            }
             res = (int32_t)vfs_write(f, (const void*)sqe->addr, sqe->len);
             uring_fdput(f);
             break;
@@ -884,6 +1079,7 @@ static int32_t dispatch_exec(io_uring_t* uring, const io_sqe_t* sqe) {
             if (!f) { res = -EBADF; break; }
             extern int drm_ring_atomic(vfs_file_t*, uint64_t);
             res = drm_ring_atomic(f, sqe->addr);
+            uring_fdput(f);   // sqe_fdget took a ref; balance it like READ/WRITE
             break;
         }
 
@@ -922,20 +1118,27 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
                          uint32_t min_complete, uint32_t flags) {
     if (!uring) return -EINVAL;
 
-    // Phase 8F: wake the SQPOLL kthread if it's parked.  Caller bumps
-    // sq_tail, then calls enter(ENTER_SQ_WAKEUP) on observing
-    // IORING_SQ_NEED_WAKEUP set.
-    if ((flags & IORING_ENTER_SQ_WAKEUP) && uring->sqp_task) {
-        wait_queue_wake_all(&uring->sqp_waitq);
-        // SQPOLL rings don't do synchronous submission from enter —
-        // the poller handles it.  We only care about GETEVENTS below.
-        if (!(flags & IORING_ENTER_GETEVENTS)) return 0;
+    uint32_t submitted = 0;
+
+    // SQPOLL rings: the poller kthread (io_sqp_kthread_entry) is the SOLE SQ
+    // consumer.  enter() must NEVER consume the SQ here, REGARDLESS of flags --
+    // doing so races the poller: both read the same sq_head, dispatch the same
+    // SQE twice (double send/write/open + a duplicate CQE), non-atomically store
+    // head back (lost update -> unbounded re-dispatch), and an async SQE makes
+    // both call io_wq_ensure_worker, orphaning a worker that close never joins
+    // (use-after-free).  The old guard only skipped the SQ_WAKEUP-without-
+    // GETEVENTS case, so enter(GETEVENTS) and enter(0) on a SQPOLL ring fell
+    // through into the consumer loop.  Just wake the poller if asked, then go
+    // straight to the GETEVENTS wait below.
+    if (uring->sqp_task) {
+        if (flags & IORING_ENTER_SQ_WAKEUP)
+            wait_queue_wake_all(&uring->sqp_waitq);
+        goto getevents;
     }
 
-    uint32_t submitted = 0;
-    uint32_t mask = uring->sq_hdr->ring_mask;
+    uint32_t mask = io_sq_mask(uring);   // TRUSTED count, not the user-writable header
 
-    // Snapshot user's sq_tail with acquire — pairs with the user's
+    // Snapshot user's sq_tail with acquire -- pairs with the user's
     // release store after filling the SQE.
     uint32_t user_tail = __atomic_load_n(&uring->sq_hdr->tail, __ATOMIC_ACQUIRE);
     uint32_t head      = uring->sq_hdr->head;
@@ -955,11 +1158,12 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
             // Offload the SQE — and any linked followers — as a
             // single chain work item.  The worker walks the chain
             // sequentially; IO_LINK failure cancels the tail.
-            int r = io_wq_enqueue_chain(uring, &head, user_tail, mask);
-            if (r < 0) {
-                io_uring_post_cqe(uring, sqe->user_data, r, 0);
-                head++;
-            }
+            // io_wq_enqueue_chain consumes `head` past the whole chain and posts
+            // exactly one CQE per SQE -- on success the worker completes them; on
+            // a failure to enqueue it completes them with error CQEs here.  So
+            // there is nothing to post or advance afterward (the old code posted
+            // a single CQE + head++, losing the rest of a partially-built chain).
+            io_wq_enqueue_chain(uring, &head, user_tail, mask);
             submitted++;
             // io_wq_enqueue_chain advances `head` past the whole
             // chain; we count the whole chain as one submission
@@ -1000,6 +1204,7 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
     // Publish new sq_head to user.
     __atomic_store_n(&uring->sq_hdr->head, head, __ATOMIC_RELEASE);
 
+getevents:
     // GETEVENTS: block until the CQ has min_complete entries waiting
     // for userspace.  WAIT_EVENT handles the canonical "register →
     // re-check → sleep → remove" protocol, including wake_pending
@@ -1014,3 +1219,34 @@ int io_uring_enter_impl(io_uring_t* uring, uint32_t to_submit,
 
     return (int)submitted;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic check of the ring index masking that replaced the
+// user-writable ring_mask (the OOB fix): for power-of-two `entries`, a masked
+// index is ALWAYS in [0, entries) regardless of the raw counter -- so a
+// malicious 0xFFFFFFFF can no longer drive an out-of-bounds sqe/cqe access.
+void io_uring_index_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t raw, entries, want; } c[] = {
+        { 0,          4,    0    },
+        { 3,          4,    3    },
+        { 4,          4,    0    },   // wraps within the ring
+        { 0xFFFFFFFFu,4,    3    },   // adversarial counter -> still in [0,4)
+        { 0x12345u,   256,  0x45 },   // 0x12345 & 0xFF
+        { 0xFFFFFFFFu,256,  255  },
+        { 0xFFFFFFFFu,4096, 4095 },
+        { 0xFFFFFFFFu,1,    0    },   // single-entry ring (mask 0)
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t got = io_ring_index(c[i].raw, c[i].entries);
+        if (got != c[i].want || got >= c[i].entries) {
+            kprintf_atomic("[io_ring_idx] FAIL raw=0x%lx entries=%u got=%u want=%u\n",
+                    (unsigned long)c[i].raw, c[i].entries, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[io_ring_idx] SELF-TEST FAILED\n"
+                  : "[io_ring_idx] SELF-TEST PASSED (trusted ring index, no user-mask OOB)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */

@@ -1,9 +1,11 @@
 #include "socket.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "tcp.h"
 #include "udp.h"
 #include "net.h"
 #include "skbuff.h"
 #include "common.h"
+#include "ilist.h"      // FIFO_ENQUEUE_TAIL / FIFO_DEQUEUE_HEAD (intrusive udp_rx queue)
 #include "kheap.h"
 #include "sched.h"
 #include "process.h"
@@ -221,6 +223,12 @@ static void sock_free_rcu(void* data) {
             skb = next;
         }
     }
+    // Free the socket's vfs_file_t in the SAME grace period (mirrors the
+    // AF_UNIX unix_sock_free_rcu discipline).  The TCP pcb_wake (pcb->sock_file)
+    // and UDP sock_poll_wake (s->file) readers load this file and write
+    // f->waitq inside rcu_read_lock, so freeing it here -- not eagerly in
+    // sock_close -- guarantees it outlives any such reader.
+    if (s->file) kfree(s->file);
     kfree(s);
 }
 
@@ -242,10 +250,13 @@ static void sock_close(vfs_file_t* self) {
     if (s->type == SOCK_DGRAM && s->bound)
         udp_table_remove(s->local_port);
 
-    // Expedited: this path is close() on an inet socket — user-syscall
-    // return blocks on the RCU grace period without it.
+    // Expedited: this path is close() on an inet socket -- user-syscall
+    // return blocks on the RCU grace period without it.  sock_free_rcu frees
+    // BOTH s and s->file (== self) after the grace period, so the vfs_file_t
+    // is deliberately NOT kfree'd here: a concurrent pcb_wake / sock_poll_wake
+    // reader that already loaded the file pointer inside rcu_read_lock would
+    // otherwise write through f->waitq after a synchronous free (UAF).
     call_rcu_expedited(sock_free_rcu, s);
-    kfree(self);
 }
 
 static int64_t sock_seek(vfs_file_t* self, int64_t offset, int whence) {
@@ -266,6 +277,7 @@ vfs_file_t* socket_open(int domain, int type) {
 
     __builtin_memset(s, 0, sizeof(socket_t));
     wait_queue_init(&s->waitq);
+    spin_lock_init(&s->udp_rx_lock);
 
     s->type = (uint8_t)sock_type;
 
@@ -278,27 +290,18 @@ vfs_file_t* socket_open(int domain, int type) {
         s->local_port = lport;
     }
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) {
         if (s->pcb) tcp_pcb_free(s->pcb);
         kfree(s);
         return 0;
     }
-    __builtin_memset(f, 0, sizeof(*f));
-
-    f->read        = sock_read;
-    f->write       = sock_write;
-    f->close       = sock_close;
-    f->seek        = sock_seek;
-    f->poll           = sock_poll;
-    f->ioctl          = NULL;
-    f->ctx            = s;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount       = 1;
-    f->rights         = 0;
-    f->path[0]        = '\0';
+    f->read  = sock_read;
+    f->write = sock_write;
+    f->close = sock_close;
+    f->seek  = sock_seek;
+    f->poll  = sock_poll;
+    f->ctx   = s;
 
     s->file = f;
     if (s->pcb) tcp_pcb_set_file(s->pcb, f);
@@ -322,15 +325,30 @@ int socket_bind(vfs_file_t* f, uint16_t port) {
         return 0;
     }
 
-    // TCP: rebind the PCB to the requested local port.
+    // TCP: rebind the socket's existing ephemeral pcb to the requested local
+    // port IN PLACE.  Do NOT free + realloc s->pcb: the other socket ops
+    // (sock_poll/connect/send/recv/listen/shutdown/accept) deref s->pcb
+    // locklessly, so freeing it while a sibling thread uses the same (shared or
+    // dup'd) fd would leave that thread holding a freed pcb -- a use-after-free
+    // write into its rx/tx rings.  socket_open already gave us a CLOSED ephemeral
+    // pcb published on s_pcb_head; retargeting its port keeps s->pcb pointing at
+    // the SAME live object, so no reader can ever observe a freed pcb.
     if (s->pcb) {
-        tcp_pcb_set_file(s->pcb, NULL);
-        tcp_pcb_free(s->pcb);
-        s->pcb = 0;
+        // Only a brand-new CLOSED socket may be bound.  Binding a connected or
+        // listening socket is illegal (POSIX -EINVAL) -- and an in-place port
+        // change would corrupt a live connection's / listener's demux.  A socket
+        // can reach a non-CLOSED state with s->bound still 0 (connect() without
+        // an explicit bind uses the ephemeral pcb), so the s->bound check above
+        // does not cover this; gate on the pcb state.
+        if (tcp_pcb_state(s->pcb) != TCP_CLOSED) return -EINVAL;
+        tcp_pcb_set_local_port(s->pcb, port);
+    } else {
+        // Defensive: a TCP socket always has an ephemeral pcb from socket_open;
+        // alloc one only if it is somehow missing.
+        s->pcb = tcp_pcb_alloc(port);
+        if (!s->pcb) return -EADDRINUSE;
+        tcp_pcb_set_file(s->pcb, f);
     }
-    s->pcb = tcp_pcb_alloc(port);
-    if (!s->pcb) return -EADDRINUSE;
-    tcp_pcb_set_file(s->pcb, f);
     s->local_port = port;
     s->bound = 1;
     return 0;
@@ -377,26 +395,19 @@ vfs_file_t* socket_accept(vfs_file_t* f, sockaddr_in_t* peer_addr) {
     if (!cs) { tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
     __builtin_memset(cs, 0, sizeof(socket_t));
     wait_queue_init(&cs->waitq);
+    spin_lock_init(&cs->udp_rx_lock);
     cs->type  = SOCK_STREAM;
     cs->pcb   = child_pcb;
     cs->bound = 1;
 
-    vfs_file_t* cf = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* cf = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!cf) { kfree(cs); tcp_close(child_pcb); tcp_pcb_free(child_pcb); return 0; }
-    __builtin_memset(cf, 0, sizeof(*cf));
-    cf->read        = sock_read;
-    cf->write       = sock_write;
-    cf->close       = sock_close;
-    cf->seek        = sock_seek;
-    cf->poll           = sock_poll;
-    cf->ioctl          = NULL;
-    cf->ctx            = cs;
-    cf->waitq           = &cf->_waitq; wait_queue_init(cf->waitq);
-    cf->secondary_waitq = NULL;
-    cf->flags          = 0;
-    cf->refcount       = 1;
-    cf->rights         = 0;
-    cf->path[0]        = '\0';
+    cf->read  = sock_read;
+    cf->write = sock_write;
+    cf->close = sock_close;
+    cf->seek  = sock_seek;
+    cf->poll  = sock_poll;
+    cf->ctx   = cs;
 
     cs->file = cf;
     tcp_pcb_set_file(child_pcb, cf);
@@ -469,8 +480,9 @@ int socket_send(vfs_file_t* f, const void* buf, uint32_t len) {
     int ar = udp_auto_bind(s);
     if (ar < 0) return ar;
     int r = udp_send(s->udp_peer_ip, s->local_port, s->udp_peer_port,
-                      buf, (uint16_t)len);
-    return (r < 0) ? -EIO : (int)len;
+                      buf, len);
+    if (r < 0) return (r == -EMSGSIZE) ? r : -EIO;   // surface "too long"
+    return (int)len;
 }
 
 // ── socket_recv ───────────────────────────────────────────────────────────
@@ -488,16 +500,24 @@ int socket_recv(vfs_file_t* f, void* buf, uint32_t len) {
         return tcp_recv_data(s->pcb, buf, len, nonblock);
     }
 
-    // UDP: wait for a datagram (or EAGAIN in nonblock).
-    if (!s->udp_rx_head) {
-        if (nonblock) return -EAGAIN;
-        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+    // UDP: wait for a datagram, then dequeue UNDER the per-socket lock so a
+    // concurrent deliver (net rx kthread) or a 2nd receiver cannot tear the ring
+    // or lose the count.  Re-check the head inside the lock + retry the wait if
+    // another receiver drained it; the user copy-out happens AFTER the dequeue
+    // (outside the lock -- a user write must never fault under it).
+    skbuff_t* skb;
+    for (;;) {
+        if (!s->udp_rx_head) {
+            if (nonblock) return -EAGAIN;
+            WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        }
+        spin_lock(&s->udp_rx_lock);
+        FIFO_DEQUEUE_HEAD(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
+        spin_unlock(&s->udp_rx_lock);
+        if (skb) break;
+        if (nonblock) return -EAGAIN;   // raced empty -> nothing to read
+        // lost the datagram to another receiver -> re-wait
     }
-
-    skbuff_t* skb = s->udp_rx_head;
-    s->udp_rx_head = skb->next;
-    if (!s->udp_rx_head) s->udp_rx_tail = 0;
-    s->udp_rx_count--;
 
     uint32_t copy = skb->len < len ? skb->len : len;
     __builtin_memcpy(buf, skb->data, copy);
@@ -557,8 +577,9 @@ int socket_sendto(vfs_file_t* f, const void* buf, uint32_t len,
     // server sees the correct ciaddr in the DHCP header.
     uint32_t src_ip = net_our_ip();
     int r = udp_send_ex(src_ip, dst_ip_be, s->local_port, dst_port,
-                         buf, (uint16_t)len);
-    return (r < 0) ? -EIO : (int)len;
+                         buf, len);
+    if (r < 0) return (r == -EMSGSIZE) ? r : -EIO;   // surface "too long"
+    return (int)len;
 }
 
 // ── socket_recvfrom ───────────────────────────────────────────────────────
@@ -573,15 +594,23 @@ int socket_recvfrom(vfs_file_t* f, void* buf, uint32_t len,
 
     int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
 
-    if (!s->udp_rx_head) {
+    // Dequeue under the per-socket lock (same discipline as socket_recv): the
+    // deliver kthread + a 2nd receiver must not tear the ring; re-check the head
+    // inside and retry the wait on a lost race; the src_addr stamp + the user
+    // copy-out happen AFTER the dequeue, outside the lock.
+    skbuff_t* skb;
+    for (;;) {
+        if (!s->udp_rx_head) {
+            if (nonblock) return -EAGAIN;
+            WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        }
+        spin_lock(&s->udp_rx_lock);
+        FIFO_DEQUEUE_HEAD(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
+        spin_unlock(&s->udp_rx_lock);
+        if (skb) break;
         if (nonblock) return -EAGAIN;
-        WAIT_EVENT(&s->waitq, s->udp_rx_head != NULL);
+        // lost the datagram to another receiver -> re-wait
     }
-
-    skbuff_t* skb = s->udp_rx_head;
-    s->udp_rx_head = skb->next;
-    if (!s->udp_rx_head) s->udp_rx_tail = 0;
-    s->udp_rx_count--;
 
     if (src_addr) {
         src_addr->sin_family = AF_INET;
@@ -668,26 +697,92 @@ void socket_deliver_udp(uint16_t dst_port, skbuff_t* skb) {
     socket_t* s = udp_table_find(dst_port);
     if (!s) { rcu_read_unlock(); skb_free(skb); return; }
 
-    // Drop if queue is full — upper bound avoids unbounded memory growth.
+    // Enqueue under the per-socket udp_rx lock so a concurrent recv/recvfrom
+    // dequeue cannot tear the list or lose the count.  Re-check the full-queue
+    // limit under the lock (the unlocked pre-check could race the count).  The
+    // skb is exclusively ours until linked; skb_free on a full queue and the
+    // wakes stay OUTSIDE the lock.
+    spin_lock(&s->udp_rx_lock);
     if (s->udp_rx_count >= UDP_RX_QUEUE_MAX) {
+        spin_unlock(&s->udp_rx_lock);
         rcu_read_unlock();
-        skb_free(skb);
+        skb_free(skb);   // upper bound avoids unbounded memory growth
         return;
     }
-
-    // Enqueue. The skb already has src_ip_be and src_port_be stamped.
-    skb->next = 0;
-    if (s->udp_rx_tail) {
-        s->udp_rx_tail->next = skb;
-    } else {
-        s->udp_rx_head = skb;
-    }
-    s->udp_rx_tail = skb;
-    s->udp_rx_count++;
+    FIFO_ENQUEUE_TAIL(s->udp_rx_head, s->udp_rx_tail, s->udp_rx_count, skb);
+    spin_unlock(&s->udp_rx_lock);
 
     // Wake any task blocked in socket_recv / socket_recvfrom.
     wait_queue_wake_all(&s->waitq);
     // And any task sleeping in poll()/select() on this fd.
     sock_poll_wake(s);
     rcu_read_unlock();
+}
+
+// ── socket file-lifetime selftest ──────────────────────────────────────────
+// Deterministic check of the socket<->vfs_file_t backpointer invariant that
+// the RCU-deferred dual free relies on: a socket's vfs_file_t is reachable as
+// s->file and points back via f->ctx, so freeing s->file in sock_free_rcu (the
+// grace-period callback) frees exactly the file that the TCP pcb_wake / UDP
+// sock_poll_wake readers may still hold inside rcu_read_lock.  Also exercises
+// the close path so a regression that double-freed or leaked the file would
+// surface.  (The cross-CPU RX-vs-close race itself is not deterministically
+// reproducible; the fix is proven by this invariant + the code-proof that the
+// file is freed only via the grace period, like the AF_UNIX precedent.)
+void sock_file_lifetime_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    vfs_file_t* f = socket_open(AF_INET, SOCK_DGRAM);
+    if (!f) { kprintf_atomic("[sock_file_life] FAIL open\n"); return; }
+    socket_t* s = (socket_t*)f->ctx;
+    if (!s) {
+        fails++;
+    } else {
+        if (s->file != f)          fails++;   // the file sock_free_rcu frees
+        if (s->type != SOCK_DGRAM) fails++;
+    }
+    // Close: f (== s->file) is now reclaimed via the RCU grace period in
+    // sock_free_rcu, NOT synchronously here, so a late pcb_wake / sock_poll_wake
+    // reader stays safe.  Must not crash / double-free.
+    f->close(f);
+    if (fails)
+        kprintf_atomic("[sock_file_life] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[sock_file_life] PASS (s->file backptr consistent, RCU-deferred free)\n");
+}
+
+// Guard for the F132 fix: socket_bind on a TCP socket must NOT free + realloc
+// s->pcb (a sibling thread on a shared/dup'd fd derefs s->pcb locklessly -> a
+// UAF write into the freed pcb's rings).  A fresh CLOSED socket rebinds its
+// ephemeral pcb IN PLACE (same pointer, new port); a non-CLOSED (connected /
+// listening) socket rejects bind with -EINVAL and keeps its pcb untouched.
+void socket_bind_rebind_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    // (1) Fresh CLOSED socket: bind rebinds the ephemeral pcb in place -- the
+    // pcb pointer must NOT change (the old free+realloc changed it).
+    vfs_file_t* f1 = socket_open(AF_INET, SOCK_STREAM);
+    if (!f1) { kprintf_atomic("[sock_bind] FAILED: open1\n"); return; }
+    socket_t* s1 = (socket_t*)f1->ctx;
+    struct tcp_pcb* pcb1 = s1->pcb;
+    if (!pcb1)                        fails++;
+    if (socket_bind(f1, 23456) != 0)  fails++;
+    if (s1->pcb != pcb1)              fails++;   // SAME pcb -- rebound in place, not freed
+    if (s1->local_port != 23456)      fails++;
+    f1->close(f1);
+
+    // (2) A LISTENing socket (s->bound still 0, so the s->bound check does not
+    // cover it): bind must be rejected with -EINVAL and leave the pcb untouched.
+    vfs_file_t* f2 = socket_open(AF_INET, SOCK_STREAM);
+    if (!f2) { kprintf_atomic("[sock_bind] FAILED: open2\n"); return; }
+    socket_t* s2 = (socket_t*)f2->ctx;
+    socket_listen(f2);
+    struct tcp_pcb* pcb2 = s2->pcb;
+    if (socket_bind(f2, 34567) != -EINVAL) fails++;   // non-CLOSED -> rejected
+    if (s2->pcb != pcb2)                   fails++;    // pcb unchanged (never freed)
+    f2->close(f2);
+
+    kprintf_atomic(fails ? "[sock_bind] SELF-TEST FAILED\n"
+                  : "[sock_bind] SELF-TEST PASSED (rebind in place; non-CLOSED bind rejected, pcb kept)\n");
 }

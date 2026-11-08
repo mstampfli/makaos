@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_REGEX_H
 #define _MAKAOS_REGEX_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -37,4 +40,7 @@ int  regexec(const regex_t* preg, const char* string,
 size_t regerror(int errcode, const regex_t* preg, char* buf, size_t size);
 void regfree(regex_t* preg);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

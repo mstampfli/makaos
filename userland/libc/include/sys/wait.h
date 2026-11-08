@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_WAIT_H
 #define _MAKAOS_SYS_WAIT_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <signal.h>   // siginfo_t
 
@@ -38,5 +42,9 @@ typedef enum {
 pid_t wait(int* status);
 pid_t waitpid(pid_t pid, int* status, int options);
 int   waitid(idtype_t idtype, id_t id, siginfo_t* info, int options);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

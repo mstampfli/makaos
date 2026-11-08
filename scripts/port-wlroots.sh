@@ -103,8 +103,10 @@ fi
 
 # ── meson configure (only re-runs if $WLR_BUILD is fresh) ─────────
 # Backends: drm (native KMS) + libinput (input via libinput port).
-# Renderer: pixman only — GL/Vulkan require libgbm + mesa we haven't
-# ported.  Session support uses our native libseat equivalent.
+# Renderer: gles2 over the static Mesa (EGL+GLESv2) stack; allocator: gbm.
+# The virgl GL stack reached first light (docs/VIRGL_BRINGUP.md phase 3c), so
+# wlroots now composites on the GPU (GLES2 over GBM/dmabuf) instead of pixman
+# software.  Session support uses our native libseat equivalent.
 if [ ! -d "$WLR_BUILD" ]; then
     log "meson setup ${WLR_BUILD}"
     meson setup "$WLR_BUILD" "$WLR_SRC" \
@@ -113,8 +115,8 @@ if [ ! -d "$WLR_BUILD" ]; then
         --libdir=lib \
         -Ddefault_library=static \
         -Dbackends=drm,libinput \
-        -Drenderers= \
-        -Dallocators= \
+        -Drenderers=gles2 \
+        -Dallocators=gbm \
         -Dsession=enabled \
         -Dxwayland=disabled \
         -Dxcb-errors=disabled \
@@ -130,6 +132,37 @@ ninja -C "$WLR_BUILD" 2>&1 | tee "$BUILD_DIR/wlroots_ninja.log"
 log "installing into $SYSROOT"
 DESTDIR="$SYSROOT" ninja -C "$WLR_BUILD" install \
     2>&1 | tee "$BUILD_DIR/wlroots_install.log"
+
+# Rewrite wlroots-0.18.pc so a STATIC meson consumer (sway, dwl) links the whole
+# GL stack correctly.  The generated .pc only Requires egl/gbm/glesv2 (their .pc
+# lists -lEGL/-lGLESv2/-lgbm but NOT the DRI megadriver, glapi, or the C++
+# runtime Mesa needs), and static link ordering wants the mutually-referencing
+# archives in ONE --start-group.  So drop egl/gbm/glesv2 from Requires and put a
+# self-contained group in Libs: wlroots + the megadriver .so + EGL/GLESv2/gbm/
+# glapi/expat/z, then libstdc++/libsupc++.  This is what the manual tinywl link
+# spells out; folding it into the .pc lets meson-built compositors just work.
+log "patching wlroots-0.18.pc for the static Mesa GL group"
+python3 - "$SYSROOT/usr/lib/pkgconfig/wlroots-0.18.pc" <<'PYEOF'
+import sys
+p = sys.argv[1]
+out = []
+for ln in open(p):
+    ln = ln.rstrip('\n')
+    if ln.startswith('Requires:'):
+        reqs = [r.strip() for r in ln[len('Requires:'):].split(',')]
+        reqs = [r for r in reqs if r and r.split()[0] not in ('egl', 'gbm', 'glesv2')]
+        out.append('Requires: ' + ', '.join(reqs))
+    elif ln.startswith('Libs:'):
+        out.append('Libs: -L${libdir} -Wl,--allow-multiple-definition '
+                   '-Wl,--start-group -lwlroots-0.18 '
+                   '${libdir}/dri/virtio_gpu_dri.so '
+                   '-lEGL -lGLESv2 -lgbm -lglapi -lexpat -lz '
+                   '-Wl,--end-group -lstdc++ -lsupc++ -lm -lrt')
+    else:
+        out.append(ln)
+open(p, 'w').write('\n'.join(out) + '\n')
+print('patched', p)
+PYEOF
 
 log "done — check $SYSROOT/usr/lib/libwlroots*"
 ls -la "$SYSROOT"/usr/lib/libwlroots* 2>/dev/null || true

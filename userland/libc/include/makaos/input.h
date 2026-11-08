@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_INPUT_H
 #define _MAKAOS_INPUT_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // ── MakaOS native input API ──────────────────────────────────────────
 //
@@ -184,4 +187,7 @@ int maka_input_read(int fd, maka_input_event_t* buf, int n);
 // Close an input fd.  Identical to close(fd), exported for symmetry.
 int maka_input_close(int fd);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

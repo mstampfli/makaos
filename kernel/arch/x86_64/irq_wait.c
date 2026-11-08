@@ -104,6 +104,15 @@ void irq_drain(uint8_t irq) {
     __atomic_store_n(&s_pending[irq], 0, __ATOMIC_RELEASE);
 }
 
+// Expose the per-slot queue for poll/epoll integration.  Waiters parked here
+// by the vfs poll layer are woken by the same wait_queue_wake_all() that
+// irq_notify() fires on DMA completion -- no separate wake path.  Poll waiters
+// re-check readiness via f->poll() after wake (register-then-recheck), so the
+// s_pending credit (used only by irq_wait) is irrelevant to them.
+wait_queue_t* irq_waitq(uint8_t irq) {
+    return &s_wq[irq];
+}
+
 void irq_notify(uint8_t irq) {
     // Phase 9A: mix TSC-at-IRQ into the kernel entropy pool.  Each
     // IRQ's exact arrival time carries jitter from interrupt
@@ -123,7 +132,7 @@ void irq_notify(uint8_t irq) {
     if (atomic_load_acq(&s_wq[irq].head)) {
         preempt_disable();
         wait_queue_wake_all(&s_wq[irq]);
-        this_cpu()->preempt_depth--;
+        preempt_enable_no_resched();
     } else {
         // Atomic saturating increment: the same IRQ line can be delivered
         // to a different CPU each time (IOAPIC), and a waiter on a third

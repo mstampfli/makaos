@@ -29,6 +29,7 @@ extern ahci_irq_handler
 extern hda_irq_handler
 extern virtio_net_irq_handler
 extern virtio_input_irq_handler
+extern virtio_gpu_irq_handler
 extern nvme_irq_handler
 extern ipi_reschedule_handler
 extern ipi_call_handler
@@ -142,6 +143,15 @@ virtio_input_irq_entry:
     PUSH_GPRS
     call lapic_eoi
     call virtio_input_irq_handler
+    POP_GPRS
+    iretq
+
+; ── VEC_VIRTIO_GPU (0x36): virtio-gpu control-queue MSI-X ────────────────
+global virtio_gpu_irq_entry
+virtio_gpu_irq_entry:
+    PUSH_GPRS
+    call lapic_eoi
+    call virtio_gpu_irq_handler
     POP_GPRS
     iretq
 

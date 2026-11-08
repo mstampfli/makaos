@@ -15,3 +15,15 @@ void* memchr(const void* s, int c, size_t n) {
     }
     return (void*)0;
 }
+
+// Copy up to n bytes; stop AFTER copying the first byte equal to c, returning a
+// pointer to the byte in dest just past it, or NULL if c was not among them.
+void* memccpy(void* dest, const void* src, int c, size_t n) {
+    unsigned char* d = (unsigned char*)dest;
+    const unsigned char* s = (const unsigned char*)src;
+    unsigned char target = (unsigned char)c;
+    while (n--) {
+        if ((*d++ = *s++) == target) return (void*)d;
+    }
+    return (void*)0;
+}

@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_ARPA_INET_H
 #define _MAKAOS_ARPA_INET_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <netinet/in.h>
 
 uint16_t htons(uint16_t v);
@@ -13,5 +17,9 @@ char*     inet_ntoa(struct in_addr in);
 int       inet_pton(int af, const char* s, void* dst);
 int       inet_aton(const char* s, struct in_addr* out);
 const char* inet_ntop(int af, const void* src, char* dst, socklen_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

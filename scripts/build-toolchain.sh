@@ -130,6 +130,7 @@ build_gcc() {
             --disable-nls \
             --enable-languages=c,c++ \
             --disable-shared \
+            --with-pic \
             --enable-threads=posix \
             --disable-libssp \
             --disable-libmudflap \
@@ -137,12 +138,15 @@ build_gcc() {
             --disable-libquadmath \
             --disable-libatomic \
             --disable-multilib \
-            --disable-hosted-libstdcxx \
-            --disable-wchar_t \
             --disable-libstdcxx-pch \
             --disable-libstdcxx-filesystem-ts \
             --disable-libstdcxx-backtrace \
             --disable-libstdcxx-verbose)
+    # --with-pic makes libtool build even the --disable-shared static target libs
+    # (libgcc, libstdc++, libsupc++) as PIC, so their objects can go into a shared
+    # object (libSDL3.so) or a PIE.  PIC code still links into the static -no-pie
+    # apps, so this is the single C++ runtime.  scripts/build-libstdcxx-pic.sh
+    # retrofits an existing non-PIC toolchain without a full rebuild.
     log "building gcc"
     make -C "$build" -j"$JOBS" all-gcc
     log "building libgcc"
@@ -150,11 +154,14 @@ build_gcc() {
     log "installing gcc + libgcc (needed before libstdc++ can probe)"
     make -C "$build" install-gcc install-target-libgcc
     log "building libstdc++"
-    # Freestanding libstdc++: headers + type traits + <atomic> + exceptions,
-    # no <iostream>/<fstream>/<regex>/<random> (those need full hosted libc
-    # features we don't all ship).  Ladybird and most C++ libs compile
-    # against the hosted bits they actually use; the unused headers simply
-    # aren't present.  If a port fails on a missing header we add a shim.
+    # HOSTED libstdc++: full C++ standard library (containers, <string>,
+    # <mutex>/<thread> over gthr-posix, <iostream>/<fstream>, ...), needed by
+    # C++ ports like Mesa. Threads map to MakaOS pthreads (_GLIBCXX_HAS_GTHREADS
+    # + pthread_barrier). libgcc's rebuild needs the gcc/tsystem.h errno patch
+    # (scripts/patches/gcc) because MakaOS's errno is a thread-local variable,
+    # not a macro. NOTE: making errno a POSIX macro is a planned future change
+    # that will require re-porting the whole userland (it renames the errno
+    # symbol); see docs/VIRGL_BRINGUP.md.
     make -C "$build" -j"$JOBS" all-target-libstdc++-v3
     log "installing libstdc++"
     make -C "$build" install-target-libstdc++-v3

@@ -20,6 +20,9 @@ extern "C" {
 #define RTLD_DEFAULT  ((void*)0)
 #define RTLD_NEXT     ((void*)-1)
 
+// dlinfo() requests.
+#define RTLD_DI_LINKMAP 2
+
 typedef struct {
     const char* dli_fname;
     void*       dli_fbase;
@@ -32,6 +35,8 @@ void* dlsym(void* handle, const char* name);
 int   dlclose(void* handle);
 char* dlerror(void);
 int   dladdr(const void* addr, Dl_info* info);
+void* dlvsym(void* handle, const char* name, const char* version);
+int   dlinfo(void* handle, int request, void* info);
 
 #ifdef __cplusplus
 }

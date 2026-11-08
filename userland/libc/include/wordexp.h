@@ -8,6 +8,9 @@
 
 #ifndef _MAKAOS_WORDEXP_H
 #define _MAKAOS_WORDEXP_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stddef.h>
 
@@ -35,4 +38,7 @@ typedef struct {
 int  wordexp(const char* words, wordexp_t* we, int flags);
 void wordfree(wordexp_t* we);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

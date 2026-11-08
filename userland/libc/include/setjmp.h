@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SETJMP_H
 #define _MAKAOS_SETJMP_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Callee-saved register snapshot + rip/rsp + mxcsr.  Layout must
 // match userland/libc/setjmp.asm exactly:
@@ -13,14 +16,24 @@
 // byte tail overflow + subsequent ldmxcsr of garbage manifested as
 // RBP corruption after ft_smooth_render's internal callback returned
 // (observed via Alt+Shift+Enter → foot PF-KILL in glyph rasterize).
-typedef struct { long __jb[9]; } jmp_buf[1];
+// Tagged `__jmp_buf_tag` (the glibc name) so glibc-style code that casts to
+// `struct __jmp_buf_tag *` before setjmp (e.g. DarkPlaces' libpng path) type-
+// checks.  Tag only -- the layout is unchanged (9 longs / 72 bytes).
+typedef struct __jmp_buf_tag { long __jb[9]; } jmp_buf[1];
 typedef jmp_buf sigjmp_buf;
 
 int  setjmp(jmp_buf env);
 __attribute__((__noreturn__)) void longjmp(jmp_buf env, int val);
-int  sigsetjmp(sigjmp_buf env, int save_mask);
+// sigsetjmp must expand to __sigsetjmp (the real symbol libc provides) at the
+// call site -- a plain function wrapper would save the wrapper's frame, not the
+// caller's. This is the glibc approach and matches libc.h's own macro.
+int  __sigsetjmp(sigjmp_buf env, int save_mask);
+#define sigsetjmp(env, save_mask) __sigsetjmp(env, save_mask)
 __attribute__((__noreturn__)) void siglongjmp(sigjmp_buf env, int val);
 #define _setjmp   setjmp
 #define _longjmp  longjmp
 
+#ifdef __cplusplus
+}
+#endif
 #endif

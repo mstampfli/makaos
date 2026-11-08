@@ -5,6 +5,9 @@
 
 #ifndef _MAKAOS_GRP_H
 #define _MAKAOS_GRP_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 #include <stddef.h>
@@ -23,4 +26,7 @@ int getgrnam_r(const char* name, struct group* grp,
 int getgrgid_r(gid_t gid, struct group* grp,
                char* buf, size_t buflen, struct group** result);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

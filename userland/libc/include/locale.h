@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // MakaOS only supports the "C" / "C.UTF-8" locale.  setlocale accepts
 // NULL or "" / "C" / "POSIX" / "C.UTF-8" and returns a canonical string;
 // anything else also returns the canonical string (no error) so ports
@@ -63,5 +67,9 @@ locale_t uselocale(locale_t loc);
 #define LC_NUMERIC_MASK  (1 << LC_NUMERIC)
 #define LC_TIME_MASK     (1 << LC_TIME)
 #define LC_MESSAGES_MASK (1 << LC_MESSAGES)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

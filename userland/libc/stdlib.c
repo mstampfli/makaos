@@ -46,13 +46,56 @@ int atexit(void (*fn)(void)) {
     return 0;
 }
 
+// ── C++ static/global destructor registry (Itanium C++ ABI) ──────────────
+// libstdc++ and every C++ TU with a global/static object register their
+// destructors via __cxa_atexit(fn, arg, dso), tagged with &__dso_handle.  A
+// static executable is a single "DSO", so __dso_handle is one null-ish handle.
+// The list grows on demand; __cxa_finalize(0) runs it in reverse at exit().
+void* __dso_handle = 0;
+
+extern void* realloc(void* ptr, size_t new_size);   // declared in libc.h (not included here)
+
+struct __cxa_fn { void (*fn)(void*); void* arg; void* dso; };
+static struct __cxa_fn* s_cxa_fns;
+static size_t s_cxa_count, s_cxa_cap;
+
+int __cxa_atexit(void (*fn)(void*), void* arg, void* dso) {
+    if (!fn) return -1;
+    if (s_cxa_count == s_cxa_cap) {
+        size_t nc = s_cxa_cap ? s_cxa_cap * 2 : 32;
+        struct __cxa_fn* np = realloc(s_cxa_fns, nc * sizeof(*np));
+        if (!np) return -1;
+        s_cxa_fns = np; s_cxa_cap = nc;
+    }
+    s_cxa_fns[s_cxa_count].fn  = fn;
+    s_cxa_fns[s_cxa_count].arg = arg;
+    s_cxa_fns[s_cxa_count].dso = dso;
+    s_cxa_count++;
+    return 0;
+}
+
+// Run registered destructors in reverse order.  dso==NULL => run all (exit);
+// otherwise only those tagged for that DSO.  Each runs at most once.
+void __cxa_finalize(void* dso) {
+    for (size_t i = s_cxa_count; i-- > 0; ) {
+        void (*fn)(void*) = s_cxa_fns[i].fn;
+        if (fn && (dso == 0 || s_cxa_fns[i].dso == dso)) {
+            s_cxa_fns[i].fn = 0;   // clear before calling: no re-entry / double-run
+            fn(s_cxa_fns[i].arg);
+        }
+    }
+}
+
 // Flush stdout/stderr before the kernel exit — in-tree apps that write
 // through the stdio buffered path (puts/printf) would otherwise lose
 // their tail on exit.  _flush_all lives in stdio.c.
 extern void _flush_all(void);
 
+extern void __cxa_finalize(void* dso);
+
 __attribute__((noreturn))
 void exit(int status) {
+    __cxa_finalize(0);           // run C++ global/static destructors first
     while (s_atexit_count > 0)
         s_atexit_fns[--s_atexit_count]();
     _flush_all();
@@ -99,4 +142,14 @@ int posix_memalign(void** memptr, size_t alignment, size_t size) {
     if (alignment == 0 || (alignment & (alignment - 1))) return EINVAL;
     *memptr = malloc(size);
     return *memptr ? 0 : ENOMEM;
+}
+
+// ── memalign ─────────────────────────────────────────────────────────
+// Legacy glibc aligned allocator (<malloc.h>).  Shares posix_memalign's
+// current alignment<=16 limitation (scalability-debt-ledger-#9).  Returns
+// NULL on failure rather than an errno, per the glibc contract.
+void* memalign(size_t alignment, size_t size) {
+    void* p = 0;
+    if (posix_memalign(&p, alignment, size) != 0) return 0;
+    return p;
 }

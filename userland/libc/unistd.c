@@ -85,13 +85,40 @@ int unlink(const char* path) {
 
 // ── Process identity ────────────────────────────────────────────────
 pid_t fork(void) {
+    // Multithreaded-fork safety.  fork() copies ONLY the calling thread, but the
+    // whole address space -- including any allocator lock a SIBLING thread was
+    // holding at the instant of the fork.  The child would inherit that lock
+    // LOCKED (its holder does not exist in the child) and deadlock/abort on its
+    // first malloc.  glibc solves this with pthread_atfork handlers; do the same:
+    //   1. run user prepare handlers (jemalloc/JVM lock their arenas), reverse order
+    //   2. take libc's own heap lock LAST (so a prepare handler may still malloc)
+    //   3. after the fork, release/reset every lock; run parent- or child-side handlers
+    // (Observed: Minecraft's OSHI hardware probe forks during multi-threaded
+    // graphics init; without this the child aborts with SIGABRT and MC's render
+    // thread blocks forever waiting on it.)  These are weak so minimal in-tree
+    // binaries that never link pthread still work.
+    extern void __run_atfork_prepare(void)     __attribute__((weak));
+    extern void __run_atfork_parent(void)      __attribute__((weak));
+    extern void __run_atfork_child(void)       __attribute__((weak));
+    extern void __libc_malloc_atfork_lock(void)   __attribute__((weak));
+    extern void __libc_malloc_atfork_unlock(void) __attribute__((weak));
+
+    if (__run_atfork_prepare)     __run_atfork_prepare();
+    if (__libc_malloc_atfork_lock) __libc_malloc_atfork_lock();
+
     pid_t r = (pid_t)__syscall_ret(syscall0(SYS_FORK));
+
     if (r == 0) {
-        // Child: its new pid must not keep the parent's TLS-cached
-        // pthread identity (mutex ownership / pthread_self would alias).
-        // Weak ref: a no-op for in-tree binaries that never link pthread.
+        // Child: allocator is now single-threaded -- unlock libc's heap first so
+        // child handlers may malloc, run child handlers, then fix pthread identity
+        // (the new pid must not keep the parent's TLS-cached pthread self).
+        if (__libc_malloc_atfork_unlock) __libc_malloc_atfork_unlock();
+        if (__run_atfork_child)           __run_atfork_child();
         extern void __pthread_reset_self(void) __attribute__((weak));
         if (__pthread_reset_self) __pthread_reset_self();
+    } else {
+        if (__libc_malloc_atfork_unlock) __libc_malloc_atfork_unlock();
+        if (__run_atfork_parent)          __run_atfork_parent();
     }
     return r;
 }
@@ -101,6 +128,8 @@ uid_t getuid(void)   { return (uid_t)syscall0(SYS_GETUID); }
 uid_t geteuid(void)  { return (uid_t)syscall0(SYS_GETEUID); }
 gid_t getgid(void)   { return (gid_t)syscall0(SYS_GETGID); }
 gid_t getegid(void)  { return (gid_t)syscall0(SYS_GETEGID); }
+int   setuid(uid_t uid) { return (int)__syscall_ret(syscall1(SYS_SETUID, (uint64_t)uid)); }
+int   setgid(gid_t gid) { return (int)__syscall_ret(syscall1(SYS_SETGID, (uint64_t)gid)); }
 
 // ── File ownership ──────────────────────────────────────────────────
 int chown(const char* path, uid_t uid, gid_t gid) {
@@ -389,16 +418,32 @@ int execvpe(const char* path, char* const argv[], char* const envp[]) {
         (uint64_t)path, (uint64_t)argv, (uint64_t)envp));
 }
 
-// setsid — new session/process group.  MakaOS has no multi-session
-// model; report the current pid as the "new session id."
-pid_t setsid(void) { return getpid(); }
-
-int setpgid(pid_t pid, pid_t pgid) {
-    (void)pid; (void)pgid; return 0;
+// ── Sessions and process groups ─────────────────────────────────────
+// These are the extern symbols ports link against (libc.h has matching
+// static inlines for in-tree apps).  They used to be stubs -- setsid()
+// returned getpid() without leaving the session, setpgid() was a no-op
+// returning success, and the getters all reported getpid() -- on the
+// grounds that "MakaOS has no multi-session model".  It does now: a
+// spawned child stays in its parent's session and process group, so
+// every one of these has real work to do and a port that calls them
+// (a shell setting up job control, the JVM daemonising) must not be
+// told a comfortable lie.
+pid_t setsid(void) {
+    return (pid_t)__syscall_ret(syscall0(SYS_SETSID));
 }
-pid_t getpgid(pid_t pid) { (void)pid; return getpid(); }
-pid_t getpgrp(void)      { return getpid(); }
-pid_t getsid(pid_t pid)  { (void)pid; return getpid(); }
+int setpgid(pid_t pid, pid_t pgid) {
+    return (int)__syscall_ret(syscall2(SYS_SETPGID, (uint64_t)pid,
+                                       (uint64_t)pgid));
+}
+pid_t getpgid(pid_t pid) {
+    return (pid_t)__syscall_ret(syscall1(SYS_GETPGID, (uint64_t)pid));
+}
+pid_t getpgrp(void) {
+    return (pid_t)syscall0(SYS_GETPGRP);
+}
+pid_t getsid(pid_t pid) {
+    return (pid_t)__syscall_ret(syscall1(SYS_GETSID, (uint64_t)pid));
+}
 
 // kill — signal a pid.  SYS_KILL backs this.
 int kill(pid_t pid, int sig) {
@@ -485,3 +530,4 @@ int gethostname(char* name, size_t len) {
 // apps (databases, journal files) can actually force a flush.
 int fsync(int fd)     { (void)fd; return 0; }
 int fdatasync(int fd) { (void)fd; return 0; }
+void sync(void)       { }   // no-op until SYS_FSYNC exists (matches fsync above)

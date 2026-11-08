@@ -401,6 +401,51 @@ static void init_kthread(void) {
     if (login)  sched_add(login);
     if (svcmgr) sched_add(svcmgr);
 
+#ifdef MAKAOS_SIGTEST
+    // JVM signal-layer verification (build with SIGTEST=1 + CONSOLE_SERIAL=1):
+    // runs /bin/sigtest, which installs a SA_SIGINFO SIGSEGV handler, faults on
+    // NULL, checks si_addr, and redirects gregs[REG_RIP] to a recovery point.
+    {
+        static const char* sig_argv[]  = { "/bin/sigtest", NULL };
+        static const int    sig_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* st = elf_exec_kernel("/bin/sigtest", pid_alloc(), sig_argv, envp, sig_stdio);
+        if (st) sched_add(st);
+    }
+#endif
+
+#ifdef MAKAOS_AVIANTEST
+    // Avian JVM first-light (build with AVIANTEST=1 + CONSOLE_SERIAL=1): run the
+    // cross-built Avian VM to execute /avian/Hello.class, proving a full JVM runs
+    // on MakaOS end to end (relies on the SA_SIGINFO/ucontext/pthread signal layer).
+    {
+        static const char* avian_argv[]  = {
+            "/bin/avian",
+            "-Xbootclasspath:/avian/classpath.jar",   // boot loader needs the jar
+                                                      // (defines String -> String$1)
+            "-cp", "/avian/classpath.jar:/avian", "Hello", NULL };
+        static const int    avian_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* av = elf_exec_kernel("/bin/avian", pid_alloc(), avian_argv, envp, avian_stdio);
+        if (av) sched_add(av);
+    }
+#endif
+
+#ifdef MAKAOS_JDKTEST
+    // OpenJDK Zero first-light (build with JDKTEST=1 + CONSOLE_SERIAL=1): run the
+    // cross-built HotSpot-Zero VM to print `java -version`, proving the full
+    // OpenJDK runtime (static-PIE launcher -> dlopen libjvm.so -> java.base) runs
+    // on MakaOS.  Boot at -m 1024M (see AVIANTEST note above).
+    {
+        static const char* java_argv[]  = {
+            "/jdk/bin/java",
+            "-XX:+ErrorFileToStderr",       // full hs_err report to serial (no fs flush on MakaOS)
+            "-Xms256m", "-Xmx3g",           // large heap -- exercises the high-RAM support
+            "-cp", "/jdk", "Hello", NULL }; // run /jdk/Hello.class
+        static const int   java_stdio[3] = { -1, -1, -1 };  // inherit tty0 (serial-mirrored)
+        task_t* jv = elf_exec_kernel("/jdk/bin/java", pid_alloc(), java_argv, envp, java_stdio);
+        if (jv) sched_add(jv);
+    }
+#endif
+
     // Regression-test harness: uncomment to stress AHCI concurrent pread.
     // Kept in-tree so future changes to the submit path can be validated.
     // stress_pread_launch();
@@ -423,6 +468,10 @@ static void init_kthread(void) {
     // shipping boot is fast and deterministic.  Re-enable for validation
     // with `-DMAKAOS_BOOT_SELFTESTS` (e.g. SELFTESTS=1 bash build.sh).
 #ifdef MAKAOS_BOOT_SELFTESTS
+    // Foundation primitives (checked.h): overflow-safe arithmetic + bounds.
+    extern void checked_selftest(void);
+    checked_selftest();
+
     extern void chaselev_selftest(void);
     chaselev_selftest();
 
@@ -431,6 +480,177 @@ static void init_kthread(void) {
     // slab fast-path hit rate and pcp hit rate; asserts >= 95%.
     extern void slab_pcpu_selftest(void);
     slab_pcpu_selftest();
+
+    // Audit fix: big-alloc (buddy-backed) kmalloc header was sized for 8
+    // bytes but offset by 16 -> up to 8-byte heap overflow for sizes in the
+    // (2^k - 16, 2^k - 8] band.  Verify usable span covers the request.
+    extern void kheap_overflow_selftest(void);
+    kheap_overflow_selftest();
+
+    // Audit fix: several syscalls did raw memcpy on unvalidated user pointers
+    // (kernel-fault DoS + arbitrary kernel write).  They now use copy_*_user;
+    // verify those reject kernel/non-canonical/NULL pointers with -EFAULT.
+    extern void copy_user_selftest(void);
+    copy_user_selftest();
+
+    extern void copy_path_user_selftest(void);
+    copy_path_user_selftest();
+
+    // exec/spawn argv+envp vector copier must reject bad array/element pointers
+    // with -EFAULT instead of raw-dereferencing them (kernel leak / panic).
+    extern void copy_user_strv_selftest(void);
+    copy_user_strv_selftest();
+
+    // Audit fix: sys_spawn SPAWN_ATTR_CRED applied attacker-chosen uid/gid with
+    // no caller check (root LPE).  Verify the down-only credential gate.
+    extern void spawn_cred_allowed_selftest(void);
+    spawn_cred_allowed_selftest();
+
+    // Thread-group children anchoring: any thread reaps any process-child.
+    extern void tg_leader_selftest(void);
+    tg_leader_selftest();
+
+    // Exit disposition shared by sys_exit + the fatal-signal path: a thread
+    // self-reaps as TASK_DEAD (no zombie-linger leak), a leader zombifies.
+    extern void task_exit_state_selftest(void);
+    task_exit_state_selftest();
+
+    // fd-table drop on exit: files_shared is unpublished (RELEASE) BEFORE the
+    // RCU-deferred table free, so a /proc/<pid>/fd reader cannot race it; one
+    // shared mechanism (task_drop_files) for sys_exit + the fatal-signal path.
+    extern void task_files_drop_selftest(void);
+    task_files_drop_selftest();
+
+    // setuid-on-exec escalation gate (now wired via ksec).  Verify it fails
+    // closed: only an explicit ksec ALLOW (with an agent present) escalates.
+    extern void ksec_exec_setuid_selftest(void);
+    ksec_exec_setuid_selftest();
+
+    // ksec request rendezvous: per-seq in-flight slots (not one shared slot)
+    // under a lock, so concurrent setuid callers cannot overwrite each other's
+    // waiter (a wake-of-freed-task UAF) or read each other's verdict.
+    extern void ksec_slot_selftest(void);
+    ksec_slot_selftest();
+
+    // unveil sandbox gate (now enforced by every path syscall, not just open).
+    extern void unveil_gate_selftest(void);
+    unveil_gate_selftest();
+
+    // Audit fix: sys_mmap/sys_munmap page-rounded user len with a wrapping add
+    // and never bounded [addr, addr+len) to the user half, so a MAP_FIXED (or
+    // munmap) at a higher-half address drove the unmap+free path through the
+    // shared kernel/HHDM page tables -> live-kernel-frame free / LPE.  Verify
+    // the overflow-safe range helpers reject the wrap + escape cases.
+    extern void mmap_range_selftest(void);
+    mmap_range_selftest();
+    extern void access_ok_selftest(void);
+    access_ok_selftest();
+
+    // Raw user-pointer syscalls (wait/pipe/fb_info/nanosleep/shm_open/unlink)
+    // now route through copy_*_user; bad (kernel/non-canonical) pointers must
+    // return -EFAULT instead of an arbitrary kernel read/write or a #PF panic.
+    extern void syscall_user_ptr_selftest(void);
+    syscall_user_ptr_selftest();
+
+    // Front-munmap of a file/shmem-backed VMA must advance file_off/file_len/
+    // shmem_pgoff in lockstep with vma->start, else later faults map the wrong page.
+    extern void mm_vma_trim_selftest(void);
+    mm_vma_trim_selftest();
+
+    // shmem_create_dma: fully-resident, pinned, best-effort-large-block backing
+    // for GPU scatter-gather (SCALABILITY_DEBT #14).  Verify every page is
+    // populated + pmm_pin'd and that teardown unpins cleanly (no leaked pin),
+    // and that a >64 MiB backing allocates (no contiguity cap).
+    extern void shmem_dma_selftest(void);
+    shmem_dma_selftest();
+
+    // DRM pinned-memory budget: a >64 MiB charge succeeds (per-resource cap
+    // removed), a runaway is cleanly rejected with -ENOMEM, counters restored.
+    extern void drm_budget_selftest(void);
+    drm_budget_selftest();
+
+    // rename(2) must reject moving a directory into its own subtree (mv /a /a/b)
+    // -- it would detach the subtree into an unreachable cycle.
+    extern void rename_under_selftest(void);
+    rename_under_selftest();
+
+    // unlink/rename must drop ONE link and free the inode only at links==0, so
+    // renaming over a multi-link file does not destroy a still-referenced inode.
+    extern void ext2_link_drop_selftest(void);
+    ext2_link_drop_selftest();
+
+    // Path-TOCTOU fix: the mutating fs ops now permission-check the parent they
+    // themselves resolve.  Exercise create/unlink/mkdir/rename as root to prove
+    // authorized mutation still works through the in-op check.
+    extern void ext2_perm_op_selftest(void);
+    ext2_perm_op_selftest();
+
+    // Audit fix (F150): ext2_vfs_pread's aligned fast path DMA's whole blocks;
+    // its run can cover a partial final block and return the on-disk slack past
+    // i_size (info-exposure).  Prove pread now clamps the byte count to EOF.
+    extern void ext2_pread_eof_selftest(void);
+    ext2_pread_eof_selftest();
+
+    // Audit fix: write(2) raw-deref'd its data buffer after only a range check,
+    // so an unmapped-but-in-range pointer panicked the kernel.  Verify the
+    // per-page VMA-backing validator (no prefault, so file-backed sources keep
+    // their content) accepts fully-backed ranges and rejects gaps/wraps.
+    extern void mm_range_has_vmas_selftest(void);
+    mm_range_has_vmas_selftest();
+
+    // Audit fix: ext2_readdir read a dirent's name_len without bounding it to
+    // the block, so a corrupt dirent could over-read past the bcache slot.
+    // Verify the clamp keeps the name within block bounds.
+    extern void ext2_readdir_clamp_selftest(void);
+    ext2_readdir_clamp_selftest();
+
+    // Audit fix: ext2 block size from an untrusted superblock was unbounded
+    // (could exceed the fixed 4096 bcache slots).  Verify the mount-time clamp.
+    extern void ext2_block_size_selftest(void);
+    ext2_block_size_selftest();
+
+    // Audit fix: path_split copied the parent path into a fixed stack buffer
+    // with no bound -> kernel stack overflow on a long path.  Verify the bound
+    // rejects an over-long parent instead of overflowing.
+    extern void ext2_path_split_selftest(void);
+    ext2_path_split_selftest();
+
+    extern void ext2_block_valid_selftest(void);
+    ext2_block_valid_selftest();
+    extern void ext2_blk_lba_selftest(void);
+    ext2_blk_lba_selftest();
+    extern void ext2_inode_size_valid_selftest(void);
+    ext2_inode_size_valid_selftest();
+    extern void ext2_group_geom_selftest(void);
+    ext2_group_geom_selftest();
+    extern void ext2_dirent_in_block_selftest(void);
+    ext2_dirent_in_block_selftest();
+    // Cross-parent directory rename must repoint the moved dir's ".." entry
+    // (else it escapes to the old parent) without clobbering siblings.
+    extern void ext2_dotdot_repoint_selftest(void);
+    ext2_dotdot_repoint_selftest();
+    extern void xfer_bytes_ok_selftest(void);
+    xfer_bytes_ok_selftest();
+    // AHCI build_prdt must bound writes to the 248-entry PRDT (no OOB past the cmd table).
+    extern void ahci_build_prdt_selftest(void);
+    ahci_build_prdt_selftest();
+
+    // Audit fix: pty ioctls dereferenced the raw user arg (arbitrary kernel
+    // R/W LPE).  Verify they now reject bad user pointers with -EFAULT.
+    extern void pty_ioctl_selftest(void);
+    pty_ioctl_selftest();
+
+    // Audit fix: the ELF phdr-table bounds check `e_phoff + phnum*56 > size`
+    // overflowed (a -56 e_phoff wrapped below size) -> OOB phdr read.  Verify
+    // the overflow-safe replacement rejects the wrap + boundary cases.
+    extern void elf_phtab_bounds_selftest(void);
+    elf_phtab_bounds_selftest();
+
+    // elf_build_task builds every task_t for the two ELF load paths; assert it
+    // sets EVERY field to its expected initial value (the drift safety net that
+    // makes deduping elf_load / elf_load_with_argv into elf_build_task safe).
+    extern void task_init_selftest(void);
+    task_init_selftest();
 
     // Buddy high-order uniqueness test: DRM dumb buffers land at
     // order=10 (4MB each), so a duplicate-address bug there silently
@@ -442,9 +662,9 @@ static void init_kthread(void) {
         for (int i = 0; i < 8; i++) {
             got[i] = pmm_buddy_alloc(10);
             kprintf("[pmm10-test] alloc %d = 0x%lx\n", i, (unsigned long)got[i]);
-            if (!got[i]) { kprintf("[pmm10-test] FAIL: OOM at %d\n", i); break; }
+            if (!got[i]) { kprintf_atomic("[pmm10-test] FAIL: OOM at %d\n", i); break; }
             for (int j = 0; j < i; j++)
-                if (got[j] == got[i]) { dup = 1; kprintf("[pmm10-test] FAIL: dup alloc[%d]==alloc[%d]==0x%lx\n", j, i, (unsigned long)got[i]); }
+                if (got[j] == got[i]) { dup = 1; kprintf_atomic("[pmm10-test] FAIL: dup alloc[%d]==alloc[%d]==0x%lx\n", j, i, (unsigned long)got[i]); }
         }
         for (int i = 0; i < 8; i++) if (got[i]) pmm_buddy_free(got[i], 10);
         kprintf("[pmm10-test] %s\n", dup ? "FAILED" : "PASSED (all 8 order=10 allocs distinct)");
@@ -461,11 +681,30 @@ static void init_kthread(void) {
     extern void dcache_selftest(void);
     dcache_selftest();
 
+    // Audit fix T1: dcache_lookup resurrected refcount-0 dentries the
+    // shrinker had committed to free (lock-free bump vs free TOCTOU) -> UAF.
+    // Stress lookers + shrinker + reinstalls on a shared key set; asserts no
+    // looked-up dentry yields a corrupted child_ino (freed-slot reuse).
+    extern void dcache_race_selftest(void);
+    dcache_race_selftest();
+
+    // Audit fix F131: dcache_invalidate must not free a dentry a path walk
+    // holds by refcount -- hash-unlink only, let the last dcache_put + shrinker
+    // reclaim it.  Hold a ref across an invalidate; confirm lookups miss yet the
+    // held dentry stays intact.
+    extern void dcache_held_invalidate_selftest(void);
+    dcache_held_invalidate_selftest();
+
     // Phase 8D: io_uring kernel-side acceptance — NOP pipeline +
     // ns/op steady-state measurement.  Userland test binary lives
     // at /bin/test_io_uring for interactive testing.
     extern void io_uring_selftest(void);
     io_uring_selftest();
+
+    // Audit fix: io_uring indexed sqes[]/cqes[] with the USER-WRITABLE
+    // ring_mask -> OOB read/write.  Verify the trusted-mask index stays in bounds.
+    extern void io_uring_index_selftest(void);
+    io_uring_index_selftest();
 
     // Tier 1 #2 (eventfd): counter + semaphore + nonblocking semantics.
     extern void eventfd_selftest(void);
@@ -474,6 +713,23 @@ static void init_kthread(void) {
     // Tier 1 #3 (timerfd): per-CPU sorted list, drained on sched_tick.
     extern void timerfd_selftest(void);
     timerfd_selftest();
+
+    // timerfd concurrent-settime race: per-node lock prevents a timer node
+    // from being linked onto two per-CPU lists by racing settime callers.
+    extern void timerfd_race_selftest(void);
+    timerfd_race_selftest();
+
+    // inet socket file lifetime: the vfs_file_t is freed via the RCU grace
+    // period (sock_free_rcu), so a tcp pcb_wake / udp sock_poll_wake reader
+    // cannot write through a synchronously-freed file.
+    extern void sock_file_lifetime_selftest(void);
+    sock_file_lifetime_selftest();
+
+    // F132: socket_bind rebinds a TCP socket's ephemeral pcb in place (no free/
+    // realloc -> no UAF for a sibling deref of s->pcb); a non-CLOSED socket
+    // rejects bind without freeing its pcb.
+    extern void socket_bind_rebind_selftest(void);
+    socket_bind_rebind_selftest();
 
     // Tier 1 #4 (socketpair): bidirectional AF_UNIX SOCK_STREAM pair.
     extern void socketpair_selftest(void);
@@ -484,9 +740,120 @@ static void init_kthread(void) {
     extern void scm_rights_selftest(void);
     scm_rights_selftest();
 
+    // AF_UNIX refcount / peer-pin lifetime machinery (T3 part B UAF fix).
+    extern void unix_refcount_selftest(void);
+    unix_refcount_selftest();
+
+    // AF_UNIX namespace string helpers: bounded hash/compare so a user sun_path
+    // can never be walked past UNIX_PATH_MAX (the boundary now NUL-caps it too).
+    extern void unix_ns_str_selftest(void);
+    unix_ns_str_selftest();
+
+    // AF_UNIX stream listen/accept backlog: a queued connect() client holds an
+    // owned ref so it cannot dangle, and accept() atomically claims it before
+    // pairing (the backlog client UAF fix).
+    extern void unix_stream_accept_selftest(void);
+    unix_stream_accept_selftest();
+
+    // SOCK_DGRAM connect() default-destination owned-ref lifetime (the
+    // asymmetric-peer UAF fix): the destination survives its own close while
+    // a connected sender still references it.
+    extern void unix_dgram_peer_selftest(void);
+    unix_dgram_peer_selftest();
+
+    // Pipe last-end-release: single atomic owner of the teardown (double-free fix).
+    extern void pipe_refcount_selftest(void);
+    pipe_refcount_selftest();
+
+    // Pipe concurrent read/write: per-pipe ring lock keeps head/tail/count and
+    // the payload bytes from tearing under racing readers/writers.
+    extern void pipe_race_selftest(void);
+    pipe_race_selftest();
+
+    // epoll watched-file pin: file survives close while a watch is registered.
+    extern void epoll_watch_refcount_selftest(void);
+    epoll_watch_refcount_selftest();
+
     // Tier 1 #6 (signalfd): block sig, send, drain via signalfd read.
     extern void signalfd_selftest(void);
     signalfd_selftest();
+
+    // signal_send_pid: rcu-safe pid lookup + delivery (sched_find_pid UAF fix).
+    extern void signal_send_pid_selftest(void);
+    signal_send_pid_selftest();
+    extern void signal_perm_selftest(void);
+    signal_perm_selftest();
+
+    // exec teardown: a multithreaded exec must not free the old page tables
+    // while sibling threads still run on them (cross-domain page-table UAF/LPE).
+    extern void exec_mm_teardown_selftest(void);
+    exec_mm_teardown_selftest();
+
+    // TCP ring-drain arithmetic + underflow clamp (T4 defense-in-depth).
+    extern void tcp_ring_consume_selftest(void);
+    tcp_ring_consume_selftest();
+
+    extern void tcp_ring_reserve_selftest(void);
+    tcp_ring_reserve_selftest();
+    // tx-ring read never crosses the 64K wrap (heap-OOB-read fix, F149).
+    extern void tcp_tx_first_chunk_selftest(void);
+    tcp_tx_first_chunk_selftest();
+
+    extern void tcp_accept_q_selftest(void);
+    tcp_accept_q_selftest();
+
+    // Freeing a TCP listener PCB must orphan (NULL the ->listener of) its
+    // SYN_RCVD children so a late handshake ACK cannot deref the freed listener.
+    extern void tcp_listener_orphan_selftest(void);
+    tcp_listener_orphan_selftest();
+
+    // SYN_RCVD half-open reaper: a never-completed, never-accepted half-open is
+    // freed past the SYN-ACK retransmit cap, bounding a remote SYN-flood leak.
+    extern void tcp_synreap_selftest(void);
+    tcp_synreap_selftest();
+
+    // Audit fix (F158): freeing a listener with queued-but-unaccepted
+    // ESTABLISHED children must RST + free them, not leak ~128 KiB each.
+    extern void tcp_listener_drain_selftest(void);
+    tcp_listener_drain_selftest();
+
+    // UDP send-size guard: an oversize user length must be rejected (-EMSGSIZE)
+    // before the user-u32 -> uint16_t UDP-length narrowing wraps and under-sizes
+    // the skb (which NULL-derefs on the unchecked skb_put -- an unprivileged DoS).
+    extern void udp_send_size_selftest(void);
+    udp_send_size_selftest();
+
+    // readdir/uname out-struct info-leak guard: the dirent buffer + utsname must
+    // be zeroed before fill so no name-tail / padding stale bytes reach userspace.
+    extern void out_struct_zerofill_selftest(void);
+    out_struct_zerofill_selftest();
+
+    // fd_table_clone correctness: fork/spawn/thread copy the parent fd table
+    // (under its lock so a sibling close cannot free a file mid-vfs_dup).
+    extern void fd_table_clone_selftest(void);
+    fd_table_clone_selftest();
+
+    // virtio-net device descriptor-id bounds (rx/tx OOB from a malicious device).
+    extern void virtio_desc_id_valid_selftest(void);
+    virtio_desc_id_valid_selftest();
+    // virtio-net RX completion id bounded to the POPULATED rx buffers (a device
+    // id in the desc ring but past the rx buffers -> NULL source / phys-0 repost).
+    extern void virtio_rx_id_valid_selftest(void);
+    virtio_rx_id_valid_selftest();
+
+    // NVMe device completion-id bounds (req[] OOB from a malicious/buggy NVMe).
+    extern void nvme_cid_valid_selftest(void);
+    nvme_cid_valid_selftest();
+    // nvme LBADS validation: reject UB-inducing / bogus device LBA sizes (F137).
+    extern void nvme_lba_size_ok_selftest(void);
+    nvme_lba_size_ok_selftest();
+    // hda codec node-scan bound: device NODE_COUNT can't infinite-loop a u8 (F138).
+    extern void hda_node_scan_end_selftest(void);
+    hda_node_scan_end_selftest();
+
+    // virtfs_is_virtual path-boundary (unveil /dev|/proc exemption bypass fix).
+    extern void virtfs_is_virtual_selftest(void);
+    virtfs_is_virtual_selftest();
 
     // Tier 2.5a (virtio-gpu): pipeline exerciser was overriding the
     // UEFI GOP framebuffer with a self-test banner, hiding the TTY
@@ -501,6 +868,53 @@ static void init_kthread(void) {
     // Happy path + two error-path probes.
     extern void drm_mock_selftest(void);
     drm_mock_selftest();
+
+    // DRM create_dumb pitch/size overflow-safe math (32-bit width*4 overflow).
+    extern void drm_dumb_size_selftest(void);
+    drm_dumb_size_selftest();
+
+    extern void drm_atomic_count_selftest(void);
+    drm_atomic_count_selftest();
+    extern void vgpu_fb_bytes_selftest(void);
+    vgpu_fb_bytes_selftest();
+    // SET_CURSOR backing-size guard: u64 w*h*4 wrap (SCAN #14 / F136).
+    extern void drm_cursor_bytes_selftest(void);
+    drm_cursor_bytes_selftest();
+
+    // TTY ring free-slot arithmetic (canonical line-framing: all-or-nothing
+    // flush so a partial push can never drop a cooked line's terminating '\n').
+    extern void tty_rb_free_selftest(void);
+    tty_rb_free_selftest();
+
+    extern void tty_ldisc_selftest(void);
+    tty_ldisc_selftest();
+
+    // termios publish/snapshot: TCSET* now lands in a stack local then publishes
+    // the whole struct under tty->lock, and the line-discipline readers snapshot
+    // under the same lock, so a concurrent set cannot tear ICANON against c_cc[].
+    extern void tty_termios_snapshot_selftest(void);
+    tty_termios_snapshot_selftest();
+
+    // PTY pair lifetime: the pair is freed exactly once (both ends closed) and
+    // unlinked, under s_pty_lock (no concurrent master/slave double-free).
+    extern void pty_lifetime_selftest(void);
+    pty_lifetime_selftest();
+    // pty slave reopen: closing the slave with the master open must clear the
+    // cached slave_file so a reopen cannot resurrect the freed vfs_file_t.
+    extern void pty_reopen_selftest(void);
+    pty_reopen_selftest();
+
+    // PTY master ring: the slave-output ring (m_head/m_tail) is now mutated
+    // under master_lock by both the producer (write_char/write_buf) and the
+    // consumer (master_read), so a cross-CPU drain cannot race a push.
+    extern void pty_master_ring_selftest(void);
+    pty_master_ring_selftest();
+
+    // evdev: the per-open client list + each client's event ring are now
+    // serialised by a per-device IRQ-safe lock, so the IRQ/kthread producer
+    // (input_device_emit) cannot deref a client a concurrent close() freed.
+    extern void evdev_ring_selftest(void);
+    evdev_ring_selftest();
 #endif /* MAKAOS_BOOT_SELFTESTS */
 
     // Stress harnesses are compiled in but not auto-launched — reference

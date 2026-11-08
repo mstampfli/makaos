@@ -12,6 +12,37 @@ typedef struct interrupt_frame_t {
     uint64_t ss;
 } __attribute__((packed)) interrupt_frame_t;
 
+// ── Full exception trap frame (the entire on-stack register save) ─────────
+// isr_common_entry (isr_stubs.asm) builds this on the kernel stack for every
+// exception and passes the C handler a pointer to its `ip` field (i.e. an
+// interrupt_frame_t* overlaying the tail).  The GPRs are pushed by PUSH_GPRS
+// (rax at the lowest address), then the ISR_EC/ISR_NOEC macros push
+// {has_ec, handler, ec}, then the CPU-pushed {ip,cs,flags,sp,ss}.  The C
+// handler receives &tf->ip; TRAP_FROM_IFRAME recovers the whole frame so
+// signal delivery can read/redirect the faulting GPRs.  Because the stub now
+// passes a pointer to the REAL frame (not a copy), edits to any field here
+// take effect on the POP_GPRS + iretq return path — this is how a synchronous
+// fault delivers a signal to a user handler (see signal_deliver_fault).
+//
+// The field order and offsets MUST match isr_stubs.asm exactly; the
+// _Static_asserts below pin the contract so an asm/layout drift fails the
+// build instead of corrupting register state at fault time.
+typedef struct trap_frame_t {
+    uint64_t rax, rbx, rcx, rdx, rbp, rsi, rdi;   // PUSH_GPRS (rax lowest)
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t has_ec, handler, ec;                 // ISR_EC/ISR_NOEC macros
+    uint64_t ip, cs, flags, sp, ss;               // CPU-pushed (interrupt_frame_t)
+} __attribute__((packed)) trap_frame_t;
+
+_Static_assert(sizeof(trap_frame_t) == 23 * 8, "trap_frame_t is 23 qwords");
+_Static_assert(__builtin_offsetof(trap_frame_t, ip) == 18 * 8,
+               "ip at GPRbase+144 (15 GPRs + has_ec/handler/ec)");
+_Static_assert(__builtin_offsetof(trap_frame_t, rax) == 0, "rax at frame base");
+
+// Recover the full trap frame from the interrupt_frame_t* the C handler got.
+#define TRAP_FROM_IFRAME(f) \
+    ((trap_frame_t*)((uint8_t*)(f) - __builtin_offsetof(trap_frame_t, ip)))
+
 typedef struct idtr_t {
     uint16_t limit;
     uint64_t base;

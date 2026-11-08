@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vfs.h"
+#include "smp.h"   // spinlock_t for the per-pipe ring lock
 
 // ── Kernel pipe ───────────────────────────────────────────────────────────
 // A pipe is a one-directional byte stream backed by a circular kernel buffer.
@@ -19,12 +20,31 @@
 #define PIPE_BUF_SIZE 4096  // must be power of 2
 
 typedef struct {
+    // ring lock: serialises every RMW of the ring state below (head/tail/
+    // count + the buf bytes they index) AND of writer_refs/reader_refs.  A
+    // pipe end can be SHARED across tasks (fork dups the fd table but both
+    // fds point at this one pipe_buf_t; threads/SCM_RIGHTS likewise), so two
+    // CPUs can read+write (or multi-read / multi-write) concurrently; without
+    // this the non-atomic count--/count++ lose updates (torn count -> wrong
+    // empty/full gating, count underflow wraps to ~4e9) and head/tail/buf
+    // tear.  Plain spin_lock (never taken in IRQ context).  Dropped before
+    // any WAIT_EVENT sleep or wait_queue_wake_all, and before the user-source
+    // copy in pipe_write (that source is demand-paged, not prefaulted).
+    spinlock_t lock;
     uint8_t  buf[PIPE_BUF_SIZE];
     uint32_t head;          // read index
     uint32_t tail;          // write index
     uint32_t count;         // bytes currently in buffer
-    uint8_t  writer_refs;   // number of open write-end fds
-    uint8_t  reader_refs;   // number of open read-end fds
+    uint8_t  writer_refs;   // 1 while the write end is open (EOF signal to reader)
+    uint8_t  reader_refs;   // 1 while the read end is open (EPIPE signal to writer)
+    // Lifetime: the two ends (read_file/write_file) and this buffer all share a
+    // single lifetime.  open_ends starts at 2 (both ends open) and is decremented
+    // once by each end's close hook; the close that drives it to 0 frees all
+    // three together.  This makes the free a single atomic last-ref transition
+    // (no double-free of two CPUs both seeing refs==0) AND lets each close hook
+    // safely wake the PEER end's waitq -- the peer vfs_file_t is not freed until
+    // this hits 0, so the wake never derefs a freed peer.
+    uint32_t open_ends;
     struct vfs_file_t* read_file;   // back-pointer — its waitq handles
                                     // blocking readers + poll/epoll
     struct vfs_file_t* write_file;  // back-pointer — its waitq handles

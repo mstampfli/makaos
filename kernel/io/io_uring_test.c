@@ -28,11 +28,11 @@ static io_uring_t* test_ring_create(uint32_t entries) {
     uint32_t cq_entries = sq_entries * 2;
 
     uint64_t hdrs = sizeof(io_sq_ring_hdr_t) + sizeof(io_cq_ring_hdr_t);
-    uint64_t sqes_off = (hdrs + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t sqes_off = page_align_up(hdrs);
     uint64_t sqes_bytes = sq_entries * sizeof(io_sqe_t);
-    uint64_t cqes_off = (sqes_off + sqes_bytes + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t cqes_off = page_align_up(sqes_off + sqes_bytes);
     uint64_t cqes_bytes = cq_entries * sizeof(io_cqe_t);
-    uint64_t total = (cqes_off + cqes_bytes + PAGE_SIZE - 1) & ~(uint64_t)PAGE_MASK;
+    uint64_t total = page_align_up(cqes_off + cqes_bytes);
 
     uint64_t pages = total >> PAGE_SHIFT;
     uint8_t order = 0; while ((1ULL << order) < pages) order++;
@@ -90,7 +90,7 @@ void io_uring_selftest(void) {
     kprintf("[io_uring_test] starting\n");
 
     io_uring_t* u = test_ring_create(64);
-    if (!u) { kprintf("[io_uring_test] FAILED: ring_create\n"); return; }
+    if (!u) { kprintf_atomic("[io_uring_test] FAILED: ring_create\n"); return; }
 
     // ── 1. NOP batch ───────────────────────────────────────────
     const uint32_t N = 32;
@@ -106,7 +106,7 @@ void io_uring_selftest(void) {
     uint64_t t1 = tsc_read_ns();
 
     if (submitted != (int)N) {
-        kprintf("[io_uring_test] FAILED: submitted=%d expected=%u\n",
+        kprintf_atomic("[io_uring_test] FAILED: submitted=%d expected=%u\n",
                 submitted, (unsigned)N);
         test_ring_destroy(u); return;
     }
@@ -121,7 +121,7 @@ void io_uring_selftest(void) {
     __atomic_store_n(&u->cq_hdr->head, ch, __ATOMIC_RELEASE);
 
     if (good != N) {
-        kprintf("[io_uring_test] FAILED: only %u/%u NOPs returned correct CQE\n",
+        kprintf_atomic("[io_uring_test] FAILED: only %u/%u NOPs returned correct CQE\n",
                 (unsigned)good, (unsigned)N);
         test_ring_destroy(u); return;
     }
@@ -156,5 +156,5 @@ void io_uring_selftest(void) {
             (unsigned)ROUNDS, (unsigned)N, (uint64_t)avg_ns_per);
 
     test_ring_destroy(u);
-    kprintf("[io_uring_test] SELF-TEST PASSED\n");
+    kprintf_atomic("[io_uring_test] SELF-TEST PASSED\n");
 }

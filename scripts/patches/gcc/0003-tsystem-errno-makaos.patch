@@ -1,0 +1,32 @@
+Skip tsystem.h's fallback `extern int errno` on MakaOS.
+
+MakaOS's <errno.h> declares errno as `extern __thread int errno;` (a
+thread-local variable, not a macro), so gcc/tsystem.h's `#ifndef errno`
+guard does not skip its plain `extern int errno;` fallback -- which then
+collides with the thread-local declaration and breaks the libgcc build
+(needed for a hosted libstdc++). errno is already declared by the
+<errno.h> included just above, so the fallback is redundant on MakaOS.
+
+(A proper POSIX errno-as-macro fix would trip the guard without this
+patch, but that renames the errno symbol and requires re-porting the
+whole userland; deferred -- see docs/VIRGL_BRINGUP.md.)
+
+Signed-off-by: MakaOS <noreply@makaos>
+
+diff --git a/gcc/tsystem.h b/gcc/tsystem.h
+--- a/gcc/tsystem.h
++++ b/gcc/tsystem.h
+@@ -100,8 +100,12 @@
+ /* All systems have this header.  */
+ #include <errno.h>
+
+-#ifndef errno
++/* MakaOS's <errno.h> (included just above) declares errno as a thread-local
++   `extern __thread int errno;` rather than a macro, so the usual `#ifndef
++   errno` guard would not skip this fallback and the plain `extern int errno;`
++   would collide with the thread-local one.  errno is already declared. */
++#if !defined(errno) && !defined(__makaos__)
+ extern int errno;
+ #endif
+
+ /* If these system headers do not exist, fixincludes must create them.  */

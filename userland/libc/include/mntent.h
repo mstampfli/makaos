@@ -6,6 +6,9 @@
 
 #ifndef _MAKAOS_MNTENT_H
 #define _MAKAOS_MNTENT_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stdio.h>
 
@@ -31,4 +34,7 @@ int            addmntent(FILE* fp, const struct mntent* mnt);
 int            endmntent(FILE* fp);
 char*          hasmntopt(const struct mntent* mnt, const char* opt);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -98,7 +98,15 @@ syscall_entry:
     mov  rdx, rsi    ; arg2 ← rsi
     mov  rsi, rdi    ; arg1 ← rdi
     mov  rdi, rax    ; nr   ← rax
+    ; 15 pushes (120 B) from a 16-aligned RSP0 leave RSP ≡ 8 (mod 16) here, but
+    ; the SysV ABI requires RSP 16-aligned AT a `call` (so the callee sees
+    ; rsp+8 ≡ 0).  Entering C 8-off left rbp misaligned in every callee, which
+    ; #GP'd fxsave in the signal-delivery path (build_simple/rt_frame) on
+    ; return-to-user.  Pad by 8 for the call; SYSCALL_KFRAME is kstack_top-
+    ; relative so this does not disturb the per-task syscall frame.
+    sub  rsp, 8
     call syscall_dispatch
+    add  rsp, 8
     ; return value in rax — leave it there for the user
 
     ; 7. Restore GPRs (reverse order of step 5).

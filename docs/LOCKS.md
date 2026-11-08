@@ -216,6 +216,74 @@ not 4 096 times. This is the hot path.
 
 ---
 
+## `g_kpml4_lock` — `kernel/mm/vmm.c`
+
+**Guards:** structural mutation of the **shared kernel PML4** — the
+upper-half (PML4[256..511]) page tables every process inherits. Held
+across the `vmm_pte_get` walk + leaf-PTE write in `vmm_page_map` /
+`vmm_page_unmap`, but **only** when `pml4_phys == g_kernel_pml4`. User
+PML4 mutations skip it entirely (they are serialized by their owning
+mm's `vma_lock`), so user demand-fault / CoW scalability is unaffected.
+
+**Added:** kstack-corruption fix (this branch).
+
+**Why a lock here:**
+- User address spaces have an owner (the `mm`, with `vma_lock`); the
+  kernel PML4 has none. `kstack_alloc` / `kstack_free` mutate it from
+  every CPU on each task create/reap, and kernel-heap demand-faults map
+  into it from IRQ context. Concurrent, those walks raced: two CPUs
+  calling `vmm_pte_get(create=1)` for VAs sharing an absent intermediate
+  entry both allocate a page-table frame and one overwrites the other's
+  install — a leaked/aliased table — and the leaf writes/clears tore.
+- This surfaced as `[pmm] DOUBLE-ALLOC` + `DOUBLE-BUDDY-FREE` under
+  fork+exec churn (the kstack subsystem mutates the kernel PML4 hardest).
+
+**IRQ-safety:** `spin_lock_irqsave` — kernel-heap page faults take it
+from interrupt/trap context, so a plain `spin_lock` could self-deadlock.
+
+**Lock ordering:** `g_kpml4_lock` → `g_pmm_lock` (the walk allocates
+intermediate tables via `pmm_buddy_alloc` while held). Never the
+reverse — pmm code never maps. `g_kstack_lock` is always **released**
+before the mapping calls, so it never nests with `g_kpml4_lock`.
+
+---
+
+## `g_kstack_lock` — `kernel/arch/x86_64/tss.c`
+
+**Guards:** the kernel-stack **slot allocator** state — the monotonic
+high-water counter `g_kstack_slots` and the recycled-slot free stack
+(`g_kstack_free` / `g_kstack_free_count`). `kstack_alloc` consults the
+free stack and the counter as one unit; `kstack_free` pushes a freed
+slot back.
+
+**Added:** kstack-corruption fix (this branch).
+
+**Why a lock here (and why recycling needs it):**
+- The previous allocator only ever did `atomic_fetch_add` on the
+  counter — slots were never reused, so the kstack VA region grew
+  without bound under fork/exec churn and leaked a page-table frame per
+  new band. Recycling freed slots caps the region at the high-water of
+  *concurrent* tasks, but "pop a free slot else bump the counter" is a
+  read-modify-write across two variables — a bare atomic can't make it
+  one decision, so a short spinlock guards it.
+- The critical section is tiny (a couple of integer ops); the
+  expensive work (`pmm_buddy_alloc`, `vmm_page_map`, and the recycled-
+  slot `tlb_flush_kernel_range` shootdown) all happens **outside** the
+  lock.
+
+**IRQ-safety:** `spin_lock_irqsave` — `kstack_free` runs from the task
+reap path which may be entered with IRQs disabled.
+
+**Lock ordering:** a leaf lock — taken alone, released before any
+mapping or shootdown. Never held across `g_kpml4_lock` / `g_pmm_lock`.
+
+**Related:** a recycled slot's VA may be cached in a remote CPU's TLB
+(kstack PTEs aren't global and `context_switch` skips CR3 reload on
+same-mm switches), so `kstack_alloc` calls `tlb_flush_kernel_range`
+(an all-CPU kernel-range shootdown, `kernel/mm/tlb.c`) on reuse.
+
+---
+
 ## Planned locks (not yet added — for Phase 3–8)
 
 Each entry will be added as the phase lands, with the same justification
@@ -267,8 +335,15 @@ template. This list is for tracking the *plan*, not the code.
 
 - **fd table mutation:** per-task_files_t mutex. Read path is
   RCU-protected.
-- **ext2 inode lock:** per-directory mutex. Reads are RCU via the
-  inode cache.
+- **ext2 inode lock (per-inode irtree leaf):** `inode_lock` holds the
+  leaf seqlock's embedded `write_lock` (a plain, preemptible spinlock) to
+  serialise writers of the same inode; it is held across the writer's
+  blocking disk I/O. The seqlock SEQUENCE is bumped odd ONLY by
+  `inode_pub_begin`/`inode_pub_end` around the brief in-memory publish of
+  `leaf->inode` -- NEVER across I/O. Reads (`irtree_get`) are a seqlock
+  retry inside `rcu_read_lock`. F135: holding the sequence odd across the
+  AHCI I/O deadlocked a preempt-disabled reader against the sleeping
+  writer; the sequence-vs-write_lock split fixed it.
 - **VMA list mutation:** per-address-space mutex. Page fault handler
   walks under RCU.
 
@@ -309,6 +384,46 @@ ancillary fd close, struct free) via `call_rcu(unix_sock_free_rcu)`,
 so a concurrent `connect`/`sendto` inside `rcu_read_lock()` sees a
 consistent peer until it exits the reader section.
 
+### `unix_sock_t.lock` -- `kernel/net/unix_sock.c`
+Per-socket leaf spinlock (F111/F112/F113).  Serializes ALL of this socket's
+per-socket queues, which used to assume the retired single-CPU model:
+- the LISTENER BACKLOG (`backlog_head/tail/count`, F111): `unix_sock_connect`
+  links under the LISTENER's lock, `unix_sock_accept` pops under the same lock.
+- the SOCK_DGRAM RX queue (`dgram_head/tail/count`, F112): `unix_sock_sendto`
+  links under the TARGET's lock, `unix_sock_recv_ex` dequeues under self's lock.
+- the SCM_RIGHTS ANCILLARY queue (`ancillary.*`, F112): `unix_sock_sendfd`
+  enqueues under the PEER's lock, `unix_sock_recvfd{,_nb}` dequeue under self's.
+- the SOCK_STREAM cbuf (`buf_head/tail/count`, F113): `cbuf_write_locked` (the
+  sender, on the PEER's lock) and `cbuf_read_locked` (the owner, on self's lock)
+  operate on a KERNEL buffer; the send/recv callers bounce the user data through
+  a 512-byte stack chunk OUTSIDE the lock and loop.
+RULE: each op locks EXACTLY the per-socket lock of the socket that OWNS the queue/
+buffer it touches (a send mutates the peer/target's, so it locks THAT socket's
+lock), so no path ever holds two per-socket locks at once (A<->B traffic uses
+A->lock and B->lock independently -- no AB-BA deadlock).  Held ONLY around the
+list/count/ring mutation -- the allocations, the user-data memcpy/copy-out (for
+the cbuf, the user<->kernel bounce), and the `unix_wake`/`unix_poll_wake` (which
+touch `rq_lock`) stay OUTSIDE it (a user-memory access must never fault under a
+preempt-disabled spinlock).  Never held together with `s_unix_pair_lock`.
+`unix_sock_free_rcu` drains the backlog/dgram/ancillary queues post-grace-period
+at refcount 0 (RCU-serialized vs the producers; consumers cannot run on a
+refcount-0 socket), so that path is single-threaded by construction and takes no
+lock.
+
+### `socket_t.udp_rx_lock` -- `kernel/net/socket.c`
+Per-socket leaf spinlock (F114) guarding the inet UDP receive ring
+(`udp_rx_head/tail/count`).  `socket_deliver_udp` (the net receive path, running
+in the `net_rx_thread` KTHREAD -- the virtio-net IRQ only `irq_notify`s it, so a
+plain preempt-disabling spinlock is correct, no irqsave) ENQUEUES under it;
+`socket_recv` / `socket_recvfrom` DEQUEUE under it (re-checking the head inside
+and retrying the wait on a lost multi-receiver race).  Held ONLY around the ring
+mutation -- the skb alloc/free, the user copy-out, the `src_addr` stamp, and the
+`wait_queue_wake_all`/`sock_poll_wake` (which touch `rq_lock`) stay OUTSIDE it.
+Leaf: never nested with the rcu/tx/udp-table locks.  `sock_free_rcu` drains the
+ring post-grace-period at refcount 0 (the deliver is RCU-serialized, no recv can
+run on a closed fd), so that path is single-threaded and takes no lock.  TCP
+rings are guarded separately by `pcb->lock`; this lock is UDP-only.
+
 ### `s_namespace_lock` — `kernel/mm/shmem.c`
 Guards the `s_namespace` table pointer.  `shmem_ns_find` walks
 lock-free inside `rcu_read_lock()` and bumps the found object's
@@ -323,6 +438,15 @@ Guards the `s_pcb_head` linked-list head and every `->next` link.
 with `rcu_dereference` on each `->next`, which keeps the pcbs alive
 via the `call_rcu`-deferred `tcp_pcb_free_rcu` path.  `tcp_pcb_alloc`
 publishes at the head via `rcu_assign_pointer`.
+Also serializes the SYN_RCVD half-open ESTABLISH-vs-REAP decision (F119): the
+timer reaper sets `pcb->reaped` + unlinks an over-cap half-open under this lock,
+and `tcp_recv`'s SYN_RCVD->ESTABLISHED transition runs under it and commits only
+if `!reaped && state==SYN_RCVD` -- so a child being reaped is never established/
+queued and a just-established child is never reaped (no UAF).  The reaper takes
+ONLY this lock (the `accept_q_push` stays under the listener's `pcb->lock`, a
+separate critical section -- no two-lock nesting); the reaper frees AFTER
+`rcu_read_unlock` (one `synchronize_rcu_expedited` per batch -- never under a
+reader).
 
 ### `task_idx_t.lock` (×3) — `kernel/proc/sched.c`
 One IRQ-safe spinlock per `task_idx_t` (pgid, tgid, sid).  Held on
@@ -343,6 +467,63 @@ waitq can fire from IRQ context without serialising on epoll.
 `epoll_wait` collects matching events into a temporary kernel buffer
 under the lock, then releases the lock before `copy_to_user` so a
 user-page fault never happens with a spinlock held.
+
+### `g_tfd_pcpu[cpu].lock` (per-CPU) + `timerfd_state_t.lock` (per-fd) -- `kernel/io/timerfd.c`
+Two-level, IRQ-safe.  `g_tfd_pcpu[cpu].lock` (one per CPU) guards that
+CPU's sorted timer list (`head` / `head_expiry`) and the list linkage
+of the nodes on it (`next` / `in_list` / `next_expiry_ns` /
+`interval_ns`).  The tick fast path reads the atomic `head_expiry` with
+no lock and only takes the per-CPU lock to drain expired timers on its
+OWN CPU.  `timerfd_state_t.lock` (one per timerfd) is a STABLE per-node
+lock that serializes a whole `timerfd_settime` move (detach from the old
+home CPU's list, attach to the calling CPU's list).  It is required
+because a timer's home CPU -- and therefore which per-CPU lock protects
+its node fields -- changes across the move, so the per-CPU lock alone
+cannot serialize two concurrent `settime` callers sharing one timerfd
+(fork / thread / SCM_RIGHTS); without the node lock they could link the
+single node onto two per-CPU lists and a later close would free it from
+one while the other still references it (a `timerfd_tick` use-after-
+free).  **Lock order: `timerfd_state_t.lock` (outer) before
+`g_tfd_pcpu[].lock` (inner); never two per-CPU locks at once (the old
+home is unlocked before the new home is locked).**  `timerfd_tick` and
+`timerfd_close_op` take only the per-CPU lock: the tick never moves a
+node across CPUs, and close runs only at the last fd-ref drop, which the
+`settime` fdget pin (F81) excludes from racing any in-flight settime --
+so neither needs the node lock and there is no lock cycle.
+
+### `pipe_buf_t.lock` (per-pipe) -- `kernel/fs/pipe.c`
+One plain spinlock per pipe.  Guards every RMW of the ring state -- head /
+tail / count and the `buf` bytes they index -- and of the writer_refs /
+reader_refs open flags.  A pipe end can be SHARED across tasks (fork dups
+the fd table but both fds point at the one pipe_buf_t; threads and
+SCM_RIGHTS likewise), so two CPUs can read+write (or multi-read /
+multi-write) concurrently; without the lock the non-atomic count--/count++
+lose updates (torn count, and a count-- underflow wraps the u32 to ~4e9 so
+an empty pipe looks full of data).  **Not IRQ-off** (no pipe path runs in
+interrupt context) and **dropped before every blocking point**: before each
+WAIT_EVENT_HOOK sleep, before every wait_queue_wake_all (a wake can
+schedule), and before pipe_destroy (which frees the struct holding the
+lock).  pipe_read drains directly into the prefaulted sys_read user buffer
+under the lock (same convention as pty_master_drain); pipe_write copies the
+NON-prefaulted user source into a small kernel bounce buffer with the lock
+DROPPED (the source is demand-paged on access and must not fault under a
+spinlock), then pushes from the bounce buffer into the ring under the lock.
+poll / ioctl read `count` locklessly as an advisory snapshot (a 32-bit
+aligned read is atomic; the authoritative re-check happens under the lock).
+
+### `io_uring_t.worker_lock` (per-ring) -- `kernel/io/io_uring.c`
+One spinlock per io_uring instance.  Serialises io_wq_ensure_worker's
+check-create-publish so AT MOST ONE async worker kthread is ever spawned
+per ring.  Without it, two concurrent SQ consumers (a non-SQPOLL ring
+driven by two threads sharing its fd) both observe `worker == NULL` and
+each spawn a kthread; the second store orphans the first, and
+io_uring_close_file joins only the published worker, so the orphan runs on
+and touches the freed ring (use-after-free).  Double-checked: a lock-free
+acquire-load fast path returns immediately when the worker already exists;
+only the first async op takes the lock.  Held across task_create_kthread +
+sched_add (neither sleeps nor takes this lock, so no sleep-under-spinlock
+and no cycle).  SQPOLL rings spawn the worker only from the single poller
+kthread, so they never contend it.
 
 ### RCU-deferred free paths (not locks, but part of Phase 6)
 

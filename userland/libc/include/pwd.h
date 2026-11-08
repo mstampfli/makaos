@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_PWD_H
 #define _MAKAOS_PWD_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -23,4 +26,7 @@ void setpwent(void);
 void endpwent(void);
 struct passwd* getpwent(void);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

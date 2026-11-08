@@ -103,7 +103,11 @@ typedef struct unix_sock {
     char     path[UNIX_PATH_MAX];
 
     // ── SOCK_STREAM data buffer (circular) ───────────────────────────────
-    // Written by peer, read by owner.  Protected by single-threaded kernel.
+    // Written by peer (cbuf_write_locked), read by owner (cbuf_read_locked),
+    // both under the OWNER's `lock` (F113) so the sender's buf_count += can no
+    // longer race the owner's buf_count -=.  The user<->ring copy is bounced
+    // through a kernel chunk in the send/recv callers so the spinlock is never
+    // held across a user-memory access.
     uint8_t  buf[UNIX_BUF_SIZE];
     uint32_t buf_head;      // read index
     uint32_t buf_tail;      // write index
@@ -115,7 +119,38 @@ typedef struct unix_sock {
     uint32_t      dgram_count;
 
     // ── Peer (SOCK_STREAM connected pair) ────────────────────────────────
+    // SYMMETRIC link: both ends point at each other (stream connect/accept and
+    // socketpair).  Lifetime is managed by the back-pointer clear in
+    // unix_sock_close (peer->peer == s -> NULL before the free), so `peer`
+    // never dangles -- NO owned reference is held on it.
     struct unix_sock* peer;
+
+    // ── SOCK_DGRAM connect() default destination ─────────────────────────
+    // ASYMMETRIC link: connect() on a datagram socket caches its default send
+    // target, but that target has NO back-pointer to us, so its close() cannot
+    // clear this pointer the way a symmetric peer's does.  We therefore hold an
+    // OWNED strong ref (unix_get at connect, unix_put at close/reconnect) so the
+    // destination cannot be freed out from under a later send -- without it,
+    // dgram_dest would dangle to freed memory the moment the destination
+    // closed.  Kept separate from `peer` so a socket can be both socketpair'd
+    // (symmetric `peer`) and connect()'d (owned `dgram_dest`) without the two
+    // lifetimes interfering.  NULL = no connected default destination.
+    struct unix_sock* dgram_dest;
+
+    // ── Per-socket data lock ─────────────────────────────────────────────
+    // Serializes ALL of this socket's per-socket queues, which used to assume
+    // the retired single-CPU model: the listener BACKLOG (backlog_head/tail/
+    // count, F111), the SOCK_DGRAM RX queue (dgram_head/tail/count, F112), the
+    // SCM_RIGHTS ANCILLARY queue (ancillary.*, F112), and the SOCK_STREAM cbuf
+    // (buf_head/tail/count, F113) -- each against its cross-CPU producer/
+    // consumer.  Held ONLY around the list/count/ring mutation: allocations, the
+    // user-data memcpy (bounced through a kernel chunk for the cbuf), and the
+    // wait_queue wakes happen OUTSIDE it (a user-memory access must never fault
+    // under a preempt-disabled spinlock; the waitq touches rq_lock).  Never
+    // nested with another per-socket lock (each op locks exactly the OWNER of the
+    // queue/buffer it touches, so A<->B traffic uses A->lock and B->lock
+    // independently) nor with s_unix_pair_lock (separate critical sections).
+    spinlock_t lock;
 
     // ── Listener backlog (SOCK_STREAM only) ──────────────────────────────
     unix_pending_t* backlog_head;
@@ -139,6 +174,13 @@ typedef struct unix_sock {
     // Used by the compositor to SIGKILL an unresponsive client after the user
     // force-closes its window. 0 = no peer (unconnected / listener).
     uint32_t peer_pid;
+
+    // Reference count.  Starts at 1 (the owning vfs_file_t).  A peer that
+    // dereferences this socket across a blocking send/recv pins it with an
+    // extra ref (tryget under rcu_read_lock) so a concurrent close cannot
+    // free it mid-operation.  The struct (and its file, per the F14 lifetime
+    // invariant) is freed via call_rcu only when this hits 0.
+    uint32_t refcount;
 } unix_sock_t;
 
 // ── Kernel API ───────────────────────────────────────────────────────────

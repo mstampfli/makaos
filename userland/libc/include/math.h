@@ -49,6 +49,14 @@ double floor(double);
 double ceil(double);
 double round(double);
 double trunc(double);
+double rint(double);
+double nearbyint(double);
+long      lrint(double);
+long long llrint(double);
+float rintf(float);
+float nearbyintf(float);
+long      lrintf(float);
+long long llrintf(float);
 double fabs(double);
 double fmod(double, double);
 double sqrt(double);
@@ -71,8 +79,19 @@ double tanh(double);
 double hypot(double, double);
 double copysign(double, double);
 double ldexp(double, int);
+float  ldexpf(float, int);
+double exp2(double);
+float  exp2f(float);
+double fma(double, double, double);
+float  fmaf(float, float, float);
 double frexp(double, int*);
+float  frexpf(float, int*);
 double modf(double, double*);
+float  modff(float, float*);
+long      lround(double);
+long      lroundf(float);
+long long llround(double);
+long long llroundf(float);
 
 // long double variants — alias to double on MakaOS (no 80-bit x87).
 long double sqrtl(long double);
@@ -131,6 +150,56 @@ double fmin(double, double);
 double fmax(double, double);
 // (long double variants are declared once in the block above —
 // duplicates trip -Werror=redundant-decls consumers like pango.)
+
+// C99 <math.h> completeness: the doubles, floats and long-double variants the
+// host libstdc++ <cmath> expects (implemented in math_c99.c). Types double_t/
+// float_t per the C standard's FLT_EVAL_METHOD == 0.
+typedef double double_t;
+typedef float  float_t;
+
+double acosh(double);   double asinh(double);   double atanh(double);
+double fdim(double, double);
+double scalbn(double, int);   double scalbln(double, long);
+double logb(double);    int ilogb(double);
+double nextafter(double, double);   double nexttoward(double, long double);
+double remainder(double, double);   double remquo(double, double, int*);
+long lrint(double);     long long llrint(double);
+long lround(double);    long long llround(double);
+double nan(const char*);
+double erf(double);     double erfc(double);
+double lgamma(double);  double tgamma(double);
+double expm1(double);   double log1p(double);
+float expm1f(float);    float log1pf(float);
+long double expm1l(long double);  long double log1pl(long double);  long double exp2l(long double);
+
+float acoshf(float);    float asinhf(float);    float atanhf(float);
+float fdimf(float, float);
+float logbf(float);     int ilogbf(float);
+float scalbnf(float, int);   float scalblnf(float, long);
+float nextafterf(float, float);   float nexttowardf(float, long double);
+float remainderf(float, float);   float remquof(float, float, int*);
+long lrintf(float);     long long llrintf(float);
+long lroundf(float);    long long llroundf(float);
+float nanf(const char*);
+float erff(float);      float erfcf(float);
+float lgammaf(float);   float tgammaf(float);
+
+long double acoshl(long double);   long double asinhl(long double);   long double atanhl(long double);
+long double coshl(long double);    long double sinhl(long double);    long double tanhl(long double);
+long double cbrtl(long double);    long double hypotl(long double, long double);
+long double fmal(long double, long double, long double);
+long double fmaxl(long double, long double);   long double fminl(long double, long double);
+long double rintl(long double);    long double nearbyintl(long double);
+long double fdiml(long double, long double);
+long double erfl(long double);     long double erfcl(long double);
+long double lgammal(long double);  long double tgammal(long double);
+long double logbl(long double);    int ilogbl(long double);
+long double scalbnl(long double, int);   long double scalblnl(long double, long);
+long double nextafterl(long double, long double);   long double nexttowardl(long double, long double);
+long double remainderl(long double, long double);   long double remquol(long double, long double, int*);
+long lrintl(long double);   long long llrintl(long double);
+long lroundl(long double);  long long llroundl(long double);
+long double nanl(const char*);
 
 #ifdef __cplusplus
 }

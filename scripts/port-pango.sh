@@ -74,25 +74,103 @@ build() {
 # glyph lookup through FreeType's cmap (the proven-good path) by attaching
 # hb_ft funcs to the shaping font.  Idempotent (marker-gated).
 patch_pango() {
+    # ── Patch 1: FreeType-backed shaping, sized correctly (pangofc-font.c) ──
+    # Native HarfBuzz OT cmap returns glyph 0 (.notdef) for every codepoint in
+    # this port, so pango text rendered as tofu.  Route glyph lookup through
+    # FreeType's cmap.  CRITICAL: attach the FT funcs AFTER hb_font_set_scale /
+    # hb_font_set_ptem -- hb_ft_font_set_funcs sizes the backing FT_Face from
+    # the hb font's CURRENT scale, so attaching before the scale is set leaves
+    # the FT_Face at its default size and glyphs+advances come out microscopic
+    # and cramped.
     local f="$PANGO_SRC/pango/pangofc-font.c"
-    grep -q "shape via FreeType cmap" "$f" 2>/dev/null && { log "already patched"; return 0; }
-    python3 - "$f" <<'PY'
+    if grep -q "attach FreeType cmap funcs AFTER" "$f" 2>/dev/null; then
+        log "pangofc-font.c already patched"
+    else
+        python3 - "$f" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
 s = s.replace("#include <hb-ot.h>\n",
               "#include <hb-ot.h>\n#include <hb-ft.h>   /* MakaOS: shape via FreeType cmap, not HB native OT */\n", 1)
-needle = "  hb_font = hb_font_create (hb_face);\n"
-ins = ("  hb_font = hb_font_create (hb_face);\n"
-       "  /* MakaOS: HarfBuzz native OT cmap returns glyph 0 for every codepoint\n"
-       "   * in this port (all pango text rendered tofu); route glyph lookup\n"
-       "   * through FreeType's cmap, the path foot/fcft prove works. */\n"
+needle = "  hb_font_set_ptem (hb_font, point_size);\n"
+ins = ("  hb_font_set_ptem (hb_font, point_size);\n"
+       "  /* MakaOS: attach FreeType cmap funcs AFTER the scale/ptem are set so\n"
+       "   * hb_ft sizes the backing FT_Face to the correct pixel size (native HB\n"
+       "   * OT cmap returns glyph 0 = tofu; attaching before the scale leaves the\n"
+       "   * FT_Face at its default size -> tiny, cramped text). */\n"
        "  hb_ft_font_set_funcs (hb_font);\n")
-assert needle in s, "port-pango: hb_font_create anchor not found"
+assert needle in s, "port-pango: hb_font_set_ptem anchor not found"
 s = s.replace(needle, ins, 1)
 open(p, 'w').write(s)
 PY
-    log "patched pangofc-font.c → FreeType-backed shaping"
+        log "patched pangofc-font.c → FreeType-backed shaping (scale-first)"
+    fi
+
+    # ── Patch 3: default font resolution to 96 dpi (pangofc-fontmap.c) ─────
+    # The PangoCairoFc fontmap's get_resolution vfunc returns an unset (-1)
+    # resolution in this port, so point sizes (e.g. "DejaVu Sans Mono 11")
+    # convert to pixels via a negative/garbage dpi and render microscopic.
+    # Fall back to the standard 96 dpi when the vfunc reports unset.
+    local m="$PANGO_SRC/pango/pangofc-fontmap.c"
+    if grep -q "Fall back to the standard 96 dpi" "$m" 2>/dev/null; then
+        log "pangofc-fontmap.c already patched"
+    else
+        python3 - "$m" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = ("  if (PANGO_FC_FONT_MAP_GET_CLASS (fcfontmap)->get_resolution)\n"
+          "    return PANGO_FC_FONT_MAP_GET_CLASS (fcfontmap)->get_resolution (fcfontmap, context);\n")
+ins = ("  if (PANGO_FC_FONT_MAP_GET_CLASS (fcfontmap)->get_resolution)\n"
+       "    {\n"
+       "      double r = PANGO_FC_FONT_MAP_GET_CLASS (fcfontmap)->get_resolution (fcfontmap, context);\n"
+       "      /* MakaOS: the PangoCairoFc fontmap returns an unset (-1) resolution,\n"
+       "       * so point sizes scale by a negative/garbage dpi -> microscopic text.\n"
+       "       * Fall back to the standard 96 dpi when unset. */\n"
+       "      if (r <= 0.0)\n"
+       "        r = 96.0;\n"
+       "      return r;\n"
+       "    }\n")
+assert needle in s, "port-pango: get_resolution anchor not found"
+s = s.replace(needle, ins, 1)
+open(p, 'w').write(s)
+PY
+        log "patched pangofc-fontmap.c → default resolution 96 dpi"
+    fi
+
+    # ── Patch 2: initialize PangoLayoutRun offsets (taskbar height fix) ────
+    # insert_run() does g_slice_new (no zeroing) and only sets ->item/->glyphs;
+    # ->y_offset/->start_x_offset/->end_x_offset are otherwise set ONLY by
+    # apply_baseline_shift(), which runs only for baseline-shifted text.  For
+    # ordinary runs y_offset was read uninitialized (y_offset = run->y_offset),
+    # so the line logical-extent height accumulated a junk value -> swaybar's
+    # bar height blew up to ~10000px and the taskbar never mapped.  Latent
+    # upstream (relies on malloc returning zeroed memory); exposed by MakaOS's
+    # dirty free-list reuse.  Zero them at creation.
+    local g="$PANGO_SRC/pango/pango-layout.c"
+    if grep -q "MakaOS: zero PangoLayoutRun offsets" "$g" 2>/dev/null; then
+        log "pango-layout.c already patched"
+    else
+        python3 - "$g" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = "  PangoLayoutRun *run = g_slice_new (PangoLayoutRun);\n\n  run->item = run_item;\n"
+ins = ("  PangoLayoutRun *run = g_slice_new (PangoLayoutRun);\n\n"
+       "  run->item = run_item;\n"
+       "  /* MakaOS: zero PangoLayoutRun offsets - g_slice_new does not zero and\n"
+       "   * apply_baseline_shift() only sets these for baseline-shifted text, so\n"
+       "   * ordinary runs otherwise read y_offset uninitialized and corrupt the\n"
+       "   * line logical height (taskbar never mapped). */\n"
+       "  run->y_offset = 0;\n"
+       "  run->start_x_offset = 0;\n"
+       "  run->end_x_offset = 0;\n")
+assert needle in s, "port-pango: insert_run anchor not found"
+s = s.replace(needle, ins, 1)
+open(p, 'w').write(s)
+PY
+        log "patched pango-layout.c → zero PangoLayoutRun offsets (taskbar fix)"
+    fi
 }
 
 main() {

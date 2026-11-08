@@ -217,7 +217,19 @@ void wait_queue_wake_one(wait_queue_t* wq) {
         chain = next;
     }
 
-    if (fired) {
+    // Mirror wake_all's guard: only dispatch a LIVE entry (the skip loop above
+    // can leave `fired` on a DEAD entry if a corrupted chain broke it out on a
+    // non-canonical next), and reject a clobbered func pointer -- catch the UAF
+    // HERE with context instead of a cryptic downstream #UD.
+    if (fired && !atomic_load_acq(&fired->dead)) {
+        extern int task_wake_func(wake_entry_t* we);
+        extern int epoll_wake_func(wake_entry_t* we);
+        if (fired->func != task_wake_func && fired->func != epoll_wake_func) {
+            extern void kprintf(const char*, ...);
+            kprintf("\n=== WAKE UAF === wq=%p fired=%p func=%p dead=%x next=%p\n",
+                    wq, fired, fired->func, fired->dead, fired->next);
+            for (;;) __asm__ volatile("cli; hlt");
+        }
         int keep = fired->func(fired);
         if (keep == WQ_KEEP) wq_add(wq, fired);
     }

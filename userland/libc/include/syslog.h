@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYSLOG_H
 #define _MAKAOS_SYSLOG_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // POSIX syslog(3) client — stubbed.  MakaOS has no syslog daemon,
 // so openlog/closelog are no-ops and syslog forwards the formatted
 // string to stderr so port libraries (fcft, wlroots loggers, glib)
@@ -71,4 +74,7 @@ void syslog(int priority, const char* format, ...)
     __attribute__((format(printf, 2, 3)));
 void vsyslog(int priority, const char* format, va_list ap);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

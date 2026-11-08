@@ -367,32 +367,41 @@ static void hang(void) {
  *   [kernel_phys + KERNEL_WINDOW - PT_PAGES*PAGE_SIZE]
  *
  * Maps:
- *   VA [0, 1GiB)                 → PA [0, 1GiB)            (identity, 2MiB pages)
+ *   VA [0, phys_ceiling)         → PA [0, phys_ceiling)    (identity, 1GiB pages)
  *   VA [KERNEL_HH_BASE, ...]     → PA [kernel_phys, ...]   (2MiB pages, 16 entries)
  *   VA [HHDM_OFFSET, ...]        → PA [0, phys_ceiling)    (1GiB pages)
+ *
+ * The identity map must cover ALL of physical RAM, not just the first GiB: the
+ * bootloader allocates the kernel window near the TOP of RAM, so with >1GiB of
+ * RAM the kernel image, the page tables, and the code executing across the
+ * `mov cr3` transition all live above 1GiB.  A 1GiB identity map faulted there
+ * (the machine hung right after ExitBootServices with no kernel output).  Using
+ * 1GiB pages, one PDPT (512 entries) identity-maps up to 512 GiB.
  */
 static uint64_t setup_paging(uint64_t kernel_phys, uint64_t phys_ceiling) {
     uint64_t pt_base = kernel_phys + KERNEL_WINDOW - (uint64_t)PT_PAGES * PAGE_SIZE;
 
     uint64_t* pml4      = (uint64_t*)(pt_base + 0 * PAGE_SIZE);
     uint64_t* pdpt_id   = (uint64_t*)(pt_base + 1 * PAGE_SIZE);
-    uint64_t* pd_id     = (uint64_t*)(pt_base + 2 * PAGE_SIZE);
+    /* pt_base + 2*PAGE_SIZE was pd_id (the old 1GiB-only identity PD); the 1GiB
+     * -page identity map below needs no PD, so that page is now unused. */
     uint64_t* pdpt_hh   = (uint64_t*)(pt_base + 3 * PAGE_SIZE);
     uint64_t* pd_kern   = (uint64_t*)(pt_base + 4 * PAGE_SIZE);
     uint64_t* pdpt_hhdm = (uint64_t*)(pt_base + 5 * PAGE_SIZE);
 
     efi_memset(pml4,      0, PAGE_SIZE);
     efi_memset(pdpt_id,   0, PAGE_SIZE);
-    efi_memset(pd_id,     0, PAGE_SIZE);
     efi_memset(pdpt_hh,   0, PAGE_SIZE);
     efi_memset(pd_kern,   0, PAGE_SIZE);
     efi_memset(pdpt_hhdm, 0, PAGE_SIZE);
 
-    /* Identity map: PML4[0] → pdpt_id → pd_id (2MiB pages for first 1GiB) */
-    pml4[0]    = (uint64_t)pdpt_id | 0x3;
-    pdpt_id[0] = (uint64_t)pd_id   | 0x3;
-    for (uint64_t i = 0; i < 512; i++)
-        pd_id[i] = (i * 2 * 1024 * 1024) | 0x83; /* P | RW | PS */
+    uint64_t gib_count = (phys_ceiling + GIB - 1) / GIB;
+    if (gib_count > 512) gib_count = 512;  /* one PDPT of 1GiB pages == 512 GiB */
+
+    /* Identity map: PML4[0] → pdpt_id (1GiB pages covering all physical RAM) */
+    pml4[0] = (uint64_t)pdpt_id | 0x3;
+    for (uint64_t i = 0; i < gib_count; i++)
+        pdpt_id[i] = (i * GIB) | 0x83; /* P | RW | PS (1GiB) */
 
     /* Kernel high-half: PML4[511] → pdpt_hh → pd_kern (2MiB pages, 16 slots) */
     pml4[511]    = (uint64_t)pdpt_hh | 0x3;
@@ -402,8 +411,6 @@ static uint64_t setup_paging(uint64_t kernel_phys, uint64_t phys_ceiling) {
 
     /* HHDM: PML4[256] → pdpt_hhdm (1GiB pages covering physical RAM) */
     pml4[256] = (uint64_t)pdpt_hhdm | 0x3;
-    uint64_t gib_count = (phys_ceiling + GIB - 1) / GIB;
-    if (gib_count > 512) gib_count = 512;
     for (uint64_t i = 0; i < gib_count; i++)
         pdpt_hhdm[i] = (i * GIB) | 0x83; /* P | RW | PS (1GiB) */
 

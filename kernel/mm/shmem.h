@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "vmm.h"
+#include "smp.h"   // spinlock_t (common.h is too low in the tree to define it)
 
 // ── Shared Memory Objects ────────────────────────────────────────────────
 //
@@ -35,6 +36,15 @@
 #define SHMEM_NAME_MAX   63
 
 typedef struct shmem {
+    // Serialises the page array against concurrent access.  shmem_get_page
+    // (run lock-free from the #PF handler on every CPU -- peers mapping the
+    // same object hold DIFFERENT per-mm vma_locks, so that gives no mutual
+    // exclusion) and shmem_resize (ftruncate, which kfree's and reallocates
+    // `pages`) both touch pages/npages; without this a faulting CPU could
+    // dereference a `pages` array kfree'd by a concurrent grow (UAF), or two
+    // first-touches of one index could double-allocate.  Per-object so faults
+    // on different objects never contend.
+    spinlock_t   lock;
     phys_addr_t* pages;       // array of physical frame addresses (0 = not yet faulted)
     uint32_t     npages;      // current capacity (set by ftruncate / create)
     uint32_t     max_pages;   // allocated length of pages[] array
@@ -44,6 +54,12 @@ typedef struct shmem {
     uint32_t     uid;
     uint32_t     gid;
     uint16_t     mode;        // permission bits (e.g. 0600)
+
+    // 1 = DMA backing: every page was eager-allocated and pmm_pin'd at create
+    // (see shmem_create_dma), so teardown must pmm_unpin each page before
+    // dropping the object ref.  A device (GPU) can DMA into these pages via a
+    // scatter-gather list, so a reclaimer/swapper must never move or free them.
+    uint8_t      pinned;
 
     // Named object identity (empty string = anonymous).
     char         name[SHMEM_NAME_MAX + 1];
@@ -57,6 +73,24 @@ typedef struct shmem {
 // refcount starts at 1 (caller owns the initial reference).
 // Returns NULL on OOM.
 shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode);
+
+// Create a fully-resident, DMA-pinned anonymous shmem object: all `npages`
+// pages are allocated NOW (not demand-paged) as best-effort large buddy blocks
+// -- the largest free block up to SHMEM_DMA_MAX_ORDER, degrading to order-0
+// under fragmentation, so it NEVER requires one big physically-contiguous
+// block -- and every page is pmm_pin'd.  This is the backing for a device
+// (GPU) that DMAs into the pages via a scatter-gather list: pinned so no
+// reclaimer/swapper can move them, fully populated so the device sees every
+// page immediately, and clustered into few large runs so the sg list is short
+// and the pages can be huge-page-mapped.  refcount starts at 1.  Freed +
+// unpinned when the last ref drops.  Returns NULL on OOM (releasing any partial
+// allocation).  Enumerate the physical pages via shm->pages[] (all non-zero).
+shmem_t* shmem_create_dma(uint32_t npages);
+
+// Largest buddy order shmem_create_dma will request per block (2 MiB = order 9).
+// Big enough for a huge-page userspace mapping and a short sg list, small enough
+// that demanding it never triggers the high-order fragmentation cliff.
+#define SHMEM_DMA_MAX_ORDER  9u
 
 // Increment the reference count.
 void shmem_ref(shmem_t* shm);

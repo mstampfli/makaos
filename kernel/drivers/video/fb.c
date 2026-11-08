@@ -41,6 +41,19 @@ static inline void fb_flush(void) {
 }
 
 void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
+    // A null or degenerate GOP framebuffer means there is no linear framebuffer
+    // to draw into -- e.g. virtio-gpu-gl is the sole display device and exposes
+    // no VGA/GOP scanout, so UEFI hands us fb=0.  Leave g_fb zeroed: every fb
+    // primitive below then no-ops and the console falls back to serial, and a
+    // GPU driver may later fb_init() a real backing (virtio_gpu.c).  WITHOUT this
+    // guard base_virt = 0 + HHDM_OFFSET aliases physical 0, and fb_clear() zeroes
+    // ~w*h*4 bytes of low memory -- the kernel image and page tables -- which
+    // hangs the boot the instant the framebuffer is first touched.
+    if (fb_phys == 0 || w == 0 || h == 0 || pitch == 0) {
+        g_fb.base_virt = 0;
+        g_fb.width = 0; g_fb.height = 0; g_fb.pitch = 0; g_fb.bpp = 0;
+        return;
+    }
     g_fb.base_virt = fb_phys + HHDM_OFFSET;
     g_fb.width     = w;
     g_fb.height    = h;
@@ -54,6 +67,7 @@ void fb_init(uint64_t fb_phys, uint32_t w, uint32_t h, uint32_t pitch) {
 }
 
 void fb_clear(void) {
+    if (!g_fb.base_virt) return;   // no framebuffer: serial-only boot
     uint32_t rows = g_fb.height;
     uint32_t cols = g_fb.pitch / 4;
     uint32_t* row_ptr = (uint32_t*)g_fb.base_virt;
@@ -80,6 +94,7 @@ void fb_clear(void) {
 }
 
 void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
+    if (!g_fb.base_virt) return;   // no framebuffer: serial-only boot
     const unsigned char* glyph = g_font8x16[(unsigned char)c];
     uint8_t* base = (uint8_t*)g_fb.base_virt
                     + row * 16 * g_fb.pitch
@@ -102,6 +117,7 @@ void fb_putc_at(uint32_t col, uint32_t row, char c, uint32_t fg, uint32_t bg) {
 }
 
 void fb_term_scroll(void) {
+    if (!g_fb.base_virt) return;   // no framebuffer: serial-only boot
     uint32_t rows = fb_rows();
     // Copy rows 1..rows-1 up to rows 0..rows-2.  dst < src so a forward
     // memcpy is safe; no memmove needed.  GCC lowers this to `rep movsb`

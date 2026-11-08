@@ -33,10 +33,11 @@ typedef struct drm_backend_ops {
 
     int (*resource_destroy)(uint32_t id);
 
-    // Attach one contiguous physical range as backing pages.  The
-    // DRM core always uses single-entry SG because our dumb buffers
-    // come from pmm_buddy_alloc.  More complex SG lists would add
-    // a nr_entries parameter here.
+    // Attach one contiguous physical range as backing pages.  Simple/test
+    // backends (drm_mock_backend) use this.  The real virtio-gpu path backs
+    // resources with SCATTER-GATHER shmem_create_dma objects and attaches them
+    // via drm_backing_attach() -> virtio_gpu_resource_attach_backing_sg (an
+    // nr_entries mem_entry list), NOT this single-range slot.
     int (*resource_attach_backing)(uint32_t id,
                                      phys_addr_t phys, uint32_t bytes);
 

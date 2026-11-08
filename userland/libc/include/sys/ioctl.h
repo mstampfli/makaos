@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYS_IOCTL_H
 #define _MAKAOS_SYS_IOCTL_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Linux _IOC / _IOR / _IOW / _IOWR live in <asm/ioctl.h> — expose
 // them via sys/ioctl.h too so libinput / libevdev / any Linux-ABI
@@ -24,4 +27,7 @@ struct winsize {
 
 int ioctl(int fd, unsigned long req, ...);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

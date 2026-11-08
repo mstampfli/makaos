@@ -17,6 +17,7 @@
 #define ELFOSABI_LINUX  3        // Linux
 
 #define PT_LOAD     1            // loadable segment
+#define PT_DYNAMIC  2            // dynamic linking info (PIE self-relocation)
 
 #define PF_X        (1U << 0)   // segment is executable
 #define PF_W        (1U << 1)   // segment is writable
@@ -51,6 +52,31 @@ typedef struct __attribute__((packed)) {
     uint64_t p_memsz;       // size in memory (>= p_filesz; extra is zero)
     uint64_t p_align;       // alignment
 } Elf64_Phdr;
+
+// ── ELF64 dynamic section + relocations (PIE self-relocation) ─────────────
+// A PIE (ET_DYN) is linked at base 0; the loader maps it at load_bias and must
+// fix up R_X86_64_RELATIVE entries (*(base+off) = base + addend).  A statically
+// linked PIE has ONLY RELATIVE relocs (it resolves its own symbols); imported
+// symbols are the dynamic loader's job, not this path.
+#define DT_NULL     0
+#define DT_RELA     7            // address of the Rela relocation table
+#define DT_RELASZ   8            // total size of the Rela table (bytes)
+#define DT_RELAENT  9            // size of one Rela entry (24)
+#define DT_RELACOUNT 0x6ffffff9  // count of leading R_X86_64_RELATIVE entries
+
+#define R_X86_64_RELATIVE   8    // B + A  (base-relative, no symbol)
+#define ELF64_R_TYPE(i)     ((uint32_t)((i) & 0xffffffffULL))
+
+typedef struct __attribute__((packed)) {
+    int64_t  d_tag;
+    uint64_t d_un;              // d_val or d_ptr
+} Elf64_Dyn;
+
+typedef struct __attribute__((packed)) {
+    uint64_t r_offset;         // location to relocate (vaddr, base-relative)
+    uint64_t r_info;           // symbol index + type
+    int64_t  r_addend;         // constant addend
+} Elf64_Rela;
 
 // ── Auxiliary vector types (SysV AMD64 ABI, §3.4.4) ─────────────────────
 #define AT_NULL    0   // end of vector

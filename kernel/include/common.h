@@ -156,6 +156,20 @@ static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
 #define PAGE_SHIFT 12  // 12 for 4KB, 21 for 2MB, 30 for 1GB
 #define PAGE_SIZE  (1ULL << PAGE_SHIFT)
 #define PAGE_MASK  (PAGE_SIZE - 1)
+
+// Upper bound on the number of CPUs the kernel is compiled to support.  Per-CPU
+// arrays (g_cpus[], the per-CPU GDT/TSS slots) are sized to this; raising it
+// only costs BSS.  Lives here, in the universal leaf header, so cpu.h and
+// tss.h can size their tables without pulling in smp.h -- which, now that
+// spin_lock disables preemption, includes preempt.h -> cpu.h and would form a
+// cycle back through tss.h.
+#define MAX_CPUS 64
+
+// Round a byte address up / down to the nearest PAGE_SIZE boundary.  64-bit,
+// pow2 PAGE_SIZE.  One source of truth for the mm allocators (pmm + kheap each
+// hand-rolled an identical copy).
+static inline uint64_t page_align_up(uint64_t addr)   { return (addr + PAGE_MASK) & ~PAGE_MASK; }
+static inline uint64_t page_align_down(uint64_t addr) { return addr & ~PAGE_MASK; }
 #define VGA_ADDR 0xB8000ULL 
 #define UINT64_MAX ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 #define UINT32_MAX 0xFFFFFFFFU
@@ -168,6 +182,17 @@ static inline void serial_hex_dbg(uint64_t v)      { (void)v; }
 #define GIB_SIZE    (1ULL << 30)
 #define PS_BIT      (1ULL << 7) // Page Size bit
 #define KERNEL_BASE_VIRT 0xFFFFFFFF80000000ULL
+
+// x86-64 user address space is [0, 2^47) under 4-level paging.  Everything at
+// or above 2^47 is either kernel or the non-canonical gap up to HHDM_OFFSET,
+// which must be rejected: a non-canonical pointer #GPs the instant the CPU
+// ring-transitions to it via iretq (the Ctrl+C makaterm crash).  Two spellings
+// of the ONE boundary -- use whichever reads naturally with the comparison:
+//   USER_ADDR_MAX  = last valid user byte     (inclusive; pair with >  or <=)
+//   USER_ADDR_CEIL = first non-canonical addr (exclusive; pair with >= or < )
+// Invariant: USER_ADDR_CEIL == USER_ADDR_MAX + 1 == 2^47.
+#define USER_ADDR_MAX  0x00007FFFFFFFFFFFULL
+#define USER_ADDR_CEIL 0x0000800000000000ULL
 
 #define NULL ((void*)0)
 

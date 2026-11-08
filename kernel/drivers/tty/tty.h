@@ -27,7 +27,12 @@
 // Future: serial ttys, ptys — all use the same struct and ops.
 
 // ── Buffer sizes ──────────────────────────────────────────────────────────
-#define TTY_READ_BUF_SIZE  4096   // power of 2; cooked output to readers
+// READ must be strictly larger than LINE so a full cooked line (up to
+// TTY_LINE_BUF_SIZE-1 bytes incl. its '\n') always fits in the ring with room
+// to spare even when a reader is behind -- otherwise ldisc_flush_line's
+// per-byte push could drop the line's tail (incl. the terminating '\n') and
+// corrupt canonical line framing.  Keep both powers of 2 (rb_* mask with -1).
+#define TTY_READ_BUF_SIZE  8192   // power of 2; cooked output to readers (> LINE)
 #define TTY_LINE_BUF_SIZE  4096   // canonical line accumulation buffer
 
 // ── tty_t ─────────────────────────────────────────────────────────────────
@@ -41,6 +46,35 @@ typedef struct tty_t {
 
     // ── Session this tty is the controlling terminal of ──────────────────
     uint32_t session;
+
+    // ── Session ownership of the terminal device ─────────────────────────
+    // owner_uid is the uid currently entitled to read/write this terminal --
+    // the classic Unix "login chowns the tty to whoever is logged in".  The
+    // /dev node's permission check resolves its uid from here instead of from
+    // a fixed table entry, so a terminal belongs to the user whose session is
+    // on it and to nobody else.  0 (root) when no user session is active.
+    //
+    // gen is bumped every time ownership changes.  Every open fd remembers the
+    // gen it was opened at, and any read/write/poll on a stale fd fails -EIO --
+    // this is vhangup(2): revoking the DEVICE alone is not enough, because a
+    // process that opened the terminal during the previous session would
+    // otherwise keep a live fd and could go on reading the next user's
+    // keystrokes (their password at the login prompt).
+    uint32_t owner_uid;
+    uint32_t gen;
+
+    // ── Line-discipline lock ─────────────────────────────────────────────
+    // Serializes every mutation of the read ring (read_buf/rd_head/rd_tail)
+    // and the canonical accumulation (line_buf/line_len).  These are touched
+    // from multiple PROCESS-context CPUs: the producer (console keyboard
+    // thread, or pty_master_write in a syscall), one or more consumers
+    // (tty/pty-slave readers -- slave fds are dup-shared, so multi-consumer
+    // is real), and tty_flush_input (ioctl TCFLSH + the ^C/^Z/^\ path).  No
+    // IRQ handler touches these, so a plain spinlock under preempt_disable is
+    // sufficient -- NO irqsave (mirrors the fb.c console-lock pattern).  Leaf
+    // lock: only the tty's own ring/line fields are touched under it; echo
+    // (fb I/O), wait_queue_wake_all, and blocking sleeps stay OUTSIDE it.
+    spinlock_t lock;
 
     // ── Read buffer: data ready for userland read() ───────────────────────
     // Ring buffer: [rd_head, rd_tail)
@@ -106,6 +140,29 @@ void tty_input_char(tty_t* tty, char c);
 // Each open() returns a fresh vfs_file_t pointing to the same tty_t.
 struct vfs_file_t* tty_open(int idx);  // idx 0 = tty0
 
+// Open the CALLING process's controlling terminal (/dev/tty).  Returns NULL
+// when the caller has no controlling terminal -- POSIX says /dev/tty is the
+// ctty indirection, never a fixed alias for the console.
+struct vfs_file_t* tty_open_ctty(void);
+
+// Current owner uid of `tty` (see tty_t::owner_uid).  NULL-safe.
+uint32_t tty_get_owner(tty_t* tty);
+
+// Hand the terminal to `uid` (0 = back to root) and REVOKE every fd that was
+// opened under the previous owner (bumps tty_t::gen).  Root-only at the
+// syscall boundary.
+void tty_set_owner(tty_t* tty, uint32_t uid);
+
+// Re-stamp `f`'s generation to the tty's current one.  Used by the fd that
+// performed the ownership change so it does not revoke itself.
+void tty_fd_resync(struct vfs_file_t* f);
+
+// 1 iff `f` is an open handle on `tty`.
+int tty_file_is(struct vfs_file_t* f, tty_t* tty);
+
+// The physical console tty (/dev/tty0).
+tty_t* tty_console(void);
+
 // Get the tty that is the controlling terminal of the calling process.
 // Returns NULL if the process has no controlling terminal.
 tty_t* tty_get_ctty(void);
@@ -115,3 +172,27 @@ void tty_set_ctty(tty_t* tty);
 
 // Flush the read buffer and line buffer (e.g. on TCSETSF).
 void tty_flush_input(tty_t* tty);
+
+// Drain up to `len` cooked bytes from the tty's read ring into `out`,
+// honouring canonical ('\n'-terminated) and raw VMIN semantics.  Takes the
+// per-tty lock internally; the caller must have already done the blocking
+// wait and must NOT hold tty->lock.  Returns the number of bytes copied.
+// Shared by /dev/tty and pty-slave reads so both go through one locked path.
+uint64_t tty_ldisc_drain(tty_t* tty, uint8_t* out, uint64_t len);
+
+// Publish a whole termios (tty_set_termios) / snapshot it (tty_get_termios)
+// under tty->lock, so a lock-free reader never observes a TCSET* multi-word
+// copy mid-update.  copy_from_user MUST land in a stack local FIRST (outside
+// the lock).  See the definitions in tty.c for the full rationale.
+void tty_set_termios(tty_t* tty, const termios_t* src);
+void tty_get_termios(tty_t* tty, termios_t* dst);
+// Authorized set-foreground-pgrp (SSOT for TIOCSPGRP/tcsetpgrp, pty + console).
+// Returns 0, or -EPERM if the caller does not own the tty's session or the pgid
+// is not a process group in that session.
+int  tty_set_fg_pgrp(tty_t* tty, uint32_t pg);
+
+// POSIX job control: is the calling process in a BACKGROUND process group of
+// `tty` (its controlling terminal)?  True iff the tty has a foreground pgrp,
+// the caller owns this tty's session, and the caller's pgrp is not that
+// foreground one.  The single predicate behind the SIGTTIN / SIGTTOU checks.
+int  tty_is_background(const tty_t* tty);

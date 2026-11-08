@@ -88,8 +88,9 @@ static inline uint8_t from_user(interrupt_frame_t* f) {
 
 static void user_signal_or_halt_noec(interrupt_frame_t* f, int sig, const char* msg) {
     if (from_user(f)) {
-        signal_send(g_current, sig);
-        signal_deliver_pending(0);
+        // Synchronous fault from user mode: deliver to a catchable handler (JVM
+        // SIGFPE/SIGILL/SIGSEGV) by redirecting the trap frame, else terminate.
+        signal_deliver_fault(sig, f);
         return;
     }
     isr_general_exception_no_ec(msg, f);
@@ -100,8 +101,7 @@ static void user_signal_or_halt_ec(interrupt_frame_t* f, uint64_t ec, int sig, c
         serial_puts_idt(msg); serial_putc_idt(' ');
         serial_puts_idt("ec="); serial_hex_idt(ec);
         serial_puts_idt("ip="); serial_hex_idt(f->ip);
-        signal_send(g_current, sig);
-        signal_deliver_pending(0);
+        signal_deliver_fault(sig, f);
         return;
     }
     isr_general_exception_ec(msg, f, ec);
@@ -119,8 +119,20 @@ void isr6_invalid_opcode(interrupt_frame_t* f)
     { user_signal_or_halt_noec(f, SIGILL,  "#UD Invalid Opcode"); }
 void isr7_device_na(interrupt_frame_t* f)
     { user_signal_or_halt_noec(f, SIGILL,  "#NM Device Not Available"); }
-void isr8_double_fault(interrupt_frame_t* f, uint64_t ec)
-    { isr_general_exception_ec("#DF Double Fault", f, ec); } // always kernel halt
+void isr8_double_fault(interrupt_frame_t* f, uint64_t ec) {
+    // Minimal raw-serial pre-dump on the guaranteed-good IST1 stack, emitted
+    // BEFORE the rich dump (fb_panic / stack-walk in panic_from_exception),
+    // either of which can itself re-fault on a corrupted stack/framebuffer and
+    // escalate to a triple fault that resets the CPU with no serial trace.
+    // This guarantees the faulting RIP/CR2 reach serial even in that case.
+    uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    serial_puts_idt("\n### #DF EARLY ip="); serial_hex_idt(f->ip);
+    serial_puts_idt("cr2=");  serial_hex_idt(cr2);
+    serial_puts_idt("sp=");   serial_hex_idt(f->sp);
+    serial_puts_idt("cs=");   serial_hex_idt(f->cs);
+    serial_puts_idt("ec=");   serial_hex_idt(ec);
+    isr_general_exception_ec("#DF Double Fault", f, ec);
+} // always kernel halt
 void isr9_coprocessor_overrun(interrupt_frame_t* f)
     { user_signal_or_halt_noec(f, SIGILL,  "Coprocessor Segment Overrun"); }
 void isr10_invalid_tss(interrupt_frame_t* f, uint64_t ec)
@@ -167,8 +179,7 @@ void isr13_gp(interrupt_frame_t* f, uint64_t ec) {
     serial_puts_idt("=== END #GP ===\n");
 
     if (from_user(f)) {
-        signal_send(g_current, SIGSEGV);
-        signal_deliver_pending(0);
+        signal_deliver_fault(SIGSEGV, f);
         return;
     }
     // Kernel GP — halt

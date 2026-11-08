@@ -95,34 +95,132 @@ if marker in s and 'MAKAOS_DRM_FIXED_DEVNAME' not in s:
     with open(p, 'w') as f: f.write(s)
     print('patched drmGetDeviceNameFromFd2')
 "
-    # Patch drmGetNodeTypeFromFd — on Linux it stats the fd and checks
-    # the character major/minor against the DRM device allocation
-    # (226:0..127).  Our fstat surface doesn't reproduce those numbers,
-    # so force DRM_NODE_PRIMARY (0) for any valid DRM fd.  wlroots'
-    # dumb-buffer allocator explicitly rejects non-primary nodes.
+    # Patch drmGetNodeTypeFromFd -- Linux stats the fd and derives the node
+    # type from the DRM minor (0-63 primary, 64-127 control, 128+ render).
+    # MakaOS DOES expose the minor via st_rdev (rdev=(226<<8)|minor), so derive
+    # it the real way: renderD128 (minor 128) MUST report DRM_NODE_RENDER, or
+    # Mesa's loader_is_device_render_capable rejects it and GL init falls back
+    # to (unavailable) software.  card0 (minor 0) stays DRM_NODE_PRIMARY.
     python3 -c "
 p='$DRM_SRC/xf86drm.c'
 with open(p) as f: s = f.read()
 marker = 'drm_public int drmGetNodeTypeFromFd(int fd)\n{'
-if marker in s and 'MAKAOS_FIXED_NODE_TYPE' not in s:
-    replacement = marker + '\n    /* MAKAOS_FIXED_NODE_TYPE: single card, always primary. */\n    (void)fd;\n    return 0; /* DRM_NODE_PRIMARY */'
+if marker in s and 'MAKAOS_NODE_TYPE_FROM_MINOR' not in s:
+    body = ('\n    /* MAKAOS_NODE_TYPE_FROM_MINOR: derive from the DRM minor. */\n'
+            '    {\n'
+            '        struct stat _sb;\n'
+            '        if (fstat(fd, &_sb) == 0) {\n'
+            '            unsigned _mn = minor(_sb.st_rdev);\n'
+            '            if (_mn >= 128) return DRM_NODE_RENDER;\n'
+            '            if (_mn >= 64)  return DRM_NODE_CONTROL;\n'
+            '            return DRM_NODE_PRIMARY;\n'
+            '        }\n'
+            '        return DRM_NODE_PRIMARY;\n'
+            '    }')
+    replacement = marker + body
     s = s.replace(marker, replacement, 1)
     with open(p, 'w') as f: f.write(s)
-    print('patched drmGetNodeTypeFromFd')
+    print('patched drmGetNodeTypeFromFd (from minor)')
 "
-    # Patch drmGetRenderDeviceNameFromFd — same sysfs walk; we don't
-    # have a render node, so return NULL and let callers fall back to
-    # drmGetDeviceNameFromFd2.
+    # Patch drmGetRenderDeviceNameFromFd — same sysfs walk we can't do.
+    # We DO have a render node now (Phase 2: /dev/dri/renderD128), and it is
+    # the node Mesa's virgl winsys opens for GL.  Single-GPU system, so return
+    # it unconditionally (mirrors drmGetDeviceNameFromFd2 -> card0 above).
     python3 -c "
 p='$DRM_SRC/xf86drm.c'
 with open(p) as f: s = f.read()
 marker = 'drm_public char *drmGetRenderDeviceNameFromFd(int fd)\n{'
-if marker in s and 'MAKAOS_NO_RENDER_NODE' not in s:
-    replacement = marker + '\n    /* MAKAOS_NO_RENDER_NODE: no separate render node. */\n    (void)fd;\n    return (char*)0;'
+if marker in s and 'MAKAOS_RENDER_NODE' not in s:
+    replacement = marker + '\n    /* MAKAOS_RENDER_NODE: single-GPU system; no sysfs. */\n    (void)fd;\n    return strdup(\"/dev/dri/renderD128\");'
     s = s.replace(marker, replacement, 1)
     with open(p, 'w') as f: f.write(s)
-    print('patched drmGetRenderDeviceNameFromFd')
+    print('patched drmGetRenderDeviceNameFromFd -> renderD128')
 "
+    # Synthesise the DRM device list.  drmGetDevice2/drmGetDevices2/
+    # drmGetDeviceFromDevId walk /sys/dev/char to enumerate DRM devices; MakaOS
+    # has no sysfs, so they would return nothing and Mesa's _eglFindDevice /
+    # render-node discovery (and therefore eglInitialize on the GBM platform)
+    # would fail.  Emit a single synthetic virtio-gpu device (card0 primary +
+    # renderD128 render node, virtio PCI identity 1af4:1050) allocated via
+    # drmDeviceAlloc so drmFreeDevice frees it correctly.  Early-return from
+    # each entry point; the original sysfs body stays as dead code.
+    DRM_SRC="$DRM_SRC" python3 - <<'PYEOF'
+import os
+p = os.path.join(os.environ['DRM_SRC'], 'xf86drm.c')
+with open(p) as f: s = f.read()
+if 'MAKAOS_SYNTH_DEVICE' in s:
+    raise SystemExit(0)
+
+synth = r'''/* MAKAOS_SYNTH_DEVICE: MakaOS has no sysfs, so drmGetDevice2/drmGetDevices2
+ * cannot enumerate via /sys/dev/char.  Synthesise the single virtio-gpu device
+ * (card0 primary + renderD128 render node, virtio PCI identity) so Mesa's
+ * EGLDevice / render-node discovery works.  Allocated through drmDeviceAlloc so
+ * drmFreeDevice frees it correctly. */
+static drmDevicePtr makaos_synth_virtio_device(void)
+{
+    char *addr;
+    drmDevicePtr dev = drmDeviceAlloc(DRM_NODE_RENDER, "/dev/dri/renderD128",
+                                      sizeof(drmPciBusInfo),
+                                      sizeof(drmPciDeviceInfo), &addr);
+    if (!dev)
+        return NULL;
+    dev->available_nodes = (1 << DRM_NODE_PRIMARY) | (1 << DRM_NODE_RENDER);
+    strcpy(dev->nodes[DRM_NODE_PRIMARY], "/dev/dri/card0");
+    strcpy(dev->nodes[DRM_NODE_RENDER], "/dev/dri/renderD128");
+    dev->bustype = DRM_BUS_PCI;
+    dev->businfo.pci = (drmPciBusInfoPtr)addr;
+    dev->businfo.pci->domain = 0;
+    dev->businfo.pci->bus    = 0;
+    dev->businfo.pci->dev    = 4;
+    dev->businfo.pci->func   = 0;
+    addr += sizeof(drmPciBusInfo);
+    dev->deviceinfo.pci = (drmPciDeviceInfoPtr)addr;
+    dev->deviceinfo.pci->vendor_id    = 0x1af4;   /* Red Hat / virtio */
+    dev->deviceinfo.pci->device_id    = 0x1050;   /* virtio-gpu */
+    dev->deviceinfo.pci->subvendor_id = 0x1af4;
+    dev->deviceinfo.pci->subdevice_id = 0x1100;
+    dev->deviceinfo.pci->revision_id  = 0;
+    return dev;
+}
+
+'''
+
+m_fromdevid = 'drm_public int drmGetDeviceFromDevId(dev_t find_rdev, uint32_t flags, drmDevicePtr *device)\n{'
+b_fromdevid = ('\n    /* MAKAOS: no sysfs; single synthesised device. */\n'
+               '    (void)find_rdev; (void)flags;\n'
+               '    *device = makaos_synth_virtio_device();\n'
+               '    return *device ? 0 : -ENOMEM;\n')
+
+m_dev2 = 'drm_public int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)\n{'
+b_dev2 = ('\n    /* MAKAOS: no sysfs; single synthesised device. */\n'
+          '    (void)fd; (void)flags;\n'
+          '    *device = makaos_synth_virtio_device();\n'
+          '    return *device ? 0 : -ENOMEM;\n')
+
+m_devs2 = ('drm_public int drmGetDevices2(uint32_t flags, drmDevicePtr devices[],\n'
+           '                              int max_devices)\n{')
+b_devs2 = ('\n    /* MAKAOS: no sysfs; report the single synthesised device. */\n'
+           '    (void)flags;\n'
+           '    if (devices == NULL)\n'
+           '        return 1;\n'
+           '    if (max_devices < 1)\n'
+           '        return 0;\n'
+           '    devices[0] = makaos_synth_virtio_device();\n'
+           '    return devices[0] ? 1 : -ENOMEM;\n')
+
+for m in (m_fromdevid, m_dev2, m_devs2):
+    if m not in s:
+        raise SystemExit('port-libdrm: device-synth marker not found: ' + m.split('(')[0])
+
+# Insert the helper just before the first user (drmGetDeviceFromDevId) and the
+# early-return into each of the three entry points.
+s = s.replace(m_fromdevid, synth + m_fromdevid + b_fromdevid, 1)
+s = s.replace(m_dev2,  m_dev2  + b_dev2,  1)
+s = s.replace(m_devs2, m_devs2 + b_devs2, 1)
+
+with open(p, 'w') as f: f.write(s)
+print('patched drmGetDevice2/drmGetDevices2/drmGetDeviceFromDevId (synth device)')
+PYEOF
 }
 
 build_lib() {
@@ -137,20 +235,26 @@ build_lib() {
     # drmFormatModifierInfo / drmFormatModifierVendorInfo struct defs
     # that xf86drm.c declares just above the #include site.
     cat > "$DRM_SRC/generated_static_table_fourcc.h" <<'TABLESTUB'
-/* Empty format-modifier lookup tables.  xf86drm.c declares the
- * struct types itself (drmFormatModifierInfo, drmFormatModifierVendorInfo)
- * right before this file is #included.  We provide zero-length tables
- * that drmGetFormatModifierName / drmGetFormatModifierVendor will
- * walk and always miss on, returning NULL — clients fall back to
- * returning "Unknown" or similar.  Populate with real entries later
- * if a port actually needs human-readable modifier names.
+/* Minimal format-modifier name tables.  xf86drm.c declares the struct types
+ * itself (drmFormatModifierInfo, drmFormatModifierVendorInfo) right before this
+ * file is #included.  These back drmGetFormatModifierName /
+ * drmGetFormatModifierVendor, used ONLY for human-readable logging (e.g.
+ * wlroots dumps the EGL dmabuf modifier list at DEBUG).
+ *
+ * A MATCHED entry is strdup'd, so a NULL name is a landmine: the old
+ * `{ 0, 0 }` stub matched DRM_FORMAT_MOD_LINEAR (modifier 0) AND vendor NONE
+ * (0), and strdup(NULL) SIGSEGV'd inside strlen the first time wlroots logged
+ * the LINEAR modifier.  Give the two well-known NONE-vendor modifiers real
+ * names; any other modifier/vendor misses the tables and the lookup returns
+ * NULL, which callers already render as "<unknown>".
  */
 static const struct drmFormatModifierInfo drm_format_modifier_table[] = {
-    { 0, 0 }
+    { DRM_FORMAT_MOD_LINEAR,  "LINEAR"  },
+    { DRM_FORMAT_MOD_INVALID, "INVALID" },
 };
 
 static const struct drmFormatModifierVendorInfo drm_format_modifier_vendor_table[] = {
-    { 0, 0 }
+    { DRM_FORMAT_MOD_VENDOR_NONE, "NONE" },
 };
 TABLESTUB
 

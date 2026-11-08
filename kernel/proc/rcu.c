@@ -3,6 +3,9 @@
 #include "sched.h"
 #include "common.h"
 #include "ipi.h"
+#include "kheap.h"    // kmalloc/kfree for the under-spinlock deferral (see call_rcu_expedited)
+#include "kprintf.h"
+#include "panic.h"    // loud panic instead of a silent cli;hlt on the preempt-disabled rail
 
 // ── RCU — QSBR implementation ────────────────────────────────────────────
 //
@@ -41,10 +44,9 @@ void synchronize_rcu(void) {
     // Safety rail: calling this with preempt disabled would self-deadlock.
     // The caller's own CPU could never reach a quiescent state because
     // its preempt_depth is stuck > 0.
-    if (this_cpu()->preempt_depth > 0) {
-        serial_puts_dbg("[rcu] PANIC: synchronize_rcu with preempt disabled\n");
-        for (;;) __asm__ volatile("cli; hlt");
-    }
+    if (this_cpu()->preempt_depth > 0)
+        panic("synchronize_rcu with preempt disabled (depth=%d): a spinlock "
+              "section cannot busy-wait a grace period", this_cpu()->preempt_depth);
 
     unsigned n = num_cpus();
     uint64_t snap[MAX_CPUS];
@@ -137,10 +139,15 @@ static void rcu_expedited_cb(void* arg) {
 }
 
 void synchronize_rcu_expedited(void) {
-    if (this_cpu()->preempt_depth > 0) {
-        serial_puts_dbg("[rcu] PANIC: synchronize_rcu_expedited with preempt disabled\n");
-        for (;;) __asm__ volatile("cli; hlt");
-    }
+    // A loud panic, NOT a silent halt: this used to serial_puts_dbg + cli;hlt,
+    // which compiles to a bare hang at KERNEL_DEBUG_SERIAL=0 -- a spinlock caller
+    // (via call_rcu_expedited) once wedged the machine invisibly this way.
+    // call_rcu_expedited now defers instead of reaching here under a lock, but a
+    // direct caller that violates the rule must fail loudly, not silently.
+    if (this_cpu()->preempt_depth > 0)
+        panic("synchronize_rcu_expedited with preempt disabled (depth=%d): "
+              "call it after dropping the spinlock, or use call_rcu_expedited",
+              this_cpu()->preempt_depth);
 
     unsigned n = num_cpus();
     uint64_t snap[MAX_CPUS];
@@ -200,10 +207,14 @@ void synchronize_rcu_expedited(void) {
 //     rcu_head_t must remain valid.  Embedding the head in the object
 //     being freed satisfies this trivially.
 
-void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
+// Lock-free push of `head` onto a SPECIFIC cpu's pending list.  The CAS
+// loop makes a cross-CPU push as safe as a local one, so rcu_barrier() can
+// place a barrier on every CPU's list (not just the local one).  One shared
+// mechanism; call_rcu_head is just this with c = this_cpu().
+static void rcu_push_on_cpu(cpu_t* c, rcu_head_t* head,
+                            rcu_func_t func, void* data) {
     head->func = func;
     head->data = data;
-    cpu_t* c = this_cpu();
     rcu_head_t* old = (rcu_head_t*)__atomic_load_n(&c->rcu_pending_head,
                                                     __ATOMIC_RELAXED);
     do {
@@ -214,6 +225,10 @@ void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
                  0,
                  __ATOMIC_RELEASE,
                  __ATOMIC_RELAXED));
+}
+
+void call_rcu_head(rcu_head_t* head, rcu_func_t func, void* data) {
+    rcu_push_on_cpu(this_cpu(), head, func, data);
 }
 
 // Layout compatibility check: pmm.h declares a bit-identical
@@ -234,11 +249,39 @@ _Static_assert(__builtin_offsetof(pmm_rcu_head_t, data) ==
                __builtin_offsetof(rcu_head_t,     data),
                "rcu_head data offset mismatch");
 
+// Async fallback node for call_rcu_expedited when it cannot synchronize.
+typedef struct { rcu_head_t head; rcu_func_t func; void* data; } rcu_defer_t;
+static void rcu_defer_cb(void* p) {
+    rcu_defer_t* d = (rcu_defer_t*)p;
+    d->func(d->data);
+    kfree(d);
+}
+
 void call_rcu_expedited(rcu_func_t func, void* data) {
-    // Expedited is still synchronous by design — IPI-forced grace
-    // period, intended for latency-sensitive user-syscall-return
-    // paths that want the callback before they unblock.  Not used
-    // by the pmm slab path.
+    // This is a deferred FREE: the caller does not consume a result, it just
+    // wants `data` reclaimed after a grace period.  If preemption is disabled
+    // we are inside a spinlock (post spinlock-fold), and synchronize_rcu_
+    // expedited() would panic -- busy-waiting a grace period with preemption off
+    // both trips that guard and risks a reader-holds-our-lock deadlock.  So fall
+    // back to the async per-CPU callback list (drained by the GP kthread):
+    // identical reclaim semantics, only the "expedited" latency is lost.  This
+    // is exactly the case that hit fd_table_grow (under files->lock) once
+    // spinlocks became non-preemptible.  kmalloc never sleeps here (returns NULL
+    // on OOM), so it is safe under the lock.
+    if (this_cpu()->preempt_depth > 0) {
+        rcu_defer_t* d = (rcu_defer_t*)kmalloc(sizeof(*d));
+        if (d) {
+            d->func = func;
+            d->data = data;
+            call_rcu_head(&d->head, rcu_defer_cb, d);
+            return;
+        }
+        // OOM under a spinlock: we cannot synchronize (would panic) and cannot
+        // queue.  Leak this one small reclaim rather than crash -- survivable,
+        // and loud so it is not silent.
+        kprintf("[rcu] WARN: call_rcu_expedited OOM under lock; leaking one node\n");
+        return;
+    }
     synchronize_rcu_expedited();
     func(data);
 }
@@ -274,11 +317,23 @@ static void rcu_gp_kthread_entry(void) {
                 NULL,
                 __ATOMIC_ACQUIRE);
             if (!cpu_chain) continue;
-            // Append cpu_chain to collected — find tail, link.
-            rcu_head_t* tail = cpu_chain;
+            // The per-CPU list is a LIFO push-stack (call_rcu_head prepends).
+            // Reverse it to FIFO order (oldest first) so callbacks fire in
+            // the order they were queued ON THAT CPU.  rcu_barrier() relies
+            // on this: its per-CPU barrier, pushed last, must be invoked
+            // LAST for that CPU — after every callback queued before it.
+            rcu_head_t* fifo = NULL;
+            while (cpu_chain) {
+                rcu_head_t* nx = cpu_chain->next;
+                cpu_chain->next = fifo;
+                fifo = cpu_chain;
+                cpu_chain = nx;
+            }
+            // Append this CPU's FIFO chain to collected (find tail, link).
+            rcu_head_t* tail = fifo;
             while (tail->next) tail = tail->next;
             tail->next = collected;
-            collected  = cpu_chain;
+            collected  = fifo;
         }
 
         if (collected) {
@@ -346,27 +401,22 @@ void rcu_barrier(void) {
     rcu_barrier_t    barriers[MAX_CPUS];
     volatile uint32_t done = 0;
 
-    // Push one barrier onto each CPU's pending list.  We can't easily
-    // target a specific remote CPU's pending head from here (our
-    // this_cpu() reflects wherever we happen to be running), so all
-    // N pushes land on our local CPU.  That's still correct: the GP
-    // kthread drains EVERY CPU's list each pass and preserves the
-    // per-CPU FIFO within a batch — so by the time all N barriers
-    // have fired, every callback queued before rcu_barrier() on the
-    // same CPU has also fired.  Cross-CPU ordering is handled by
-    // synchronize_rcu() implicitly: the GP kthread only invokes
-    // callbacks AFTER a grace period elapses, during which every
-    // pre-barrier call_rcu_head must have landed somewhere.
+    // Push one barrier onto EACH CPU's pending list (rcu_push_on_cpu's CAS
+    // makes the cross-CPU push safe).  Combined with the GP kthread's
+    // per-CPU FIFO invocation, CPU i's barrier is invoked after every
+    // callback that was queued on CPU i before rcu_barrier() ran.  So once
+    // all N barriers have fired, every pre-barrier callback on every CPU has
+    // also fired — the correct rcu_barrier guarantee.
     //
-    // To explicitly guarantee coverage of callbacks on other CPUs
-    // (which may have been enqueued after the GP kthread's last
-    // snapshot), we queue one barrier per CPU and trust the GP
-    // kthread to batch-drain everyone.  A simpler N-barriers-on-one-
-    // CPU design works because the synchronize_rcu inside the
-    // kthread waits for ALL CPUs' outstanding readers.
+    // The earlier design pushed all N barriers on the LOCAL CPU, which only
+    // ordered against local-CPU callbacks: a callback queued on a different
+    // CPU (e.g. a typesafe slab free from pmm_slab_shrink_all_locked running
+    // elsewhere) could still be pending when rcu_barrier() returned, an
+    // intermittent use-after-reclaim (caught as is_slab_ptr=1 after barrier).
     for (unsigned i = 0; i < n; i++) {
         barriers[i].done_count = &done;
-        call_rcu_head(&barriers[i].head, rcu_barrier_cb, &barriers[i]);
+        rcu_push_on_cpu(&g_cpus[i], &barriers[i].head,
+                        rcu_barrier_cb, &barriers[i]);
     }
 
     while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < n) {

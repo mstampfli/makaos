@@ -112,17 +112,18 @@ vfs_file_t* eventfd_new(uint32_t init_val, uint32_t flags) {
     wait_queue_init(&s->read_wq);
     wait_queue_init(&s->write_wq);
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(*f));
+    vfs_file_t* f = vfs_anon_fd(&s->read_wq);   // poll/epoll: read readiness (POLLIN)
     if (!f) { kfree(s); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
     f->read  = eventfd_read_op;
     f->write = eventfd_write_op;
     f->poll  = eventfd_poll_op;
     f->close = eventfd_close_op;
     f->ctx   = s;
-    f->waitq = &s->read_wq;                // epoll registers on read readiness
-    f->secondary_waitq = NULL;
-    f->refcount = 1;
+    // Write readiness (POLLOUT) fires on write_wq when a reader drains a full
+    // eventfd.  Expose it as the secondary waitq so sys_poll/sys_select (which
+    // register on both f->waitq and f->secondary_waitq) wake a POLLOUT waiter;
+    // otherwise a task polling a FULL eventfd for POLLOUT starves forever.
+    f->secondary_waitq = &s->write_wq;
     f->flags    = (flags & EFD_NONBLOCK) ? 0x800 : 0;
     return f;
 }
@@ -215,5 +216,25 @@ void eventfd_selftest(void) {
     }
     f->close(f);
 
-    kprintf_atomic("[eventfd-selftest] PASS (counter + semaphore + EAGAIN + EINVAL + poll)\n");
+    // Case 5: POLLOUT readiness must be wired to write_wq.  A full eventfd is
+    // not writable; the POLLOUT wakeup (fired when a reader drains it) goes to
+    // write_wq, so poll/select must register a POLLOUT waiter there via
+    // f->secondary_waitq -- otherwise a task polling a FULL eventfd for POLLOUT
+    // starves.  Verify the full-eventfd readiness + the secondary_waitq wiring.
+    f = eventfd_new(0, EFD_NONBLOCK);
+    if (!f) { kprintf_atomic("[eventfd-selftest] FAIL alloc full\n"); return; }
+    eventfd_state_t* s5 = (eventfd_state_t*)f->ctx;
+    s5->count = EVENTFD_MAX;   // force full (eventfd_new's init_val is only uint32)
+    p = f->poll(f, POLLIN | POLLOUT);
+    if ((p & POLLOUT) || !(p & POLLIN)) {
+        kprintf_atomic("[eventfd-selftest] FAIL full poll = %d (want POLLIN, no POLLOUT)\n", p);
+        f->close(f); return;
+    }
+    if (f->secondary_waitq != &s5->write_wq) {
+        kprintf_atomic("[eventfd-selftest] FAIL POLLOUT not wired to write_wq\n");
+        f->close(f); return;
+    }
+    f->close(f);
+
+    kprintf_atomic("[eventfd-selftest] PASS (counter + semaphore + EAGAIN + EINVAL + poll + POLLOUT-wiring)\n");
 }

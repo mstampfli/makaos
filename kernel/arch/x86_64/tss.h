@@ -1,6 +1,6 @@
 #pragma once
-#include "common.h"
-#include "smp.h"     // MAX_CPUS
+#include "common.h"   // MAX_CPUS lives here (leaf) -- do NOT include smp.h:
+                      // it pulls preempt.h -> cpu.h -> tss.h and would cycle.
 
 // ── Task State Segment (64-bit) ───────────────────────────────────────────
 // In 64-bit mode the TSS is used for:

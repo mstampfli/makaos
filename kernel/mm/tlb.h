@@ -38,6 +38,10 @@
 void tlb_flush_range(task_mm_t* mm, uint64_t start, uint64_t end);
 void tlb_flush_mm   (task_mm_t* mm);
 
+// Shoot down a shared KERNEL higher-half VA range on every online CPU (for
+// global mappings no mm owns, e.g. recycled kstack slots).  See tlb.c.
+void tlb_flush_kernel_range(uint64_t start, uint64_t end);
+
 // IPI handler entry — wired from ipi.c ipi_tlb_flush_handler().
 // Runs on the target CPU; drains its shootdown MPSC queue and executes
 // each descriptor, publishing done back to the sender.

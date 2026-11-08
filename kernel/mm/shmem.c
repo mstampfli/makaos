@@ -1,6 +1,8 @@
 #include "shmem.h"
 #include "pmm.h"
 #include "kheap.h"
+#include "kprintf.h"   // kprintf (shmem_dma_selftest diagnostics)
+#include "kstr.h"    // str_eq (shared string utils; was local s_streq)
 #include "errno.h"
 #include "cred.h"
 #include "vfs.h"
@@ -31,11 +33,6 @@ static shmem_ns_table_t* s_namespace      = NULL;  // RCU-protected
 static spinlock_t        s_namespace_lock = SPINLOCK_INIT;
 
 // ── Internal helpers ─────────────────────────────────────────────────────
-
-static int s_streq(const char* a, const char* b) {
-    while (*a && *b && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
 
 static uint32_t shm_hash_str(const char* s, uint32_t cap) {
     uint32_t h = 2166136261u;
@@ -69,6 +66,7 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
 
     shmem_t* shm = kmalloc(sizeof(shmem_t));
     if (!shm) return NULL;
+    shm->lock = (spinlock_t)SPINLOCK_INIT;
 
     // Allocate page array.  Start with capacity = npages (or minimum 1
     // so we always have a valid pointer even for zero-size objects).
@@ -86,8 +84,51 @@ shmem_t* shmem_create(uint32_t npages, uint32_t uid, uint32_t gid, uint16_t mode
     shm->uid       = uid;
     shm->gid       = gid;
     shm->mode      = mode;
+    shm->pinned    = 0;
     shm->name[0]   = '\0';
 
+    return shm;
+}
+
+// ── shmem_create_dma ─────────────────────────────────────────────────────
+// Fully-resident, pinned backing for device DMA (GPU scatter-gather).  Unlike
+// the demand-paged path (shmem_get_page, order-0 on first touch), this eager-
+// allocates the whole object up front as best-effort LARGE buddy blocks so the
+// backing is a handful of big runs, not thousands of scattered pages -- shorter
+// device sg list, huge-page-capable mapping -- while still never REQUIRING a
+// large contiguous block (it degrades to order-0 under fragmentation).  Every
+// page is pmm_pin'd for the object's lifetime; shmem_free_rcu unpins them.
+shmem_t* shmem_create_dma(uint32_t npages) {
+    if (npages == 0) return NULL;
+    shmem_t* shm = shmem_create(npages, 0, 0, 0600);
+    if (!shm) return NULL;
+    shm->pinned = 1;
+
+    uint32_t i = 0;
+    while (i < npages) {
+        uint32_t remaining = npages - i;
+        // Largest order whose block fits the remaining pages, capped so we never
+        // demand a huge contiguous span.
+        uint8_t order = 0;
+        while (order < SHMEM_DMA_MAX_ORDER &&
+               ((uint32_t)1 << (order + 1)) <= remaining)
+            order++;
+        phys_addr_t p;
+        for (;;) {
+            p = pmm_buddy_alloc(order);
+            if (p != PMM_INVALID_ADDR) break;
+            if (order == 0) { shmem_unref(shm); return NULL; }  // true OOM
+            order--;   // fragmentation: fall back to a smaller block
+        }
+        uint32_t blk = (uint32_t)1 << order;
+        __builtin_memset((void*)(p + HHDM_OFFSET), 0, (size_t)blk * PAGE_SIZE);
+        for (uint32_t j = 0; j < blk; j++) {
+            phys_addr_t f = p + (phys_addr_t)j * PAGE_SIZE;   // object owns rc=1
+            shm->pages[i + j] = f;
+            pmm_pin(f);                                        // DMA-safe, swap-immune
+        }
+        i += blk;
+    }
     return shm;
 }
 
@@ -117,13 +158,19 @@ int shmem_tryget(shmem_t* shm) {
 static void shmem_free_rcu(void* data) {
     shmem_t* shm = (shmem_t*)data;
     for (uint32_t i = 0; i < shm->npages; i++) {
-        if (shm->pages[i])
+        if (shm->pages[i]) {
+            // DMA-pinned backing (shmem_create_dma): drop the pin taken at
+            // create BEFORE the ref, so this ref_dec can actually free the
+            // frame.  The device has already detached (the GPU resource is
+            // unref'd before shmem_unref), so the DMA guard is no longer needed.
+            if (shm->pinned) pmm_unpin(shm->pages[i]);
             // Drop the OBJECT's ref.  Frames still mapped by a surviving
             // PTE (a process that hasn't munmapped yet) stay alive until
             // that PTE is torn down — they are NOT recycled out from
             // under a live mapping.  Same per-frame refcount every other
             // RAM page uses.
             pmm_ref_dec(shm->pages[i]);
+        }
     }
     kfree(shm->pages);
     kfree(shm);
@@ -152,8 +199,24 @@ void shmem_unref(shmem_t* shm) {
 // ── shmem_get_page ───────────────────────────────────────────────────────
 
 phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
-    if (!shm || pg_idx >= shm->npages)
+    if (!shm) return PMM_INVALID_ADDR;
+
+    // Hold shm->lock across the whole check-then-set: it serialises against a
+    // concurrent shmem_resize (which kfree's/reallocs `pages` and mutates
+    // npages) and against another faulter touching the same index.  Without it,
+    // reading shm->pages[pg_idx] here could dereference an array a concurrent
+    // grow kfree'd (UAF), and two first-touches of one index would double-
+    // allocate the frame (leak + incoherent shared page).  Per-object lock, so
+    // faults on different objects never contend; the hold spans one
+    // pmm_buddy_alloc + a page zero, bounded.  Plain spin_lock (NOT irqsave):
+    // get_page and shmem_resize run only in process context (#PF / ftruncate),
+    // never from an IRQ handler, so no IRQ can take this lock, and we avoid
+    // holding IRQs off across the page zero.
+    spin_lock(&shm->lock);
+    if (pg_idx >= shm->npages) {
+        spin_unlock(&shm->lock);
         return PMM_INVALID_ADDR;
+    }
 
     // Caller installs a PTE for the returned frame, so it gets one
     // reference.  The shmem object also holds one reference per
@@ -162,19 +225,24 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
     // every mapping PTE (munmap/teardown) have released it — so a
     // shrink or destroy can never recycle a frame a process still maps.
     if (shm->pages[pg_idx]) {
-        pmm_ref_inc(shm->pages[pg_idx]);   // ref for the caller's PTE
-        return shm->pages[pg_idx];
+        phys_addr_t f = shm->pages[pg_idx];
+        pmm_ref_inc(f);   // ref for the caller's PTE
+        spin_unlock(&shm->lock);
+        return f;
     }
 
     // First touch: allocate a zeroed physical frame (rc=1 = object ref).
     phys_addr_t frame = pmm_buddy_alloc(0);
-    if (frame == PMM_INVALID_ADDR)
+    if (frame == PMM_INVALID_ADDR) {
+        spin_unlock(&shm->lock);
         return PMM_INVALID_ADDR;
+    }
 
     __builtin_memset((void*)(frame + HHDM_OFFSET), 0, PAGE_SIZE);
 
     shm->pages[pg_idx] = frame;
     pmm_ref_inc(frame);    // +1 for the caller's PTE (object keeps rc=1)
+    spin_unlock(&shm->lock);
     return frame;
 }
 
@@ -183,7 +251,14 @@ phys_addr_t shmem_get_page(shmem_t* shm, uint32_t pg_idx) {
 int shmem_resize(shmem_t* shm, uint32_t new_npages) {
     if (!shm) return -EINVAL;
     if (new_npages > SHMEM_MAX_PAGES) return -EINVAL;
-    if (new_npages == shm->npages) return 0;
+
+    // Serialise the whole resize against shmem_get_page (the #PF handler): the
+    // grow path kfree's and reallocates `pages`, and both paths mutate npages
+    // and the slots.  Same per-object lock get_page takes (process-context
+    // only, so plain spin_lock).  Without it a concurrent fault dereferences a
+    // kfree'd `pages` array (UAF).
+    spin_lock(&shm->lock);
+    if (new_npages == shm->npages) { spin_unlock(&shm->lock); return 0; }
 
     if (new_npages < shm->npages) {
         // Shrinking: drop the OBJECT's ref on pages beyond the new
@@ -195,11 +270,13 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
         // new thread's stack while foot kept writing to it.
         for (uint32_t i = new_npages; i < shm->npages; i++) {
             if (shm->pages[i]) {
+                if (shm->pinned) pmm_unpin(shm->pages[i]);   // release the DMA pin first
                 pmm_ref_dec(shm->pages[i]);
                 shm->pages[i] = 0;
             }
         }
         shm->npages = new_npages;
+        spin_unlock(&shm->lock);
         return 0;
     }
 
@@ -212,10 +289,10 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
             else              new_cap *= 2;
         }
         if (new_cap > SHMEM_MAX_PAGES) new_cap = SHMEM_MAX_PAGES;
-        if (new_cap < new_npages) return -EINVAL;
+        if (new_cap < new_npages) { spin_unlock(&shm->lock); return -EINVAL; }
 
         phys_addr_t* new_arr = kmalloc(new_cap * sizeof(phys_addr_t));
-        if (!new_arr) return -ENOMEM;
+        if (!new_arr) { spin_unlock(&shm->lock); return -ENOMEM; }
 
         // Copy existing entries.
         for (uint32_t i = 0; i < shm->npages; i++)
@@ -234,6 +311,7 @@ int shmem_resize(shmem_t* shm, uint32_t new_npages) {
     }
 
     shm->npages = new_npages;
+    spin_unlock(&shm->lock);
     return 0;
 }
 
@@ -253,7 +331,7 @@ shmem_t* shmem_ns_find(const char* name) {
         for (uint32_t n = 0; n < cap; n++) {
             shmem_t* shm = t->slots[i].shm;
             if (!shm) break;
-            if (s_streq(shm->name, name)) {
+            if (str_eq(shm->name, name)) {
                 if (shmem_tryget(shm)) result = shm;
                 break;
             }
@@ -278,7 +356,7 @@ int shmem_ns_insert(shmem_t* shm) {
         uint32_t i = shm_hash_str(shm->name, old_cap);
         for (uint32_t n = 0; n < old_cap; n++) {
             if (!old->slots[i].shm) break;
-            if (s_streq(old->slots[i].shm->name, shm->name)) {
+            if (str_eq(old->slots[i].shm->name, shm->name)) {
                 spin_unlock_irqrestore(&s_namespace_lock, flags);
                 return -EEXIST;
             }
@@ -384,24 +462,52 @@ void shmem_fd_close(vfs_file_t* self) {
 
 vfs_file_t* shmem_fd_create(shmem_t* shm) {
     if (!shm) return NULL;
-    vfs_file_t* f = kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // zeroed, waitq wired, refcount=1
     if (!f) return NULL;
-    __builtin_memset(f, 0, sizeof(*f));
 
-    f->read     = shmem_fd_read;
-    f->write    = shmem_fd_write;
-    f->close    = shmem_fd_close;
-    f->seek     = NULL;
-    f->poll           = NULL;
-    f->ioctl          = NULL;
-    f->ctx            = shm;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags          = 0;
-    f->refcount    = 1;
-    f->rights   = 0xFFFFFFFF; // all rights — narrowed by restrict_fd if needed
-    f->path[0]  = '\0';
+    f->read  = shmem_fd_read;
+    f->write = shmem_fd_write;
+    f->close = shmem_fd_close;
+    f->ctx   = shm;
+    f->rights = 0xFFFFFFFF;   // non-default: all rights, narrowed by restrict_fd if needed
 
     shmem_ref(shm); // fd owns a reference
     return f;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Verify shmem_create_dma: every page is populated and pmm_pin'd, the backing
+// clusters into a few large runs (not N scattered pages), and teardown unpins
+// cleanly (a missing unpin would print "[pmm] BUG ... PINNED frame" and leak).
+void shmem_dma_selftest(void) {
+    const uint32_t N = 700;   // 2.7 MiB: spans an order-9 block + smaller fallbacks
+    shmem_t* shm = shmem_create_dma(N);
+    if (!shm) { kprintf("[shmem-dma] FAIL: create_dma returned NULL\n"); return; }
+    uint32_t unpop = 0, unpinned = 0, runs = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        if (!shm->pages[i]) { unpop++; continue; }
+        if (pmm_pin_get(shm->pages[i]) == 0) unpinned++;
+        if (i == 0 || shm->pages[i] != shm->pages[i - 1] + 4096u) runs++;
+    }
+    kprintf("[shmem-dma] populate/pin: %s (N=%u, unpopulated=%u, unpinned=%u, %u runs)\n",
+            (unpop == 0 && unpinned == 0) ? "PASS" : "FAIL", N, unpop, unpinned, runs);
+    shmem_unref(shm);          // deferred RCU free: must unpin every page
+    synchronize_rcu();         // force the free to run now so a leak/BUG shows in-line
+    kprintf("[shmem-dma] freed (PASS if no '[pmm] BUG ... PINNED frame' printed above)\n");
+
+    // A backing bigger than the OLD 64 MiB per-resource contiguity cap must
+    // allocate via scatter-gather (no large contiguous block required).
+    const uint32_t BIG = 20000;   // ~78 MiB, > 16384 pages (64 MiB)
+    shmem_t* big = shmem_create_dma(BIG);
+    if (!big) { kprintf("[shmem-dma] >64MiB: FAIL (create_dma(%u pages) returned NULL)\n", BIG); return; }
+    uint32_t bunpop = 0, bruns = 0;
+    for (uint32_t i = 0; i < BIG; i++) {
+        if (!big->pages[i]) { bunpop++; continue; }
+        if (i == 0 || big->pages[i] != big->pages[i - 1] + 4096u) bruns++;
+    }
+    kprintf("[shmem-dma] >64MiB: %s (%u pages = ~%u MiB, unpopulated=%u, %u runs)\n",
+            bunpop == 0 ? "PASS" : "FAIL", BIG, (BIG * 4u) / 1024u, bunpop, bruns);
+    shmem_unref(big);
+    synchronize_rcu();
+}
+#endif

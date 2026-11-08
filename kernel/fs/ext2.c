@@ -1,10 +1,14 @@
 #include "ext2.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "ahci.h"
 #include "kheap.h"
+#include "kstr.h"    // str_len (shared string utils)
 #include "common.h"
 #include "smp.h"
 #include "seqlock.h"
 #include "rcu.h"
+#include "cred.h"      // cred_t: a new inode is stamped with its creator's uid/gid
+#include "checked.h"   // index_ok / ckd_add_u32: bounded-index + overflow-safe add
 #include "dcache.h"    // Phase 7: cached path-component lookups +
                        // invalidation hooks at every mutation site
 
@@ -40,14 +44,20 @@
 static inline void ext2_scratch_free_(uint8_t** p) {
     if (*p) kfree(*p);
 }
+// The single fixed size of every block buffer: the bcache slots and all
+// EXT2_SCRATCH allocations.  This is also the MAXIMUM ext2 block size the FS
+// supports -- ext2_block_size_checked() rejects any superblock whose block
+// size would exceed it, so a DMA read or memcpy of a full block can never
+// overrun these buffers.  Keep the bcache slot dimension below in lockstep.
+#define EXT2_BLOCK_SIZE_MAX 4096u
 #define EXT2_SCRATCH_DECL(name) \
     uint8_t* name __attribute__((cleanup(ext2_scratch_free_))) = NULL
 #define EXT2_SCRATCH_ALLOC(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return 0; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return 0; } while (0)
 #define EXT2_SCRATCH_ALLOC_NEG1(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return -1; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return -1; } while (0)
 #define EXT2_SCRATCH_ALLOC_VOID(name) \
-    do { name = (uint8_t*)kmalloc(4096); if (!name) return; } while (0)
+    do { name = (uint8_t*)kmalloc(EXT2_BLOCK_SIZE_MAX); if (!name) return; } while (0)
 // Convenience: declare + alloc in one step for cases where the function
 // has already passed all early-error checks before the scratch is needed.
 #define EXT2_SCRATCH(name)       EXT2_SCRATCH_DECL(name); EXT2_SCRATCH_ALLOC(name)
@@ -59,6 +69,47 @@ static inline void ext2_scratch_free_(uint8_t** p) {
 static uint32_t s_part_lba        = 0;
 static uint32_t s_block_size      = 0;   // bytes per block (1024, 2048, or 4096)
 static uint32_t s_sectors_per_blk = 0;   // block_size / 512
+
+// Map an on-disk s_log_block_size to the block size in bytes, or 0 if the
+// value is unsupported.  `log` comes straight from an untrusted superblock, so
+// this is the validation gate: only 1024/2048/4096 (log 0/1/2) are accepted --
+// every one of which is <= EXT2_BLOCK_SIZE_MAX (the fixed bcache slot / scratch
+// size), so a full-block DMA read or memcpy can never overrun those buffers.
+// log >= 3 would yield a block > 4096 (buffer overflow); log >= 32 is also a
+// shift past the operand width (UB).  Pure -> unit-tested below.
+static uint32_t ext2_block_size_checked(uint32_t log) {
+    if (log > 2u) return 0;          // > 4096 unsupported; rejects the mount
+    return 1024u << log;             // 1024 / 2048 / 4096
+}
+// PRIMITIVE (on-disk inode size validation): is `inode_size` (the untrusted
+// superblock s_inode_size) usable for this block_size?  Require a power of two,
+// at least the inode struct we copy (sizeof ext2_inode_t), and no larger than the
+// block.  power-of-2 + <= block_size means inode_size DIVIDES block_size, so inodes
+// tile a block without straddling: (local*inode_size) % block_size <= block_size -
+// inode_size, hence off + sizeof(ext2_inode_t) <= block_size -- no OOB bcache-slot
+// read (inode_load_into) or scratch write (inode_disk_write).  Pure -> unit-tested.
+static inline int ext2_inode_size_valid(uint32_t inode_size, uint32_t block_size) {
+    return inode_size >= sizeof(ext2_inode_t)
+        && inode_size <= block_size
+        && (inode_size & (inode_size - 1u)) == 0u;   // power of two
+}
+// PRIMITIVE (on-disk group geometry validation): a group's block bitmap and its
+// inode bitmap each occupy exactly ONE filesystem block, so a group holds at
+// most block_size*8 blocks and block_size*8 inodes.  s_blocks_per_group /
+// s_inodes_per_group are untrusted u32 superblock fields; a forged value above
+// block_size*8 makes the in-group bit index (rel % blocks_per_group, or the
+// bitmap_find_free scan up to blocks_per_group) run past the fixed 4096-byte
+// bitmap scratch -> heap OOB read/write in alloc_block / free_block /
+// alloc_inode / free_inode_num.  block_size <= EXT2_BLOCK_SIZE_MAX (4096), so
+// block_size*8 <= 32768 bits fits the scratch.  Also rejects zero (div-by-zero
+// in the group math).  Pure -> unit-tested.
+static inline int ext2_group_geom_valid(uint32_t blocks_per_grp,
+                                        uint32_t inodes_per_grp,
+                                        uint32_t block_size) {
+    uint32_t cap = block_size * 8u;   // bits in a one-block bitmap
+    return blocks_per_grp != 0 && inodes_per_grp != 0
+        && blocks_per_grp <= cap && inodes_per_grp <= cap;
+}
 static uint32_t s_inodes_per_grp  = 0;
 static uint32_t s_blocks_per_grp  = 0;
 static uint32_t s_inode_size      = 128; // bytes per inode on disk
@@ -76,6 +127,7 @@ static spinlock_t* s_group_locks  = NULL;
 // lock acquisition ordering complexity of dual-parent locking.
 static spinlock_t  s_rename_lock  = SPINLOCK_INIT;
 static uint32_t s_first_data_blk  = 0;   // superblock's s_first_data_block
+static uint32_t s_blocks_count    = 0;   // superblock's s_blocks_count (total FS blocks)
 static uint8_t  s_mounted         = 0;
 
 // ── Block cache ───────────────────────────────────────────────────────────
@@ -140,7 +192,7 @@ typedef struct {
     uint64_t   last_use;       // LRU counter — bumped on each hit
 } bcache_way_t;
 
-static uint8_t      s_bcache_data[BCACHE_NSETS][BCACHE_WAYS][4096];
+static uint8_t      s_bcache_data[BCACHE_NSETS][BCACHE_WAYS][EXT2_BLOCK_SIZE_MAX];
 static bcache_way_t s_bcache_meta[BCACHE_NSETS][BCACHE_WAYS];
 // Global monotonic LRU clock — bumped on every hit.  Atomic because many
 // readers may tick it concurrently.  Overflow is safe (we compare by
@@ -252,8 +304,68 @@ static void bcache_fill(uint32_t blk, const uint8_t* data, uint32_t len) {
 //
 // Returns `ref.data == NULL` on I/O error.  Caller must `bcache_put(&ref)`
 // on success to drop any held pin.
+// ── Physical block-number validation ──────────────────────────────────────
+// Every block number that becomes a device LBA (lba = s_part_lba + blk*spb)
+// must be proven in-range FIRST.  i_block[] entries, indirect-block entries and
+// BGD fields are all untrusted on-disk data; a wild value would DMA a sector
+// outside the filesystem -- a cross-partition / off-device read, or an OOB
+// write on inode writeback.  Valid physical blocks are [s_first_data_blk,
+// s_blocks_count).  The math is factored into pure helpers so it is unit-tested
+// (ext2_block_valid_selftest) independent of any mounted image.
+// PRIMITIVE (on-disk block index + run, category D -> index_ok / ckd_add_u32).
+static inline int ext2_block_in_range(uint32_t blk, uint32_t first, uint32_t count) {
+    return blk >= first && index_ok(blk, count);   // [first, count), half-open upper
+}
+// Are blocks [start, start+run) ALL valid?  Overflow-safe: start+run can wrap.
+static inline int ext2_run_in_range(uint32_t start, uint32_t run,
+                                    uint32_t first, uint32_t count) {
+    if (run == 0)      return 1;           // empty run is vacuously valid
+    if (start < first) return 0;           // below the first data block
+    uint32_t end;                          // end = start + run, overflow-safe
+    if (!ckd_add_u32(start, run, &end)) return 0;   // wrap -> reject
+    return end <= count;                   // [start, start+run) within the FS
+}
+static inline int ext2_block_valid(uint32_t blk) {
+    return ext2_block_in_range(blk, s_first_data_blk, s_blocks_count);
+}
+static inline int ext2_run_valid(uint32_t start, uint32_t run) {
+    return ext2_run_in_range(start, run, s_first_data_blk, s_blocks_count);
+}
+// PRIMITIVE (on-disk directory entry bounds).  A dirent at byte `off` carries an
+// untrusted on-disk rec_len (uint16) + name_len (uint8).  Before reusing/splitting
+// it (dir_add_entry) or comparing its name (dir_remove_entry), require it to be
+// well-formed within the blk_bytes-sized block: rec_len keeps the WHOLE entry in
+// the block (off + rec_len <= blk_bytes), and the aligned header+name fits the
+// entry (align4(8 + name_len) <= rec_len).  Without this a corrupt rec_len/name_len
+// makes `rec_len - actual_len` UNDERFLOW (huge slack) so the split writes
+// `dae_buf + off + actual_len` PAST the 4096-byte heap block = heap OOB write.
+// Pure -> unit-tested (ext2_dirent_in_block_selftest).
+static inline int ext2_dirent_in_block(uint32_t off, uint32_t rec_len,
+                                       uint32_t name_len, uint32_t blk_bytes) {
+    uint32_t actual = 8u + name_len;
+    if (actual & 3u) actual = (actual | 3u) + 1u;      // align to 4 (same as the walk)
+    if ((uint64_t)off + rec_len > blk_bytes) return 0; // entry runs past the block
+    return actual <= rec_len;                          // header+name fits its rec_len
+}
+// PRIMITIVE (on-disk block number -> 64-bit device LBA).  blk is validated by
+// ext2_block_valid, but the LBA MUST be formed in 64-bit: blk*spb can exceed
+// 2^32 for a large filesystem or a crafted s_blocks_count, and a 32-bit product
+// WRAPS to a wrong sector (silent OOB read/write within the device).  No
+// overflow check is needed -- blk < 2^32 and spb <= 8, so the product is < 2^35
+// and the +part_lba sum < 2^36, all within u64.  Factored pure for unit testing.
+static inline uint64_t ext2_blk_lba(uint32_t part_lba, uint32_t blk, uint32_t spb) {
+    return (uint64_t)part_lba + (uint64_t)blk * spb;
+}
+static inline uint64_t ext2_blk_to_lba(uint32_t blk) {
+    return ext2_blk_lba(s_part_lba, blk, s_sectors_per_blk);
+}
+
 static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
     bcache_ref_t r = { NULL, blk, 0, 0, 0 };
+    // Reject any block outside the filesystem before it can become an LBA or
+    // pollute the cache (untrusted i_block[]/indirect/BGD source).  r.data stays
+    // NULL, which every caller already treats as an I/O error.
+    if (!ext2_block_valid(blk)) return r;
     uint32_t set = bcache_set_of(blk);
 
     // Fast path — walk the 4 ways, optimistic pin + verify tag.
@@ -275,7 +387,7 @@ static bcache_ref_t bcache_get(uint32_t blk, uint8_t* scratch) {
     }
 
     // Slow path — go to disk.
-    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+    uint64_t lba = ext2_blk_to_lba(blk);   // 64-bit LBA: blk*spb must not wrap
     if (!ahci_read(lba, scratch, s_sectors_per_blk)) return r;
     bcache_fill(blk, scratch, s_block_size);
     r.data = scratch;
@@ -303,10 +415,14 @@ static void bcache_put(bcache_ref_t* r) {
 //     consistent read; on a rare collision they redo the memcpy.
 //     They NEVER block on a writer — that's the entire point of using
 //     a seqlock here over a spinlock.
-//   - Writers use inode_lock / inode_unlock which call seq_write_begin
-//     / seq_write_end on the leaf.  Two CPUs writing different inodes
-//     never contend.  Two CPUs writing the SAME inode serialise on the
-//     leaf's internal write_lock for tens of nanoseconds.
+//   - Writers use inode_lock / inode_unlock.  inode_lock takes ONLY the
+//     leaf's internal write_lock (serialising writers of the same inode);
+//     it does NOT bump the sequence odd, so it may be held across blocking
+//     disk I/O without making readers spin.  The sequence is bumped odd
+//     only by inode_pub_begin / inode_pub_end around the brief in-memory
+//     publish of leaf->inode (SCAN #13: holding the sequence odd across
+//     I/O deadlocked a preempt-disabled irtree_get reader against the
+//     sleeping writer).  Two CPUs writing different inodes never contend.
 //   - The L0 / L1 pointer slots are publish-once stores; lookup is a
 //     plain acquire-load with no atomics on the hot path.  Allocation
 //     of a fresh leaf the first time we touch a given inode is
@@ -316,10 +432,11 @@ static void bcache_put(bcache_ref_t* r) {
 // The leaf's `inode` field doubles as the in-memory authoritative copy
 // of the inode for read-modify-write sequences: callers do
 // `leaf = inode_lock(ino)` (which fault-loads the disk image into the
-// leaf if needed), mutate `leaf->inode`, then call inode_writeback() to
-// push the change to disk before inode_unlock.  The seqcount bump on
-// the unlock side is what lets concurrent irtree_get readers notice the
-// change without taking any lock.
+// leaf if needed), do their disk I/O, then publish the final bytes with
+// inode_pub_begin(); leaf->inode = ...; inode_pub_end(); before
+// inode_writeback() persists them and inode_unlock() drops the write_lock.
+// The seqcount bump on the publish is what lets concurrent irtree_get
+// readers notice the change without taking any lock.
 
 #define IRTREE_BITS  8
 #define IRTREE_SIZE  (1u << IRTREE_BITS)   // 256
@@ -367,13 +484,40 @@ extern uint64_t tsc_read_ns(void);
 // Lookup: plain acquire-loads down the L0 / L1 chain.  No lock needed
 // because every store in irtree_alloc is publish-once with release
 // semantics; we either see the leaf or we don't.
+// A live leaf is always a kernel higher-half (HHDM/heap) pointer.  Anything
+// below the higher-half base is a corrupted slot -- e.g. the non-canonical
+// (bit-47-cleared) value a work-stealing use-after-free leaves in l1tab.
+// Validate before EVERY dereference so a corrupt slot recovers (re-fetch from
+// disk) instead of #GP-ing the whole process.
+static inline int irtree_leaf_ok(irtree_leaf_t* p) {
+    return (uintptr_t)p >= 0xFFFF800000000000ULL;
+}
+static void irtree_report_corrupt(uint32_t ino, uint32_t l0, uint32_t l1,
+                                  irtree_l1_t* l1tab, irtree_leaf_t* leaf) {
+    // Rate-limited: the corruption is recovered transparently, so we only
+    // need a few samples for observability, not a per-hit flood.
+    static volatile uint32_t seen;
+    uint32_t n = __atomic_fetch_add(&seen, 1u, __ATOMIC_RELAXED);
+    if (n >= 8) return;
+    extern void kprintf_atomic(const char*, ...);
+    kprintf_atomic("[irtree] recovered corrupt leaf #%u ino=%u l0=%u l1=%u val=%p l1tab=%p\n",
+                   n, ino, l0, l1, (void*)leaf, (void*)l1tab);
+}
+
 static irtree_leaf_t* irtree_lookup(uint32_t ino) {
     uint32_t l0 = (ino >> IRTREE_BITS) & IRTREE_MASK;
     uint32_t l1 = ino & IRTREE_MASK;
     irtree_l1_t* l1tab = __atomic_load_n(&s_irtree[l0], __ATOMIC_ACQUIRE);
     if (!l1tab) return NULL;
     irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1], __ATOMIC_ACQUIRE);
-    if (!leaf || leaf->ino != ino) return NULL;
+    if (!leaf) return NULL;
+    if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // Corrupted slot: clear it (recover -> re-fetch) and DON'T deref.
+        irtree_report_corrupt(ino, l0, l1, l1tab, leaf);
+        __atomic_store_n(&l1tab->leaves[l1], NULL, __ATOMIC_RELEASE);
+        return NULL;
+    }
+    if (leaf->ino != ino) return NULL;
     return leaf;
 }
 
@@ -404,6 +548,14 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
         __atomic_store_n(&s_irtree[l0], l1tab, __ATOMIC_RELEASE);
     }
     irtree_leaf_t* leaf = l1tab->leaves[l1];
+    if (leaf && UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // Corrupted slot (work-stealing UAF left a non-canonical pointer).
+        // Under s_irtree_alloc_lock we own the slot: report, drop it, and
+        // fall through to a fresh allocation that overwrites the poison.
+        irtree_report_corrupt(ino, l0, l1, l1tab, leaf);
+        leaf = NULL;
+        l1tab->leaves[l1] = NULL;
+    }
     if (leaf) {
         // Already present (another CPU raced us here).  Bump its
         // refcount and return — the caller's rcu_read_lock kept it
@@ -418,6 +570,16 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
     // Fresh allocation from the typesafe slab.
     leaf = (irtree_leaf_t*)pmm_slab_alloc(&s_irtree_leaf_cache);
     if (!leaf) { spin_unlock(&s_irtree_alloc_lock); return NULL; }
+    if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+        // The SLAB ITSELF handed back a non-canonical (bit-47-cleared) pointer
+        // -> the corruption is in the slab freelist head, not a post-store
+        // write into l1tab.  Report the exact value + which cache, drop it.
+        extern void kprintf_atomic(const char*, ...);
+        kprintf_atomic("[irtree] SLAB-RETURNED-NONCANON leaf=%p ino=%u\n",
+                       (void*)leaf, ino);
+        spin_unlock(&s_irtree_alloc_lock);
+        return NULL;
+    }
     seqlock_init(&leaf->seq);
     leaf->ino          = ino;
     leaf->valid        = 0;
@@ -433,14 +595,27 @@ static irtree_leaf_t* irtree_alloc_with_ref(uint32_t ino) {
 // No locking — safe to call without holding anything.
 static uint8_t inode_load_into(uint32_t ino, ext2_inode_t* out);
 
-// Public per-inode write-side lock: returns the leaf with its seqlock
-// held in WRITE state.
+// Public per-inode write-side lock.  Returns the leaf with its per-inode
+// write_lock (the seqlock's embedded spinlock) held to SERIALISE writers --
+// but with the sequence counter EVEN, NOT bumped to the odd "write in
+// progress" state.
 //
-// Critical design rule: we NEVER hold the seqlock across disk I/O.  If
-// the leaf needs loading, we do the I/O into a local buffer FIRST, then
-// briefly take the seqlock to publish.  Holding a seqlock across a
-// blocking AHCI read would cause every concurrent reader (via irtree_get
-// → seq_begin) to spin for milliseconds — and forever if the I/O hangs.
+// Critical design rule (SCAN #13 fix): the seqlock SEQUENCE is never held odd
+// across blocking disk I/O.  A writer may sleep arbitrarily long inside
+// write_block/inode_writeback (AHCI submit + completion wait); if it held the
+// sequence odd across that sleep, every concurrent irtree_get reader would spin
+// in seq_begin's cpu_relax -- and irtree_get spins with rcu_read_lock held
+// (== preempt_disable), so a reader on the sleeping writer's CPU can never be
+// preempted to let the writer run.  That is a hard deadlock (a preempt-disabled
+// reader starves the runnable task that would complete the writer's I/O), which
+// the AHCI completion self-heal cannot break.  So inode_lock holds ONLY the
+// write_lock across the I/O (a plain spinlock -- preemptible, so writer-vs-writer
+// contention self-heals); the sequence is bumped odd ONLY by inode_pub_begin /
+// inode_pub_end around the brief IN-MEMORY publish of leaf->inode (no I/O there).
+// The seqlock protects exactly the 128-byte leaf->inode snapshot irtree_get
+// copies -- it never protected directory data blocks (those go through bcache),
+// so moving the I/O outside the sequence weakens no guarantee: a reader gets a
+// consistent pre- or post-publish inode, exactly as before.
 //
 // Benign race: two CPUs may load the same inode concurrently; both
 // publish identical bytes.  Last-writer-wins is correct.
@@ -477,14 +652,30 @@ static irtree_leaf_t* inode_lock(uint32_t ino) {
         seq_write_end(&leaf->seq);
     }
 
-    seq_write_begin(&leaf->seq);
+    // Serialise writers WITHOUT bumping the sequence odd: hold only the
+    // embedded write_lock across the caller's (possibly I/O-bearing) critical
+    // section.  Readers see a consistent EVEN sequence and never spin here.
+    spin_lock(&leaf->seq.write_lock);
     return leaf;
 }
 
 static void inode_unlock(irtree_leaf_t* leaf) {
     if (!leaf) return;
-    seq_write_end(&leaf->seq);
+    spin_unlock(&leaf->seq.write_lock);
     __atomic_fetch_sub(&leaf->refcount, 1u, __ATOMIC_ACQ_REL);
+}
+
+// Publish in-memory changes to leaf->inode (and leaf->valid) atomically w.r.t.
+// seqlock readers.  The caller MUST already hold the write side via inode_lock
+// (write_lock held), so these bump ONLY the sequence (the _unlocked variants --
+// no nested spinlock).  NO blocking I/O may run between begin and end: that is
+// the whole point (readers spin in seq_begin only for this nanosecond-scale
+// window, never across the writer's disk I/O).
+static inline void inode_pub_begin(irtree_leaf_t* leaf) {
+    seq_write_begin_unlocked(&leaf->seq);
+}
+static inline void inode_pub_end(irtree_leaf_t* leaf) {
+    seq_write_end_unlocked(&leaf->seq);
 }
 
 // Brief-section reader: copy the cached inode out under a seqlock retry
@@ -555,6 +746,14 @@ uint32_t irtree_shrink(uint32_t max, uint64_t idle_ns_cutoff) {
             irtree_leaf_t* leaf = __atomic_load_n(&l1tab->leaves[l1],
                                                     __ATOMIC_ACQUIRE);
             if (!leaf) continue;
+            if (UNLIKELY(!irtree_leaf_ok(leaf))) {
+                // Corrupt slot — clear it (recover) instead of #GP-ing the
+                // shrinker on the bit-47-cleared pointer.  Leaks the pointed-at
+                // object but that is already lost; keep the kernel alive.
+                irtree_report_corrupt(l1 /*ino unknown here*/, l0, l1, l1tab, leaf);
+                __atomic_store_n(&l1tab->leaves[l1], NULL, __ATOMIC_RELEASE);
+                continue;
+            }
 
             // Quick unlocked check — spares the lock acquire when
             // the leaf is hot.  A racy race (leaf gets touched between
@@ -608,7 +807,8 @@ static uint8_t read_block(uint32_t blk, uint8_t* buf) {
 // publishes the new contents into the block cache (skipped on slot
 // conflict — harmless, the next read will re-fetch).
 static uint8_t write_block(uint32_t blk, const uint8_t* buf) {
-    uint32_t lba = s_part_lba + blk * s_sectors_per_blk;
+    if (!ext2_block_valid(blk)) return 0;   // never write outside the filesystem
+    uint64_t lba = ext2_blk_to_lba(blk);   // 64-bit LBA: blk*spb must not wrap
     if (!ahci_write(lba, buf, s_sectors_per_blk)) return 0;
     bcache_fill(blk, buf, s_block_size);
     return 1;
@@ -718,6 +918,7 @@ static uint8_t read_inode(uint32_t ino, ext2_inode_t* out) {
     return 1;
 }
 
+
 // Internal disk writeback shared between inode_writeback (called with
 // the leaf seqlock held) and the legacy write_inode wrapper (which
 // takes the seqlock itself).  Does NOT touch the irtree cache.
@@ -764,16 +965,38 @@ uint8_t ext2_init(uint32_t part_lba) {
     ext2_superblock_t* sb = (ext2_superblock_t*)sb_buf;
     if (sb->s_magic != EXT2_MAGIC) return 0;
 
-    s_block_size      = 1024u << sb->s_log_block_size;
+    // Validate the block size from the untrusted superblock before any block
+    // read: an out-of-range s_log_block_size would make s_block_size exceed the
+    // fixed 4096-byte bcache slots / DMA scratch (heap+BSS overflow) or shift UB.
+    s_block_size      = ext2_block_size_checked(sb->s_log_block_size);
+    if (s_block_size == 0) return 0;   // unsupported block size -> refuse mount
     s_sectors_per_blk = s_block_size / 512;
     s_inodes_per_grp  = sb->s_inodes_per_group;
     s_blocks_per_grp  = sb->s_blocks_per_group;
     s_first_data_blk  = sb->s_first_data_block;
+    s_blocks_count    = sb->s_blocks_count;
     s_inode_size      = (sb->s_rev_level >= 1 && sb->s_inode_size > 0)
                         ? sb->s_inode_size : 128;
 
+    // Reject a degenerate superblock (all fields untrusted on-disk data): a zero
+    // total block count would make every block-range check fail.  s_block_size
+    // was already validated by ext2_block_size_checked.
+    if (s_blocks_count == 0) return 0;
+    // The per-group block and inode bitmaps each occupy one block, so blocks-
+    // and inodes-per-group must each be in [1, block_size*8].  A larger forged
+    // value would overrun the fixed 4096-byte bitmap scratch in alloc/free ->
+    // heap OOB read/write.  Refuse the mount.
+    if (!ext2_group_geom_valid(s_blocks_per_grp, s_inodes_per_grp, s_block_size))
+        return 0;
+
+    // s_inode_size is untrusted (u16 on disk): a value that is not a power of two,
+    // smaller than the inode struct we copy, or larger than the block makes an inode
+    // straddle the bcache slot -> OOB read in inode_load_into / OOB write in
+    // inode_disk_write.  Refuse the mount.
+    if (!ext2_inode_size_valid(s_inode_size, s_block_size)) return 0;
+
     // Number of block groups.
-    s_num_groups = (sb->s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
+    s_num_groups = (s_blocks_count + s_blocks_per_grp - 1) / s_blocks_per_grp;
 
     // One spinlock per group for bitmap RMW + BGD counter updates.
     // Two CPUs allocating in different groups never contend.  Allocated
@@ -787,13 +1010,7 @@ uint8_t ext2_init(uint32_t part_lba) {
     return 1;
 }
 
-// ── String helpers ─────────────────────────────────────────────────────────
-
-static uint32_t str_len(const char* s) {
-    uint32_t n = 0;
-    while (s[n]) n++;
-    return n;
-}
+// str_len lives in kstr.h (shared string utils).
 
 // ── Block address resolution (direct + single indirect) ───────────────────
 
@@ -964,6 +1181,10 @@ static uint32_t inode_build_run(const ext2_inode_t* ino, uint32_t blk_idx,
 
 // ── Directory lookup ───────────────────────────────────────────────────────
 
+// Defined below (before ext2_readdir); forward-declared so dir_lookup can use
+// the same dirent-name bounds clamp.
+uint32_t ext2_dirent_namelen_clamp(uint32_t off, uint32_t name_len, uint32_t blk_bytes);
+
 // Find a directory entry named `name` (length `name_len`) inside the directory
 // inode `dir_ino`. Returns the inode number or 0 if not found.
 static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32_t name_len) {
@@ -989,8 +1210,12 @@ static uint32_t dir_lookup(const ext2_inode_t* dir_ino, const char* name, uint32
         while (off + 8 <= blk_bytes) {
             const ext2_dirent_t* de = (const ext2_dirent_t*)(r.data + off);
             if (de->rec_len == 0) break;
+            // Clamp guard: a corrupt dirent near the block tail could claim a
+            // name that runs past the 4096-byte bcache slot; only compare when
+            // the name actually fits in the block (same boundary as readdir).
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
+                ext2_dirent_namelen_clamp(off, de->name_len, blk_bytes) >= name_len &&
                 kmemeq(de->name, name, name_len)) {
                 found = de->inode;
                 break;
@@ -1111,7 +1336,10 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                 // Sparse block(s): zero-fill without any disk I/O.
                 __builtin_memset(dst + total, 0, bytes);
             } else {
-                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                // Untrusted block ptr from inode/indirect -> never DMA a run
+                // that escapes the filesystem.
+                if (!ext2_run_valid(phys_blk, run)) return -1;
+                uint64_t lba     = ext2_blk_to_lba(phys_blk);   // 64-bit LBA: must not wrap
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
                 // User-space buffer → scatter-gather zero-copy via HHDM page
@@ -1123,13 +1351,22 @@ static int64_t ext2_vfs_read(vfs_file_t* self, void* buf, uint64_t len) {
                 } else {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
-                // Warm the block cache from the just-DMA'd data so a second
-                // exec of the same binary is a pure cache hit.  bcache_fill
-                // silently drops updates for currently-pinned slots — harmless.
-                for (uint32_t i = 0; i < run; i++)
-                    bcache_fill(phys_blk + i,
-                                dest + (uint64_t)i * s_block_size,
-                                s_block_size);
+                // Warm the SHARED block cache from the just-DMA'd data so a
+                // second exec of the same binary is a pure cache hit -- but ONLY
+                // when the source is a trusted KERNEL buffer (ELF loader / demand
+                // paging, is_user==0).  For a user destination `dest` is unpinned
+                // user memory (ahci_read_user unpinned it) that a sibling thread
+                // can overwrite between the DMA and this memcpy: warming from it
+                // would poison the shared cross-process cache slot tagged
+                // phys_blk with attacker bytes (and a racing munmap would fault
+                // here in kernel mode).  The user-read path simply forgoes the
+                // opportunistic warm; a later read re-fills from disk.  (bcache_
+                // fill silently drops updates for currently-pinned slots.)
+                if (!is_user)
+                    for (uint32_t i = 0; i < run; i++)
+                        bcache_fill(phys_blk + i,
+                                    dest + (uint64_t)i * s_block_size,
+                                    s_block_size);
             }
             // file_blks_left rounds UP, so a run covering the file's
             // final block DMA'd that block's tail slack into dst too.
@@ -1206,7 +1443,9 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
             if (!phys_blk) {
                 __builtin_memset(dst + total, 0, bytes);
             } else {
-                uint32_t lba     = s_part_lba + phys_blk * s_sectors_per_blk;
+                // Untrusted block ptr -> bound the run to the filesystem.
+                if (!ext2_run_valid(phys_blk, run)) return -1;
+                uint64_t lba     = ext2_blk_to_lba(phys_blk);   // 64-bit LBA: must not wrap
                 uint32_t sectors = run * s_sectors_per_blk;
                 uint8_t* dest    = dst + total;
                 uint8_t is_user = ((uint64_t)dest < HHDM_OFFSET);
@@ -1215,11 +1454,23 @@ static int64_t ext2_vfs_pread(vfs_file_t* self, void* buf, uint64_t len, uint64_
                 } else {
                     if (!ahci_read(lba, dest, sectors)) return -1;
                 }
-                for (uint32_t i = 0; i < run; i++)
-                    bcache_fill(phys_blk + i,
-                                dest + (uint64_t)i * s_block_size,
-                                s_block_size);
+                // Warm the SHARED cache ONLY from a trusted kernel source -- a
+                // user `dest` is unpinned user memory a sibling thread can
+                // overwrite between the DMA and this memcpy, which would poison
+                // the cross-process cache slot tagged phys_blk (same as
+                // ext2_vfs_read above).
+                if (!is_user)
+                    for (uint32_t i = 0; i < run; i++)
+                        bcache_fill(phys_blk + i,
+                                    dest + (uint64_t)i * s_block_size,
+                                    s_block_size);
             }
+            // file_blks_left rounds UP, so a run covering the file's final block
+            // DMA'd that block's tail slack past EOF into dst.  Clamp the byte
+            // COUNT to i_size exactly as ext2_vfs_read does -- without this a
+            // pread past a partial final block returns phantom on-disk slack
+            // bytes (stale data past end-of-file = info-exposure).
+            if (bytes > remain_file) bytes = remain_file;
             total   += bytes;
             cur_pos += bytes;
             continue;
@@ -1298,7 +1549,9 @@ static int64_t ext2_vfs_write(vfs_file_t* self, const void* buf, uint64_t len) {
     fd->inode.i_blocks = ((fd->file_size + s_block_size - 1) / s_block_size) * (s_block_size / 512);
     irtree_leaf_t* leaf = inode_lock(fd->ino);
     if (leaf) {
+        inode_pub_begin(leaf);
         leaf->inode = fd->inode;
+        inode_pub_end(leaf);
         inode_writeback(leaf);
         inode_unlock(leaf);
     }
@@ -1369,29 +1622,18 @@ static vfs_file_t* ext2_open_by_ino(uint32_t ino, const char* path) {
     fd->file_size = inode.i_size;
     fd->inode     = inode;
 
-    vfs_file_t* f = (vfs_file_t*)kmalloc(sizeof(vfs_file_t));
+    vfs_file_t* f = vfs_alloc_file();   // kmalloc+zero, waitq wired, refcount=1
     if (!f) { kfree(fd); return NULL; }
-    __builtin_memset(f, 0, sizeof(*f));
 
-    f->read            = ext2_vfs_read;
-    f->write           = ext2_vfs_write;
-    f->seek            = ext2_vfs_seek;
-    f->pread           = ext2_vfs_pread;
-    f->close           = ext2_vfs_close;
-    f->poll            = NULL;
-    f->ioctl           = NULL;
-    f->ctx             = fd;
-    f->waitq           = &f->_waitq; wait_queue_init(f->waitq);
-    f->secondary_waitq = NULL;
-    f->flags           = 0;
-    f->refcount        = 1;
-    f->rights          = 0;
-    f->ino             = ino;
+    f->read  = ext2_vfs_read;
+    f->write = ext2_vfs_write;
+    f->seek  = ext2_vfs_seek;
+    f->pread = ext2_vfs_pread;
+    f->close = ext2_vfs_close;
+    f->ctx   = fd;
+    f->ino   = ino;
 
-    uint32_t pi = 0;
-    if (path)
-        while (pi < 255 && path[pi]) { f->path[pi] = path[pi]; pi++; }
-    f->path[pi] = '\0';
+    str_lcpy(f->path, path, sizeof(f->path));
     return f;
 }
 
@@ -1415,6 +1657,103 @@ vfs_file_t* ext2_open_ino(uint32_t ino, const char* path) {
 }
 
 // ── ext2_readdir ───────────────────────────────────────────────────────────
+
+// Bytes of an on-disk dirent's name that are safe to read: the smaller of the
+// claimed name_len and the bytes left in the block after the 8-byte dirent
+// header.  A corrupt/short on-disk dirent could otherwise claim a name_len that
+// runs past the end of the 4096-byte bcache slot -> out-of-bounds read (leaking
+// adjacent kernel memory into the returned filename).  Pure + bounds-only so it
+// can be unit-tested in isolation (ext2_readdir_clamp_selftest).
+uint32_t ext2_dirent_namelen_clamp(uint32_t off, uint32_t name_len,
+                                   uint32_t blk_bytes) {
+    uint32_t avail = (off + 8u <= blk_bytes) ? (blk_bytes - off - 8u) : 0u;
+    return name_len < avail ? name_len : avail;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the dirent name-length bound (the security boundary
+// that stops a corrupt on-disk dirent over-reading past the 4096-byte bcache
+// slot).  The 4088/4090 tail cases are exactly the over-read scenarios: the
+// header fits but the name would start at / past the slot end -> clamp to 0.
+void ext2_readdir_clamp_selftest(void) {
+    extern void kprintf(const char*, ...);
+    kprintf("[ext2_readdir_test] dirent name_len clamp bounds\n");
+    struct { uint32_t off, nlen, blk, want; } c[] = {
+        { 0,    5,   4096, 5  },   // fits -> unchanged
+        { 4088, 200, 4096, 0  },   // header ends at slot end, name OOB -> 0
+        { 4090, 1,   4096, 0  },   // header itself overruns -> 0
+        { 4078, 200, 4096, 10 },   // only 10 bytes left in block
+        { 4000, 255, 4096, 88 },   // avail = 4096-4000-8
+        { 100,  50,  120,  12 },   // short final block: avail = 120-100-8
+        { 0,    0,   4096, 0  },   // empty name
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = ext2_dirent_namelen_clamp(c[i].off, c[i].nlen, c[i].blk);
+        if (got != c[i].want) {
+            kprintf_atomic("[ext2_readdir_test] FAIL off=%u nlen=%u blk=%u got=%u want=%u\n",
+                    c[i].off, c[i].nlen, c[i].blk, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_readdir_test] SELF-TEST FAILED\n"
+                  : "[ext2_readdir_test] SELF-TEST PASSED (name clamped to block bounds)\n");
+}
+
+// Deterministic test of the mount-time block-size validation: only log 0/1/2
+// (1024/2048/4096) are accepted, and every accepted size is <= the fixed
+// buffer max.  log 3 (8192) is the first overflow; 31/32 are the shift-UB edge.
+void ext2_block_size_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t log, want; } c[] = {
+        { 0,  1024 },   // 1024
+        { 1,  2048 },   // 2048
+        { 2,  4096 },   // 4096 == EXT2_BLOCK_SIZE_MAX
+        { 3,  0    },   // 8192 -> rejected (would overrun the 4096 buffers)
+        { 10, 0    },   // huge -> rejected
+        { 31, 0    },   // rejected
+        { 32, 0    },   // shift-UB region -> rejected
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = ext2_block_size_checked(c[i].log);
+        if (got != c[i].want || (got != 0 && got > EXT2_BLOCK_SIZE_MAX)) {
+            kprintf_atomic("[ext2_blksz_test] FAIL log=%u got=%u want=%u\n",
+                    c[i].log, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_blksz_test] SELF-TEST FAILED\n"
+                  : "[ext2_blksz_test] SELF-TEST PASSED (block size validated <= 4096)\n");
+}
+
+// Pure test of ext2_group_geom_valid (the bitmap-OOB mount guard): blocks- and
+// inodes-per-group must be in [1, block_size*8] so the in-group bit index stays
+// within the one-block (<= 4096-byte) bitmap scratch.
+void ext2_group_geom_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t bpg, ipg, bs, want; } c[] = {
+        { 8192,  8192,  1024, 1 },   // 1 KiB blocks: cap 8192 -> legit max passes
+        { 8193,  100,   1024, 0 },   // blocks_per_group over cap -> reject
+        { 100,   8193,  1024, 0 },   // inodes_per_group over cap -> reject
+        { 32768, 32768, 4096, 1 },   // 4 KiB blocks: cap 32768 -> legit max passes
+        { 32769, 100,   4096, 0 },   // over cap -> reject
+        { 0,     100,   1024, 0 },   // zero blocks -> reject
+        { 100,   0,     1024, 0 },   // zero inodes -> reject
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_group_geom_valid(c[i].bpg, c[i].ipg, c[i].bs);
+        if ((got != 0) != (c[i].want != 0)) {
+            kprintf_atomic("[ext2_geom] FAIL bpg=%u ipg=%u bs=%u got=%d want=%u\n",
+                    c[i].bpg, c[i].ipg, c[i].bs, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_geom] SELF-TEST FAILED\n"
+                  : "[ext2_geom] SELF-TEST PASSED (group geometry bounded to block_size*8)\n");
+}
+#endif
 
 int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
     if (!s_mounted || !entries || max <= 0) return -1;
@@ -1451,7 +1790,9 @@ int ext2_readdir(const char* path, ext2_entry_t* entries, int max) {
             if (de->rec_len == 0) break;
 
             if (de->inode != 0) {
-                uint32_t nlen = de->name_len;
+                // Clamp to what actually fits in this block so a corrupt
+                // dirent's name_len can't over-read past the bcache slot.
+                uint32_t nlen = ext2_dirent_namelen_clamp(off, de->name_len, blk_bytes);
                 // Skip "." and ".."
                 int is_dot = (nlen == 1 && de->name[0] == '.');
                 int is_dotdot = (nlen == 2 && de->name[0] == '.' && de->name[1] == '.');
@@ -1815,6 +2156,10 @@ static uint8_t dir_add_entry(uint32_t dir_ino_num, const char* name,
         while (off + 8 <= blk_bytes) {
             ext2_dirent_t* de = (ext2_dirent_t*)(dae_buf + off);
             if (de->rec_len == 0) break;
+            // Untrusted on-disk rec_len/name_len: a corrupt entry would underflow the
+            // slack below and write the split entry past dae_buf (heap OOB).  A
+            // malformed entry stops the walk (we append to a fresh block instead).
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
 
             // Check if this entry has slack space we can use.
             uint32_t actual_len = 8 + de->name_len;
@@ -1864,7 +2209,9 @@ success:
     // Both happen under the seqlock writer side held by inode_lock, so
     // a concurrent reader sees either the pre-update or post-update
     // inode but never a torn snapshot.
+    inode_pub_begin(dir_leaf);
     dir_leaf->inode = dir_inode;
+    inode_pub_end(dir_leaf);
     inode_writeback(dir_leaf);
     inode_unlock(dir_leaf);
     return 1;
@@ -1902,6 +2249,9 @@ static uint8_t dir_remove_entry(uint32_t dir_ino_num, const char* name) {
         while (off + 8 <= blk_bytes) {
             ext2_dirent_t* de = (ext2_dirent_t*)(dre_buf + off);
             if (de->rec_len == 0) break;
+            // Untrusted on-disk rec_len/name_len: bound the entry to the block so the
+            // kmemeq name compare below cannot read past dre_buf (heap OOB read).
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
 
             if (de->inode != 0 &&
                 de->name_len == (uint8_t)name_len &&
@@ -1924,41 +2274,307 @@ out:
     return ok;
 }
 
+// Find the ".." entry in a directory block and repoint it at new_ino.  The
+// untrusted on-disk rec_len/name_len are bounded to the block (the same
+// ext2_dirent_in_block discipline dir_remove_entry uses) so the scan cannot read
+// past `block`.  Only the inode field is touched -- rec_len/name_len/name are
+// left intact so the entry stays valid.  Returns 1 if ".." was found+updated,
+// 0 otherwise.  Pure (no I/O) -> unit-tested by ext2_dotdot_repoint_selftest.
+static uint8_t dirent_repoint_dotdot(uint8_t* block, uint32_t blk_bytes,
+                                     uint32_t new_ino) {
+    uint32_t off = 0;
+    while (off + 8 <= blk_bytes) {
+        ext2_dirent_t* de = (ext2_dirent_t*)(block + off);
+        if (de->rec_len == 0) break;
+        if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
+        if (de->inode != 0 && de->name_len == 2 &&
+            de->name[0] == '.' && de->name[1] == '.') {
+            de->inode = new_ino;
+            return 1;
+        }
+        off += de->rec_len;
+    }
+    return 0;
+}
+
+// Repoint a directory's ".." entry at new_parent_ino.  Used by rename when a
+// directory moves to a different parent: ".." lives in the directory's first
+// data block.  Returns 1 on success.  Caller holds s_rename_lock; this takes the
+// directory's own inode lock for the read-modify-write of its data block.
+static uint8_t dir_set_dotdot(uint32_t dir_ino_num, uint32_t new_parent_ino) {
+    irtree_leaf_t* dir_leaf = inode_lock(dir_ino_num);
+    if (!dir_leaf) return 0;
+    ext2_inode_t dir_inode = dir_leaf->inode;
+    uint8_t ok = 0;
+    uint32_t blk = inode_get_block(&dir_inode, 0);   // ".." is in block 0
+    if (blk) {
+        uint8_t* buf = (uint8_t*)kmalloc(4096);
+        if (buf) {
+            if (read_block(blk, buf)) {
+                uint32_t blk_bytes = (dir_inode.i_size < s_block_size)
+                                     ? dir_inode.i_size : s_block_size;
+                if (dirent_repoint_dotdot(buf, blk_bytes, new_parent_ino)) {
+                    write_block(blk, buf);
+                    ok = 1;
+                }
+            }
+            kfree(buf);
+        }
+    }
+    inode_unlock(dir_leaf);
+    return ok;
+}
+
 // ── Path utilities ─────────────────────────────────────────────────────────
 
 // Split path into parent path and basename.
 // parent_out must be >= str_len(path)+1 bytes.
 // Returns the basename pointer within `path`.
-static const char* path_split(const char* path, char* parent_out) {
-    uint32_t len = str_len(path);
-    // Find last '/'.
-    int last_slash = -1;
-    for (int i = (int)len - 1; i >= 0; i--) {
-        if (path[i] == '/') { last_slash = i; break; }
-    }
+// Max path length the FS handles (matches sys_open's char[512] user-path copy).
+// Every path_split parent buffer is sized to this so a path sys_open accepts is
+// never spuriously rejected, while the explicit `cap` argument keeps the copy
+// in bounds REGARDLESS of buffer size (defense in depth).
+#define EXT2_PATH_MAX 512
 
-    if (last_slash <= 0) {
-        // Parent is "/".
-        parent_out[0] = '/';
-        parent_out[1] = '\0';
-        // Basename starts after '/' at position 0, or at 0 if no slash.
-        return (last_slash == 0) ? path + 1 : path;
-    }
+// path_split (the single bounded dirname primitive) now lives in kstr.h next to
+// str_len/str_eq/str_lcpy so every filesystem shares the one bound (was here,
+// but virtfs hand-rolled its own copy and dropped the terminator bound).
 
-    // Copy up to last_slash.
-    for (int i = 0; i < last_slash; i++) parent_out[i] = path[i];
-    parent_out[last_slash] = '\0';
-    return path + last_slash + 1;
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the physical block-number range checks that stop an
+// untrusted on-disk block pointer from becoming a wild device LBA.  Drives the
+// pure helpers with a fixed filesystem shape (first-data-block 1, 100 blocks)
+// so no mounted image is needed; covers the boundary + the overflow-safe run.
+void ext2_block_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    // Single block in [1,100): 0 and >=100 (and 0xFFFFFFFF) are out of range.
+    struct { uint32_t blk; int want; } b[] = {
+        { 0, 0 }, { 1, 1 }, { 50, 1 }, { 99, 1 }, { 100, 0 }, { 0xFFFFFFFFu, 0 },
+    };
+    for (unsigned i = 0; i < sizeof(b)/sizeof(b[0]); i++) {
+        int got = ext2_block_in_range(b[i].blk, 1u, 100u);
+        if (got != b[i].want) {
+            kprintf_atomic("[ext2_blkvalid] FAIL blk=%u got=%d want=%d\n",
+                    b[i].blk, got, b[i].want);
+            fails++;
+        }
+    }
+    // Run [start, start+run) within [1,100), including a uint32 wrap case.
+    struct { uint32_t start, run; int want; } r[] = {
+        { 1, 99, 1 },                 // 1..99 fits exactly
+        { 1, 100, 0 },                // would reach block 100 -> reject
+        { 50, 50, 1 },                // 50..99 fits
+        { 50, 51, 0 },                // reaches 100 -> reject
+        { 99, 1, 1 },                 // just block 99
+        { 99, 2, 0 },                 // reaches 100 -> reject
+        { 1, 0, 1 },                  // empty run is vacuously ok
+        { 0xFFFFFF00u, 0x200u, 0 },   // start+run wraps uint32 -> reject
+    };
+    for (unsigned i = 0; i < sizeof(r)/sizeof(r[0]); i++) {
+        int got = ext2_run_in_range(r[i].start, r[i].run, 1u, 100u);
+        if (got != r[i].want) {
+            kprintf_atomic("[ext2_blkvalid] FAIL run start=%u run=%u got=%d want=%d\n",
+                    r[i].start, r[i].run, got, r[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_blkvalid] SELF-TEST FAILED\n"
+                  : "[ext2_blkvalid] SELF-TEST PASSED (block + run range, overflow-safe)\n");
 }
+
+// ext2_blk_lba forms the device LBA in 64-bit so blk*spb cannot wrap a u32 and
+// hit a wrong sector.  Drive the WRAP boundary explicitly: a 32-bit product
+// would truncate these, a correct 64-bit one does not.
+void ext2_blk_lba_selftest(void) {
+    kprintf("[ext2_blklba] ext2_blk_lba must form a 64-bit LBA without u32 wrap\n");
+    int fails = 0;
+    struct { uint32_t part, blk, spb; uint64_t want; } c[] = {
+        { 2,       0,           8, 2ULL },            // blk 0 -> just the partition base
+        { 2,       100,         8, 802ULL },          // normal small block
+        { 0,       0x20000000u, 8, 0x100000000ULL },  // blk*spb == 2^32: u32 would wrap to 0
+        { 0x1000,  0x20000000u, 8, 0x100001000ULL },  // + part base, still past 2^32
+        { 0,       0xFFFFFFFFu, 8, 0x7FFFFFFF8ULL },   // max block number, no wrap
+        { 7,       0x10000000u, 4, 0x40000007ULL },    // mixed spb=4
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint64_t got = ext2_blk_lba(c[i].part, c[i].blk, c[i].spb);
+        if (got != c[i].want) {
+            kprintf_atomic("[ext2_blklba] FAIL part=0x%lx blk=0x%lx spb=%u got=0x%lx want=0x%lx\n",
+                    (unsigned long)c[i].part, (unsigned long)c[i].blk, c[i].spb,
+                    (unsigned long)got, (unsigned long)c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_blklba] SELF-TEST FAILED\n"
+                  : "[ext2_blklba] SELF-TEST PASSED (64-bit LBA, no u32 wrap)\n");
+}
+
+// ext2_inode_size_valid gates the untrusted s_inode_size at mount so an inode can
+// never straddle the bcache slot (the OOB read/write at inode_load_into /
+// inode_disk_write).  Drive the reject cases a `> 0` check would have let through.
+void ext2_inode_size_valid_selftest(void) {
+    kprintf("[ext2_isz] ext2_inode_size_valid must reject non-pow2 / too-small / too-big\n");
+    int fails = 0;
+    struct { uint32_t isz, bsz; int want; } c[] = {
+        { 128,  4096, 1 },   // standard inode
+        { 256,  4096, 1 },   // large inode, power of 2
+        { 4096, 4096, 1 },   // inode == block (1 per block)
+        { 128,  1024, 1 },   // smallest supported block
+        { 0,    4096, 0 },   // zero
+        { 64,   4096, 0 },   // power of 2 but < sizeof(ext2_inode_t)
+        { 192,  4096, 0 },   // in range but NOT a power of two
+        { 4032, 4096, 0 },   // the crafted-straddle case (not a power of two)
+        { 8192, 4096, 0 },   // larger than the block
+        { 130,  4096, 0 },   // not a power of two
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_inode_size_valid(c[i].isz, c[i].bsz);
+        if (got != c[i].want) {
+            kprintf_atomic("[ext2_isz] FAIL isz=%u bsz=%u got=%d want=%d\n",
+                    c[i].isz, c[i].bsz, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_isz] SELF-TEST FAILED\n"
+                  : "[ext2_isz] SELF-TEST PASSED (inode-size pow2 + range validation)\n");
+}
+
+// ext2_dirent_in_block gates the untrusted on-disk rec_len/name_len so dir_add_entry's
+// slack split (and dir_remove_entry's name compare) stay inside the 4096-byte block.
+// Drive the underflow + past-block reject cases a bare walk would have written/read OOB.
+void ext2_dirent_in_block_selftest(void) {
+    kprintf("[ext2_dirent] ext2_dirent_in_block must reject corrupt rec_len/name_len\n");
+    int fails = 0;
+    struct { uint32_t off, rec, nlen, blk, want; } c[] = {
+        { 0,    16,     5,   4096, 1 },   // valid: actual align(13)=16 == rec, in-block
+        { 0,    12,     4,   4096, 1 },   // valid: actual 12 == rec
+        { 4080, 16,     5,   4096, 1 },   // valid: exact fit, off+rec == blk
+        { 2048, 2048,   200, 4096, 1 },   // valid: large entry filling half the block
+        { 0,    16,     255, 4096, 0 },   // actual align(263)=264 > rec 16 -> slack underflow
+        { 4088, 16,     0,   4096, 0 },   // off+rec 4104 > blk -> runs past the block
+        { 0,    4,      0,   4096, 0 },   // rec_len 4 < 8 header -> reject
+        { 0,    0xFFFF, 10,  4096, 0 },   // huge rec_len past the block
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = ext2_dirent_in_block(c[i].off, c[i].rec, c[i].nlen, c[i].blk);
+        if (got != (int)c[i].want) {
+            kprintf_atomic("[ext2_dirent] FAIL off=%u rec=%u nlen=%u got=%d want=%u\n",
+                    c[i].off, c[i].rec, c[i].nlen, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ext2_dirent] SELF-TEST FAILED\n"
+                  : "[ext2_dirent] SELF-TEST PASSED (dirent rec_len/name_len bounds)\n");
+}
+
+// Deterministic test of dirent_repoint_dotdot (the F68 cross-parent dir-rename
+// fix core): in a constructed dir block it must repoint ONLY the ".." entry's
+// inode, leaving "."/sibling entries and all rec_len/name_len metadata intact,
+// and report not-found when there is no "..".
+void ext2_dotdot_repoint_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    const uint32_t bb = 1024;            // block_size-independent: pass blk_bytes
+    // Heap-allocate the block buffer: the kernel stack is only 8KiB (KSTACK_PAGES
+    // = 2), so a 4096-byte stack array would gut it -- every dir-block buffer in
+    // this file is kmalloc'd for exactly this reason.
+    uint8_t* blk = (uint8_t*)kmalloc(4096);
+    if (!blk) { kprintf_atomic("[ext2_dotdot] SELF-TEST FAILED (alloc)\n"); return; }
+
+    // Block: "." (ino 10), ".." (ino 20), "file" (ino 30, fills the rest).
+    __builtin_memset(blk, 0, 4096);
+    ext2_dirent_t* d  = (ext2_dirent_t*)(blk + 0);
+    d->inode = 10; d->rec_len = 12; d->name_len = 1; d->file_type = EXT2_FT_DIR;
+    d->name[0] = '.';
+    ext2_dirent_t* dd = (ext2_dirent_t*)(blk + 12);
+    dd->inode = 20; dd->rec_len = 12; dd->name_len = 2; dd->file_type = EXT2_FT_DIR;
+    dd->name[0] = '.'; dd->name[1] = '.';
+    ext2_dirent_t* f  = (ext2_dirent_t*)(blk + 24);
+    f->inode = 30; f->rec_len = (uint16_t)(bb - 24); f->name_len = 4;
+    f->file_type = EXT2_FT_REG_FILE;
+    f->name[0]='f'; f->name[1]='i'; f->name[2]='l'; f->name[3]='e';
+
+    if (!dirent_repoint_dotdot(blk, bb, 99)) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. not found\n"); }
+    if (dd->inode != 99) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. inode=%u (want 99)\n", dd->inode); }
+    if (dd->name_len != 2 || dd->rec_len != 12 || dd->name[0] != '.' || dd->name[1] != '.') {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL .. metadata clobbered\n"); }
+    if (d->inode != 10) { fails++; kprintf_atomic("[ext2_dotdot] FAIL . clobbered\n"); }
+    if (f->inode != 30) { fails++; kprintf_atomic("[ext2_dotdot] FAIL sibling clobbered\n"); }
+
+    // Block with NO ".." (only "." and a sibling) -> not found, nothing changes.
+    __builtin_memset(blk, 0, 4096);
+    d = (ext2_dirent_t*)(blk + 0);
+    d->inode = 10; d->rec_len = 12; d->name_len = 1; d->name[0] = '.';
+    f = (ext2_dirent_t*)(blk + 12);
+    f->inode = 30; f->rec_len = (uint16_t)(bb - 12); f->name_len = 1; f->name[0] = 'x';
+    if (dirent_repoint_dotdot(blk, bb, 99) != 0) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL spurious match (no ..)\n"); }
+    if (f->inode != 30 || d->inode != 10) {
+        fails++; kprintf_atomic("[ext2_dotdot] FAIL touched entries with no ..\n"); }
+
+    kfree(blk);
+    kprintf_atomic(fails ? "[ext2_dotdot] SELF-TEST FAILED\n"
+                         : "[ext2_dotdot] PASS (.. repointed, siblings + metadata intact)\n");
+}
+
+// Deterministic test of path_split's bound: a parent longer than the
+// destination buffer must be REJECTED (return NULL), never copied (the kernel
+// stack overflow this fixes).  Also checks normal splits + the exact boundary.
+void ext2_path_split_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    char buf[EXT2_PATH_MAX];
+
+    // Tiny inline compare (no str_eq in this TU).
+    #define EQ(a,b) ({ const char* _x=(a); const char* _y=(b); \
+                       while (*_x && *_x==*_y) { _x++; _y++; } *_x==*_y; })
+
+    const char* b;
+    b = path_split("/foo/bar", buf, sizeof(buf));        // normal split
+    if (!b || !EQ(b,"bar") || !EQ(buf,"/foo")) {
+        kprintf_atomic("[ext2_pathsplit] FAIL normal b=%p\n", (void*)b); fails++; }
+
+    b = path_split("/a", buf, sizeof(buf));              // root parent
+    if (!b || !EQ(b,"a") || !EQ(buf,"/")) {
+        kprintf_atomic("[ext2_pathsplit] FAIL root b=%p\n", (void*)b); fails++; }
+
+    // "/abcdefg/x": last '/' at index 8, parent "/abcdefg" is 8 chars -> needs
+    // 9 bytes (8 + NUL).  cap 9 fits exactly; cap 8 must reject.
+    b = path_split("/abcdefg/x", buf, 9u);
+    if (!b || !EQ(buf,"/abcdefg")) {
+        kprintf_atomic("[ext2_pathsplit] FAIL fit-9 b=%p\n", (void*)b); fails++; }
+    b = path_split("/abcdefg/x", buf, 8u);
+    if (b != (const char*)0) {                            // MUST reject, not overflow
+        kprintf_atomic("[ext2_pathsplit] FAIL overflow-8 not rejected\n"); fails++; }
+
+    // The bug case: a parent far larger than cap must reject with no copy.
+    b = path_split("/aaaaaaaaaaaaaaaaaaaa/x", buf, 8u);   // parent 20+ chars, cap 8
+    if (b != (const char*)0) {
+        kprintf_atomic("[ext2_pathsplit] FAIL long-parent not rejected\n"); fails++; }
+
+    #undef EQ
+    kprintf_atomic(fails ? "[ext2_pathsplit] SELF-TEST FAILED\n"
+                  : "[ext2_pathsplit] SELF-TEST PASSED (parent bound, no stack overflow)\n");
+}
+#endif /* MAKAOS_BOOT_SELFTESTS */
 
 // ── ext2_write_file ────────────────────────────────────────────────────────
 
-int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
+// True (0) iff `cred` may add/remove entries in directory `dir_ino` (write+exec).
+// Defined after the errno.h include below; forward-declared here so the mutating
+// ops can gate on the SAME parent inode they resolve (closes the path-TOCTOU).
+static int ext2_dir_write_ok(uint32_t dir_ino, const void* cred);
+
+int ext2_write_file(const char* path, const uint8_t* data, uint32_t size,
+                    const void* cred) {
     if (!s_mounted) return 0;
 
     // Split into parent dir and basename.
-    char parent_path[256];
-    const char* basename = path_split(path, parent_path);
+    char parent_path[EXT2_PATH_MAX];
+    const char* basename = path_split(path, parent_path, sizeof(parent_path));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(parent_path);
@@ -1970,26 +2586,49 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 
     uint32_t existing_ino = dir_lookup(&parent_inode, basename, str_len(basename));
 
+    // Creating a NEW file (existing_ino == 0) requires write+exec on THIS
+    // parent -- checked on the same parent_ino this call resolved and will
+    // dir_add_entry into, so a concurrent rename of an intermediate path
+    // component cannot land the create in a directory the caller was never
+    // authorized for (the path-TOCTOU).  A NULL cred (internal overwrite /
+    // truncate of an EXISTING file) skips it; it gates new-file creation only.
+    if (!existing_ino && cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
+
     // Scratch buffer reused for every block write below.  Lazily alloc'd
     // only after we've passed all the early-error checks in each branch.
     EXT2_SCRATCH_DECL(wr_buf);
 
     if (existing_ino) {
-        // Overwrite: free all old blocks.
-        ext2_inode_t old_inode;
-        if (!read_inode(existing_ino, &old_inode)) return 0;
-
-        // Free all data blocks.
-        free_inode_blocks(&old_inode);
-
-        // Now write new data into existing inode.
+        // Overwrite.  Hold the per-inode lock across the ENTIRE free -> realloc
+        // -> writeback.  Previously this ran on a read_inode SNAPSHOT with the
+        // lock taken only for the final writeback, so two concurrent writers to
+        // the same file (two O_TRUNC opens, or ftruncate+write) both snapshotted
+        // the same i_block[] and both ran free_inode_blocks -- the second freed
+        // blocks the first had already freed AND re-allocated, handing a live
+        // block back to the bitmap to be re-allocated to ANOTHER file (cross-file
+        // corruption).  inode_lock is the per-inode write_lock (serialises
+        // writers) + seqlock; the bitmap/bcache ops below never take inode_lock
+        // (the same lock order the final writeback already used), so no cycle.
         uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
-        uint32_t written = 0;
 
+        // Alloc the scratch BEFORE the lock: EXT2_SCRATCH_ALLOC has an embedded
+        // `return 0` on OOM, which under the lock would leak it.
         if (n_blocks > 0) EXT2_SCRATCH_ALLOC(wr_buf);
+
+        irtree_leaf_t* leaf = inode_lock(existing_ino);
+        if (!leaf) return 0;
+
+        // Work on a LOCAL copy of the (now lock-stable) inode so an error mid-way
+        // discards cleanly, exactly as the read_inode snapshot did before; the
+        // single inode_unlock + `return ok` below is the only exit under the lock.
+        ext2_inode_t work = leaf->inode;
+        free_inode_blocks(&work);
+
+        uint32_t written = 0;
+        int ok = 1;
         for (uint32_t bi = 0; bi < n_blocks; bi++) {
             uint32_t blk = alloc_block();
-            if (!blk) return 0;
+            if (!blk) { ok = 0; break; }
 
             uint32_t to_write = size - written;
             if (to_write > s_block_size) to_write = s_block_size;
@@ -1997,25 +2636,29 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
             __builtin_memcpy(wr_buf, data + written, to_write);
             __builtin_memset(wr_buf + to_write, 0, s_block_size - to_write);
 
-            if (!write_block(blk, wr_buf)) { free_block(blk); return 0; }
-            if (!inode_set_block(&old_inode, bi, blk)) { free_block(blk); return 0; }
+            if (!write_block(blk, wr_buf))        { free_block(blk); ok = 0; break; }
+            if (!inode_set_block(&work, bi, blk)) { free_block(blk); ok = 0; break; }
 
             written += to_write;
         }
 
-        old_inode.i_size   = size;
-        old_inode.i_blocks = n_blocks * (s_block_size / 512);
-        old_inode.i_mode   = EXT2_S_IFREG | 0644;
-        old_inode.i_links_count = 1;
-        {
-            irtree_leaf_t* leaf = inode_lock(existing_ino);
-            if (leaf) {
-                leaf->inode = old_inode;
-                inode_writeback(leaf);
-                inode_unlock(leaf);
-            }
+        if (ok) {
+            work.i_size        = size;
+            work.i_blocks      = n_blocks * (s_block_size / 512);
+            // Overwriting an EXISTING file must not re-stamp its mode: doing so
+            // silently widened every rewritten file to 0644 (a 0600 /etc/shadow
+            // became world-readable the first time anything rewrote it).  Only
+            // fill the mode in if it is not already a regular file.
+            if ((work.i_mode & 0xF000) != EXT2_S_IFREG)
+                work.i_mode    = EXT2_S_IFREG | 0644;
+            work.i_links_count = 1;
+            inode_pub_begin(leaf);
+            leaf->inode = work;          // commit to the cache only on success
+            inode_pub_end(leaf);
+            inode_writeback(leaf);
         }
-        return 1;
+        inode_unlock(leaf);
+        return ok;
     }
 
     // File doesn't exist — allocate a new inode.
@@ -2030,6 +2673,17 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     new_inode.i_mode        = EXT2_S_IFREG | 0644;
     new_inode.i_links_count = 1;
     new_inode.i_size        = size;
+    // A new file belongs to whoever CREATED it.  The inode is zeroed above, so
+    // without this every file created by any user came out uid=0/gid=0 (owned
+    // by root) -- invisible while fs_lookup ignored file permissions, but the
+    // moment that gate became real it would have left unprivileged processes
+    // unable to write back the files they had just created (e.g. in /tmp).
+    // A NULL cred is an internal kernel write and stays uid/gid 0.
+    if (cred) {
+        const cred_t* cc = (const cred_t*)cred;
+        new_inode.i_uid = (uint16_t)cc->euid;
+        new_inode.i_gid = (uint16_t)cc->egid;
+    }
 
     uint32_t n_blocks = (size + s_block_size - 1) / s_block_size;
     uint32_t written  = 0;
@@ -2063,8 +2717,10 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
     {
         irtree_leaf_t* leaf = inode_lock(new_ino);
         if (leaf) {
+            inode_pub_begin(leaf);
             leaf->inode = new_inode;
             leaf->valid = 1;
+            inode_pub_end(leaf);
             inode_writeback(leaf);
             inode_unlock(leaf);
         }
@@ -2085,10 +2741,10 @@ int ext2_write_file(const char* path, const uint8_t* data, uint32_t size) {
 
 // ── ext2_create ───────────────────────────────────────────────────────────
 // Create an empty file.  Returns 0 if the file already exists.
-int ext2_create(const char* path) {
+int ext2_create(const char* path, const void* cred) {
     if (!s_mounted) return 0;
-    char parent_path[256];
-    const char* basename = path_split(path, parent_path);
+    char parent_path[EXT2_PATH_MAX];
+    const char* basename = path_split(path, parent_path, sizeof(parent_path));
     if (!basename || basename[0] == '\0') return 0;
     uint32_t parent_ino = path_to_inode(parent_path);
     if (!parent_ino) return 0;
@@ -2096,8 +2752,9 @@ int ext2_create(const char* path) {
     if (!read_inode(parent_ino, &parent_inode)) return 0;
     // Fail if already exists.
     if (dir_lookup(&parent_inode, basename, str_len(basename))) return 0;
-    // Create empty file via ext2_write_file.
-    int r = ext2_write_file(path, (const uint8_t*)"", 0);
+    // Create empty file via ext2_write_file; pass cred so the parent write+exec
+    // check happens on ext2_write_file's OWN parent resolution (the create site).
+    int r = ext2_write_file(path, (const uint8_t*)"", 0, cred);
     // Phase 7C: invalidate any negative dentry that cached ENOENT
     // at this path.  After create, the path exists — future lookups
     // should re-resolve and install a positive dentry.
@@ -2108,7 +2765,7 @@ int ext2_create(const char* path) {
 // ── ext2_truncate ─────────────────────────────────────────────────────────
 // Truncate file to zero bytes.
 int ext2_truncate(const char* path) {
-    return ext2_write_file(path, (const uint8_t*)"", 0);
+    return ext2_write_file(path, (const uint8_t*)"", 0, NULL);  // existing file: no create-perm check
 }
 
 // ── ext2_truncate_to ──────────────────────────────────────────────────────
@@ -2143,7 +2800,7 @@ int ext2_truncate_to(const char* path, uint64_t length) {
         int64_t n = vfs_read(f, buf, new_size);
         vfs_close(f);
         if (n < 0) { kfree(buf); return 0; }
-        int r = ext2_write_file(path, buf, new_size);
+        int r = ext2_write_file(path, buf, new_size, NULL);  // existing file: no create-perm check
         kfree(buf);
         return r;
     } else {
@@ -2157,7 +2814,7 @@ int ext2_truncate_to(const char* path, uint64_t length) {
         if (n < 0) { kfree(buf); return 0; }
         // Zero the extended region.
         for (uint32_t i = cur_size; i < new_size; i++) buf[i] = 0;
-        int r = ext2_write_file(path, buf, new_size);
+        int r = ext2_write_file(path, buf, new_size, NULL);  // existing file: no create-perm check
         kfree(buf);
         return r;
     }
@@ -2168,10 +2825,31 @@ int ext2_truncate_to(const char* path, uint64_t length) {
 // Permission-aware path walk.  Checks execute (search) on every directory
 // component traversed.  Uses the same walk as path_to_inode internally.
 // cred is a const cred_t* — typed as void* to avoid the ext2.h → cred.h
-// dependency (cred.h is a security layer header, not an fs header).
+// dependency (cred.h is a security layer header, not an fs header).  The
+// headers themselves are pulled in at the top of this file, since the write
+// path also needs cred_t (to stamp a new inode's owner).
 #include "perm.h"
-#include "cred.h"
 #include "errno.h"
+
+// ── ext2_dir_write_ok ───────────────────────────────────────────────────────
+// Returns 0 iff `cred` (a cred_t*) may create/remove directory entries in
+// directory inode `dir_ino` -- i.e. write+exec on the dir -- else a negative
+// errno.  The mutating ops (unlink/mkdir/rename/create-via-write_file) call this
+// on the SAME parent inode they themselves resolved and are about to modify, so
+// the permission decision and the modification are on ONE resolution.  That
+// closes the path-TOCTOU: the syscall-layer check resolves the parent
+// separately, and a concurrent rename of an intermediate path component could
+// otherwise make the op act on a different parent than was permission-checked.
+static int ext2_dir_write_ok(uint32_t dir_ino, const void* cred) {
+    ext2_inode_t din;
+    if (!read_inode(dir_ino, &din)) return -ENOENT;
+    inode_perm_t ip = {
+        .uid = din.i_uid, .gid = din.i_gid,
+        .mode = din.i_mode & 0x1FF,
+        .inode_nr = dir_ino, .dev = 0, .nosuid = 0,
+    };
+    return vfs_check_perm(&ip, (const cred_t*)cred, ACL_PERM_WRITE | ACL_PERM_EXEC);
+}
 
 // Phase 7B: dcache-accelerated path walk.
 //
@@ -2279,18 +2957,23 @@ uint8_t ext2_read_inode(uint32_t ino, ext2_inode_t* out) {
 
 // ── ext2_mkdir ────────────────────────────────────────────────────────────
 
-int ext2_mkdir(const char* path) {
+int ext2_mkdir(const char* path, const void* cred) {
     if (!s_mounted) return 0;
 
     // Check it doesn't already exist.
     if (path_to_inode(path)) return 0; // already exists
 
-    char md_parent[256];
-    const char* basename = path_split(path, md_parent);
+    char md_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, md_parent, sizeof(md_parent));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(md_parent);
     if (!parent_ino) return 0;
+
+    // Write+exec on the resolved parent, BEFORE allocating anything (so a denial
+    // leaks nothing) and on the same parent_ino we dir_add_entry into below --
+    // closes the path-TOCTOU vs the syscall-layer check's separate resolution.
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
 
     // Allocate inode.
     uint32_t new_ino = alloc_inode();
@@ -2347,8 +3030,10 @@ int ext2_mkdir(const char* path) {
     {
         irtree_leaf_t* leaf = inode_lock(new_ino);
         if (leaf) {
+            inode_pub_begin(leaf);
             leaf->inode = new_inode;
             leaf->valid = 1;
+            inode_pub_end(leaf);
             inode_writeback(leaf);
             inode_unlock(leaf);
         }
@@ -2365,7 +3050,9 @@ int ext2_mkdir(const char* path) {
     {
         irtree_leaf_t* pleaf = inode_lock(parent_ino);
         if (pleaf) {
+            inode_pub_begin(pleaf);
             pleaf->inode.i_links_count++;
+            inode_pub_end(pleaf);
             inode_writeback(pleaf);
             inode_unlock(pleaf);
         }
@@ -2393,20 +3080,84 @@ int ext2_mkdir(const char* path) {
     return 1;
 }
 
+// ── link-count drop (shared by unlink + rename dst-removal) ─────────────────
+// Pure: drop one hard link.  Returns 1 if the inode should now be freed (the
+// count reached 0), 0 if other names still reference it.  The `> 0` guard
+// stops a corrupt/0 count from wrapping the u16 to 65535; a drop at 0 reports
+// "free" so an already-orphaned inode is reclaimed rather than leaked.
+static int ext2_link_drop(uint16_t* links) {
+    if (*links > 0) (*links)--;
+    return (*links == 0);
+}
+
+// Drop one link from an already-inode_lock'd leaf and free its inode + data
+// blocks ONLY when the link count reaches 0 (otherwise just write back the
+// decremented count).  Always consumes the lock.  This is the single
+// count-aware free site shared by ext2_unlink and ext2_rename's dst-removal so
+// the two cannot drift -- the rename path used to free unconditionally, which
+// destroyed a still-referenced multi-link inode.
+static void ext2_drop_link_locked(irtree_leaf_t* leaf, uint32_t ino) {
+    // Work on a LOCAL copy: free_inode_blocks does bitmap I/O while clearing
+    // i_block[]/i_blocks, so mutating the cached leaf->inode in place would let
+    // a reader see a half-freed inode (the sequence is even during I/O now).
+    // Compute the final inode off-cache, publish it atomically (brief seq
+    // bracket, no I/O), then persist.
+    ext2_inode_t work = leaf->inode;
+    uint16_t links = work.i_links_count;   // local: avoid &packed-member
+    int freed = ext2_link_drop(&links);
+    work.i_links_count = links;
+    if (freed) {
+        free_inode_blocks(&work);
+        work.i_dtime = 1;
+    }
+    inode_pub_begin(leaf);
+    leaf->inode = work;
+    inode_pub_end(leaf);
+    inode_writeback(leaf);
+    inode_unlock(leaf);
+    if (freed) free_inode_num(ino);
+}
+
+// Deterministic check of the link-drop decision shared by unlink + rename:
+// only the drop that takes the count to 0 reports "free", and a corrupt/0
+// count never wraps.  This is the core of the fix -- rename used to skip this
+// logic entirely and free a multi-link inode on every dst-removal.
+void ext2_link_drop_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
+    uint16_t c;
+    c = 2; if (ext2_link_drop(&c) != 0 || c != 1) fails++;   // 2->1: keep
+    c = 1; if (ext2_link_drop(&c) != 1 || c != 0) fails++;   // 1->0: free
+    c = 3;                                                    // 3->2->1->0
+    if (ext2_link_drop(&c) != 0 || c != 2) fails++;
+    if (ext2_link_drop(&c) != 0 || c != 1) fails++;
+    if (ext2_link_drop(&c) != 1 || c != 0) fails++;
+    c = 0; if (ext2_link_drop(&c) != 1 || c != 0) fails++;   // underflow guard: stays 0
+    if (fails)
+        kprintf_atomic("[ext2_link_drop] SELF-TEST FAILED (%d)\n", fails);
+    else
+        kprintf_atomic("[ext2_link_drop] PASS (free only at links==0, no u16 underflow)\n");
+}
+
 // ── ext2_unlink ───────────────────────────────────────────────────────────
 // Remove a regular file at `path`.  Returns 1 on success, 0 on failure.
-int ext2_unlink(const char* path) {
+int ext2_unlink(const char* path, const void* cred) {
     if (!s_mounted || !path) return 0;
 
     uint32_t ino = path_to_inode(path);
     if (!ino) return 0;
 
-    char ul_parent[256];
-    const char* basename = path_split(path, ul_parent);
+    char ul_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, ul_parent, sizeof(ul_parent));
     if (!basename || basename[0] == '\0') return 0;
 
     uint32_t parent_ino = path_to_inode(ul_parent);
     if (!parent_ino) return 0;
+
+    // Write+exec on the resolved parent, on the same parent_ino we
+    // dir_remove_entry from below -- closes the path-TOCTOU vs the syscall-layer
+    // check's separate resolution (a swapped intermediate dir is now denied).
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
 
     // Lock the target inode for the whole link-count decrement +
     // possible free.  A concurrent open() that snapshots inode.i_dtime
@@ -2428,17 +3179,7 @@ int ext2_unlink(const char* path) {
     if (!leaf) return 0;
 
     // Decrement link count; only free inode/data when it reaches 0.
-    if (leaf->inode.i_links_count > 0) leaf->inode.i_links_count--;
-    if (leaf->inode.i_links_count == 0) {
-        free_inode_blocks(&leaf->inode);
-        leaf->inode.i_dtime = 1;
-        inode_writeback(leaf);
-        inode_unlock(leaf);
-        free_inode_num(ino);
-    } else {
-        inode_writeback(leaf);
-        inode_unlock(leaf);
-    }
+    ext2_drop_link_locked(leaf, ino);
 
     // Phase 7C: invalidate the dentry that cached this path component.
     // Future lookups for (parent_ino, basename) will miss dcache and
@@ -2446,6 +3187,124 @@ int ext2_unlink(const char* path) {
     // the same name) or install a negative dentry.
     dcache_invalidate(parent_ino, basename, str_len(basename));
 
+    return 1;
+}
+
+// ── ext2_rmdir ──────────────────────────────────────────────────────────────
+
+// Returns 1 iff the directory holds only "." and ".." (every other dirent is a
+// hole, inode==0).  Walks all data blocks with the same bounded-dirent
+// discipline as dir_remove_entry so a corrupt on-disk rec_len cannot over-read.
+// Operates on a caller-provided inode snapshot (no lock held during the block
+// I/O).  On OOM returns 0 (treated as "not empty" -> rmdir refuses, safe).
+static int ext2_dir_is_empty(const ext2_inode_t* dir_inode) {
+    uint32_t bytes_left = dir_inode->i_size;
+    uint32_t blk_idx    = 0;
+    EXT2_SCRATCH_DECL(die_buf);
+    while (bytes_left > 0) {
+        uint32_t blk = inode_get_block(dir_inode, blk_idx);
+        blk_idx++;
+        if (!blk) break;
+        if (!die_buf) EXT2_SCRATCH_ALLOC(die_buf);
+        if (!read_block(blk, die_buf)) return 0;
+
+        uint32_t blk_bytes = (bytes_left < s_block_size) ? bytes_left : s_block_size;
+        uint32_t off = 0;
+        while (off + 8 <= blk_bytes) {
+            ext2_dirent_t* de = (ext2_dirent_t*)(die_buf + off);
+            if (de->rec_len == 0) break;
+            if (!ext2_dirent_in_block(off, de->rec_len, de->name_len, blk_bytes)) break;
+            if (de->inode != 0) {
+                int is_dot    = (de->name_len == 1 && de->name[0] == '.');
+                int is_dotdot = (de->name_len == 2 && de->name[0] == '.' &&
+                                                      de->name[1] == '.');
+                if (!is_dot && !is_dotdot) return 0;   // a real child -> not empty
+            }
+            off += de->rec_len;
+        }
+        if (blk_bytes >= s_block_size) bytes_left -= s_block_size;
+        else                          bytes_left = 0;
+    }
+    return 1;
+}
+
+// Remove an EMPTY directory.  Returns 1 on success, 0 on failure (not found,
+// not a directory, non-empty, or a permission denial).  Mirrors ext2_unlink's
+// lock discipline (never hold the target inode lock across dir_remove_entry,
+// which locks the parent) and, because that brief unlock reopens a create-race
+// window, re-checks emptiness after the entry is gone and rolls the removal
+// back rather than orphan any child that raced in.
+int ext2_rmdir(const char* path, const void* cred) {
+    if (!s_mounted || !path) return 0;
+
+    uint32_t ino = path_to_inode(path);
+    if (!ino) return 0;
+
+    char rd_parent[EXT2_PATH_MAX];
+    const char* basename = path_split(path, rd_parent, sizeof(rd_parent));
+    if (!basename || basename[0] == '\0') return 0;
+    // Refuse "." and ".." as the leaf.
+    if (basename[0] == '.' &&
+        (basename[1] == '\0' || (basename[1] == '.' && basename[2] == '\0')))
+        return 0;
+
+    uint32_t parent_ino = path_to_inode(rd_parent);
+    if (!parent_ino || parent_ino == ino) return 0;   // never the root itself
+
+    // Write+exec on the resolved parent, on the same parent_ino we
+    // dir_remove_entry from below (path-TOCTOU close, as in ext2_unlink).
+    if (cred && ext2_dir_write_ok(parent_ino, cred) != 0) return 0;
+
+    // Must be an EMPTY directory.  Snapshot the inode under the lock, then do
+    // the block I/O for the empty scan without holding it.
+    irtree_leaf_t* leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    if ((leaf->inode.i_mode & 0xF000) != EXT2_S_IFDIR) { inode_unlock(leaf); return 0; }
+    ext2_inode_t dir_copy = leaf->inode;
+    inode_unlock(leaf);
+    if (!ext2_dir_is_empty(&dir_copy)) return 0;
+
+    // Detach from the parent first (makes the dir unreachable by name).
+    if (!dir_remove_entry(parent_ino, basename)) return 0;
+
+    // Re-check emptiness now the entry is gone: if a create raced in during the
+    // brief unlock, roll the detach back rather than orphan the child.
+    leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    dir_copy = leaf->inode;
+    inode_unlock(leaf);
+    if (!ext2_dir_is_empty(&dir_copy)) {
+        dir_add_entry(parent_ino, basename, ino, EXT2_FT_DIR);   // rollback
+        return 0;
+    }
+
+    // Free the empty directory: release its data block(s) + inode.
+    leaf = inode_lock(ino);
+    if (!leaf) return 0;
+    ext2_inode_t work = leaf->inode;
+    free_inode_blocks(&work);
+    work.i_links_count = 0;
+    work.i_dtime       = 1;
+    inode_pub_begin(leaf);
+    leaf->inode = work;
+    inode_pub_end(leaf);
+    inode_writeback(leaf);
+    inode_unlock(leaf);
+    free_inode_num(ino);
+
+    // The removed dir's ".." held a link on the parent; drop it (RMW under lock).
+    {
+        irtree_leaf_t* pleaf = inode_lock(parent_ino);
+        if (pleaf) {
+            inode_pub_begin(pleaf);
+            if (pleaf->inode.i_links_count > 0) pleaf->inode.i_links_count--;
+            inode_pub_end(pleaf);
+            inode_writeback(pleaf);
+            inode_unlock(pleaf);
+        }
+    }
+
+    dcache_invalidate(parent_ino, basename, str_len(basename));
     return 1;
 }
 
@@ -2458,7 +3317,7 @@ int ext2_unlink(const char* path) {
 // exists at both names (or both nowhere).  rename is a control-plane
 // operation — taking a single global lock for it is what Linux does
 // and is fine for any reasonable workload.
-int ext2_rename(const char* src, const char* dst) {
+int ext2_rename(const char* src, const char* dst, const void* cred) {
     if (!s_mounted || !src || !dst) return 0;
 
     spin_lock(&s_rename_lock);
@@ -2472,21 +3331,39 @@ int ext2_rename(const char* src, const char* dst) {
     uint8_t is_dir = ((src_inode.i_mode & 0xF000) == EXT2_S_IFDIR);
 
     // Resolve src parent/basename.
-    char rn_src_parent[256];
-    const char* src_base = path_split(src, rn_src_parent);
+    char rn_src_parent[EXT2_PATH_MAX];
+    const char* src_base = path_split(src, rn_src_parent, sizeof(rn_src_parent));
     if (!src_base || src_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t src_parent_ino = path_to_inode(rn_src_parent);
     if (!src_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
 
     // Resolve dst parent/basename.
-    char rn_dst_parent[256];
-    const char* dst_base = path_split(dst, rn_dst_parent);
+    char rn_dst_parent[EXT2_PATH_MAX];
+    const char* dst_base = path_split(dst, rn_dst_parent, sizeof(rn_dst_parent));
     if (!dst_base || dst_base[0] == '\0') { spin_unlock(&s_rename_lock); return 0; }
     uint32_t dst_parent_ino = path_to_inode(rn_dst_parent);
     if (!dst_parent_ino) { spin_unlock(&s_rename_lock); return 0; }
 
+    // Write+exec on BOTH resolved parents -- removing the src entry needs write
+    // on the src parent, adding the dst entry needs write on the dst parent.
+    // Checked here on the same inodes the op modifies (closes the path-TOCTOU),
+    // AND closes the gap where sys_rename only checked the SRC parent so a
+    // rename INTO a no-write directory wrongly succeeded.
+    if (cred && (ext2_dir_write_ok(src_parent_ino, cred) != 0 ||
+                 ext2_dir_write_ok(dst_parent_ino, cred) != 0)) {
+        spin_unlock(&s_rename_lock);
+        return 0;
+    }
+
     // If dst exists as a regular file, unlink it under its inode lock.
     uint32_t dst_ino = path_to_inode(dst);
+    // rename(2): if src and dst resolve to the SAME file (same inode, including
+    // two hard links to it), do nothing and succeed.  Without this guard the
+    // dst-removal below frees the inode and its blocks, then dir_add_entry
+    // re-adds a dirent pointing at the now-freed inode -- data loss + a dangling
+    // directory entry.  (The dir-into-own-subtree case is rejected earlier in
+    // sys_rename; here dst_ino is 0 for that case, so this does not mask it.)
+    if (dst_ino && dst_ino == src_ino) { spin_unlock(&s_rename_lock); return 1; }
     if (dst_ino) {
         irtree_leaf_t* dleaf = inode_lock(dst_ino);
         if (!dleaf) { spin_unlock(&s_rename_lock); return 0; }
@@ -2500,15 +3377,19 @@ int ext2_rename(const char* src, const char* dst) {
         // potential parent↔child deadlock if a future codepath nests
         // them in the opposite order).
         inode_unlock(dleaf);
-        dir_remove_entry(dst_parent_ino, dst_base);
-        dleaf = inode_lock(dst_ino);
-        if (dleaf) {
-            free_inode_blocks(&dleaf->inode);
-            dleaf->inode.i_links_count = 0;
-            inode_writeback(dleaf);
-            inode_unlock(dleaf);
+        // Remove dst's name and drop ONE link, freeing the inode + blocks only
+        // when its link count reaches 0 (mirrors ext2_unlink via the shared
+        // helper).  The old code freed unconditionally (i_links_count = 0 +
+        // free_inode_blocks + free_inode_num), which destroyed a still-
+        // referenced multi-link dst -- the surviving name then pointed at a
+        // freed/reissued inode (cross-link).  Gate the drop on dir_remove_entry
+        // succeeding: if a racing unlink(dst) already removed the name (and may
+        // have freed the inode), it owns the drop and freeing here too would
+        // double-free the inode bit + blocks.
+        if (dir_remove_entry(dst_parent_ino, dst_base)) {
+            dleaf = inode_lock(dst_ino);
+            if (dleaf) ext2_drop_link_locked(dleaf, dst_ino);
         }
-        free_inode_num(dst_ino);
     }
 
     // Add new directory entry pointing at the same inode.
@@ -2518,8 +3399,55 @@ int ext2_rename(const char* src, const char* dst) {
         return 0;
     }
 
-    // Remove old directory entry.
-    dir_remove_entry(src_parent_ino, src_base);
+    // Remove old directory entry.  If it FAILS (I/O error, OOM for its block
+    // buffer, or a concurrent unlink(src) that already removed src_base -- unlink
+    // takes the parent-inode lock, NOT s_rename_lock, so it races this window),
+    // src_ino would keep BOTH the new dst name and the old src name at
+    // i_links_count==1 (rename is a move, so the count was never bumped); a later
+    // unlink of either name then drops the count to 0 and frees the inode +
+    // blocks while the OTHER name still references it (cross-link / data
+    // corruption).  Roll the move back -- remove the dst dirent dir_add_entry
+    // just added -- and fail, so the rename is atomic (fully done or not at all).
+    if (!dir_remove_entry(src_parent_ino, src_base)) {
+        dir_remove_entry(dst_parent_ino, dst_base);
+        spin_unlock(&s_rename_lock);
+        return 0;
+    }
+
+    // Moving a DIRECTORY to a different parent: its ".." backlink moves from the
+    // old parent to the new one.  Repoint ".." (else it escapes to the old
+    // parent -- /b/dir/.. would resolve to /a) and fix both parents' link
+    // counts (each subdirectory contributes one ".." link to its parent).
+    // Without this the old parent's count stays too high (it can never be
+    // rmdir'd) and the new parent's too low (an over-decrement elsewhere could
+    // free it while this dir's ".." still references it -- a cross-link).  A
+    // same-parent rename touches neither.  RMW each parent under its own inode
+    // lock, taken one at a time (no nesting) to match the existing lock order.
+    // Only swap the parents' link counts if ".." was ACTUALLY repointed: each
+    // subdir contributes one ".." link to its parent, so if dir_set_dotdot
+    // failed (I/O error / OOM / ".." not found) ".." still backlinks the OLD
+    // parent and the counts must NOT move -- decrementing the old parent there
+    // would make its count too low and let an over-decrement free it while this
+    // dir's ".." still references it (the cross-link the swap exists to prevent).
+    if (is_dir && src_parent_ino != dst_parent_ino &&
+        dir_set_dotdot(src_ino, dst_parent_ino)) {
+        irtree_leaf_t* spleaf = inode_lock(src_parent_ino);
+        if (spleaf) {
+            inode_pub_begin(spleaf);
+            if (spleaf->inode.i_links_count > 0) spleaf->inode.i_links_count--;
+            inode_pub_end(spleaf);
+            inode_writeback(spleaf);
+            inode_unlock(spleaf);
+        }
+        irtree_leaf_t* dpleaf = inode_lock(dst_parent_ino);
+        if (dpleaf) {
+            inode_pub_begin(dpleaf);
+            dpleaf->inode.i_links_count++;
+            inode_pub_end(dpleaf);
+            inode_writeback(dpleaf);
+            inode_unlock(dpleaf);
+        }
+    }
 
     // Phase 7C: invalidate both the src dentry (moved away) and any
     // cached negative dentry at the dst (which may previously have
@@ -2530,4 +3458,119 @@ int ext2_rename(const char* src, const char* dst) {
 
     spin_unlock(&s_rename_lock);
     return 1;
+}
+
+// Deterministic guard for the SCAN #11 path-TOCTOU fix (F129): exercise the
+// mutating ops with a ROOT cred and assert the in-op write+exec permission
+// check (now on the op's OWN resolved parent) does NOT block allowed access and
+// that create/unlink/mkdir/rename perform their state transitions.  Proves the
+// fix did not break normal (authorized) file mutation -- the part a clean boot
+// alone does not strongly exercise.  Self-cleaning (the one leftover scratch dir
+// is harmless; the disk image is rebuilt from the source tree each boot).
+void ext2_perm_op_selftest(void) {
+    extern void kprintf(const char*, ...);
+    if (!s_mounted) { kprintf("[fs_permop] SKIP (ext2 not mounted)\n"); return; }
+    int fails = 0;
+    cred_t root;
+    __builtin_memset(&root, 0, sizeof root);   // euid/egid 0 -> root, passes write+exec
+
+    // Clear any leftovers from a prior boot of the SAME read-write disk so the
+    // test starts from a known-clean state -- these no-op (return 0) if absent.
+    // This is what makes the test reboot-idempotent.
+    ext2_unlink("/__fsperm_a", &root);
+    ext2_unlink("/__fsperm_f", &root);
+    ext2_unlink("/__fsperm_d/c", &root);
+    ext2_unlink("/__fsperm_s", &root);
+    ext2_unlink("/__fsperm_t", &root);
+    ext2_rmdir("/__fsperm_d", &root);
+
+    // create -> resolves -> unlink -> gone.
+    if (!ext2_create("/__fsperm_a", &root))      fails++;
+    if (!path_to_inode("/__fsperm_a"))           fails++;
+    if (!ext2_unlink("/__fsperm_a", &root))      fails++;
+    if (path_to_inode("/__fsperm_a"))            fails++;
+
+    // mkdir -> resolves.  Tolerant of a leftover /__fsperm_d (mkdir returns 0 if
+    // it already exists): the success condition is "the dir exists afterwards",
+    // so the test stays reboot-safe even if rmdir cleanup ever failed.
+    ext2_mkdir("/__fsperm_d", &root);
+    if (!path_to_inode("/__fsperm_d"))           fails++;
+
+    // rmdir negative cases: it must REFUSE a regular file and a non-empty dir.
+    if (!ext2_create("/__fsperm_f", &root))      fails++;
+    if (ext2_rmdir("/__fsperm_f", &root))        fails++;   // not a directory
+    if (!ext2_unlink("/__fsperm_f", &root))      fails++;
+    if (!ext2_create("/__fsperm_d/c", &root))    fails++;
+    if (ext2_rmdir("/__fsperm_d", &root))        fails++;   // non-empty
+    if (!ext2_unlink("/__fsperm_d/c", &root))    fails++;
+
+    // rmdir positive: the now-empty dir is removed and gone (cleans up the
+    // leftover the test used to leak, and exercises the new primitive).
+    if (!ext2_rmdir("/__fsperm_d", &root))       fails++;
+    if (path_to_inode("/__fsperm_d"))            fails++;
+
+    // create -> rename a->b -> old gone, new present -> unlink b.
+    if (!ext2_create("/__fsperm_s", &root))                fails++;
+    if (!ext2_rename("/__fsperm_s", "/__fsperm_t", &root)) fails++;
+    if (path_to_inode("/__fsperm_s"))                      fails++;
+    if (!path_to_inode("/__fsperm_t"))                     fails++;
+    if (!ext2_unlink("/__fsperm_t", &root))               fails++;
+
+    kprintf_atomic(fails ? "[fs_permop] SELF-TEST FAILED\n"
+                  : "[fs_permop] SELF-TEST PASSED (root create/unlink/mkdir/rmdir/rename, empty+negative, reboot-safe)\n");
+}
+
+// Deterministic guard for the ext2_vfs_pread EOF-clamp fix (F150): a pread that
+// reads PAST a partial final block must return EXACTLY i_size-offset bytes, not
+// the on-disk slack past end-of-file.  Uses a MULTI-block file with a partial
+// final block (so the aligned fast-path run covers the final block and would
+// over-return) created via the real write/open path, then preads more than the
+// file size from offset 0 and asserts the count is i_size (no phantom tail).
+void ext2_pread_eof_selftest(void) {
+    extern void kprintf(const char*, ...);
+    if (!s_mounted) { kprintf("[ext2_pread_eof] SKIP (ext2 not mounted)\n"); return; }
+    cred_t root; __builtin_memset(&root, 0, sizeof root);
+    uint32_t fsize = s_block_size + 100u;            // multi-block, partial final block
+    uint8_t* wbuf = (uint8_t*)kmalloc(fsize);
+    uint8_t* rbuf = (uint8_t*)kmalloc(fsize + s_block_size);
+    if (!wbuf || !rbuf) {
+        if (wbuf) kfree(wbuf);
+        if (rbuf) kfree(rbuf);
+        kprintf("[ext2_pread_eof] SKIP (no mem)\n");
+        return;
+    }
+    for (uint32_t i = 0; i < fsize; i++) wbuf[i] = (uint8_t)(i & 0xFF);
+    __builtin_memset(rbuf, 0xAA, fsize + s_block_size);
+
+    int fails = 0;
+    vfs_file_t* f = NULL;
+    // Clear any leftover from a prior boot of the same disk so the write below
+    // always starts from a clean slate (reboot-idempotent).
+    ext2_unlink("/__pread_eof", &root);
+    if (!ext2_write_file("/__pread_eof", wbuf, fsize, &root)) {
+        fails++;
+    } else {
+        f = ext2_open("/__pread_eof");
+        if (!f || !f->pread) {
+            fails++;
+        } else {
+            // Read MORE than the file across the partial final block: must
+            // return EXACTLY fsize bytes (not the full final block slack).
+            int64_t got = f->pread(f, rbuf, fsize + s_block_size, 0);
+            if (got != (int64_t)fsize) {
+                kprintf_atomic("[ext2_pread_eof] FAIL got=%ld want=%u (phantom tail past EOF)\n",
+                        (long)got, fsize);
+                fails++;
+            } else {
+                for (uint32_t i = 0; i < fsize; i++)
+                    if (rbuf[i] != (uint8_t)(i & 0xFF)) { fails++; break; }
+            }
+        }
+        if (f && f->close) f->close(f);
+        ext2_unlink("/__pread_eof", &root);
+    }
+    kfree(wbuf);
+    kfree(rbuf);
+    kprintf_atomic(fails ? "[ext2_pread_eof] SELF-TEST FAILED\n"
+                  : "[ext2_pread_eof] SELF-TEST PASSED (pread clamps to i_size, no phantom tail past EOF)\n");
 }

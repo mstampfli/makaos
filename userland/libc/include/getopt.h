@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_GETOPT_H
 #define _MAKAOS_GETOPT_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // POSIX getopt — global state + basic long-option struct.
 // libc.c provides the runtime impl.
@@ -26,4 +29,7 @@ int getopt_long(int argc, char* const argv[],
                 const char* shortopts,
                 const struct option* longopts, int* longind);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

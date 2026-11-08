@@ -62,8 +62,13 @@ extern "C" {
 #define EADDRNOTAVAIL 99
 #define ENETDOWN    100
 #define ENETUNREACH 101
+#define ENETRESET   102
 #define ECONNABORTED 103
 #define EDESTADDRREQ 89
+// Robust-mutex / POSIX 2008 codes. The kernel never returns these; they exist
+// so userland (e.g. libstdc++ <system_error> -> std::errc) can name them.
+#define EOWNERDEAD      130
+#define ENOTRECOVERABLE 131
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
 #define EALREADY    114
@@ -93,7 +98,14 @@ extern "C" {
 #define ETXTBSY    26
 #define ENOTBLK    15
 
-extern __thread int errno;
+// POSIX: errno is a modifiable lvalue, conventionally a MACRO over a per-thread
+// int (glibc/musl style).  As a macro it satisfies system-header `#ifndef errno`
+// guards; the storage (libc.c) keeps the symbol name `errno`, so already-compiled
+// objects that reference the TLS symbol directly still link unchanged.
+int* __errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
 
 // glibc extensions a handful of ports (libinput, systemd, elfutils)
 // log messages through.  We populate both from argv[0] when crt0 runs.

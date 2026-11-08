@@ -294,6 +294,15 @@ int feraiseexcept(int excepts)  { (void)excepts; return 0; }
 int fetestexcept(int excepts)   { (void)excepts; return 0; }
 int fegetround(void)            { return 0 /*FE_TONEAREST*/; }
 int fesetround(int round)       { (void)round; return 0; }
+// Full-environment ops (HotSpot's C1/C2 pull these in via <cfenv>). MakaOS runs
+// only the default round-to-nearest, non-stop FP environment, so save/restore
+// and hold/update are no-ops that report success.
+int fegetenv(void* envp)                   { (void)envp; return 0; }
+int fesetenv(const void* envp)             { (void)envp; return 0; }
+int fegetexceptflag(void* fp, int excepts) { (void)fp; (void)excepts; return 0; }
+int fesetexceptflag(const void* fp, int excepts) { (void)fp; (void)excepts; return 0; }
+int feholdexcept(void* envp)               { (void)envp; return 0; }
+int feupdateenv(const void* envp)          { (void)envp; return 0; }
 
 // iconv — MakaOS has no locale / charset conversion database yet.
 // iconv_open reports unsupported so callers fall back to UTF-8
@@ -359,6 +368,18 @@ size_t wcsxfrm(wchar_t* dst, const wchar_t* src, size_t n) {
         dst[copy] = L'\0';
     }
     return len;
+}
+
+// wcsftime: wide-character strftime. MakaOS has no wide locale/time formatter
+// yet, so this produces an empty result (0 characters). Callers that use it
+// for optional locale-aware wide time strings (e.g. the JVM) fall back to a
+// narrow/default path. TODO: format via strftime + widening once wide locale
+// support lands.
+size_t wcsftime(wchar_t* s, size_t maxsize, const wchar_t* format,
+                const struct tm* tm) {
+    (void)format; (void)tm;
+    if (maxsize > 0 && s) s[0] = L'\0';
+    return 0;
 }
 
 int wcscoll(const wchar_t* a, const wchar_t* b) {
@@ -679,6 +700,21 @@ char* asctime(const struct tm* tm) {
 }
 char* ctime(const time_t* t) {
     return asctime(localtime(t));
+}
+// Thread-safe variants: format into the caller's buffer (POSIX requires it to be
+// at least 26 bytes -- the fixed "Www Mmm dd hh:mm:ss yyyy\n\0" layout).
+char* asctime_r(const struct tm* tm, char* buf) {
+    char* s = asctime(tm);
+    if (!s || !buf) return 0;
+    __builtin_memcpy(buf, s, 26);   // fixed 26-byte layout incl. NUL
+    return buf;
+}
+char* ctime_r(const time_t* t, char* buf) {
+    extern struct tm* localtime_r(const time_t*, struct tm*);
+    struct tm tmp;
+    struct tm* lt = localtime_r(t, &tmp);
+    if (!lt) return 0;
+    return asctime_r(lt, buf);
 }
 
 // difftime — both time_t values are seconds; the difference is exact.

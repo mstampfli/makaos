@@ -24,3 +24,11 @@ void irq_notify(uint8_t irq);
 // One-time init for the per-IRQ wait queues.  Call from kmain before
 // any driver registers an IRQ handler.
 void irq_wait_init(void);
+
+// Return the per-slot wait_queue backing `irq`, so a device file can hang
+// its poll/epoll waiters on the very queue irq_notify() already drains.
+// The queue is woken preempt-safely from irq_notify() in ISR context, so a
+// pollable device (e.g. /dev/dsp) gets its POLLOUT/POLLIN wakeups for free
+// with no second wake site -- the DMA-completion ISR is the single source.
+struct wait_queue_t;
+struct wait_queue_t* irq_waitq(uint8_t irq);

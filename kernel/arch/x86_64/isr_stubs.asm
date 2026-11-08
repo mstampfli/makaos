@@ -75,43 +75,25 @@ global isr_common_entry
 isr_common_entry:
   PUSH_GPRS
 
-  ; After PUSH_GPRS the stack looks like (low → high addresses):
-  ;   [15 GPRs × 8] [has_ec] [handler] [ec] [ip] [cs] [flags] [sp] [ss]
-  ;    rsp+0..112    rsp+120   rsp+128  rsp+136  ...
-  ; We use rbx as a scratch pointer into the CPU frame area.
-  lea rbx, [rsp + 15*8]   ; rbx → &has_ec
+  ; After PUSH_GPRS the stack is the exact trap_frame_t layout (idt.h),
+  ; low → high addresses:
+  ;   [rax rbx rcx rdx rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15]  ; 15 GPRs
+  ;   [has_ec] [handler] [ec] [ip] [cs] [flags] [sp] [ss]
+  ;    rsp+0..112          rsp+120  rsp+128 rsp+136 ...
+  ; We pass the C handler a pointer to the REAL frame's `ip` field (an
+  ; interrupt_frame_t*), NOT a copy — so any edit the handler makes to the
+  ; saved GPRs (via TRAP_FROM_IFRAME) or to ip/sp/flags takes effect on the
+  ; POP_GPRS + iretq below.  That is how a synchronous fault delivers a
+  ; signal to a user handler (signal_deliver_fault redirects ip/sp + rdi/rsi/rdx).
+  lea rbx, [rsp + 15*8]   ; rbx → &has_ec (rbx is callee-saved: survives the call)
 
-  ; Allocate interrupt_frame_t (5 qwords)
-  sub rsp, 5*8
-
-  ; CPU frame fields are at rbx+0(has_ec) rbx+8(handler) rbx+16(ec)
+  ; CPU frame fields: rbx+0(has_ec) rbx+8(handler) rbx+16(ec)
   ;   rbx+24(ip) rbx+32(cs) rbx+40(flags) rbx+48(sp) rbx+56(ss)
-
-  ; frame.ip
-  mov rax, [rbx + 24]
-  mov [rsp + 0], rax
-
-  ; frame.cs
-  mov rax, [rbx + 32]
-  mov [rsp + 8], rax
-
-  ; frame.flags
-  mov rax, [rbx + 40]
-  mov [rsp + 16], rax
-
-  ; frame.sp
-  mov rax, [rbx + 48]
-  mov [rsp + 24], rax
-
-  ; frame.ss
-  mov rax, [rbx + 56]
-  mov [rsp + 32], rax
-
-  ; load handler pointer and has_ec flag
   mov rcx, [rbx + 8]     ; rcx = c handler address
   mov rdx, [rbx + 0]     ; rdx = has_ec flag
+  lea rdi, [rbx + 24]    ; arg0 = &ip = interrupt_frame_t* into the REAL frame
 
-  lea rdi, [rsp]          ; arg0 = &frame
+  sub rsp, 8             ; 16-byte-align rsp for the SysV call (was ≡8 mod 16)
 
   test rdx, rdx
   jz .call_no_ec
@@ -124,12 +106,12 @@ isr_common_entry:
   call rcx
 
 .after_call:
-  add rsp, 5*8            ; pop interrupt_frame_t
+  add rsp, 8             ; undo the alignment pad → rsp back at GPR base
 
-  POP_GPRS
+  POP_GPRS               ; restore (possibly handler-modified) GPRs
 
-  add rsp, 8*3            ; drop has_ec + handler + ec
-  iretq
+  add rsp, 8*3           ; drop has_ec + handler + ec
+  iretq                  ; return via (possibly handler-modified) ip/cs/flags/sp/ss
 
 ; IDT entry generators
 ; Push has_ec and handler BEFORE touching rdi/rsi so PUSH_GPRS saves originals.

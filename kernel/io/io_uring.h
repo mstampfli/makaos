@@ -183,6 +183,12 @@ typedef struct io_uring {
     struct io_wq_work* volatile wq_head;  // pending work (Treiber)
     wait_queue_t           wq_waitq;    // worker sleeps here when head==NULL
     volatile uint32_t      worker_stop; // set on ring close
+    volatile uint32_t      worker_done; // worker's last write before TASK_DEAD
+    spinlock_t             worker_lock; // serialises io_wq_ensure_worker's
+                                        // check-create-publish so two concurrent
+                                        // consumers spawn at most ONE worker (a
+                                        // second spawn would orphan the first ->
+                                        // a worker close never joins = UAF)
 
     // ── Phase 8F: SQPOLL kthread ───────────────────────────────
     // When IORING_SETUP_SQPOLL was requested, a dedicated poller
@@ -195,6 +201,7 @@ typedef struct io_uring {
     wait_queue_t      sqp_waitq;
     volatile uint32_t sqp_idle_ms;     // sq_thread_idle
     volatile uint32_t sqp_stop;
+    volatile uint32_t sqp_done;        // poller's last write before TASK_DEAD
 
     // ── Phase 8G: fixed files ──────────────────────────────────
     // User registers an array of fds once; subsequent SQEs with
@@ -215,6 +222,10 @@ typedef struct io_uring {
     struct io_overflow_cqe* overflow_head;
     struct io_overflow_cqe* overflow_tail;
     spinlock_t              overflow_lock;
+    // Number of nodes on the overflow list.  Capped at IO_URING_OVERFLOW_MAX so
+    // a ring that never reaps its CQ cannot grow the list without bound (a
+    // kernel-memory DoS); drained to 0 at close so the list is never leaked.
+    uint32_t                overflow_count;
 
     // Kernel-side aliases (HHDM) into the backing memory — lets the
     // kernel read/write ring fields without going through the user

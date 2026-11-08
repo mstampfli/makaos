@@ -12,8 +12,139 @@
 #include "sched.h"
 #include "perm.h"
 #include "cred.h"
+#include "ksec.h"
 #include "kprintf.h"
 #include "tsc.h"
+
+/* Loud per-load demand-paging trace ([elf] lazy).  Bring-up instrumentation,
+ * OFF by default so it never drowns userspace serial output; per the log.h
+ * convention (compile-time per-subsystem gate).  -DCONFIG_DEBUG_DEMAND_PAGING=1
+ * to re-enable.  Shared with the [pf] warmth trace in syscall.c. */
+#ifndef CONFIG_DEBUG_DEMAND_PAGING
+#define CONFIG_DEBUG_DEMAND_PAGING 0
+#endif
+
+// Returns 1 if the program-header table [e_phoff, e_phoff + e_phnum*sizeof
+// (Elf64_Phdr)) lies fully within a file of `size` bytes with NO 64-bit
+// overflow; 0 otherwise.  The old inline check `e_phoff + phnum*56 > size`
+// added unchecked 64-bit values, so an attacker-controlled e_phoff near
+// UINT64_MAX (e.g. -56) wrapped below `size` and passed -> the phdr reads
+// landed BEFORE the header buffer (OOB heap read).  Pure + bounds-only so it
+// can be unit-tested in isolation (elf_phtab_bounds_selftest).  e_phnum is at
+// most 65535, so e_phnum*56 cannot overflow.
+int elf_phtab_in_bounds(uint64_t e_phoff, uint16_t e_phnum, uint64_t size) {
+    if (e_phnum == 0) return 0;
+    uint64_t tab = (uint64_t)e_phnum * sizeof(Elf64_Phdr);
+    if (e_phoff > size) return 0;          // offset alone past EOF (catches the wrap)
+    if (tab > size - e_phoff) return 0;    // overflow-safe remainder check
+    return 1;
+}
+
+// Returns 1 if a PT_LOAD segment [vaddr+load_bias, +memsz) lies fully within
+// [0, user_top) with no 64-bit overflow; 0 otherwise.  The mapping code below
+// computes `(p_vaddr + load_bias + p_memsz + PAGE_MASK)`, which can overflow
+// (seg_end < seg_start -> a bogus/empty VMA), and never range-checked p_vaddr
+// (a kernel-half / non-canonical VA -> an un-faultable mapping).  Pure +
+// bounds-only so it is unit-testable.
+int elf_seg_range_ok(uint64_t vaddr, uint64_t load_bias,
+                     uint64_t memsz, uint64_t user_top) {
+    uint64_t vbase = vaddr + load_bias;
+    if (vbase < vaddr) return 0;             // vaddr + load_bias overflow
+    if (vbase >= user_top) return 0;         // base in kernel / non-canonical half
+    if (memsz > user_top - vbase) return 0;  // base + memsz past user_top (overflow-safe)
+    return 1;
+}
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+// Deterministic test of the phdr-table bounds.  The 0xFFFF...C8 (-56) row is
+// the exact overflow the old `e_phoff + phnum*56 > size` check got wrong: it
+// wrapped to 0, passed, and read 56 bytes before the buffer.
+void elf_phtab_bounds_selftest(void) {
+    kprintf("[elf_test] program-header table bounds\n");
+    struct { uint64_t off; uint16_t n; uint64_t sz; int want; } c[] = {
+        { 64,                     1,  4096, 1 },  // normal
+        { 0xFFFFFFFFFFFFFFC8ULL,  1,  4096, 0 },  // -56: old check wrapped to 0 (the bug)
+        { 4096,                   1,  4096, 0 },  // off == size, no room
+        { 4040,                   1,  4096, 1 },  // last 56 bytes fit exactly
+        { 4041,                   1,  4096, 0 },  // one past
+        { 0,                      0,  4096, 0 },  // phnum 0
+        { 0,                      73, 4096, 1 },  // 73*56 = 4088 <= 4096
+        { 0,                      74, 4096, 0 },  // 74*56 = 4144 > 4096
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int got = elf_phtab_in_bounds(c[i].off, c[i].n, c[i].sz);
+        if (got != c[i].want) {
+            kprintf_atomic("[elf_test] FAIL off=0x%lx n=%u sz=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].off, (unsigned)c[i].n,
+                    (unsigned long)c[i].sz, got, c[i].want);
+            fails++;
+        }
+    }
+
+    // PT_LOAD segment-range bounds.  The overflow rows are the exact cases the
+    // old un-checked `(p_vaddr + load_bias + p_memsz + PAGE_MASK)` would wrap.
+    const uint64_t TOP = VMM_USER_STACK_TOP;
+    struct { uint64_t va; uint64_t bias; uint64_t msz; int want; } s[] = {
+        { 0x400000,            0,                TOP,        0 },  // memsz spans whole user half -> past top
+        { 0x400000,            0,                0x1000,     1 },  // normal fixed-load segment
+        { 0x1000,              0x555555554000,   0x2000,     1 },  // PIE load_bias, fits
+        { 0xFFFF800000000000,  0,                0x1000,     0 },  // base in the kernel half
+        { 0xFFFFFFFFFFFFF000,  0x2000,           0x1000,     0 },  // vaddr + bias wraps past 2^64
+        { TOP - 0x1000,        0,                0x1000,     1 },  // last user page, exact fit
+        { TOP,                 0,                1,          0 },  // base == top (one past the ceiling)
+        { TOP - 1,             0,                1,          1 },  // one byte below top, fits
+        { TOP - 0x1000,        0,                0x1001,     0 },  // one byte past top
+    };
+    for (unsigned i = 0; i < sizeof(s) / sizeof(s[0]); i++) {
+        int got = elf_seg_range_ok(s[i].va, s[i].bias, s[i].msz, TOP);
+        if (got != s[i].want) {
+            kprintf_atomic("[elf_test] FAIL seg va=0x%lx bias=0x%lx msz=0x%lx got=%d want=%d\n",
+                    (unsigned long)s[i].va, (unsigned long)s[i].bias,
+                    (unsigned long)s[i].msz, got, s[i].want);
+            fails++;
+        }
+    }
+
+    kprintf_atomic(fails ? "[elf_test] SELF-TEST FAILED\n"
+                  : "[elf_test] SELF-TEST PASSED (phdr table + segment range bounds)\n");
+}
+#endif
+
+// Read `n` bytes at file offset `off` into `buf`.  The in-memory image `data`
+// (size bytes) is used when it covers the range -- the eager path, and small
+// files whose whole image the exec path happened to read.  Otherwise it preads
+// from the backing file, because on the exec path `data` is only the first-page
+// header buffer (PAGE_SIZE), NOT the whole file: a PIE larger than a page has
+// its .dynamic / .rela.dyn / segment pages past the buffer.  Returns 1 iff all
+// n bytes were obtained.
+static int elf_read_at(const uint8_t* data, uint64_t size, vfs_file_t* bf,
+                       uint64_t off, uint64_t n, void* buf) {
+    if (n == 0) return 1;
+    if (off <= size && off + n <= size) { __builtin_memcpy(buf, data + off, n); return 1; }
+    if (!bf) return 0;
+    int64_t rc;
+    if (bf->pread) rc = bf->pread(bf, buf, n, (int64_t)off);
+    else { bf->seek(bf, (int64_t)off, 0 /*SEEK_SET*/); rc = bf->read(bf, buf, n); }
+    return rc == (int64_t)n;
+}
+
+// ── Shared segment-page fill (eager map + PIE reloc fault-in) ──────────────
+// Fill one 4KiB frame (`dst`, HHDM-mapped) with a file-backed segment's bytes
+// for the page at `pg_off` (offset of the page within the page-aligned VMA /
+// segment start).  Zero-fills the page and the BSS tail; the file bytes come
+// from `data` when in range else the backing file `bf` (see elf_read_at).
+// `file_off` is the file byte offset of the VMA start, `file_len` its file-
+// backed length -- the SAME coordinates and span primitive (vma_file_page_span)
+// the lazy demand-fault (isr14) uses, so an eagerly loaded segment and a
+// demand-paged one are byte-identical.  One fill model, no drift.
+static void elf_fill_page(const uint8_t* data, uint64_t size, vfs_file_t* bf,
+                          uint64_t file_off, uint64_t file_len, uint64_t pg_off,
+                          uint8_t* dst) {
+    __builtin_memset(dst, 0, PAGE_SIZE);
+    uint64_t n = vma_file_page_span(pg_off, file_len);
+    if (n) elf_read_at(data, size, bf, file_off + pg_off, n, dst);
+}
 
 // ── Internal: load ELF into a fresh address space ─────────────────────────
 // Allocates new PML4 + mm_t, maps PT_LOAD segments, sets up brk and stack VMA.
@@ -40,7 +171,9 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return 0;
     if (ehdr->e_machine != EM_X86_64) return 0;
     if (ehdr->e_phnum   == 0)        return 0;
-    if (ehdr->e_phoff + (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr) > size) return 0;
+    // Overflow-safe bounds check (see elf_phtab_in_bounds): a malicious e_phoff
+    // near UINT64_MAX would otherwise wrap past this guard -> OOB phdr reads.
+    if (!elf_phtab_in_bounds(ehdr->e_phoff, ehdr->e_phnum, size)) return 0;
 
     // For ET_DYN (static PIE), compute a load bias so the binary does not
     // collide with the kernel or other fixed mappings.
@@ -98,23 +231,38 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
         if (ph->p_type != PT_LOAD) continue;
         if (ph->p_memsz == 0)      continue;
 
+        // Reject a segment whose [vaddr+bias, +memsz) overflows or escapes the
+        // user half BEFORE deriving seg_start/seg_end (whose rounding can wrap
+        // to seg_end < seg_start -> a bogus/empty VMA, or land in the kernel
+        // half -> an un-faultable mapping).
+        if (!elf_seg_range_ok(ph->p_vaddr, load_bias,
+                              ph->p_memsz, VMM_USER_STACK_TOP)) {
+            mm_destroy(mm);
+            vmm_free_user(pml4);
+            pmm_buddy_free(pml4, 0);
+            return 0;
+        }
+
         // Convert ELF flags to VMA flags.
         uint32_t prot_flags = 0;
         if (ph->p_flags & PF_R) prot_flags |= VMA_R;
         if (ph->p_flags & PF_W) prot_flags |= VMA_W;
         if (ph->p_flags & PF_X) prot_flags |= VMA_X;
 
-        virt_addr_t seg_start = (ph->p_vaddr + load_bias) & ~PAGE_MASK;
-        virt_addr_t seg_end   = (ph->p_vaddr + load_bias + ph->p_memsz + PAGE_MASK) & ~PAGE_MASK;
+        virt_addr_t seg_start = page_align_down(ph->p_vaddr + load_bias);
+        virt_addr_t seg_end   = page_align_up(ph->p_vaddr + load_bias + ph->p_memsz);
+
+        // File backing for this segment in page-aligned VMA coordinates, shared
+        // by the lazy VMA, the eager fill, and the demand-fault handler so all
+        // three agree byte-for-byte.  file_off: ELF file offset of the segment's
+        // page-aligned start (p_offset & PAGE_MASK == p_vaddr & PAGE_MASK by the
+        // ELF alignment invariant, so rounding down is exact).  file_len: bytes
+        // from file_off that are file-backed (the rest is BSS/zero tail).
+        uint64_t file_off = ph->p_offset & ~(uint64_t)PAGE_MASK;
+        uint64_t file_len = (ph->p_offset & PAGE_MASK) + ph->p_filesz;
 
         if (backing_file) {
             // ── Lazy path: file-backed VMA, pages faulted in on demand ────
-            // file_off: ELF file offset for the start of this page-aligned
-            //   segment.  p_offset & PAGE_MASK == p_vaddr & PAGE_MASK (ELF
-            //   alignment invariant), so rounding down to page is safe.
-            uint64_t file_off = ph->p_offset & ~(uint64_t)PAGE_MASK;
-            // file_len: bytes from file_off that are file-backed (rest = BSS).
-            uint64_t file_len = (ph->p_offset & PAGE_MASK) + ph->p_filesz;
             if (!mm_vma_add_file(mm, seg_start, seg_end, prot_flags,
                                  backing_file, file_off, file_len)) {
                 mm_destroy(mm);
@@ -141,27 +289,123 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                     return 0;
                 }
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
-                __builtin_memset(fptr, 0, PAGE_SIZE);
-
-                virt_addr_t page_end      = page + PAGE_SIZE;
-                virt_addr_t file_start_va = ph->p_vaddr + load_bias;
-                virt_addr_t file_end_va   = ph->p_vaddr + load_bias + ph->p_filesz;
-                if (file_start_va < page_end && file_end_va > page) {
-                    virt_addr_t copy_start = (file_start_va > page) ? file_start_va : page;
-                    virt_addr_t copy_end   = (file_end_va < page_end) ? file_end_va : page_end;
-                    uint64_t    frame_off  = copy_start - page;
-                    uint64_t    file_off   = ph->p_offset + (copy_start - file_start_va);
-                    uint64_t    nbytes     = copy_end - copy_start;
-                    if (file_off + nbytes <= size) {
-                        __builtin_memcpy(fptr + frame_off, data + file_off, nbytes);
-                    }
+                elf_fill_page(data, size, backing_file, file_off, file_len,
+                              page - seg_start, fptr);
+                if (!vmm_page_map(pml4, page, frame, pte_flags)) {
+                    // OOM on an intermediate PT page: this frame is NOT mapped,
+                    // so vmm_free_user won't reclaim it (free it here) and the
+                    // segment page would demand-fault a fresh ZERO page -- the
+                    // code/data we just copied would silently load as zeros (a
+                    // corrupt image run as valid).  Free the frame + the rest of
+                    // the half-built image and fail, like the alloc-fail path.
+                    pmm_buddy_free(frame, 0);
+                    mm_destroy(mm);
+                    vmm_free_user(pml4);
+                    pmm_buddy_free(pml4, 0);
+                    return 0;
                 }
-                vmm_page_map(pml4, page, frame, pte_flags);
             }
         }
 
         if (seg_end > seg_end_max) seg_end_max = seg_end;
         if (seg_start < seg_start_min) seg_start_min = seg_start;
+    }
+
+    // ── PIE self-relocation (R_X86_64_RELATIVE) ──────────────────────────
+    // A statically-linked PIE (ET_DYN) is linked at base 0 and carries only
+    // RELATIVE relocs.  Apply them now, writing through the physical frame
+    // (frame + HHDM) so a read-only / RELRO page is no obstacle.  Without this
+    // every absolute pointer in the image (vtables, .data.rel.ro, string/reloc
+    // tables, __init_array) stays base-0 -> wild pointers the instant the
+    // program runs.  Imported symbols are the dynamic loader's job, not this
+    // static-PIE path.
+    //
+    // The .dynamic and .rela.dyn tables (and the reloc-target pages) usually
+    // live PAST the header buffer `data` for any non-trivial PIE, so read them
+    // through elf_read_at (backing file).  Each not-yet-resident reloc-target
+    // page is populated from the file the same way isr14 would demand-fault it
+    // (elf_fill_page, straddle-safe via the VMA's file_off) and mapped, so only
+    // reloc pages become resident; the rest stays demand-paged.  Reloc entries
+    // on pointer-sized data are 8-aligned, so an 8-byte write never straddles a
+    // page.  If the image can't be fully relocated, we FAIL the load rather than
+    // run a binary with wild pointers.
+    if (load_bias != 0) {
+        uint64_t dyn_vaddr = 0, dyn_filesz = 0;
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            const Elf64_Phdr* ph = (const Elf64_Phdr*)(data + ehdr->e_phoff
+                                     + (uint64_t)i * ehdr->e_phentsize);
+            if (ph->p_type == PT_DYNAMIC) { dyn_vaddr = ph->p_vaddr; dyn_filesz = ph->p_filesz; break; }
+        }
+        // Resolve a base-0 vaddr to a file offset via the PT_LOAD table (the
+        // phdrs are always in the header buffer `data`).  -1 if not loadable.
+        #define ELF_VA2OFF(V) ({ uint64_t _o = (uint64_t)-1; \
+            for (uint16_t _i = 0; _i < ehdr->e_phnum; _i++) { \
+                const Elf64_Phdr* _p = (const Elf64_Phdr*)(data + ehdr->e_phoff \
+                                        + (uint64_t)_i * ehdr->e_phentsize); \
+                if (_p->p_type == PT_LOAD && (V) >= _p->p_vaddr \
+                    && (V) < _p->p_vaddr + _p->p_filesz) { \
+                    _o = _p->p_offset + ((V) - _p->p_vaddr); break; } } _o; })
+        uint64_t dyn_off = dyn_vaddr ? ELF_VA2OFF(dyn_vaddr) : (uint64_t)-1;
+        uint64_t rela_va = 0, rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
+        Elf64_Dyn* dyn  = NULL;
+        uint8_t*   rela = NULL;
+        #define RELOC_FAIL() do { if (dyn) kfree(dyn); if (rela) kfree(rela); \
+            mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); \
+            return 0; } while (0)
+
+        // ── .dynamic -> DT_RELA / DT_RELASZ / DT_RELAENT ──────────────────
+        if (dyn_off != (uint64_t)-1 && dyn_filesz && dyn_filesz <= (1u << 20)) {
+            dyn = (Elf64_Dyn*)kmalloc(dyn_filesz);
+            if (!dyn) RELOC_FAIL();
+            if (!elf_read_at(data, size, backing_file, dyn_off, dyn_filesz, dyn))
+                RELOC_FAIL();
+            for (uint64_t i = 0; (i + 1) * sizeof(Elf64_Dyn) <= dyn_filesz
+                                  && dyn[i].d_tag != DT_NULL; i++) {
+                if      (dyn[i].d_tag == DT_RELA)    rela_va  = dyn[i].d_un;
+                else if (dyn[i].d_tag == DT_RELASZ)  rela_sz  = dyn[i].d_un;
+                else if (dyn[i].d_tag == DT_RELAENT) rela_ent = dyn[i].d_un;
+            }
+            kfree(dyn); dyn = NULL;
+        }
+
+        // ── .rela.dyn -> apply every R_X86_64_RELATIVE ────────────────────
+        uint64_t rela_off = rela_va ? ELF_VA2OFF(rela_va) : (uint64_t)-1;
+        if (rela_sz && rela_ent >= sizeof(Elf64_Rela) && rela_off != (uint64_t)-1
+            && rela_sz <= (16u << 20)) {
+            rela = (uint8_t*)kmalloc(rela_sz);
+            if (!rela) RELOC_FAIL();
+            if (!elf_read_at(data, size, backing_file, rela_off, rela_sz, rela))
+                RELOC_FAIL();
+            for (uint64_t o = 0; o + rela_ent <= rela_sz; o += rela_ent) {
+                const Elf64_Rela* r = (const Elf64_Rela*)(rela + o);
+                if (ELF64_R_TYPE(r->r_info) != R_X86_64_RELATIVE) continue;
+                uint64_t    off0 = r->r_offset;          // base-0 target vaddr
+                virt_addr_t va   = load_bias + off0;      // runtime target vaddr
+                virt_addr_t page = va & ~(virt_addr_t)0xFFF;
+                phys_addr_t phys = vmm_page_phys(pml4, page);
+                if (phys == PMM_INVALID_ADDR) {
+                    vma_t* vma = mm_vma_find(mm, page);
+                    phys_addr_t frame = vma ? pmm_buddy_alloc(0) : PMM_INVALID_ADDR;
+                    if (!vma || frame == PMM_INVALID_ADDR) RELOC_FAIL();
+                    uint8_t* dst = (uint8_t*)(frame + HHDM_OFFSET);
+                    if (vma->flags & VMA_FILE)
+                        elf_fill_page(data, size, backing_file, vma->file_off,
+                                      vma->file_len, page - vma->start, dst);
+                    else
+                        __builtin_memset(dst, 0, PAGE_SIZE);   // anonymous -> zero page
+                    if (!vmm_page_map(pml4, page, frame, mm_vma_pte_flags(vma->flags))) {
+                        pmm_buddy_free(frame, 0);
+                        RELOC_FAIL();
+                    }
+                    phys = frame;
+                }
+                *(uint64_t*)((uintptr_t)(phys + HHDM_OFFSET) + (va & 0xFFF)) =
+                    load_bias + (uint64_t)r->r_addend;
+            }
+            kfree(rela); rela = NULL;
+        }
+        #undef RELOC_FAIL
+        #undef ELF_VA2OFF
     }
 
     // ── AT_PHDR safety net ────────────────────────────────────────────────
@@ -183,9 +427,14 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
                 uint8_t* fptr = (uint8_t*)(frame + HHDM_OFFSET);
                 __builtin_memset(fptr, 0, PAGE_SIZE);
                 __builtin_memcpy(fptr, data, hdr_bytes);
-                if (mm_vma_add(mm, hpage, hpage + PAGE_SIZE, VMA_R | VMA_ANON)) {
+                // Only point AT_PHDR at the page if BOTH the VMA add and the
+                // map succeed -- a failed map (PT-page OOM) would otherwise set
+                // AT_PHDR to an unmapped page that demand-faults to zeros, the
+                // exact zero-phdr -> broken-TLS hazard this safety net exists to
+                // avoid.  On either failure free the frame and leave AT_PHDR 0.
+                if (mm_vma_add(mm, hpage, hpage + PAGE_SIZE, VMA_R | VMA_ANON) &&
                     vmm_page_map(pml4, hpage, frame,
-                                 mm_vma_pte_flags(VMA_R | VMA_ANON));
+                                 mm_vma_pte_flags(VMA_R | VMA_ANON))) {
                     *out_phdr_vaddr = hpage + ehdr->e_phoff;
                 } else {
                     pmm_buddy_free(frame, 0);
@@ -195,7 +444,7 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     }
 
     // Heap: starts after last segment, page-aligned.
-    virt_addr_t brk_start = (seg_end_max + PAGE_MASK) & ~PAGE_MASK;
+    virt_addr_t brk_start = page_align_up(seg_end_max);
     if (brk_start < VMM_USER_CODE_BASE) brk_start = VMM_USER_CODE_BASE + PAGE_SIZE;
     mm->brk_start = brk_start;
     mm->brk       = brk_start;
@@ -203,7 +452,14 @@ uint8_t elf_load_into(const uint8_t* data, uint64_t size,
     // Stack VMA (demand-paged).
     virt_addr_t stack_end   = VMM_USER_STACK_TOP;
     virt_addr_t stack_start = stack_end - VMM_USER_STACK_PAGES * PAGE_SIZE;
-    mm_vma_add(mm, stack_start, stack_end, VMA_R | VMA_W | VMA_ANON);
+    if (!mm_vma_add(mm, stack_start, stack_end, VMA_R | VMA_W | VMA_ANON)) {
+        // No stack VMA -> the first user stack access would fault with no
+        // covering VMA (SIGSEGV) while we report success.  Fail the load.
+        mm_destroy(mm);
+        vmm_free_user(pml4);
+        pmm_buddy_free(pml4, 0);
+        return 0;
+    }
 
     *out_pml4  = pml4;
     *out_mm    = mm;
@@ -318,9 +574,12 @@ uint64_t elf_setup_stack(phys_addr_t pml4,
         }
     }
 
-    // Allocate user-VA pointer arrays in kernel heap.
-    uint64_t* argv_va = (uint64_t*)kmalloc((argc + 1) * 8);
-    uint64_t* envp_va = (uint64_t*)kmalloc((envc + 1) * 8);
+    // Allocate user-VA pointer arrays in kernel heap.  Size in u64 so the
+    // (count+1)*8 can never wrap the u32 width (argc/envc are attacker-supplied
+    // via execve; the count can't actually reach 2^29 -- the argv array alloc
+    // fails first -- but computing the size in u64 removes the latent footgun).
+    uint64_t* argv_va = (uint64_t*)kmalloc(((uint64_t)argc + 1) * 8);
+    uint64_t* envp_va = (uint64_t*)kmalloc(((uint64_t)envc + 1) * 8);
     if (!argv_va || !envp_va) {
         if (argv_va) kfree(argv_va);
         if (envp_va) kfree(envp_va);
@@ -416,48 +675,66 @@ static vfs_file_t* resolve_stdio(const int* spec, int i) {
     int fd = spec[i];
     if (fd == -2) return vfs_null_open(); // explicit /dev/null
 
-    // Caller is the parent (g_current) setting up the child's stdio.
-    // Walk the parent's own fdtable_t directly; no task_files_t.lock
-    // needed because fork/spawn runs in the parent's own task context
-    // and its own fd table is only mutated by itself.
-    fdtable_t* ft = (g_current && g_current->files_shared)
-                    ? g_current->files_shared->ft : NULL;
-
-    if (fd == -1) {
-        if (ft && (uint32_t)i < ft->cap && ft->fd_table[i])
-            return vfs_dup(ft->fd_table[i]);
-        return tty_open(0); // no parent fd — fall back to tty0
-    }
-    if (ft && (uint32_t)fd < ft->cap && ft->fd_table[fd])
-        return vfs_dup(ft->fd_table[fd]);
-    return tty_open(0); // requested fd doesn't exist — fall back to tty0
+    // Caller is the parent (g_current) setting up the child's stdio.  Dup the
+    // requested slot (`fd`, or `i` when fd==-1 means "inherit") under the
+    // parent's fd-table lock: a sibling thread sharing the table can close()
+    // the fd concurrently, and the old lock-free "check slot then vfs_dup it"
+    // double-fetched the slot and could vfs_dup a file the sibling had just
+    // freed (a use-after-free).  Under the lock a non-NULL slot is live, so the
+    // single vfs_dup is safe; vfs_dup(NULL) returns NULL for an empty slot.
+    task_files_t* tf = (g_current) ? g_current->files_shared : NULL;
+    if (!tf) return tty_open(0);
+    uint32_t slot = (fd == -1) ? (uint32_t)i : (uint32_t)fd;
+    vfs_file_t* f = NULL;
+    spin_lock(&tf->lock);
+    if (slot < tf->ft->cap) f = vfs_dup(tf->ft->fd_table[slot]);
+    spin_unlock(&tf->lock);
+    return f ? f : tty_open(0);   // empty / out-of-range slot -> fall back to tty0
 }
 
-// ── elf_load ──────────────────────────────────────────────────────────────
-// Full task creation: address space + kstack + fd_table.
-// stdio: array of 3 fd specs (see resolve_stdio). Pass NULL to open tty0.
-task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
-                 vfs_file_t* backing_file) {
-    phys_addr_t pml4;
-    mm_t*       mm;
-    uint64_t    entry;
-
-    if (!elf_load_into(data, size, &pml4, &mm, &entry,
-                       NULL, NULL, NULL, backing_file)) return NULL;
-
-    // Allocate task + shared resources.
+// ---- elf_build_task ----------------------------------------------------------
+// The shared task_t construction for BOTH ELF load paths.  elf_load and
+// elf_load_with_argv previously carried ~57 identical lines of task-field init
+// that drifted (the sigstate.handlers / cleartid / fs_base / pf_* zeroing
+// comments below are the scars).  ONE mechanism now, with the only three real
+// differences as parameters:
+//   stdio     -- fd 0/1/2 source; NULL means tty0 for all three
+//                (resolve_stdio(NULL, i) == tty_open(0)).
+//   comm_name -- process-name source (basename taken, max 15 chars); NULL (the
+//                no-argv path) leaves comm empty.
+//   user_rsp  -- initial user RSP pushed as r13 (VMM_USER_STACK_TOP for the
+//                no-argv path, the SysV-built stack for the argv path).
+// Takes ownership of pml4/mm: on success they are held by the task's mm_shared;
+// on ANY failure they (and every partially-built resource) are freed and NULL
+// is returned.
+static task_t* elf_build_task(phys_addr_t pml4, mm_t* mm, uint32_t pid,
+                              const int stdio[3], const char* comm_name,
+                              uint64_t entry, uint64_t user_rsp) {
     task_t* t = kmalloc(sizeof(task_t));
     if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+    // Zero the freshly slab-allocated task_t up front.  kmalloc returns slab
+    // poison, and these exec paths have historically drifted from process.c's
+    // field-by-field init, leaving members as garbage (sigstate.handlers ->
+    // force-kill; cleartid_addr -> wild futex write on exit; fs_base /
+    // wake_pending / pf_disk / pf_cache).  Zeroing first makes any member not
+    // explicitly set below default to 0; the explicit non-zero inits (mm,
+    // files, pledge, ctx, ...) still run after and override.  Drift-proof.
+    __builtin_memset(t, 0, sizeof(*t));
 
     task_mm_t* tmm = task_mm_alloc(pml4, mm);
     if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
 
     task_files_t* files = task_files_alloc();
     if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
-    fd_table_init(files, 4);
-    files->ft->fd_table[0] = tty_open(0); // elf_load: no caller stdio spec, default tty0
-    files->ft->fd_table[1] = tty_open(0);
-    files->ft->fd_table[2] = tty_open(0);
+    // fd_table_init OOM leaves files->ft == NULL; the fd_table[0..2] stores
+    // below would then write through NULL (kernel #PF).  Release and fail.
+    if (!fd_table_init(files, 4)) {
+        task_files_release(files); kfree(t); task_mm_release(tmm); return NULL;
+    }
+    // stdio==NULL resolves all three to tty0 (resolve_stdio(NULL, i)).
+    files->ft->fd_table[0] = resolve_stdio(stdio, 0);
+    files->ft->fd_table[1] = resolve_stdio(stdio, 1);
+    files->ft->fd_table[2] = resolve_stdio(stdio, 2);
 
     t->pid              = pid;
     t->tgid             = pid;
@@ -479,6 +756,31 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->mlfq_ticks_left  = 0;
     t->sigstate.pending   = 0;
     t->sigstate.blocked   = 0;
+    t->sigstate.sigframe_rsp = 0;
+    // Fresh per-process signal dispositions (all SIG_DFL), refcounted and
+    // shared across any threads this image later spawns.  A NULL here (OOM)
+    // must abort the build: the first signal path derefs t->sighand, and a
+    // slab-poison "handler" would force-SIGKILL the process on the very first
+    // signal (this was the silent killer of sway/svcmgr/login behind the
+    // desktop stall -- a compositor died the moment a helper exited/SIGCHLD'd).
+    t->sighand = sighand_alloc();
+    if (!t->sighand) {
+        task_files_release(files); task_mm_release(tmm); kfree(t); return NULL;
+    }
+    // exec also resets these per-task fields, which the elf.c exec paths
+    // previously left as slab garbage (a drift from process.c's task init):
+    //   cleartid_addr -- a garbage value makes exit write 0 to a wild futex
+    //                    address (futex clear-on-exit) and wake on it;
+    //   fs_base       -- garbage %fs base until libc sets TLS;
+    //   wake_pending  -- garbage feeds the lost-wakeup scheduler guard;
+    //   last_ran_cpu  -- garbage CPU-affinity hint;
+    //   pf_disk/cache -- produced UINT_MAX "[pf] ... (109% warm)" accounting.
+    t->cleartid_addr = 0;
+    t->fs_base       = 0;
+    t->last_ran_cpu  = 0;
+    t->wake_pending  = 0;
+    t->pf_disk       = 0;
+    t->pf_cache      = 0;
     t->signalfd_head      = NULL;
     t->drm_bytes_charged  = 0;
     t->drm_priority       = 0;
@@ -487,7 +789,7 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     t->sleep_until_ns   = 0;
     t->cwd = kmalloc(KPATH_MAX);
     if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
-    // Credentials: inherit from parent if present, otherwise root.
+    // Credentials: inherit from the spawning process if present, otherwise root.
     if (g_current && g_current->files_shared)
         cred_copy(&t->cred, &g_current->cred);
     else
@@ -500,25 +802,51 @@ task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
     uint64_t* stk = (uint64_t*)kstack_top;
     *(--stk) = 0;
     *(--stk) = (uint64_t)user_trampoline;
-    t->comm[0] = '\0'; // elf_load: no argv — comm unknown
+
+    // comm: basename of comm_name (max 15 chars); empty when comm_name is NULL.
+    if (comm_name) {
+        const char* base = comm_name;
+        for (const char* p = comm_name; *p; p++) if (*p == '/') base = p + 1;
+        uint32_t ci = 0;
+        while (ci < 15 && base[ci]) { t->comm[ci] = base[ci]; ci++; }
+        t->comm[ci] = '\0';
+    } else {
+        t->comm[0] = '\0';
+    }
 
     // exec: reset pledge to PLEDGE_ALL and unveil to empty (full visibility).
     // The new image sets its own restrictions.
     t->pledge_mask = PLEDGE_ALL;
     unveil_init(&t->unveil);
 
-    *(--stk) = 0;                  // rbx
-    *(--stk) = 0;                  // rbp
-    *(--stk) = entry;              // r12 = user RIP
-    *(--stk) = VMM_USER_STACK_TOP; // r13 = user RSP (no argv yet — elf_load path)
-    *(--stk) = 0;                  // r14
-    *(--stk) = 0;                  // r15
+    *(--stk) = 0;          // rbx
+    *(--stk) = 0;          // rbp
+    *(--stk) = entry;      // r12 = user RIP
+    *(--stk) = user_rsp;   // r13 = user RSP
+    *(--stk) = 0;          // r14
+    *(--stk) = 0;          // r15
     t->ctx.rsp = (uint64_t)stk;
 
     return t;
 }
 
-// ── elf_load_with_argv ────────────────────────────────────────────────────
+// ---- elf_load ----------------------------------------------------------------
+// Full task creation: address space + kstack + fd_table.  No argv: stdio
+// defaults to tty0, comm stays empty, user RSP is the bare stack top.
+task_t* elf_load(const uint8_t* data, uint64_t size, uint32_t pid,
+                 vfs_file_t* backing_file) {
+    phys_addr_t pml4;
+    mm_t*       mm;
+    uint64_t    entry;
+
+    if (!elf_load_into(data, size, &pml4, &mm, &entry,
+                       NULL, NULL, NULL, backing_file)) return NULL;
+
+    return elf_build_task(pml4, mm, pid, NULL /*stdio->tty0*/, NULL /*comm*/,
+                          entry, VMM_USER_STACK_TOP);
+}
+
+// ---- elf_load_with_argv ------------------------------------------------------
 // Like elf_load but also calls elf_setup_stack to build the SysV stack.
 // Required for Linux ABI binaries (bash, musl apps) that read argc/argv/envp.
 //
@@ -547,87 +875,113 @@ task_t* elf_load_with_argv(const uint8_t* data, uint64_t size, uint32_t pid,
         return NULL;
     }
 
-    // Allocate task + shared resources (same as elf_load).
-    task_t* t = kmalloc(sizeof(task_t));
-    if (!t) { mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+    const char* comm_name = (argv && argv[0]) ? argv[0] : "unknown";
+    return elf_build_task(pml4, mm, pid, stdio, comm_name, entry, user_rsp);
+}
 
-    task_mm_t* tmm = task_mm_alloc(pml4, mm);
-    if (!tmm) { kfree(t); mm_destroy(mm); vmm_free_user(pml4); pmm_buddy_free(pml4, 0); return NULL; }
+#ifdef MAKAOS_BOOT_SELFTESTS
+// [task_init]: exercises elf_build_task (the shared ELF task constructor) and
+// asserts EVERY task_t field lands at its expected initial value.  The drift
+// safety net for the exec-critical field init the two load paths used to
+// duplicate: a forgotten/wrong field is a corrupted task (force-kill, wild
+// futex write, priv confusion), and this fails loudly at boot instead.
+void task_init_selftest(void) {
+    extern void kprintf_atomic(const char*, ...);
+    int fails = 0;
 
-    task_files_t* files = task_files_alloc();
-    if (!files) { kfree(t); task_mm_release(tmm); return NULL; }
-    fd_table_init(files, 4);
-    files->ft->fd_table[0] = resolve_stdio(stdio, 0);
-    files->ft->fd_table[1] = resolve_stdio(stdio, 1);
-    files->ft->fd_table[2] = resolve_stdio(stdio, 2);
-
-    t->pid              = pid;
-    t->tgid             = pid;
-    t->ppid             = 0;
-    t->pgid             = pid;
-    t->sid              = pid;
-    t->flags            = 0;
-    t->state            = TASK_READY;
-    t->next             = NULL;
-    t->children         = NULL;
-    t->child_next       = NULL;
-    t->pg_prev = t->pg_next = NULL;
-    t->tg_prev = t->tg_next = NULL;
-    t->sid_prev = t->sid_next = NULL;
-    t->home_cpu = 0;
-    t->mm_shared        = tmm;
-    t->files_shared     = files;
-    t->mlfq_level       = 0;
-    t->mlfq_ticks_left  = 0;
-    t->sigstate.pending   = 0;
-    t->sigstate.blocked   = 0;
-    t->signalfd_head      = NULL;
-    t->drm_bytes_charged  = 0;
-    t->drm_priority       = 0;
-    t->umask            = 0022u;
-    t->exit_code        = 0;
-    t->sleep_until_ns   = 0;
-    t->cwd = kmalloc(KPATH_MAX);
-    if (t->cwd) { t->cwd[0] = '/'; t->cwd[1] = '\0'; }
-    // Credentials: inherit from spawning process if present, otherwise root.
-    if (g_current && g_current->files_shared)
-        cred_copy(&t->cred, &g_current->cred);
-    else
-        cred_init_root(&t->cred);
-    __asm__ volatile("fxsave %0" : "=m"(t->ctx.fxsave_buf));
-
-    virt_addr_t kstack_top = kstack_alloc();
-    t->kstack_top = kstack_top;
-
-    uint64_t* stk = (uint64_t*)kstack_top;
-    *(--stk) = 0;
-    *(--stk) = (uint64_t)user_trampoline;
-    // Set comm: basename of argv[0], max 15 chars.
-    {
-        const char* name = (argv && argv[0]) ? argv[0] : "unknown";
-        const char* base = name;
-        for (const char* p = name; *p; p++) if (*p == '/') base = p + 1;
-        uint32_t ci = 0;
-        while (ci < 15 && base[ci]) { t->comm[ci] = base[ci]; ci++; }
-        t->comm[ci] = '\0';
+    phys_addr_t pml4 = vmm_alloc_pml4();
+    mm_t* mm = (pml4 == PMM_INVALID_ADDR) ? NULL : mm_create();
+    if (pml4 == PMM_INVALID_ADDR || !mm) {
+        if (mm) mm_destroy(mm);
+        if (pml4 != PMM_INVALID_ADDR) { vmm_free_user(pml4); pmm_buddy_free(pml4, 0); }
+        kprintf_atomic("[task_init] SELF-TEST FAILED (OOM building test address space)\n");
+        return;
     }
 
-    // exec: reset pledge to PLEDGE_ALL and unveil to empty.
-    // Credentials are inherited (set above); pledge/unveil reset on exec
-    // so the new image can set its own restrictions.
-    t->pledge_mask = PLEDGE_ALL;
-    unveil_init(&t->unveil);
+    const uint32_t TPID = 4242u;
+    const uint64_t TENTRY = 0x400000ull;
+    task_t* t = elf_build_task(pml4, mm, TPID, NULL, NULL, TENTRY,
+                               VMM_USER_STACK_TOP);
+    if (!t) {   // elf_build_task freed pml4/mm on failure
+        kprintf_atomic("[task_init] SELF-TEST FAILED (elf_build_task returned NULL)\n");
+        return;
+    }
 
-    *(--stk) = 0;          // rbx
-    *(--stk) = 0;          // rbp
-    *(--stk) = entry;      // r12 = user RIP
-    *(--stk) = user_rsp;   // r13 = user RSP (points to argc on stack)
-    *(--stk) = 0;          // r14
-    *(--stk) = 0;          // r15
-    t->ctx.rsp = (uint64_t)stk;
+    // Identity.
+    if (t->pid  != TPID) fails++;
+    if (t->tgid != TPID) fails++;
+    if (t->ppid != 0)    fails++;
+    if (t->pgid != TPID) fails++;
+    if (t->sid  != TPID) fails++;
+    if (t->flags != 0)   fails++;
+    if (t->state != TASK_READY) fails++;
+    // Resource pointers (never NULL) + fd 0/1/2 wired to tty0.
+    if (!t->mm_shared)    fails++;
+    if (!t->files_shared) fails++;
+    if (!t->kstack_top)   fails++;
+    if (t->ctx.rsp == 0)  fails++;
+    if (t->files_shared && t->files_shared->ft) {
+        if (!t->files_shared->ft->fd_table[0]) fails++;
+        if (!t->files_shared->ft->fd_table[1]) fails++;
+        if (!t->files_shared->ft->fd_table[2]) fails++;
+    } else fails++;
+    // List links start unlinked.
+    if (t->next || t->children || t->child_next) fails++;
+    if (t->pg_prev || t->pg_next)  fails++;
+    if (t->tg_prev || t->tg_next)  fails++;
+    if (t->sid_prev || t->sid_next) fails++;
+    // The historically-drifting zeroed fields (the scar list).
+    if (t->cleartid_addr != 0) fails++;
+    if (t->fs_base != 0)       fails++;
+    if (t->wake_pending != 0)  fails++;
+    if (t->last_ran_cpu != 0)  fails++;
+    if (t->pf_disk != 0 || t->pf_cache != 0) fails++;
+    if (t->signalfd_head != NULL) fails++;
+    if (t->on_cpu != 0)        fails++;
+    if (t->syscall_a5 != 0 || t->syscall_a6 != 0) fails++;
+    if (t->kthread_ctx != NULL) fails++;
+    // sigstate reset: pending/blocked/frame clear + a fresh all-SIG_DFL sighand.
+    if (t->sigstate.pending != 0 || t->sigstate.blocked != 0) fails++;
+    if (t->sigstate.sigframe_rsp != 0) fails++;
+    if (!t->sighand) fails++;
+    else {
+        const volatile uint8_t* hb = (const volatile uint8_t*)&t->sighand->handlers;
+        for (unsigned i = 0; i < sizeof(t->sighand->handlers); i++)
+            if (hb[i] != 0) { fails++; break; }
+    }
+    // Misc scalars.
+    if (t->umask != 0022u) fails++;
+    if (t->exit_code != 0) fails++;
+    if (t->sleep_until_ns != 0) fails++;
+    if (t->mlfq_level != 0 || t->mlfq_ticks_left != 0) fails++;
+    if (t->home_cpu != 0) fails++;
+    if (t->drm_bytes_charged != 0 || t->drm_priority != 0) fails++;
+    // cwd == "/", comm empty (NULL comm_name), pledge full.
+    if (!t->cwd || t->cwd[0] != '/' || t->cwd[1] != '\0') fails++;
+    if (t->comm[0] != '\0') fails++;
+    if (t->pledge_mask != PLEDGE_ALL) fails++;
+    // The two parameterised stack values (r12=entry, r13=user_rsp) landed at
+    // their known offsets from ctx.rsp (layout: r15,r14,r13,r12,rbp,rbx,...).
+    {
+        const uint64_t* s = (const uint64_t*)t->ctx.rsp;
+        if (s[2] != VMM_USER_STACK_TOP) fails++;   // r13 = user RSP
+        if (s[3] != TENTRY)             fails++;   // r12 = user RIP
+    }
 
-    return t;
+    // Teardown (mirror task_free_rcu's resource frees; this task was never
+    // scheduled/listed and has no signalfd subscribers).
+    kstack_free(t->kstack_top);
+    task_mm_release(t->mm_shared);
+    task_files_release(t->files_shared);
+    sighand_release(t->sighand);
+    kfree(t->cwd);
+    unveil_free(&t->unveil);
+    kfree(t);
+
+    kprintf_atomic(fails ? "[task_init] SELF-TEST FAILED\n"
+                  : "[task_init] SELF-TEST PASSED (every task_t field initialised by elf_build_task)\n");
 }
+#endif
 
 // ── elf_read_buf ──────────────────────────────────────────────────────────
 // Shared read primitive used by every ELF load path (spawn, exec, kernel).
@@ -675,9 +1029,10 @@ static task_t* elf_load_vfs(vfs_file_t* f, uint32_t pid) {
     int64_t n = vfs_read(f, hdr, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            f->path[0] ? f->path : "?",
-            (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                f->path[0] ? f->path : "?",
+                (uint32_t)((t1 - t0) / 1000u));
     task_t* t = elf_load(hdr, (uint64_t)n, pid, f);
     kfree(hdr);
     return t;
@@ -694,9 +1049,10 @@ static task_t* elf_load_vfs_with_argv(vfs_file_t* f, uint32_t pid,
     int64_t n = vfs_read(f, hdr, PAGE_SIZE);
     uint64_t t1 = tsc_read_ns();
     if (n < (int64_t)sizeof(Elf64_Ehdr)) { kfree(hdr); return NULL; }
-    kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
-            f->path[0] ? f->path : "?",
-            (uint32_t)((t1 - t0) / 1000u));
+    if (CONFIG_DEBUG_DEMAND_PAGING)
+        kprintf("[elf] lazy %s: header %u us (demand-paged)\n",
+                f->path[0] ? f->path : "?",
+                (uint32_t)((t1 - t0) / 1000u));
     task_t* t = elf_load_with_argv(hdr, (uint64_t)n, pid, argv, envp, stdio, f);
     kfree(hdr);
     return t;
@@ -710,10 +1066,17 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
     // exec_ino is declared outside the block so it survives into the open
     // call below — eliminating the redundant second path walk.
     uint32_t exec_ino;
+    // Hoisted so the setuid escalation can be applied to the child after it is
+    // built (and the requester's identity captured for the ksec request).
+    uint32_t setuid_uid   = 0xFFFFFFFFu;   // 0xFFFFFFFF = no escalation
+    uint32_t caller_uid   = 0;
+    uint32_t caller_gid   = 0;
     {
         cred_t root_cred; cred_init_root(&root_cred);
         const cred_t* c = (g_current && g_current->files_shared)
                           ? &g_current->cred : &root_cred;
+        caller_uid = c->euid;
+        caller_gid = c->egid;
         int exec_err = 0;
         exec_ino = ext2_lookup_path(path, c, &exec_err);
         if (!exec_ino) return NULL;
@@ -721,10 +1084,11 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
         if (!ext2_read_inode(exec_ino, &exec_inode)) return NULL;
         inode_perm_t ip = {
             .uid = exec_inode.i_uid, .gid = exec_inode.i_gid,
-            .mode = exec_inode.i_mode & 0x1FF,
+            // Full low-12 mode so vfs_check_exec sees the setuid bit (04000);
+            // acl_from_mode only reads the low 9, so the perm check is unaffected.
+            .mode = exec_inode.i_mode & 0xFFF,
             .inode_nr = exec_ino, .dev = 0, .nosuid = 0,
         };
-        uint32_t setuid_uid = 0xFFFFFFFFu;
         if (vfs_check_exec(&ip, c, &setuid_uid) != 0) return NULL;
     }
 
@@ -734,6 +1098,11 @@ task_t* elf_exec_from_ext2(const char* path, uint32_t pid,
 
     task_t* t = elf_load_vfs_with_argv(f, pid, argv, envp, stdio);
     vfs_close(f);
+    // setuid-on-exec: apply any escalation to the new (not-yet-scheduled) child,
+    // ksec-mediated and fail-closed (no agent / deny -> no change).
+    if (t) ksec_exec_setuid(&t->cred, setuid_uid, exec_ino,
+                            (g_current ? g_current->pid : 0),
+                            caller_uid, caller_gid);
     return t;
 }
 

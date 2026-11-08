@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYSCALL_H
 #define _MAKAOS_SYSCALL_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // MakaOS-specific syscall numbers and raw syscall macros.
 // These are the kernel ABI — numbers must match kernel/syscall/syscall.h.
 
@@ -120,6 +123,7 @@
 #define SYS_FUTEX             114
 #define SYS_SET_FS            115
 #define SYS_SET_CLEARTID      116
+#define SYS_SIGALTSTACK       118
 
 // futex ops (kernel/proc/futex.h).  timeout arg is RELATIVE
 // nanoseconds, 0 = wait forever.
@@ -169,11 +173,17 @@ static inline uint64_t syscall0(uint64_t nr) {
 
 // -errno decode: negative kernel return → set errno + return -1; positive
 // → pass through unchanged.
-extern __thread int errno;
+int* __errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
 static inline long __syscall_ret(uint64_t r) {
     long s = (long)r;
     if (s < 0 && s > -4096) { errno = (int)-s; return -1; }
     return s;
 }
 
+#ifdef __cplusplus
+}
+#endif
 #endif

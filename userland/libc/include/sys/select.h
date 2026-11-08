@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_SELECT_H
 #define _MAKAOS_SYS_SELECT_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <time.h>
 #include <signal.h>
@@ -30,5 +34,9 @@ struct timeval {
 int select(int nfds, fd_set* rd, fd_set* wr, fd_set* er, struct timeval* tv);
 int pselect(int nfds, fd_set* rd, fd_set* wr, fd_set* er,
              const struct timespec* tv, const sigset_t* mask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

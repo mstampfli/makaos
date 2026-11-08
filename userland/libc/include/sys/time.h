@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_SYS_TIME_H
 #define _MAKAOS_SYS_TIME_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/select.h>
 #include <time.h>
 
@@ -39,5 +43,9 @@ int lutimes(const char* path, const struct timeval times[2]);
             (r)->tv_usec += 1000000;                        \
         }                                                   \
     } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

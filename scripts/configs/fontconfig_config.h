@@ -46,6 +46,20 @@
 #define HAVE_EXPAT               1
 #define HAVE_FREETYPE            1
 
+// ── FreeType optional API (meson normally probes these by compile+link;
+//    the cross build can't run probes, so they default OFF and the code
+//    paths get compiled out). All four symbols ARE in our libfreetype.a
+//    (verified with nm). The critical one is FT_Get_X11_Font_Format: when
+//    absent, fcfreetype.c never sets FC_FONTFORMAT on scanned fonts, and
+//    pango's filter_by_format() then drops EVERY font (it accepts only
+//    "TrueType"/"CFF"), leaving an empty match set -> .notdef tofu in the
+//    bar. The others fix latent gaps: PS foundry/info, BDF properties, and
+//    FT_Done_MM_Var cleanup of variable-font data. ─────────────────────
+#define HAVE_FT_GET_X11_FONT_FORMAT 1
+#define HAVE_FT_GET_PS_FONT_INFO    1
+#define HAVE_FT_GET_BDF_PROPERTY    1
+#define HAVE_FT_DONE_MM_VAR         1
+
 // ── Compile-time constants ─────────────────────────────────────────
 #define ALIGNOF_VOID_P           8
 #define ALIGNOF_DOUBLE           8

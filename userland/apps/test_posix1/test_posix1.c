@@ -87,9 +87,17 @@ static void test_printf_octal(void) {
 
 static void test_write_readonly_fd(void) {
     printf("-- write() to read-only fd\n");
-    // fd 0 is keyboard (read-only — no write handler).
-    ssize_t r = write(0, "x", 1);
-    check("write(stdin) == -1", r == (ssize_t)-1);
+    // Open a file O_RDONLY and write to it -> must fail with EBADF.  (Do NOT
+    // use fd 0: the console tty is read-write, so writing to stdin succeeds —
+    // as it does on any POSIX system where stdin is a terminal.  The kernel
+    // does enforce O_RDONLY: open() nulls f->write for read-only files.)
+    int rofd = open("/etc/passwd", O_RDONLY, 0);
+    check("open ro file", rofd >= 0);
+    errno = 0;
+    ssize_t r = write(rofd, "x", 1);
+    check("write(ro fd) == -1", r == (ssize_t)-1);
+    check("errno == EBADF (ro fd)", errno == EBADF);
+    close(rofd);
 }
 
 static void test_brk_exact(void) {
@@ -191,11 +199,14 @@ static void test_errno(void) {
     check("write(badfd) == -1",     r == (ssize_t)-1);
     check("errno == EBADF (write)", errno == EBADF);
 
-    // write to read-only fd (stdin) → EBADF (no write handler)
+    // write to a read-only fd → EBADF.  Use an O_RDONLY file, not fd 0: the
+    // console tty is read-write, so writing to stdin legitimately succeeds.
+    int rofd = open("/etc/passwd", O_RDONLY, 0);
     errno = 0;
-    r = write(0, "x", 1);
-    check("write(stdin) == -1",     r == (ssize_t)-1);
+    r = write(rofd, "x", 1);
+    check("write(ro fd) == -1",     r == (ssize_t)-1);
     check("errno == EBADF (ro fd)", errno == EBADF);
+    close(rofd);
 
     // close bad fd → EBADF
     errno = 0;
@@ -573,7 +584,14 @@ static void test_pipe(void) {
     check("pipe EOF when writer closed", n == 0);
     close(fds[0]);
 
-    // EPIPE: write returns error when read end closed
+    // EPIPE: write returns error when read end closed.  Writing to a pipe
+    // with no reader raises SIGPIPE, whose default action terminates the
+    // process before write() can return — so ignore it first (as any program
+    // that wants the EPIPE return must).  Without this the whole test suite
+    // was killed here (sig 13) and every later test silently never ran.
+    struct_sigaction _ign_pipe = {0}, _old_pipe;
+    _ign_pipe.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &_ign_pipe, &_old_pipe);
     pipe(fds);
     close(fds[0]);  // close read end
     errno = 0;
@@ -581,6 +599,7 @@ static void test_pipe(void) {
     check("pipe write with reader closed == -1", n == -1);
     check("errno == EPIPE", errno == EPIPE);
     close(fds[1]);
+    sigaction(SIGPIPE, &_old_pipe, NULL);  // restore
 }
 
 // ── test_sigaction ────────────────────────────────────────────────────────

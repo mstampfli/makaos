@@ -6,6 +6,9 @@
 
 #ifndef _MAKAOS_UTIME_H
 #define _MAKAOS_UTIME_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <sys/types.h>
 
@@ -16,4 +19,7 @@ struct utimbuf {
 
 int utime(const char* path, const struct utimbuf* times);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

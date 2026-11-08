@@ -58,6 +58,9 @@ path stays as a fallback for pre-virtio-gpu consoles.
   connector in the DRM wrapper).
 - 3D: defer virgl / TRANSFER_TO_HOST_3D until after Hyprland lands
   on the 2D path; wlroots-pixman renderer doesn't need GL.
+  Concrete dependency-ordered bring-up plan (kernel 3D commands +
+  fences, DRM render node, Mesa/GBM/EGL port, wlroots/SDL/QEMU
+  wiring) in docs/VIRGL_BRINGUP.md.
 
 ### Tier 2.5b — DRM/KMS uAPI layer
 `kernel/drivers/video/drm.c` + `/dev/dri/card0` chardev

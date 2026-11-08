@@ -139,8 +139,29 @@ static void dump_stack_head(uint64_t rsp) {
  * free-form panic case; `msg` is always the final user-facing one-
  * liner. */
 static __attribute__((noreturn))
+/* Lockless polling-serial primitives for the earliest possible fault trace:
+ * no serial lock (kprintf_atomic's lock may be the thing that is wedged), no
+ * framebuffer, no stack walk.  Survives a corrupted stack / held lock so the
+ * faulting RIP/CR2 reach serial even when the rich dump below re-faults and
+ * triple-faults the CPU (observed under the sway desktop). */
+static void praw_s(const char* s) { extern void serial_raw_putc(char);
+    for (; *s; s++) serial_raw_putc(*s); }
+static void praw_h(uint64_t v) { extern void serial_raw_putc(char);
+    for (int i = 60; i >= 0; i -= 4) { uint8_t n = (uint8_t)((v >> i) & 0xF);
+        serial_raw_putc(n < 10 ? (char)('0' + n) : (char)('A' + (n - 10))); }
+    serial_raw_putc('\n'); }
+
 void panic_common(const char* msg, const interrupt_frame_t* frame,
                    uint64_t error_code, int has_ec) {
+    /* Earliest fault trace, BEFORE the re-entry guard / halt_other_cpus /
+     * locked kprintf — so even a panic-in-panic that re-faults still leaves
+     * the original RIP/CR2 on serial. */
+    praw_s("\n### PANIC EARLY ip=");
+    praw_h(frame ? frame->ip : 0);
+    praw_s("cr2="); praw_h(read_cr2());
+    praw_s("sp=");  praw_h(frame ? frame->sp : 0);
+    praw_s("ec=");  praw_h(error_code);
+
     /* Re-entry guard — first caller wins the dump. */
     uint32_t expected = 0xFFFFFFFFu;
     uint32_t my_id    = 0;

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYS_TIMERFD_H
 #define _MAKAOS_SYS_TIMERFD_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <time.h>
 
@@ -14,4 +17,7 @@ int timerfd_settime(int fd, int flags,
                     struct itimerspec* old_value);
 int timerfd_gettime(int fd, struct itimerspec* curr_value);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

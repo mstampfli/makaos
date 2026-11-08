@@ -22,6 +22,7 @@
 #include "preempt.h"
 #include "cpu.h"
 #include "acpi.h"
+#include "checked.h"   // index_ok: single source of truth for bounded indices
 
 // ── PCI class codes ─────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE    0x01
@@ -42,6 +43,11 @@
 #define NVME_REG_ACQ        0x0030  // Admin CQ Base Address (RW, 64b)
 // Doorbells start at 0x1000, stride = 4 << (CAP.DSTRD).
 // SQyTDBL at 0x1000 + 2*y*stride; CQyHDBL at 0x1000 + (2*y+1)*stride.
+// The doorbell offset scales with the device-reported CAP.DSTRD and the queue
+// id, so BAR0 is mapped to cover the highest doorbell we may write (qid up to
+// MAX_CPUS); a controller advertising a stride that would need more than this
+// is refused rather than allowed to drive an MMIO store past the mapping.
+#define NVME_BAR0_MAX_MAP   0x100000u   // 1 MiB ceiling on the BAR0 doorbell map
 
 // ── CC (Controller Configuration) bit layout ────────────────────────────
 #define CC_EN              (1u << 0)   // Enable
@@ -135,6 +141,23 @@ static uint8_t         s_acq_phase = 1;   // phase bit flips each wrap; initial
 static uint32_t        s_ns_nsid = 0;      // first namespace id
 static uint32_t        s_ns_lba_size = 512;
 static uint32_t        s_nr_ioq = 0;       // number of per-CPU I/O queues
+
+// PRIMITIVE (nvme LBA-size validation).  The Identify-Namespace LBA Data Size
+// exponent (LBADS, an 8-bit device-supplied field, 0..255) gives the sector
+// size as 2^LBADS.  A bare `1u << lbads` is UNDEFINED for lbads >= 32 (x86
+// masks the shift count to & 31, so e.g. lbads=32 yields 1 -- a tiny bogus
+// sector size), and any sub-512 / oversized size defeats nvme_rw's
+// mul_within_u32(nlb, s_ns_lba_size, 8192) DMA guard: a lying controller makes
+// our byte length under-count, so a transfer slips past the 2-PRP (<=8 KiB)
+// bound and the device DMAs past the PRPs.  Accept only the driver-supported
+// 512..4096-byte range (lbads 9..12) and compute the size with no UB; reject
+// everything else (nvme_init then refuses the namespace).  Returns true + the
+// byte size in *size on success.  Pure -> unit-tested (nvme_lba_size_ok_selftest).
+static inline bool nvme_lba_size_ok(uint32_t lbads, uint32_t* size) {
+    if (lbads < 9u || lbads > 12u) return false;   // only 512..4096-byte sectors
+    *size = 1u << lbads;                            // safe: lbads <= 12, no UB/wrap
+    return true;
+}
 
 // PCI location — saved so MSI-X setup can write PCI config.
 static pci_device_t    s_pci;
@@ -403,6 +426,15 @@ static void cid_push(nvme_ioq_t* q, uint16_t cid) {
     __atomic_fetch_or(&q->cid_free_bitmap, 1ULL << cid, __ATOMIC_RELEASE);
 }
 
+// PRIMITIVE (device-supplied index, category D -> delegates to index_ok).
+// Is a completion's command id a valid index into the NVME_IOQ_DEPTH-entry
+// req[] table?  The submit side draws cids from the 64-bit cid_free_bitmap so
+// it is always in range, but the COMPLETION cid is echoed by the device and
+// MUST be validated before indexing req[] -- an out-of-range cid otherwise
+// drives an OOB write of req->status/->done and a wait_queue_wake_all through
+// a fabricated wait_queue_t.  Pure -> unit-tested (nvme_cid_valid_selftest).
+static int nvme_cid_valid(uint16_t cid) { return index_ok(cid, NVME_IOQ_DEPTH); }
+
 // ── Async I/O submit — per-CPU queue, wakeup via that CPU's MSI-X ────
 static uint8_t io_submit_async(nvme_sqe_t* cmd) {
     // Pin to the current CPU for the duration of queue selection +
@@ -481,6 +513,12 @@ void nvme_irq_handler(void) {
         q->cq_head = (q->cq_head + 1) % NVME_IOQ_DEPTH;
         if (q->cq_head == 0) q->cq_phase ^= 1;
 
+        // cqe.cid is echoed by the device; reject an out-of-range id before it
+        // indexes req[] (OOB write + wake through a garbage wait_queue_t).  The
+        // CQE is already consumed (cq_head/phase advanced), so the doorbell
+        // below still credits it -- we just drop the corrupt completion.
+        if (!nvme_cid_valid(cqe.cid)) continue;
+
         nvme_request_t* req = &q->req[cqe.cid];
         req->status = cqe.status_phase;
         // Full fence so the device's preceding DMA to the caller buffer
@@ -493,7 +531,7 @@ void nvme_irq_handler(void) {
     // Manual decrement — calling preempt_enable() here would itself
     // re-open the sched_preempt → do_switch → `sti` path that would
     // let the next MSI-X nest inside this handler.
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // Expose asm stub.
@@ -519,7 +557,14 @@ static inline phys_addr_t kva_to_phys(const void* va) {
 // lists for larger I/Os.
 static uint8_t nvme_rw(uint64_t lba, void* buf, uint32_t nlb, uint8_t write) {
     if (!nlb) return 1;
-    uint32_t bytes = nlb * s_ns_lba_size;
+    // The 2-PRP path supports <= 8 KiB.  Form the byte length in u64 (mul_within_u32)
+    // so a huge nlb cannot wrap u32 and slip past this bound while cdw12 still carries
+    // a (16-bit-masked) large sector count -> the device DMAs far past the PRPs.
+    uint32_t bytes;
+    if (!mul_within_u32(nlb, s_ns_lba_size, 8192u, &bytes)) {
+        kprintf("[nvme] nvme_rw: >8KB transfers not yet supported\n");
+        return 0;
+    }
     phys_addr_t pa = kva_to_phys(buf);
     uint32_t pg_off = (uint32_t)(pa & 0xFFFu);
     phys_addr_t prp1 = pa;
@@ -559,14 +604,7 @@ uint8_t nvme_write(uint64_t lba, const void* buf, uint32_t nlb) {
 // Returns 0 on failure; on success, `*out_tbl_size` gets the usable
 // entry count (for the caller to cap s_nr_ioq).
 static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
-    uint8_t cap = (uint8_t)(pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn,
-                                              0x34u) & 0xFCu);
-    uint8_t msix_cap = 0;
-    while (cap) {
-        uint32_t dw = pci_cfg_read32(s_pci.bus, s_pci.dev, s_pci.fn, cap);
-        if ((dw & 0xFF) == 0x11u) { msix_cap = cap; break; }
-        cap = (uint8_t)((dw >> 8) & 0xFCu);
-    }
+    uint8_t msix_cap = pci_find_cap(s_pci.bus, s_pci.dev, s_pci.fn, 0x11u);
     if (!msix_cap) {
         kprintf("[nvme] no MSI-X capability\n");
         return 0;
@@ -590,9 +628,17 @@ static uint8_t nvme_msix_enable(uint32_t nr_wanted, uint32_t* out_tbl_size) {
     // Map enough space for all entries we intend to program.
     uint32_t map_bytes = 16u * tbl_size;
     // Round up to page so vmm_map_mmio is happy.
-    map_bytes = (map_bytes + 0xFFFu) & ~0xFFFu;
+    map_bytes = (uint32_t)page_align_up(map_bytes);
     s_msix_table = (volatile uint32_t*)
                    vmm_map_mmio(bar_phys + tbl_off, map_bytes);
+    if (!s_msix_table) {
+        // MSI-X is required here (each per-CPU I/O queue uses its own vector;
+        // this driver has no INTx fallback), so a failed table map fails enable
+        // -- consistent with the !bar_phys guard above -- rather than NULL-deref
+        // the programming loop below.
+        kprintf("[nvme] MSI-X table map failed\n");
+        return 0;
+    }
 
     // Program one entry per CPU we actually want to service.
     for (uint32_t cpu = 0; cpu < nr_wanted; cpu++) {
@@ -652,6 +698,10 @@ uint8_t nvme_init(void) {
         return 0;
     }
     s_regs = (uint8_t*)vmm_map_mmio(bar_phys, 0x2000);
+    // A failed BAR0 map (OOM / MMIO-VA exhaustion -> NULL) must fail init, not
+    // NULL-deref s_regs in reg_rd32 below.  nvme_init returns 0 on every other
+    // setup failure; mirror that.
+    if (!s_regs) return 0;
 
     // 3. Read CAP to learn doorbell stride and max queue depth.  Read as
     //    two 32-bit halves — some controllers don't support a 64-bit MMIO
@@ -668,6 +718,29 @@ uint8_t nvme_init(void) {
     kprintf("[nvme] VS=%x.%x.%x CAP_lo=%x CAP_hi=%x mqes=%u dstrd_field=%u stride=%u\n",
             (vs >> 16) & 0xFFFF, (vs >> 8) & 0xFF, vs & 0xFF,
             cap_lo, cap_hi, s_max_qentries, dstrd, s_doorbell_stride);
+
+    // Size the BAR0 mapping to cover the doorbells of every I/O queue we may
+    // create.  The highest doorbell is cq_doorbell(MAX_CPUS) = 0x1000 +
+    // (2*MAX_CPUS + 1)*stride; the stride is the device-reported 4 << CAP.DSTRD,
+    // so the fixed 0x2000 map above is overrun once DSTRD is large enough -- an
+    // OOB MMIO store at the sq/cq_doorbell write sites.  Remap over the real
+    // extent before any doorbell is touched (the admin queue setup below writes
+    // the qid-0 doorbells).  The common small-stride case (QEMU/real devices,
+    // DSTRD=0 -> extent 0x1208) stays within 0x2000 and is left unchanged.
+    uint64_t db_extent = 0x1000ull + (2ull * MAX_CPUS + 1ull) * s_doorbell_stride + 4ull;
+    db_extent = page_align_up(db_extent);             // round up to a page
+    if (db_extent > NVME_BAR0_MAX_MAP) {
+        kprintf("[nvme] CAP.DSTRD=%u needs a %u-byte doorbell region (> %u); refusing\n",
+                dstrd, (uint32_t)db_extent, (uint32_t)NVME_BAR0_MAX_MAP);
+        return 0;
+    }
+    if (db_extent > 0x2000ull) {
+        s_regs = (uint8_t*)vmm_map_mmio(bar_phys, db_extent);
+        // The remap to the larger doorbell window replaced the first mapping;
+        // on failure s_regs is now NULL, so fail init rather than NULL-deref
+        // the doorbells.
+        if (!s_regs) return 0;
+    }
 
     // 4. Allocate admin queues (one 4 KiB page each — enough for 64 entries
     //    of SQE=64B (4096/64=64) and CQE=16B (4096/16=256)).
@@ -729,9 +802,17 @@ uint8_t nvme_init(void) {
     uint8_t  flbas = idbuf[26];
     uint8_t  lbaf_i = flbas & 0xF;
     uint32_t lbaf  = *(uint32_t*)(idbuf + 128 + 4 * lbaf_i);
-    uint32_t lbads = (lbaf >> 16) & 0xFF;   // 2^lbads = LBA size
+    uint32_t lbads = (lbaf >> 16) & 0xFF;   // 2^lbads = LBA size (device-supplied)
+    uint32_t lba_size;
+    if (!nvme_lba_size_ok(lbads, &lba_size)) {
+        // Out-of-range / UB-inducing LBADS: refuse the namespace rather than
+        // derive a bogus sector size that defeats nvme_rw's DMA-size guard.
+        kprintf("[nvme] NS%u: unsupported LBA data size 2^%u -- refusing namespace\n",
+                first_nsid, lbads);
+        return 0;
+    }
     s_ns_nsid = first_nsid;
-    s_ns_lba_size = 1u << lbads;
+    s_ns_lba_size = lba_size;
     kprintf("[nvme] NS%u: nsze=%lu lba_size=%u bytes\n",
             first_nsid, nsze, s_ns_lba_size);
 
@@ -810,4 +891,63 @@ uint8_t nvme_init(void) {
 
     kprintf("[nvme] init complete — per-CPU I/O queues live\n");
     return 1;
+}
+
+// ── nvme_cid_valid selftest ───────────────────────────────────────────────
+// Deterministic check of the device-echoed completion-id bounds guard that
+// stops an OOB write of req[]/a wake through a fabricated wait_queue_t from a
+// malicious/buggy controller (or CQ-page DMA corruption) reporting cid >= 64.
+void nvme_cid_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint16_t cid; int want; } c[] = {
+        { 0,                 1 },  // first slot
+        { NVME_IOQ_DEPTH-1,  1 },  // last valid slot (63)
+        { NVME_IOQ_DEPTH,    0 },  // == 64, first OOB
+        { 1000,              0 },  // arbitrary OOB
+        { 0xFFFF,            0 },  // device garbage (uint16 max)
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (nvme_cid_valid(c[i].cid) != c[i].want) {
+            kprintf_atomic("[nvme_cid] FAIL cid=%u got=%d want=%d\n",
+                    (unsigned)c[i].cid, nvme_cid_valid(c[i].cid), c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[nvme_cid] SELF-TEST FAILED\n"
+                  : "[nvme_cid] SELF-TEST PASSED (device completion-id bounds)\n");
+}
+
+// Deterministic check of the LBADS validation: only the driver-supported
+// 512..4096-byte sizes (lbads 9..12) are accepted, the sub-512 / oversized
+// values are rejected, and the lbads >= 32 rows are exactly the `1u << lbads`
+// UB the raw code hit (the shift count wraps to & 31, yielding a tiny size that
+// defeats the DMA-size guard).  Rejecting BEFORE the shift makes the UB
+// unreachable.
+void nvme_lba_size_ok_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t lbads; bool eok; uint32_t esize; } c[] = {
+        { 9,   true,  512 },    // 512-byte sector (the common case)
+        { 10,  true,  1024 },
+        { 11,  true,  2048 },
+        { 12,  true,  4096 },   // 4 KiB sector
+        { 8,   false, 0 },      // 256-byte: sub-512, reject
+        { 0,   false, 0 },      // 1-byte: the guard-defeat input, reject
+        { 13,  false, 0 },      // 8 KiB: > 2-PRP path / oversized, reject
+        { 31,  false, 0 },      // 2^31: no UB but huge, reject
+        { 32,  false, 0 },      // THE UB edge: 1u<<32 is undefined -> rejected before the shift
+        { 255, false, 0 },      // max 8-bit field, reject
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t sz = 0xDEADu;
+        bool ok = nvme_lba_size_ok(c[i].lbads, &sz);
+        if (ok != c[i].eok || (ok && sz != c[i].esize)) {
+            kprintf_atomic("[nvme_lbads] FAIL lbads=%u ok=%d sz=%u\n",
+                    c[i].lbads, (int)ok, sz);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[nvme_lbads] SELF-TEST FAILED\n"
+                  : "[nvme_lbads] SELF-TEST PASSED (valid 512..4096 LBA size, no UB shift)\n");
 }

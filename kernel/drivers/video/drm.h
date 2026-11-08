@@ -15,14 +15,15 @@
 vfs_file_t* vfs_drm_open(void);
 
 // Predicate used by sys_mmap to recognise a DRM fd before calling
-// drm_resolve_dumb_mmap.  Compares the close op under the hood.
+// drm_mmap_backing.  Compares the close op under the hood.
 int drm_is_drm_file(vfs_file_t* f);
 
-// Resolve a MAP_DUMB "magic offset" → backing physical address + size.
-// Callers: sys_mmap.  Returns 0 on success, -errno on failure.
-int64_t drm_resolve_dumb_mmap(vfs_file_t* f, uint64_t offset,
-                                uint64_t len, phys_addr_t* out_phys,
-                                uint64_t* out_bytes);
+// Resolve a MAP_DUMB "magic offset" to a DRM object and install userspace PTEs
+// for its scatter-gather backing at [vaddr, vaddr+len) (page-granular).  Zero
+// faults -- the backing is already resident.  Caller: sys_mmap (which has
+// already marked the VMA VMA_MMIO).  Returns 0 on success, -errno on failure.
+int64_t drm_mmap_backing(vfs_file_t* f, uint64_t offset, uint64_t len,
+                         phys_addr_t pml4, virt_addr_t vaddr, uint64_t pte);
 
 // io_uring op entry point.  Called from kernel/io/io_uring.c when a
 // SQE with IORING_OP_DRM_COMMIT is processed.  `drm_fd_file` is the

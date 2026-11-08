@@ -111,8 +111,19 @@ void smp_call_function_single(uint32_t cpu, void (*fn)(void*), void* arg) {
     smp_call_push(cpu, &slot);
     lapic_send_ipi(g_cpus[cpu].apic_id, VEC_IPI_CALL);
 
-    while (!__atomic_load_n(&slot.done, __ATOMIC_ACQUIRE))
+    // While waiting, SERVICE incoming TLB shootdowns by hand.  This loop can run
+    // with IRQs disabled (pcp_drain_all under the slab shrinker calls us), and an
+    // IRQ-off spinner never takes the VEC_IPI_TLB_FLUSH interrupt -> it never ACKs
+    // a concurrent TLB shootdown -> the sender spins in tlb_flush_common Phase 3
+    // forever -> multi-CPU deadlock (observed via QMP RIP sampling: 3 CPUs frozen
+    // in tlb_flush_common, this CPU frozen here, under Minecraft's GC/munmap
+    // churn).  tlb_shootdown_drain() takes NO locks (pure invlpg), so draining
+    // the queue here is always safe and breaks the cycle regardless of IRQ state.
+    extern void tlb_shootdown_drain(void);
+    while (!__atomic_load_n(&slot.done, __ATOMIC_ACQUIRE)) {
+        tlb_shootdown_drain();
         cpu_relax();
+    }
 }
 
 void ipi_call_handler(void) {

@@ -182,7 +182,10 @@ FOOTER
         [ -f "$src" ] || { log "missing $name (skip)"; continue; }
         local obj="$build_objs/$(basename "$name" .c).o"
         objs+=("$obj")
-        if [ "$src" -nt "$obj" ]; then
+        # config.h is an implicit dependency of every object (it carries the
+        # HAVE_* feature switches). The mtime check must include it, else a
+        # config.h edit silently fails to recompile and ships stale objects.
+        if [ "$src" -nt "$obj" ] || [ "$FC_SRC/config.h" -nt "$obj" ]; then
             "$CROSS_CC" "${CFLAGS[@]}" "${includes[@]}" -c "$src" -o "$obj"
         fi
     done

@@ -304,14 +304,19 @@ int ac97_init(void) {
     pcm_write16(NABM_SR, SR_LVBCI | SR_BCIS | SR_FIFOE);
 
     // 8. Allocate BDL (one page, must be below 4 GiB for AC97 32-bit DMA).
-    s_bdl_phys = (uint32_t)pmm_buddy_alloc(0);
-    if (!s_bdl_phys) return 0;
+    // Check the FULL phys_addr_t for the OOM sentinel BEFORE truncating to
+    // uint32: pmm_buddy_alloc returns PMM_INVALID_ADDR (UINT64_MAX), and the
+    // old (uint32_t) cast turned that into 0xFFFFFFFF -- which `!s_bdl_phys`
+    // never caught, so OOM was treated as a (wild, mapped) 4 GiB address.
+    phys_addr_t bdl_alloc = pmm_buddy_alloc(0);
+    if (!PMM_ALLOC_OK(bdl_alloc)) return 0;
+    s_bdl_phys = (uint32_t)bdl_alloc;
     s_bdl = (bdl_entry_t*)(uint64_t)(s_bdl_phys + HHDM_OFFSET);
 
     // 9. Allocate DMA buffers (4 contiguous pages each for 85 ms headroom).
     for (int i = 0; i < BDL_ENTRIES; i++) {
         phys_addr_t p = pmm_buddy_alloc(DMA_BUF_ORDER);
-        if (!p) return 0;
+        if (!PMM_ALLOC_OK(p)) return 0;
         s_dma_phys[i] = (uint32_t)p;
         s_dma_bufs[i] = (uint8_t*)(p + HHDM_OFFSET);
         // Silence the buffer initially.

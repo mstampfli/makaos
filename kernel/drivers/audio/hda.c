@@ -1,4 +1,5 @@
 #include "hda.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pci.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -192,25 +193,59 @@ static inline void sd_w32(uint32_t r,uint32_t v){ w32(s_sd_base+r,v); }
 
 // ── CORB/RIRB verb interface ──────────────────────────────────────────────
 
-static uint32_t verb_send(uint32_t verb) {
+// Issue one codec verb and return its 32-bit RIRB response.  Polls the RIRB
+// write pointer for the codec's reply; on TIMEOUT (no reply within the poll
+// window) it sets *timed_out (if non-NULL) and returns 0 WITHOUT consuming a
+// RIRB slot.  Callers that read a value (get_param) MUST check the flag and
+// reject the read -- the old code fell through and returned s_rirb[exp], the
+// STALE slot for this verb (zero-init before the first response, otherwise a
+// previous response's leftover), so a slow/absent codec fabricated a phantom
+// widget topology (node count / func type / caps) during enumeration.  On
+// timeout the read pointer is left UNADVANCED (the codec wrote nothing) so the
+// ring stays consistent for a later verb; the old unconditional `s_rirb_rp =
+// exp` desynced the ring by one slot on every timeout.  timed_out may be NULL
+// for SET verbs whose response carries no value (best-effort config writes).
+static uint32_t verb_send(uint32_t verb, int* timed_out) {
     uint16_t wp = (uint16_t)((r16(HDA_CORBWP) + 1u) & (RING_SZ - 1u));
     s_corb[wp] = verb;
     __asm__ volatile("mfence" ::: "memory");
     w16(HDA_CORBWP, wp);
 
     uint16_t exp = (uint16_t)((s_rirb_rp + 1u) & (RING_SZ - 1u));
+    int got = 0;
     for (int i = 0; i < 500000; i++) {
         __asm__ volatile("lfence" ::: "memory");
-        if (r16(HDA_RIRBWP) == exp) break;
+        if (r16(HDA_RIRBWP) == exp) { got = 1; break; }
     }
+    if (!got) {
+        if (timed_out) *timed_out = 1;
+        return 0;
+    }
+    if (timed_out) *timed_out = 0;
     uint64_t resp = s_rirb[exp];
     s_rirb_rp = exp;
     w8(HDA_RIRBSTS, RIRBSTS_RINTFL);
     return (uint32_t)(resp & 0xFFFFFFFFu);
 }
 
-static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par) {
-    return verb_send(VERB12(cad, nid, V_GET_PARAM, par));
+static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par, int* timed_out) {
+    return verb_send(VERB12(cad, nid, V_GET_PARAM, par), timed_out);
+}
+
+// PRIMITIVE (hda node-id scan bound).  HDA node ids (function groups, widgets)
+// are u8 (0..255).  A codec NODE_COUNT param reports the subordinate-node start
+// and count as two device-supplied u8s, so their sum can reach 510.  A raw
+// `for (uint8_t n = start; n < start + count; n++)` loop NEVER terminates once
+// start+count > 255: the u8 counter wraps at 255 while the int-promoted bound
+// stays ahead, so a malformed/malicious codec hangs audio init in an infinite
+// codec-verb loop (DoS).  Return the half-open scan end clamped to 256 so the
+// loop (driven by a u32 counter) always terminates and never iterates past the
+// valid u8 nid space (which would truncate back to a low nid via get_param's
+// u8 nid arg and re-process a node).  Pure -> unit-tested (hda_node_scan_end_
+// selftest).
+static inline uint32_t hda_node_scan_end(uint8_t start, uint8_t count) {
+    uint32_t end = (uint32_t)start + count;
+    return end > 256u ? 256u : end;
 }
 
 // ── Codec enumeration and configuration ──────────────────────────────────
@@ -218,38 +253,53 @@ static uint32_t get_param(uint8_t cad, uint8_t nid, uint8_t par) {
 // 48 kHz / 16-bit / stereo output on stream tag 1.
 
 static int codec_configure(uint8_t cad) {
-    uint32_t nc      = get_param(cad, 0, PAR_NODE_COUNT);
+    int to = 0;
+    uint32_t nc      = get_param(cad, 0, PAR_NODE_COUNT, &to);
+    if (to) return 0;                       // root NODE_COUNT unreadable: cannot configure
     uint8_t fg_start = (uint8_t)((nc >> 16) & 0xFFu);
     uint8_t fg_count = (uint8_t)(nc & 0xFFu);
 
-    for (uint8_t fg = fg_start; fg < fg_start + fg_count; fg++) {
-        if ((get_param(cad, fg, PAR_FUNC_TYPE) & 0xFFu) != 0x01u) continue;
+    // u32 counter + clamped end so a device NODE_COUNT with start+count > 255
+    // cannot wrap a u8 counter into an infinite loop (hda_node_scan_end keeps
+    // the iteration inside the valid 0..255 nid space, so fgn/wn never truncate).
+    for (uint32_t fg = fg_start; fg < hda_node_scan_end(fg_start, fg_count); fg++) {
+        uint8_t fgn = (uint8_t)fg;
+        // Skip this function group on a verb timeout (stale FUNC_TYPE would mis-
+        // classify it) as well as on a non-audio type.
+        uint32_t ft = get_param(cad, fgn, PAR_FUNC_TYPE, &to);
+        if (to || (ft & 0xFFu) != 0x01u) continue;
 
-        uint32_t wc      = get_param(cad, fg, PAR_NODE_COUNT);
+        uint32_t wc      = get_param(cad, fgn, PAR_NODE_COUNT, &to);
+        if (to) continue;                   // widget count unreadable: skip this FG
         uint8_t w_start  = (uint8_t)((wc >> 16) & 0xFFu);
         uint8_t w_count  = (uint8_t)(wc & 0xFFu);
 
         uint8_t dac = 0, pin = 0;
-        for (uint8_t w = w_start; w < w_start + w_count; w++) {
-            uint32_t cap   = get_param(cad, w, PAR_WIDGET_CAP);
+        for (uint32_t w = w_start; w < hda_node_scan_end(w_start, w_count); w++) {
+            uint8_t   wn   = (uint8_t)w;
+            uint32_t cap   = get_param(cad, wn, PAR_WIDGET_CAP, &to);
+            if (to) continue;               // widget caps unreadable: skip this widget
             uint8_t  wtype = (uint8_t)((cap >> 20) & 0xFu);
             if (!dac && wtype == WTYPE_AUDIO_OUT) {
-                dac = w;
+                dac = wn;
             } else if (!pin && wtype == WTYPE_PIN) {
-                if (get_param(cad, w, PAR_PIN_CAP) & (1u << 4))
-                    pin = w;
+                uint32_t pc = get_param(cad, wn, PAR_PIN_CAP, &to);
+                if (!to && (pc & (1u << 4)))
+                    pin = wn;
             }
         }
         if (!dac || !pin) continue;
 
-        verb_send(VERB12(cad, dac, V_SET_POWER, 0));
-        verb_send(VERB12(cad, pin, V_SET_POWER, 0));
-        verb_send(VERB4(cad, dac, V4_SET_FMT, FMT_48K_16BIT_STEREO));
-        verb_send(VERB12(cad, dac, V_SET_STRM, (1u << 4) | 0u));  // tag=1, ch=0
-        verb_send(VERB4(cad, dac, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE));
-        verb_send(VERB12(cad, pin, V_SET_CONN_SEL, 0));
-        verb_send(VERB12(cad, pin, V_SET_PIN_CTL, PIN_OUT_EN | PIN_HP_EN));
-        verb_send(VERB4(cad, pin, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE));
+        // SET verbs carry no response value, so a timeout is best-effort: pass
+        // NULL rather than treating the (empty) reply as data.
+        verb_send(VERB12(cad, dac, V_SET_POWER, 0), 0);
+        verb_send(VERB12(cad, pin, V_SET_POWER, 0), 0);
+        verb_send(VERB4(cad, dac, V4_SET_FMT, FMT_48K_16BIT_STEREO), 0);
+        verb_send(VERB12(cad, dac, V_SET_STRM, (1u << 4) | 0u), 0);  // tag=1, ch=0
+        verb_send(VERB4(cad, dac, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE), 0);
+        verb_send(VERB12(cad, pin, V_SET_CONN_SEL, 0), 0);
+        verb_send(VERB12(cad, pin, V_SET_PIN_CTL, PIN_OUT_EN | PIN_HP_EN), 0);
+        verb_send(VERB4(cad, pin, V4_SET_AMP, AMP_OUT_BOTH_UNMUTE), 0);
         return 1;
     }
     return 0;
@@ -357,6 +407,17 @@ int hda_write(const void* buf, uint32_t len) {
     return (int)done;
 }
 
+// Non-blocking writability test for poll().  Ready when the FIFO can absorb
+// a half-FIFO write in one shot (the default SDL playback buffer is one
+// half-FIFO, 4 KiB, so its PlayDevice write() never blocks under the audio
+// device lock).  A larger app-chosen buffer still works -- hda_write() just
+// blocks for the tail -- but the common path is block-free.  fifo_free() is a
+// plain read of the two ring indices; safe to call lockless from poll.
+int hda_poll_writable(void) {
+    if (!s_ok) return 0;
+    return fifo_free() >= (FIFO_BYTES / 2u);
+}
+
 // ── Initialisation ────────────────────────────────────────────────────────
 
 int hda_init(void) {
@@ -369,15 +430,20 @@ int hda_init(void) {
     {
         uint32_t status = pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x04u) >> 16;
         if (status & (1u << 4)) {
-            uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn, 0x34u) & 0xFCu);
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                uint8_t  id = (uint8_t)(dw & 0xFFu);
-                if (id == 0x05u)       // MSI
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 16));
-                else if (id == 0x11u)  // MSI-X
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap, dw & ~(1u << 31));
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
+            // pci_find_cap is the bounded (48-hop) capability walk; the old
+            // hand-rolled `while (cap)` here had NO hop cap, so a cyclic
+            // capability chain would spin forever at init.  Disable MSI (0x05)
+            // and MSI-X (0x11) via two bounded lookups; the per-cap disable
+            // write stays.
+            uint8_t msi = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+            if (msi) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msi);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msi, dw & ~(1u << 16));
+            }
+            uint8_t msix = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
+            if (msix) {
+                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix, dw & ~(1u << 31));
             }
         }
     }
@@ -409,7 +475,7 @@ int hda_init(void) {
 
     // 6. CORB: 256 entries × 4 B = 1 KiB (fits in one 4 KiB page).
     phys_addr_t corb_phys = pmm_buddy_alloc(0);
-    if (!corb_phys) return 0;
+    if (!PMM_ALLOC_OK(corb_phys)) return 0;
     s_corb = (uint32_t*)((uintptr_t)corb_phys + HHDM_OFFSET);
     __builtin_memset(s_corb, 0, 256 * sizeof(uint32_t));
 
@@ -425,7 +491,7 @@ int hda_init(void) {
 
     // 7. RIRB: 256 entries × 8 B = 2 KiB (fits in one page).
     phys_addr_t rirb_phys = pmm_buddy_alloc(0);
-    if (!rirb_phys) return 0;
+    if (!PMM_ALLOC_OK(rirb_phys)) return 0;
     s_rirb = (uint64_t*)((uintptr_t)rirb_phys + HHDM_OFFSET);
     __builtin_memset(s_rirb, 0, 256 * sizeof(uint64_t));
 
@@ -458,14 +524,14 @@ int hda_init(void) {
 
     // 10. Allocate BDL (one page; 8 entries × 16 B = 128 B).
     phys_addr_t bdl_phys = pmm_buddy_alloc(0);
-    if (!bdl_phys) return 0;
+    if (!PMM_ALLOC_OK(bdl_phys)) return 0;
     s_bdl = (bdle_t*)((uintptr_t)bdl_phys + HHDM_OFFSET);
 
     // 11. Allocate DMA buffers (one per BDL entry) and populate BDL.
     //     All buffers start zeroed (silence).
     for (uint32_t i = 0; i < BDL_ENTRIES; i++) {
         phys_addr_t p = pmm_buddy_alloc(BUF_ORDER);
-        if (!p) return 0;
+        if (!PMM_ALLOC_OK(p)) return 0;
         s_buf[i] = (uint8_t*)((uintptr_t)p + HHDM_OFFSET);
         for (uint32_t j = 0; j < BUF_BYTES; j++) s_buf[i][j] = 0;
         s_bdl[i].addr_lo = (uint32_t)(p & 0xFFFFFFFFu);
@@ -476,7 +542,7 @@ int hda_init(void) {
 
     // 12. Allocate software FIFO (one order-1 alloc = 2 pages = 8 KiB).
     phys_addr_t fifo_phys = pmm_buddy_alloc(1);
-    if (!fifo_phys) return 0;
+    if (!PMM_ALLOC_OK(fifo_phys)) return 0;
     s_fifo    = (uint8_t*)((uintptr_t)fifo_phys + HHDM_OFFSET);
     s_fifo_wp = 0;
     s_fifo_rp = 0;
@@ -495,34 +561,30 @@ int hda_init(void) {
     //     MSI bypasses the PIC and IOAPIC entirely.  The HDA controller writes
     //     a LAPIC-format message to memory when a stream completes.
     {
-        uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                               0x34u) & 0xFCu);
-        while (cap) {
-            uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-            if ((dw & 0xFFu) == 0x05u) {  // MSI capability
-                uint32_t mc = dw;
+        // Bounded MSI (0x05) capability lookup (was an unbounded `while (cap)`
+        // search that could spin forever on a cyclic capability chain).
+        uint8_t cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+        if (cap) {
+            uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
 
-                uint64_t msi_addr = lapic_msi_addr();
+            uint64_t msi_addr = lapic_msi_addr();
+            pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                            cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
+
+            int is_64bit = (int)((mc >> 23) & 1u);
+            if (is_64bit) {
                 pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                cap + 4u, (uint32_t)(msi_addr & 0xFFFFFFFFu));
-
-                int is_64bit = (int)((mc >> 23) & 1u);
-                if (is_64bit) {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, (uint32_t)(msi_addr >> 32));
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 12u, lapic_msi_data(VEC_HDA_MSI));
-                } else {
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn,
-                                    cap + 8u, lapic_msi_data(VEC_HDA_MSI));
-                }
-
-                // Enable MSI, single message.
-                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                (mc & ~(0x7u << 20)) | (1u << 16));
-                break;
+                                cap + 8u, (uint32_t)(msi_addr >> 32));
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                cap + 12u, lapic_msi_data(VEC_HDA_MSI));
+            } else {
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn,
+                                cap + 8u, lapic_msi_data(VEC_HDA_MSI));
             }
-            cap = (uint8_t)((dw >> 8) & 0xFCu);
+
+            // Enable MSI, single message.
+            pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                            (mc & ~(0x7u << 20)) | (1u << 16));
         }
 
         g_hda_irq = HDA_IRQ_SLOT;
@@ -542,4 +604,35 @@ int hda_init(void) {
     s_running = 0;
     s_ok      = 1;
     return 1;
+}
+
+// Deterministic check of the codec node-scan bound: legitimate small ranges
+// pass through unchanged, and every start+count that exceeds the u8 nid space
+// (the inputs that infinite-looped a raw u8 counter) clamp to 256 so the loop
+// terminates inside 0..255.  The 255+1 / 200+100 / 255+255 rows are exactly the
+// device NODE_COUNT values that wrapped the old `for (uint8_t n = start;
+// n < start+count; n++)` loops.
+void hda_node_scan_end_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint8_t start, count; uint32_t end; } c[] = {
+        { 2,   10,  12  },   // normal function-group range 2..11
+        { 1,   14,  15  },   // typical widget range
+        { 0,   0,   0   },   // empty count -> loop body never runs
+        { 128, 128, 256 },   // sum == 256 exactly (boundary, no clamp needed)
+        { 0,   255, 255 },   // 0..254, max within one byte
+        { 255, 1,   256 },   // sum 256: old u8 counter wrapped 255->0 forever
+        { 200, 100, 256 },   // sum 300 -> clamp to 256
+        { 255, 255, 256 },   // sum 510 (worst case) -> clamp to 256
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t e = hda_node_scan_end(c[i].start, c[i].count);
+        if (e != c[i].end) {
+            kprintf_atomic("[hda_nodes] FAIL start=%u count=%u end=%u want=%u\n",
+                    c[i].start, c[i].count, e, c[i].end);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[hda_nodes] SELF-TEST FAILED\n"
+                  : "[hda_nodes] SELF-TEST PASSED (codec node scan bound clamps to u8 nid space, terminates)\n");
 }

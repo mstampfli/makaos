@@ -1,5 +1,8 @@
 #ifndef _FTS_H
 #define _FTS_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Minimal BSD fts(3) — file-tree traversal.  Implemented over
 // opendir/readdir/d_type (no per-entry stat by default).  Covers the
 // subset ports actually use: fts_open / fts_read / fts_close, with
@@ -60,4 +63,7 @@ FTS*    fts_open(char* const* path_argv, int options,
 FTSENT* fts_read(FTS* ftsp);
 int     fts_close(FTS* ftsp);
 
+#ifdef __cplusplus
+}
+#endif
 #endif // _FTS_H

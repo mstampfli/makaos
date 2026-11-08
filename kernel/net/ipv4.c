@@ -7,6 +7,7 @@
 #include "net.h"
 #include "common.h"
 #include "kheap.h"
+#include "errno.h"
 
 static uint16_t s_ip_id = 0;  // monotonically increasing packet ID
 
@@ -36,9 +37,11 @@ uint32_t inet_pseudo_partial(uint32_t src_ip_be, uint32_t dst_ip_be,
     return sum;
 }
 
-__attribute__((unused))
-static uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
-                                    uint8_t proto, const void* data, uint16_t len) {
+// The one TCP/UDP transport checksum: pseudo-header + 16-bit ones-complement
+// sum over `len` bytes of `data` (with the trailing odd-byte fold) + ~sum.
+// Single source of truth for every udp/tcp send + receive-validate path.
+uint16_t transport_checksum(uint32_t src_be, uint32_t dst_be,
+                            uint8_t proto, const void* data, uint16_t len) {
     uint32_t pseudo = inet_pseudo_partial(src_be, dst_be, proto, len);
     const uint16_t* p = (const uint16_t*)data;
     uint32_t sum = pseudo;
@@ -115,6 +118,13 @@ int ipv4_send_ex(skbuff_t* skb, uint32_t src_ip_be, uint32_t dst_ip_be,
                   uint8_t protocol) {
     uint32_t our_ip = net_our_ip();
     if (src_ip_be == 0 && our_ip != 0) src_ip_be = our_ip;
+
+    // Universal L3 backstop: the IP total-length field is 16-bit, so reject any
+    // payload that would overflow it before forming total_len below.  Every L4
+    // protocol (UDP/TCP/ICMP) funnels through here, so this one guard prevents
+    // the (uint16_t)(IPV4_HDR_LEN + payload_len) wrap for all of them.  The
+    // caller owns skb and frees it on this error return.
+    if (skb->len > 0xFFFFu - IPV4_HDR_LEN) return -EMSGSIZE;
     uint16_t payload_len = (uint16_t)skb->len;
 
     // Prepend IP header.

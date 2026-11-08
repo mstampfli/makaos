@@ -24,18 +24,21 @@
 #define E2BIG        7
 #define EPIPE       32
 
-// ── errno global ──────────────────────────────────────────────────────────
-extern __thread int errno;
+// ── errno (POSIX macro over a per-thread int; see errno.h / libc.c) ─────────
+int* __errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
 
 // ── Basic types ───────────────────────────────────────────────────────────
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-typedef unsigned long long uint64_t;
+typedef unsigned long      uint64_t;   // LP64: 64-bit == long, matching glibc
 typedef signed char        int8_t;
 typedef signed short       int16_t;
 typedef signed int         int32_t;
-typedef signed long long   int64_t;
+typedef signed long        int64_t;    // LP64: 64-bit == long, matching glibc
 typedef uint64_t           size_t;
 typedef int64_t            ssize_t;
 typedef int64_t            intmax_t;
@@ -101,10 +104,11 @@ typedef uint32_t           socklen_t;
 #define _IOFBF      0
 #define _IOLBF      1
 #define _IONBF      2
-#define LOCALEDIR   "/usr/share/locale"
-#ifndef PACKAGE
-#define PACKAGE     "bash"
-#endif
+// NOTE: PACKAGE / LOCALEDIR (gettext message-catalog identity) were removed
+// from this shared header -- they are per-program autoconf identity and do not
+// belong in the system libc.  A program that uses gettext (e.g. a local bash
+// build) must define its own PACKAGE/LOCALEDIR via its build (-DPACKAGE=...),
+// exactly as upstream autoconf does.
 
 #define NULL ((void*)0)
 #define EXIT_SUCCESS 0
@@ -1186,6 +1190,9 @@ typedef struct termios {
 #define TIOCEXCL    0x540C
 #define TIOCNXCL    0x540D
 #define TIOCSCTTY   0x540E
+// Root-only: give the console to a uid for one login session and revoke every
+// fd opened under the previous owner (see kernel/syscall/syscall.h).
+#define TIOCSCONSOWN 0x54F0
 
 typedef struct winsize {
     uint16_t ws_row;
@@ -1669,7 +1676,22 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 
 // ── sysconf / pathconf / confstr / getdtablesize ─────────────────────────
 #define _SC_CLK_TCK         2
+#define _SC_GETPW_R_SIZE_MAX 70
+#define _SC_GETGR_R_SIZE_MAX 71
 #define _SC_OPEN_MAX        4
+#define _SC_IOV_MAX         60
+#define _CS_PATH            0
+#define _CS_GNU_LIBC_VERSION       2
+#define _CS_GNU_LIBPTHREAD_VERSION 3
+#define _PC_LINK_MAX          0
+#define _PC_MAX_CANON         1
+#define _PC_MAX_INPUT         2
+#define _PC_NAME_MAX          3
+#define _PC_PATH_MAX          4
+#define _PC_PIPE_BUF          5
+#define _PC_CHOWN_RESTRICTED  6
+#define _PC_NO_TRUNC          7
+#define _PC_VDISABLE          8
 #define _SC_PAGESIZE        30
 #define _SC_NGROUPS_MAX     3
 #define _SC_ARG_MAX         0
@@ -1677,6 +1699,8 @@ static inline int setrlimit(int resource, const struct rlimit* rlim) {
 // every name sysconf() implements.
 #define _SC_NPROCESSORS_CONF 10
 #define _SC_NPROCESSORS_ONLN 11
+#define _SC_PHYS_PAGES      85
+#define _SC_AVPHYS_PAGES    86
 long sysconf(int name);
 long pathconf(const char* path, int name);
 int  confstr(int name, char* buf, size_t len);
@@ -2058,11 +2082,8 @@ int __libc_start_main(int (*main)(int, char**, char**),
                       void (*init)(void), void (*fini)(void),
                       void (*rtld_fini)(void), void* stack_end);
 
-// __errno_location — glibc's way of getting &errno (used by -D_REENTRANT code)
-static inline int* __errno_location(void) {
-    extern __thread int errno;
-    return &errno;
-}
+// __errno_location is declared once with the errno macro above (a real libc
+// function, so the errno macro cannot recurse into an inline body).
 
 // pselect — like select but with sigset mask and timespec
 static inline int pselect(int nfds, fd_set* r, fd_set* w, fd_set* e,

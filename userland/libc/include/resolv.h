@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_RESOLV_H
 #define _MAKAOS_RESOLV_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <arpa/nameser.h>
 
@@ -25,4 +28,7 @@ int dn_expand(const unsigned char* msg, const unsigned char* eom,
 // Convenience — some callers use the non-__ prefixed name.
 typedef struct __res_state res_state_t;
 
+#ifdef __cplusplus
+}
+#endif
 #endif

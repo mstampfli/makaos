@@ -47,6 +47,20 @@ typedef struct vma_t {
     rcu_head_t      rcu_head;
 } vma_t;
 
+// Bytes of file backing to copy into the page at `pg_off` (the offset of that
+// page within a file-backed VMA whose backing spans `file_len` bytes); 0 if the
+// page lies entirely past the backing (pure BSS/zero tail).  The caller zero-
+// fills the whole page first, then reads this many bytes from the file at
+// (vma->file_off + pg_off).  Underflow-safe by construction: it never evaluates
+// file_len - pg_off when pg_off >= file_len.  Single source of truth for every
+// file-backed page fill: the demand-fault handler, its read-ahead, and the PIE
+// self-relocation page populate.
+static inline uint64_t vma_file_page_span(uint64_t pg_off, uint64_t file_len) {
+    if (pg_off >= file_len) return 0;
+    uint64_t n = file_len - pg_off;
+    return n < PAGE_SIZE ? n : PAGE_SIZE;
+}
+
 // ── Memory descriptor ─────────────────────────────────────────────────────
 // One per address space (PML4).  Shared by all threads in a task group.
 // Kernel threads have mm == NULL.
@@ -101,6 +115,15 @@ uint8_t mm_vma_add_file(mm_t* mm, virt_addr_t start, virt_addr_t end,
 // v->shmem_pgoff inside the section — once rcu_read_unlock has fired,
 // the pointer must not be touched again.
 vma_t* mm_vma_find(mm_t* mm, virt_addr_t addr);
+
+// Is every page in [addr, addr+len) backed by a VMA?  Used to validate a user
+// buffer the kernel will raw-dereference for READING (e.g. write(2)'s data
+// buffer): an unbacked page would take an unresolvable kernel-mode #PF and
+// panic, so the caller must reject it with -EFAULT up front.  Unlike a prefault
+// it does NOT map or zero absent-but-valid pages, so a file-backed source page
+// keeps its real content (a prefault would zero-fill it).  Returns 1 if fully
+// backed (or len==0), 0 if any page is unbacked, addr+len wraps, or mm is NULL.
+int mm_range_has_vmas(mm_t* mm, uint64_t addr, uint64_t len);
 
 // Remove and free all VMAs and the mm_t itself.
 // Does NOT unmap or free physical frames — caller must walk the page tables

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_FB_H
 #define _MAKAOS_FB_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Framebuffer access — root-only mapping into userspace.
 // Used by the compositor, makadisplay, and anything doing direct pixel
 // output.  The FB is 32-bit BGRA on x86_64 UEFI/GOP.
@@ -21,4 +24,7 @@ int    fb_blit(const void* src,
                 uint32_t dst_x, uint32_t dst_y,
                 uint32_t w, uint32_t h, uint32_t src_pitch);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

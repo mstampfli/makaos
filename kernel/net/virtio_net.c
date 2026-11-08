@@ -1,5 +1,7 @@
 #include "virtio_net.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "pci.h"
+#include "virtio_pci.h"   // shared virtio-PCI transport: caps, status bits, common_cfg, find_virtio_cap
 #include "vmm.h"
 #include "pmm.h"
 #include "kheap.h"
@@ -8,61 +10,25 @@
 #include "lapic.h"
 #include "irq_wait.h"
 #include "common.h"
+#include "checked.h"   // index_ok: single source of truth for bounded indices
 
 extern void virtio_net_irq_entry(void);
 
 // ── PCI IDs ───────────────────────────────────────────────────────────────
-#define VIRTIO_VENDOR          0x1AF4u
+// Generic virtio-PCI transport constants (VIRTIO_VENDOR, VIRTIO_PCI_CAP_*,
+// VIRTIO_STATUS_*, VIRTIO_F_VERSION_1) live in virtio_pci.h.
 #define VIRTIO_DEV_NET_MODERN  0x1041u  // virtio 1.x network device
 #define VIRTIO_DEV_NET_LEGACY  0x1000u  // transitional (also works)
 #define PCI_CLASS_NETWORK      0x02u
 #define PCI_SUBCLASS_ETHERNET  0x00u
 
-// ── virtio-PCI capability types ───────────────────────────────────────────
-#define VIRTIO_PCI_CAP_COMMON_CFG  1u
-#define VIRTIO_PCI_CAP_NOTIFY_CFG  2u
-#define VIRTIO_PCI_CAP_ISR_CFG     3u
-#define VIRTIO_PCI_CAP_DEVICE_CFG  4u
-#define VIRTIO_PCI_CAP_PCI_CFG     5u
-
-// ── virtio device status bits ─────────────────────────────────────────────
-#define VIRTIO_STATUS_ACKNOWLEDGE   1u
-#define VIRTIO_STATUS_DRIVER        2u
-#define VIRTIO_STATUS_DRIVER_OK     4u
-#define VIRTIO_STATUS_FEATURES_OK   8u
-#define VIRTIO_STATUS_FAILED       128u
-
-// ── virtio feature bits ───────────────────────────────────────────────────
-// We negotiate a minimal set — only what we need.
-#define VIRTIO_F_VERSION_1          (1ULL << 32)  // modern device
+// ── virtio-net feature bits ─────────────────────────────────────────────────
 #define VIRTIO_NET_F_MAC            (1ULL << 5)   // device has a MAC address
 #define VIRTIO_NET_F_STATUS         (1ULL << 16)  // device exposes link status
 
 #define DRIVER_FEATURES  (VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC)
 
-// ── virtio-PCI common configuration structure (spec §4.1.4.3) ────────────
-typedef struct __attribute__((packed)) {
-    uint32_t device_feature_select;
-    uint32_t device_feature;
-    uint32_t driver_feature_select;
-    uint32_t driver_feature;
-    uint16_t msix_config;
-    uint16_t num_queues;
-    uint8_t  device_status;
-    uint8_t  config_generation;
-    // Per-queue fields (select queue first via queue_select):
-    uint16_t queue_select;
-    uint16_t queue_size;
-    uint16_t queue_msix_vector;
-    uint16_t queue_enable;
-    uint16_t queue_notify_off;
-    uint32_t queue_desc_lo;
-    uint32_t queue_desc_hi;
-    uint32_t queue_driver_lo;   // avail ring
-    uint32_t queue_driver_hi;
-    uint32_t queue_device_lo;   // used ring
-    uint32_t queue_device_hi;
-} virtio_pci_common_cfg_t;
+// virtio_pci_common_cfg_t (spec 4.1.4.3) lives in virtio_pci.h.
 
 // ── virtio-net device configuration (spec §5.1.4) ────────────────────────
 typedef struct __attribute__((packed)) {
@@ -151,8 +117,9 @@ typedef struct {
 
 // ── Packet buffers for RX ─────────────────────────────────────────────────
 // Each RX descriptor gets its own pre-allocated buffer.  We allocate
-// VIRTQ_SIZE buffers of ETH_MAX_FRAME + VIRTIO_NET_HDR_LEN bytes each.
-// Stored as physical addresses (passed to device) + virtual (for CPU access).
+// VIRTQ_NUM_RX_BUFS buffers of ETH_MAX_FRAME + VIRTIO_NET_HDR_LEN bytes each
+// (the array is sized VIRTQ_SIZE but only the first VIRTQ_NUM_RX_BUFS slots are
+// populated).  Stored as physical addresses (for the device) + virtual (CPU).
 typedef struct {
     phys_addr_t phys;
     uint8_t*    virt;
@@ -181,56 +148,7 @@ static phys_addr_t s_tx_buf_phys = 0;
 
 static uint8_t s_mac[ETH_ALEN];
 
-// ── PCI capability walker ─────────────────────────────────────────────────
-
-typedef struct {
-    uint8_t  bar;
-    uint32_t offset;
-    uint32_t length;
-    uint32_t extra;   // notify_off_multiplier for type 2
-} vcap_t;
-
-static int find_virtio_cap(uint8_t bus, uint8_t dev, uint8_t fn,
-                            uint8_t cap_type, vcap_t* out) {
-    // Walk PCI capability list looking for vendor-specific (type 9) caps
-    // that have virtio_pci_cap.cfg_type == cap_type.
-    uint8_t cap = (uint8_t)(pci_cfg_read32(bus, dev, fn, 0x34u) & 0xFCu);
-    while (cap) {
-        uint32_t dw0 = pci_cfg_read32(bus, dev, fn, cap);
-        uint8_t  id  = (uint8_t)(dw0 & 0xFFu);
-        uint8_t  next = (uint8_t)((dw0 >> 8) & 0xFCu);
-        uint8_t  len  = (uint8_t)((dw0 >> 16) & 0xFFu);
-
-        if (id == 0x09u && len >= 16u) {  // vendor-specific PCI capability
-            // virtio_pci_cap layout at `cap`:
-            // +0: cap_vndr, cap_next, cap_len, cfg_type
-            // +4: bar
-            // +8: offset (32-bit)
-            // +12: length (32-bit)
-            uint32_t dw1 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 4u));
-            uint32_t dw2 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 8u));
-            uint32_t dw3 = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 12u));
-
-            uint8_t cfg_type = (uint8_t)((dw0 >> 24) & 0xFFu);
-            uint8_t bar_idx  = (uint8_t)(dw1 & 0xFFu);
-
-            if (cfg_type == cap_type) {
-                out->bar    = bar_idx;
-                out->offset = dw2;
-                out->length = dw3;
-                if (cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG) {
-                    // notify_off_multiplier is an extra dword after cap+12
-                    out->extra = pci_cfg_read32(bus, dev, fn, (uint8_t)(cap + 16u));
-                } else {
-                    out->extra = 0;
-                }
-                return 1;
-            }
-        }
-        cap = next;
-    }
-    return 0;
-}
+// vcap_t + find_virtio_cap (the PCI capability walker) live in virtio_pci.h.
 
 // ── Virtqueue helpers ─────────────────────────────────────────────────────
 
@@ -293,8 +211,26 @@ static uint16_t virtq_alloc_desc(virtq_t* vq) {
     return idx;
 }
 
+// PRIMITIVE (device-supplied index, category D -> delegates to index_ok).
+// Is a descriptor id a valid index into the VIRTQ_SIZE-entry desc ring / free
+// list?  Device-supplied ids (read from the used ring) MUST pass this before
+// being used as an index -- an out-of-range id otherwise drives an OOB write of
+// s_rxq.desc[] / the free list.  Used by the TX completion path and virtq_submit,
+// which operate over the FULL desc ring.  Pure -> unit-tested.
+static int virtio_desc_id_valid(uint32_t id) { return index_ok(id, VIRTQ_SIZE); }
+
+// PRIMITIVE (device-supplied RX completion id, category D).  The RX path is
+// TIGHTER than virtio_desc_id_valid: a completion id also indexes s_rx_bufs[],
+// which is populated only for VIRTQ_NUM_RX_BUFS entries (those are the only RX
+// descriptors we ever post), so an id in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) is one
+// the device invented -- its s_rx_bufs[] slot is {NULL, 0}, which would memcpy
+// from a NULL source and re-post a descriptor pointing at physical frame 0.
+// Pure -> unit-tested (virtio_rx_id_valid_selftest).
+static int virtio_rx_id_valid(uint32_t id) { return index_ok(id, VIRTQ_NUM_RX_BUFS); }
+
 // Return a descriptor to the free list.
 static void virtq_free_desc(virtq_t* vq, uint16_t idx) {
+    if (!virtio_desc_id_valid(idx)) return;   // defense-in-depth: never index OOB
     vq->desc[idx].next = vq->free_head;
     vq->free_head      = idx;
 }
@@ -315,15 +251,18 @@ static void virtq_submit(virtq_t* vq, uint16_t head_idx, uint16_t qidx) {
 }
 
 // ── RX ring setup ─────────────────────────────────────────────────────────
-// Pre-populate the RX ring with VIRTQ_SIZE device-writable buffers so the
-// device can deposit incoming packets immediately.
+// Pre-populate the RX ring with VIRTQ_NUM_RX_BUFS device-writable buffers so
+// the device can deposit incoming packets immediately.
 
 static void rxq_refill(void) {
     // Each RX descriptor chain: [virtio_net_hdr (10 B)] [frame (1514 B)]
     // We use two descriptors per packet: one for the header, one for data.
     // Actually simpler: one large buffer = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME.
-    // Use single-descriptor approach (simpler, one page per slot).
-    for (uint16_t i = 0; i < VIRTQ_SIZE / 2; i++) {
+    // Use single-descriptor approach (simpler, one page per slot).  Posts
+    // exactly VIRTQ_NUM_RX_BUFS descriptors (the populated s_rx_bufs[] slots);
+    // the sequential free list makes the posted desc ids 0..VIRTQ_NUM_RX_BUFS-1,
+    // so a completion id from the device maps back to s_rx_bufs[id].
+    for (uint16_t i = 0; i < VIRTQ_NUM_RX_BUFS; i++) {
         uint16_t idx = virtq_alloc_desc(&s_rxq);
         if (idx == 0xFFFFu) break;
 
@@ -392,7 +331,11 @@ int virtio_net_tx(const void* data, uint16_t len) {
         if (++spins > 10000000u) { spin_unlock(&s_tx_lock); return -1; }  // timeout
     }
     uint16_t used_idx = (uint16_t)(s_txq.last_used_idx & (VIRTQ_SIZE - 1));
-    virtq_free_desc(&s_txq, (uint16_t)s_txq.used->ring[used_idx].id);
+    // Free the descriptor the device reports it completed, but never trust an
+    // out-of-range id (it would OOB-write the desc table / corrupt the free
+    // list): fall back to `idx`, the single descriptor we actually submitted.
+    uint32_t done_id = s_txq.used->ring[used_idx].id;
+    virtq_free_desc(&s_txq, virtio_desc_id_valid(done_id) ? (uint16_t)done_id : idx);
     s_txq.last_used_idx++;
 
     spin_unlock(&s_tx_lock);
@@ -404,49 +347,73 @@ int virtio_net_tx(const void* data, uint16_t len) {
 int virtio_net_rx_poll(skbuff_t** skb_out) {
     if (!s_ok) return 0;
 
-    __asm__ volatile("lfence" ::: "memory");
-    if (s_rxq.used->idx == s_rxq.last_used_idx) return 0;  // nothing received
-    serial_puts_dbg("[virtio] rx packet!\n");
+    // Loop over used entries so a DROPPED packet (skb_alloc OOM, or a bogus
+    // device-invented desc id) does NOT end the drain and is NEVER handed back
+    // as a NULL skb.  The old code returned 1 with *skb_out==NULL on skb_alloc
+    // failure under RX memory pressure, and net_rx_thread fed that NULL straight
+    // into eth_recv -> a kernel NULL-deref #PF (a remote-driven, OOM-triggered
+    // DoS).  We only ever return 1 with a VALID skb here.
+    for (;;) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (s_rxq.used->idx == s_rxq.last_used_idx) return 0;  // nothing received
+        serial_puts_dbg("[virtio] rx packet!\n");
 
-    uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
-    uint32_t desc_id   = s_rxq.used->ring[used_slot].id;
-    uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
-    s_rxq.last_used_idx++;
+        uint16_t used_slot = (uint16_t)(s_rxq.last_used_idx & (VIRTQ_SIZE - 1));
+        uint32_t desc_id   = s_rxq.used->ring[used_slot].id;
+        uint32_t pkt_len   = s_rxq.used->ring[used_slot].len;
+        s_rxq.last_used_idx++;   // advance first so a bad entry can't wedge the ring
 
-    // The packet starts after the virtio-net header.
-    uint8_t* raw    = s_rx_bufs[desc_id].virt;
-    uint32_t eth_len = (pkt_len > VIRTIO_NET_HDR_LEN)
-                       ? (pkt_len - VIRTIO_NET_HDR_LEN) : 0;
-    // CLAMP against the actual RX buffer payload — pkt_len comes straight
-    // from the device-written used ring and is otherwise untrusted.  The
-    // source buffer holds at most ETH_MAX_FRAME payload bytes; a device
-    // reporting more would make the memcpy over-read past the source page
-    // into adjacent kernel memory (info leak / corruption).
-    if (eth_len > ETH_MAX_FRAME) eth_len = ETH_MAX_FRAME;
+        // desc_id is written by the device and indexes s_rx_bufs[] (the memcpy
+        // source) and s_rxq.desc[].  Only VIRTQ_NUM_RX_BUFS s_rx_bufs[] entries
+        // are populated -- those are the only RX descriptors we posted -- so use
+        // the TIGHTER rx bound, not the full-ring virtio_desc_id_valid: an id the
+        // device invented in [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) has a {NULL, 0}
+        // buffer slot, which would memcpy from NULL and re-post a descriptor at
+        // physical frame 0.  Drop the bogus completion (do NOT index the tables
+        // or re-post it) and move to the next used entry.
+        if (!virtio_rx_id_valid(desc_id)) continue;
 
-    skbuff_t* skb = skb_alloc(eth_len);
-    if (skb && eth_len > 0) {
-        uint8_t* dst = (uint8_t*)skb_put(skb, eth_len);
-        __builtin_memcpy(dst, raw + VIRTIO_NET_HDR_LEN, eth_len);
+        // The packet starts after the virtio-net header.
+        uint8_t* raw    = s_rx_bufs[desc_id].virt;
+        uint32_t eth_len = (pkt_len > VIRTIO_NET_HDR_LEN)
+                           ? (pkt_len - VIRTIO_NET_HDR_LEN) : 0;
+        // CLAMP against the actual RX buffer payload -- pkt_len comes straight
+        // from the device-written used ring and is otherwise untrusted.  The
+        // source buffer holds at most ETH_MAX_FRAME payload bytes; a device
+        // reporting more would make the memcpy over-read past the source page
+        // into adjacent kernel memory (info leak / corruption).
+        if (eth_len > ETH_MAX_FRAME) eth_len = ETH_MAX_FRAME;
+
+        skbuff_t* skb = skb_alloc(eth_len);
+        if (skb && eth_len > 0) {
+            uint8_t* dst = (uint8_t*)skb_put(skb, eth_len);
+            __builtin_memcpy(dst, raw + VIRTIO_NET_HDR_LEN, eth_len);
+        }
+
+        // Return the descriptor to the avail ring REGARDLESS (even on skb_alloc
+        // OOM) so the device gets the buffer back and the RX ring does not leak
+        // descriptors.
+        s_rxq.desc[desc_id].addr  = s_rx_bufs[desc_id].phys;
+        s_rxq.desc[desc_id].len   = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME;
+        s_rxq.desc[desc_id].flags = VIRTQ_DESC_F_WRITE;
+        s_rxq.desc[desc_id].next  = 0;
+        s_rxq.avail->ring[s_rxq.avail_idx & (VIRTQ_SIZE - 1)] = (uint16_t)desc_id;
+        s_rxq.avail_idx++;
+        __asm__ volatile("mfence" ::: "memory");
+        s_rxq.avail->idx = s_rxq.avail_idx;
+        __asm__ volatile("mfence" ::: "memory");
+        // Notify device that avail ring has new entries (queue 0 = RX).
+        volatile uint16_t* notify_reg =
+            (volatile uint16_t*)(s_notify + s_rxq.notify_off * s_notify_mult);
+        *notify_reg = 0;
+
+        // skb_alloc OOM: the packet is dropped (its descriptor was recycled
+        // above) -- skip it; never hand a NULL skb to eth_recv.
+        if (!skb) continue;
+
+        *skb_out = skb;
+        return 1;
     }
-
-    // Return the descriptor to the avail ring so the device can reuse it.
-    s_rxq.desc[desc_id].addr  = s_rx_bufs[desc_id].phys;
-    s_rxq.desc[desc_id].len   = VIRTIO_NET_HDR_LEN + ETH_MAX_FRAME;
-    s_rxq.desc[desc_id].flags = VIRTQ_DESC_F_WRITE;
-    s_rxq.desc[desc_id].next  = 0;
-    s_rxq.avail->ring[s_rxq.avail_idx & (VIRTQ_SIZE - 1)] = (uint16_t)desc_id;
-    s_rxq.avail_idx++;
-    __asm__ volatile("mfence" ::: "memory");
-    s_rxq.avail->idx = s_rxq.avail_idx;
-    __asm__ volatile("mfence" ::: "memory");
-    // Notify device that avail ring has new entries (queue 0 = RX).
-    volatile uint16_t* notify_reg =
-        (volatile uint16_t*)(s_notify + s_rxq.notify_off * s_notify_mult);
-    *notify_reg = 0;
-
-    *skb_out = skb;
-    return 1;
 }
 
 const uint8_t* virtio_net_mac(void) { return s_mac; }
@@ -560,7 +527,9 @@ int virtio_net_init(void) {
     // Step 6: Configure virtqueues.
 
     // Allocate RX packet buffers (one page each = 4 KiB, holds max frame).
-    for (uint16_t i = 0; i < VIRTQ_SIZE / 2; i++) {
+    // Exactly VIRTQ_NUM_RX_BUFS slots are populated; s_rx_bufs[] entries beyond
+    // that stay {NULL, 0} and are rejected by virtio_rx_id_valid at completion.
+    for (uint16_t i = 0; i < VIRTQ_NUM_RX_BUFS; i++) {
         phys_addr_t p = pmm_buddy_alloc(0);
         if (!p) return 0;
         s_rx_bufs[i].phys = p;
@@ -625,43 +594,27 @@ int virtio_net_init(void) {
     //   - Tell virtio which MSI-X vector serves queue 0 (and queue 1)
     //     via queue_select / queue_msix_vector
     {
-        uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                               0x34u) & 0xFCu);
-        uint8_t msix_cap = 0;
-        {
-            uint8_t c = cap;
-            while (c) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, c);
-                if ((dw & 0xFFu) == 0x11u) { msix_cap = c; break; }
-                c = (uint8_t)((dw >> 8) & 0xFCu);
-            }
-        }
+        uint8_t msix_cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
         if (!msix_cap) {
             // Fall back to legacy MSI if MSI-X is absent (very old QEMU).
-            cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                           0x34u) & 0xFCu);
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                if ((dw & 0xFFu) == 0x05u) {
-                    uint32_t mc = dw;
-                    uint64_t msi_addr = lapic_msi_addr();
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 4u,
-                                    (uint32_t)(msi_addr & 0xFFFFFFFFu));
-                    int is_64 = (int)((mc >> 23) & 1u);
-                    if (is_64) {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
-                                        (uint32_t)(msi_addr >> 32));
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 12u,
-                                        lapic_msi_data(VEC_VIRTIO_NET));
-                    } else {
-                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
-                                        lapic_msi_data(VEC_VIRTIO_NET));
-                    }
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
-                                    (mc & ~(0x7u << 20)) | (1u << 16));
-                    break;
+            uint8_t cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
+            if (cap) {
+                uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
+                uint64_t msi_addr = lapic_msi_addr();
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 4u,
+                                (uint32_t)(msi_addr & 0xFFFFFFFFu));
+                int is_64 = (int)((mc >> 23) & 1u);
+                if (is_64) {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                    (uint32_t)(msi_addr >> 32));
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 12u,
+                                    lapic_msi_data(VEC_VIRTIO_NET));
+                } else {
+                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap + 8u,
+                                    lapic_msi_data(VEC_VIRTIO_NET));
                 }
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
+                pci_cfg_write32(dev.bus, dev.dev, dev.fn, cap,
+                                (mc & ~(0x7u << 20)) | (1u << 16));
             }
         } else {
             // MSI-X path.
@@ -673,6 +626,16 @@ int virtio_net_init(void) {
                                               (uint8_t)bir);
             volatile uint32_t* msix_table = (volatile uint32_t*)
                 vmm_map_mmio(bar_phys + tbl_off, 0x1000u);
+            if (!msix_table) {
+                // No working legacy-INTx path is wired for this NIC (modern
+                // QEMU exposes only MSI-X), so a failed table map means no IRQ
+                // can ever be delivered -- fail init (s_ok stays 0, the NIC is
+                // treated as absent) rather than NULL-deref the writes below or
+                // silently run an IRQ-less NIC whose RX would stall.
+                extern void kprintf(const char*, ...);
+                kprintf("[virtio-net] MSI-X table map failed; no IRQ\n");
+                return 0;
+            }
 
             uint32_t msi_addr = (uint32_t)lapic_msi_addr();
             uint32_t msi_data = lapic_msi_data(VEC_VIRTIO_NET);
@@ -702,4 +665,57 @@ int virtio_net_init(void) {
 
     s_ok = 1;
     return 1;
+}
+
+// ── virtio_desc_id_valid selftest ─────────────────────────────────────────
+// Deterministic check of the device-supplied descriptor-id bounds guard that
+// stops an OOB read of s_rx_bufs[] / OOB write of s_rxq.desc[] from a malicious
+// or buggy device reporting an id >= VIRTQ_SIZE in the used ring.
+void virtio_desc_id_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t id; int want; } c[] = {
+        { 0,            1 },  // first slot
+        { VIRTQ_SIZE-1, 1 },  // last valid slot (255)
+        { VIRTQ_SIZE,   0 },  // == 256, first OOB
+        { 0xFFFFFFFFu,  0 },  // device garbage
+        { 1000u,        0 },  // arbitrary OOB
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (virtio_desc_id_valid(c[i].id) != c[i].want) {
+            kprintf_atomic("[virtio_descid] FAIL id=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].id, virtio_desc_id_valid(c[i].id), c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[virtio_descid] SELF-TEST FAILED\n"
+                  : "[virtio_descid] SELF-TEST PASSED (device desc-id bounds)\n");
+}
+
+// ── virtio_rx_id_valid selftest ───────────────────────────────────────────
+// Deterministic check of the TIGHTER RX-completion bound: an id is valid only
+// if it indexes a POPULATED s_rx_bufs[] slot ([0, VIRTQ_NUM_RX_BUFS)).  The
+// gap [VIRTQ_NUM_RX_BUFS, VIRTQ_SIZE) passes the generic desc-id guard but must
+// be REJECTED here -- those slots are {NULL, 0} and a device inventing such an
+// id would memcpy from NULL and re-post a descriptor at physical frame 0.
+void virtio_rx_id_valid_selftest(void) {
+    extern void kprintf(const char*, ...);
+    struct { uint32_t id; int want; } c[] = {
+        { 0,                    1 },  // first populated slot
+        { VIRTQ_NUM_RX_BUFS-1,  1 },  // last populated slot (127)
+        { VIRTQ_NUM_RX_BUFS,    0 },  // first unpopulated (128): generic-valid but rx-INVALID
+        { VIRTQ_SIZE-1,         0 },  // 255: in the desc ring but no rx buffer
+        { VIRTQ_SIZE,           0 },  // == 256, OOB everywhere
+        { 0xFFFFFFFFu,          0 },  // device garbage
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        if (virtio_rx_id_valid(c[i].id) != c[i].want) {
+            kprintf_atomic("[virtio_rxid] FAIL id=%lu got=%d want=%d\n",
+                    (unsigned long)c[i].id, virtio_rx_id_valid(c[i].id), c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[virtio_rxid] SELF-TEST FAILED\n"
+                  : "[virtio_rxid] SELF-TEST PASSED (rx-completion id bounded to populated buffers)\n");
 }

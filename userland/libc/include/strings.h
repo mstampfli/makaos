@@ -3,11 +3,19 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int    strcasecmp(const char* a, const char* b);
 int    strncasecmp(const char* a, const char* b, size_t n);
 void   bzero(void* s, size_t n);
 int    ffs  (int i);
 int    ffsl (long i);
 int    ffsll(long long i);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

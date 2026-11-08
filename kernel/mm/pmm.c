@@ -1,4 +1,5 @@
 #include "pmm.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "common.h"
 #include "smp.h"
 #include "rcu.h"      // Phase 5B: call_rcu for SLAB_TYPESAFE_BY_RCU
@@ -26,6 +27,12 @@
 // g_pmm_lock".  Never call a non-_locked public entry from inside a
 // critical section — it would self-deadlock.
 static spinlock_t g_pmm_lock = SPINLOCK_INIT;
+
+// The corruption detectors below (DOUBLE-ALLOC / DOUBLE-BUDDY-FREE /
+// REF-INC-ON-FREE) emit via kprintf_atomic, which holds the serial lock for
+// the whole line so the frame=/caller= fields stay contiguous even while four
+// CPUs flood the UART with per-char kprintf ([elf]/[pf]/[socket-dbg]) noise.
+extern void kprintf_atomic(const char* fmt, ...);
 
 // Forward declarations for _locked internals so init code can call them
 // without going through the public lock-taking wrappers.
@@ -74,13 +81,7 @@ static void** g_slab_heads;      // [frame_index] -> (void*)head_frame_index
 // registered, then read-only — no synchronisation needed.
 static slab_cache_t* g_slab_cache_head = NULL;
 
-static inline uint64_t align_down(uint64_t addr) {
-  return (addr & ~(PAGE_SIZE - 1));
-}
-
-static inline uint64_t align_up(uint64_t addr) {
-  return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-}
+// page_align_up / page_align_down live in common.h (shared with kheap).
 
 static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
   uint8_t* ptr = (uint8_t*)addr;
@@ -89,7 +90,21 @@ static inline void zero(virt_addr_t addr, uint64_t amount_bytes) {
   }
 }
 
+// DIAG: catch double-conversion (phys_to_virt fed an already-virtual address).
+// A real physical address is always < HHDM_OFFSET; anything >= it is a virtual
+// pointer wrongly passed as phys, which wraps bit 47 and yields a non-canonical
+// pointer. Report the caller RIP the first few times so the culprit is found.
+extern void kprintf_atomic(const char*, ...);
+static volatile uint32_t s_p2v_bad_reports;
+static void __attribute__((noinline)) phys_to_virt_bad(uint64_t phys, void* ra) {
+  uint32_t n = __atomic_fetch_add(&s_p2v_bad_reports, 1u, __ATOMIC_RELAXED);
+  if (n < 24)
+    kprintf_atomic("[p2v] BAD phys=%p (already virtual) caller=%p (rpt %u)\n",
+                   (void*)phys, ra, n);
+}
 static inline virt_addr_t phys_to_virt(phys_addr_t phys) {
+  if (__builtin_expect((uint64_t)phys >= HHDM_OFFSET, 0))
+    phys_to_virt_bad((uint64_t)phys, __builtin_return_address(0));
   return (virt_addr_t)(phys + HHDM_OFFSET);
 }
 
@@ -209,8 +224,8 @@ mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count) {
   uint64_t hole_idx_largest_base = PMM_INVALID_FRAME;
   uint64_t hole_size_largest = 0; // in frame indices
 
-  uintptr_t kernel_start_idx = align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT;
-  uintptr_t kernel_end_idx = align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT;
+  uintptr_t kernel_start_idx = page_align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT;
+  uintptr_t kernel_end_idx = page_align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT;
 
   for (uint32_t i = 0; i < count; i++) {
     e820_entry_t entry = map[i];
@@ -222,8 +237,8 @@ mem_survey_t pmm_mem_survey(e820_entry_t* map, uint32_t count) {
       g_phys_ceiling = end;
     }
 
-    uint64_t start = align_up(entry.base);
-    end = align_down(entry.base + entry.length);
+    uint64_t start = page_align_up(entry.base);
+    end = page_align_down(entry.base + entry.length);
 
     uint64_t start_idx = start >> PAGE_SHIFT;
     uint64_t end_idx = end >> PAGE_SHIFT;
@@ -339,19 +354,19 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   meta_size_bytes += g_total_frames * sizeof(slab_cache_t*);
   meta_size_bytes += g_total_frames * sizeof(void*);
 
-  uint64_t meta_frames = (align_up(meta_size_bytes) >> PAGE_SHIFT);
+  uint64_t meta_frames = (page_align_up(meta_size_bytes) >> PAGE_SHIFT);
 
   // ensure the chosen hole fits meta_frames
   {
-    uint64_t hole_start = align_up(survey.hole);
+    uint64_t hole_start = page_align_up(survey.hole);
     uint64_t hole_end = hole_start;
     uint64_t hole_size_frames = 0;
 
     for (uint32_t i = 0; i < count; i++) {
       if (map[i].type != 1) continue;
 
-      uint64_t start = align_up(map[i].base);
-      uint64_t end   = align_down(map[i].base + map[i].length);
+      uint64_t start = page_align_up(map[i].base);
+      uint64_t end   = page_align_down(map[i].base + map[i].length);
 
       if (hole_start < start || hole_start >= end) continue;
 
@@ -371,8 +386,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   uint64_t meta_frame_start_idx = (meta_phys >> PAGE_SHIFT);
   uint64_t meta_frame_end_idx   = meta_frame_start_idx + meta_frames;
 
-  uint64_t kernel_start_idx = (align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT);
-  uint64_t kernel_end_idx   = (align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT);
+  uint64_t kernel_start_idx = (page_align_down(KERNEL_BASE_PHYS) >> PAGE_SHIFT);
+  uint64_t kernel_end_idx   = (page_align_up(KERNEL_BASE_PHYS + LOADER_RESERVED_SIZE) >> PAGE_SHIFT);
 
   // carve: [coalesce]... [slab_trackers][slab_heads]
   uint64_t off = 0;
@@ -397,7 +412,7 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   g_slab_heads = (void**)(meta_virt + off);
   off += g_total_frames * sizeof(void*);
 
-  zero(meta_virt, align_up(meta_size_bytes));
+  zero(meta_virt, page_align_up(meta_size_bytes));
 
   // Initialize free lists
   for (uint8_t i = 0; i <= MAX_ORDER; i++) {
@@ -409,8 +424,8 @@ void pmm_buddy_init_from_map(e820_entry_t* map, uint32_t count) {
   for (uint32_t i = 0; i < count; i++) {
     if (map[i].type != 1) continue;
 
-    uint64_t start = align_up(map[i].base);
-    uint64_t end   = align_down(map[i].base + map[i].length);
+    uint64_t start = page_align_up(map[i].base);
+    uint64_t end   = page_align_down(map[i].base + map[i].length);
 
     if (start >= (g_total_frames << PAGE_SHIFT)) continue;
     if (end   >  (g_total_frames << PAGE_SHIFT)) end = (g_total_frames << PAGE_SHIFT);
@@ -539,9 +554,9 @@ static void pmm_mark_allocated(phys_addr_t phys, uint8_t order) {
         uint32_t prev = __atomic_exchange_n(&g_frame_refcount[fi + k], 1,
                                              __ATOMIC_ACQ_REL);
         if (prev != 0) {
-            extern void kprintf(const char* fmt, ...);
-            kprintf("[pmm] DOUBLE-ALLOC frame=%p rc=%u order=%u\n",
-                    (void*)(phys + k * 4096), (unsigned)prev, (unsigned)order);
+            kprintf_atomic("[pmm] DOUBLE-ALLOC frame=%p rc=%u order=%u caller=%p\n",
+                    (void*)(phys + k * 4096), (unsigned)prev, (unsigned)order,
+                    __builtin_return_address(0));
         }
     }
 }
@@ -706,9 +721,24 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   // slabs during refill).
   if (order == 0) {
     extern phys_addr_t pcp_alloc(void);
-    phys_addr_t r = pcp_alloc();
-    if (r != PMM_INVALID_ADDR) {
-      pmm_mark_allocated(r, 0);          // shared stamp — see above
+    // Never hand out a frame that is ALREADY owned (rc != 0).  A lock-free pcp
+    // race can leave a frame simultaneously in a per-CPU stash and on the buddy
+    // free list, so pcp_alloc may return a frame a live owner still holds.
+    // Returning it would double-own it (the corruption root).  Drop such a frame
+    // (do NOT re-free it -- its real owner still has it) and pop another; the
+    // dropped frame is reclaimed with its owner.  Bounded so a fully-poisoned
+    // stash can't spin forever -- fall through to the locked buddy path.
+    for (int attempt = 0; attempt < 64; attempt++) {
+      phys_addr_t r = pcp_alloc();
+      if (r == PMM_INVALID_ADDR) break;   // refill failed -> buddy path
+      uint64_t rfi = r >> PAGE_SHIFT;
+      if (rfi < g_total_frames &&
+          __atomic_load_n(&g_frame_refcount[rfi], __ATOMIC_RELAXED) != 0) {
+        kprintf_atomic("[pmm] pcp returned owned frame %p rc=%u -- dropped\n",
+                (void*)r, (unsigned)g_frame_refcount[rfi]);
+        continue;                          // corrupt: pop another
+      }
+      pmm_mark_allocated(r, 0);            // shared stamp — see above
 #if PMM_DEBUG_ALWAYS_ZERO
       __builtin_memset((void*)(r + HHDM_OFFSET), 0, PAGE_SIZE);
 #endif
@@ -718,13 +748,28 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
   }
 
   uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-  phys_addr_t r = pmm_buddy_alloc_locked(order);
-  if (r == PMM_INVALID_ADDR) {
-    // Hard pressure: reclaim every empty slab page we're sitting on
-    // and retry once.  Guarantees we never fail an allocation while
-    // holding reclaimable slab pages.
-    pmm_slab_shrink_all_locked();
+  phys_addr_t r = PMM_INVALID_ADDR;
+  // Same invariant as the pcp path: never hand out an already-owned frame.  If
+  // the buddy free list is holding a corrupted (still-owned) block, drop it and
+  // pop another.  Bounded; all under g_pmm_lock so rc is stable here.
+  for (int attempt = 0; attempt < 64; attempt++) {
     r = pmm_buddy_alloc_locked(order);
+    if (r == PMM_INVALID_ADDR) {
+      // Hard pressure: reclaim every empty slab page we're sitting on
+      // and retry once.  Guarantees we never fail an allocation while
+      // holding reclaimable slab pages.
+      pmm_slab_shrink_all_locked();
+      r = pmm_buddy_alloc_locked(order);
+      if (r == PMM_INVALID_ADDR) break;
+    }
+    uint64_t rfi = r >> PAGE_SHIFT;
+    uint64_t n = order_to_pages(order), owned = 0;
+    for (uint64_t k = 0; k < n; k++)
+      if (rfi + k < g_total_frames && g_frame_refcount[rfi + k] != 0) { owned = 1; break; }
+    if (!owned) break;                     // clean block -> use it
+    kprintf_atomic("[pmm] buddy returned owned block %p order=%u -- dropped\n",
+            (void*)r, (unsigned)order);
+    r = PMM_INVALID_ADDR;                  // drop (leak); its owner still holds it
   }
   if (r != PMM_INVALID_ADDR) pmm_mark_allocated(r, order);   // shared stamp
   spin_unlock_irqrestore(&g_pmm_lock, flags);
@@ -738,6 +783,30 @@ phys_addr_t pmm_buddy_alloc(uint8_t order) {
 }
 
 void pmm_buddy_free(phys_addr_t addr, uint8_t order) {
+  // DOUBLE-FREE tripwire: the public free is used for page-table frames and
+  // explicit alloc-cleanup, which all carry rc==1 while live (leaf frees go
+  // through pmm_ref_dec, not here).  rc==0 here means the frame was already
+  // freed -- a double pmm_buddy_free.  caller= points at the offending free
+  // site (e.g. vmm_free_user_ex's PT/PD/PDPT frees).
+  {
+    // A frame reaching the PUBLIC free with rc==0 was already freed -- a double
+    // pmm_buddy_free (page-table/kstack teardown of a frame some other owner
+    // still had, from an allocator double-hand-out).  Proceeding would push the
+    // SAME frame onto the free list twice: the second push corrupts the doubly-
+    // linked list and the coalesce bitmap, which is what cascades into wild
+    // double-allocs, scribbles and panics.  A double-free must be a NO-OP: the
+    // frame is already free, so drop this redundant free and keep the free list
+    // consistent.  (Boot-time population and the pcp drain use the _locked path,
+    // not this one, and legitimately free rc==0 frames -- so this guard is safe
+    // to apply only here, where a live free always carries rc>=1.)
+    uint64_t _fi = addr >> PAGE_SHIFT;
+    if (_fi < g_total_frames &&
+        __atomic_load_n(&g_frame_refcount[_fi], __ATOMIC_RELAXED) == 0) {
+      kprintf_atomic("[pmm] double buddy_free dropped: frame=%p order=%u caller=%p\n",
+              (void*)addr, (unsigned)order, __builtin_return_address(0));
+      return;
+    }
+  }
   // Phase 4E: order-0 hits the per-CPU pcp push.
   if (order == 0) {
     extern void pcp_free(phys_addr_t);
@@ -1111,7 +1180,7 @@ void pmm_slab_cache_init(slab_cache_t* cache, size_t slot_size, uint8_t flags) {
 
   // Pre-compute objects per slab page for slab_pcpu promote/demote.
   // Mirrors the layout pmm_slab_grow_locked uses: header at offset 0,
-  // first slot at align_up(sizeof(header), slot_size), slots packed.
+  // first slot at page_align_up(sizeof(header), slot_size), slots packed.
   size_t   slab_bytes     = (size_t)PAGE_SIZE << cache->slab_order;
   uint64_t first_slot_off = align_up_to((uint64_t)sizeof(slab_header_t),
                                          (uint64_t)slot_size);
@@ -1337,8 +1406,7 @@ void pmm_ref_inc(phys_addr_t addr) {
     // at the inc, where the caller's return address points straight at
     // the offending site.
     if (g_frame_refcount[fi] == 0) {
-        extern void kprintf(const char* fmt, ...);
-        kprintf("[pmm] REF-INC-ON-FREE frame=%p caller=%p\n",
+        kprintf_atomic("[pmm] REF-INC-ON-FREE frame=%p caller=%p\n",
                 (void*)addr, __builtin_return_address(0));
     }
     g_frame_refcount[fi]++;

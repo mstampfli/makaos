@@ -1,6 +1,8 @@
 #pragma once
 #include "common.h"
-#include "smp.h"
+#include "spinlock_types.h"   // spinlock_t for cpu_t::rq_lock -- NOT smp.h, which
+                              // (once spin_lock disables preemption) includes
+                              // preempt.h -> cpu.h and would form a cycle.
 #include "tss.h"
 
 // MLFQ levels — must match sched.c.  Kept as a compile-time constant
@@ -112,6 +114,10 @@ typedef struct cpu_t {
     // Scheduling.
     struct task_t*  current;            // task currently executing
     struct task_t*  idle;               // this CPU's idle task
+    struct task_t*  switching_from;     // task being switched away from across
+                                        // the current context_switch; the
+                                        // incoming task clears its on_cpu flag
+                                        // (set before the switch, read after).
     cpu_rq_t        rq;                 // run queue / sleep list / zombie list
     spinlock_t      rq_lock;            // protects rq state; IRQ-safe
 
@@ -183,6 +189,11 @@ typedef struct cpu_t {
     // Statistics — non-atomic, owner-only.
     uint64_t        sched_ticks;
     uint64_t        context_switches;
+    // Switches INTO a non-idle task only.  Unlike context_switches (which an
+    // idle CPU bumps every idle-loop sched_yield, even idle->idle), this only
+    // advances when a real task is scheduled -- a clean "the scheduler made
+    // forward progress" signal for the liveness watchdog.
+    uint64_t        nonidle_switches;
 
     // Per-CPU Task State Segment.  The CPU reads this on every ring-3 → 0
     // transition (rsp[0]) and on exception delivery via IST (ist[0..6]).
@@ -446,6 +457,27 @@ ALWAYS_INLINE cpu_t* this_cpu(void) {
     *(out_lo_p) = __exp_lo;                                                           \
     *(out_hi_p) = __exp_hi;                                                           \
 } while (0)
+
+// Absolute-address LOCKed 16-byte CAS — for cross-CPU access to a remote
+// core's 16-byte-aligned cmpxchg16b slot (e.g. another CPU's pcp_hdr during a
+// cross-CPU drain).  Unlike the %gs per-CPU variants this targets an arbitrary
+// pointer and takes the LOCK prefix, so it is atomic across cores.  ptr16 MUST
+// be 16-byte aligned.  Returns 1 on success; on mismatch it writes the observed
+// value back through old_lo_p/old_hi_p (standard cmpxchg semantics for a retry
+// loop).
+#define cmpxchg16b_abs(ptr16, old_lo_p, old_hi_p, new_lo, new_hi) ({                  \
+    uint8_t  __ok;                                                                    \
+    uint64_t __old_lo = *(old_lo_p);                                                  \
+    uint64_t __old_hi = *(old_hi_p);                                                  \
+    __asm__ volatile("lock cmpxchg16b %1\n\tsetz %0"                                  \
+        : "=q"(__ok), "+m"(*(volatile __uint128_t*)(ptr16)),                          \
+          "+a"(__old_lo), "+d"(__old_hi)                                              \
+        : "b"((uint64_t)(new_lo)), "c"((uint64_t)(new_hi))                            \
+        : "memory", "cc");                                                            \
+    *(old_lo_p) = __old_lo;                                                           \
+    *(old_hi_p) = __old_hi;                                                           \
+    __ok;                                                                             \
+})
 
 // Read a per-CPU pointer at a runtime offset.
 #define this_cpu_read_ptr_at(byte_off_var) ({                                        \

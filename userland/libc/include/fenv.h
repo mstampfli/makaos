@@ -43,4 +43,9 @@ int fesetexceptflag(const fexcept_t* flagp, int excepts);
 }
 #endif
 
+int fegetexceptflag(fexcept_t* flagp, int excepts);
+int fesetexceptflag(const fexcept_t* flagp, int excepts);
+int feholdexcept(fenv_t* envp);
+int feupdateenv(const fenv_t* envp);
+
 #endif

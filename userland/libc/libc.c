@@ -14,7 +14,17 @@
 // poisoned every multithreaded port: one thread's failed open changed
 // another thread's error-handling branch).  Lives in .tbss; crt0 sets
 // up the TLS block before anything can touch it.
+//
+// POSIX makes `errno` a MACRO (*__errno_location()) -- see errno.h -- so that
+// system-header `#ifndef errno` fallback guards (e.g. libgcc's tsystem.h) work
+// instead of colliding with a bare `__thread int errno` declaration.  The
+// STORAGE below keeps the symbol name `errno`, so every already-compiled port
+// that references the TLS symbol directly still links (no ABI break, no
+// re-port).  This TU defines the storage + the accessor, so it must see the
+// real symbol, not the macro -- #undef it here.
+#undef errno
 __thread int errno;
+int* __errno_location(void) { return &errno; }
 
 // glibc-ism: argv[0] split into "/path/to/prog" and "prog".  Several
 // upstream ports (systemd, libinput, elfutils, util-linux) log
@@ -29,6 +39,18 @@ char* program_invocation_short_name = _prog_name_default;
 // If the loader doesn't set it, default to an empty environment.
 static char* s_empty_env[] = { NULL };
 char** environ = s_empty_env;
+// glibc exposes the same array under __environ (environ is the weak alias there);
+// prebuilt .so's compiled against glibc import __environ. Same variable here.
+extern char** __environ __attribute__((alias("environ")));
+
+// __dso_handle identifies a module to __cxa_atexit for per-DSO destructor
+// registration. It is normally supplied by crtbeginS.o, but MakaOS builds
+// shared objects with a bare `ld -shared` (no crt fragments), so we provide a
+// weak fallback here. libc.a is linked into each module (executable or shared),
+// giving each its own copy; a null handle registers destructors against the
+// global list, which run at process exit -- correct for a module that is never
+// dlclosed (e.g. libjvm.so).
+__attribute__((weak)) void* __dso_handle = 0;
 
 // Count entries in environ
 static int _env_count(void) {
@@ -155,6 +177,20 @@ int strncmp(const char* a, const char* b, size_t n) {
     while (n && *a && *a == *b) { a++; b++; n--; }
     if (!n) return 0;
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+// strxfrm -- locale collation transform.  MakaOS has only the "C" locale, where
+// the transformed key compares byte-wise the same as the source, so this is a
+// plain bounded copy.  (strcoll lives further down; both are now declared in
+// <string.h> so libstdc++'s <cstring> finds them in ::.)
+size_t strxfrm(char* dst, const char* src, size_t n) {
+    size_t len = strlen(src);
+    if (n) {
+        size_t c = len < n - 1 ? len : n - 1;   // leave room for the NUL
+        for (size_t i = 0; i < c; i++) dst[i] = src[i];
+        dst[c] = '\0';
+    }
+    return len;   // length of src, per C99 (NOT counting the NUL)
 }
 
 char* strcpy(char* dst, const char* src) {
@@ -289,6 +325,14 @@ static void heap_lock(void) {
 static void heap_unlock(void) {
     __atomic_clear(&s_heap_lock_flag, __ATOMIC_RELEASE);
 }
+
+// fork() atfork hooks for the allocator lock.  A child forked while a SIBLING
+// thread held s_heap_lock_flag would inherit it LOCKED (the holder does not
+// exist in the child) and deadlock/abort on its first malloc.  fork() takes the
+// lock across the address-space copy (no thread can be mid-malloc) and resets it
+// unlocked in the child.  Not static: called from fork() in unistd.c.
+void __libc_malloc_atfork_lock(void)   { heap_lock(); }
+void __libc_malloc_atfork_unlock(void) { heap_unlock(); }
 
 static int heap_grow(size_t need) {
     size_t new_end = s_heap_end + need + 4096;
@@ -531,16 +575,35 @@ static int vsnprintf_impl(char* buf, size_t size, const char* fmt, va_list ap) {
         }
         if (left_align) zero_pad = 0;  // POSIX: '-' overrides '0'
 
-        // Width
+        // Width -- a '*' takes the width from an int argument (a negative value
+        // means left-justify with the absolute width, per C99). Consuming that
+        // argument is mandatory: skipping it (as the old digit-only parser did
+        // for "%*d"/"%.*s") shifts every following va_arg by one slot -- e.g.
+        // HotSpot's "%.*s%s" then reads the precision int as the next string
+        // pointer and strlen()s it.
         int width = 0;
-        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        if (*fmt == '*') {
+            fmt++;
+            int w = va_arg(ap, int);
+            if (w < 0) { left_align = 1; zero_pad = 0; width = -w; }
+            else       { width = w; }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        }
 
-        // Precision
+        // Precision -- '.' then digits, or '.*' taking the precision from an int
+        // argument (a negative value means "no precision", i.e. omitted).
         int prec = -1;
         if (*fmt == '.') {
             fmt++;
-            prec = 0;
-            while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); fmt++; }
+            if (*fmt == '*') {
+                fmt++;
+                int p = va_arg(ap, int);
+                prec = (p < 0) ? -1 : p;
+            } else {
+                prec = 0;
+                while (*fmt >= '0' && *fmt <= '9') { prec = prec * 10 + (*fmt - '0'); fmt++; }
+            }
         }
 
         // Length modifier
@@ -759,6 +822,12 @@ int sprintf(char* buf, const char* fmt, ...) {
     return r;
 }
 
+// vsprintf: unbounded vsnprintf (caller guarantees buf size).  libstdc++'s
+// locale __convert_from_v uses it.
+int vsprintf(char* buf, const char* fmt, va_list ap) {
+    return vsnprintf_impl(buf, (size_t)-1, fmt, ap);
+}
+
 // ── Math helpers ──────────────────────────────────────────────────────────
 // abs/labs/llabs: integer absolute value.
 int       abs(int x)          { return x < 0 ? -x : x; }
@@ -865,94 +934,15 @@ int putchar(int c) {
 // ── sscanf ────────────────────────────────────────────────────────────────
 // Minimal sscanf supporting %d, %u, %x, %s, %c, %ld, %lu, %lx, %%, [width].
 
+// sscanf: thin wrapper over the unified scanf engine (vsscanf -> scanf_core,
+// defined later in this file).  The former inline parser here lacked %[...]
+// scansets and field width, which broke HotSpot's -XX: flag parser; there is
+// now ONE scanf implementation so the two can never diverge again.
+int vsscanf(const char* str, const char* fmt, va_list ap);
 int sscanf(const char* str, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    int count = 0;
-    const char* s = str;
-
-    while (*fmt) {
-        if (*fmt == '%') {
-            fmt++;
-            // Width modifier (ignored for now, we parse until whitespace/delimiter).
-            while (*fmt >= '0' && *fmt <= '9') fmt++;
-
-            int is_long = 0;
-            if (*fmt == 'l') { is_long = 1; fmt++; }
-
-            if (*fmt == '%') {
-                if (*s == '%') { s++; }
-                fmt++;
-                continue;
-            }
-            if (*fmt == 'c') {
-                char* dst = va_arg(ap, char*);
-                if (!*s) goto done;
-                *dst = *s++;
-                count++;
-                fmt++;
-                continue;
-            }
-            if (*fmt == 's') {
-                char* dst = va_arg(ap, char*);
-                // Skip leading whitespace.
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                while (*s && *s != ' ' && *s != '\t' && *s != '\n')
-                    *dst++ = *s++;
-                *dst = '\0';
-                count++;
-                fmt++;
-                continue;
-            }
-            if (*fmt == 'd' || *fmt == 'i') {
-                // Skip whitespace.
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 10);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, long*)       = v;
-                else         *va_arg(ap, int*)         = (int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            if (*fmt == 'u') {
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 10);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, unsigned long*)      = (unsigned long)v;
-                else         *va_arg(ap, unsigned int*)        = (unsigned int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            if (*fmt == 'x' || *fmt == 'X') {
-                while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-                if (!*s) goto done;
-                char* end;
-                long v = strtol(s, &end, 16);
-                if (end == s) goto done;
-                if (is_long) *va_arg(ap, unsigned long*)      = (unsigned long)v;
-                else         *va_arg(ap, unsigned int*)        = (unsigned int)v;
-                s = end; count++; fmt++;
-                continue;
-            }
-            // Unknown specifier: skip.
-            fmt++;
-        } else if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
-            // Whitespace in format matches any amount of whitespace in input.
-            while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-            fmt++;
-        } else {
-            // Literal character match.
-            if (*s == *fmt) { s++; }
-            else break;
-            fmt++;
-        }
-    }
-done:
+    int count = vsscanf(str, fmt, ap);
     va_end(ap);
     return count;
 }
@@ -1336,6 +1326,35 @@ char* strtok_r(char* s, const char* delim, char** saveptr) {
     return tok;
 }
 
+// strsep: like strtok_r but returns empty tokens for adjacent delimiters and
+// advances *stringp to NULL past the last token (BSD/glibc extension used by
+// e.g. OpenJDK's cgroup parsing).
+char* strsep(char** stringp, const char* delim) {
+    char* start = *stringp;
+    if (!start) return NULL;
+    char* p = start + strcspn(start, delim);
+    if (*p) { *p++ = '\0'; *stringp = p; }
+    else    { *stringp = NULL; }
+    return start;
+}
+
+// vfork: MakaOS has no suspend-parent vfork; fall back to fork(). Functionally
+// correct (the child gets its own address space); only less efficient than a
+// true vfork for the immediate fork+exec pattern.
+pid_t vfork(void) { return fork(); }
+
+// posix_fallocate: MakaOS has no fallocate syscall, so we grow the file to make
+// the byte range addressable (sparse, not physically preallocated). This
+// satisfies callers that only need the size to exist. Returns an errno value
+// (0 on success), never -1, and never shrinks the file.
+int posix_fallocate(int fd, off_t offset, off_t len) {
+    if (len <= 0 || offset < 0) return EINVAL;
+    off_t need = offset + len;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size >= need) return 0;
+    return ftruncate(fd, need) == 0 ? 0 : errno;
+}
+
 static char* s_strtok_save = NULL;
 char* strtok(char* s, const char* delim) {
     return strtok_r(s, delim, &s_strtok_save);
@@ -1377,6 +1396,26 @@ char* strcasestr(const char* haystack, const char* needle) {
         if (!*n) return (char*)haystack;
     }
     return NULL;
+}
+
+// C99 long-double parse. MakaOS has no extended-precision path; delegate to
+// strtod (double precision suffices for the callers that pull it in via libstdc++).
+long double strtold(const char* s, char** endptr) {
+    return (long double)strtod(s, endptr);
+}
+
+// C11 quick_exit / at_quick_exit. Rarely used; a small fixed registry suffices.
+static void (*s_quick_exit_fns[32])(void);
+static int s_quick_exit_n = 0;
+int at_quick_exit(void (*func)(void)) {
+    if (!func || s_quick_exit_n >= 32) return -1;
+    s_quick_exit_fns[s_quick_exit_n++] = func;
+    return 0;
+}
+void quick_exit(int status) {
+    for (int i = s_quick_exit_n; i-- > 0; ) s_quick_exit_fns[i]();
+    _exit(status);
+    for (;;) { }
 }
 
 double strtod(const char* s, char** endptr) {
@@ -1446,12 +1485,24 @@ int vasprintf(char** strp, const char* fmt, __builtin_va_list ap) {
 DIR* opendir(const char* path) {
     if (!path) { errno = EINVAL; return NULL; }
     size_t plen = strnlen(path, 511);
-    k_dirent_t* entries = malloc(4096 * sizeof(k_dirent_t));
-    if (!entries) { errno = ENOMEM; return NULL; }
-    int count = _sys_readdir(path, plen, entries, 4096);
-    if (count < 0) {
-        free(entries);
-        return NULL;
+    // Grow-on-demand: a 4096-entry buffer is ~1.07MB (sizeof(k_dirent_t) is
+    // 268B); a single malloc that large can fail in a port's heap (e.g.
+    // fontconfig's font-dir scan), making opendir return NULL BEFORE the
+    // syscall — the directory then silently looks empty (no fonts -> tofu).
+    // Start modest and double on truncation: sys_readdir re-reads from the
+    // start, so a larger max just re-reads the whole dir.  Memory now tracks
+    // the dir's actual size instead of a fixed 1MB per opendir.
+    int cap = 64;
+    k_dirent_t* entries = NULL;
+    int count = 0;
+    for (;;) {
+        k_dirent_t* grown = realloc(entries, (size_t)cap * sizeof(k_dirent_t));
+        if (!grown) { free(entries); errno = ENOMEM; return NULL; }
+        entries = grown;
+        count = _sys_readdir(path, plen, entries, cap);
+        if (count < 0) { free(entries); return NULL; }
+        if (count < cap || cap >= 65536) break;  // got them all (or sane cap hit)
+        cap *= 2;                                 // truncated — re-read larger
     }
     DIR* dir = malloc(sizeof(DIR));
     if (!dir) { free(entries); errno = ENOMEM; return NULL; }
@@ -1811,6 +1862,9 @@ void endpwent(void) {
 long sysconf(int name) {
     switch (name) {
     case _SC_CLK_TCK:    return 100;
+    case _SC_GETPW_R_SIZE_MAX: return 1024;
+    case _SC_GETGR_R_SIZE_MAX: return 1024;
+    case _SC_IOV_MAX:          return 1024;
     case _SC_OPEN_MAX:   return 1024;
     case _SC_PAGESIZE:   return 4096;
     case _SC_NGROUPS_MAX:return 32;
@@ -1822,11 +1876,136 @@ long sysconf(int name) {
         long n = (long)syscall0(113 /* SYS_NPROC */);
         return n > 0 ? n : 1;
     }
+    case _SC_PHYS_PAGES:
+    case _SC_AVPHYS_PAGES:
+        // Total/available physical RAM in pages.  MakaOS exposes no meminfo
+        // syscall yet, so report a sane default (1 GiB) rather than -1: callers
+        // like Mesa use this only to size caches/pools, and a negative here
+        // would make total-memory math wrap.  TODO: back this with a real PMM
+        // page-count syscall when one exists.
+        return (1024L * 1024 * 1024) / 4096;
     default:             return -1;
     }
 }
-long pathconf(const char* path, int name) { (void)path; (void)name; return -1; }
-int  confstr(int name, char* buf, size_t len) { (void)name; (void)buf; (void)len; return 0; }
+// pathconf/fpathconf: report the fixed configurable limits MakaOS enforces.
+static long pathconf_value(int name) {
+    switch (name) {
+    case _PC_LINK_MAX:         return 127;
+    case _PC_MAX_CANON:        return 255;
+    case _PC_MAX_INPUT:        return 255;
+    case _PC_NAME_MAX:         return 255;   // ext2/virtfs component limit
+    case _PC_PATH_MAX:         return 4096;
+    case _PC_PIPE_BUF:         return 4096;
+    case _PC_CHOWN_RESTRICTED: return 1;
+    case _PC_NO_TRUNC:         return 1;
+    case _PC_VDISABLE:         return 0;
+    default:                   return -1;
+    }
+}
+long pathconf(const char* path, int name)  { (void)path; return pathconf_value(name); }
+long fpathconf(int fd, int name)            { (void)fd;   return pathconf_value(name); }
+
+// confstr: report a modern glibc/NPTL identity so callers that gate legacy
+// workarounds on the version (e.g. OpenJDK) take the current path. Returns the
+// buffer size needed including the terminating NUL.
+int confstr(int name, char* buf, size_t len) {
+    const char* val;
+    switch (name) {
+    case _CS_GNU_LIBC_VERSION:       val = "glibc 2.38"; break;
+    case _CS_GNU_LIBPTHREAD_VERSION: val = "NPTL 2.38";  break;
+    default:
+        if (buf && len) buf[0] = '\0';
+        return 0;
+    }
+    size_t need = strlen(val) + 1;
+    if (buf && len) {
+        size_t copy = need < len ? need : len;
+        memcpy(buf, val, copy);
+        buf[copy - 1] = '\0';
+    }
+    return (int)need;
+}
+
+// mincore: MakaOS exposes no page-residency query, so report ENOSYS. Callers
+// (e.g. OpenJDK's committed-memory probing) treat this as "unknown" and skip
+// the optimisation.
+int mincore(void* addr, size_t len, unsigned char* vec) {
+    (void)addr; (void)len; (void)vec;
+    errno = ENOSYS;
+    return -1;
+}
+
+// getloadavg: MakaOS keeps no load-average statistic, so report zero load for
+// the requested samples. Returns the number of samples filled (<= 3).
+int getloadavg(double loadavg[], int nelem) {
+    if (nelem < 0) return -1;
+    int n = nelem < 3 ? nelem : 3;
+    for (int i = 0; i < n; i++) loadavg[i] = 0.0;
+    return n;
+}
+
+// glibc malloc extensions. MakaOS's allocator does not support returning free
+// memory to the OS or per-block size introspection, so these report "nothing
+// trimmed" / unknown. Consumers (e.g. the JVM's trim-native-heap command and
+// native memory tracking) treat these as unavailable.
+int malloc_trim(size_t pad) { (void)pad; return 0; }
+size_t malloc_usable_size(void* ptr) { (void)ptr; return 0; }
+void malloc_stats(void) {}
+struct mallinfo { int arena, ordblks, smblks, hblks, hblkhd, usmblks,
+                      fsmblks, uordblks, fordblks, keepcost; };
+struct mallinfo mallinfo(void) { struct mallinfo mi; memset(&mi, 0, sizeof(mi)); return mi; }
+
+// ── scheduling / priority hints ──────────────────────────────────────────
+// sched_getcpu: which CPU the caller runs on.  MakaOS exposes no getcpu, so
+// report 0 -- callers (Mesa's u_thread) use it only for cache/affinity hints.
+int sched_getcpu(void) { return 0; }
+
+// Priority (nice) is a no-op: MakaOS has no nice levels.  Accept and report the
+// default so code that lowers worker-thread priority degrades to a harmless
+// no-op rather than failing.
+int setpriority(int which, int who, int prio) { (void)which; (void)who; (void)prio; return 0; }
+int getpriority(int which, int who) { (void)which; (void)who; return 0; }
+
+// syscall(2) compatibility shim.  MakaOS is Linux-SOURCE compatible but NOT
+// syscall-NUMBER compatible, so we must NOT forward the raw number to the
+// kernel (that would invoke a different call).  Map the specific Linux numbers
+// portable code passes to their MakaOS libc equivalents; anything else is
+// ENOSYS.  Extend the switch as new callers appear.  <sys/syscall.h> defines
+// the matching SYS_* tags.
+// gettid(2): the calling thread's kernel task id.  MakaOS makes every thread a
+// task, so SYS_GETPID already returns the per-thread id (what pthread caches as
+// its tid).  Self-contained here so syscall() below has no cross-object dep.
+int gettid(void) { return (int)syscall0(SYS_GETPID); }
+
+long syscall(long n, ...) {
+    switch (n) {
+    case 186: return gettid();   // SYS_gettid
+    case 202: {                  // SYS_futex -> MakaOS native futex (114)
+        va_list ap;
+        va_start(ap, n);
+        void* uaddr = va_arg(ap, void*);
+        int   op    = va_arg(ap, int);
+        int   val   = va_arg(ap, int);
+        void* to    = va_arg(ap, void*);
+        va_end(ap);
+        // MakaOS's futex is always process-private and uses the monotonic
+        // clock, so strip the flags it does not model, leaving a plain
+        // FUTEX_WAIT/FUTEX_WAKE/etc. for the kernel.
+        op &= ~(128 | 256);      // FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME
+        // Convert the raw kernel return (-errno) to the POSIX -1/errno
+        // convention via __syscall_ret, like every other libc syscall.
+        // Returning it raw handed callers -11 (-EAGAIN) / -4 (-EINTR) where
+        // they expected -1+errno: HotSpot's WaitBarrier does
+        // `s = syscall(SYS_futex,...); guarantee(s==0 || (s==-1 && errno==EAGAIN)
+        // || (s==-1 && errno==EINTR))` and aborted on s==-11 (not 0, not -1)
+        // with a stale errno ("futex FUTEX_WAIT failed: Unknown errno").
+        return __syscall_ret(syscall4(114, (uint64_t)(uintptr_t)uaddr,
+                              (uint64_t)op, (uint64_t)(unsigned)val,
+                              (uint64_t)(uintptr_t)to));
+    }
+    default:  errno = ENOSYS; return -1;
+    }
+}
 
 // ── mkstemp / mktemp ─────────────────────────────────────────────────────
 int mkstemp(char* tmpl) {
@@ -2757,86 +2936,200 @@ FILE* tmpfile(void) {
     return 0;
 }
 
-// ── scanf family — minimal %d/%s/%u/%x/%lx/%ld — satisfies libinput. ─────
-// libinput-record parses trivially-formatted event dumps with scanf.
-// We don't need fancy conversion; only the primitives below.
+// ── scanf family — the single source of truth for sscanf/vsscanf ────────────
+// One correct, complete C99 scanf engine (scanf_core); sscanf and vsscanf both
+// route through it so the two can never drift.  Supports: assignment
+// suppression (%*), field width, length modifiers (h hh l ll j z t L q),
+// conversions d i u o x X p c s [ (scanset, incl. ^negation and leading ]),
+// floating (a e f g and caps), n, and %%.  The former hand-rolled parsers
+// lacked %[...] scansets and field width entirely, which silently broke
+// HotSpot's ENTIRE -XX: flag parser (arguments.cpp parse_argument builds every
+// flag match out of "%255[A-Za-z0-9_]" scansets) -- every -XX: option came back
+// "Improperly specified VM option".  libinput/libdrm/mesa also rely on it.
 static int scanf_core(const char** bufp, const char* fmt, va_list ap);
 int vsscanf(const char* buf, const char* fmt, va_list ap) {
     const char* b = buf;
     return scanf_core(&b, fmt, ap);
 }
+static int sc_is_ws(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
 static int scanf_core(const char** bufp, const char* fmt, va_list ap) {
     int matched = 0;
     const char* b = *bufp;
+    const char* const start = *bufp;
+
     while (*fmt) {
-        if (*fmt == ' ' || *fmt == '\t' || *fmt == '\n') {
-            while (*b == ' ' || *b == '\t' || *b == '\n') b++;
+        unsigned char fc = (unsigned char)*fmt;
+
+        // Whitespace in the format matches any run (including none) of input ws.
+        if (sc_is_ws(fc)) {
+            while (sc_is_ws((unsigned char)*b)) b++;
             fmt++;
             continue;
         }
-        if (*fmt != '%') {
+        // Ordinary character: must match literally, else stop.
+        if (fc != '%') {
             if (*b != *fmt) break;
             b++; fmt++;
             continue;
         }
+
+        // ---- conversion: %[*][width][length]specifier ----
         fmt++;
-        int longflag = 0, llflag = 0;
-        while (*fmt == 'l') { longflag++; if (longflag == 2) llflag = 1; fmt++; }
-        while (*b == ' ' || *b == '\t' || *b == '\n') b++;
-        switch (*fmt) {
-        case 'd': {
-            int neg = 0;
-            if (*b == '-') { neg = 1; b++; } else if (*b == '+') b++;
-            if (*b < '0' || *b > '9') return matched;
-            long long v = 0;
-            while (*b >= '0' && *b <= '9') { v = v*10 + (*b - '0'); b++; }
-            if (neg) v = -v;
-            if (llflag)      *va_arg(ap, long long*) = v;
-            else if (longflag) *va_arg(ap, long*)    = (long)v;
-            else               *va_arg(ap, int*)     = (int)v;
-            matched++;
+        if (*fmt == '%') {                     // "%%" -> a literal percent
+            if (*b != '%') break;
+            b++; fmt++;
+            continue;
+        }
+
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
+
+        int width = -1;                        // -1 => unbounded
+        if (*fmt >= '0' && *fmt <= '9') {
+            width = 0;
+            while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        }
+
+        int lg = 0, sh = 0;                    // lg: 1=long 2=long long ; sh: 1=short 2=char
+        for (;;) {
+            if (*fmt == 'l')                         { lg = (lg >= 1) ? 2 : 1; fmt++; }
+            else if (*fmt == 'h')                    { sh = (sh >= 1) ? 2 : 1; fmt++; }
+            else if (*fmt=='j'||*fmt=='z'||*fmt=='t'){ lg = 1; fmt++; }   // long-width on LP64
+            else if (*fmt=='L'||*fmt=='q')           { lg = 2; fmt++; }
+            else break;
+        }
+
+        char conv = *fmt;
+        switch (conv) {
+        case 'c': {                            // width chars, no ws-skip, no NUL
+            int n = (width < 0) ? 1 : width, got = 0;
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            while (n-- > 0 && *b) { if (out) *out++ = *b; b++; got++; }
+            if (got == 0) goto out;
+            if (!suppress) matched++;
             break;
         }
-        case 'u': case 'x': {
-            int base = (*fmt == 'x') ? 16 : 10;
-            if (base == 16 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) b += 2;
-            unsigned long long v = 0; int consumed = 0;
-            while (*b) {
-                int d;
-                if (*b >= '0' && *b <= '9') d = *b - '0';
-                else if (base == 16 && *b >= 'a' && *b <= 'f') d = *b - 'a' + 10;
-                else if (base == 16 && *b >= 'A' && *b <= 'F') d = *b - 'A' + 10;
-                else break;
-                v = v * base + d; b++; consumed++;
+        case 's': {                            // ws-skip, non-ws run, NUL-terminated
+            while (sc_is_ws((unsigned char)*b)) b++;
+            if (!*b) goto out;
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            int got = 0;
+            while (*b && !sc_is_ws((unsigned char)*b) && (width < 0 || got < width)) {
+                if (out) *out++ = *b;
+                b++; got++;
             }
-            if (!consumed) return matched;
-            if (llflag)      *va_arg(ap, unsigned long long*) = v;
-            else if (longflag) *va_arg(ap, unsigned long*)    = (unsigned long)v;
-            else               *va_arg(ap, unsigned int*)     = (unsigned int)v;
-            matched++;
+            if (out) *out = '\0';
+            if (got == 0) goto out;
+            if (!suppress) matched++;
             break;
         }
-        case 's': {
-            char* out = va_arg(ap, char*);
-            int i = 0;
-            while (*b && *b != ' ' && *b != '\t' && *b != '\n') { out[i++] = *b++; }
-            out[i] = 0;
-            if (!i) return matched;
-            matched++;
+        case '[': {                            // scanset: %[set] / %[^set]; no ws-skip
+            fmt++;                             // step past '['
+            int negate = 0;
+            if (*fmt == '^') { negate = 1; fmt++; }
+            const char* set = fmt;
+            if (*fmt == ']') fmt++;            // a leading ']' is a set member
+            while (*fmt && *fmt != ']') fmt++;
+            const char* set_end = fmt;         // at ']' (or '\0' if malformed)
+            char* out = suppress ? NULL : va_arg(ap, char*);
+            int got = 0;
+            while (*b && (width < 0 || got < width)) {
+                int in = 0;
+                for (const char* p = set; p < set_end; p++)
+                    if (*p == *b) { in = 1; break; }
+                if (in == negate) break;       // member+^stop, or non-member+plain stop
+                if (out) *out++ = *b;
+                b++; got++;
+            }
+            if (out) *out = '\0';
+            if (got == 0) goto out;
+            if (!suppress) matched++;
+            // fmt now at ']' (or '\0'); the common advance below steps past it.
             break;
         }
-        case 'c': {
-            char* out = va_arg(ap, char*);
-            if (!*b) return matched;
-            *out = *b++;
-            matched++;
+        case 'd': case 'i': case 'u': case 'o':
+        case 'x': case 'X': case 'p': {
+            while (sc_is_ws((unsigned char)*b)) b++;
+            int base = (conv == 'i') ? 0 : (conv == 'd' || conv == 'u') ? 10
+                     : (conv == 'o') ? 8 : 16;
+            int is_signed = (conv == 'd' || conv == 'i');
+            char tmp[65];
+            const char* src = b;
+            if (width >= 0) {                  // bound the parse to `width` chars
+                int m = width > 64 ? 64 : width, k = 0;
+                while (k < m && b[k]) { tmp[k] = b[k]; k++; }
+                tmp[k] = '\0';
+                src = tmp;
+            }
+            char* endp = NULL;
+            if (conv == 'p') {
+                unsigned long long v = strtoull(src, &endp, 16);
+                if (endp == src) goto out;
+                if (!suppress) *va_arg(ap, void**) = (void*)(unsigned long)v;
+            } else if (is_signed) {
+                long long v = strtoll(src, &endp, base);
+                if (endp == src) goto out;
+                if (!suppress) {
+                    if (sh >= 2)      *va_arg(ap, signed char*) = (signed char)v;
+                    else if (sh == 1) *va_arg(ap, short*)       = (short)v;
+                    else if (lg >= 2) *va_arg(ap, long long*)   = v;
+                    else if (lg == 1) *va_arg(ap, long*)        = (long)v;
+                    else              *va_arg(ap, int*)         = (int)v;
+                }
+            } else {
+                unsigned long long v = strtoull(src, &endp, base);
+                if (endp == src) goto out;
+                if (!suppress) {
+                    if (sh >= 2)      *va_arg(ap, unsigned char*)      = (unsigned char)v;
+                    else if (sh == 1) *va_arg(ap, unsigned short*)     = (unsigned short)v;
+                    else if (lg >= 2) *va_arg(ap, unsigned long long*) = v;
+                    else if (lg == 1) *va_arg(ap, unsigned long*)      = (unsigned long)v;
+                    else              *va_arg(ap, unsigned int*)       = (unsigned int)v;
+                }
+            }
+            b += (endp - src);
+            if (!suppress) matched++;
             break;
         }
-        case '%': if (*b++ != '%') return matched; break;
-        default: return matched;
+        case 'a': case 'A': case 'e': case 'E':
+        case 'f': case 'F': case 'g': case 'G': {
+            while (sc_is_ws((unsigned char)*b)) b++;
+            char tmp[65];
+            const char* src = b;
+            if (width >= 0) {
+                int m = width > 64 ? 64 : width, k = 0;
+                while (k < m && b[k]) { tmp[k] = b[k]; k++; }
+                tmp[k] = '\0';
+                src = tmp;
+            }
+            char* endp = NULL;
+            double v = strtod(src, &endp);
+            if (endp == src) goto out;
+            if (!suppress) {
+                if (lg >= 1) *va_arg(ap, double*) = v;
+                else         *va_arg(ap, float*)  = (float)v;
+            }
+            b += (endp - src);
+            if (!suppress) matched++;
+            break;
         }
-        fmt++;
+        case 'n':                              // count consumed; no match, no input
+            if (!suppress) {
+                if (lg >= 2)      *va_arg(ap, long long*)   = (long long)(b - start);
+                else if (lg == 1) *va_arg(ap, long*)        = (long)(b - start);
+                else if (sh >= 2) *va_arg(ap, signed char*) = (signed char)(b - start);
+                else if (sh == 1) *va_arg(ap, short*)       = (short)(b - start);
+                else              *va_arg(ap, int*)         = (int)(b - start);
+            }
+            break;
+        default:                               // unknown conversion: cannot continue
+            goto out;
+        }
+        if (*fmt) fmt++;                        // advance past the specifier (never past NUL)
     }
+out:
     *bufp = b;
     return matched;
 }

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_TERMIOS_H
 #define _MAKAOS_TERMIOS_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef unsigned int  tcflag_t;
 typedef unsigned char cc_t;
@@ -71,4 +74,7 @@ int tcsetattr(int fd, int actions, const struct termios* t);
 int tcflush(int fd, int q);
 int tcdrain(int fd);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -46,6 +46,12 @@ fetch() {
     [ -d "$SRC_DIR" ] || {
         log "extracting"
         tar -xzf "$TARBALL" -C "$THIRD_PARTY"
+        # MakaOS patches — applied once, right after a fresh extraction.
+        for p in "$REPO_ROOT"/scripts/patches/tofi/*.patch; do
+            [ -e "$p" ] || continue
+            log "applying $(basename "$p")"
+            patch -p1 -d "$SRC_DIR" < "$p"
+        done
     }
     # No scdoc on the host → drop the man-page subdir.
     if grep -q "subdir('doc')" "$SRC_DIR/meson.build" 2>/dev/null; then

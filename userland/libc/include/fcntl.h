@@ -1,6 +1,10 @@
 #ifndef _MAKAOS_FCNTL_H
 #define _MAKAOS_FCNTL_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // open() flags
@@ -29,6 +33,10 @@
 #define F_GETLK     5
 #define F_SETLK     6
 #define F_SETLKW    7
+// LFS aliases (LP64: identical to the base commands).
+#define F_GETLK64   F_GETLK
+#define F_SETLK64   F_SETLK
+#define F_SETLKW64  F_SETLKW
 #define F_DUPFD_CLOEXEC 8
 
 // fcntl fd flags
@@ -50,9 +58,19 @@ struct flock {
     pid_t   l_pid;
 };
 
+// LFS record lock: LP64 makes off_t 64-bit, so this is identical to flock.
+struct flock64 {
+    short   l_type;
+    short   l_whence;
+    off_t   l_start;
+    off_t   l_len;
+    pid_t   l_pid;
+};
+
 int open(const char* path, int flags, ...);
 int openat(int dirfd, const char* path, int flags, ...);
 int creat(const char* path, mode_t mode);
+int posix_fallocate(int fd, off_t offset, off_t len);
 int fcntl(int fd, int cmd, ...);
 
 // memfd sealing (Linux values).  The kernel's fcntl returns -EINVAL
@@ -72,5 +90,17 @@ int fcntl(int fd, int cmd, ...);
 #define AT_REMOVEDIR         0x200
 #define AT_SYMLINK_FOLLOW    0x400
 #define AT_EACCESS           0x200
+
+#ifdef __cplusplus
+}
+#endif
+
+
+// LFS (*64) aliases -- MakaOS is LP64 with 64-bit off_t/ino_t,
+// so the large-file variants are the same as the plain functions.
+#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
+#define open64   open
+#define openat64 openat
+#endif
 
 #endif

@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_PLEDGE_H
 #define _MAKAOS_PLEDGE_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 // OpenBSD-style pledge + unveil + fd-rights restriction.
 
 // pledge() — space-separated promise list.
@@ -19,4 +22,7 @@ int unveil_lock(void);
 #define RIGHT_MMAP   0x0020
 int restrict_fd(int fd, unsigned rights);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

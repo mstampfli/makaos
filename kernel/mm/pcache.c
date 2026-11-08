@@ -75,6 +75,13 @@ static void clock_insert(pcache_entry_t* e) {
 }
 
 static void clock_remove(pcache_entry_t* e) {
+    // Idempotent: a live entry always has clock_next != NULL (self for a
+    // single-entry ring, a peer otherwise); removal NULLs both links.  So
+    // clock_next == NULL means "already removed" -- return, don't walk NULL
+    // links.  Two paths can race to remove the same entry (CLOCK eviction vs
+    // pcache_evict_inode on a truncate); the second call must be a no-op, not a
+    // NULL-deref of clock_prev/next.
+    if (e->clock_next == NULL) return;
     if (e->clock_next == e) {
         // Last entry in ring.
         g_clock_hand = NULL;
@@ -297,17 +304,27 @@ static uint8_t pcache_evict_one(void) {
         uint32_t h = pcache_hash(victim_ino, victim_pg_idx);
         pcache_bucket_t* b = &g_buckets[h];
 
+        // Unlinking from the hash bucket is the OWNERSHIP claim: whoever removes
+        // the entry from its bucket (under the bucket lock) owns the frame
+        // ref_dec + kfree.  We already clock_remove'd above and dropped the clock
+        // lock, so a concurrent pcache_evict_inode on this same inode could have
+        // taken the bucket lock first, unlinked+freed cand.  If our walk does NOT
+        // find cand, that path already owns it -- bail WITHOUT freeing (freeing
+        // here was a double frame-unref + double kfree + count underflow).
         spin_lock(&b->lock);
+        uint8_t owned = 0;
         pcache_entry_t** pp = &b->head;
         while (*pp) {
             if (*pp == cand) {
                 *pp = cand->next;
+                owned = 1;
                 break;
             }
             pp = &(*pp)->next;
         }
         spin_unlock(&b->lock);
 
+        if (!owned) return 0;   // concurrent evict_inode already claimed + freed it
         pmm_ref_dec(victim_frame);
         kfree(cand);
         return 1;

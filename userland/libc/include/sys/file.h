@@ -1,5 +1,8 @@
 #ifndef _MAKAOS_SYS_FILE_H
 #define _MAKAOS_SYS_FILE_H 1
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // BSD advisory file locking — used by fontconfig's cache-write path
 // and libdrm's magic-file logic.  Single-user MakaOS has no contention,
@@ -12,4 +15,7 @@
 
 int flock(int fd, int operation);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

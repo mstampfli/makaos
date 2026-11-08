@@ -3,6 +3,25 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "common.h"
+
+// Wait for `cond`, running `hook` between checks.  SLEEPS when preemptible
+// (the normal case), but BUSY-POLLS when called in atomic context
+// (preempt_depth > 0 -- e.g. a filesystem metadata write issued under an
+// ext2 allocation spinlock).  sched_sleep panics if preemption is disabled
+// (see sched.c), so a plain WAIT_EVENT would silently halt the CPU there.
+// The busy-poll is self-sufficient: the AHCI ISR still fires (spinlocks
+// disable preemption, NOT interrupts), and `hook` (ahci_rescan_completions)
+// re-polls SACT/CI directly, so the completion is observed with no sleep.
+#define AHCI_WAIT(wq, cond, hook)                                   \
+    do {                                                            \
+        if (this_cpu()->preempt_depth > 0) {                        \
+            while (!(cond)) { hook; cpu_relax(); }                  \
+        } else {                                                    \
+            WAIT_EVENT_HOOK((wq), (cond), hook);                    \
+        }                                                           \
+    } while (0)
+
+static void ahci_rescan_completions(void);   // AHCI_WAIT hook (defined below)
 #include "idt.h"
 #include "lapic.h"
 #include "sched.h"
@@ -11,6 +30,7 @@
 #include "smp.h"
 #include "preempt.h"
 #include "cpu.h"
+#include "checked.h"   // mul_within_u32: overflow-safe bounded multiply
 
 // ── PCI class codes ────────────────────────────────────────────────────────
 #define PCI_CLASS_STORAGE  0x01
@@ -119,6 +139,15 @@ typedef struct {
     uint32_t dbc;      // byte count-1 (bits[21:0]), bit[31]=interrupt on completion
 } __attribute__((packed)) prdt_entry_t;  // 16 bytes
 
+// PRDT entries that fit one 4 KiB command table alongside the 128-byte header:
+// 128 + AHCI_PRDT_ENTRIES*16 = 128 + 3968 = 4096.  Single source of truth for
+// the table size, the build_prdt bound, and the self-test -- they must agree.
+#define AHCI_PRDT_ENTRIES  248u
+// Max 4 KiB pages a single user scatter-gather I/O can span: AHCI_DMA_SECTORS
+// (1024 sectors = 512 KiB = 128 pages) + 2 slack for a misaligned first_off that
+// straddles a page boundary.  Bounds the phys_pages/page_ptrs/pin_addrs arrays.
+#define AHCI_MAX_IO_PAGES  130u
+
 // Command table: one full 4KB page per slot.
 // Header (128 bytes) + 248 PRDT entries × 16 bytes = 128 + 3968 = 4096 bytes.
 // 248 entries × 4 KiB/entry = ~992 KiB max per NCQ command — more than enough
@@ -127,7 +156,7 @@ typedef struct {
     uint8_t      cfis[64];    // Command FIS (H2D)
     uint8_t      acmd[16];    // ATAPI command (unused)
     uint8_t      rsv[48];     // Reserved
-    prdt_entry_t prdt[248];   // Physical Region Descriptor Table
+    prdt_entry_t prdt[AHCI_PRDT_ENTRIES];   // Physical Region Descriptor Table
 } __attribute__((packed)) cmd_table_t;   // exactly 4096 bytes
 
 // ── Driver state ──────────────────────────────────────────────────────────
@@ -230,9 +259,14 @@ static void port_start(hba_port_t* p) {
 static void port_init(hba_port_t* p) {
     port_stop(p);
 
-    // Shared structures
+    // Shared structures.  pmm_buddy_alloc returns PMM_INVALID_ADDR (UINT64_MAX),
+    // NOT 0, on OOM; without this guard the memset below would write through
+    // UINT64_MAX + HHDM_OFFSET (a wild kernel pointer) and program that wild
+    // address into the device DMA command header.  port_init is void, so on OOM
+    // just leave the port un-initialised (dead, but no wild write/DMA).
     s_cmdlist_phys = pmm_buddy_alloc(0);
     s_fis_phys     = pmm_buddy_alloc(0);
+    if (!PMM_ALLOC_OK(s_cmdlist_phys) || !PMM_ALLOC_OK(s_fis_phys)) return;
     __builtin_memset((void*)(s_cmdlist_phys + HHDM_OFFSET), 0, PAGE_SIZE);
     __builtin_memset((void*)(s_fis_phys     + HHDM_OFFSET), 0, PAGE_SIZE);
 
@@ -241,6 +275,7 @@ static void port_init(hba_port_t* p) {
     cmd_header_t* hdr = (cmd_header_t*)(s_cmdlist_phys + HHDM_OFFSET);
     for (uint32_t i = 0; i < s_nslots; i++) {
         s_ctbl_phys[i] = pmm_buddy_alloc(0);
+        if (!PMM_ALLOC_OK(s_ctbl_phys[i])) return;   // OOM: no wild memset / DMA program
         __builtin_memset((void*)(s_ctbl_phys[i] + HHDM_OFFSET), 0, PAGE_SIZE);
         hdr[i].ctba  = (uint32_t)(s_ctbl_phys[i] & 0xFFFFFFFF);
         hdr[i].ctbau = (uint32_t)(s_ctbl_phys[i] >> 32);
@@ -320,7 +355,7 @@ void ahci_irq_handler(void) {
         }
         __atomic_fetch_or(&s_free_mask, active, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
-        this_cpu()->preempt_depth--;
+        preempt_enable_no_resched();
         return;
     }
 
@@ -370,7 +405,7 @@ void ahci_irq_handler(void) {
         __atomic_fetch_or(&s_free_mask, done, __ATOMIC_RELEASE);
         wait_queue_wake_all(&s_slot_avail_wq);
     }
-    this_cpu()->preempt_depth--;
+    preempt_enable_no_resched();
 }
 
 // ── Slot allocation ───────────────────────────────────────────────────────
@@ -381,8 +416,13 @@ static uint32_t slot_alloc(void) {
     for (;;) {
         uint32_t free = __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE);
         if (!free) {
-            WAIT_EVENT(&s_slot_avail_wq,
-                       __atomic_load_n(&s_free_mask, __ATOMIC_ACQUIRE) != 0);
+            // Busy-poll, NEVER sleep: the caller holds s_submit_busy (the
+            // exclusive submit gate), so it must stay on its CPU and make its own
+            // progress.  Sleeping here let the gate holder be descheduled and
+            // never rescheduled behind a preempt-disabled gate waiter, leaking
+            // s_submit_busy forever (see slot_wait).  rescan frees completed slots.
+            ahci_rescan_completions();
+            cpu_relax();
             continue;
         }
         uint32_t slot = (uint32_t)__builtin_ctz(free);
@@ -395,12 +435,19 @@ static uint32_t slot_alloc(void) {
 }
 
 // ── PRDT builder ─────────────────────────────────────────────────────────
-// Build PRDT entries for a contiguous physical buffer.
-// Returns the number of entries written (≤ 248).
+// Build PRDT entries for a contiguous physical buffer.  Returns the number of
+// entries written (1..248), or 0 if `bytes` needs MORE than the 248-entry table
+// holds -- a caller MUST treat 0 as "transfer too fragmented" and fail, exactly
+// like the inline builders' fail-on-remainder (ahci_submit_hhdm / do_rw_direct).
+// The `n < 248u` bound makes the write safe by construction: it can never run
+// past prdt[247] / off the end of the 4 KiB cmd_table_t, no matter how large
+// `bytes` is.  (The sole caller, ahci_read_multi, passes PAGE_SIZE = one entry,
+// so it never overflows; the bound is defense-in-depth before this helper is
+// wired into any larger transfer.)
 
 static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes) {
     uint32_t n = 0;
-    while (bytes > 0) {
+    while (bytes > 0 && n < AHCI_PRDT_ENTRIES) {
         // Stay within the current 4 KiB page boundary.
         uint32_t off   = (uint32_t)(phys & (PAGE_SIZE - 1));
         uint32_t chunk = PAGE_SIZE - off;
@@ -413,6 +460,7 @@ static uint32_t build_prdt(prdt_entry_t* prdt, phys_addr_t phys, uint32_t bytes)
         phys  += chunk;
         bytes -= chunk;
     }
+    if (bytes) return 0;   // did not fit the 248-entry table -> caller must fail
     return n;
 }
 
@@ -553,13 +601,13 @@ static void ahci_rescan_completions(void) {
         uint32_t active = __atomic_load_n(&s_active_mask, __ATOMIC_ACQUIRE);
         if (!active) {
             spin_unlock_irqrestore(&s_ci_lock, flags);
-            this_cpu()->preempt_depth--;
+            preempt_enable_no_resched();
             return;
         }
         uint32_t done = s_ncq ? (active & ~s_port->sact) : (active & ~s_port->ci);
         if (!done) {
             spin_unlock_irqrestore(&s_ci_lock, flags);
-            this_cpu()->preempt_depth--;
+            preempt_enable_no_resched();
             return;
         }
         __atomic_fetch_and(&s_active_mask, ~done, __ATOMIC_RELEASE);
@@ -579,12 +627,36 @@ static void ahci_rescan_completions(void) {
 }
 
 static void slot_wait(uint32_t slot) {
-    // Post-wake hook: rescan for completions the ISR may have missed due
-    // to IRQ coalescing (W1C of port_is can clear a completion's IS bit
-    // before the ISR reads SACT/CI).
-    WAIT_EVENT_HOOK(&s_slot_wq[slot],
-                    __atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE),
-                    ahci_rescan_completions());
+    // Busy-poll the caller's OWN completion -- NEVER sleep.  The caller holds
+    // s_submit_busy (the exclusive submit gate).  Sleeping here deadlocked the
+    // whole storage stack: the holder context-switched away mid-I/O, was woken
+    // by the completion but never rescheduled -- a concurrent preempt-DISABLED
+    // busy-poll submitter (ext2 metadata I/O under a spinlock, e.g. /bin/net
+    // creating /etc/resolv.conf) occupied a CPU and could not yield back to it,
+    // so it never ran to call submit_busy_release().  s_submit_busy stayed 1 and
+    // every later submitter -- including the compositor demand-paging its binary
+    // -- spun on the gate forever (observed: gate held, slot done+free, no
+    // waiter queued, all other CPUs idle).  Busy-polling keeps the holder on its
+    // CPU straight through completion, so the gate is always released promptly;
+    // rescan self-services via SACT/CI register polling with IRQs on or off.
+    // (Root cause is ext2 holding spinlocks across block I/O -- see
+    //  docs/SCALABILITY_DEBT.md; this makes the current design deadlock-free.)
+    while (!__atomic_load_n(&s_slot_done[slot], __ATOMIC_ACQUIRE)) {
+        ahci_rescan_completions();
+        cpu_relax();
+    }
+}
+
+// PRIMITIVE (DMA transfer sizing): byte length of `sectors` sectors, overflow-safe
+// and bounded -- a zero-sector transfer is rejected, and the length is formed in
+// 64-bit (via the generic mul_within_u32) so `sectors * sector_size` can never wrap
+// a u32 and slip past a byte-based transfer guard (the wrap would make a huge request
+// look tiny, so the PRDT/page bound passes while the HBA still moves the huge sector
+// count -> DMA overrun).  On true, *out_bytes <= max_bytes (fits u32 losslessly).
+// Thin domain wrapper over checked.h's mul_within_u32; unit-tested (xfer_bytes_ok_selftest).
+static inline bool xfer_bytes_ok(uint32_t sectors, uint32_t sector_size,
+                                 uint32_t max_bytes, uint32_t* out_bytes) {
+    return sectors != 0 && mul_within_u32(sectors, sector_size, max_bytes, out_bytes);
 }
 
 // ── Pre-scheduler polling path ────────────────────────────────────────────
@@ -705,21 +777,41 @@ static uint8_t do_rw_direct(uint64_t lba, void* buf, uint32_t count,
 static volatile uint32_t s_submit_busy = 0;
 static wait_queue_t      s_submit_busy_wq = { NULL, SPINLOCK_INIT };
 
-static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
-                                  uint8_t write) {
-    if (!buf || !count) return 0;
-
-    uint32_t bytes = count * 512u;
-
-    // Acquire exclusive submit: spin-CAS with sleep-fallback.
+// Acquire/release the single-submitter serializer.  EVERY submit entry point
+// (ahci_submit_hhdm, ahci_submit_sg, ahci_read_multi) must bracket its
+// slot_alloc + s_slot_done/result reset + issue + slot_wait + result read with
+// these: at s_nslots=1 all submitters share slot 0's s_slot_done[0]/
+// s_slot_result[0], so a second submitter that resets them while the first is
+// still reading drives a spurious retry whose PRDT rebuild misdirects in-flight
+// DMA.  One named serializer used everywhere (was inline in only one path).
+static void submit_busy_acquire(void) {
     for (;;) {
         uint32_t expected = 0;
         if (__atomic_compare_exchange_n(&s_submit_busy, &expected, 1u, 0,
                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
-            break;
-        WAIT_EVENT(&s_submit_busy_wq,
-                   __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0);
+            return;
+        // Poll when atomic (ext2 metadata I/O under a spinlock): another
+        // submitter releases the gate; the rescan keeps completions flowing.
+        AHCI_WAIT(&s_submit_busy_wq,
+                  __atomic_load_n(&s_submit_busy, __ATOMIC_ACQUIRE) == 0,
+                  ahci_rescan_completions());
     }
+}
+static void submit_busy_release(void) {
+    __atomic_store_n(&s_submit_busy, 0u, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&s_submit_busy_wq);
+}
+
+static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
+                                  uint8_t write) {
+    if (!buf || !count) return 0;
+
+    // 64-bit length so a huge count cannot wrap u32 and slip past the 248-entry
+    // PRDT bound below while issue_cmd is still handed the raw sector count.
+    uint32_t bytes;
+    if (!xfer_bytes_ok(count, 512u, 0xFFFFFFFFu, &bytes)) return 0;
+
+    submit_busy_acquire();
 
     uint8_t rc = 0;
 
@@ -755,6 +847,16 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
             rem -= chunk;
             nprdt++;
         }
+        if (rem) {
+            // Transfer too fragmented for the 248-entry PRDT: free the slot we
+            // reserved (it was never issued, so the IRQ completion will never
+            // OR it back into s_free_mask) and fail cleanly rather than issue a
+            // truncated command (mirrors do_rw_direct's `if (rem) return 0`).
+            __atomic_fetch_or(&s_free_mask, (1u << slot), __ATOMIC_RELEASE);
+            wait_queue_wake_all(&s_slot_avail_wq);
+            rc = 0;
+            break;
+        }
 
         volatile uint64_t* sentinel = (volatile uint64_t*)buf;
         if (!write && bytes >= 8)
@@ -776,8 +878,7 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
         break;
     }
 
-    __atomic_store_n(&s_submit_busy, 0u, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&s_submit_busy_wq);
+    submit_busy_release();
     return rc;
 }
 
@@ -788,11 +889,22 @@ static uint8_t ahci_submit_hhdm(uint64_t lba, void* buf, uint32_t count,
 static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
                                 uint32_t first_off, uint32_t count,
                                 uint8_t write) {
-    phys_addr_t phys_pages[130];
+    // Self-guard: the phys_pages[] stack array below (and the PRDT) must not be
+    // overrun by an over-large page count.  Callers already clamp (ahci_read_user
+    // rejects npages > AHCI_MAX_IO_PAGES), but the function must not trust its
+    // input -- fail cleanly instead of smashing the stack.
+    if (npages > AHCI_MAX_IO_PAGES) return 0;
+    phys_addr_t phys_pages[AHCI_MAX_IO_PAGES];
     for (uint32_t i = 0; i < npages; i++)
         phys_pages[i] = (phys_addr_t)((uint64_t)pages[i] - HHDM_OFFSET);
 
-    uint32_t bytes = count * 512u;
+    uint32_t bytes;
+    if (!xfer_bytes_ok(count, 512u, AHCI_MAX_IO_PAGES * PAGE_SIZE, &bytes)) return 0;  // <= npages cap
+
+    // Serialize against every other submitter: at s_nslots=1 this path shares
+    // slot 0's s_slot_done/result with ahci_submit_hhdm / ahci_read_multi, so
+    // it must hold the same single-submitter lock around the slot lifecycle.
+    submit_busy_acquire();
     uint32_t slot  = slot_alloc();
 
     cmd_table_t* ct = (cmd_table_t*)(s_ctbl_phys[slot] + HHDM_OFFSET);
@@ -803,7 +915,9 @@ static uint8_t ahci_submit_sg(uint64_t lba, uint8_t** pages, uint32_t npages,
     s_slot_result[slot] = 0;
     issue_cmd(slot, lba, count, write, nprdt);
     slot_wait(slot);
-    return s_slot_result[slot];
+    uint8_t rc = s_slot_result[slot];   // read under the lock before release
+    submit_busy_release();
+    return rc;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -828,20 +942,23 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
     if (!s_irq_ready) return do_rw_direct(lba, user_buf, count, 0);
 
     uint64_t va        = (uint64_t)user_buf;
-    uint32_t total_bytes = count * 512u;
     uint32_t first_off = (uint32_t)(va & 0xFFFu);
+    // npages <= AHCI_MAX_IO_PAGES  <=>  first_off + count*512 <= cap*PAGE_SIZE.
+    // Form the length in u64 (xfer_bytes_ok) so a huge count cannot wrap u32 and
+    // fake a small npages that passes this bound while the DMA still moves the
+    // huge count -> overrun.
+    uint32_t total_bytes;
+    if (!xfer_bytes_ok(count, 512u, AHCI_MAX_IO_PAGES * PAGE_SIZE - first_off, &total_bytes)) return 0;
     uint32_t npages    = (first_off + total_bytes + PAGE_SIZE - 1u) / PAGE_SIZE;
 
-    if (npages > 130u) return 0;
-
     phys_addr_t pml4 = g_current->mm_shared->pml4_phys;
-    void* page_ptrs[130];
+    void* page_ptrs[AHCI_MAX_IO_PAGES];
     if (!vmm_get_user_pages(pml4, va, npages, page_ptrs)) return 0;
 
     // vmm_get_user_pages already pinned each frame UNDER its resolution
     // lock (closing the resolve→DMA recycle window).  We own those pins;
     // release them after the DMA completes.
-    phys_addr_t pin_addrs[130];
+    phys_addr_t pin_addrs[AHCI_MAX_IO_PAGES];
     for (uint32_t i = 0; i < npages; i++)
         pin_addrs[i] = (phys_addr_t)((uint64_t)page_ptrs[i] - HHDM_OFFSET);
 
@@ -871,6 +988,12 @@ uint8_t ahci_read_user(uint64_t lba, void* user_buf, uint32_t count) {
 uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
     if (!s_port || !s_irq_ready || !nframes) return 0;
     if (nframes > MAX_NCQ_SLOTS) nframes = MAX_NCQ_SLOTS;
+
+    // Serialize the whole batch against every other submitter (hhdm/sg): at
+    // s_nslots=1 they share slot 0's s_slot_done/result.  Holding the
+    // single-submitter lock across the batch keeps any intra-batch NCQ
+    // parallelism (distinct slots) while excluding concurrent submitters.
+    submit_busy_acquire();
 
     uint32_t slots[MAX_NCQ_SLOTS];
     uint32_t submitted_mask = 0;
@@ -906,6 +1029,7 @@ uint32_t ahci_read_multi(uint64_t lba, phys_addr_t* frames, uint32_t nframes) {
         if (*p == AHCI_READ_POISON) continue;  // zero-data DMA — skip
         result_mask |= (1u << i);
     }
+    submit_busy_release();
     return result_mask;
 }
 
@@ -952,6 +1076,10 @@ uint8_t ahci_init(void) {
     uint64_t abar_phys = pci_bar_base(dev.bus, dev.dev, dev.fn, AHCI_BAR);
     if (!abar_phys) return 0;
     s_hba = (hba_mem_t*)vmm_map_mmio(abar_phys, sizeof(hba_mem_t));
+    // A failed ABAR map (OOM / MMIO-VA exhaustion -> NULL) must fail init, not
+    // NULL-deref s_hba->ghc below.  ahci_init returns 0 on every other setup
+    // failure; mirror that so the boot falls back / reports no AHCI disk.
+    if (!s_hba) return 0;
 
     // 4. Enable AHCI mode.
     s_hba->ghc |= HBA_GHC_AE;
@@ -1006,16 +1134,8 @@ uint8_t ahci_init(void) {
         //   bits[10:8] = 001 → (1u<<8)
         //   bits[7:0]  = vector
         {
-            uint8_t cap = (uint8_t)(pci_cfg_read32(dev.bus, dev.dev, dev.fn,
-                                                    0x34u) & 0xFCu);
-            uint8_t msix_cap = 0, msi_cap = 0;
-            while (cap) {
-                uint32_t dw = pci_cfg_read32(dev.bus, dev.dev, dev.fn, cap);
-                uint8_t  id = dw & 0xFFu;
-                if (id == 0x11u && !msix_cap) msix_cap = cap;
-                if (id == 0x05u && !msi_cap)  msi_cap  = cap;
-                cap = (uint8_t)((dw >> 8) & 0xFCu);
-            }
+            uint8_t msix_cap = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x11u);
+            uint8_t msi_cap  = pci_find_cap(dev.bus, dev.dev, dev.fn, 0x05u);
 
             int irq_armed = 0;
 
@@ -1032,24 +1152,29 @@ uint8_t ahci_init(void) {
                     s_msix_entry = (volatile uint32_t*)
                                    vmm_map_mmio(bar_phys + tbl_off, 16u);
 
-                    // Fixed delivery to BSP LAPIC — works in both xAPIC and
-                    // x2APIC modes.  Lowest-priority (mode 001) is NOT
-                    // supported in x2APIC and silently drops the interrupt.
-                    uint32_t msi_addr = (uint32_t)lapic_msi_addr();
-                    uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
+                    // A failed table map (NULL) must not be programmed: leave
+                    // irq_armed = 0 so the MSI (then INTx) fallback below arms
+                    // the device, rather than NULL-deref s_msix_entry.
+                    if (s_msix_entry) {
+                        // Fixed delivery to BSP LAPIC -- works in both xAPIC and
+                        // x2APIC modes.  Lowest-priority (mode 001) is NOT
+                        // supported in x2APIC and silently drops the interrupt.
+                        uint32_t msi_addr = (uint32_t)lapic_msi_addr();
+                        uint32_t msi_data = lapic_msi_data(VEC_AHCI_MSI);
 
-                    s_msix_entry[0] = msi_addr;   // addr_lo
-                    s_msix_entry[1] = 0;           // addr_hi
-                    s_msix_entry[2] = msi_data;    // data
-                    s_msix_entry[3] = 0;           // vector_ctrl: bit0=0 → unmasked
+                        s_msix_entry[0] = msi_addr;   // addr_lo
+                        s_msix_entry[1] = 0;           // addr_hi
+                        s_msix_entry[2] = msi_data;    // data
+                        s_msix_entry[3] = 0;           // vector_ctrl: bit0=0 -> unmasked
 
-                    // Enable MSI-X in message control (bit 31).
-                    // Also clear Function Mask (bit 30) so vectors fire.
-                    uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
-                    mc = (mc | (1u << 31)) & ~(1u << 30);
-                    pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
+                        // Enable MSI-X in message control (bit 31).
+                        // Also clear Function Mask (bit 30) so vectors fire.
+                        uint32_t mc = pci_cfg_read32(dev.bus, dev.dev, dev.fn, msix_cap);
+                        mc = (mc | (1u << 31)) & ~(1u << 30);
+                        pci_cfg_write32(dev.bus, dev.dev, dev.fn, msix_cap, mc);
 
-                    irq_armed = 1;
+                        irq_armed = 1;
+                    }
                 }
             }
 
@@ -1084,3 +1209,59 @@ uint8_t ahci_init(void) {
 
     return 0;
 }
+
+#ifdef MAKAOS_BOOT_SELFTESTS
+#include "kprintf.h"
+// xfer_bytes_ok forms a sector->byte length in 64-bit so the transfer-size guards
+// (PRDT capacity, npages<=130) cannot be bypassed by a u32 wrap.  Drive the WRAP
+// boundary explicitly: a naive u32 `sectors*512` would truncate the 2^23 case to 0
+// and pass; the primitive rejects it.
+void xfer_bytes_ok_selftest(void) {
+    kprintf("[ahci_xfer] xfer_bytes_ok must size sector transfers in u64, no wrap\n");
+    int fails = 0;
+    struct { uint32_t sectors, ssz, max; uint8_t want_ok; uint32_t want_bytes; } c[] = {
+        { 0,         512, 1u << 20,    0, 0 },            // zero sectors -> reject
+        { 8,         512, 1u << 20,    1, 4096 },          // normal
+        { 2,         512, 1024,        1, 1024 },          // exact boundary (bytes == max)
+        { 3,         512, 1024,        0, 0 },             // one sector over the bound
+        { 0x800000u, 512, 0xFFFFFFFFu, 0, 0 },            // sectors*512 == 2^32: u32 wraps to 0
+        { 0x7FFFFFu, 512, 0xFFFFFFFFu, 1, 0xFFFFFE00u },   // just under the u32 wrap
+        { 0x200000u, 512, 0xFFFFFFFFu, 1, 0x40000000u },   // 2^30, large no-wrap
+    };
+    for (unsigned i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        uint32_t got = 0xDEADBEEFu;
+        bool ok = xfer_bytes_ok(c[i].sectors, c[i].ssz, c[i].max, &got);
+        if (ok != (c[i].want_ok != 0) || (ok && got != c[i].want_bytes)) {
+            kprintf_atomic("[ahci_xfer] FAIL sectors=0x%lx max=0x%lx ok=%d want=%d bytes=0x%lx want=0x%lx\n",
+                    (unsigned long)c[i].sectors, (unsigned long)c[i].max, ok, c[i].want_ok,
+                    (unsigned long)got, (unsigned long)c[i].want_bytes);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[ahci_xfer] SELF-TEST FAILED\n"
+                  : "[ahci_xfer] SELF-TEST PASSED (sector-bytes u64, no wrap, bounded)\n");
+}
+
+#include "kheap.h"
+// build_prdt must bound its writes to the 248-entry PRDT table and signal
+// overflow (return 0) when a transfer needs more entries -- it must never write
+// past prdt[247], off the end of the 4 KiB cmd_table_t.  Heap-allocated array
+// (250 entries = 4000 bytes is too big for the 8 KiB kstack).
+void ahci_build_prdt_selftest(void) {
+    prdt_entry_t* prdt = (prdt_entry_t*)kmalloc((AHCI_PRDT_ENTRIES + 2u) * sizeof(prdt_entry_t));
+    if (!prdt) { kprintf_atomic("[ahci_prdt] FAIL alloc\n"); return; }
+    int fails = 0;
+    // One page from a page-aligned base -> exactly one entry, all consumed.
+    if (build_prdt(prdt, 0x100000u, PAGE_SIZE) != 1u) fails++;
+    // Exactly a full table -> fills the table, all consumed.
+    if (build_prdt(prdt, 0x100000u, AHCI_PRDT_ENTRIES * PAGE_SIZE) != AHCI_PRDT_ENTRIES) fails++;
+    // One page too many -> overflow: returns 0 AND never writes the entry one past
+    // the table (canary proves the bound stopped the loop at the last slot, no OOB).
+    prdt[AHCI_PRDT_ENTRIES].dba = 0xDEADBEEFu;
+    if (build_prdt(prdt, 0x100000u, (AHCI_PRDT_ENTRIES + 1u) * PAGE_SIZE) != 0u) fails++;
+    if (prdt[AHCI_PRDT_ENTRIES].dba != 0xDEADBEEFu) fails++;
+    kfree(prdt);
+    kprintf_atomic(fails ? "[ahci_prdt] SELF-TEST FAILED\n"
+                  : "[ahci_prdt] SELF-TEST PASSED (PRDT bounded to 248, overflow signalled)\n");
+}
+#endif

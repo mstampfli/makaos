@@ -126,6 +126,9 @@ typedef struct __attribute__((aligned(16))) task_t {
 
     task_mm_t*    mm_shared;     // ref-counted address space (never NULL)
     task_files_t* files_shared;  // ref-counted fd table    (never NULL)
+    sighand_t*    sighand;       // ref-counted signal dispositions, shared
+                                 // across a thread group (never NULL on a live
+                                 // task; POSIX per-process handler table)
 
     cpu_ctx_t     ctx;
     virt_addr_t   kstack_top;
@@ -152,10 +155,18 @@ typedef struct __attribute__((aligned(16))) task_t {
     // atomic-or).  See kernel/io/signalfd.c.
     void*         signalfd_head;
 
-    // Total DRM dumb-buffer bytes charged to this task.  Incremented
-    // on CREATE_DUMB, decremented on DESTROY_DUMB or drm_close.  Hard
-    // cap enforced in drm.c; future OOM kill reads this to prioritise.
+    // Total DRM pinned-backing bytes charged to this task.  Incremented
+    // on CREATE_DUMB / resource_create, decremented on destroy or drm_close.
+    // Bounded by the pinned-memory budget in drm.c; future OOM kill reads
+    // this to prioritise.
     uint64_t      drm_bytes_charged;
+
+    // Per-task pinned-memory ceiling OVERRIDE (0 = use the RAM-derived
+    // default).  A privileged client raises its own ceiling via
+    // DRM_IOCTL_MAKA_PIN_LIMIT so a trusted compositor / GPU app that
+    // legitimately needs more than the fair share can be granted it, while
+    // the default gate stays for untrusted clients.
+    uint64_t      drm_pin_limit;
 
     // DRM context priority (#5 of design-hardening).  Higher numbers
     // submit commits with higher priority than lower numbers.  Default
@@ -195,6 +206,13 @@ typedef struct __attribute__((aligned(16))) task_t {
     // Owned by the task's home-CPU rq_lock; written by sched_wake,
     // consumed by sched_sleep.
     uint8_t       wake_pending;
+
+    // SMP on_cpu handshake: 1 while this task is executing on a CPU (set on
+    // the incoming task just before context_switch, cleared on the outgoing
+    // task just after).  sched_wake reads it to avoid migrating a task that
+    // has gone SLEEPING but not yet finished switching off its kstack — see
+    // the handshake comment in sched_wake.  Accessed with atomics across CPUs.
+    volatile uint8_t on_cpu;
 
     // Persistent wait entry — lives in the task struct instead of the
     // caller's stack frame so a drain firing AFTER sched_sleep returned
@@ -323,6 +341,11 @@ task_mm_t*    task_mm_alloc(phys_addr_t pml4, mm_t* mm);
 void          task_mm_release(task_mm_t* m);
 task_files_t* task_files_alloc(void);
 void          task_files_release(task_files_t* f);
+// Drop a task's fd table on exit in the ONE correct order: unpublish
+// files_shared (RELEASE) BEFORE task_files_release, so the RCU-deferred table
+// free cannot race a /proc/<pid>/fd reader.  Both the sys_exit and the
+// fatal-signal terminate paths MUST use this so the order cannot drift.
+void          task_drop_files(task_t* t);
 
 // ── API ───────────────────────────────────────────────────────────────────
 
@@ -339,6 +362,12 @@ static inline task_t* process_create_user(phys_addr_t cp, uint32_t cn, uint32_t 
 void    task_destroy(task_t* t);
 static inline void process_destroy(task_t* t) { task_destroy(t); }
 
+// Exit disposition (shared by sys_exit + the fatal-signal terminate path so
+// they cannot drift): a TASK_FLAG_THREAD self-reaps as TASK_DEAD, a leader
+// becomes a wait()-able TASK_ZOMBIE + SIGCHLDs its parent.
+int     task_exit_self_reaps(uint32_t flags);
+void    task_set_exit_state(task_t* t, int32_t exit_code);
+
 mm_t*   task_get_mm(void* task);
 
 void context_switch(cpu_ctx_t* from, cpu_ctx_t* to, phys_addr_t new_pml4);
@@ -349,11 +378,15 @@ extern void fork_trampoline(void);
 
 // PID pool.
 uint32_t pid_alloc(void);
+int user_task_over_cap(void);  // RLIMIT_NPROC fork-bomb guard
 void     pid_free(uint32_t pid);
 
 // fd table helpers — operate on task_files_t directly.
 uint8_t fd_table_init(task_files_t* f, uint32_t cap);
 uint8_t fd_table_grow(task_files_t* f);
+// Clone src's table into a fresh dst, vfs_dup'ing each fd under src->lock
+// (fork / thread-copy / spawn).  1 on success, 0 on OOM (dst->ft left NULL).
+uint8_t fd_table_clone(task_files_t* dst, task_files_t* src);
 
 // Fork the current user task.
 // user_rbp/rbx/r12-r15 are the callee-saved registers at the syscall site;

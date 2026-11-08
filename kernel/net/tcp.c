@@ -1,4 +1,5 @@
 #include "tcp.h"
+#include "kprintf.h"   // kprintf_atomic (locked whole-line output for selftest result lines)
 #include "ipv4.h"
 #include "eth.h"
 #include "net.h"
@@ -11,10 +12,16 @@
 #include "vfs.h"
 #include "syscall.h"  // POLLIN / POLLOUT / POLLHUP / POLLERR
 #include "smp.h"
+#include "preempt.h"
 #include "rcu.h"
 
 // ── TCP constants ─────────────────────────────────────────────────────────
 #define TCP_RTO_NS        1000000000ULL   // retransmit timeout: 1 second
+// Max SYN-ACK retransmits for a SYN_RCVD half-open before the timer reaps it.
+// At TCP_RTO_NS=1s this is ~6 s of grace before an un-completed, un-accepted
+// half-open is freed -- enough for a slow legitimate client, but it bounds a
+// remote SYN flood (each withheld-final-ACK SYN otherwise leaks ~128 KiB).
+#define TCP_SYN_RCVD_MAX_RETRIES 5u
 #define TCP_MSS           1460u           // max segment size (1500 - 20 IP - 20 TCP)
 #define TCP_WINDOW        65535u          // advertised receive window
 #define TCP_TIME_WAIT_NS  4000000000ULL   // TIME_WAIT: 2×MSL = 4 seconds
@@ -47,6 +54,18 @@ struct tcp_pcb {
 
     // Retransmission.
     uint64_t rto_deadline;  // TSC nanoseconds when oldest unacked segment expires
+    // SYN-ACK retransmit count for a SYN_RCVD half-open.  Incremented by the
+    // timer thread each time the SYN-ACK is resent; past TCP_SYN_RCVD_MAX_RETRIES
+    // an UN-ACCEPTED half-open (sock_file==NULL) is reaped, so a remote SYN that
+    // never completes cannot leak its ~128 KiB forever (a SYN-flood DoS).  Only
+    // the timer thread writes it; no lock needed for the counter itself.
+    uint8_t  rexmit;
+    // Set by the timer reaper UNDER s_pcb_wlock when it claims a half-open for
+    // freeing.  tcp_recv's handshake completion checks it (also under
+    // s_pcb_wlock) and aborts the establish, so a child the reaper is freeing is
+    // never moved to ESTABLISHED / pushed onto an accept queue (no UAF of a
+    // being-reaped child).
+    uint8_t  reaped;
 
     // Send buffer (ring).
     uint8_t* txbuf;
@@ -84,8 +103,16 @@ struct tcp_pcb {
     uint8_t  reset;      // 1 if the connection was aborted by RST
     uint64_t timewait_start; // when TIME_WAIT was entered
 
+    // Serializes the ring accounting (tx/rx used + indices + snd_una) between
+    // the RX kernel thread and the socket syscall path.  See tcp_pcb_lock.
+    spinlock_t lock;
+
     // Intrusive singly-linked list node for s_pcb_head.
     struct tcp_pcb* next;
+    // Transient link used ONLY by the timer reaper to chain claimed half-opens
+    // for a batched free after one RCU grace period.  Separate from `next` so a
+    // concurrent RCU reader still walking `next` is undisturbed by the chaining.
+    struct tcp_pcb* reap_next;
 };
 
 // ── PCB list ──────────────────────────────────────────────────────────────
@@ -101,8 +128,9 @@ struct tcp_pcb {
 static tcp_pcb_t* s_pcb_head   = NULL;
 static spinlock_t s_pcb_wlock  = SPINLOCK_INIT;
 
-// Ephemeral port counter.
-static uint16_t s_eph_port = 49152u;
+// Ephemeral port counter -- atomic so concurrent connect()s on different CPUs
+// each get a distinct port (a plain RMW lost updates -> duplicate local ports).
+static uint32_t s_eph_next = 0u;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -120,6 +148,80 @@ static uint32_t seq32(void) {
 #define SEQ_GT(a,b)  ((int32_t)((a)-(b)) > 0)
 #define SEQ_GE(a,b)  ((int32_t)((a)-(b)) >= 0)
 
+// Consume `n` bytes from the read side of a tx/rx ring: advance *head (masked)
+// and decrement *used, CLAMPING n to *used so an over-consume can never
+// underflow the count.  Single source of truth for both the txbuf ACK drain
+// and the rxbuf read drain.  Defense-in-depth: a raced ACK accounting update
+// (T4 -- snd_una/txbuf_used RMW'd from another CPU with no per-PCB lock yet) or
+// a malformed segment could otherwise make `n` exceed *used, underflowing it to
+// ~4e9 -- which wedges the producer's `while used >= SIZE` wait or drives a wild
+// length.  Clamping bounds the worst case to a transient mis-account.  Pure ->
+// unit-tested (tcp_ring_consume_selftest).  Returns the bytes actually consumed.
+static uint32_t tcp_ring_consume(uint32_t* head, uint32_t* used,
+                                 uint32_t n, uint32_t mask) {
+    if (n > *used) n = *used;            // clamp: never underflow the count
+    *head = (*head + n) & mask;
+    *used -= n;
+    return n;
+}
+
+// Reserve up to `want` bytes on the WRITE side of a tx/rx ring: clamp to the
+// free space (size - *used), set *out_start to the old tail, advance *tail
+// (masked) and *used by the reserved amount, return the amount reserved.  The
+// producer mirror of tcp_ring_consume.  Reserving the index range UNDER the
+// per-PCB lock and copying the payload into [out_start, +n) OUTSIDE the lock
+// keeps a user-memory copy out of the critical section (no fault under a
+// spinlock) and is multi-producer-safe (disjoint reserved ranges).  Pure ->
+// unit-tested (tcp_ring_reserve_selftest).
+static uint32_t tcp_ring_reserve(uint32_t* tail, uint32_t* used, uint32_t want,
+                                 uint32_t size, uint32_t mask, uint32_t* out_start) {
+    uint32_t space = size - *used;       // invariant: *used <= size
+    uint32_t n     = want < space ? want : space;
+    *out_start = *tail;
+    *tail = (*tail + n) & mask;
+    *used += n;
+    return n;
+}
+
+// ── Per-PCB lock ───────────────────────────────────────────────────────────
+// Serializes the send/receive ring accounting (txbuf_used / rxbuf_used + the
+// head/tail indices + snd_una) between the RX path (the net RX kernel thread)
+// and the socket syscall path (send/recv on user CPUs).  RX runs in a kernel
+// thread (the virtio_net IRQ only irq_notify's; it is never an IRQ handler),
+// so a plain spinlock under preempt_disable is sufficient -- NO irqsave (the
+// F35 pattern).  LEAF lock: held ONLY around the field mutations; pcb_wake
+// (rq_lock), tcp_send_segment (I/O), the user payload copy, and sched_sleep all
+// stay OUTSIDE it.  NOTE (T4 remaining): snd_nxt (advanced by tcp_send_segment
+// while it also does I/O) and the state-machine transitions are NOT yet under
+// this lock -- those are single-writer-dominant and benign-read races, a
+// separate follow-up; this lock closes the documented ring-accounting race.
+static inline void tcp_pcb_lock(tcp_pcb_t* pcb)   { preempt_disable(); spin_lock(&pcb->lock); }
+static inline void tcp_pcb_unlock(tcp_pcb_t* pcb) { spin_unlock(&pcb->lock); preempt_enable(); }
+
+// ── Listener accept-queue ring (single source of truth) ────────────────────
+// The completed-connection FIFO on a LISTEN pcb: the RX kernel thread enqueues
+// a child that finished its handshake (SYN_RCVD -> ESTABLISHED) while accept()
+// on a user CPU dequeues -- so accept_head/accept_tail/accept_count race and
+// the uint8_t count can tear (lost child, double-dequeue).  These two helpers
+// are the ONLY mutators of the ring; the CALLER must hold the LISTENER's
+// pcb->lock around them (the queue belongs to the listener, so it is a single
+// lock -- no child<->listener two-lock cycle).  accept_q_push returns false if
+// the backlog is full (the child is dropped, as before).
+static bool accept_q_push(tcp_pcb_t* lst, tcp_pcb_t* child) {
+    if (lst->accept_count >= TCP_BACKLOG) return false;     // full -> drop
+    lst->accept_queue[lst->accept_tail] = child;
+    lst->accept_tail = (uint8_t)((lst->accept_tail + 1u) % TCP_BACKLOG);
+    lst->accept_count++;
+    return true;
+}
+static tcp_pcb_t* accept_q_pop(tcp_pcb_t* lst) {
+    if (lst->accept_count == 0) return NULL;                 // empty
+    tcp_pcb_t* child = lst->accept_queue[lst->accept_head];
+    lst->accept_head = (uint8_t)((lst->accept_head + 1u) % TCP_BACKLOG);
+    lst->accept_count--;
+    return child;
+}
+
 // Wake any task blocked on this PCB: the blocking waiter (in recv/send/
 // connect/accept) and any poll()/select() waiter camped on the socket fd.
 // Both are fire-and-forget — a blocking task might be sleeping in recv
@@ -131,8 +233,12 @@ static void pcb_wake(tcp_pcb_t* pcb) {
         pcb->waiter = NULL;
         sched_wake(t);
     }
-    if (pcb->sock_file) {
-        vfs_file_t* f = (vfs_file_t*)pcb->sock_file;
+    void* sf = __atomic_load_n(&pcb->sock_file, __ATOMIC_ACQUIRE);
+    if (sf) {
+        // sf is the socket's vfs_file_t.  This wake runs inside the tcp_recv /
+        // tcp_timer_tick rcu_read_lock section, and sock_close defers the file
+        // free to sock_free_rcu, so f outlives this reader -- no UAF write.
+        vfs_file_t* f = (vfs_file_t*)sf;
         wait_queue_wake_all(f->waitq);
     }
 }
@@ -165,16 +271,8 @@ static int tcp_send_segment(tcp_pcb_t* pcb, uint8_t flags,
     }
 
     // Compute TCP checksum.
-    uint32_t pseudo = inet_pseudo_partial(pcb->local_ip, pcb->remote_ip,
-                                           IPPROTO_TCP,
-                                           (uint16_t)(TCP_HDR_MIN_LEN + dlen));
-    const uint16_t* pw = (const uint16_t*)h;
-    uint32_t sum = pseudo;
-    uint16_t l = TCP_HDR_MIN_LEN + dlen;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    if (l) sum += *(const uint8_t*)pw;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    h->checksum = (uint16_t)~sum;
+    h->checksum = transport_checksum(pcb->local_ip, pcb->remote_ip, IPPROTO_TCP,
+                                     h, (uint16_t)(TCP_HDR_MIN_LEN + dlen));
 
     // Advance snd_nxt (SYN and FIN each consume one sequence number).
     if (flags & (TCP_SYN | TCP_FIN)) pcb->snd_nxt++;
@@ -187,6 +285,32 @@ static int tcp_send_segment(tcp_pcb_t* pcb, uint8_t flags,
     int r = ipv4_send(skb, pcb->remote_ip, IPPROTO_TCP);
     skb_free(skb);
     return r;
+}
+
+// PRIMITIVE (tx-ring no-wrap chunk).  Bytes of a [off, off+len) span that lie
+// BEFORE the TCP_TXBUF_SIZE ring wrap -- the largest prefix tcp_send_segment can
+// flat-memcpy without reading past the 64 KiB txbuf.  off is a masked ring index
+// (0..TCP_TXBUF_SIZE-1), so off + return <= TCP_TXBUF_SIZE always.  The caller
+// sends this many bytes from `off`, then the remaining (len - this) from offset 0.
+// Pure -> unit-tested (tcp_tx_first_chunk_selftest).
+static inline uint32_t tcp_tx_first_chunk(uint32_t off, uint32_t len) {
+    uint32_t to_end = TCP_TXBUF_SIZE - off;   // off < TCP_TXBUF_SIZE -> to_end >= 1
+    return len <= to_end ? len : to_end;
+}
+
+// Send up to `len` bytes of buffered TX data starting at txbuf ring offset `off`,
+// splitting at the ring wrap so tcp_send_segment's flat memcpy NEVER reads past
+// the 64 KiB txbuf.  A span that crossed the wrap (off + len > TCP_TXBUF_SIZE)
+// used to over-read up to ~TCP_MSS bytes of adjacent kernel heap and transmit it
+// on the wire (remote info-leak) AND drop the wrapped tail.  Emits one segment
+// (no wrap) or two consecutive segments -- snd_nxt advances per segment, so the
+// seq numbers are contiguous.  Callers pass pure-data flags (no SYN/FIN) when len
+// can wrap, so duplicating the flags across a 2-way split is correct.
+static int tcp_send_ring(tcp_pcb_t* pcb, uint8_t flags, uint32_t off, uint32_t len) {
+    uint32_t first = tcp_tx_first_chunk(off, len);
+    int r = tcp_send_segment(pcb, flags, pcb->txbuf + off, (uint16_t)first);
+    if (r < 0 || first == len) return r;
+    return tcp_send_segment(pcb, flags, pcb->txbuf, (uint16_t)(len - first));
 }
 
 // ── Send a RST ────────────────────────────────────────────────────────────
@@ -210,14 +334,8 @@ static void tcp_send_rst(uint32_t src_ip, uint16_t src_port,
     h->checksum = 0;
     h->urgent   = 0;
 
-    uint32_t pseudo = inet_pseudo_partial(src_ip, dst_ip, IPPROTO_TCP,
-                                           TCP_HDR_MIN_LEN);
-    const uint16_t* pw = (const uint16_t*)h;
-    uint32_t sum = pseudo;
-    uint16_t l = TCP_HDR_MIN_LEN;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    h->checksum = (uint16_t)~sum;
+    h->checksum = transport_checksum(src_ip, dst_ip, IPPROTO_TCP,
+                                     h, TCP_HDR_MIN_LEN);
 
     ipv4_send(skb, dst_ip, IPPROTO_TCP);
     skb_free(skb);
@@ -260,15 +378,8 @@ void tcp_recv(skbuff_t* skb) {
     // Verify checksum.
     uint16_t saved = seg->checksum;
     seg->checksum  = 0;
-    uint32_t pseudo = inet_pseudo_partial(skb->src_ip_be, skb->dst_ip_be,
-                                           IPPROTO_TCP, (uint16_t)skb->len);
-    const uint16_t* pw = (const uint16_t*)skb->data;
-    uint32_t sum = pseudo;
-    uint16_t l = (uint16_t)skb->len;
-    while (l > 1) { sum += *pw++; l -= 2; }
-    if (l) sum += *(const uint8_t*)pw;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    uint16_t calc = (uint16_t)~sum;
+    uint16_t calc = transport_checksum(skb->src_ip_be, skb->dst_ip_be,
+                                       IPPROTO_TCP, skb->data, (uint16_t)skb->len);
     seg->checksum = saved;
     if (calc != saved) { skb_free(skb); return; }
 
@@ -341,15 +452,54 @@ void tcp_recv(skbuff_t* skb) {
 
     case TCP_SYN_RCVD:
         if ((flags & TCP_ACK) && ntoh32(seg->ack) == pcb->snd_nxt) {
-            pcb->snd_una = ntoh32(seg->ack);
-            pcb->state   = TCP_ESTABLISHED;
-            // Move to listener's accept queue.
+            // Commit the establish atomically vs the timer half-open reaper: if
+            // the reaper already claimed this half-open (over its SYN-ACK
+            // retransmit cap) it set ->reaped + unlinked it under s_pcb_wlock and
+            // is freeing it -- do NOT establish or queue a child that is being
+            // reaped (that would push a freed pcb onto the accept queue).  The
+            // reaper, also under s_pcb_wlock, observes ESTABLISHED here and skips
+            // it.  The accept_q_push stays under the LISTENER's lock (separate
+            // critical section; no two-lock nesting).
+            int establish = 0;
+            uint64_t wf = spin_lock_irqsave(&s_pcb_wlock);
+            if (!pcb->reaped && pcb->state == TCP_SYN_RCVD) {
+                pcb->snd_una = ntoh32(seg->ack);
+                pcb->state   = TCP_ESTABLISHED;
+                establish = 1;
+            }
+            spin_unlock_irqrestore(&s_pcb_wlock, wf);
+            // Move to listener's accept queue under the LISTENER's lock (it
+            // races accept()'s dequeue); wake accept() OUTSIDE the lock.
             tcp_pcb_t* lst = pcb->listener;
-            if (lst && lst->accept_count < TCP_BACKLOG) {
-                lst->accept_queue[lst->accept_tail] = pcb;
-                lst->accept_tail = (uint8_t)((lst->accept_tail + 1u) % TCP_BACKLOG);
-                lst->accept_count++;
-                pcb_wake(lst);
+            if (establish) {
+                bool queued = false;
+                if (lst) {
+                    tcp_pcb_lock(lst);
+                    queued = accept_q_push(lst, pcb);
+                    tcp_pcb_unlock(lst);
+                }
+                if (queued) {
+                    pcb_wake(lst);
+                } else {
+                    // Accept backlog full (accept_q_push == false) or the listener
+                    // is gone (lst NULLed by its own tcp_pcb_free): this just-
+                    // established child is orphaned -- sock_file == NULL and not on
+                    // any accept queue, so the SYN_RCVD-only half-open reaper never
+                    // matches it and it would leak on s_pcb_head forever (+ its
+                    // ~128 KiB tx/rx rings; a remote peer completing > TCP_BACKLOG
+                    // handshakes faster than accept() drains is a memory DoS).
+                    // Refuse the peer with a RST and free the child via the
+                    // RCU-deferred teardown.  Safe under tcp_recv's rcu_read_lock:
+                    // tcp_pcb_free unlinks + call_rcu-defers, and the code after the
+                    // switch never touches pcb again (just rcu_read_unlock + skb_free),
+                    // so the free lands after this reader section ends.  The reaper
+                    // (SYN_RCVD only) and a concurrent retransmit (handled by the
+                    // ESTABLISHED case, which never re-establishes) cannot double-free it.
+                    tcp_send_rst(pcb->local_ip, pcb->local_port,
+                                 pcb->remote_ip, pcb->remote_port,
+                                 pcb->snd_nxt, pcb->rcv_nxt);
+                    tcp_pcb_free(pcb);
+                }
             }
         }
         break;
@@ -379,17 +529,22 @@ void tcp_recv(skbuff_t* skb) {
         // Process ACK — advance snd_una.
         if ((flags & TCP_ACK) && SEQ_GT(ack, pcb->snd_una) &&
             SEQ_LE(ack, pcb->snd_nxt)) {
+            tcp_pcb_lock(pcb);               // serialize txbuf_used + snd_una vs send()
             uint32_t acked = ack - pcb->snd_una;
-            pcb->txbuf_head  = (pcb->txbuf_head + acked) & TCP_TXBUF_MASK;
-            pcb->txbuf_used -= acked;
+            tcp_ring_consume(&pcb->txbuf_head, &pcb->txbuf_used,
+                             acked, TCP_TXBUF_MASK);
             pcb->snd_una     = ack;
             pcb->snd_wnd     = ntoh16(seg->window);
             if (pcb->snd_una == pcb->snd_nxt) pcb->rto_deadline = 0;
-            pcb_wake(pcb);
+            tcp_pcb_unlock(pcb);
+            pcb_wake(pcb);                   // wake OUTSIDE the lock (takes rq_lock)
         }
 
         // Receive in-order data.
         if (dlen > 0 && seq == pcb->rcv_nxt) {
+            // The payload copy is kernel skbuff -> kernel rxbuf, so it is safe
+            // under the lock; serialize rxbuf_used/tail vs recv().
+            tcp_pcb_lock(pcb);
             uint32_t space = TCP_RXBUF_SIZE - pcb->rxbuf_used;
             uint32_t copy  = dlen < space ? dlen : space;
             for (uint32_t i = 0; i < copy; i++)
@@ -397,7 +552,8 @@ void tcp_recv(skbuff_t* skb) {
             pcb->rxbuf_tail  = (pcb->rxbuf_tail + copy) & TCP_RXBUF_MASK;
             pcb->rxbuf_used += copy;
             pcb->rcv_nxt    += copy;
-            pcb_wake(pcb);
+            tcp_pcb_unlock(pcb);
+            pcb_wake(pcb);                   // wake + ACK OUTSIDE the lock (rq_lock / I/O)
             // Send ACK.
             tcp_send_segment(pcb, TCP_ACK, NULL, 0);
         }
@@ -450,6 +606,8 @@ void tcp_recv(skbuff_t* skb) {
 
 // ── Timer tick ────────────────────────────────────────────────────────────
 
+static void tcp_pcb_free_rcu(void* data);   // defined below; used by the reaper
+
 void tcp_timer_tick(void) {
     uint64_t now = tsc_read_ns();
     // RCU reader section: a concurrent tcp_pcb_free can unlink a pcb we're
@@ -470,7 +628,6 @@ void tcp_timer_tick(void) {
             // dropped it, and connect() hit the caller's timeout.
             uint8_t flags;
             uint32_t rlen = 0;
-            const void* rdata = NULL;
             uint32_t old_nxt = pcb->snd_nxt;
             if (pcb->state == TCP_SYN_SENT) {
                 flags = TCP_SYN;
@@ -478,6 +635,10 @@ void tcp_timer_tick(void) {
             } else if (pcb->state == TCP_SYN_RCVD) {
                 flags = TCP_SYN | TCP_ACK;
                 pcb->snd_nxt = pcb->snd_una;
+                // Count SYN-ACK retransmits of an UN-ACCEPTED half-open so the
+                // reaper below can free it once it exceeds the cap (only the
+                // timer thread writes rexmit -> no lock needed).
+                if (!pcb->sock_file && pcb->rexmit < 255u) pcb->rexmit++;
             } else {
                 // ESTABLISHED / FIN_WAIT / CLOSE_WAIT / ...: resend data.
                 rlen = pcb->snd_nxt - pcb->snd_una;
@@ -485,9 +646,13 @@ void tcp_timer_tick(void) {
                 pcb->snd_nxt = pcb->snd_una;
                 flags = TCP_ACK;
                 if (pcb->fin_sent && rlen == 0) flags |= TCP_FIN;
-                rdata = pcb->txbuf + (pcb->txbuf_head & TCP_TXBUF_MASK);
             }
-            tcp_send_segment(pcb, flags, rdata, (uint16_t)rlen);
+            if (rlen > 0)
+                // Wrap-safe resend from txbuf_head (the oldest unacked byte): the
+                // in-flight span can cross the ring wrap -- tcp_send_ring splits it.
+                tcp_send_ring(pcb, flags, pcb->txbuf_head & TCP_TXBUF_MASK, rlen);
+            else
+                tcp_send_segment(pcb, flags, NULL, 0);
             if (!rlen && !pcb->fin_sent && pcb->state != TCP_SYN_SENT &&
                 pcb->state != TCP_SYN_RCVD)
                 pcb->snd_nxt = old_nxt;
@@ -502,6 +667,47 @@ void tcp_timer_tick(void) {
         }
     }
     rcu_read_unlock();
+
+    // ── Reap SYN_RCVD half-opens past the SYN-ACK retransmit cap ─────────────
+    // A SYN_RCVD child with no socket (never accepted) whose final ACK never
+    // arrives would resend its SYN-ACK forever and never be freed -- an
+    // unbounded remote SYN-flood kernel-memory leak (~128 KiB each).  This MUST
+    // run OUTSIDE the rcu_read_lock above: tcp_pcb_free_rcu is reached via a
+    // grace period, and synchronize_rcu_expedited PANICS if called under a
+    // reader / preempt-disabled.  Claim each victim UNDER s_pcb_wlock (atomic vs
+    // tcp_recv's handshake completion, which sets ESTABLISHED under the same
+    // lock and checks ->reaped): set ->reaped (so a racing establish aborts),
+    // unlink it (leaving its own ->next intact so a concurrent reader walking
+    // ->next is undisturbed), and chain it via ->reap_next.  Then ONE grace
+    // period covers the whole batch before the direct frees.
+    tcp_pcb_t* reap = NULL;
+    uint64_t f = spin_lock_irqsave(&s_pcb_wlock);
+    tcp_pcb_t* prev = NULL;
+    for (tcp_pcb_t* p = s_pcb_head; p; ) {
+        tcp_pcb_t* pn = p->next;
+        if (p->state == TCP_SYN_RCVD && !p->sock_file &&
+            p->rexmit > TCP_SYN_RCVD_MAX_RETRIES) {
+            p->reaped = 1;
+            if (prev) rcu_assign_pointer(prev->next, pn);
+            else      rcu_assign_pointer(s_pcb_head, pn);
+            p->reap_next = reap;   // chain (separate field; ->next left intact)
+            reap = p;
+            // prev unchanged -- p is unlinked
+        } else {
+            prev = p;
+        }
+        p = pn;
+    }
+    spin_unlock_irqrestore(&s_pcb_wlock, f);
+
+    if (reap) {
+        synchronize_rcu_expedited();   // one grace period for the whole batch
+        while (reap) {
+            tcp_pcb_t* nx = reap->reap_next;
+            tcp_pcb_free_rcu(reap);    // grace period elapsed -> free directly
+            reap = nx;
+        }
+    }
 }
 
 // ── Public PCB management ─────────────────────────────────────────────────
@@ -512,6 +718,7 @@ tcp_pcb_t* tcp_pcb_alloc(uint16_t lport) {
 
     // Zero the PCB.
     __builtin_memset(p, 0, sizeof(tcp_pcb_t));
+    spin_lock_init(&p->lock);
     p->local_ip   = net_our_ip();
     p->local_port = lport;
     p->rcv_wnd    = TCP_WINDOW;
@@ -557,6 +764,19 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
     // s_pcb_wlock; the ->next pointer updates are plain stores because
     // readers walk via rcu_dereference which on x86 is a plain load.
     uint64_t flags = spin_lock_irqsave(&s_pcb_wlock);
+    // Orphan any SYN_RCVD child that still points back at `pcb` as its listener.
+    // Once `pcb` is freed below, a child's late handshake-completing ACK would
+    // otherwise read the dangling child->listener and lock + push the accept
+    // queue of freed memory (a remote-timed heap UAF write, tcp_recv's
+    // TCP_SYN_RCVD case).  NULLing the backpointer makes that path skip the dead
+    // listener (its `if (lst)` guard).  No-op when `pcb` is not a listener (no
+    // child references it).  Under s_pcb_wlock (held for the unlink) so it
+    // cannot race a concurrent list alloc/free; a concurrent RX reader that
+    // already loaded the old child->listener is safe because `pcb`'s own free is
+    // RCU-deferred and keeps it alive until that reader drops its rcu section.
+    for (tcp_pcb_t* p = s_pcb_head; p; p = p->next) {
+        if (p->listener == pcb) p->listener = NULL;
+    }
     if (s_pcb_head == pcb) {
         rcu_assign_pointer(s_pcb_head, pcb->next);
     } else {
@@ -568,6 +788,34 @@ void tcp_pcb_free(tcp_pcb_t* pcb) {
         }
     }
     spin_unlock_irqrestore(&s_pcb_wlock, flags);
+
+    // Listener teardown: RST + free every child still queued in the accept
+    // backlog.  A queued child is ESTABLISHED with sock_file == NULL, referenced
+    // ONLY by this accept_queue (its ->listener was just NULLed above), so once
+    // `pcb` is gone nothing else ever collects it -- tcp_accept is unreachable
+    // and the half-open reaper matches SYN_RCVD only -- an unbounded ~128 KiB/
+    // child leak across repeated listen/fill/close (the residual F141's orphan
+    // path did not cover: those were children establishing AFTER the listener
+    // went away; these were queued BEFORE).  Keyed on accept_count (non-zero
+    // only for a listener with queued children, regardless of state -- tcp_close
+    // has already set a closing listener to TCP_CLOSED by here), so a connected-
+    // socket free pays nothing.  Pop under the listener lock (accept_q's required
+    // lock), then RST + free OUTSIDE it so the child's tcp_pcb_free (which takes
+    // s_pcb_wlock) never nests under the listener lock -- matching the establish
+    // path's s_pcb_wlock-then-pcb_lock ordering.  Disjoint from accept() (each
+    // child is popped once under the lock) and from the reaper (SYN_RCVD only),
+    // so no double-free.  RST + RCU-deferred free mirror the F141 orphan dispose.
+    while (pcb->accept_count > 0) {
+        tcp_pcb_lock(pcb);
+        tcp_pcb_t* child = accept_q_pop(pcb);
+        tcp_pcb_unlock(pcb);
+        if (!child) break;   // raced empty (a concurrent accept took the last)
+        tcp_send_rst(child->local_ip, child->local_port,
+                     child->remote_ip, child->remote_port,
+                     child->snd_nxt, child->rcv_nxt);
+        tcp_pcb_free(child);
+    }
+
     // Defer the actual free until every in-flight reader has dropped
     // its reference.  Expedited: close() on a TCP socket releases its
     // PCB here, on the user-syscall return path.
@@ -604,10 +852,10 @@ int tcp_listen(tcp_pcb_t* pcb) {
 }
 
 tcp_pcb_t* tcp_accept(tcp_pcb_t* listener) {
-    if (listener->accept_count == 0) return NULL;
-    tcp_pcb_t* child = listener->accept_queue[listener->accept_head];
-    listener->accept_head = (uint8_t)((listener->accept_head + 1u) % TCP_BACKLOG);
-    listener->accept_count--;
+    // Dequeue under the listener's lock (races the RX thread's accept_q_push).
+    tcp_pcb_lock(listener);
+    tcp_pcb_t* child = accept_q_pop(listener);
+    tcp_pcb_unlock(listener);
     return child;
 }
 
@@ -639,16 +887,23 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock) {
                 return -ENOTCONN;
         }
 
-        uint32_t space = TCP_TXBUF_SIZE - pcb->txbuf_used;
-        uint32_t chunk = len - done;
-        if (chunk > space) chunk = space;
-        if (chunk > TCP_MSS) chunk = TCP_MSS;
-
+        // Reserve a chunk of tx-ring space UNDER the lock (clamps to free
+        // space), then copy the user payload into the reserved range OUTSIDE
+        // the lock: src may be user memory (so the copy must not run under a
+        // spinlock), and the RX ACK path only advances txbuf_head, never the
+        // reserved tail range, so this is safe and multi-producer-correct.
+        uint32_t want = len - done;
+        if (want > TCP_MSS) want = TCP_MSS;
+        uint32_t tail0;
+        tcp_pcb_lock(pcb);
+        uint32_t chunk = tcp_ring_reserve(&pcb->txbuf_tail, &pcb->txbuf_used,
+                                          want, TCP_TXBUF_SIZE, TCP_TXBUF_MASK,
+                                          &tail0);
+        tcp_pcb_unlock(pcb);
+        if (chunk == 0) continue;          // raced full -> re-enter the wait loop
         for (uint32_t i = 0; i < chunk; i++)
-            pcb->txbuf[(pcb->txbuf_tail + i) & TCP_TXBUF_MASK] = src[done + i];
-        pcb->txbuf_tail  = (pcb->txbuf_tail + chunk) & TCP_TXBUF_MASK;
-        pcb->txbuf_used += chunk;
-        done            += chunk;
+            pcb->txbuf[(tail0 + i) & TCP_TXBUF_MASK] = src[done + i];
+        done += chunk;
 
         // Send what we just buffered if the send window allows.
         uint32_t sendable = pcb->snd_wnd - (pcb->snd_nxt - pcb->snd_una);
@@ -656,8 +911,9 @@ int tcp_send(tcp_pcb_t* pcb, const void* data, uint32_t len, int nonblock) {
         if (sendable) {
             uint32_t send_off = (pcb->txbuf_head +
                                  (pcb->snd_nxt - pcb->snd_una)) & TCP_TXBUF_MASK;
-            tcp_send_segment(pcb, TCP_ACK | TCP_PSH,
-                              pcb->txbuf + send_off, (uint16_t)sendable);
+            // Wrap-safe: send_off + sendable can cross the ring end; tcp_send_ring
+            // splits the read so the flat memcpy never runs past the 64 KiB txbuf.
+            tcp_send_ring(pcb, TCP_ACK | TCP_PSH, send_off, sendable);
         }
     }
     return (int)done;
@@ -668,26 +924,36 @@ int tcp_recv_data(tcp_pcb_t* pcb, void* buf, uint32_t len, int nonblock) {
     if (len == 0) return 0;
     uint8_t* dst = (uint8_t*)buf;
 
-    while (pcb->rxbuf_used == 0) {
-        // Already at EOF — return 0 bytes so the caller sees end-of-stream.
-        if (pcb->fin_rcvd) return 0;
-        if (pcb->reset)    return -ECONNRESET;
-        if (pcb->state == TCP_CLOSED) return -ENOTCONN;
-        if (nonblock)      return -EAGAIN;
-        pcb->waiter = g_current;
-        sched_sleep();
-    }
+    for (;;) {
+        while (pcb->rxbuf_used == 0) {
+            // Already at EOF — return 0 bytes so the caller sees end-of-stream.
+            if (pcb->fin_rcvd) return 0;
+            if (pcb->reset)    return -ECONNRESET;
+            if (pcb->state == TCP_CLOSED) return -ENOTCONN;
+            if (nonblock)      return -EAGAIN;
+            pcb->waiter = g_current;
+            sched_sleep();
+        }
 
-    uint32_t avail = pcb->rxbuf_used;
-    uint32_t copy  = len < avail ? len : avail;
-    for (uint32_t i = 0; i < copy; i++)
-        dst[i] = pcb->rxbuf[(pcb->rxbuf_head + i) & TCP_RXBUF_MASK];
-    pcb->rxbuf_head  = (pcb->rxbuf_head + copy) & TCP_RXBUF_MASK;
-    pcb->rxbuf_used -= copy;
-    pcb->rcv_wnd    += copy;
-    // Send window update ACK so the peer can resume sending.
-    tcp_send_segment(pcb, TCP_ACK, NULL, 0);
-    return (int)copy;
+        // Reserve the read range UNDER the lock (snapshot head, advance
+        // head/used via the clamped helper), then copy out to the (possibly
+        // user) dst OUTSIDE the lock.  Multi-consumer-safe: concurrent recv()s
+        // reserve disjoint ranges; the clamp keeps copy <= used.
+        tcp_pcb_lock(pcb);
+        uint32_t avail = pcb->rxbuf_used;
+        if (avail == 0) { tcp_pcb_unlock(pcb); continue; }  // raced empty -> re-wait
+        uint32_t copy  = len < avail ? len : avail;
+        uint32_t head0 = pcb->rxbuf_head;
+        tcp_ring_consume(&pcb->rxbuf_head, &pcb->rxbuf_used, copy, TCP_RXBUF_MASK);
+        pcb->rcv_wnd += copy;
+        tcp_pcb_unlock(pcb);
+
+        for (uint32_t i = 0; i < copy; i++)
+            dst[i] = pcb->rxbuf[(head0 + i) & TCP_RXBUF_MASK];
+        // Send window update ACK so the peer can resume sending.
+        tcp_send_segment(pcb, TCP_ACK, NULL, 0);
+        return (int)copy;
+    }
 }
 
 void tcp_close(tcp_pcb_t* pcb) {
@@ -709,7 +975,21 @@ void tcp_pcb_set_waiter(tcp_pcb_t* pcb, void* waiter) {
 }
 
 void tcp_pcb_set_file(tcp_pcb_t* pcb, void* file) {
-    if (pcb) pcb->sock_file = file;
+    // RELEASE store: (un)publishes the poll backpointer so a pcb_wake reader
+    // either observes the file (and is covered by the file's RCU grace period,
+    // sock_free_rcu) or observes NULL and skips the wake.  Pairs with the
+    // ACQUIRE load in pcb_wake.
+    if (pcb) __atomic_store_n(&pcb->sock_file, file, __ATOMIC_RELEASE);
+}
+
+void tcp_pcb_set_local_port(tcp_pcb_t* pcb, uint16_t port) {
+    // Rebind an ephemeral, CLOSED pcb's local port IN PLACE (socket_bind).  The
+    // pcb is already published on s_pcb_head and has no traffic yet, so an
+    // atomic store retargets demux (pcb_find matches on local_port) without
+    // freeing + reallocating the pcb -- so a sibling socket op derefing s->pcb
+    // can never observe a freed pcb (the bind UAF).  A concurrent demux reader
+    // sees the old or new port; for a CLOSED pcb neither matches a live flow.
+    if (pcb) __atomic_store_n(&pcb->local_port, port, __ATOMIC_RELEASE);
 }
 
 uint32_t tcp_pcb_rx_used(const tcp_pcb_t* pcb) {
@@ -731,7 +1011,304 @@ int tcp_pcb_has_accept(const tcp_pcb_t* pcb) {
 }
 
 uint16_t tcp_ephemeral_port(void) {
-    uint16_t p = s_eph_port;
-    s_eph_port = (uint16_t)(s_eph_port == 65535u ? 49152u : s_eph_port + 1u);
-    return p;
+    // Lock-free: atomic fetch-add hands each caller a distinct index, mapped
+    // into the dynamic/private range [49152, 65535] (16384 ports).  Wrap/reuse
+    // after 16384 outstanding is inherent to ephemeral ports.
+    uint32_t n = __atomic_fetch_add(&s_eph_next, 1u, __ATOMIC_RELAXED);
+    return (uint16_t)(49152u + (n % 16384u));
+}
+
+// ── tcp_ring_consume selftest ─────────────────────────────────────────────
+// Deterministic check of the tx/rx ring drain arithmetic + the underflow
+// clamp that bounds the worst case of the (still-open) T4 PCB data race.
+void tcp_ring_consume_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t head0, used0, n, mask, ehead, eused, eret; } c[] = {
+        // head, used, n, mask=0xFF (256-byte ring) -> expected head/used/ret
+        {   0, 100,  30, 0xFFu,  30,  70, 30 },  // normal drain
+        { 250, 100,  20, 0xFFu,  14,  80, 20 },  // head wraps: (250+20)&255 = 14
+        {   0,  10,  50, 0xFFu,  10,   0, 10 },  // OVER-consume -> clamp to used, no underflow
+        {   5,   5,   5, 0xFFu,  10,   0,  5 },  // exact drain to empty
+        {  64,   0,  17, 0xFFu,  64,   0,  0 },  // already empty -> consume 0, no underflow
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t head = c[i].head0, used = c[i].used0;
+        uint32_t ret = tcp_ring_consume(&head, &used, c[i].n, c[i].mask);
+        if (head != c[i].ehead || used != c[i].eused || ret != c[i].eret) {
+            kprintf_atomic("[tcp_ring] FAIL i=%u head=%lu(want %lu) used=%lu(want %lu) ret=%lu(want %lu)\n",
+                    i, (unsigned long)head, (unsigned long)c[i].ehead,
+                    (unsigned long)used, (unsigned long)c[i].eused,
+                    (unsigned long)ret, (unsigned long)c[i].eret);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[tcp_ring] SELF-TEST FAILED\n"
+                  : "[tcp_ring] SELF-TEST PASSED (ring drain + underflow clamp)\n");
+}
+
+// ── tcp_ring_reserve selftest ─────────────────────────────────────────────
+// Deterministic check of the producer-side ring reserve arithmetic that the
+// per-PCB-lock send/rx-write paths use: the reserved range starts at the old
+// tail, is clamped to the free space (size - used), and advances tail (masked)
+// and used by the reserved amount.  Pairs with tcp_ring_consume_selftest.
+void tcp_ring_reserve_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t tail0, used0, want, size, mask, estart, etail, eused, eret; } c[] = {
+        {   0,   0,  30, 256, 0xFFu,   0,  30,  30, 30 },  // normal reserve
+        { 250,   0,  20, 256, 0xFFu, 250,  14,  20, 20 },  // tail wraps: (250+20)&255 = 14
+        {   0, 250,  50, 256, 0xFFu,   0,   6, 256,  6 },  // clamp to free space (6)
+        { 100, 256,  10, 256, 0xFFu, 100, 100, 256,  0 },  // full -> reserve 0
+        { 200, 200, 100, 256, 0xFFu, 200,   0, 256, 56 },  // wrap + clamp: free = 56
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t tail = c[i].tail0, used = c[i].used0, start = 0xDEADu;
+        uint32_t ret = tcp_ring_reserve(&tail, &used, c[i].want, c[i].size,
+                                        c[i].mask, &start);
+        if (start != c[i].estart || tail != c[i].etail ||
+            used != c[i].eused || ret != c[i].eret) {
+            kprintf_atomic("[tcp_reserve] FAIL i=%u start=%lu tail=%lu used=%lu ret=%lu\n",
+                    i, (unsigned long)start, (unsigned long)tail,
+                    (unsigned long)used, (unsigned long)ret);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[tcp_reserve] SELF-TEST FAILED\n"
+                  : "[tcp_reserve] SELF-TEST PASSED (ring reserve, clamp + wrap)\n");
+}
+
+// ── tx-ring no-wrap chunk selftest ─────────────────────────────────────────
+// Deterministic check that the TX read never crosses the 64 KiB txbuf wrap: for
+// every (off, len) the first chunk stays within [off, TCP_TXBUF_SIZE).  The
+// 65000+1460 / 65535+1460 / 1+65536 rows are exactly the spans whose flat memcpy
+// used to over-read adjacent kernel heap and leak it on the wire.
+void tcp_tx_first_chunk_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    struct { uint32_t off, len, want; } c[] = {
+        { 0,     1460,  1460  },   // start of ring, no wrap
+        { 64000, 1460,  1460  },   // 65536-64000=1536 >= 1460 -> no wrap
+        { 65000, 1460,  536   },   // 65536-65000=536 < 1460 -> clamp (tail 924)
+        { 65535, 1460,  1     },   // worst case: 1 byte before the wrap (tail 1459)
+        { 65535, 1,     1     },   // exactly fills to the ring end
+        { 0,     65536, 65536 },   // full ring from 0, no wrap
+        { 1,     65535, 65535 },   // 65536-1 == len, no wrap
+        { 1,     65536, 65535 },   // 65536-1 < len -> clamp (tail 1)
+        { 100,   0,     0     },   // zero-length
+    };
+    for (unsigned i = 0; i < sizeof(c)/sizeof(c[0]); i++) {
+        uint32_t got = tcp_tx_first_chunk(c[i].off, c[i].len);
+        if (got != c[i].want || (uint64_t)c[i].off + got > TCP_TXBUF_SIZE) {
+            kprintf_atomic("[tcp_txwrap] FAIL off=%u len=%u got=%u want=%u\n",
+                    c[i].off, c[i].len, got, c[i].want);
+            fails++;
+        }
+    }
+    kprintf_atomic(fails ? "[tcp_txwrap] SELF-TEST FAILED\n"
+                  : "[tcp_txwrap] SELF-TEST PASSED (tx-ring read never crosses the 64K wrap)\n");
+}
+
+// ── accept-queue ring selftest ────────────────────────────────────────────
+// Deterministic check of the listener accept-queue push/pop ring (now taken
+// under the listener's pcb->lock at both the RX enqueue and accept() dequeue):
+// FIFO order, full-rejects, empty->NULL, and wrap-around across the modulo.
+// Uses a kmalloc'd fake listener and distinct non-NULL marker pointers (never
+// dereferenced -- only compared for identity).
+void tcp_accept_q_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst = (tcp_pcb_t*)kmalloc(sizeof(tcp_pcb_t));
+    if (!lst) { kprintf_atomic("[tcp_accept] SELF-TEST SKIP (no mem)\n"); return; }
+    __builtin_memset(lst, 0, sizeof(*lst));     // head = tail = count = 0
+    tcp_pcb_t* mark[TCP_BACKLOG];
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        mark[i] = (tcp_pcb_t*)(uintptr_t)(0x1000u + i);  // identity-only markers
+
+    if (accept_q_pop(lst) != NULL) { kprintf_atomic("[tcp_accept] FAIL pop empty\n"); fails++; }
+
+    // Fill to the backlog; one more must be rejected.
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        if (!accept_q_push(lst, mark[i])) { kprintf_atomic("[tcp_accept] FAIL push %u\n", i); fails++; }
+    if (lst->accept_count != TCP_BACKLOG) { kprintf_atomic("[tcp_accept] FAIL count\n"); fails++; }
+    if (accept_q_push(lst, mark[0]))      { kprintf_atomic("[tcp_accept] FAIL push full\n"); fails++; }
+
+    // Drain in FIFO order to empty.
+    for (unsigned i = 0; i < TCP_BACKLOG; i++)
+        if (accept_q_pop(lst) != mark[i]) { kprintf_atomic("[tcp_accept] FAIL FIFO %u\n", i); fails++; }
+    if (lst->accept_count != 0 || accept_q_pop(lst) != NULL) {
+        kprintf_atomic("[tcp_accept] FAIL drained\n"); fails++; }
+
+    // Wrap-around: push+pop many times past the modulo boundary, stays FIFO.
+    for (unsigned r = 0; r < TCP_BACKLOG * 3u; r++) {
+        if (!accept_q_push(lst, mark[r % TCP_BACKLOG]) ||
+            accept_q_pop(lst) != mark[r % TCP_BACKLOG]) {
+            kprintf_atomic("[tcp_accept] FAIL wrap r=%u\n", r); fails++; }
+    }
+    if (lst->accept_count != 0) { kprintf_atomic("[tcp_accept] FAIL wrap count\n"); fails++; }
+
+    kfree(lst);
+    kprintf_atomic(fails ? "[tcp_accept] SELF-TEST FAILED\n"
+                  : "[tcp_accept] SELF-TEST PASSED (accept-queue ring: FIFO, full, empty, wrap)\n");
+}
+
+// Deterministic test of the listener->child orphaning (the child->listener UAF
+// fix): freeing a listener PCB must NULL the ->listener backpointer of every
+// SYN_RCVD child on the live list (so the child's later handshake ACK skips the
+// freed listener), and freeing an UNRELATED pcb must NOT disturb a child.  Uses
+// the real alloc/free path on high test ports; the concurrent late-ACK race is
+// covered by code-proof (RCU keeps a concurrent reader's listener alive).
+void tcp_listener_orphan_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst   = tcp_pcb_alloc(0xFFFE);
+    tcp_pcb_t* child = tcp_pcb_alloc(0xFFFE);
+    if (!lst || !child) {
+        if (lst)   tcp_pcb_free(lst);
+        if (child) tcp_pcb_free(child);
+        kprintf_atomic("[tcp_orphan] SELF-TEST SKIP (no mem)\n");
+        return;
+    }
+    lst->state      = TCP_LISTEN;
+    child->state    = TCP_SYN_RCVD;
+    child->listener = lst;
+
+    // 1. Freeing the listener clears the child's backpointer.
+    tcp_pcb_free(lst);
+    if (child->listener != NULL) {
+        fails++;
+        kprintf_atomic("[tcp_orphan] FAIL child->listener not cleared on listener free\n");
+    }
+
+    // 2. Freeing an UNRELATED pcb must NOT clear a child's backpointer, and the
+    //    matching listener free must.
+    tcp_pcb_t* lst2  = tcp_pcb_alloc(0xFFFD);
+    tcp_pcb_t* other = tcp_pcb_alloc(0xFFFC);
+    if (lst2 && other) {
+        child->listener = lst2;
+        tcp_pcb_free(other);                    // unrelated -> must not touch child
+        if (child->listener != lst2) {
+            fails++;
+            kprintf_atomic("[tcp_orphan] FAIL unrelated free cleared child->listener\n");
+        }
+        tcp_pcb_free(lst2);                      // matching -> must clear
+        if (child->listener != NULL) {
+            fails++;
+            kprintf_atomic("[tcp_orphan] FAIL second listener free did not clear\n");
+        }
+    } else {
+        if (lst2)  tcp_pcb_free(lst2);
+        if (other) tcp_pcb_free(other);
+    }
+
+    tcp_pcb_free(child);   // cleanup
+    kprintf_atomic(fails ? "[tcp_orphan] SELF-TEST FAILED\n"
+                  : "[tcp_orphan] SELF-TEST PASSED (listener free orphans SYN_RCVD children)\n");
+}
+
+// Walk s_pcb_head and report whether `target` is still on it.  Pointer-compare
+// only -- safe even if `target` was just RCU-freed (we never deref it).
+static int tcp_pcb_on_list(tcp_pcb_t* target) {
+    int found = 0;
+    rcu_read_lock();
+    for (tcp_pcb_t* p = rcu_dereference(s_pcb_head); p; p = rcu_dereference(p->next))
+        if (p == target) { found = 1; break; }
+    rcu_read_unlock();
+    return found;
+}
+
+// Verify the SYN_RCVD half-open reaper: a child past the SYN-ACK retransmit cap
+// with NO socket (never accepted) is freed by tcp_timer_tick (so a remote SYN
+// flood cannot leak kernel memory unbounded); a child WITH a socket is never
+// reaped.  Single-threaded, so tcp_timer_tick's reap-pass synchronize_rcu_
+// expedited has no concurrent reader and cannot deadlock.  Robust against the
+// live net_tcp_timer_thread: it reaps the same orphan (same outcome) and never
+// touches the owned child (sock_file != NULL).
+void tcp_synreap_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+
+    // (A) an over-cap SYN_RCVD orphan (sock_file==NULL) gets reaped.
+    tcp_pcb_t* orphan = tcp_pcb_alloc(0xFEED);
+    if (!orphan) { kprintf_atomic("[tcp_synreap] SELF-TEST SKIP (no mem)\n"); return; }
+    orphan->state     = TCP_SYN_RCVD;
+    orphan->sock_file = NULL;
+    orphan->rexmit    = (uint8_t)(TCP_SYN_RCVD_MAX_RETRIES + 1u);   // over the cap
+    tcp_timer_tick();                                               // reap-pass frees it
+    if (tcp_pcb_on_list(orphan)) {
+        fails++;
+        kprintf_atomic("[tcp_synreap] FAIL over-cap orphan not reaped\n");
+        tcp_pcb_free(orphan);   // not reaped -> free so the test does not leak
+    }
+
+    // (B) a SYN_RCVD child WITH a socket is NEVER reaped, even over the cap.
+    tcp_pcb_t* owned = tcp_pcb_alloc(0xFEEE);
+    if (owned) {
+        owned->state     = TCP_SYN_RCVD;
+        owned->sock_file = (void*)owned;      // any non-NULL = "has a socket owner"
+        owned->rexmit    = (uint8_t)(TCP_SYN_RCVD_MAX_RETRIES + 1u);
+        tcp_timer_tick();
+        if (!tcp_pcb_on_list(owned)) {
+            fails++;
+            kprintf_atomic("[tcp_synreap] FAIL child with a socket was reaped\n");
+        } else {
+            owned->sock_file = NULL;
+            tcp_pcb_free(owned);              // cleanup
+        }
+    }
+
+    kprintf_atomic(fails ? "[tcp_synreap] SELF-TEST FAILED\n"
+                  : "[tcp_synreap] SELF-TEST PASSED (over-cap SYN_RCVD half-open reaped, owned child kept)\n");
+}
+
+// Verify the listener-close backlog drain (F158): freeing a listener PCB with
+// queued-but-unaccepted ESTABLISHED children (sock_file == NULL, sitting in the
+// accept_queue) must RST + free EVERY child -- they are referenced ONLY by the
+// queue, so the old tcp_pcb_free (which freed the listener but left the children
+// on s_pcb_head) leaked them.  Builds a full backlog, frees the listener WITHOUT
+// accepting, and asserts the queue drained (accept_count==0) and no child is
+// still on s_pcb_head.  Pointer-compare only (RCU-safe post-free); the listener
+// memory stays valid until its own RCU grace period, so reading accept_count
+// after the free is safe.  Side effect: N RSTs are sent to the children's (zero)
+// remote addresses -- harmless bogus packets, the same dispose the F141 orphan
+// path performs in production.
+void tcp_listener_drain_selftest(void) {
+    extern void kprintf(const char*, ...);
+    int fails = 0;
+    tcp_pcb_t* lst = tcp_pcb_alloc(0xFFFB);
+    if (!lst) { kprintf_atomic("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    lst->state = TCP_LISTEN;
+
+    tcp_pcb_t* kids[TCP_BACKLOG];
+    unsigned n = 0;
+    for (unsigned i = 0; i < TCP_BACKLOG; i++) {
+        tcp_pcb_t* c = tcp_pcb_alloc(0xFFFB);
+        if (!c) break;
+        c->state     = TCP_ESTABLISHED;
+        c->sock_file = NULL;
+        c->listener  = lst;
+        tcp_pcb_lock(lst);
+        bool q = accept_q_push(lst, c);
+        tcp_pcb_unlock(lst);
+        if (!q) { tcp_pcb_free(c); break; }
+        kids[n++] = c;
+    }
+    if (n == 0) { tcp_pcb_free(lst); kprintf_atomic("[tcp_lstdrain] SELF-TEST SKIP (no mem)\n"); return; }
+    if (lst->accept_count != n) {
+        kprintf_atomic("[tcp_lstdrain] FAIL count %u != %u\n", lst->accept_count, n); fails++;
+    }
+
+    // Free the listener WITHOUT accepting -> the drain must RST + free every child.
+    tcp_pcb_free(lst);
+
+    if (lst->accept_count != 0) {
+        kprintf_atomic("[tcp_lstdrain] FAIL backlog not drained (%u left)\n", lst->accept_count); fails++;
+    }
+    for (unsigned i = 0; i < n; i++)
+        if (tcp_pcb_on_list(kids[i])) {
+            kprintf_atomic("[tcp_lstdrain] FAIL child %u leaked on s_pcb_head\n", i); fails++;
+        }
+
+    kprintf_atomic(fails ? "[tcp_lstdrain] SELF-TEST FAILED\n"
+                  : "[tcp_lstdrain] SELF-TEST PASSED (listener close drains + frees queued ESTABLISHED children)\n");
 }
