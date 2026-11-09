@@ -1,78 +1,94 @@
 # MakaOS
 
-A 64-bit hobby operating system for x86-64, built from scratch — from the UEFI
-bootloader up through a 4-way SMP kernel, a custom libc, and a ported
-wlroots/Wayland desktop stack, all booted and tested in QEMU.
+> [!CAUTION]
+> ## MakaOS is a hobby OS. It is NOT usable, and it is NOT secure.
+>
+> MakaOS is a learning project. It is not an operating system you can use for anything
+> real, and it is deliberately not hardened. Run it only inside QEMU, and never give it
+> a network or data you care about.
+>
+> - **No exploit mitigations worth the name:** no ASLR, no KASLR, no SMAP, no kernel
+>   W^X, and `mprotect` silently does nothing.
+> - **Accounts are a toy:** passwords are stored in plaintext (`root` / `toor`), and
+>   `chmod`/`chown` don't store anything.
+> - **Many syscalls fake success**, and the pledge sandbox allows anything it doesn't
+>   list.
+> - **Known holes are open:** the security audit (`docs/AUDIT_FINDINGS.md`) still lists
+>   33 open findings, including sandbox escapes and local denial of service.
+> - **It is not Linux:** its syscall ABI is its own, so Linux programs don't run on it
+>   directly.
+>
+> Nothing here comes with any guarantee. Treat every "works" in this repository as "worked
+> in QEMU on the author's machine".
 
-## Features
+A 64-bit hobby operating system for x86-64, written from scratch: a UEFI bootloader, an
+SMP kernel, a custom libc, and its own userland (about 101,000 lines of C and assembly),
+plus ported software such as bash, a sway/wlroots desktop, Mesa, SDL and OpenJDK.
 
-**Boot**
-- UEFI/OVMF boot (`boot/uefi`): a `BOOTX64.EFI` (clang COFF) collects the E820
-  memory map and GOP framebuffer, installs a higher-half mapping, and hands off
-  to the kernel. UEFI is the only boot path.
+**[docs/FEATURES.md](docs/FEATURES.md)** lists everything it can do, kernel internals
+included, each item with its evidence and an honest status (verified, implemented,
+partial, stub, not built, missing).
 
-**Kernel** (`kernel/`)
-- 4-way **SMP**: per-CPU runqueues, an MLFQ scheduler over a Chase-Lev
-  work-stealing deque, RCU, and lock-minimized hot paths.
-- Memory: buddy-allocator PMM with per-CPU magazines, VMM with demand paging,
-  copy-on-write `fork`, per-process VMAs, and a slab + kernel-heap allocator.
-- Ring-3 userspace: ELF64 loader, `syscall`/`sysret` fast path, per-process
-  kernel stacks via TSS, real TLS (`%fs`), futexes, and kernel-owned thread
-  join — enough to run pthreads-heavy programs.
-- ~118 syscalls with Linux-style `-errno` returns, including POSIX signals,
-  `pipe`, `dup`/`fcntl`, `epoll`/`eventfd`/`timerfd`/`signalfd`, `io_uring`,
-  and Unix-domain sockets with `SCM_RIGHTS`.
-- Drivers: PCI, IRQ-driven AHCI, NVMe, virtio-gpu (DRM/KMS), virtio-net,
-  virtio-input (absolute tablet), Intel HD Audio, and PS/2 keyboard + mouse.
-- Networking: an ARP / IPv4 / UDP / TCP stack over virtio-net.
-- Filesystems: ext2 (read **and** write) behind a small VFS, with pollable
-  `/dev` character devices.
+## Highlights
 
-**Userspace** (`userland/`)
-- A from-scratch libc (System V AMD64 ABI) with TLS, pthreads, and a `__thread`
-  `errno`; **bash 5.2** runs as `/bin/sh`.
-- A POSIX conformance suite (`test_posix1`, 156 assertions) plus assorted apps,
-  including a DOOM port.
+- **Boot:** UEFI only (`boot/uefi`): a clang-built `BOOTX64.EFI` hands the memory map,
+  framebuffer and ACPI tables to a higher-half kernel.
+- **Kernel:** SMP (4 CPUs in QEMU) with per-CPU run queues on Chase-Lev work-stealing
+  deques, RCU, a buddy + per-CPU + slab allocator stack, demand paging and copy-on-write
+  `fork`, real TLS, futexes, signals with `SA_SIGINFO`, sessions and job control, and a
+  dynamic loader (static PIE + `dlopen`). 119 syscalls in its own numbering, including
+  `epoll`, `io_uring`, `eventfd`/`timerfd`/`signalfd`, and Unix sockets with
+  `SCM_RIGHTS`.
+- **Drivers:** PCI, AHCI, NVMe, virtio-gpu (DRM/KMS, virgl 3D), virtio-net,
+  virtio-input, Intel HDA, PS/2.
+- **Networking:** ARP / IPv4 / UDP / TCP / DHCP / DNS, plus TLS through mbedTLS.
+- **Filesystems:** ext2 (read and write) behind a VFS with dentry and inode caches.
+- **Userland:** a from-scratch libc with pthreads; bash 5.2 as `/bin/sh`.
+- **Ported software** (built separately, see `docs/DESKTOP.md`): sway, foot, swaybg,
+  tofi, Mesa (virgl), SDL2/3, GLFW, DarkPlaces (Quake), OpenJDK 17 (Zero), Avian, LWJGL.
 
-**Desktop** (upstream ports, not custom code)
-- A wlroots-0.18 stack cross-compiled and run on the kernel's
-  virtio-gpu/DRM + libinput path: the **sway** compositor, **foot** terminal,
-  **swaybg** wallpaper, **tofi** launcher, and `wlr-randr`, with an absolute
-  virtio-tablet pointer. Actively being stabilized — see `docs/`.
+## Building and running
+
+Full guide: **[docs/BUILDING.md](docs/BUILDING.md)**. Booting needs x2APIC: either KVM,
+or QEMU 9.0 or newer in software emulation (slower). Building needs neither.
+
+Quickest path, kernel + login + shell, no cross-compiler (under a minute):
+
+```sh
+MINIMAL=1 NO_QEMU=1 bash build.sh
+./run.sh
+```
+
+Full build:
+
+```sh
+bash scripts/build-toolchain.sh   # once, builds the x86_64-pc-makaos cross-compiler
+NO_QEMU=1 bash build.sh
+./run.sh
+```
+
+Log in as `root` / `toor`.
 
 ## Repository layout
 
 ```
-boot/           UEFI bootloader (boot/uefi -> BOOTX64.EFI)
-kernel/         mm, proc/sched, syscalls, signals, VFS/ext2, net stack,
-                drivers (AHCI / NVMe / virtio-gpu/-net/-input / HDA / PS-2)
-userland/       libc, pthreads, and apps; bash as /bin/sh
-scripts/        Cross-toolchain + upstream-port build scripts (port-*.sh)
-docs/           Architecture, SMP design, lock inventory, session notes
-build.sh        Build the sysroot and assemble the ext2 disk image
-run.sh          Boot the image in QEMU (UEFI/OVMF, virtio-gpu + SDL display)
+boot/uefi/      UEFI bootloader (BOOTX64.EFI)
+kernel/         arch, mm, proc (scheduler, signals), syscall, fs, net, drivers,
+                acpi, time, io, security, crypto, debug
+userland/       libc, apps (one directory per program), compat/linux shims, entry stub
+scripts/        cross-toolchain, port scripts (port-*.sh), run helpers
+docs/           build guide, feature inventory, design docs, audit and session logs
+build.sh        builds everything and assembles build/disk.img
+build_bash.sh   cross-builds bash 5.2 (called by build.sh)
+run.sh          boots the image in QEMU (KVM, OVMF, SDL window)
 ```
 
-Engineering rules live in `PRINCIPLES.md`, `CODE_STYLE.md`, `MAKAOS.md`,
-`DEBUGGING.md`, and `DO_NOT_TOUCH.md`; `CLAUDE.md` indexes them.
-
-## Building and running
-
-Prerequisites: the cross toolchain built by `scripts/build-toolchain.sh`, plus
-`qemu-system-x86_64`, `e2fsprogs` (`mkfs.ext2`, `debugfs`), OVMF, and `nasm`.
-
-```sh
-bash build.sh   # build + assemble build/disk.img
-./run.sh        # boot it in QEMU (UEFI/OVMF, SDL window)
-```
-
-QEMU exposes a GDB stub on `tcp::1234`; the kernel ELF carries DWARF, so
-`gdb build/kernel.elf` then `target remote :1234` attaches.
+Engineering rules: `PRINCIPLES.md`, `CODE_STYLE.md`, `MAKAOS.md`, `DEBUGGING.md` and
+`DO_NOT_TOUCH.md`.
 
 ## Status
 
-In active development and unmistakably a learning project — but a substantial
-one. It boots under QEMU (TCG and KVM), runs bash and multithreaded userland,
-brings up a Wayland compositor, and drives real input/audio/network/storage
-devices. Rough edges remain: the desktop's client-presentation path and a few
-subsystems are still being hardened.
+In active development, and a learning project first. It has booted in QEMU with KVM to a
+login prompt, run bash and multithreaded programs, brought up the sway desktop, and run
+Java and Quake. Large parts are partial or missing: see the "Known not working or
+missing" section of `docs/FEATURES.md`.
