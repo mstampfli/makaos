@@ -60,7 +60,7 @@ DOOMGENERIC_DIR="$DOOM_DIR/doomgeneric"
 
 if [ ! -d "$DOOMGENERIC_DIR" ] || [ -z "$(ls -A "$DOOMGENERIC_DIR" 2>/dev/null)" ]; then
     echo "[+] Initialising doomgeneric submodule..."
-    git -c http.sslVerify=false submodule update --init || \
+    git submodule update --init || \
         echo "[!] submodule init failed — place doomgeneric at $DOOMGENERIC_DIR manually"
 fi
 
