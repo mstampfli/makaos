@@ -483,7 +483,7 @@ PHASE9_HANDOFF.md and SMP_KNOWN_RACES.md files cited below were deleted in
 - 9-8 ⏳ multi-CPU soak: `stress -c 4`, per-process DOOM, cross-CPU
           signals, cleanup of any "Phase 9 TODO" comments.  Not formally
           done; the June 2026 bughunt fixed many SMP races found under
-          load instead (see docs/AUDIT_FINDINGS.md, docs/AUTOFIX_LOG.md).
+          load instead (see docs/AUDIT_FINDINGS.md).
 
 ---
 

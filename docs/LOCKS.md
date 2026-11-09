@@ -122,7 +122,8 @@ per-CPU allocator magazines (slab) + pcp (buddy order-0).  Fast
 paths never touch it; refill/drain hit it ~1 in 16–32 allocs after
 warmup.  Measured cross-CPU hit rate: 99.99 % (Phase 4H self-test).
 
-**History:** see `docs/PHASE4_REDESIGN.md` for the full design.
+**History:** the full design was in `docs/PHASE4_REDESIGN.md`, removed on 2026-11-09
+(`git show 6e92687:docs/PHASE4_REDESIGN.md`).
 
 ---
 
@@ -362,7 +363,7 @@ per-inode entry under Phase 8 below does describe the current code.
   completion instead of sleeping when called under it (b1dd61a); the
   same holds for the per-group `s_group_locks[g]` in block/inode
   allocation. This breaks rule 3 (tight critical section) and is
-  recorded in `docs/SCALABILITY_DEBT.md`. The seqlock SEQUENCE is bumped odd ONLY by
+  was recorded in the removed `docs/SCALABILITY_DEBT.md` (in git history). The seqlock SEQUENCE is bumped odd ONLY by
   `inode_pub_begin`/`inode_pub_end` around the brief in-memory publish of
   `leaf->inode` -- NEVER across I/O. Reads (`irtree_get`) are a seqlock
   retry inside `rcu_read_lock`. F135: holding the sequence odd across the
@@ -568,7 +569,7 @@ kthread, so they never contend it.
 | 1 | 0 | 0 |
 | 2 | 1 (pid_ht writer) | 1 |
 | 3 | 0 (all lock-free) | 1 |
-| 4 | 1 global g_pmm_lock (temporary until redesign lands — see PHASE4_REDESIGN.md) | 2 |
+| 4 | 1 global g_pmm_lock (temporary until the Phase 4 redesign landed) | 2 |
 | 5 | 1 per-CPU rq_lock (MAX_CPUS=64 instances but 1 design entry) | 3 |
 | 6 | 8 writer-only (arp / udp / unix-ns / shmem-ns / tcp-pcb / 3×task_idx) + 1 epoll-per-fd | ~11 |
 | 7 | 0 (seqlocks) | ~11 |
@@ -643,7 +644,7 @@ Per-object or per-group:
   submission queue tail (guards same-CPU preemption, not contention).
 - `pty_t.master_lock` (`kernel/drivers/tty/pty.h`) -- pty master ring.
 - `tty_t.lock` (`kernel/drivers/tty/tty.h`) -- line discipline and termios
-  (see `tty_set_termios` in `docs/PRIMITIVES.md`).
+  (see `tty_set_termios`).
 - `wait_queue_t.remove_lock` (`kernel/include/wait.h`) -- `wq_remove` only.
 - `io_uring_t.fixed_files_lock`, `.overflow_lock`, `.cq_lock`
   (`kernel/io/io_uring.h`).

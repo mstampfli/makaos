@@ -4,8 +4,8 @@ How to diagnose bugs in MakaOS and systems-level C/NASM code.
 
 **Strong defaults.** Deviations require justification.
 
-Companion to `CODE_STYLE.md` (how code looks), `PRINCIPLES.md` (how
-code is built), and `MAKAOS.md` (project-specific context).
+How to boot and attach a debugger is in `docs/BUILDING.md`; this file
+describes the kernel's own debugging facilities and how to use them.
 
 ### What exists today
 
@@ -55,8 +55,7 @@ The canonical loop:
    What subsystem? What state?
 4. **Attach GDB.** Confirm or refute the hypothesis. Look at
    registers, the stack, the data structures.
-5. **Fix the root cause.** Not the symptom. See `PRINCIPLES.md §2` —
-   no hacks.
+5. **Fix the root cause.** Not the symptom; no hacks.
 6. **Add a test** (self-test or integration) that would have caught
    it. The bug escaped the existing tests; the tests need to grow.
 
@@ -89,8 +88,7 @@ Every log line carries:
   scan visually.
 - **CPU id:** `CPU0`, `CPU1`, etc. Non-optional on SMP.
 - **Subsystem tag:** the subsystem emitting the log (`sched`, `ext2`,
-  `pipe`, `svcmgr`, `vm`). Matches the function prefix convention
-  from `CODE_STYLE.md §2`.
+  `pipe`, `svcmgr`, `vm`). Matches the subsystem's function prefix.
 - **Level:** `DEBUG`, `INFO`, `WARN`, `ERR`, `CRIT`. Uppercase.
 
 ### 2.2 Levels
@@ -239,8 +237,8 @@ TRACE_POINT(sched_switch, pid_t prev, pid_t next)
 Fixed-size circular buffer of structured events. Lock-free per-CPU
 ring, drained or dumped on demand.
 
-- **Per-CPU** — avoids cross-CPU cache-line ping-pong on hot paths.
-  See `PRINCIPLES.md §5.3` on false sharing.
+- **Per-CPU** -- avoids cross-CPU cache-line ping-pong (false sharing)
+  on hot paths.
 - **Fixed-size entries** — no variable-length allocation on the hot
   path.
 - **Dumped on panic** as part of the panic output.
@@ -403,7 +401,7 @@ monitor can still read it physically.
 ### 7.2 Rules
 
 - **Assert internal invariants, not external input.** External
-  input gets validated and returns an error (see `PRINCIPLES.md §4`).
+  input gets validated and returns an error.
   An assert firing means the code is wrong — not the caller.
 - **Assert messages are informative.** Include the value or the
   context, not just the condition:
@@ -448,7 +446,7 @@ Where feasible, compile debug builds with:
 
 - **UBSan** — undefined behavior (signed overflow, misaligned
   access, shift out of range, etc.). Essentially free and catches
-  real bugs. See `PRINCIPLES.md §4.4`.
+  real bugs.
 - **AddressSanitizer / KASAN-style shadow memory** — out-of-bounds
   and use-after-free. Expensive but invaluable for tracking down
   silent corruption.

@@ -12,6 +12,10 @@ This file is a historical log written June-July 2026 on the `bughunt` branch
 claim that MakaOS is secure. MakaOS is a hobby kernel and is NOT secure: the
 audit below is incomplete, and re-verification found new gaps (listed below).
 
+Entries below cite `docs/AUTOFIX_LOG.md`, `docs/SCALABILITY_DEBT.md`,
+`docs/PRIMITIVES.md` and session logs. Those files were removed on 2026-11-09 and
+are in the git history, for example `git show 6e92687:docs/AUTOFIX_LOG.md`.
+
 Method: every finding entry (each heading, bullet and lettered sub-finding; 281
 status entries, some are cross-references to the same fix) was checked against
 the code on main by reading the cited function or the named fix helper/guard.

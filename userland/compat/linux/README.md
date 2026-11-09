@@ -21,9 +21,9 @@ provides that API lives **here**, in one place — never injected per-port.
 
 3. **Backed by native MakaOS features, not faked.** A shim translates the Linux
    API to a real native MakaOS mechanism (a kernel subsystem, a syscall). When
-   the native feature does not exist yet, the shim may be a **documented stub —
-   but the stub lives HERE**, and the missing native feature is recorded in
-   `docs/SCALABILITY_DEBT.md` with the path to the real implementation. As the
+   the native feature does not exist yet, the shim may be a **documented stub,
+   but the stub lives HERE**, and the missing native feature is noted in the
+   table below. As the
    native feature lands, the shim becomes a thin real client without moving.
 
 4. **This is not a Linux binary personality.** These shims are for *source*
@@ -53,6 +53,6 @@ compat/linux/<library>/*.h   # the shim's public header(s), if it ships any
 | mtdev | MT protocol A→B | (kernel emits B natively) | ledger #10 |
 | libiconv | charset conversion | real converter / port | ledger #15 |
 
-See `docs/SCALABILITY_DEBT.md` for each stub's path to a real, general
-implementation. The convergent native features are a **device registry**
+The "ledger #N" entries refer to `docs/SCALABILITY_DEBT.md`, removed on 2026-11-09
+(`git show 6e92687:docs/SCALABILITY_DEBT.md`). The convergent native features are a **device registry**
 (libudev + libdrm enumeration) and a **capability/session broker** (libseat).
