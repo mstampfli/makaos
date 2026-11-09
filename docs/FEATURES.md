@@ -349,7 +349,7 @@ MakaOS is not secure. No security audit has been done. KSEC.md and docs/SECURITY
 
 ### Implemented
 - Users and credentials (ruid/euid/suid, gids, 32 supplementary groups, down-only setuid family): implemented.
-- File permission checks from mode bits: verified (34e1c6b). But chmod and chown are fake (section 4), and files are always created 0644.
+- File permission checks from mode bits: verified (34e1c6b; `vfs_check_perm` on open, create, unlink, rename, mkdir, rmdir, truncate, access and the path walk; root bypasses all but exec). But chmod and chown are fake (section 4), and files are always created 0644 (requested mode and umask ignored), owned by the creating euid/egid.
 - `login` against `/etc/passwd` + `/etc/shadow`: verified (1eeee16, 6989a76). Passwords are plaintext (see Missing).
 - setuid escalation through the ksec policy agent (fail-closed): implemented.
   - The `/bin/ksec` daemon is installed but never started, so escalation always fails for non-root users.

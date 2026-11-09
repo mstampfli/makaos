@@ -9,8 +9,11 @@
 >
 > - **No exploit mitigations worth the name:** no ASLR, no KASLR, no SMAP, no kernel
 >   W^X, and `mprotect` silently does nothing.
-> - **Accounts are a toy:** passwords are stored in plaintext (`root` / `toor`), and
->   `chmod`/`chown` don't store anything.
+> - **Accounts are a toy:** passwords are stored in plaintext (`root` / `toor`).
+>   File permissions are checked (owner/group/other bits on open, create, delete and
+>   path walk), but only the modes the image was built with exist: `chmod`/`chown`
+>   report success and store nothing, and every new file is `0644`, owned by its
+>   creator.
 > - **Many syscalls fake success**, and the pledge sandbox allows anything it doesn't
 >   list.
 > - **Known holes are open:** the security audit (`docs/AUDIT_FINDINGS.md`) still lists

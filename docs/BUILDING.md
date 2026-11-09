@@ -127,6 +127,26 @@ Minecraft need their downloaded jars (`docs/JVM_PORT_PLAN.md`).
   - `AUTOLOGIN=1` logs straight in (test images only). docs/FEATURES.md lists all
     build flags.
 
+## Getting files in and out
+
+MakaOS has no text editor. Write and compile on the host, then copy into the image with
+`scripts/diskfiles.sh` (works on `build/disk.img` in place, no rebuild):
+
+```sh
+toolchain/bin/x86_64-pc-makaos-gcc --sysroot=build/sysroot -O2 -o /tmp/t/prog prog.c
+bash scripts/diskfiles.sh put /tmp/t              # -> /root/t (dirs recursive, +x kept)
+bash scripts/diskfiles.sh put notes.txt --to /home/maka --user maka
+bash scripts/diskfiles.sh ls /root/t
+bash scripts/diskfiles.sh get /root/out.txt /tmp/from-makaos
+```
+
+- `put` refuses while a QEMU has the image open for writing; shut MakaOS down first.
+- What persists: `run.sh` and `scripts/boot.sh` write to `build/disk.img`, so files you
+  create in MakaOS survive a reboot (checked 2026-11-09: written in MakaOS, read back on
+  the host with `get`). `scripts/run-gl-gui.sh` boots with `snapshot=on` and discards
+  all writes. Every `build.sh` run recreates the file system, so `put` your files again
+  after a build.
+
 ## Booting without KVM
 
 Without KVM, MakaOS boots under QEMU 9.0 or newer in software emulation. Checked
@@ -175,6 +195,7 @@ then, use software emulation.
 | Serial log ends at `K`, black screen | No x2APIC: QEMU 8.x without KVM | Use KVM or QEMU 9+ (see Booting without KVM) |
 | `[!] Cannot boot MakaOS: it needs x2APIC` | Same, caught before launch | The message names what is missing |
 | WSL2 on AMD: no `svm`, `Nested features: 0x0` | Windows update KB5127648 | Restart Windows to apply KB5127936, or use QEMU 9+ |
+| UEFI dump `#UD - Invalid Opcode` right after `kernel_phys=` | Loader zeroed memory it did not own (fixed 2026-11-09 in `boot/uefi/main.c`) | Rebuild |
 | Typed `-` shows as `'`, `/` as `-` | The console uses a Swiss German keymap | Type as on a Swiss German keyboard |
 | Every bash command prints `[stat-dbg] ... -> -2` | A leftover debug print in `kernel/syscall/syscall.c` | Harmless; to be removed |
 | In foot, output lines start where the prompt line ended | Looks like the pty does not turn `\n` into `\r\n` (ONLCR); not yet checked in the code | Open bug |
