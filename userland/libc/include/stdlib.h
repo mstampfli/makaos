@@ -36,6 +36,9 @@ float      strtof(const char* s, char** endptr);
 
 // Env
 char* getenv(const char* name);
+// GNU: getenv that returns NULL in setuid programs. MakaOS has no such mode,
+// so it equals getenv (defined in glibc_compat.c).
+char* secure_getenv(const char* name);
 int   setenv(const char* name, const char* value, int overwrite);
 int   unsetenv(const char* name);
 int   putenv(char* str);

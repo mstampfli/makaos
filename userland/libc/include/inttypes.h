@@ -8,7 +8,8 @@ extern "C" {
 #endif
 
 // Format-string macros for int8/16/32/64 and ptr-sized integers.
-// x86_64 ABI: int32_t is "int", int64_t is "long long".
+// LP64 x86_64: int32_t is "int", int64_t is "long" (see stdint.h), so the
+// 64-bit, MAX and PTR conversions use the "l" length modifier.
 #define PRId8  "d"
 #define PRIi8  "i"
 #define PRIo8  "o"
@@ -27,12 +28,12 @@ extern "C" {
 #define PRIu32 "u"
 #define PRIx32 "x"
 #define PRIX32 "X"
-#define PRId64 "lld"
-#define PRIi64 "lli"
-#define PRIo64 "llo"
-#define PRIu64 "llu"
-#define PRIx64 "llx"
-#define PRIX64 "llX"
+#define PRId64 "ld"
+#define PRIi64 "li"
+#define PRIo64 "lo"
+#define PRIu64 "lu"
+#define PRIx64 "lx"
+#define PRIX64 "lX"
 
 #define PRIdMAX  PRId64
 #define PRIiMAX  PRIi64
@@ -50,9 +51,9 @@ extern "C" {
 #define SCNd32  "d"
 #define SCNu32  "u"
 #define SCNx32  "x"
-#define SCNd64  "lld"
-#define SCNu64  "llu"
-#define SCNx64  "llx"
+#define SCNd64  "ld"
+#define SCNu64  "lu"
+#define SCNx64  "lx"
 
 intmax_t  strtoimax(const char* s, char** endptr, int base);
 uintmax_t strtoumax(const char* s, char** endptr, int base);

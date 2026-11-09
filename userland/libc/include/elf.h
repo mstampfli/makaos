@@ -98,6 +98,28 @@ typedef struct {
     Elf64_Xword   st_size;
 } Elf64_Sym;
 
+// Note header: starts each entry of a PT_NOTE segment / SHT_NOTE section,
+// followed by the name and descriptor, each padded to 4 bytes. Read by code
+// that looks up a module's GNU build-id (e.g. Mesa's util/build_id.c).
+typedef struct {
+    Elf32_Word n_namesz;
+    Elf32_Word n_descsz;
+    Elf32_Word n_type;
+} Elf32_Nhdr;
+
+typedef struct {
+    Elf64_Word n_namesz;
+    Elf64_Word n_descsz;
+    Elf64_Word n_type;
+} Elf64_Nhdr;
+
+// Note types (n_type) for notes named "GNU".
+#define NT_GNU_ABI_TAG      1
+#define NT_GNU_HWCAP        2
+#define NT_GNU_BUILD_ID     3
+#define NT_GNU_GOLD_VERSION 4
+#define NT_GNU_PROPERTY_TYPE_0 5
+
 // Segment types (p_type).
 #define PT_NULL         0
 #define PT_LOAD         1
@@ -121,6 +143,7 @@ typedef struct {
 #define SHT_PROGBITS 1
 #define SHT_SYMTAB   2
 #define SHT_STRTAB   3
+#define SHT_NOTE     7
 #define SHT_NOBITS   8
 #define SHT_DYNSYM   11
 

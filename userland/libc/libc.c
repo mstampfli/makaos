@@ -1563,6 +1563,24 @@ int dirfd(DIR* dirp) {
     return -1;
 }
 
+// fdopendir -- DIR* for an open directory fd.  Like openat/fstatat this only
+// works for the synthetic dir-fds dirfd() hands out, whose path is known: the
+// kernel cannot map an ordinary fd back to a path.  Any other fd fails with
+// ENOSYS (the same answer openat gives for dir-relative opens), never a fake
+// empty directory.  On success the DIR owns the fd, as POSIX requires:
+// closedir() releases the slot.
+DIR* fdopendir(int fd) {
+    int slot = fd - AT_FD_BASE;
+    if (fd < AT_FD_BASE || slot >= AT_FD_SLOTS || !s_at_dirs[slot].in_use) {
+        errno = (fd < 0) ? EBADF : ENOSYS;
+        return NULL;
+    }
+    DIR* dir = opendir(s_at_dirs[slot].path);
+    if (!dir) return NULL;
+    dir->at_fd = fd;
+    return dir;
+}
+
 int closedir(DIR* dirp) {
     if (!dirp) { errno = EBADF; return -1; }
     if (dirp->at_fd >= AT_FD_BASE) {
