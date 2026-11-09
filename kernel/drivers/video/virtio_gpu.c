@@ -26,6 +26,7 @@
 #include "idt.h"       // idt_irq_register -- Phase 2b control-queue MSI-X
 #include "lapic.h"     // VEC_VIRTIO_GPU, lapic_msi_addr / lapic_msi_data
 #include "irq_wait.h"  // irq_wait / irq_notify -- the GPU fence wait queue
+#include "tsc.h"       // tsc_read_ns -- wall-time bound for control-queue waits
 
 // ── PCI IDs ─────────────────────────────────────────────────────────
 // Generic virtio-PCI transport constants (VIRTIO_VENDOR, VIRTIO_PCI_CAP_*,
@@ -309,6 +310,53 @@ static uint8_t*    s_cmd_virt = NULL;   // request at +0, response at +CMD_RESP_
 // complexity until we have an interrupt-driven completion path.
 static spinlock_t s_ctrl_lock = SPINLOCK_INIT;
 
+// Set once the device has reported an error (NEEDS_RESET / FAILED) while a
+// command was in flight on that queue.  From then on every send on it fails at
+// once: its bounce buffer may still be written for the abandoned command.
+static int s_ctrl_dead = 0;
+static int s_cursor_dead = 0;
+
+// Wait until the device retires the command just published on `vq`.  Caller
+// holds that queue's lock.  Returns 1 once vq->used->idx moved on
+// (last_used_idx updated), 0 if the device reported an error (then *dead = 1).
+//
+// A virtio request cannot be cancelled: once published, the device WILL write
+// its response into the queue's bounce buffer, however long the host takes (a
+// large virgl SUBMIT_3D translated to D3D12/GL on a slow or emulated host can
+// take seconds).  Abandoning it and reusing the buffer makes every later
+// command read its predecessor's response -- which is what an iteration-capped
+// poll used to do.  So wait by wall time, warn while waiting, and give up only
+// when the device itself reports an error, marking the queue dead instead of
+// continuing with corrupted state.
+static int vgpu_wait_used(virtq_t* vq, int* dead, const char* qname,
+                          uint32_t req_type, uint32_t len) {
+    const uint64_t warn_every_ns = 2000000000ull;   // 2 s
+    uint64_t t0 = tsc_read_ns(), next_warn = t0 + warn_every_ns;
+    for (uint32_t i = 0;; i++) {
+        uint16_t used_idx = vq->used->idx;
+        __asm__ volatile("lfence" ::: "memory");
+        if (used_idx != vq->last_used_idx) {
+            vq->last_used_idx = used_idx;
+            return 1;
+        }
+        __builtin_ia32_pause();
+        if ((i & 0xFFFu) != 0) continue;            // check status + clock occasionally
+        uint8_t st = s_common->device_status;
+        if (st & (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED)) {
+            *dead = 1;
+            pr_warn("virtio-gpu", "device error status=0x%x on %s reqtype=0x%x len=%u; queue disabled",
+                    (unsigned)st, qname, req_type, len);
+            return 0;
+        }
+        uint64_t now = tsc_read_ns();
+        if (now >= next_warn) {
+            pr_warn("virtio-gpu", "%s still waiting %lu ms for reqtype=0x%x len=%u",
+                    qname, (unsigned long)((now - t0) / 1000000ull), req_type, len);
+            next_warn = now + warn_every_ns;
+        }
+    }
+}
+
 static int vgpu_send_ctrl(const void* req, uint32_t req_len,
                            void* resp, uint32_t resp_len) {
     if (!s_cmd_virt) return 0;
@@ -316,6 +364,7 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
     if (resp_len > (CMD_BUF_SIZE - CMD_RESP_OFF)) return 0;
 
     spin_lock(&s_ctrl_lock);
+    if (s_ctrl_dead) { spin_unlock(&s_ctrl_lock); return 0; }
     __builtin_memcpy(s_cmd_virt + CMD_REQ_OFF, req, req_len);
     __builtin_memset(s_cmd_virt + CMD_RESP_OFF, 0, resp_len);
 
@@ -351,38 +400,25 @@ static int vgpu_send_ctrl(const void* req, uint32_t req_len,
     *(volatile uint16_t*)(s_notify + vq->notify_off * s_notify_mult) = VQ_CONTROLQ;
     __asm__ volatile("mfence" ::: "memory");
 
-    // Poll for completion.  Bounded by a large counter — no interrupt
-    // yet; the DRM layer will wire one once we're event-driven.
-    for (int i = 0; i < 10000000; i++) {
-        uint16_t used_idx = vq->used->idx;
-        __asm__ volatile("lfence" ::: "memory");
-        if (used_idx != vq->last_used_idx) {
-            vq->last_used_idx = used_idx;
-            // Response bytes are now in s_cmd_virt + CMD_RESP_OFF.
-            __builtin_memcpy(resp, s_cmd_virt + CMD_RESP_OFF, resp_len);
-            // Return descriptors to free list.
-            vq->desc[d1].next = vq->free_head;
-            vq->desc[d0].next = d1;
-            vq->free_head = d0;
-            // Fence: this command retired.  Wake any WAITer directly (the MSI-X
-            // handler also wakes, but the poll is authoritative so completion is
-            // never lost if the IRQ is slow/misconfigured).
-            __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
-            if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
-            spin_unlock(&s_ctrl_lock);
-            return 1;
-        }
+    // Wait for the device to retire it (polling; the MSI-X wake below is for
+    // fence WAITers).  Only a device error ends the wait early.
+    if (!vgpu_wait_used(vq, &s_ctrl_dead, "ctrl", ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, req_len)) {
+        spin_unlock(&s_ctrl_lock);   // descriptors stay leaked: the device may still own them
+        return 0;
     }
-    // Timeout → leak descriptors (safer than racing the device).  Log loudly
-    // with the device status: a SILENT return here is exactly what let a
-    // queue-size mismatch (device DEVICE_NEEDS_RESET, status bit 0x40) wedge
-    // the control queue undiagnosed.  This path should never fire in normal
-    // operation now that queue geometry is negotiated in virtq_activate().
-    pr_warn("virtio-gpu", "ctrl timeout reqtype=0x%x len=%u status=0x%x",
-            ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, req_len,
-            (unsigned)s_common->device_status);
+    // Response bytes are now in s_cmd_virt + CMD_RESP_OFF.
+    __builtin_memcpy(resp, s_cmd_virt + CMD_RESP_OFF, resp_len);
+    // Return descriptors to free list.
+    vq->desc[d1].next = vq->free_head;
+    vq->desc[d0].next = d1;
+    vq->free_head = d0;
+    // Fence: this command retired.  Wake any WAITer directly (the MSI-X
+    // handler also wakes, but the poll is authoritative so completion is
+    // never lost if the IRQ is slow/misconfigured).
+    __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
+    if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
     spin_unlock(&s_ctrl_lock);
-    return 0;
+    return 1;
 }
 
 // ── Cursor queue (§5.7.6.10) ─────────────────────────────────────────
@@ -417,6 +453,7 @@ static int vgpu_send_cursor(const virtio_gpu_update_cursor_t* req) {
     if (!s_cursor_virt) return 0;
 
     spin_lock(&s_cursor_lock);
+    if (s_cursor_dead) { spin_unlock(&s_cursor_lock); return 0; }
     __builtin_memcpy(s_cursor_virt, req, sizeof(*req));
     __builtin_memset(s_cursor_virt + 2048, 0, sizeof(virtio_gpu_ctrl_hdr_t));
 
@@ -447,22 +484,16 @@ static int vgpu_send_cursor(const virtio_gpu_update_cursor_t* req) {
     *(volatile uint16_t*)(s_notify + vq->notify_off * s_notify_mult) = VQ_CURSORQ;
     __asm__ volatile("mfence" ::: "memory");
 
-    // Poll for completion (QEMU answers in microseconds; same bounded
-    // poll as the control queue until we go interrupt-driven).
-    for (int i = 0; i < 10000000; i++) {
-        uint16_t used_idx = vq->used->idx;
-        __asm__ volatile("lfence" ::: "memory");
-        if (used_idx != vq->last_used_idx) {
-            vq->last_used_idx = used_idx;
-            vq->desc[d1].next = vq->free_head;
-            vq->desc[d0].next = d1;
-            vq->free_head = d0;
-            spin_unlock(&s_cursor_lock);
-            return 1;
-        }
+    // Wait for completion: same rule as the control queue (see vgpu_wait_used).
+    if (!vgpu_wait_used(vq, &s_cursor_dead, "cursor", req->hdr.type, (uint32_t)sizeof(*req))) {
+        spin_unlock(&s_cursor_lock);
+        return 0;
     }
+    vq->desc[d1].next = vq->free_head;
+    vq->desc[d0].next = d1;
+    vq->free_head = d0;
     spin_unlock(&s_cursor_lock);
-    return 0;
+    return 1;
 }
 
 // ── Init ────────────────────────────────────────────────────────────
@@ -777,6 +808,7 @@ static int vgpu_send_ctrl_data(const void* req, uint32_t req_len,
     if (resp_len > (CMD_BUF_SIZE - CMD_RESP_OFF)) return 0;
 
     spin_lock(&s_ctrl_lock);
+    if (s_ctrl_dead) { spin_unlock(&s_ctrl_lock); return 0; }
     __builtin_memcpy(s_cmd_virt + CMD_REQ_OFF, req, req_len);
     __builtin_memset(s_cmd_virt + CMD_RESP_OFF, 0, resp_len);
 
@@ -818,28 +850,20 @@ static int vgpu_send_ctrl_data(const void* req, uint32_t req_len,
     *(volatile uint16_t*)(s_notify + vq->notify_off * s_notify_mult) = VQ_CONTROLQ;
     __asm__ volatile("mfence" ::: "memory");
 
-    for (int i = 0; i < 10000000; i++) {
-        uint16_t used_idx = vq->used->idx;
-        __asm__ volatile("lfence" ::: "memory");
-        if (used_idx != vq->last_used_idx) {
-            vq->last_used_idx = used_idx;
-            __builtin_memcpy(resp, s_cmd_virt + CMD_RESP_OFF, resp_len);
-            // Return all three descriptors to the free list.
-            vq->desc[d2].next = vq->free_head;
-            vq->desc[d1].next = d2;
-            vq->desc[d0].next = d1;
-            vq->free_head = d0;
-            __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
-            if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
-            spin_unlock(&s_ctrl_lock);
-            return 1;
-        }
+    if (!vgpu_wait_used(vq, &s_ctrl_dead, "ctrl(data)", ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, data_len)) {
+        spin_unlock(&s_ctrl_lock);   // descriptors stay leaked: the device may still own them
+        return 0;
     }
-    pr_warn("virtio-gpu", "ctrl(data) timeout reqtype=0x%x datalen=%u status=0x%x",
-            ((virtio_gpu_ctrl_hdr_t*)s_cmd_virt)->type, data_len,
-            (unsigned)s_common->device_status);
+    __builtin_memcpy(resp, s_cmd_virt + CMD_RESP_OFF, resp_len);
+    // Return all three descriptors to the free list.
+    vq->desc[d2].next = vq->free_head;
+    vq->desc[d1].next = d2;
+    vq->desc[d0].next = d1;
+    vq->free_head = d0;
+    __atomic_add_fetch(&s_gpu_fence_done, 1, __ATOMIC_ACQ_REL);
+    if (g_virtio_gpu_irq != 0xFFu) irq_notify(g_virtio_gpu_irq);
     spin_unlock(&s_ctrl_lock);
-    return 0;
+    return 1;
 }
 
 int virtio_gpu_resource_attach_backing_sg(uint32_t res_id,

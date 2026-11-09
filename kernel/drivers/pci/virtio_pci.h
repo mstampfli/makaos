@@ -28,6 +28,7 @@
 #define VIRTIO_STATUS_DRIVER        2u
 #define VIRTIO_STATUS_DRIVER_OK     4u
 #define VIRTIO_STATUS_FEATURES_OK   8u
+#define VIRTIO_STATUS_DEVICE_NEEDS_RESET 64u
 #define VIRTIO_STATUS_FAILED      128u
 
 // transport feature bit: modern (non-legacy) device.

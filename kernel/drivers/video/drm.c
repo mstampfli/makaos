@@ -572,6 +572,7 @@ typedef struct drm_res3d {
 typedef struct drm_client {
     drm_dumb_t* dumbs;
     drm_fb_t*   fbs;
+    uint32_t    nfbs;                  // live fbs in `fbs` (ADDFB2 +1, RMFB/CLOSEFB -1)
     // ONE GEM handle namespace per fd (Linux's model): a handle names exactly
     // one object -- a dumb OR a res3d, never both -- so find_dumb and find_res3d
     // can never both match it.  Two independent counters used to hand out the
@@ -1139,9 +1140,10 @@ static int drm_ioctl_addfb2(vfs_file_t* f, uint64_t arg) {
     shmem_ref(src_backing);
     fb->next   = c->fbs;
     c->fbs     = fb;
-    pr_info("drm", "ADDFB2 fb=%u res=%u %s %ux%u",
+    c->nfbs++;
+    pr_info("drm", "ADDFB2 fb=%u res=%u %s %ux%u live=%u",
             fb->fb_id, fb->vgpu_res_id, is_3d ? "(3D)" : "(dumb)",
-            a.width, a.height);
+            a.width, a.height, c->nfbs);
 
     a.fb_id = fb->fb_id;
     if (copy_to_user((void*)arg, &a, sizeof(a)) != 0) return -EFAULT;
@@ -1183,21 +1185,26 @@ static void drm_fb_free(drm_fb_t* fb) {
     kfree(fb);
 }
 
-static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
-    drm_mode_rmfb_t a;
-    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    drm_client_t* c = client_of(f);
+// Unlink and free one of this client's fbs (RMFB and CLOSEFB share it).
+static int drm_fb_remove(drm_client_t* c, uint32_t fb_id) {
     drm_fb_t** pp = &c->fbs;
     while (*pp) {
-        if ((*pp)->fb_id == a.fb_id) {
+        if ((*pp)->fb_id == fb_id) {
             drm_fb_t* fb = *pp;
             *pp = fb->next;
+            c->nfbs--;
             drm_fb_free(fb);
             return 0;
         }
         pp = &(*pp)->next;
     }
     return -ENOENT;
+}
+
+static int drm_ioctl_rmfb(vfs_file_t* f, uint64_t arg) {
+    drm_mode_rmfb_t a;
+    if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
+    return drm_fb_remove(client_of(f), a.fb_id);
 }
 
 // ── Atomic commit — the single state-changing primitive ─────────────
@@ -2908,18 +2915,7 @@ static int drm_ioctl_mode_getfb(vfs_file_t* self, uint64_t arg) {
 static int drm_ioctl_mode_closefb(vfs_file_t* self, uint64_t arg) {
     struct __attribute__((packed)) { uint32_t fb_id; uint32_t pad; } a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    drm_client_t* c = client_of(self);
-    drm_fb_t** pp = &c->fbs;
-    while (*pp) {
-        if ((*pp)->fb_id == a.fb_id) {
-            drm_fb_t* x = *pp;
-            *pp = x->next;
-            drm_fb_free(x);
-            return 0;
-        }
-        pp = &(*pp)->next;
-    }
-    return -ENOENT;
+    return drm_fb_remove(client_of(self), a.fb_id);
 }
 
 // ── Legacy cursor ioctl — accepted (virtio-gpu compositor-side cursor). ──
@@ -3464,10 +3460,16 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
     drm_client_t* c = client_of(f);
     drm_virtgpu_execbuffer_t a;
     if (copy_from_user(&a, (void*)arg, sizeof(a)) != 0) return -EFAULT;
-    if (!c->virgl_ctx_id) return -EINVAL;                       // context first
+    if (!c->virgl_ctx_id) {                                     // context first
+        pr_warn("drm", "execbuf: no virgl context");
+        return -EINVAL;
+    }
     // 64 KiB matches the virtio-gpu control request window; virtio_gpu_3d_submit
     // enforces the exact device limit.  virgl command streams are multi-KiB.
-    if (a.size == 0 || (a.size & 3u) || a.size > 65536u) return -EINVAL;
+    if (a.size == 0 || (a.size & 3u) || a.size > 65536u) {
+        pr_warn("drm", "execbuf: rejected size=%u bo_handles=%u", a.size, a.num_bo_handles);
+        return -EINVAL;
+    }
 
     // Attach every bo the command stream references to this fd's virgl context
     // BEFORE submitting.  vrend rejects any command that touches a resource not
@@ -3477,7 +3479,10 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
     // per resource (ctx_attached), not per-execbuffer.
     if (a.num_bo_handles) {
         extern int virtio_gpu_3d_ctx_attach_resource(uint32_t ctx_id, uint32_t res_id);
-        if (a.num_bo_handles > 4096u) return -EINVAL;
+        if (a.num_bo_handles > 4096u) {
+            pr_warn("drm", "execbuf: rejected bo_handles=%u", a.num_bo_handles);
+            return -EINVAL;
+        }
         uint32_t* handles = (uint32_t*)kmalloc(a.num_bo_handles * sizeof(uint32_t));
         if (!handles) return -ENOMEM;
         if (copy_from_user(handles, (void*)a.bo_handles,
@@ -3515,6 +3520,7 @@ static int drm_ioctl_virtgpu_execbuffer(vfs_file_t* f, uint64_t arg) {
     if (copy_from_user(cmds, (void*)a.command, a.size) != 0) { kfree(cmds); return -EFAULT; }
     int rc = virtio_gpu_3d_submit(c->virgl_ctx_id, cmds, a.size);
     kfree(cmds);
+    if (rc != 0) pr_warn("drm", "execbuf: submit size=%u failed rc=%d", a.size, rc);
     // Fences / syncobjs are Phase 2b; report "no out fence" if one was asked for.
     if (rc == 0 && (a.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT)) {
         a.fence_fd = -1;
@@ -3724,6 +3730,8 @@ static void drm_close(vfs_file_t* self) {
     if (c) {
         drm_fb_t* fb = c->fbs;
         while (fb) { drm_fb_t* n = fb->next; drm_fb_free(fb); fb = n; }
+        c->fbs = NULL;
+        c->nfbs = 0;
         drm_dumb_t* d = c->dumbs;
         while (d)  { drm_dumb_t* n = d->next; dumb_free(d, g_current); d = n; }
         // Tear down 3D (virgl) render-node state: free every live bo, then the
