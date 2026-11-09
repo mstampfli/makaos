@@ -18,6 +18,7 @@ TAG=release-2.30.50
 B="$REPO/build/sdl2compat_build"
 
 [ -f "$SYSROOT/usr/include/SDL3/SDL.h" ] || { echo "FATAL: SDL3 headers missing (run port-sdl3 first)"; exit 1; }
+[ -d "$SC/.git" ] || git clone --depth 1 --branch release-2.30.50 https://github.com/libsdl-org/sdl2-compat "$SC"
 [ -d "$SC/.git" ] || { echo "FATAL: sdl2-compat git checkout missing at $SC"; exit 1; }
 
 # Pin the SDL3-3.2.0-compatible tag (fetch if this shallow clone lacks it).

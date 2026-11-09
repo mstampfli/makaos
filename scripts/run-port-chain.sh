@@ -26,6 +26,9 @@ PORTS=(
     libinput
     hwdata
     libdisplay-info
+    # GL stack: wlroots renders with GLES2 over GBM, so Mesa (virgl, EGL,
+    # GBM, GLES2; needs the wayland port above) must be in the sysroot first.
+    mesa
     wlroots
     json-c
     pcre2

@@ -15,6 +15,14 @@ LD="$REPO/toolchain/bin/x86_64-pc-makaos-ld"
 B="$REPO/build/darkplaces_build"
 L="$SYSROOT/usr/lib"
 
+# Pinned to the upstream commit current when this port was written (2026-07-10).
+DP_COMMIT="${DP_COMMIT:-5b08123f4d511193a585f2d603a70674ae27af12}"
+if [ ! -d "$DP" ]; then
+    mkdir -p "$(dirname "$DP")"
+    git init -q "$DP"
+    git -C "$DP" fetch -q --depth 1 https://github.com/DarkPlacesEngine/darkplaces "$DP_COMMIT"
+    git -C "$DP" checkout -q FETCH_HEAD
+fi
 [ -d "$DP" ] || { echo "FATAL: darkplaces source missing at $DP"; exit 1; }
 [ -f "$L/libSDL2.a" ] || { echo "FATAL: libSDL2.a missing (run port-sdl2-compat first)"; exit 1; }
 mkdir -p "$B"

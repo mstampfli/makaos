@@ -123,13 +123,21 @@ build() {
         "$scanner" server-header "$pxml" "$pdir/${proto}-protocol.h"
     done
 
+    # wlroots' link set (itself + the static Mesa GL group it renders with)
+    # comes from its .pc, which port-wlroots.sh rewrites for static linking.
+    # That .pc carries its own --start-group, and ld groups cannot nest, so
+    # it goes before dwl's group rather than inside it.
+    local wlr_libs
+    wlr_libs="$(pkg-config --libs wlroots-0.18)"
+
     (cd "$DWL_SRC" && \
         "$CROSS_CC" "${cflags[@]}" -I "$pdir" \
         -nostartfiles -Wl,--build-id=none \
         "$SYSROOT/usr/lib/crt0.o" \
         dwl.c util.c \
+        $wlr_libs \
         -Wl,--start-group \
-        -lwlroots-0.18 -lwayland-server -lwayland-client \
+        -lwayland-server -lwayland-client \
         -lxkbcommon -lpixman-1 -ldrm -ludev -lseat -lffi -ldisplay-info \
         -linput -levdev -lmtdev \
         -lc -lm -lrt -lpthread -ldl \

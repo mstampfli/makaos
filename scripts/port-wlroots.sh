@@ -3,8 +3,10 @@
 #
 # Upstream-clean wlroots 0.18.1 build.  Input comes from libinput
 # (ported separately); no custom backend shim.  Backends: drm +
-# libinput; renderer is pixman-only (GL/Vulkan not ported yet);
-# session via our native libseat+libudev.
+# libinput; renderer is GLES2 over the static Mesa/virgl stack with a
+# GBM allocator, so port-mesa.sh must run first; session via our native
+# libseat+libudev.  c_std is pinned to c11: wlroots asks for "c23,c11",
+# which meson 1.3.x (Ubuntu 24.04) rejects, and the code is C11.
 #
 # Outputs sysroot/usr/lib/libwlroots-0.18.{a,so.*} and headers.
 
@@ -16,6 +18,7 @@ BUILD_DIR="$REPO_ROOT/build"
 THIRD_PARTY="$BUILD_DIR/third_party"
 WLR_SRC="$THIRD_PARTY/wlroots-${WLR_VERSION}"
 WLR_TARBALL="$THIRD_PARTY/wlroots-${WLR_VERSION}.tar.gz"
+WLR_URL="https://gitlab.freedesktop.org/wlroots/wlroots/-/releases/${WLR_VERSION}/downloads/wlroots-${WLR_VERSION}.tar.gz"
 WLR_BUILD="$BUILD_DIR/wlroots_build"
 
 SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
@@ -30,10 +33,12 @@ log() { printf '[port-wlroots] %s\n' "$*" >&2; }
 # build is upstream-clean.  Also wipes if the tarball exists but the
 # dir doesn't (first run after a `rm -rf` clean).
 fetch() {
-    [ -f "$WLR_TARBALL" ] || {
-        log "FATAL: tarball missing at $WLR_TARBALL — populate third_party/ first"
-        exit 1
-    }
+    mkdir -p "$THIRD_PARTY"
+    if [ ! -f "$WLR_TARBALL" ]; then
+        log "downloading wlroots-${WLR_VERSION}"
+        curl -fsSL --retry 3 -o "$WLR_TARBALL.part" "$WLR_URL"
+        mv "$WLR_TARBALL.part" "$WLR_TARBALL"
+    fi
     if [ -d "$WLR_SRC/backend/native" ]; then
         log "stale native/ backend detected — re-extracting source"
         rm -rf "$WLR_SRC"
@@ -114,6 +119,7 @@ if [ ! -d "$WLR_BUILD" ]; then
         --prefix=/usr \
         --libdir=lib \
         -Ddefault_library=static \
+        -Dc_std=c11 \
         -Dbackends=drm,libinput \
         -Drenderers=gles2 \
         -Dallocators=gbm \

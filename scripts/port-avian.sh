@@ -36,7 +36,10 @@ AVIAN="$REPO/build/third_party/avian"
 SYSROOT="$REPO/build/sysroot"
 TOOLS="$REPO/toolchain/bin"
 OUT="$REPO/build/avian-app"
-BUILT="$AVIAN/build/linux-x86_64-interpret"
+# Avian's makefile names its targets relative to its own tree; make does not
+# match an absolute path against them, so request targets by BUILT_REL.
+BUILT_REL="build/linux-x86_64-interpret"
+BUILT="$AVIAN/$BUILT_REL"
 
 : "${JAVA_HOME:=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")}"
 export JAVA_HOME
@@ -87,7 +90,7 @@ make -C "$AVIAN" -j"$(nproc)" \
     platform=linux arch=x86_64 process=interpret bootimage=false classpath=avian \
     java-version=8 \
     cc="$MCC" cxx="$MCXX" build-cc=gcc build-cxx=g++ rdynamic=-Wl,--export-dynamic \
-    "$BUILT/classpath.jar" "$BUILT/avian" || true
+    "$BUILT_REL/classpath.jar" "$BUILT_REL/avian" || true
 [ -f "$BUILT/interpret.o" ] || { echo "FATAL: Avian objects did not build"; exit 1; }
 
 # 5. Link a MakaOS PIE from the objects (see header comment for why).  Object set

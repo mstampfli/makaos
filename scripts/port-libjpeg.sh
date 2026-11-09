@@ -10,6 +10,12 @@ SYSROOT="${SYSROOT:-$BUILD_DIR/sysroot}"
 CROSS_CC="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-gcc"
 CROSS_AR="$REPO_ROOT/toolchain/bin/x86_64-pc-makaos-ar"
 log() { printf '[port-libjpeg] %s\n' "$*" >&2; }
+if [ ! -d "$SRC" ]; then
+    log "downloading jpeg-9e"
+    mkdir -p "$(dirname "$SRC")"
+    curl -fsSL --retry 3 -o "$SRC.tar.gz" "https://www.ijg.org/files/jpegsrc.v9e.tar.gz"
+    tar -xzf "$SRC.tar.gz" -C "$(dirname "$SRC")"
+fi
 [ -d "$SRC" ] || { log "FATAL: $SRC not found"; exit 1; }
 
 # jconfig.h — POSIX/GCC resolution of the IJG feature template.

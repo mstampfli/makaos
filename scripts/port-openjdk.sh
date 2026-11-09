@@ -9,8 +9,9 @@
 #
 # Prereqs:
 #   - a prior `bash build.sh` (fresh build/sysroot: libc.a + C++-safe headers)
-#   - host boot JDK at /usr/lib/jvm/java-17-openjdk-amd64
-#   - the openjdk17u source unpacked at build/third_party/openjdk17u
+#   - host boot JDK at /usr/lib/jvm/java-17-openjdk-amd64 (openjdk-17-jdk-headless)
+#   - the openjdk17u source at build/third_party/openjdk17u (cloned at
+#     $OPENJDK_TAG if missing)
 #   - the MakaOS gcc cross-toolchain on PATH (toolchain/bin)
 #
 # After this runs: `make hotspot java.base` produces the exploded JDK image at
@@ -26,7 +27,14 @@ GCCVER_DIR="$TOOLS/lib/gcc/x86_64-pc-makaos/14.2.0"
 BOOTJDK="/usr/lib/jvm/java-17-openjdk-amd64"
 CONF="linux-x86_64-zero-release"
 
-[ -d "$JDK" ] || { echo "[port-openjdk] missing $JDK (unpack openjdk17u there first)"; exit 1; }
+# Pinned to the jdk17u release current when this port was written (2026-07).
+OPENJDK_TAG="${OPENJDK_TAG:-jdk-17.0.19-ga}"
+if [ ! -d "$JDK" ]; then
+  echo "[port-openjdk] cloning openjdk/jdk17u-dev at $OPENJDK_TAG"
+  mkdir -p "$(dirname "$JDK")"
+  git clone --depth 1 --branch "$OPENJDK_TAG" https://github.com/openjdk/jdk17u-dev "$JDK"
+fi
+[ -d "$BOOTJDK" ] || { echo "[port-openjdk] missing boot JDK $BOOTJDK (apt install openjdk-17-jdk-headless)"; exit 1; }
 export PATH="$TOOLS/bin:$PATH"
 
 echo "[port-openjdk] 1/8 autoconf: teach the build about the makaos triplet"
@@ -59,16 +67,24 @@ sed -i 's/ifeq ($(call isTargetOs, aix), true)/ifeq ($(call isTargetOs, aix linu
 LC="$JDK/make/common/modules/LauncherCommon.gmk"
 sed -i 's/  LDFLAGS_JDKEXE += -Wl,--exclude-libs,ALL/  # MakaOS: launcher must export its libc symbols for the dlopen'"'"'d libjvm.so/' "$LC"
 sed -i 's/-ljli -lpthread $(LIBDL), \\/-ljli_static -lpthread $(LIBDL), \\/' "$LC"
-grep -q "native/java.base, \\\\" "$LC" || \
+# Guard on what this patch inserts (the comma-less FindLibDirForModule line);
+# "native/java.base, \" alone also matches upstream's LDFLAGS_aix line.
+grep -q 'FindLibDirForModule, java.base) \\$' "$LC" || \
   sed -i 's#-L$(call FindLibDirForModule, java.base), \\#-L$(call FindLibDirForModule, java.base) \\\n          -L$(SUPPORT_OUTPUTDIR)/native/java.base, \\#' "$LC"
-sed -i 's/  ifeq ($(call isTargetOs, aix), true)\n    $$(BUILD_LAUNCHER_$1): $(call FindStaticLib, java.base, jli_static)/  ifeq ($(call isTargetOs, aix linux), true)\n    $$(BUILD_LAUNCHER_$1): $(call FindStaticLib, java.base, jli_static)/' "$LC" || \
-  perl -0pi -e 's/ifeq \(\$\(call isTargetOs, aix\), true\)\n(\s*\$\$\(BUILD_LAUNCHER_\$1\): \$\(call FindStaticLib, java.base, jli_static\))/ifeq (\$(call isTargetOs, aix linux), true)\n$1/' "$LC"
+grep -q 'FindLibDirForModule, java.base) \\$' "$LC" || { echo "[port-openjdk] FATAL: launcher -L patch did not apply"; exit 1; }
+# Make the linux launcher DEPEND on libjli_static.a, or make may link it first
+# ("cannot find -ljli_static").  Two-line match, so perl -0 (sed is line-based).
+perl -0pi -e 's/ifeq \(\$\(call isTargetOs, aix\), true\)\n(\s*\$\$\(BUILD_LAUNCHER_\$1\): \$\(call FindStaticLib, java.base, jli_static\))/ifeq (\$(call isTargetOs, aix linux), true)\n$1/' "$LC"
+grep -q 'isTargetOs, aix linux), true)' "$LC" || { echo "[port-openjdk] FATAL: launcher jli_static dependency patch did not apply"; exit 1; }
 
 echo "[port-openjdk] 3/8 toolchain: gcc specs for MakaOS static-PIE + shared links"
 # The gcc driver defaults to -static executables. Teach it: -shared -> ET_DYN with
 # BOTH hash tables (MakaOS's loader reads DT_HASH); -pie -> the proven MakaOS
 # dynamic-PIE recipe (export-dynamic + link-pie.ld) with the whole libc group so
-# the launcher exports libc/libm/... to the .so's it dlopens.
+# the launcher exports libc/libm/... to the .so's it dlopens.  No -lz in that
+# group: the JDK uses its bundled zlib (inside libjli_static/libzip), and a
+# whole-archive libz.a collides with it and with any explicit -lz (the same
+# archive loaded twice -> every zlib symbol defined twice).
 cat > "$GCCVER_DIR/specs" <<'SPECS'
 *startfile:
 %{shared:crtdso.o%s;:crt0.o%s}
@@ -77,7 +93,7 @@ cat > "$GCCVER_DIR/specs" <<'SPECS'
 %{shared:-shared -Bdynamic --hash-style=both;pie:-pie -Bdynamic --export-dynamic --hash-style=sysv --build-id=none -e _entry %{!T*:-T %R/usr/lib/link-pie.ld};:-static %{!T*:-T %R/usr/lib/makaos-link.ld}} -nostdlib
 
 *lib:
-%{shared:;:--whole-archive -lc -lm -lz -lpthread -ldl --no-whole-archive -lstdc++ -lgcc}
+%{shared:;:--whole-archive -lc -lm -lpthread -ldl --no-whole-archive -lstdc++ -lgcc}
 SPECS
 # gcc's fixincludes copy of stdio.h SHADOWS the sysroot stdio.h; remove it so
 # libc header edits are visible (only stdio.h + stddef.h get fixincluded).
@@ -85,19 +101,31 @@ rm -f "$GCCVER_DIR/include-fixed/stdio.h"
 
 echo "[port-openjdk] 4/8 vendor cups/alsa/fontconfig/libffi API headers into sysroot"
 # configure probes these even though we build headless; the headers just need to
-# exist. (The stub bodies are never linked for a headless Zero build.)
-# NOTE: the actual header contents were vendored by hand during bring-up; if this
-# sysroot lacks them, copy from a distro's -dev packages or stub the few types
-# configure checks. Left as a documented manual step.
+# exist (a headless Zero build never links cups or ALSA). fontconfig and libffi
+# come from their MakaOS ports; cups and ALSA are API-only, copied from the
+# host's -dev packages (libcups2-dev, libasound2-dev).
+for d in cups alsa; do
+  if [ ! -d "$SYSROOT/usr/include/$d" ]; then
+    [ -d "/usr/include/$d" ] || { echo "[port-openjdk] missing host /usr/include/$d (apt install libcups2-dev libasound2-dev)"; exit 1; }
+    cp -r "/usr/include/$d" "$SYSROOT/usr/include/"
+    echo "  vendored $d headers from the host"
+  fi
+done
 for h in cups/cups.h cups/ppd.h alsa/asoundlib.h fontconfig/fontconfig.h ffi.h; do
-  [ -f "$SYSROOT/usr/include/$h" ] || echo "  [warn] $SYSROOT/usr/include/$h missing -- vendor it before configure"
+  [ -f "$SYSROOT/usr/include/$h" ] || { echo "[port-openjdk] $SYSROOT/usr/include/$h missing"; exit 1; }
 done
 
 echo "[port-openjdk] 5/8 configure (Zero variant, headless, cross to makaos)"
 cd "$JDK"
 if [ ! -f "build/$CONF/spec.gmk" ]; then
+  # Explicit --build/--host/--target instead of --openjdk-target: inside WSL,
+  # OpenJDK's config.guess reports x86_64-pc-wsl (it sees cmd.exe/wslpath) and
+  # would configure a Windows-hosted build, and --openjdk-target cannot be
+  # combined with --build.
   bash configure \
-    --openjdk-target=x86_64-pc-makaos \
+    --build=x86_64-pc-linux-gnu \
+    --host=x86_64-pc-makaos \
+    --target=x86_64-pc-makaos \
     --with-jvm-variants=zero \
     --with-boot-jdk="$BOOTJDK" \
     --with-build-jdk="$BOOTJDK" \
@@ -107,6 +135,7 @@ if [ ! -f "build/$CONF/spec.gmk" ]; then
     --disable-warnings-as-errors \
     --disable-precompiled-headers \
     --with-freetype=bundled \
+    --with-zlib=bundled \
     --with-cups-include="$SYSROOT/usr/include" \
     --with-alsa-include="$SYSROOT/usr/include" \
     --with-fontconfig-include="$SYSROOT/usr/include" \

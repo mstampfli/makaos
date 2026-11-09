@@ -2,11 +2,10 @@
 # ── MakaOS sway port ───────────────────────────────────────────────────
 #
 # The i3-compatible Wayland compositor — the userspace goal.  Built
-# against the ported wlroots 0.18.1 stack with the minimal feature set:
-# no tray (needs sd-bus), no swaybar/swaynag binaries yet (they link
-# fine but double the surface — enable once the core is proven), no
-# gdk-pixbuf, no man pages.  Installs sway + swaymsg + the default
-# config into the sysroot.
+# against the ported wlroots 0.18.1 stack with a small feature set:
+# swaybar and swaynag enabled, no tray (needs sd-bus), no gdk-pixbuf,
+# no man pages.  Installs sway + swaymsg + swaybar + swaynag + the
+# default config into the sysroot.
 
 set -euo pipefail
 

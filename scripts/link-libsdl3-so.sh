@@ -13,7 +13,7 @@ OUT="${1:-build/libSDL3.so}"
 "$LD" -shared -m elf_x86_64_makaos --build-id=none -soname libSDL3.so.0 \
     --gc-sections --allow-multiple-definition \
     -L "$L" \
-    build/dso_handle.o \
+    "$L/crtdso.o" \
     --whole-archive "$L/libSDL3.a" --no-whole-archive \
     --start-group \
       "$L/dri/virtio_gpu_dri.so" \
