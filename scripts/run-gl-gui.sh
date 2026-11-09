@@ -21,6 +21,7 @@
 #   DISP='sdl,gl=on' bash scripts/run-gl-gui.sh                 # SDL instead of GTK
 #   DISP='gtk,gl=es' bash scripts/run-gl-gui.sh                 # request GLES, not desktop GL
 #   GDK_BACKEND=wayland SDL_VIDEODRIVER=wayland bash scripts/run-gl-gui.sh   # native Wayland
+#   GLPROVIDER=none bash scripts/run-gl-gui.sh                  # leave GL vendor env alone (WSLg)
 # Serial (kernel log) -> build/serial-gl.txt.  Quit: close the window or
 # `pkill qemu-system-x86` from another terminal.
 set -euo pipefail
@@ -83,12 +84,15 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
   export GDK_BACKEND="${GDK_BACKEND:-wayland}"
 fi
 
+. scripts/qemu-host.sh
+qemu_select_accel || exit 1
+
 pkill -9 -f "qemu-system-x86_64.*disk\.img" 2>/dev/null || true
 
 echo "[run-gl-gui] virtio-gpu-gl + $DISPLAY_OPT  (GLPROVIDER=${GLPROVIDER:-nvidia}, host GL EGL=${__EGL_VENDOR_LIBRARY_FILENAMES:-default})"
 echo "[run-gl-gui] serial -> $SERIAL"
-exec qemu-system-x86_64 \
-  -accel kvm -cpu host -smp 4 -m 1024M -nodefaults -no-user-config \
+exec "$QEMU_BIN" \
+  "${QEMU_ACCEL_ARGS[@]}" -smp 4 -m 1024M -nodefaults -no-user-config \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$OVMF_VARS" \
   -drive format=raw,file=build/disk.img,if=none,id=hd0,snapshot=on \
@@ -96,7 +100,7 @@ exec qemu-system-x86_64 \
   -device virtio-gpu-gl-pci,id=vgpu \
   -display "$DISPLAY_OPT" \
   -device virtio-tablet-pci \
-  -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
+  -audiodev "$(qemu_audio)",id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -serial file:"$SERIAL" \
   -no-reboot -no-shutdown \

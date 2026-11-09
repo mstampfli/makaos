@@ -19,15 +19,29 @@ OBJCOPY="objcopy"
 
 # Cross-compiler for userland — target-aware, sysroot baked in, knows
 # about crt0 + link script + libc without any command-line flag soup.
-# Built by scripts/build-toolchain.sh; falls back to host gcc if absent
-# (early-development convenience only — production path is the cross).
+# Built by scripts/build-toolchain.sh.
+#
+# Bootstrap: the cross-gcc build needs libc.a + headers in the sysroot, and
+# libc is built here.  When the cross-compiler is missing, build.sh runs in
+# BOOTSTRAP mode: it compiles only libc (host gcc, pointed at the sysroot
+# headers instead of the host's) into build/sysroot and stops.  Everything
+# after libc (ports, apps, kernel image) needs the real cross-compiler.
+# scripts/build-toolchain.sh runs this bootstrap itself when needed.
 USER_CC="$(pwd)/toolchain/bin/x86_64-pc-makaos-gcc"
 USER_CXX="$(pwd)/toolchain/bin/x86_64-pc-makaos-g++"   # for C++ ports (Mesa GL stack)
+BOOTSTRAP=0
 if [ ! -x "$USER_CC" ]; then
-  echo "[!] cross-toolchain missing — run scripts/build-toolchain.sh"
-  echo "    falling back to host gcc for userland (legacy path)"
+  echo "[!] cross-toolchain missing: bootstrap mode, building libc into the sysroot only"
+  echo "    (then run scripts/build-toolchain.sh, then build.sh again)"
   USER_CC="$CC"
+  BOOTSTRAP=1
 fi
+
+# `MINIMAL=1 bash build.sh`: kernel + UEFI loader + libc + the core in-tree
+# programs (login, /bin/shell, svcmgr, ls, ps, coreutils) on a bootable image.
+# No ports, no cross-compiler needed: a login prompt in a couple of minutes
+# from a fresh clone.
+MINIMAL="${MINIMAL:-0}"
 
 # ── Kernel compile flags (clang, ELF64, freestanding) ─────────────────────
 KERNEL_INCLUDES=(
@@ -176,6 +190,17 @@ SYSROOT_CFLAGS=(
   -isystem "$SYSROOT/usr/include"
 )
 
+# Bootstrap: host gcc would otherwise resolve <fts.h>, <pthread.h>, ... to the
+# host's glibc headers.  Point every userland compile at the MakaOS sysroot
+# headers, plus gcc's own freestanding headers (stddef.h, stdarg.h, ...).
+if [ "$BOOTSTRAP" = "1" ]; then
+  USER_CFLAGS+=(
+    -nostdinc
+    -isystem "$SYSROOT/usr/include"
+    -isystem "$("$CC" -print-file-name=include)"
+  )
+fi
+
 # ── Common user object files ───────────────────────────────────────────────
 "$NASM" -f elf64 "$USERLAND_DIR/entry/entry.asm"    -o "$BUILD_DIR/user_entry.o"
 "$NASM" -f elf64 "$USERLAND_DIR/libc/setjmp.asm"    -o "$BUILD_DIR/user_setjmp.o"
@@ -297,6 +322,14 @@ cp "$USERLAND_DIR/link.ld" "$SYSROOT/usr/lib/makaos-link.ld"
 # %R/usr/lib/link-pie.ld for the -pie case (see toolchain specs).
 cp "$USERLAND_DIR/link-pie.ld" "$SYSROOT/usr/lib/link-pie.ld"
 
+if [ "$BOOTSTRAP" = "1" ] && [ "$MINIMAL" != "1" ]; then
+  echo "[+] Bootstrap sysroot ready: $SYSROOT/usr/lib/libc.a"
+  echo "    Next: bash scripts/build-toolchain.sh, then bash build.sh again."
+  echo "    (Or MINIMAL=1 bash build.sh for a kernel + login + shell image without it.)"
+  exit 0
+fi
+
+if [ "$MINIMAL" != "1" ]; then   # ports: skipped by MINIMAL=1
 # ── mbedTLS (userspace port, sysroot-based) ────────────────────────────────
 # port-mbedtls.sh fetches the upstream tarball into build/third_party/,
 # compiles it against $SYSROOT, and installs libmbedtls.a + headers into
@@ -315,6 +348,7 @@ for port in zlib expat libffi pixman libxkbcommon freetype harfbuzz libdrm; do
   echo "[+] Building Tier 2 lib: $port"
   SYSROOT="$SYSROOT" bash "scripts/port-$port.sh"
 done
+fi   # end ports
 
 USER_INCLUDES=(
   -I "$USERLAND_DIR/libc"
@@ -361,6 +395,24 @@ USER_RT=(
 )
 
 USER_LINK="$USERLAND_DIR/link.ld"
+
+if [ "$MINIMAL" = "1" ]; then
+  echo "[+] MINIMAL: core in-tree programs only (no ports)"
+  # Linked with plain ld against the in-tree runtime objects (like the
+  # coreutils below), so this works with host gcc as well as the cross-gcc.
+  minimal_app() {
+    local name="$1"
+    "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/$name" \
+      -c "$USERLAND_DIR/apps/$name/$name.c" -o "$BUILD_DIR/user_$name.o"
+    ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_$name.o" \
+      -o "$BUILD_DIR/user_$name.elf"
+  }
+  for app in login shell svcmgr net ls ps hello cat echo mkdir rm mv clear reboot uname; do
+    minimal_app "$app"
+  done
+fi
+
+if [ "$MINIMAL" != "1" ]; then   # full userland: skipped by MINIMAL=1
 
 "$USER_CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" -I"$USERLAND_DIR/apps/home" -c "$USERLAND_DIR/apps/home/home.c" -o "$BUILD_DIR/user_home.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_home.o" \
@@ -700,8 +752,23 @@ fi
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_shell.o" \
    -o "$BUILD_DIR/user_shell.elf"
 
-# ── Bash 5.2 (optional — requires /tmp/bash-5.2 source tree) ──────────────
-BASH_SRC="${BASH_SRC:-/tmp/bash-5.2}"
+# ── Bash 5.2 ──────────────────────────────────────────────────────────────
+# Source: $BASH_SRC if set, else a legacy /tmp/bash-5.2 tree if present,
+# else the upstream tarball fetched into build/third_party (like the ports).
+if [ -z "${BASH_SRC:-}" ]; then
+    if [ -d /tmp/bash-5.2 ]; then
+        BASH_SRC=/tmp/bash-5.2
+    else
+        BASH_SRC="$(pwd)/$BUILD_DIR/third_party/bash-5.2"
+        if [ ! -d "$BASH_SRC" ]; then
+            mkdir -p "$BUILD_DIR/third_party"
+            echo "[+] Fetching bash 5.2 source"
+            curl -fSL --retry 3 -o "$BUILD_DIR/third_party/bash-5.2.tar.gz" \
+                https://ftp.gnu.org/gnu/bash/bash-5.2.tar.gz
+            tar -xzf "$BUILD_DIR/third_party/bash-5.2.tar.gz" -C "$BUILD_DIR/third_party"
+        fi
+    fi
+fi
 if [ -d "$BASH_SRC" ]; then
     if [ "$BASH_SRC/builtins/mkbuiltins" -nt "$BUILD_DIR/user_bash.elf" ] || \
        [ ! -f "$BUILD_DIR/user_bash.elf" ]; then
@@ -780,6 +847,7 @@ DISPLAY_INCLUDES=("${USER_INCLUDES[@]}" -I"$DISPLAY_DIR")
 "$USER_CC" "${USER_CFLAGS[@]}" "${DISPLAY_INCLUDES[@]}" -c "$DISPLAY_DIR/terminal.c" -o "$BUILD_DIR/user_terminal.o"
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_libdisplay.o" "$BUILD_DIR/user_terminal.o" \
    -o "$BUILD_DIR/user_terminal.elf"
+fi   # end full userland
 
 echo "[+] Building kernel (clang + ld.lld)"
 
@@ -1018,9 +1086,13 @@ ext2_setperm() {
 # Generate /etc/passwd and /etc/shadow into a temp staging dir.
 mkdir -p "$BUILD_DIR/etc_stage"
 
-cat > "$BUILD_DIR/etc_stage/passwd" <<'PASSWD_EOF'
-root:0:0:/root:/bin/bash
-maka:1000:1000:/home/maka:/bin/bash
+# Login shell: bash when it was built, else the in-tree /bin/shell (a bash
+# entry with no /bin/bash on disk makes every login fail).
+LOGIN_SHELL=/bin/shell
+[ -f "$BUILD_DIR/user_bash.elf" ] && LOGIN_SHELL=/bin/bash
+cat > "$BUILD_DIR/etc_stage/passwd" <<PASSWD_EOF
+root:0:0:/root:$LOGIN_SHELL
+maka:1000:1000:/home/maka:$LOGIN_SHELL
 PASSWD_EOF
 
 # /etc/shadow — plaintext passwords for now (no crypto).
@@ -1418,16 +1490,10 @@ if [ -f "$BUILD_DIR/user_bash.elf" ]; then
     ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_bash.elf" bin/sh
     echo "[+] sh (bash) installed at bin/sh (root:root 0755)"
 else
-    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "[build] !! WARNING: build/user_bash.elf is MISSING — /bin/bash AND /bin/sh"
-    echo "[build] !! will NOT be installed.  /etc/passwd makes /bin/bash root's login"
-    echo "[build] !! shell, so login WILL FAIL ('login: failed to exec session' loop"
-    echo "[build] !! / stuck after login).  build/user_bash.elf is git-untracked since"
-    echo "[build] !! b00dfe2 and built from \$BASH_SRC (default /tmp/bash-5.2), which is"
-    echo "[build] !! ephemeral.  Fix: restore the prebuilt ELF from git ->"
-    echo "[build] !!   git show f260b18:build/user_bash.elf > build/user_bash.elf"
-    echo "[build] !! (or re-provide the bash source tree at \$BASH_SRC and rebuild)."
-    echo "[build] !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "[build] !! NOTE: no build/user_bash.elf, so no /bin/bash or /bin/sh on the image."
+    echo "[build] !!   Login uses the in-tree /bin/shell instead.  Ports and scripts that"
+    echo "[build] !!   exec /bin/sh will fail.  To include bash 5.2, unpack its source to"
+    echo "[build] !!   \$BASH_SRC (default /tmp/bash-5.2) and rebuild."
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
@@ -1849,6 +1915,9 @@ if [ -n "$NO_QEMU" ]; then
   exit 0
 fi
 
+. "$SCRIPT_DIR/scripts/qemu-host.sh"
+qemu_select_accel || { echo "[+] Image is built: $BUILD_DIR/disk.img (not booted)"; exit 1; }
+
 echo "[+] Running QEMU (UEFI/OVMF)"
 
 OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
@@ -1868,9 +1937,8 @@ for _i in 1 2 3 4 5; do
     sleep 0.2
 done
 
-qemu-system-x86_64 \
-  -accel kvm \
-  -cpu host \
+"$QEMU_BIN" \
+  "${QEMU_ACCEL_ARGS[@]}" \
   -smp 4 \
   -m 1024M \
   -nodefaults \

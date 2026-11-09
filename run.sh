@@ -3,15 +3,17 @@ set -e
 
 BUILD_DIR="build"
 
+. "$(dirname "$0")/scripts/qemu-host.sh"
+qemu_select_accel || exit 1
+
 OVMF_CODE="/usr/share/OVMF/OVMF_CODE_4M.fd"
 OVMF_VARS_SRC="/usr/share/OVMF/OVMF_VARS_4M.fd"
 OVMF_VARS="$BUILD_DIR/OVMF_VARS.fd"
 
 cp "$OVMF_VARS_SRC" "$OVMF_VARS"
 
-qemu-system-x86_64 \
-  -accel kvm \
-  -cpu host \
+"$QEMU_BIN" \
+  "${QEMU_ACCEL_ARGS[@]}" \
   -smp 4 \
   -m 256M \
   -nodefaults \
@@ -24,8 +26,8 @@ qemu-system-x86_64 \
   -vga none \
   -device virtio-vga,xres=1280,yres=800 \
   -device virtio-tablet-pci \
-  -display sdl \
-  -audiodev pa,id=snd0 \
+  -display "$(qemu_display)" \
+  -audiodev "$(qemu_audio)",id=snd0 \
   -device intel-hda \
   -device hda-duplex,audiodev=snd0 \
   -netdev user,id=net0,hostfwd=tcp::18080-:80 \

@@ -96,7 +96,10 @@ build_binutils() {
 # ── Build gcc stage 1 (cross-compiler + libgcc) ────────────────────────
 build_gcc() {
     local build="$BUILD_DIR/gcc-${GCC_VERSION}-build"
-    if [ -f "$PREFIX/bin/${TARGET}-gcc" ] && [ "${FORCE:-0}" != "1" ]; then
+    # libstdc++ is installed last, after gcc itself, so it is the marker for
+    # a complete toolchain: a run that died in libstdc++ gets resumed.
+    if [ -f "$PREFIX/bin/${TARGET}-gcc" ] && [ -f "$PREFIX/$TARGET/lib/libstdc++.a" ] \
+       && [ "${FORCE:-0}" != "1" ]; then
         log "gcc already built — skip (FORCE=1 to rebuild)"
         return
     fi
@@ -104,11 +107,16 @@ build_gcc() {
     (cd "$GCC_SRC" && ./contrib/download_prerequisites)
 
     log "configuring gcc (C + C++)"
-    # Sysroot must already contain a built libc.a + split headers; the
-    # top-level ./build.sh produces those.  libstdc++ autoconf needs
-    # them to link its probe test cases during configure.
+    # Sysroot must already contain a built libc.a + split headers.
+    # libstdc++ autoconf needs them to link its probe test cases during
+    # configure.  On a fresh clone, build.sh's bootstrap mode (no cross
+    # compiler yet) builds exactly that with host gcc.
     if [ ! -f "$SYSROOT/usr/lib/libc.a" ]; then
-        log "FATAL: $SYSROOT/usr/lib/libc.a missing — run ./build.sh first"
+        log "no libc.a in the sysroot yet: running build.sh bootstrap"
+        (cd "$REPO_ROOT" && NO_QEMU=1 bash build.sh)
+    fi
+    if [ ! -f "$SYSROOT/usr/lib/libc.a" ]; then
+        log "FATAL: $SYSROOT/usr/lib/libc.a missing after bootstrap"
         exit 1
     fi
     if [ ! -f "$SYSROOT/usr/include/pthread.h" ]; then

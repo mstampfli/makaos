@@ -29,12 +29,16 @@ fi
 [[ -f "$OVMF_CODE" ]] || { echo "[boot] missing $OVMF_CODE (install the 'ovmf' package)." >&2; exit 1; }
 cp "$OVMF_VARS_SRC" build/OVMF_VARS.fd
 
-# Display: prefer SDL (it shows the guest cursor); fall back to GTK.  The
+. scripts/qemu-host.sh
+qemu_select_accel || exit 1
+
+# Display: SDL (it shows the guest cursor; QEMU_DISPLAY overrides it, see
+# scripts/qemu-host.sh), or GTK if this QEMU lacks SDL.  The
 # virtio-tablet below makes the pointer ABSOLUTE, so the guest cursor tracks
 # your host cursor 1:1 -- always visible, smooth, and unaffected by window
 # scaling (a relative PS/2 mouse needed a grab and got jumpy when scaled).
-DISPLAY_OPT="sdl"
-if ! qemu-system-x86_64 -display help 2>/dev/null | grep -qw sdl; then
+DISPLAY_OPT="$(qemu_display)"
+if [ "$DISPLAY_OPT" = sdl ] && ! "$QEMU_BIN" -display help 2>/dev/null | grep -qw sdl; then
     DISPLAY_OPT="gtk"
 fi
 
@@ -46,8 +50,8 @@ pkill qemu-system-x86 2>/dev/null || true
 sleep 1
 : > build/serial.txt
 
-exec qemu-system-x86_64 \
-    -accel kvm -cpu host -smp 4 -m 1024M \
+exec "$QEMU_BIN" \
+    "${QEMU_ACCEL_ARGS[@]}" -smp 4 -m 1024M \
     -nodefaults -no-user-config \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \

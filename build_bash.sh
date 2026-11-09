@@ -28,6 +28,7 @@ CFLAGS=(
   -I"$BASH_SRC" -I"$BASH_SRC/include" -I"$BASH_SRC/lib"
   -I"$LIBC"
   -DMAKAOS -DHAVE_CONFIG_H -DSHELL -DPREFER_STDARG -DOLD_ALIAS_HACK
+  -DPACKAGE='"bash"' -DLOCALEDIR='"/usr/share/locale"'
   -Wno-implicit-function-declaration -Wno-int-conversion
   -Wno-incompatible-pointer-types -Wno-unused-value
   -Wno-pointer-sign -Wno-discarded-qualifiers
@@ -44,9 +45,23 @@ BUILTIN_CFLAGS=(
 EXCLUDE=(array2.c gen-helpfiles.c glob_loop.c gm_loop.c sm_loop.c getenv.c
   netconn.c netopen.c fnxform.c unicode.c random.c emacs_keymap.c vi_keymap.c
   mkbuiltins.c mksyntax.c nojobs.c memset.c strcasestr.c strchrnul.c strdup.c
-  strftime.c strstr.c xfree.c oslib.c gettimeofday.c)
+  strftime.c strstr.c xfree.c oslib.c gettimeofday.c dprintf.c)
 # Readline has its own shell.c, tilde.c, xmalloc.c that duplicate bash's
 RL_EXCLUDE=(shell.c xmalloc.c xfree.c emacs_keymap.c vi_keymap.c)
+
+# A pristine bash tarball lacks headers its own build generates
+# (pathnames.h, version.h, signames.h, builtins/pipesize.h).  Run bash's
+# configure on the host once to produce exactly those, then drop the host
+# config.h it also writes: it would shadow our MakaOS shim config.h, since
+# #include "config.h" searches the source dir first.
+if [ ! -f "$BASH_SRC/pathnames.h" ] || [ ! -f "$BASH_SRC/builtins/pipesize.h" ]; then
+  echo "[+] Preparing bash source (host configure for generated headers)"
+  (cd "$BASH_SRC" && ./configure --without-bash-malloc --disable-nls > configure.makaos.log 2>&1 \
+     && make pathnames.h version.h signames.h >> configure.makaos.log 2>&1 \
+     && make -C builtins pipesize.h >> configure.makaos.log 2>&1) \
+    || { echo "[!] bash source preparation failed, see $BASH_SRC/configure.makaos.log"; exit 1; }
+  rm -f "$BASH_SRC/config.h"
+fi
 
 echo "[+] Generating builtin .c files from .def"
 if [ ! -f "$BASH_SRC/builtins/mkbuiltins" ]; then
@@ -150,25 +165,35 @@ EOF
   -I"$SHIM_INC" -I"$LIBC" -DMAKAOS \
   -c "$STUBS_DIR/bash_stubs.c" -o "$OBJ_DIR/bash_stubs.o"
 
-echo "[+] Building runtime objects"
-"$CC" "${CFLAGS[@]}" -c "$LIBC/libc.c"  -o "$RT_DIR/_libc.o"
-"$CC" "${CFLAGS[@]}" -c "$LIBC/stdio.c" -o "$RT_DIR/_stdio.o"
-"$CC" "${CFLAGS[@]}" -c "$LIBC/math.c"  -o "$RT_DIR/_math.o"
-nasm -f elf64 "$ENTRY/entry.asm" -o "$RT_DIR/_entry.o"
-nasm -f elf64 "$LIBC/setjmp.asm" -o "$RT_DIR/_setjmp.o"
+if [ "$errors" -gt 0 ]; then
+  echo "[!] $errors bash source file(s) failed to compile (errors suppressed; rerun one by hand to see them)"
+fi
+
+# Link against the real MakaOS libc that build.sh puts in the sysroot (crt0 +
+# libc.a), not a private copy of a few libc files: libc is split across many
+# objects (unistd.c, tls.c, ...) and a partial copy leaves symbols unresolved.
+SYSROOT_LIB="$BUILD/sysroot/usr/lib"
+if [ ! -f "$SYSROOT_LIB/libc.a" ] || [ ! -f "$SYSROOT_LIB/crt0.o" ]; then
+  echo "[!] $SYSROOT_LIB/libc.a or crt0.o missing: run build.sh first"
+  exit 1
+fi
 
 echo "[+] Linking bash.elf"
 "$LD" -T "$USERLAND/link.ld" \
-  "$RT_DIR/_entry.o" "$RT_DIR/_libc.o" "$RT_DIR/_stdio.o" \
-  "$RT_DIR/_math.o" "$RT_DIR/_setjmp.o" \
+  "$SYSROOT_LIB/crt0.o" \
   "$OBJ_DIR"/*.o \
+  --start-group "$SYSROOT_LIB/libc.a" --end-group \
   -o "$BUILD/user_bash.elf"
 
-echo "[+] Installing bash to disk image"
-debugfs -w "$BUILD/ext2.img" -R "write $BUILD/user_bash.elf bin/bash" >/dev/null 2>&1
-debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash mode 0100755" >/dev/null 2>&1
-debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash uid 0" >/dev/null 2>&1
-debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash gid 0" >/dev/null 2>&1
-dd if="$BUILD/ext2.img" of="$BUILD/disk.img" bs=512 seek=4096 conv=notrunc status=none
+# Standalone use: refresh an existing image.  build.sh installs /bin/bash
+# itself when it assembles the image, so nothing to do if there is none yet.
+if [ -f "$BUILD/ext2.img" ] && [ -f "$BUILD/disk.img" ]; then
+  echo "[+] Installing bash to disk image"
+  debugfs -w "$BUILD/ext2.img" -R "write $BUILD/user_bash.elf bin/bash" >/dev/null 2>&1
+  debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash mode 0100755" >/dev/null 2>&1
+  debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash uid 0" >/dev/null 2>&1
+  debugfs -w "$BUILD/ext2.img" -R "set_inode_field /bin/bash gid 0" >/dev/null 2>&1
+  dd if="$BUILD/ext2.img" of="$BUILD/disk.img" bs=512 seek=4096 conv=notrunc status=none
+fi
 
 echo "[+] bash built and installed: $(stat -c '%s' "$BUILD/user_bash.elf") bytes"

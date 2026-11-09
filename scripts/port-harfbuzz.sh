@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ── MakaOS harfbuzz port (cross-g++ + sysroot) ────────────────────────
 #
-# Complex-script text shaping.  C++ library — first real test of our
-# freestanding libstdc++.  Minimal build: just the unified C++
-# aggregator (hb.cc).  No Graphite2, no ICU, no GObject.
+# Complex-script text shaping.  C++ library, built against the hosted
+# libstdc++ from scripts/build-toolchain.sh (hosted since 2867c87, so no
+# -ffreestanding: hosted headers like <cmath> refuse freestanding mode).
+# Minimal build: just the unified C++ aggregator (harfbuzz.cc).  No
+# Graphite2, no ICU, no GObject.
 
 set -euo pipefail
 
@@ -28,7 +30,6 @@ fi
 CXXFLAGS=(
     -O2 -fPIC
     -std=c++17
-    -ffreestanding
     -fno-exceptions -fno-rtti
     -Wall
     -Wno-unused-parameter

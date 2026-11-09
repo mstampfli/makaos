@@ -47,12 +47,15 @@ done
 "$REPO_ROOT/scripts/gen-pkgconfig.sh" >/dev/null
 log "done"
 
-# Freestanding libstdc++ omits the hosted C-wrapper headers
-# (<cassert>, <cstring>, ...) that harfbuzz and other C++ ports use.
-# Install our shims (scripts/cxx-shims/) into the toolchain's C++
-# include dir, which is already on g++'s default search path.
+# Legacy freestanding toolchains only: freestanding libstdc++ omits the
+# hosted C-wrapper headers (<cassert>, <cstring>, ...) that C++ ports use,
+# so our shims (scripts/cxx-shims/) filled them in.  scripts/build-toolchain.sh
+# builds a HOSTED libstdc++ since 2867c87, whose real headers must not be
+# overwritten (<string> needs the real <cstdlib>).  c++config.h says which
+# kind of libstdc++ this toolchain has.
 CXXINC="$REPO_ROOT/toolchain/x86_64-pc-makaos/include/c++/${GCC_VER:-14.2.0}"
-if [ -d "$CXXINC" ]; then
+CXXCONFIG="$CXXINC/x86_64-pc-makaos/bits/c++config.h"
+if [ -d "$CXXINC" ] && grep -q '^#define _GLIBCXX_HOSTED 0' "$CXXCONFIG" 2>/dev/null; then
     # Force-copy: some shims (cstdlib) intentionally REPLACE the
     # freestanding originals, which omit malloc/free.
     cp -f "$REPO_ROOT"/scripts/cxx-shims/* "$CXXINC/"
