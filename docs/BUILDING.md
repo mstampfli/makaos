@@ -6,6 +6,52 @@ This is the canonical guide. It was checked on 2026-11-08 by building a fresh cl
 **MakaOS is a hobby OS: not usable for real work, and insecure (see the README). Run it
 only inside QEMU, on a host you don't mind experimenting on.**
 
+## At a glance
+
+Three image sizes. All have the same kernel; they differ in userland.
+
+| Image | Build | What is in it |
+|---|---|---|
+| Minimal | `MINIMAL=1 NO_QEMU=1 bash build.sh` (about 20 s, no cross compiler) | kernel, login, `/bin/shell`, `ls`, `ps`, `cat`, `kilo` and the other core programs. No bash |
+| Base | `bash scripts/build-toolchain.sh` once, then `NO_QEMU=1 bash build.sh` (about 7 min first time, then about 25 s) | the above plus bash 5.2, all in-tree programs and libraries, the cross compiler for your own programs |
+| Desktop | Base, then the port scripts ([Desktop and JVM ports](#desktop-and-jvm-ports)) | the above plus sway, foot, Mesa, SDL, GLFW, Avian, OpenJDK, DarkPlaces. Every later `build.sh` then takes about 3.5 min |
+
+How to start it:
+
+| Command | Window | Graphics | sway | Disk writes |
+|---|---|---|---|---|
+| `./run.sh` | yes | 2D | no, text login | kept |
+| `bash scripts/boot.sh` | yes | 2D | no, text login | kept |
+| `./run-sway-gui.sh` | yes | 2D | by hand: log in, run `WLR_RENDERER=pixman sway` (software rendering; an autostarted sway needs 3D) | kept |
+| `bash scripts/run-gl-gui.sh` | yes | 3D (virgl) | with an `AUTOLOGIN=1` image (it autostarts sway) | **discarded** (`snapshot=on`) |
+| `bash build.sh` without `NO_QEMU=1` | no, serial to `build/serial.txt` | 2D | no | kept |
+
+- sway starts by itself only when the image was built with `AUTOLOGIN=1` (default
+  `AUTOLOGIN_SPEC=root:/bin/sway`). Otherwise you get a login prompt; log in as `root` /
+  `toor`. On the Desktop image you can then start sway by hand.
+- "Kept" means files you create in MakaOS are still there at the next boot.
+- **Every `build.sh` run wipes the disk**: it recreates the root file system from
+  scratch. That includes `scripts/boot.sh --build`, `scripts/run-port-chain.sh` and the
+  `AVIANTEST`/`JDKTEST` builds. Copy files back in with `scripts/diskfiles.sh` afterwards
+  ([Getting files in and out](#getting-files-in-and-out)).
+- `QEMU_AUDIO=none` silences any of the launchers; `QEMU_DISPLAY=gtk` uses a GTK window.
+
+## One-command setup
+
+From a fresh clone, on Ubuntu/Debian or WSL2:
+
+```sh
+git clone https://github.com/mstampfli/makaos.git
+cd makaos
+bash scripts/setup.sh            # cross compiler + Base image (about 8 min)
+bash scripts/setup.sh --qemu     # same, plus QEMU 9.2 when the machine has no KVM
+bash scripts/setup.sh --desktop  # same, plus all desktop and JVM ports
+```
+
+It checks the host packages first and prints the `apt install` line for anything
+missing, skips steps that are already done, and finally checks that the machine can
+boot the image. The rest of this guide describes the individual steps.
+
 ## Requirements
 
 - An x86-64 Linux host (WSL2 works). All commands run from the repo root.
@@ -33,11 +79,14 @@ sudo apt install build-essential bison flex texinfo libgmp-dev libmpfr-dev libmp
 
 - Network access on the first build: the scripts download binutils, gcc, bash and the
   base libraries into `build/third_party/`.
+- No git submodules are needed. The only one, `userland/apps/doom/doomgeneric`, is used
+  only by the optional `build_doom.sh`, which fetches it itself (not rebuilt or tested
+  since the build changes of 2026-11).
 
 ## Quick start: kernel, login and shell (no cross-compiler)
 
 ```sh
-git clone --recurse-submodules https://github.com/mstampfli/makaos.git
+git clone https://github.com/mstampfli/makaos.git
 cd makaos
 MINIMAL=1 NO_QEMU=1 bash build.sh   # 20 to 75 s from a fresh clone
 ./run.sh
@@ -111,8 +160,11 @@ NVIDIA driver of the machine it was written on. Under WSLg the QEMU window rende
 Mesa's d3d12 driver; both `sdl,gl=on` and `gtk,gl=on` work. QEMU cannot `screendump` a
 virgl display ("no surface"), so take screenshots of the host window instead.
 
-Not tested: DarkPlaces needs Quake game data that is not in the repository; LWJGL and
-Minecraft need their downloaded jars (`docs/JVM_PORT_PLAN.md`).
+DarkPlaces (Quake): `bash scripts/fetch-quake-shareware.sh` stages the freely
+redistributable shareware data; the next `AUTOLOGIN=1` build makes sway start it (`Alt+d`
+restarts it). Known problem: under sway it renders briefly, then goes black or is
+disconnected. Not tested: LWJGL and Minecraft, which need their downloaded jars
+(`scripts/fetch-minecraft.sh`).
 
 ## Logging in and checking it works
 
@@ -153,23 +205,12 @@ Without KVM, MakaOS boots under QEMU 9.0 or newer in software emulation. Checked
 2026-11-09 with QEMU 9.2.0 (`-accel tcg -cpu max,+x2apic`): the minimal image reached
 `login:` in about 4 seconds, and the full image logged in to bash 5.2.
 
-Build QEMU 9.2 into `~/opt` (about 10 minutes; `run.sh` finds it there by itself):
-
-```sh
-sudo apt install libglib2.0-dev libpixman-1-dev libslirp-dev libsdl2-dev libpulse-dev \
-  libvirglrenderer-dev libepoxy-dev libgbm-dev
-mkdir -p ~/src && cd ~/src
-curl -fLO https://download.qemu.org/qemu-9.2.0.tar.xz
-sha256sum qemu-9.2.0.tar.xz   # f859f0bc65e1f533d040bbe8c92bcfecee5af2c921a6687c652fb44d089bd894
-tar -xJf qemu-9.2.0.tar.xz && cd qemu-9.2.0
-./configure --prefix="$HOME/opt/qemu-9.2.0" --target-list=x86_64-softmmu \
-  --disable-docs --enable-slirp --enable-sdl --enable-opengl --enable-virglrenderer
-make -j"$(nproc)" && make install
-```
-
-`libslirp-dev` gives the guest networking (`-netdev user`), `libsdl2-dev` the window,
-`libpulse-dev` the sound device `run.sh` attaches, and virglrenderer/epoxy/gbm the 3D
-device (`virtio-gpu-gl-pci`) the GPU desktop needs.
+Build QEMU 9.2 into `~/opt` with `bash scripts/build-qemu.sh` (about 10 minutes; `run.sh`
+finds it there by itself). It checks the host packages first, verifies the source
+tarball's SHA-256 and configures SDL windows (GTK too when `libgtk-3-dev` is installed),
+guest networking (slirp),
+PulseAudio and the 3D device (`virtio-gpu-gl-pci`, via virglrenderer) the GPU desktop and
+the 3D ioctls need.
 
 WSL2 on AMD: Windows update KB5127648 (build 26100.9711, October 2026) silently breaks
 nested virtualization. `/proc/cpuinfo` shows no `svm`, `dmesg` shows
