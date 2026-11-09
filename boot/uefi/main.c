@@ -531,19 +531,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* ST) {
 
     serial_puts("kernel.bin size="); serial_hex(kernel_size);
 
-    /* Allocate 32 MiB window (kernel + reserved space for page tables) */
-    size_t window_pages = KERNEL_WINDOW / PAGE_SIZE;
-    EFI_PHYSICAL_ADDRESS kernel_phys = 0;
+    /* Allocate the 32 MiB window (kernel + page tables at its top) on a 2 MiB
+       boundary (the kernel is mapped with 2 MiB pages).  AllocatePages only
+       guarantees 4 KiB alignment, so allocate 2 MiB of slack and round UP:
+       [aligned, aligned + KERNEL_WINDOW) then always lies inside what we own.
+       (The old code added 0x1FFFF but masked with ~0x1FFFFF, which usually
+       rounded DOWN below the allocation; the efi_memset below then zeroed
+       foreign memory -- intermittently the loader itself, giving #UD.) */
+    const uint64_t align = 2ULL * 1024 * 1024;
+    size_t window_pages = (size_t)((KERNEL_WINDOW + align) / PAGE_SIZE);
+    EFI_PHYSICAL_ADDRESS alloc_base = 0;
     if (EFI_ERROR(BS->AllocatePages(AllocateAnyPages, EfiLoaderData,
-                                     window_pages, &kernel_phys))) {
+                                     window_pages, &alloc_base))) {
         serial_puts("FATAL: AllocatePages\n"); hang();
     }
-
-    /* Align to 2 MiB boundary */
-    uint64_t aligned = (kernel_phys + 0x1FFFFULL) & ~0x1FFFFFULL;
-    /* If alignment wasted too much, we still have room because we allocated
-       32 MiB but the kernel itself is much smaller. Accept the aligned base. */
-    kernel_phys = aligned;
+    uint64_t kernel_phys = (alloc_base + align - 1) & ~(align - 1);
 
     serial_puts("kernel_phys="); serial_hex(kernel_phys);
 
