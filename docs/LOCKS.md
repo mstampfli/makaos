@@ -4,6 +4,13 @@ Every spinlock/mutex in the kernel tree must be listed here with its
 justification. If it isn't, either it's a bug (undocumented lock) or
 the inventory is stale — either way, fix it.
 
+**Status (checked against main, 2026-11-08): the inventory is NOT
+complete.** More than 30 locks in the tree have no entry yet; they are
+listed, with a one-line summary taken from their declaration comments,
+under "Locks not yet documented here" at the end. The kernel has no
+sleeping mutex type: every "mutex" mentioned below is a `spinlock_t`.
+Every `spin_lock` also disables preemption (74c8dec).
+
 Rules for adding a new entry:
 1. **Hot path is covered by something else** (RCU, per-CPU, seqlock, atomics).
    The lock may only guard the cold control-plane path.
@@ -121,9 +128,12 @@ warmup.  Measured cross-CPU hit rate: 99.99 % (Phase 4H self-test).
 
 ## `cpu_t.rq_lock` — `kernel/proc/sched.c` (per-CPU, MAX_CPUS instances)
 
-**Guards:** one CPU's run queue (MLFQ `heads[]`/`tails[]`), sleep
-list, zombie list, and `reschedule_pending` flag. Each CPU has its
-own instance; no global scheduler lock exists.
+**Guards:** one CPU's run queue (`cpu_rq_t`: the owner side of the
+per-MLFQ-level Chase-Lev deques, plus the sleep list and zombie list)
+and the `reschedule_pending` flag. Each CPU has its own instance; no
+global scheduler lock exists. Steals (`sched_try_steal`) take tasks
+with the deque's lock-free CAS, then push them onto the thief's own
+deque under the thief's `rq_lock`.
 
 **Readers (lock-free):**
 - `pid_ht_find` — not a reader of rq state, uses RCU on a separate
@@ -132,9 +142,10 @@ own instance; no global scheduler lock exists.
   in turn because it needs to walk the lists safely. Cold path
   (only /proc enumeration and broadcast kill(-1)).
 
-**Writers:** `sched_add`, `sched_add_zombie`, `sched_reap_*`,
-`sched_wake`, `sched_sleep`, `sched_yield`, `sched_tick`, `do_switch`,
-`sched_wait_pid`, `sched_poll_pid`, `sched_has_child_zombie`.
+**Writers:** `sched_add`, `sched_add_zombie`, `sched_reap_zombie`,
+`sched_wake`, `sched_sleep`, `sched_tick`, `do_switch` (so also
+`sched_yield` / `sched_preempt`, which call it), `sched_try_steal`,
+and the zombie unlink helper (all in `kernel/proc/sched.c`).
 
 **Why a lock per CPU, not a global:**
 - The alternative (one global sched lock) would serialize every
@@ -197,11 +208,11 @@ the per-cell pixel writes that back `fb_putc_at`.
   - **Ring of "draw commands" consumed by one CPU**: serialises worse
     than just taking the lock, and complicates the panic path.
 
-**IRQ-safety:** `spin_lock_irqsave` / `spin_unlock_irqrestore`. The
-panic-print path inside `#PF` / `#GP` / `#UD` exception handlers calls
-`fb_term_putc` from IRQ/trap context — a plain `spin_lock` could
-deadlock if the holder gets interrupted by a fault that also tries to
-print.
+**IRQ-safety:** plain `spin_lock`, NOT irqsave (2ca6919). Holding a
+~2.5 MiB `fb_term_scroll` memcpy under `cli` starved this CPU's timer
+IRQ for up to ~100 ms under TCG. Panic paths do not take the lock: they
+print with `fb_panic_str`, which writes pixels directly (output may be
+briefly garbled, but nothing can deadlock).
 
 **Critical section contents:** one character's worth of
 `fb_term_putc_locked`: a few field reads/writes on `g_fb_col/row`,
@@ -225,7 +236,7 @@ across the `vmm_pte_get` walk + leaf-PTE write in `vmm_page_map` /
 PML4 mutations skip it entirely (they are serialized by their owning
 mm's `vma_lock`), so user demand-fault / CoW scalability is unaffected.
 
-**Added:** kstack-corruption fix (this branch).
+**Added:** kstack-corruption fix (ba5e1b0, 2026-06-23).
 
 **Why a lock here:**
 - User address spaces have an owner (the `mm`, with `vma_lock`); the
@@ -256,7 +267,7 @@ high-water counter `g_kstack_slots` and the recycled-slot free stack
 free stack and the counter as one unit; `kstack_free` pushes a freed
 slot back.
 
-**Added:** kstack-corruption fix (this branch).
+**Added:** kstack-corruption fix (ba5e1b0, 2026-06-23).
 
 **Why a lock here (and why recycling needs it):**
 - The previous allocator only ever did `atomic_fetch_add` on the
@@ -284,10 +295,19 @@ same-mm switches), so `kstack_alloc` calls `tlb_flush_kernel_range`
 
 ---
 
-## Planned locks (not yet added — for Phase 3–8)
+## Planned locks (the original Phase 3-8 plan)
 
 Each entry will be added as the phase lands, with the same justification
 template. This list is for tracking the *plan*, not the code.
+
+What actually landed differs in places: wait queues are MPSC as planned
+(`wait.h`, plus a `remove_lock` taken only by `wq_remove`); the slab
+depot is the single `g_pmm_lock`, not one lock per size class; the
+scheduler uses a per-CPU `rq_lock` rather than lock-free owner-only
+access; the ext2 block cache uses per-way trylock writer locks and
+reader pin counts, not a seqlock; fd tables and VMA lists use
+spinlocks (`task_files_t.lock`, `mm_t.vma_lock`), not mutexes. The
+per-inode entry under Phase 8 below does describe the current code.
 
 ### Phase 3 — Lock-free data structures
 
@@ -336,9 +356,13 @@ template. This list is for tracking the *plan*, not the code.
 - **fd table mutation:** per-task_files_t mutex. Read path is
   RCU-protected.
 - **ext2 inode lock (per-inode irtree leaf):** `inode_lock` holds the
-  leaf seqlock's embedded `write_lock` (a plain, preemptible spinlock) to
-  serialise writers of the same inode; it is held across the writer's
-  blocking disk I/O. The seqlock SEQUENCE is bumped odd ONLY by
+  leaf seqlock's embedded `write_lock` to serialise writers of the same
+  inode; it is held across the writer's disk I/O. Since 74c8dec that
+  spinlock disables preemption, so the AHCI submit path busy-polls for
+  completion instead of sleeping when called under it (b1dd61a); the
+  same holds for the per-group `s_group_locks[g]` in block/inode
+  allocation. This breaks rule 3 (tight critical section) and is
+  recorded in `docs/SCALABILITY_DEBT.md`. The seqlock SEQUENCE is bumped odd ONLY by
   `inode_pub_begin`/`inode_pub_end` around the brief in-memory publish of
   `leaf->inode` -- NEVER across I/O. Reads (`irtree_get`) are a seqlock
   retry inside `rcu_read_lock`. F135: holding the sequence odd across the
@@ -551,6 +575,12 @@ kthread, so they never contend it.
 | 8 | per-object mutexes (not global) | ~11 + per-object |
 | 9 | 1 (g_fb_lock — Phase 9-5 SMP bring-up) | ~12 |
 | 9-6 | 0 (audit only — children list Treiber stack, AHCI MPSC) | ~12 |
+| bughunt (Jun to Aug 2026) | g_kpml4_lock, g_kstack_lock, and many per-object locks (pipe, tty, pty, evdev, timerfd, io_uring, AF_UNIX, UDP, TCP pcb, shmem) | ~31 global |
+
+As of 2026-11-08 the tree holds about 31 global singleton spinlocks
+(counting the three `task_idx_t` tables), plus the per-CPU `rq_lock`,
+the per-group ext2 `s_group_locks[]`, and the per-object locks. That is
+over the "under 20" target below.
 
 After Phase 4 proper lands (post-SMP, per-CPU magazines), g_pmm_lock
 collapses to a rarely-taken depot lock and doesn't change the total
@@ -564,3 +594,65 @@ share that specific object, which is typically 1–2.
 **Target final global spinlock count: under 20.**
 Anything beyond that, I will have to justify. If it creeps higher,
 that's a design signal to step back and reconsider.
+
+---
+
+## Locks not yet documented here
+
+Found in the tree on 2026-11-08 with no entry above. The summary is
+taken from each declaration's own comment; none has been given the full
+justification template yet.
+
+Global singletons:
+- `g_pool_lock` (`kernel/crypto/random.c`) -- the CSPRNG entropy pool.
+- `s_hda_wlock` (`kernel/drivers/audio/hda.c`) -- producer side of the
+  `/dev/audio` FIFO (multi-open writers); the ISR consumer never takes it.
+- `g_i8042_lock` (`kernel/drivers/input/input_core.c`) -- the PS/2
+  controller; plain `spin_lock`, ISRs run with local IRQs off.
+- `s_ci_lock` (`kernel/drivers/storage/ahci.c`) -- the SACT|=bit / CI|=bit
+  MMIO pair in NCQ issue. (Submission itself is gated by the
+  `s_submit_busy` CAS flag, which is not a spinlock.)
+- `s_pty_lock` (`kernel/drivers/tty/pty.c`) -- pty pair lifetime vs
+  open-by-index and close.
+- `s_state_sl` seqlock (`kernel/drivers/video/drm.c`) -- DRM scanout state.
+- `s_res_rc_lock` (`kernel/drivers/video/drm.c`) -- host-resource refcount
+  hash.
+- `s_dyn_blob_lock` (`kernel/drivers/video/drm.c`) -- DRM property blob list.
+- `s_ctrl_lock`, `s_cursor_lock` (`kernel/drivers/video/virtio_gpu.c`) --
+  the virtio-gpu control queue submit+poll window, and the cursor queue.
+- `g_dcache_wlock` (`kernel/fs/dcache.c`) -- dcache writers.
+- `s_rename_lock` (`kernel/fs/ext2.c`) -- serialises every ext2 rename.
+- `s_irtree_alloc_lock` (`kernel/fs/ext2.c`) -- inode radix-tree node
+  allocation and eviction.
+- `g_clock_lock` (`kernel/mm/pcache.c`) -- the page-cache CLOCK ring.
+- `s_unix_pair_lock` (`kernel/net/unix_sock.c`) -- AF_UNIX connect pairing
+  vs close (leaf).
+- `s_tx_lock` (`kernel/net/virtio_net.c`) -- virtio-net TX ring and bounce
+  buffer.
+- `s_pid_lock` (`kernel/proc/process.c`) -- the pid allocator bitmap.
+- `s_ksec_lock` (`kernel/security/ksec.c`) -- ksec request slots.
+- `s_sfd_lock` (`kernel/io/signalfd.c`) -- the signalfd list, IRQ-safe.
+
+Per-object or per-group:
+- `s_group_locks[g]` (`kernel/fs/ext2.c`) -- one per block group, bitmap and
+  group-descriptor updates (held across polled I/O, see Phase 8 above).
+- bcache way `wlock` (`kernel/fs/ext2.c`) -- trylock-only writer lock.
+- `input_device_t.lock` (`kernel/drivers/input/evdev.h`) -- evdev client list
+  and rings, IRQ-safe.
+- `nvme_ioq.sq_lock` (`kernel/drivers/storage/nvme.c`) -- per-CPU NVMe
+  submission queue tail (guards same-CPU preemption, not contention).
+- `pty_t.master_lock` (`kernel/drivers/tty/pty.h`) -- pty master ring.
+- `tty_t.lock` (`kernel/drivers/tty/tty.h`) -- line discipline and termios
+  (see `tty_set_termios` in `docs/PRIMITIVES.md`).
+- `wait_queue_t.remove_lock` (`kernel/include/wait.h`) -- `wq_remove` only.
+- `io_uring_t.fixed_files_lock`, `.overflow_lock`, `.cq_lock`
+  (`kernel/io/io_uring.h`).
+- `mm_t.vma_lock` (`kernel/mm/mm.h`) -- VMA list writers; readers use RCU.
+- `pcache_bucket_t.lock` (`kernel/mm/pcache.c`) -- page-cache hash bucket.
+- `shmem_t.lock` (`kernel/mm/shmem.h`) -- shmem page array vs fault and
+  ftruncate.
+- `tcp_pcb_t.lock` (`kernel/net/tcp.c`) -- TCP ring accounting between the RX
+  thread and the socket syscalls.
+- `futex_bucket_t.lock` (`kernel/proc/futex.c`) -- futex hash bucket.
+- `task_files_t.lock` (`kernel/proc/process.h`) -- fd-table writers
+  (install / close / dup / grow); readers use RCU.

@@ -1,5 +1,17 @@
 # virtio-gpu 3D (virgl) bring-up plan
 
+Status (verified 2026-11-08 against main): DONE through Phase 4. Phases 0-2
+(0152728, 698d83d, bd3c28f, 0ea7fc8, 1d5d3cf), Phase 3 static Mesa + gltest
+first light, Phase 4: wlroots GLES2/GBM (2fcab8d), sway linked against the
+GLES2/virgl stack (260aca9), SDL3 GLES2/EGL (830d580) and desktop GL 3.3
+(ab7c641). Many later virgl/DRM fixes (cube maps c61e072, transfer pitch +
+host-resource refcount de1d542, scatter-gather backing e095550/aba707a). Left
+undone from the plan: the wayland-egl stubs (userland/libc/wayland_egl_stub.c)
+are still built and linked; sync_file fence FDs are not implemented; blob
+resources and venus remain out of scope. The virgl path needs the gl QEMU
+launch (scripts/run-gl.sh, scripts/run-gl-gui.sh); the "Where we are" section
+below is the pre-Mesa baseline and its file:line references are stale.
+
 Accelerated OpenGL for MakaOS: turn the working 2D KMS stack into a real
 GL-capable stack via virtio-gpu's 3D (virgl) path, so the compositor can use a
 GLES2 renderer and SDL/apps get hardware GL instead of software rasterisation.
@@ -41,7 +53,7 @@ anywhere" and "2D only", read Phase 3 for the current state.
   hard-patches `drmGetRenderDeviceNameFromFd` to NULL (marker
   `MAKAOS_NO_RENDER_NODE`).
 - QEMU is launched with plain `-device virtio-gpu-pci` (no `gl=on`), see
-  `build.sh` / `scripts/run-sway-gui.sh`.
+  `build.sh` / `run-sway-gui.sh` (repo root).
 
 ## Target architecture
 
@@ -227,7 +239,7 @@ winsys, producing `libgbm`, `libEGL`, `libGLESv2` (and `libGL`).
   chunk; expect toolchain/dependency friction).
 - Effort: very large (own multi-session sub-project).
 
-STATUS (in progress):
+STATUS: DONE (3a/3b/3c below).
 
 3a/3b DONE -- the static Mesa GL stack BUILDS and installs on MakaOS:
 libEGL.a, libGLESv2.a, libgbm.a, libglapi.a, and libgallium_dri (a static
@@ -284,7 +296,8 @@ ext2 open(O_CREAT) hang (ext2 alloc/writeback held spinlocks across block I/O
 whose completion wait sched_sleep'd, a silent panic since 74c8dec made spinlocks
 disable preemption; fixed in ahci.c AHCI_WAIT, which busy-polls when preempt is
 disabled).  NEXT: propagate the Mesa-GL link fragment to port-sway.sh /
-port-dwl.sh, then SDL3's GL path.
+port-dwl.sh, then SDL3's GL path.  (Done for sway in 260aca9 and SDL3 in
+830d580/ab7c641; dwl was not converted.)
 
 DONE earlier this pass:
 - Feasibility CONFIRMED from Mesa 24.0.9 source: a fully STATIC virgl+EGL+GBM+
@@ -342,6 +355,9 @@ BLOCKER (hard prerequisite, own sub-project) -- HOSTED libstdc++:
   planned, deliberate future change (do it, then rebuild every port); it is out
   of scope for the Mesa bring-up, which only needs the isolated libstdc++-v3
   build that never rebuilds libgcc.
+  UPDATE: errno is now the POSIX macro `(*__errno_location())` in
+  userland/libc/include/errno.h, done ABI-preserving (5365e89) without a full
+  re-port.
 
 ### Phase 4 - wire the clients
 

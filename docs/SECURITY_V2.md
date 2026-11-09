@@ -1,5 +1,33 @@
 # MakaOS Security v2 — Capability-First Architecture
 
+> **MakaOS is not secure.** It is a hobby OS: not audited, not hardened, and
+> not fit for real use or real data. This document is a design that has not
+> been built. Nothing in it describes how MakaOS behaves today.
+
+Status (verified 2026-11-08 against main): DESIGN ONLY, nothing of v2 is
+implemented. There is no `cap_ctx`, no `task_identity_t` /
+`task_set_identity`, no syscall-entry capability gate, no mount namespaces or
+per-app filesystem views, no per-app UIDs, no manifests, no
+`KSEC_OP_INSTALL_APP` / `KSEC_OP_BROKER_CONNECT`, no D-Bus resolver.
+
+What exists today is the v1 Linux-shaped model, and it is weak:
+- POSIX uid/gid credentials (kernel/security/cred.h) with root (uid 0) as
+  all-powerful; setuid exec arbitrated by ksec v1 (see KSEC.md for its gaps:
+  not started at boot, policy path ignored, no `/run/ksec`).
+- ext2 file permissions have only been enforced since 34e1c6b (2026-08-13).
+  Before that every user could read /etc/shadow and write /etc/passwd (a
+  two-step local root); the same commit added a credential check to reboot.
+  Passwords in /etc/shadow are plaintext (per KSEC.md).
+- Per-fd rights bitmask (kernel/security/rights.h), OpenBSD-style `pledge` /
+  `unveil` (kernel/security/pledge.c, unveil.c), a DRM render-node ioctl
+  allowlist (34e1c6b), SMEP and NX. No ASLR: PIE executables load at a fixed
+  base (VMM_USER_CODE_BASE in kernel/proc/elf.c).
+- `SO_PEERCRED` is faked in libc: every AF_UNIX peer reports uid 0
+  (userland/libc/sys_socket.c; SCALABILITY_DEBT.md #3), so no service can
+  authenticate a local caller.
+- No security audit has been done; the "stable kernel" gate in section 9 has
+  not been declared met.
+
 **Status:** Forward-looking design.  Do NOT implement yet.  The current
 system (v1) stays in place — current `ksec` (KSEC.md) continues to
 serve as the setuid/escalation arbiter until the kernel is stable.
@@ -167,7 +195,11 @@ resource-fd grants, user-consent flows, and manifest registration.
 
 ### 3.2  What's kept from v1
 
-The structural bones transfer cleanly:
+The structural bones transfer cleanly (note, 2026-11-08: only the pipe
+protocol and the `granted_rights` response field exist in v1 today; the
+`/run/ksec` socket, SO_PEERCRED identification, SCM_RIGHTS resource-fd grants,
+the drop-in directory, `ksecctl`, SIGHUP reload and password/timed auth are v1
+design that was never built, see KSEC.md):
 
 - Userland daemon running as a dedicated UID, kernel enforces mechanism.
 - Pipe-based kernel↔ksec protocol with seq numbers, fixed-size packed
@@ -400,7 +432,8 @@ rebuilding setuid binaries or restoring the old exec path.
 
 ## 8. Selling-point framing
 
-Marketing / external-facing description of v2 (for when it ships):
+Marketing / external-facing description of v2 (for when it ships; none of
+this is true of MakaOS today, do not quote it as a current property):
 
 > MakaOS ships with per-app isolation by default.  Every installed app
 > has its own UID, its own filesystem view, and its own set of

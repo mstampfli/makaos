@@ -1,5 +1,26 @@
 # Porting a JVM to MakaOS — plan
 
+Status (verified 2026-11-08 against main):
+- Phase 0 (SA_SIGINFO/ucontext, pthread_kill, sigaltstack): DONE (fc475b2,
+  27afb67, e2c82c7, 43c410c; see the 2026-07-11 update below). Phase 0 item 2 is
+  only partly met: `mprotect` is a libc stub (userland/libc/jdk_compat.c, no
+  SYS_MPROTECT), and realtime signals 32-63 are accepted as no-ops (5473acc;
+  the kernel still has NSIG=32).
+- Phase 1 (Avian Hello World): DONE (46f31ef, scripts/port-avian.sh).
+- Phase 2 (OpenJDK 17 Zero): DONE. `java -version` and `java Hello` run;
+  recipe in scripts/port-openjdk.sh (d51264e), boot harness JDKTEST=1 (cafa1ba),
+  multi-GB heap (6cc0937). Built as a "linux-family" target against MakaOS libc,
+  not via a separate os_makaos.cpp as planned below.
+- Phase 3 (HotSpot JIT): PARTLY. build.sh can stage a JDK_VARIANT=server build
+  (its recipe is NOT in port-openjdk.sh, which only builds Zero). Per the build.sh
+  Minecraft launch comments, C1 runs; C2 miscompiles java.util.HashMap.resize,
+  so the launch is capped at -XX:TieredStopAtLevel=1. Not independently verified.
+- Phase 4 (completeness): ongoing. LWJGL 3.3.3 desktop GL via GLFW-Wayland
+  works (37b69cb); glibc-ABI compat for prebuilt glibc-linked .so's (LWJGL
+  natives, some JDK libs) and a Minecraft launcher (MCTEST=1, McLaunch) landed
+  in c6252b3. Whether Minecraft reaches a playable state is not recorded:
+  unverified.
+
 Goal: run real Java on MakaOS. MakaOS has a **custom syscall ABI** (write=0,
 exit=1, ... — not Linux-numbered), so the JVM is **ported from source** against
 MakaOS's Linux-flavored libc, exactly like every other port. We are NOT running
@@ -151,7 +172,8 @@ under a `SIGTEST=1` boot). Next is Phase 1 (Avian first-light).
 The JVM runs end to end: it loads and links classes from classpath.jar, runs the
 bytecode interpreter, and executes `Hello.main`, which prints
 `Hello from Avian JVM on MakaOS` and continues cleanly. Boot the AVIANTEST image
-at **-m 1024M** (MakaOS hangs very early at 2048M, a separate RAM-size bug).
+at **-m 1024M** (MakaOS hangs very early at 2048M, a separate RAM-size bug;
+that bug was fixed later in 856bbaa, the UEFI loader now identity-maps all RAM).
 
 Three fixes past the "JVM starts but no main" state:
 

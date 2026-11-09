@@ -1,5 +1,32 @@
 # Session 2026-06-11 — sway on MakaOS
 
+> **What this is:** a dated session record (2026-06-11/12), kept for
+> history. It is not current documentation; build and test commands below
+> describe that session and may be out of date. Nothing here is a security
+> claim: MakaOS is a hobby OS and is NOT secure.
+>
+> **Open items from this record, checked 2026-11-08 against main @ ebe8a14**
+> (code/history check only; nothing was run):
+> - foot window not presenting under sway, foot font-loader SIGSEGV: fixed
+>   later in this same record (sections 8 and 10).
+> - `on_cpu` steal gate (section 9, "reverted, known debt"): re-landed as an
+>   on_cpu handshake in sched.c (ded5751, a3b0d0c, fd90406, 2026-06-23;
+>   reworked in b183a70).
+> - ext2 spinlocks held across sleeping disk I/O (section 11): the per-inode
+>   seqlock part is fixed (F135, 1f47765); `s_rename_lock` is still a spinlock
+>   held across directory I/O in ext2_rename (open).
+> - io_uring_register doing kmalloc + copy_from_user under the
+>   `fixed_files_lock` irqsave spinlock (section 11): still open.
+> - swaybar/swaynag: enabled (`-Dswaybar=true -Dswaynag=true` in
+>   scripts/port-sway.sh, e79b1dc), though that script's header comment
+>   still says otherwise.
+> - glob in wordexp: still not implemented (wordexp.h says no globbing).
+> - Zombie reaping (exec children, kernel thread tasks): thread exit/reap was
+>   reworked later (F57, F66 in docs/AUDIT_FINDINGS.md); not re-tested.
+> - First-frame-black presentation quirk, the one-off `free_list_pop` #GP,
+>   `wmenu-run` on the image: not verified.
+> - `CLAUDE.md` (section 8) no longer exists in the repo.
+
 Goal given: *"fix the issue that sway won't run, then keep making the
 kernel better."*  Status at the end of the session:
 

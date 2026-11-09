@@ -1,5 +1,30 @@
 # MakaOS autonomous fix log
 
+> **What this is:** a dated, append-only log of an autonomous fix loop
+> (2026-06-15 to 2026-07-02), first on an `autofix` branch, later on
+> `bughunt` (merged to main 2026-11-08). It is a history record, not current
+> documentation. Statements such as "the OS is healthy", "POSIX-conformant",
+> "audited CLEAN" or "no bug remains" describe what that loop observed at
+> the time. They are not security claims: MakaOS is a hobby OS and is NOT
+> secure (see the 2026-11-08 status block in `docs/AUDIT_FINDINGS.md` for
+> findings still open on main).
+>
+> **Checked 2026-11-08 against main @ ebe8a14:**
+> - Commit hashes cited in the early iterations (up to about the 2026-06-24
+>   entries; e.g. b00dfe2, d00e0d1, 809127d, 981324f, c8f963d) are from the
+>   pre-merge `autofix` branch and do not exist in this repository's
+>   history; the changes reached main under other hashes.
+> - The backlog items (desktop presentation stall, slab_test corruption) are
+>   marked resolved by the log itself (2026-06-23 summary); not re-tested.
+> - The final "open follow-ups" (F201 vfs_anon_fd, F202 elf_build_task) are
+>   done: both helpers exist on main (f7fd65b, 1d980a9).
+> - F1-F171 entries here mirror `docs/AUDIT_FINDINGS.md`; use that file for
+>   per-finding status. F172-F202 (the DRY and primitive-adoption sweeps,
+>   2026-07-01/02) are recorded only in this log and were not re-verified.
+> - Build/test commands quoted in the entries (`SELFTESTS=1`,
+>   `CONSOLE_SERIAL=1`, `AUTOLOGIN_SPEC=...`, `/tmp/*.sh` helper scripts,
+>   QEMU memory sizes) reflect that session and are not maintained here.
+
 Branch: `autofix` (off `main` @ b00dfe2). The loop never touches `main`; the
 user reviews this branch and merges what they trust. Each cron fire appends a
 dated one-line note below for continuity.

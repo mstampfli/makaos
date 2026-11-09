@@ -1,5 +1,13 @@
 # DRY consolidation phase -- sweep-1 plan (2026-07-01)
 
+Status (verified 2026-11-08 against main): DONE (e.g. ba54a02, 5df5c58,
+8153c4a, e6df157). Every primitive the units introduced is still on main
+(tty_set_fg_pgrp, transport_checksum, virtio_pci.h, uaccess.h, ilist.h, kstr.h,
+pci_find_cap, page_align_up, vfs_alloc_file, path_split, ...). Follow-ups still
+open: the elf_load / elf_load_with_argv duplication in kernel/proc/elf.c
+(U-elf-unwind), and lru_push_head_locked in kernel/fs/dcache.c is still dead
+code. This is a historical record; the "pending" label below is stale.
+
 ## SWEEP 1 COMPLETE (F172-F194, 2026-07-02)
 All units below are marked [DONE] or [SKIPPED, verified]. 21 consolidations
 shipped + 1 shipped security fix (F172) + the DHCP-flake root fix (F183/F185)
@@ -19,7 +27,7 @@ treating it as a bug.
 - F172  console tcsetpgrp/TIOCSPGRP signal-hijack (real bug) -> one tty_set_fg_pgrp SSOT.
 - F173  preempt_enable_no_resched() SSOT (10 sites).
 
-## Confirmed units (ranked value/risk), pending
+## Confirmed units (ranked value/risk), all done or verified-skipped
 HIGH value, LOW risk:
 - U-checksum [F178 DONE] transport_checksum() was __attribute__((unused)) while its body was copy-pasted 5x (udp recv+send, tcp send-seg+send-rst+recv-validate). Verified 4/5 byte-identical (same inet_pseudo_partial + word-sum + odd-byte fold + ~sum); tcp_send_rst OMITTED the `if(l) sum+=*(u8*)pw` odd-byte fold -- but RST is header-only (TCP_HDR_MIN_LEN=20, EVEN), so `l` is always 0 there and the omission never fired (latent-harmless). Made transport_checksum extern (dropped unused+static), declared in ipv4.h, routed all 5; the rst fix is by-construction (adds the dead-for-RST fold for consistency). NET gate: DHCP + tcp selftests PASS.
 - U-virtio-cap [F177 DONE] find_virtio_cap + vcap_t + virtio_pci_common_cfg_t + the generic transport macros (VIRTIO_VENDOR, VIRTIO_PCI_CAP_* 1-5, VIRTIO_STATUS_* x5, VIRTIO_F_VERSION_1) were triplicated across virtio_net/gpu/input -- verified byte-identical (find_virtio_cap same logic, common_cfg field-identical). Extracted to new kernel/drivers/pci/virtio_pci.h (header-only, find_virtio_cap is static inline -> no new .c/build change); removed all 3 local copies. Device-specific constants (VIRTIO_DEV_*, per-device feature bits, GPU cmd opcodes, VTI_CFG_*, DRIVER_FEATURES) stay per-driver. Boot-critical: virtio-net DHCP + virtio-gpu init + virtio-input all exercised at boot = the gate.

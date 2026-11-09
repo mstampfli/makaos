@@ -6,6 +6,10 @@ use instead of re-deriving the same logic. The goal: each recurring concern has
 source of truth -- so a whole class of bug cannot reappear and the code reads
 the same everywhere.
 
+Scope note: each primitive closes one named bug class at the sites that use it. That
+is not a security claim about the system. MakaOS is a hobby OS, has not been
+security-reviewed as a whole, and is not safe for real use or untrusted users.
+
 ## The rule (applies to all new code, and to every conversion sweep)
 
 1. **Reuse before reinvent.** Before writing a check, a copy, a ring, a refcount
@@ -21,7 +25,11 @@ the same everywhere.
 ## Where primitives live (placement + marking)
 
 There is NO single catch-all primitives header. A primitive lives next to what it
-serves, and every primitive is tagged so it is greppable (`grep -rn PRIMITIVE`):
+serves, and every primitive is meant to be tagged so it is greppable (`grep -rn PRIMITIVE`).
+As of 2026-11-08 about 20 are tagged; many cataloged below are not yet (for example
+`copy_from_user`, `copy_sockaddr_un_from_user`, `tcp_ring_consume`, `fd_table_clone`,
+`fd_install_cloexec`, `ext2_dir_write_ok`, `PMM_ALLOC_OK`, `UDP_MAX_PAYLOAD`), so this
+catalog, not the grep, is the complete list:
 
 - **Cross-cutting generics with no single domain** (checked arithmetic + bounds:
   `ckd_mul`/`ckd_add`, `index_ok`, `in_range`) live in one small focused header,
@@ -61,12 +69,25 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   no-u32-wrap check. Reused by ahci `xfer_bytes_ok` + nvme_rw (single source).
 - Test: `checked_selftest` (kernel/main/checked.c), wired in kernel/main.c.
 
-### B. User memory (the syscall boundary) -- `kernel/syscall/syscall.c`
+### B. User memory (the syscall boundary) -- `kernel/include/uaccess.h` + `kernel/syscall/syscall.c`
+`_access_ok` is defined inline in `uaccess.h` (shared with the signal path, 606646c);
+`copy_from_user` / `copy_to_user` / `user_buf_check` are declared there and defined in
+`syscall.c`.
 - `copy_from_user(dst, uptr, len)` / `copy_to_user(uptr, src, len)` -- validated
-  byte copy (`_access_ok` + VMA-checked prefault; never a raw deref).
+  byte copy (`_access_ok` + VMA-checked prefault; never a raw deref). The copy itself
+  is `__uaccess_copy` (syscall.c), a `rep movsb` registered in the fault-fixup table,
+  so a fault on a bad or concurrently unmapped user page returns -EFAULT instead of
+  panicking (b183a70; see the extable entry below).
+- Fault-fixup table: `_ASM_EXTABLE(insn, fixup)` + `extable_fixup(rip)`
+  (`kernel/include/extable.h`, `kernel/arch/x86_64/extable.c`, b183a70). The page-fault
+  handler (`isr14_page_fault`) looks an otherwise unrecoverable kernel-mode fault's RIP
+  up in `__ex_table` and resumes at the fixup. Today only `__uaccess_copy` is
+  registered, so any OTHER raw kernel access to user memory still panics on fault (the
+  direct-deref paths behind `user_buf_check` / `user_buf_readable_ok` say so in their
+  comments).
 - `copy_path_from_user(dst, uptr, dstsz)` -- NUL-terminated path, page-granular,
-  no over-read; returns length / -EFAULT / -ENAMETOOLONG (F39). To be generalized
-  to `copy_str_from_user` during the sweep.
+  no over-read; returns length / -EFAULT / -ENAMETOOLONG (F39). It stays the named
+  path copy (no `copy_str_from_user` rename; see below).
 - `_access_ok(addr, len)` / `user_buf_check(addr, len)` -- validate a user range
   the kernel will deref DIRECTLY (range-check + prefault), w/o copying. USE this for
   any syscall arg the kernel reads/writes through a raw pointer instead of copy_*_user
@@ -80,6 +101,9 @@ Pure, inline, zero-cost. Safety delegates to the compiler overflow builtins.
   userspace.  `user_buf_prefault` itself is now overflow-safe (F52): it iterates by
   page COUNT, so a huge len can no longer wrap its bound, skip the loop, and return
   "ok" without validating anything (which defeated sys_read -> read(sockfd, KADDR, ~0)).
+  `_access_ok` also rejects every address above `USER_ADDR_MAX` (0x00007FFFFFFFFFFF,
+  common.h), i.e. the kernel half AND the non-canonical gap (6c36d68), so a
+  non-canonical pointer returns -EFAULT instead of #GP-ing the kernel.
   `_access_ok` and `mmap_round_len` now fold their addr+len / len+PAGE_MASK wrap
   guards onto `ckd_add_u64` (category A) -- the F19/F24 overflow class, exactly the
   use ckd_add documents. Direct `access_ok_selftest` covers the wrap branch that
@@ -234,6 +258,13 @@ New domain primitive (not a fold -- correct WIDTH, no checked-arith primitive ne
   underflowed `rec_len - actual_len` and split-wrote past the 4096-byte heap block
   (heap OOB write). Mirrors the read-side ext2_dirent_namelen_clamp.
   `ext2_dirent_in_block_selftest` drives the underflow / past-block / rec<8 rejects.
+- `ext2_group_geom_valid(blocks_per_grp, inodes_per_grp, block_size)` (kernel/fs/ext2.c,
+  7b5e488) -- rejects superblock group geometry whose per-group block or inode count is
+  zero or exceeds the bits in one bitmap block (block_size*8), which would run the
+  bitmap scans past the 4096-byte scratch. Checked at mount; `ext2_group_geom_selftest`.
+- `virtio_rx_id_valid(id)` (kernel/net/virtio_net.c, 6c0bae1) -> `index_ok(id,
+  VIRTQ_NUM_RX_BUFS)`: tighter than `virtio_desc_id_valid` because an RX completion id
+  also indexes the populated `s_rx_bufs[]`. `virtio_rx_id_valid_selftest`.
 
 ### F. Allocation-result sentinels (test the RIGHT failure value)
 A fallible allocator whose failure value is NOT 0 must be tested against its actual
@@ -244,7 +275,7 @@ memset / a wild DMA base programmed into a device). One named test closes the cl
 - `PMM_ALLOC_OK(p)` := `((p) != PMM_INVALID_ADDR)` (kernel/mm/pmm.h, F121) -- the
   canonical "is this pmm_buddy_alloc / vmm_alloc_pml4 result a VALID frame" test.
   Documented in-header with WHY `!phys`/`==0` is wrong. Used at EVERY driver
-  DMA-init alloc site (ahci/hda/ac97/virtio_gpu/virtio_input, 20 sites); mm/** and
+  DMA-init alloc site (ahci/hda/ac97/virtio_gpu/virtio_input, 23 sites as of 2026-11-08); mm/** and
   io_uring/drm/nvme use the equivalent explicit `== PMM_INVALID_ADDR`. RULE: any new
   pmm_buddy_alloc / vmm_alloc_pml4 caller gates the result through PMM_ALLOC_OK (or
   the explicit `== PMM_INVALID_ADDR`) -- NEVER `!phys`, and NEVER narrow to a
@@ -404,13 +435,35 @@ reader must take the SAME lock, or it can catch the assignment mid-flight.
   a `reaped` flag (complete commits only if !reaped; reap claims only if not completed) so neither frees/queues a
   resource the other owns (no UAF).
 
+### H. Shared helpers from the July 2026 DRY sweep (one copy each, not `PRIMITIVE`-tagged)
+Plan and per-unit record: `docs/DRY_SWEEP1_PLAN.md`.
+- `FIFO_ENQUEUE_TAIL` / `FIFO_DEQUEUE_HEAD` (`kernel/include/ilist.h`, 455c583) -- the
+  intrusive singly-linked FIFO used by the udp_rx, unix-dgram, unix-accept and
+  io_uring-overflow queues (owns the reset-tail-on-last-dequeue invariant).
+- `str_eq` / `str_len` / `str_lcpy` / `path_split(path, parent_out, cap)`
+  (`kernel/include/kstr.h`, 80e329c / 5e29f77) -- kernel string helpers; `path_split`
+  takes an explicit capacity.
+- `page_align_up` / `page_align_down` (`kernel/include/common.h`, d81da3b).
+- `USER_ADDR_MAX` / `USER_ADDR_CEIL` (`kernel/include/common.h`, 91c4806) -- the one
+  definition of the 2^47 user-VA boundary.
+- `pci_find_cap` (`kernel/drivers/pci/pci.h`, 99cdc15) -- bounded PCI capability walk.
+- `kernel/drivers/pci/virtio_pci.h` (067e92e) -- the shared virtio-PCI transport header.
+- `inet_checksum` / `transport_checksum` (`kernel/net/ipv4.h`, fe7faae).
+- `vfs_alloc_file` / `vfs_anon_fd` (`kernel/fs/vfs.c`, 5df5c58 / f7fd65b) -- the fd
+  file allocation paths (eventfd / signalfd / timerfd use `vfs_anon_fd`).
+- `resolve_at_path` (`kernel/syscall/syscall.c`, cc7bf85) -- cwd-relative path
+  resolution for the path syscalls.
+- `tty_is_background` (`kernel/drivers/tty/tty.c`, 7446be3) -- the job-control
+  background-pgrp predicate.
+- `preempt_enable_no_resched` (`kernel/include/preempt.h`, 757412a).
+
 ## Status
 
 Phase 2 (the primitive-extraction phase): category A landed (cfbc0f6); D's device
 + on-disk index/run validators folded onto A (a1509ff); B's user-range overflow
 guards (`_access_ok` / `mmap_round_len`) folded onto `ckd_add_u64` + direct
 `access_ok_selftest` (89c3fb2); F46 added `ext2_blk_lba` (u64 LBA, fixed a real u32
-wrap bug) (this commit). Verified NOT foldable / correct-by-construction (kept as-is,
+wrap bug) (7c9f801). Verified NOT foldable / correct-by-construction (kept as-is,
 do not retry): `drm_dumb_size` (F23, DRM_MAX_FB_DIM policy cap + u64 math, not a
 hand-rolled overflow check); `drm_atomic_count_ok` (F40, inclusive `<= MAX`, index_ok
 would be off-by-one); `io_uring compute_layout` (clamps entries to IO_URING_MAX_ENTRIES

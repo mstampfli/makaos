@@ -7,6 +7,34 @@ How to diagnose bugs in MakaOS and systems-level C/NASM code.
 Companion to `CODE_STYLE.md` (how code looks), `PRINCIPLES.md` (how
 code is built), and `MAKAOS.md` (project-specific context).
 
+### What exists today
+
+This document is the target. The kernel implements part of it:
+
+- **Logging (§2):** `kernel/include/log.h` (`pr_info`/`pr_warn`/
+  `pr_err`/`pr_crit`/`pr_debug`, the §2.1 prefix, an in-memory ring).
+  Most kernel output still goes through raw `kprintf`/`serial_puts_dbg`
+  without the structured prefix. `CONFIG_DEBUG` defaults to 1 and no
+  build sets it to 0: there is no release build yet, so "compiled out
+  in release" is not exercised.
+- **Panic (§3):** `kernel/debug/panic.c` does cli, halts other CPUs by
+  IPI, dumps CPU state, backtrace, current task, log ring and trace
+  ring, then hangs. It does **not** dump lock state (§3.2 item 5).
+- **Tracing (§4):** `kernel/include/trace.h` has a per-CPU ring
+  (`trace_emit`, `trace_ring_dump`), but there is no `TRACE_POINT`
+  macro and no kernel code calls `trace_emit` yet, so the ring is empty.
+- **Stack walking (§5):** frame-pointer walker with symbol lookup
+  (`kernel/debug/stackwalk.c`, kernel built with
+  `-fno-omit-frame-pointer`), output `<function>+<offset>` only. No
+  DWARF fallback.
+- **Assertions (§7):** `ASSERT`/`ASSERT_CRIT` in
+  `kernel/include/assert.h` as described.
+- **Memory debugging (§8):** no allocator poisoning, no redzones, and
+  no sanitizer builds exist.
+- **Self-tests:** opt-in with `SELFTESTS=1 bash build.sh`
+  (`-DMAKAOS_BOOT_SELFTESTS`); they run at boot and print PASS/FAIL to
+  serial.
+
 ---
 
 ## 1. The workflow
@@ -290,7 +318,10 @@ This path is fast enough to run inside a panic handler.
 
 ### 6.1 Launching
 
-QEMU with:
+`run.sh` and `build.sh` already start QEMU with `-gdb tcp::1234` (the
+same as `-s`), so you can attach to a running guest at any time; `./gdb.sh`
+does it for you. To stop at the very first instruction instead, add `-S`
+(pause at start, wait for GDB) to the QEMU command line:
 
 ```
 qemu-system-x86_64 ... -s -S
@@ -324,8 +355,9 @@ gdb build/kernel.elf
 
 ### 6.3 QEMU monitor
 
-Enter the monitor with `Ctrl-a c` in a text console, or use
-`-monitor stdio` / `-monitor telnet::45454,server,nowait`.
+`run.sh` exposes the monitor on a Unix socket: `nc -U /tmp/qemu-hmp.sock`.
+(`build.sh`'s headless boot uses `-monitor none`.) For your own QEMU command
+lines, `-monitor stdio` or `Ctrl-a c` in a text console work too.
 
 Useful commands:
 

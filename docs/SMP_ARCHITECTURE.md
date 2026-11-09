@@ -9,6 +9,44 @@
 
 The design is walked through subsystem by subsystem. Each picks the technique and justifies it.
 
+This file is the April 2026 design plan. The code diverged from it in places; where it
+does, the code (and `LOCKS.md`) is authoritative.
+
+### Where the implementation differs from this plan (checked against main, 2026-11-08)
+
+- **Spinlocks** (`kernel/include/smp.h`, types in `spinlock_types.h`): CAS test-and-set
+  with a `pause` spin, and every `spin_lock` also raises `preempt_depth`, so a spinlock
+  section is non-preemptible by construction (74c8dec). `this_cpu()` is one
+  `mov %gs:0` load of a self-pointer at offset 0 of `cpu_t`, not an `rdmsr`.
+- **Scheduler**: each CPU's run queue is an MLFQ of Chase-Lev deques (one per level,
+  `cpu_rq_t` in `kernel/include/cpu.h`) plus a sleep list and a zombie list, guarded by
+  a per-CPU IRQ-safe `rq_lock`. Steals use the deque's lock-free CAS, then push locally
+  under the thief's `rq_lock`. Cross-CPU wakes take the target CPU's `rq_lock`; there is
+  no lock-free MPSC mailbox. So the scheduler common path does take a (per-CPU,
+  normally uncontended) lock.
+- **Slab**: a SLUB-style per-CPU slot per size class (10 classes), popped and pushed
+  with one `cmpxchg16b` on `{freelist, tid}` (`kernel/mm/slab_pcpu.c`). The depot is
+  the single `g_pmm_lock`, not one lock per size class.
+- **pcp**: 64 order-0 frames per CPU (`SLAB_PCPU_PCP_DEPTH`), `cmpxchg16b` on
+  `cpu_t.pcp_hdr` (`kernel/mm/pcp.c`), as planned.
+- **Hazard pointers**: not used anywhere. The fd table is RCU-published (`task_files_t.ft`)
+  with a per-table spinlock for writers.
+- **Wait queues**: MPSC as planned (`kernel/include/wait.h`: CAS push, `xchg` drain, a
+  `remove_lock` only for `wq_remove`).
+- **ext2 block cache**: NOT a seqlock. Each way has a trylock-only writer lock plus an
+  atomic reader pin count. The seqlock is used for the ext2 in-memory inode cache
+  (`irtree` leaves) and the DRM scanout state instead.
+- **pgid/tgid/sid index**: walked under a per-table IRQ-safe spinlock, not RCU (see
+  `LOCKS.md`, `task_idx_t.lock`).
+- **Signal handlers**: one refcounted `sighand_t` shared per process (27afb67), not a
+  per-task RCU table.
+- **VMA list**: RCU readers, writers under the per-mm `vma_lock` spinlock (not a mutex).
+- **System clock**: no seqlock. **Timer wheel**: none; timeouts use the per-CPU sleep
+  lists and timerfd keeps per-CPU sorted lists (`kernel/io/timerfd.c`).
+- **Lock count**: the tree has far more locks than this plan anticipated (about 30
+  global singletons plus many per-object locks added by the June 2026 bughunt). See
+  `LOCKS.md`.
+
 ---
 
 ## Layer 0 — SMP primitives (`smp.h`, real implementations)
@@ -362,7 +400,9 @@ Strict order so every phase is testable independently. Each phase boots and pass
 - Locks only on mutation paths
 - RCU for reads
 
-**Phase 9 — AP boot** (in progress — 9-1 through 9-4c done)
+**Phase 9 -- AP boot** (9-1 through 9-7 done, 9-8 open). The
+PHASE9_HANDOFF.md and SMP_KNOWN_RACES.md files cited below were deleted in
+81fec8e (2026-04-19); read them from git history.
 - 9-1 ✅ per-CPU `cpu_t` + `%gs:0` self-pointer + one-insn `this_cpu()`
 - 9-2 ✅ ACPI MADT parse → `g_acpi.cpus[]` + RSDP via UEFI config table
 - 9-3 ✅ x2APIC rewrite of `lapic.c`, IPI vectors 0x40/0x41/0x42 reserved,
@@ -430,8 +470,20 @@ Strict order so every phase is testable independently. Each phase boots and pass
                           sys_exec and task_mm_release also not wired
                           (sole owner on those paths; cpumask already
                           zero by the time the pml4 is freed).
+          Later corrections (bughunt, June to Aug 2026): the "not wired"
+          reasoning above was wrong for multithreaded processes.  Now
+          also shot down: the CoW break in isr14_page_fault and in
+          vmm_get_user_pages (db95c23), fork and spawn after the
+          parent's pages are write-protected (tlb_flush_mm), brk shrink
+          before freeing frames (f9e67c4), and recycled kernel-stack
+          slots (tlb_flush_kernel_range).  exec no longer frees the old
+          page tables under sibling threads (9879052).  A CPU waiting
+          for shootdown ACKs now drains its own incoming shootdown queue,
+          which fixed a two-CPU deadlock with IRQs off (b183a70).
 - 9-8 ⏳ multi-CPU soak: `stress -c 4`, per-process DOOM, cross-CPU
-          signals, cleanup of any "Phase 9 TODO" comments.
+          signals, cleanup of any "Phase 9 TODO" comments.  Not formally
+          done; the June 2026 bughunt fixed many SMP races found under
+          load instead (see docs/AUDIT_FINDINGS.md, docs/AUTOFIX_LOG.md).
 
 ---
 
@@ -444,7 +496,7 @@ Strict order so every phase is testable independently. Each phase boots and pass
 - **fb_term_scroll**: already `rep movsb`, unchanged.
 - **ext2 bcache hit**: ~100 ns (seqlock read + memcpy) vs a mutex version at 500+ ns.
 
-No hot path takes a lock. Anywhere contention matters, the architecture either splits the data per-CPU or uses RCU/seqlock for reads.
+None of these numbers has been measured. The goal was that no hot path takes a lock; in the code today the allocator fast paths and the read-mostly tables meet it, but the scheduler (per-CPU `rq_lock`) and most per-object data paths (pipes, TCP rings, AF_UNIX queues, ttys) take a spinlock.
 
 ---
 

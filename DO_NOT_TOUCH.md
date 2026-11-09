@@ -1,7 +1,7 @@
 # MakaOS Development Rules
 
 ## File reading
-Always use Bash to read files. Never use the Read or Explore tools — all kernel source files are too large and will cause an internal error.
+Always use Bash to read files. Never use the Read or Explore tools: the largest kernel sources (`kernel/syscall/syscall.c` ~7200 lines, `kernel/drivers/video/drm.c` ~3900, `kernel/fs/ext2.c` ~3600) are too large to read whole and have caused internal errors.
 
 ## Running builds
 Always run builds (`./build.sh`, `./run.sh`, `scripts/build-toolchain.sh`, any long compilation) with `run_in_background: true` and attach the `Monitor` tool to stream stdout. Never run a build as a foreground Bash call with a long timeout — it blocks the conversation and wastes tokens on tail output.

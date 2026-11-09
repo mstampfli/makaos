@@ -1,5 +1,22 @@
 # SESSION 2026-06-27 -- bughunt campaign (SCANs #13-#20, F135-F158)
 
+> **What this is:** a dated session record from 2026-06-27, kept for history.
+> It is not current documentation and not a security claim: MakaOS is a hobby
+> kernel and is NOT secure. "Clean" below means one bug class came back clean
+> in one sweep, nothing more.
+>
+> **Status check 2026-11-08 (against main @ ebe8a14):** the `bughunt` branch
+> was merged into main on 2026-11-08 (the "main untouched" line under State is
+> history). F135-F158 are present in the code (see the status block in
+> `docs/AUDIT_FINDINGS.md`). The recorded LOW items are still as described:
+> ext2_vfs_seek u32 truncation, pg_file_idx key, sys_read prefault-only and the
+> dead mm_t.refcount field are all unchanged. The F159 "T4" fix is PARTIAL:
+> only one timer thread runs tcp_timer_tick now, but it still rewinds snd_nxt
+> without pcb->lock while tcp_send reads it and tcp_send_segment advances it,
+> so the "single-writer invariant" claim does not hold. Re-verification also
+> found new open gaps (sys_ftruncate permission, sys_spawn unveil and nproc
+> cap, TIOCSCTTY, fd rights in io_uring/sendmsg); see AUDIT_FINDINGS.md.
+
 Autonomous security-audit-and-fix loop on branch `bughunt`. Each turn: state a
 one-line suspicion, verify against the real code (no assumptions), fix at the
 root (no stopgaps), verify from every angle, build (`NO_QEMU=1 SELFTESTS=1` then

@@ -1,5 +1,15 @@
 # MakaOS dynamic loader (dlopen) -- implementation plan
 
+Status (verified 2026-11-08 against main): Phases 0-5 done (PIE toolchain,
+kernel ET_DYN exec in kernel/proc/elf.c, libc loader in userland/libc/dlfcn.c,
+DT_NEEDED, dynamic + cross-module TLS, real libSDL3.so; commits 8ba43d6,
+64990c6, cbe02f5, 03f4371, 184ca56, 8ca73ca). Later additions not in the plan:
+dladdr, SONAME dedup, RTLD_DEFAULT/RTLD_NEXT (approximated by global scope),
+$ORIGIN (8abbb68); DarkPlaces built on top (c14df69). Still open: IRELATIVE/ifunc
+(neither kernel nor loader handles it), RELRO (no mprotect syscall; libc
+mprotect is a stub in userland/libc/jdk_compat.c), dlclose does not unload
+DT_NEEDED deps, TLS module slots/blocks leak on dlclose, RTLD_LOCAL ignored.
+
 Goal: real `dlopen`/`dlsym`/`dlclose`/`dlerror` loading actual PIC `.so`s, so
 sdl2-compat / DarkPlaces / Mesa DRI / (later) LWJGL+JVM work unmodified and the
 static-bind hacks (SDL static-ANGLE EGL, planned sdl2-compat patch) get deleted.
@@ -31,7 +41,7 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
      `__thread` to general-dynamic and pull in `__tls_get_addr` -- a Phase 4
      thing). libc.a then carries only RELATIVE + TPOFF relocs, no 32/32S, so it
      links into a PIE; ET_EXEC apps are unaffected (PIE codegen at fixed base).
-   - crt0 (`entry.asm`) was ALREADY PIC (all `[rel ...]`), no change needed.
+   - crt0 (`userland/entry/entry.asm`) was ALREADY PIC (all `[rel ...]`), no change needed.
    - `userland/link-pie.ld` = ld's stock `-pie` script + the `__tdata_end` /
      `__tbss_end` symbols `libc/tls.c` needs (the stock `.xd` omits them).
    - MILESTONE (verified headless): `piehello` -- a real libc program (crt0 +
@@ -64,8 +74,8 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
    **DONE**: `DT_NEEDED` loads deps recursively (/lib/<name>), published-before-
    deps so circular chains dedup; `dlopen(NULL)` global scope; path dedup +
    refcount; `DT_FINI_ARRAY` on dlclose.  Tested: libdso2.so as a DT_NEEDED dep,
-   dlopen(NULL)+dlsym.  TODO: per-object dep list so dlclose unloads deps;
-   `dlerror` is not yet per-thread (TLS) -- fine until threads dlopen.
+   dlopen(NULL)+dlsym.  TODO: per-object dep list so dlclose unloads deps.
+   (`dlerror` per-thread: DONE in c5d0a82, `__thread` error buffer.)
 4. Dynamic TLS -- **DONE** (the hard part).  `__tls_get_addr(module,offset)` +
    a per-thread DTV (a `__thread` array in the static TLS -> lock-free hot path);
    the loader registers each `.so`'s `PT_TLS` as a module and resolves
@@ -97,6 +107,7 @@ ELF. Most `scripts/port-*.sh` libs are already `-fPIC`.
      handle, and libSDL3 imports no SDL_* from the exe), but real RTLD_LOCAL
      wants per-handle symbol visibility.  Revisit if a plugin needs isolation.
    NEXT: DarkPlaces (PRELOAD static, link -lSDL2) + Xonotic assets.
+   (DarkPlaces: DONE, c14df69; see docs/XONOTIC_PORT.md.)
 
 ## Risks
 - Phase 0 toolchain surgery (PIE script may be missing from ld; PIC libc/crt).

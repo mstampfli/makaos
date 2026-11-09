@@ -1,5 +1,17 @@
 # Xonotic (DarkPlaces engine) port -- status & plan
 
+Status (verified 2026-11-08 against main): PARTLY DONE. The DarkPlaces engine
+builds (c14df69) and renders Quake shareware data (id1/pak0.pak via
+scripts/fetch-quake-shareware.sh, c151daf) through sdl2-compat -> libSDL3.so ->
+Mesa/virgl, headless and under sway (4cf29f7). The cube-map "array size 1"
+virgl error is fixed (c61e072); the sway SET_SCANOUT INVALID_RESOURCE_ID
+black screen was addressed by host-resource refcounting (de1d542). Xonotic
+proper (`-game xonotic` + Xonotic data) was never attempted: no Xonotic data is
+fetched or installed. After 2026-07-11 the only related change is the
+scripts/run-quake-shot.sh capture helper (c6252b3); work moved to the JVM port.
+Note: the "no dynamic loader" premise in the Feasibility section is obsolete;
+MakaOS has one (docs/DYNLINKER_PLAN.md).
+
 Goal: run Xonotic (open-source arena FPS, DarkPlaces engine) natively on MakaOS
 through the SDL3 + Mesa/virgl desktop-GL stack.
 
@@ -53,8 +65,10 @@ from automation (it froze the host GPU before).
    small libc additions were needed: memccpy, select (SYS_SELECT wrapper), the
    glibc __jmp_buf_tag tag; plus a real latent fix (the exe now self-applies its
    initial-exec TLS relocs so libc's errno works -- see DYNLINKER_PLAN.md).
-5. **Assets** -- NEXT: no game data yet, so DarkPlaces exits at "Couldn't load
-   gfx/mainmenu".  Minimal-data-first (user's call): a small data set to render
+5. **Assets** -- Quake shareware DONE (c151daf: scripts/fetch-quake-shareware.sh
+   stages pak0.pak, build.sh installs it at /root/id1 when present; not shipped
+   by default). Xonotic data: NOT DONE. Original note: no game data yet, so
+   DarkPlaces exits at "Couldn't load gfx/mainmenu".  Minimal-data-first (user's call): a small data set to render
    real content + a visible frame.  For DarkPlaces-Quake (id1) that's the Quake
    shareware pak0.pak; for Xonotic proper, `-game xonotic` + a minimal Xonotic
    data subset.
@@ -67,6 +81,8 @@ from automation (it froze the host GPU before).
    vrend log shows them).  No crash; exits only on the missing gfx/mainmenu.
    OPEN: host vrend rejects a cube-map with array size 1 ("Illegal command
    buffer") -- a virgl compat quirk to chase once content renders.
+   FIXED in c61e072 (array_size/last_level/nr_samples now forwarded to
+   RESOURCE_CREATE_3D).
    Then hand the windowed run (run-gl-gui.sh) to the user for the visual check.
 
 ## Risks / unknowns

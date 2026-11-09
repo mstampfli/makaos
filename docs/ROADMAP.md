@@ -18,7 +18,7 @@ before the next begins; within a tier, ports are independent.
 | epoll / poll / timerfd / eventfd / signalfd | round out what exists; wayland event loop |
 | socketpair + SCM_RIGHTS fd passing | wayland IPC |
 | mmap MAP_SHARED + POSIX shm polish | wl_shm buffer sharing |
-| dlopen / dlsym stubs | no real dynamic linking — load into static binaries, some libs want the symbols |
+| dlopen / dlsym | went further than planned: a real PIE + dlopen loader (DT_NEEDED, dynamic TLS, real `libSDL3.so`); see docs/DYNLINKER_PLAN.md |
 | setlocale / strcoll / nl_langinfo stubs | ICU, curl, libxml2 |
 | C++ toolchain rebuild (--enable-languages=c,c++ + libstdc++) | unlocks every C++ port |
 
@@ -56,11 +56,10 @@ path stays as a fallback for pre-virtio-gpu consoles.
 - Cursor queue (secondary virtqueue, same format as control).
 - Multi-scanout support (virtio-gpu reports N displays — one per
   connector in the DRM wrapper).
-- 3D: defer virgl / TRANSFER_TO_HOST_3D until after Hyprland lands
-  on the 2D path; wlroots-pixman renderer doesn't need GL.
-  Concrete dependency-ordered bring-up plan (kernel 3D commands +
-  fences, DRM render node, Mesa/GBM/EGL port, wlroots/SDL/QEMU
-  wiring) in docs/VIRGL_BRINGUP.md.
+- 3D: originally deferred until after Hyprland; done anyway in July
+  2026 (kernel 3D commands + fences, DRM render node, static Mesa/
+  GBM/EGL, wlroots and SDL3 on GLES2/virgl). Status and plan in
+  docs/VIRGL_BRINGUP.md.
 
 ### Tier 2.5b — DRM/KMS uAPI layer
 `kernel/drivers/video/drm.c` + `/dev/dri/card0` chardev
@@ -107,7 +106,8 @@ path stays as a fallback for pre-virtio-gpu consoles.
 ## Tier 5 — wlroots
 
 Compositor library.  Configures with the pixman software renderer
-(no GPU).  Depends on 2.5 + 3 + 4.
+(no GPU).  Depends on 2.5 + 3 + 4.  (Since July 2026 it also renders
+through the GLES2/GBM renderer on virgl.)
 
 ## Tier 6 — Hyprland
 
@@ -135,6 +135,25 @@ Extra deps it pulls in:
 
 ---
 
-**Current progress:** Tier 0 (toolchain + sysroot) done — cross-gcc
-`x86_64-pc-makaos-gcc`, libc with split standard headers, mbedTLS
-ported, HTTPS verified end-to-end.
+**Current progress (checked against main, 2026-11-08):**
+- Tier 0 (toolchain + sysroot): done. Cross-gcc `x86_64-pc-makaos-gcc`
+  (C and C++, hosted libstdc++), libc with split standard headers,
+  mbedTLS ported. `http_get` speaks HTTPS, but there is no CA bundle:
+  certificate verification only passes in its explicit insecure mode
+  (`MBEDTLS_SSL_VERIFY_NONE`), so it is not a trustworthy TLS client.
+- Tier 1: done, except OpenBSD-style `pledge()`/`unveil()` libc wrappers
+  (see Tier 7). Locale is C / C.UTF-8 only.
+- Tier 2: done (all eight have `scripts/port-*.sh`).
+- Tier 2.5: done. virtio-gpu 2D and 3D (virgl), DRM/KMS uAPI with
+  atomic modeset, hardware cursor, PRIME and a render node.
+- Tiers 3, 4, 5: done (libdrm, libudev-zero, libinput, wayland,
+  wayland-protocols, wlroots 0.18.1).
+- Tier 6: Hyprland NOT ported. The desktop runs **sway** 1.10.1 on
+  wlroots instead (docs/DESKTOP.md).
+- Tier 7: SDL3 with the Wayland backend done (plus sdl2-compat, GLFW).
+  libc pledge/unveil wrappers not done (pledge/unveil exist only as
+  `spawn()` attributes). curl not ported.
+- Tier 8 (Ladybird): not started.
+- Off-roadmap work since June 2026: a JVM stack (Avian, OpenJDK 17 Zero,
+  LWJGL; docs/JVM_PORT_PLAN.md) with glibc-ABI compatibility shims for
+  prebuilt `.so` files, and DarkPlaces/Quake (docs/XONOTIC_PORT.md).

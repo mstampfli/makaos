@@ -27,15 +27,20 @@ provides that API lives **here**, in one place — never injected per-port.
    native feature lands, the shim becomes a thin real client without moving.
 
 4. **This is not a Linux binary personality.** These shims are for *source*
-   ports (recompiled against MakaOS's libc). Running unmodified Linux binaries
-   would be a separate syscall-translation personality — explicitly out of scope
-   here.
+   ports (recompiled against MakaOS's libc). Running unmodified Linux
+   executables would be a separate syscall-translation personality - explicitly
+   out of scope here. The one binary-level exception lives elsewhere: the
+   dynamic loader (`userland/libc/dlfcn.c`) can `dlopen` prebuilt glibc-linked
+   `.so` files (e.g. LWJGL and OpenJDK natives) into a native MakaOS process,
+   treating glibc's core sonames as satisfied by MakaOS libc. The glibc-ABI
+   symbol aliases those libraries import live in `userland/libc/glibc_compat.c`,
+   not here.
 
 ## Layout
 
 ```
-compat/linux/<library>/<library>.c   # the shim implementation (source of truth)
-compat/linux/<library>/<library>.h   # the shim's public header (if it ships one)
+compat/linux/<library>/*.c   # the shim implementation (source of truth)
+compat/linux/<library>/*.h   # the shim's public header(s), if it ships any
 ```
 
 ## Current shims and their native backing
@@ -44,7 +49,7 @@ compat/linux/<library>/<library>.h   # the shim's public header (if it ships one
 |------|-----------|-------------------------|------|
 | libseat | seat/session/device-access | capability + session subsystem | ledger #1 |
 | libudev | device discovery + hotplug | kernel device registry | ledger #2 |
-| libevdev | evdev event decode | kernel evdev (real) | — |
+| libevdev | evdev event decode | kernel evdev (real) | none; superseded by upstream libevdev 1.13.1 (`scripts/port-libevdev.sh`), the shim here is no longer built |
 | mtdev | MT protocol A→B | (kernel emits B natively) | ledger #10 |
 | libiconv | charset conversion | real converter / port | ledger #15 |
 

@@ -2,6 +2,16 @@
 
 ## Status
 
+Status (verified 2026-11-08 against main): DONE. Landed in 0d841f1
+(2026-04-20); every file, symbol and syscall named below exists on main
+(`SYS_SLABINFO` 100, `pmm_slab_demote_or_keep`, `slab_shrinker.c`,
+`slab_pcpu_selftest` called from kernel/main.c). Later SMP race fixes to this
+code: the pcp stash vs cross-CPU `pcp_drain_all` race (kernel/mm/pcp.c) and the
+documented `{freelist, tid}` migration-safety argument in slab_pcpu.c, both in
+b183a70 (2026-08-13). The shrinker is now pressure-aware (Phase 5D, see the
+slab_shrinker.c header), not just the fixed 1 s drain described below. The
+acceptance numbers below are from the April run and were not re-measured.
+
 **LANDED.**  All eight sub-phases (4A–4H) are committed and the
 acceptance self-test passes at 99.99 % slab fast-path hit rate on
 4-CPU × 50k mixed-size alloc/free stress.  See

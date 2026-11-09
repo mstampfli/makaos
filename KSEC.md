@@ -2,8 +2,8 @@
 
 ## Overview
 
-ksec is the userland policy engine for the Kore security model. It runs as
-uid=0, started by init before any unprivileged process, and registers itself
+ksec is the userland policy engine for the Kore security model. It is meant to
+run as uid=0, started by init before any unprivileged process, and registers itself
 as the kernel's single policy agent via `sys_register_policy_agent()`. After
 registration the kernel blocks on ksec for every privilege escalation decision.
 
@@ -11,17 +11,59 @@ The kernel enforces mechanism (fd rights, setuid exec, ACL checks). ksec
 enforces policy (who is allowed to escalate, to what, under what conditions).
 Policy changes never require a kernel recompile or reboot — restart ksec.
 
+> **MakaOS is not secure.** It is a hobby OS: not audited, not hardened, and
+> not fit for real use or real data. This document is mostly a **design**.
+> Nothing here is a security guarantee.
+
+## Implementation status
+
+What exists today (`kernel/security/ksec.c`, `userland/apps/ksec/ksec.c`):
+
+- The kernel channel: `sys_register_policy_agent`, the wire structs and
+  opcodes below, per-seq in-flight slots, and `ksec_reader_thread`.
+- Kernel senders: setuid-on-exec (`KSEC_OP_EXEC_SETUID`, fail-closed:
+  no agent or no ALLOW means no escalation), `setuid`/`seteuid`
+  escalation (`KSEC_OP_SETUID`/`SETEUID`), and the `KSEC_OP_SETUID_BIT`
+  notification from `chmod`.
+- A minimal daemon installed as `/bin/ksec`. It reads one 4 KiB
+  `/etc/ksec.policy` (at most 64 entries), answers `EXEC_SETUID`, always
+  denies `SETUID`/`SETEUID`, and auto-creates an entry on `SETUID_BIT`.
+
+Known gaps (do not rely on any of this):
+
+- **ksec is not started at boot.** Nothing launches `/bin/ksec` and no
+  `/etc/ksec.policy` is installed, so by default no agent is registered.
+  Any root process can register itself as the agent at any time while
+  none is registered; there is no boot-only check.
+- **The daemon ignores the policy path.** Path/glob matching is not
+  wired into the lookup, so a `setuid` entry without `inode=` matches
+  every setuid binary. `gid=` is numeric only and supplemental groups
+  are not checked. `auth=password` denies; `auth=timed` is treated like
+  `none`. `flags=` is not parsed.
+- **`chmod`, `fchmod`, `chown` and `fchown` are no-ops** that return
+  success, so setuid bits cannot be set or cleared from userland, and
+  the `SETUID_BIT` notification carries inode/dev 0.
+- **Not implemented at all:** the `/run/ksec` socket protocol, `ksecctl`,
+  SIGHUP reload, the drop-in directory, `KSEC_OP_RESOURCE_FD` and
+  `KSEC_OP_CLRUID_BIT` handling, `/proc/setuid_inodes` boot
+  reconciliation, `nosuid` mounts (the exec check honors a `nosuid`
+  flag, but nothing ever sets it), password challenges, and the
+  package-manager integration (there is no package manager).
+- Login uses plaintext passwords in `/etc/shadow`.
+
+The sections below describe the intended design unless they say otherwise.
+
 ---
 
 ## Startup Sequence
 
 ```
-init forks ksec
+init forks ksec          (design: not wired yet, see Implementation status)
   ksec opens two pipes: req_pipe[2], resp_pipe[2]
   ksec calls sys_register_policy_agent(resp_pipe[0], req_pipe[1])
     kernel stores resp_pipe[0] as "kernel reads responses here"
     kernel stores req_pipe[1] as "kernel writes requests here"
-    kernel spawns ksec_reader_thread (reads from req_pipe[0] — wait, see note below)
+    kernel spawns ksec_reader_thread (reads responses from resp_pipe[0])
   ksec reads from req_pipe[0] in its main loop
   ksec writes to resp_pipe[1] in its main loop
 ```
@@ -263,7 +305,11 @@ ksecctl audit                       # show recent grant/deny log
 
 ---
 
-## Security Properties
+## Security Properties (design goals)
+
+These are what the finished design is meant to provide. Most are not met
+today (see Implementation status); only "no ambient setuid" holds, and
+only because no agent is registered by default.
 
 - **No ambient setuid**: a binary with the setuid bit but no ksec entry execs
   without escalation. The bit alone is not sufficient.
@@ -279,3 +325,5 @@ ksecctl audit                       # show recent grant/deny log
 - **Kernel enforcement is final**: the kernel checks fd rights on every
   syscall. ksec's ALLOW just causes the kernel to set the euid or hand out an
   fd. The kernel never trusts userland to have correctly enforced anything.
+  (Today: rights are checked on read/write/seek-style paths, and an fd with
+  `rights == 0` is unrestricted.)

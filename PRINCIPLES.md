@@ -328,8 +328,8 @@ concern, not a polish pass.
 ### 7.1 The approach
 
 - **In-kernel self-tests**: boot-time sanity checks for invariants,
-  data structure correctness, and core algorithms. These run every
-  boot in debug builds.
+  data structure correctness, and core algorithms. They are opt-in:
+  `SELFTESTS=1 bash build.sh` compiles them in and they run at boot.
 - **Integration tests at subsystem boundaries**: every public API of
   every subsystem has at least one integration test covering its
   success path and its most important failure modes.

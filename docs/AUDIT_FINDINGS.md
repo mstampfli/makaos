@@ -5,9 +5,101 @@ use-after-free, refcount races, and memory-safety bugs. Each item lists the
 mechanism and the confirmation method. FIXED items have a regression test or a
 verified clean boot; TODO items are confirmed by code reading and await a fix.
 
+## Status as of 2026-11-08 (verified against main @ ebe8a14)
+
+This file is a historical log written June-July 2026 on the `bughunt` branch
+(merged to main 2026-11-08). It is not current documentation and it is not a
+claim that MakaOS is secure. MakaOS is a hobby kernel and is NOT secure: the
+audit below is incomplete, and re-verification found new gaps (listed below).
+
+Method: every finding entry (each heading, bullet and lettered sub-finding; 281
+status entries, some are cross-references to the same fix) was checked against
+the code on main by reading the cited function or the named fix helper/guard.
+High/critical, LPE, UAF and every entry the log left open were read properly;
+lower-severity FIXED entries were checked more cheaply (helper or guard present
+at the call site). No build or test was run for this pass. Commit hashes are
+best-effort from `git log`.
+
+Counts: FIXED 210 / OPEN 33 / PARTIAL 15 / SAFE (assessed not a bug, still
+true) 18 / N/A 1 / UNVERIFIED 4.
+
+Inline convention: an entry with no `[Status 2026-11-08: ...]` tag is FIXED
+(see the commit index below). Every entry that is not plainly FIXED, or whose
+original text went stale ("commit pending", "OPEN", "NOT yet fixed", "fix this
+next"), carries an inline tag.
+
+Fix commit index (F number -> commit): F1 15353a2, F2 15353a2, F3 e543cbe,
+F4 b39e9c2, F5 ed76074, F6 db7b437, F7 73dc6f8, F8 b21f567, F9 b21f567,
+F10 84dae46, F11 27f5c6d, F12 94785d4 (PARTIAL), F13 d33851c, F14 9409ec7,
+F15 fa2c1aa, F16 b7a6022, F17 a11b5c7, F18 309b122, F19 061dd1f, F20 c39af16,
+F21 7d0723c, F22 bd604e2, F23 47fd72b, F24 47d87db, F25 2e31b27, F26 1e178fa,
+F27 8ad7c3a, F28 bd45703, F29 910f910, F30 d1b177f, F31 9f05c7a, F32 77d3172,
+F33 187e3d1, F34 cd9ba66, F35 25a5b9d, F36 15c38b8, F37 0587892,
+F38 825f782 (PARTIAL), F39 02434e9, F40 06df3a3, F41 f560392, F42 dd2b262,
+F43 9653cb4, F44 0654ccb, F45 c092584, F46 7c9f801, F47 e0d688c, F48 d508629,
+F49 657c508, F50 3156d03, F51 acf0f0e, F52 4486b77, F53 7a20570, F54 3ed20e7,
+F55 2c48217, F56 ae363f4, F57 061fb91, F58 4ae6947, F59 1dc3697, F60 402eecb,
+F61 aaabf20, F62 157e734, F63 41fb091, F64 5636f2f, F65 546f2fb, F66 960d9e8,
+F67 74be320, F68 c8f028f, F69 980f76c, F70 09e8c90, F71 6a7d801, F72 f9e67c4,
+F73 8bb722b, F74 6675f53, F75 e799392, F76 6ec59cc, F77 6a334f1, F78 1622ede,
+F79 2ede0e8, F80 911b19b, F81 9df7fae, F82 b1143b8, F83 c507b68, F84 0a4ff57,
+F85 f679a8e, F86 7b5e488, F87 1d40833, F88 37531d7 (PARTIAL), F89 e082ea0,
+F90 02f614a, F91 00a7574, F92 9fa9e52, F93 e060698, F94 ab24b41,
+F95 3f359d4, F96 a7fd088, F97 9879052, F98 6c0bae1, F99 db95c23 (PARTIAL),
+F100 f545a32, F101 a5d582a, F102 823a00d, F103 5276261, F104 9a1d63a,
+F105 165139f, F106 0110d22, F107 45868ae, F108 358040d, F109 7015cf4,
+F110 67cd061, F111 073f257, F112 0d8083b, F113 01b2f03, F114 95a15d9,
+F115 5e3a90b, F116 9b9e7d6, F117 d59d48f, F118 2f70585, F119 a527646,
+F120 8256524, F121 0f5c16e (virtio_net missed), F122 ed69751, F123 463285c,
+F124 a149025, F125 a149025, F126 6befbd5, F127 9fdba0b, F128 157d7bb,
+F129 cc38e5c, F130 90ea20a, F131 e6d2695, F132 f35ecdb, F133 b183a70,
+F134 6202ab2, F135 1f47765, F136 86b6fae, F137 96091e7, F138 298a7b1,
+F139 c391c55, F140 e4a83c6, F141 df77a40, F142 39a0198, F143 3ca4e99,
+F144 1eb9aca, F145 176ec23, F146 4a8030b, F147 1c77834, F148 e6526f8,
+F149 b26a0a6, F150 9ecffc8, F151 5ba0bca, F152 0a90b51, F153 9effd3c,
+F154 ed69751, F155 4cffb93, F156 fb4b637, F157 4d05a2b, F158 cbe2f96,
+F159 599739e (PARTIAL), F160 ea7ac2a (PARTIAL), F161 e52a393, F162 4475680,
+F163 a1fd162, F164 58ea6a7, F165 5f18fcf (PARTIAL), F166 b452116,
+F167 1b202de, F168 aa55ac4, F169 72df355, F170 b51bb81,
+F171 beae63c + 7b666c9 (PARTIAL). Later fixes not in this log: fs_lookup
+final-file permission check 34e1c6b; do_switch switching_from b183a70;
+kernel fault-fixup table (extable, covers copy_*_user only) b183a70.
+
+Most serious open items (code reading, 2026-11-08):
+1. NEW: `sys_ftruncate` on an ext2 fd checks no write mode, fd rights or file
+   permission (syscall.c sys_ftruncate -> ext2.c ext2_truncate_to), so a
+   read-only fd to a root-owned file can truncate it. (`sys_truncate` checks.)
+2. NEW: `sys_spawn` has no `unveil_ok(UNVEIL_EXEC)` (sys_exec has one), and a
+   spawned child defaults to an empty unveil table and all pledges unless the
+   caller passes them: a sandboxed process can spawn an unconfined child (F38).
+3. NEW: F160 fd rights are not enforced on io_uring READ/WRITE or
+   sendmsg/recvmsg, and SCM_RIGHTS never checks RIGHT_SEND_FD on passed fds.
+4. NEW: F171 bypasses: TIOCSCTTY sets the controlling tty and fg_pgid with no
+   session-leader check; sys_spawn and wait set the console fg_pgid unchecked.
+5. NEW: `sys_spawn` skips `user_task_over_cap` (F165 fork-bomb cap bypass).
+6. F12: `e_phentsize` is never validated; the ET_DYN PT_DYNAMIC scan strides by
+   it (elf.c ~336-346): a crafted static-PIE gives a kernel out-of-bounds read.
+7. NEW (suspected): `fdget` and /proc fd open `vfs_tryget` under RCU, but most
+   close paths `kfree` the vfs_file_t synchronously (not RCU-deferred, cache not
+   TYPESAFE_BY_RCU): narrow UAF window behind the F73/F77-F82/F88 fixes.
+8. (l) raw user-buffer derefs after a pre-check (pipe, pty, AF_UNIX send/recv,
+   TCP/UDP recv write-back) are not in the extable: a sibling munmap panics the
+   kernel (local DoS).
+9. TCP lost-wakeup at 4 sites (recv/send/accept/connect) still open: hang/DoS.
+10. Remote/local resource exhaustion: no per-listener SYN_RCVD cap or SYN
+   cookies, ARP cache unbounded, AF_UNIX SOCK_DGRAM queue uncapped.
+Also new, lower: F56 ext2_write_file error path can leave freed blocks
+referenced (disk-full -> blocks shared between files); F58 DGRAM reconnect does
+an unlocked dgram_dest swap (double unix_put); F99 CoW break drops the old
+frame ref before the TLB shootdown; F121 missed 5 `!phys` sites in
+virtio_net.c; TCP bind has no EADDRINUSE/privileged-port check (unverified);
+io_uring_close_file may free ring pages still mapped by a non-owner mm
+(unverified).
+
 ## FIXED
 
 ### F1. kmalloc big-alloc header overflow (`kernel/mm/kheap.c`) — commit pending
+[Status 2026-11-08: FIXED (15353a2)]
 Big (buddy-backed) `kmalloc` sized the block with `size + 8` but returned
 `raw + 16` (and `kfree` used `-16`), so a request in the band
 `(2^k - 16, 2^k - 8]` over-ran its buddy block by up to 8 bytes (e.g.
@@ -18,6 +110,7 @@ constant drives the sizing, the payload offset, and the free offset, plus a
 prints the pre-fix `size+8` shortfall — confirmed FAIL pre-fix, PASS post-fix.
 
 ### F2. Chase-Lev deque idle-steal IRQ race (`kernel/proc/sched.c`) — commit pending
+[Status 2026-11-08: FIXED (15353a2)]
 `cpu_idle_loop` -> `sched_try_steal` did an owner-side `chaselev_push` on the
 LOCAL deque with IRQs enabled and no lock, while this CPU's `sched_tick` (timer
 IRQ) does owner-side `chaselev_push`/`chaselev_pop` on the SAME deque under
@@ -29,6 +122,7 @@ IRQ side already uses (irqsave also masks the same-CPU IRQ, so no deadlock).
 `chaselev_selftest` still PASSES and SMP boot is healthy post-fix.
 
 ### F3. dcache resurrect-from-zero UAF (`kernel/fs/dcache.c`) — commit pending
+[Status 2026-11-08: FIXED (e543cbe)]
 `dcache_lookup` bumped `refcount` 0->1 with a bare `__atomic_fetch_add` (no
 tryget) while the shrinker freed `refcount == 0` dentries under `g_dcache_wlock`.
 A lookup resurrecting (0->1) a dentry between the shrinker's refcount read and
@@ -45,6 +139,7 @@ between the shrinker's refcount read and the free), so the stress test is a
 regression guard; the primary confirmation is the TOCTOU code proof.
 
 ### F4. Unvalidated user-pointer memcpy across 6 syscalls (`kernel/syscall/syscall.c`) — commit pending
+[Status 2026-11-08: FIXED (b39e9c2)]
 `sys_readdir`, `sys_stat`, `sys_unlink`, `sys_getcwd`, `sys_chdir`, `sys_mkdir`
 did raw `__builtin_memcpy` directly on user pointers (the path argument, and
 for readdir/getcwd the output buffer) with no validation. A bad pointer faulted
@@ -63,6 +158,7 @@ healthy boot confirms no regression for valid pointers.
 ## TODO — confirmed, high severity
 
 ### F11 (was T2). CoW/fork PTE + refcount race (`kernel/mm/vmm.c`) - FIXED, commit pending
+[Status 2026-11-08: FIXED (27f5c6d)]
 `vmm_clone_user_ex` writes the parent PTE (drop WRITABLE) + `pmm_ref_inc`
 WITHOUT `vma_lock`, while the CoW-break fault handler does its read-check-act
 under `vma_lock`. They sync on different things, so a sibling thread faulting a
@@ -73,6 +169,9 @@ later double `pmm_ref_dec` frees a mapped frame (UAF). In-tree comments
 across the clone's parent-PTE walk. FIXED: the clone now takes src_mm->vma_lock per-PTE around the read-decide-write (src_pt[si] read -> VMA lookup -> RO write + pmm_ref_inc), the same lock+decision the fault handler uses, so a sibling fault can no longer interleave. Per-PTE (not whole-walk) so concurrent faults on other pages still progress; callers (task_fork, sys_thread) hold no vma_lock so no self-deadlock; the clone touches only page-table/HHDM memory so it cannot fault under the lock. Tiny-window race so no deterministic test (like F2/F3/F5); confirmed by code proof + a clean boot that fork-execs login/svcmgr (the clone path) with no deadlock/corruption + all 10 selftests pass.
 
 ### T3. AF_UNIX UAF: close frees vfs_file_t while peer sends (`kernel/net/unix_sock.c`)
+[Status 2026-11-08: (A) FIXED (F14, 9409ec7); (B) FIXED (F15, fa2c1aa); the
+scoped-out DGRAM default destination FIXED as F58 (4ae6947), but its reconnect
+swap is unlocked (suspected double unix_put, see F58)]
 Split into two distinct UAF classes once verified against the real code:
 
 (A) the `->file` UAF -> FIXED (F14): `unix_sock_close` `kfree`d the `vfs_file_t`
@@ -114,6 +213,10 @@ there is to store the target PATH and re-resolve via `ns_find` per `sendto`
 (already the RCU-safe path for by-path sends), or hold a connection ref.
 
 ### T4. TCP PCB fields mutated lock-free from 3 CPUs (`kernel/net/tcp.c`)
+[Status 2026-11-08: PARTIAL. Data-plane lock FIXED (F44, 0654ccb), accept
+queue FIXED (F45, c092584), underflow clamp FIXED (F18). OPEN: snd_nxt is still
+advanced in tcp_send_segment and rewound/restored by tcp_timer_tick without
+pcb->lock, and state transitions are unlocked (stream corruption, not OOB)]
 `tcp_timer_tick` retransmit (`snd_nxt = snd_una` rewind), `tcp_send`
 (`txbuf_used += chunk`), and `tcp_recv` ACK (`txbuf_used -= acked`,
 `txbuf_head += acked`, `snd_una = ack`) RMW the same non-atomic PCB fields from
@@ -203,6 +306,7 @@ VERIFIED DESIGN NOTES (from a deep read this pass, to de-risk the dedicated run)
     mis-account. The per-PCB lock itself remains OPEN.
 
 ### F5. signal_send non-atomic RMW of sigstate.blocked (`kernel/proc/signal.c`) — FIXED, commit pending
+[Status 2026-11-08: FIXED (ed76074)]
 `signal_send`'s `t->sigstate.blocked &= ~bit` (SIGKILL unblock) was a non-atomic
 RMW on the *target* task's `blocked` from the sender's CPU, racing the target's
 own RMWs in `sys_sigprocmask` (`|=`/`&=`) and `signal_setup_frame` (`|=`) ->
@@ -249,6 +353,7 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
   and that secondary_waitq points at write_wq -> PASSES. (Low reachability:
   full = 2^64-2, but the fix is one line and correct.)
 - **unix_sock_accept** wakes client via `unix_wake` not `unix_poll_wake`
+  [Status 2026-11-08: OPEN (latent; still no non-blocking connect)]
   (line ~612): latent missing-wakeup, harmless until non-blocking connect lands.
 - **ext2_readdir over-read** (`kernel/fs/ext2.c`) -> FIXED (F6). The walk guarded
   only `off+8<=blk_bytes` (header) then read up to `name_len` (<=255) name bytes,
@@ -261,12 +366,14 @@ proof + clean boot (login/shell exercise sigprocmask) + all 8 selftests pass.
 - **unvalidated user-pointer memcpy in syscalls** -> FIXED, see F4 (the
   sys_readdir near-miss expanded into a 6-syscall sweep).
 - **AF_UNIX data buffers non-atomic** (`unix_sock.h:106`): `buf_count`/`head`/
+  [Status 2026-11-08: FIXED (F113, 01b2f03): cbuf_write_locked/cbuf_read_locked]
   `tail` plain fields RMW'd by sender+receiver on different CPUs. The lost-wakeup
   interlock is TSO-safe, but the byte-copy loops tear under concurrent r/w.
 
 ## Second audit pass (2026-06-24) - un-audited subsystems
 
 ### F8. ext2 dir_lookup name over-read (`kernel/fs/ext2.c`) - commit pending
+[Status 2026-11-08: FIXED (b21f567)]
 The F6 readdir clamp MISSED the parallel dirent walk in `dir_lookup` (path
 resolution - more reachable than readdir: every open/stat/exec hits it). Same
 class: `kmemeq(de->name, name, name_len)` with only the `off+8<=blk_bytes`
@@ -275,6 +382,7 @@ Fixed by routing through the existing `ext2_dirent_namelen_clamp` helper (only
 compare when the name fits the block). Covered by `ext2_readdir_clamp_selftest`.
 
 ### F9. io_uring OP_READ/OP_WRITE unvalidated sqe->addr (`kernel/io/io_uring.c`) - commit pending
+[Status 2026-11-08: FIXED (b21f567); fd rights are still not checked here, see F160]
 CRITICAL. OP_READ/OP_WRITE passed the user-controlled `sqe->addr` straight to
 `vfs_read`/`vfs_write`/`pread` with no validation (every other opcode taking a
 user pointer routes through a `sys_*` wrapper that validates). OP_READ with a
@@ -297,6 +405,9 @@ extended to assert user_buf_check rejects kernel/non-canonical/ceiling/NULL.
   each case (ideally hoist a shared tty_ioctl_common - master/slave/console are 3
   drifting copies). Deterministically testable (call pty_*_ioctl with bad ptrs).
 - **ELF e_phoff integer overflow** -> FIXED (F12): extracted overflow-safe
+  [Status 2026-11-08: F12 PARTIAL (94785d4): the "reject phentsize<56" part was
+  never done; the ET_DYN PT_DYNAMIC scan strides by unchecked e_phentsize
+  (elf.c ~336-346) -> kernel OOB read. F13 FIXED (d33851c)]
   elf_phtab_in_bounds(e_phoff,phnum,size) (offset>size catches the wrap, then a
   remainder check) + elf_phtab_bounds_selftest (the -56 wrap + boundary cases) ->
   PASSED; valid ELFs (login/svcmgr) still load. Follow-up -> FIXED (F13):
@@ -572,6 +683,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   handling, the sys_open 512-byte path reaching ext2_create, + full build/boot.)
 
 - **io_uring user-writable ring_mask OOB read+write**
+  [Status 2026-11-08: FIXED (F33, 187e3d1); the "Good NEXT item" text is stale]
   (`kernel/io/io_uring.c` io_uring_post_cqe / io_uring_enter_impl / SQPOLL) ->
   FIXED (F33), was CRITICAL. io_uring indexes the sqes[]/cqes[] arrays with
   the ring `mask` read from the USER-MAPPED, USER-WRITABLE ring header
@@ -596,6 +708,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
 ## SIXTH AUDIT PASS continued (2 re-run agents) — 2 more findings
 
 - **sys_spawn SPAWN_ATTR_CRED root privilege escalation**
+  [Status 2026-11-08: FIXED (F31, 9f05c7a): spawn_cred_allowed; "FIX THIS NEXT" is stale]
   (`kernel/syscall/syscall.c` sys_spawn) -> FIXED (F31), was CRITICAL.
   The SPAWN_ATTR_CRED block sets the child's uid/gid to attacker-chosen values
   with NO caller-privilege check: `child->cred.ruid=euid=suid=a.uid;
@@ -617,6 +730,7 @@ findings; fixed the highest reachability x severity (mmap LPE) this pass.
   any. Confidence HIGH. (FIX THIS NEXT.)
 
 - **init->children plain-store vs cross-CPU CAS race** -> FIXED (F34)
+  [Status 2026-11-08: FIXED (F34, cd9ba66): task_children_clear XCHG; the "-> OPEN" below is stale]
   (`kernel/syscall/syscall.c:~655` sys_exit + `kernel/proc/signal.c:~427`
   signal_terminate, the `g_init_task == g_current` branch) -> OPEN (HIGH, but
   init-exit is rare). init->children is a lock-free Treiber stack whose contract
@@ -670,6 +784,7 @@ them would EXPAND what policy can grant and must be done very carefully (a
 botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
 
 - **KSEC_OP_RESOURCE_FD (4) unwired** -> OPEN (feature, fail-closed). Privileged
+  [Status 2026-11-08: OPEN (feature gap, fail-closed): no KSEC_OP_RESOURCE_FD user in kernel/]
   resources (framebuffer map, sys_register_policy_agent, sys_setgroups, the root
   gates at syscall.c:3023/2524) use direct cred_is_root checks; the ksec
   resource-fd grant path is never used, so ONLY root can obtain them. Wiring it
@@ -677,11 +792,13 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ksec_response_t.granted_rights field) to a specific non-root process. Adds a
   grant path -- careful.
 - **KSEC_OP_CLRUID_BIT (6) unhandled** -> OPEN (feature, fail-closed). ksec can
+  [Status 2026-11-08: OPEN (feature gap, fail-closed): no handler; chmod/fchmod still no-op]
   request the kernel clear a setuid bit on an inode (anti-tamper after policy
   revokes a binary); no kernel handler exists, so the request is a no-op. Also
   blocked today because sys_chmod can't persist a setuid bit (TODO stub,
   syscall.c:~4665). Wiring needs ext2 setuid-bit persistence first.
 - **setgid/setegid have no ksec escalation path** -> OPEN (feature, fail-closed).
+  [Status 2026-11-08: OPEN (feature gap, fail-closed): still returns -EPERM]
   Asymmetric with setuid/seteuid (which ask ksec): a non-root process can never
   gain a gid via policy (returns -EPERM). For symmetry, sys_setgid/setegid could
   do the KSEC_OP round-trip on the escalation case like sys_setuid does. Adds a
@@ -708,9 +825,11 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ext2_block_valid_selftest (boundary + overflow-safe run) + clean boot to login
   (all userland is read from ext2 through the gated sinks -> no over-rejection).
 - mremap / mprotect / madvise / msync -> SAFE (NOT IMPLEMENTED; no syscall nrs).
+  [Status 2026-11-08: SAFE (still not implemented)]
   If added later they MUST route addr/old_size/new_size through mmap_range_ok
   before any vmm_* call, like sys_munmap, or they reintroduce the F24 class.
 - ptrace -> SAFE (NOT IMPLEMENTED; no cross-process peek/poke/getregs surface).
+  [Status 2026-11-08: SAFE (still not implemented)]
 - AHCI / NVMe DMA descriptor construction -> SAFE as reached. PRDT bounded by
   nprdt < 248; ext2 pre-clamps transfers to AHCI_DMA_SECTORS; NVMe rejects >8KB;
   AHCI slots are derived from the hardware SACT/CI ctz (never device-echoed);
@@ -736,6 +855,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   carries) right after the counts[] copy -> -EINVAL otherwise. Pure
   drm_atomic_count_ok helper + deterministic drm_atomic_count_selftest.
 - shm/shmem -> SAFE (string-named, RCU + tryget + per-frame refcount + size cap).
+  [Status 2026-11-08: SAFE (mount table rechecked: no sys_mount; shm not re-audited)]
   VFS mount table -> SAFE (no sys_mount/umount; static const mount array).
 
 ## EIGHTH AUDIT PASS (5-agent read-only fan-out, 2026-06-25)
@@ -758,12 +878,14 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   wayland -- is unregressed). The OOM failure path is not reproducible at boot,
   so no bespoke selftest (F34 precedent).
 - signal sigframe / sigreturn -> SAFE. The classic ring-0 LPE is closed: CS/SS
+  [Status 2026-11-08: SAFE (spot-checked: RFLAGS mask and MXCSR sanitize present)]
   are hardcoded RPL-3 selectors on every iretq (never sourced from the sigframe),
   RFLAGS is masked to condition codes + forced IF (`& 0xCD5 | 0x202`), RIP/RSP
   are canonical-checked, the frame copy is bounds-checked copy_from_user, the
   frame-setup write validates the user rsp range + VMA coverage, and FXRSTOR
   MXCSR is sanitized. No finding.
 - network RX (eth/arp/ipv4/udp/tcp/icmp + virtio-net) -> SAFE. The RX skb is
+  [Status 2026-11-08: RX parsing not re-audited; ICMP echo rate limit OPEN (none in icmp.c)]
   allocated at the clamped real frame length, so every wire length field
   (ihl/tot_len/udplen/tcp doff) is validated against the true buffer; no IP
   reassembly, TCP is in-order-only with a masked+clamped ring; virtio descid is
@@ -792,6 +914,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   memset right after the kmalloc, restoring the zero-then-init invariant. Code-
   proof (matches the 3 siblings) + clean boot.
 - VFS path resolution -> no symlink support (no ELOOP surface). **HIGH: unveil()
+  [Status 2026-11-08: F38 PARTIAL (825f782): sys_spawn has NO unveil_ok(UNVEIL_EXEC)
+  and the child defaults to an empty unveil table + all pledges -> sandbox
+  escape. chmod/chown still no-op stubs (SAFE). F39 FIXED (02434e9)]
   was enforced ONLY in sys_open** -> FIXED (F38). unveil_check had one call site;
   every other path syscall escaped the sandbox. Fixed with ONE shared gate
   (unveil_ok, syscall.c) wired into open (refactored), unlink, rename (both
@@ -814,15 +939,18 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   copy_path_user_selftest (rejects kernel/non-canonical/NULL pointers) + clean
   boot (every exec/open/stat copies a real path through it).
 - ELF loader (beyond F13) -> SAFE as reached. phdr table + PT_LOAD range are
+  [Status 2026-11-08: OPEN (low): still no p_filesz<=p_memsz check; see also F12 phentsize]
   overflow-checked (elf_phtab_in_bounds / elf_seg_range_ok), argv/envp stack is
   capped (MAX_ARGS/MAX_ENVS + VMM_USER_STACK_PAGES), no PT_INTERP/dynamic loader
   exists. LOW/latent: no p_filesz<=p_memsz check; the eager-path `data+file_off`
   overflow guard is dead code (every caller uses the lazy backing-file path).
 - AF_UNIX SCM_RIGHTS -> fd-array counts bounded (SCM_MAX_FD), sender refcount and
+  [Status 2026-11-08: SAFE for bounds (SCM_MAX_FD enforced); RIGHT_SEND_FD not checked, see F160]
   queue-vs-teardown ownership correct. The recvmsg double-close it flagged is
   subsumed by the F37 fd_install fix (fd_install no longer closes, so recvmsg's
   vfs_close is now the single correct close).
 - ext2 device-LBA wrap -> FIXED (F46): bcache_get/write_block formed `uint32_t lba
+  [Status 2026-11-08: F46 FIXED (7c9f801); recorded ahci_read/write LBA-vs-capacity bound still OPEN (low, see follow-up (d))]
   = s_part_lba + blk * s_sectors_per_blk` (u32) before passing it to the uint64_t
   ahci_read/write. blk is bounded only by the untrusted on-disk s_blocks_count, so
   blk*spb (spb<=8) overflows u32 and WRAPS to a valid wrong sector (crafted-image
@@ -876,6 +1004,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   ext2_inode_size_valid_selftest drives the reject cases; boot still mounts + loads
   /bin/login (real s_inode_size valid).
 - socket syscalls deref raw user pointer -> FIXED (F51, HIGH/LPE): sys_recvfrom /
+  [Status 2026-11-08: FIXED (acf0f0e); residual raw user writes after blocking (tcp.c, socket.c) can panic on a racing munmap, see (l)]
   sendto / accept / connect / bind passed the raw user buf_ptr / addr_ptr (only
   !NULL-checked) to code that derefs them DIRECTLY -- tcp_recv_data `dst[i]=` into
   buf_ptr, UDP/unix recv memcpy into buf_ptr, socket_accept writes peer sockaddr,
@@ -938,6 +1067,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pointed at this change during a flaky-boot stall; a denial-tracing debug (zero denials)
   was the decisive check -- confirm the mechanism, not just one revert sample.
 - ext2_write_file overwrite race -> FIXED (F56): the overwrite branch read the inode as a
+  [Status 2026-11-08: race FIXED (ae363f4). NEW: error path frees the old blocks before the new
+  inode is committed; a later alloc/write failure (disk full) leaves freed blocks referenced]
   read_inode SNAPSHOT (lock released), then ran free_inode_blocks + alloc/write/set-block
   with NO inode lock held, taking inode_lock only for the final writeback. Two concurrent
   writers to the SAME file (two O_TRUNC opens, ftruncate+write) both snapshot the same
@@ -974,6 +1105,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   self-reaping it as TASK_DEAD -- a per-thread task-struct/pid LEAK (the very thing the
   sys_exit thread branch avoids), not a memory-safety bug; investigate separately.
 - SOCK_DGRAM connect() default destination not refcounted -> FIXED (F58): the DGRAM connect
+  [Status 2026-11-08: FIXED (4ae6947). Suspected (untested): the old=dgram_dest swap is unlocked, so two
+  concurrent connect() calls can both unix_put(old). Also send() after DGRAM connect checks s->peer]
   branch cached `s->peer = target` with no unix_get and no back-pointer (asymmetric: target
   does not point back, so its close cannot clear the senders' cached pointers like a
   symmetric stream/socketpair peer's close does). So connect A->B, close B (RCU-freed,
@@ -990,6 +1123,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   new, THE INVARIANT (destination survives its own close while a sender references it ->
   refcount==1, not freed), sendto-after-dest-close returns 2, final close balances. Boot:
   `[unix_dgram_peer] SELF-TEST PASSED`, socketpair + refcount selftests still pass, 0 fault.
+  [Status 2026-11-08: follow-ups (f) F60, (g) F59, (h) F62 all FIXED]
   RECORDED follow-ups (verified-real, NOT yet fixed): (f) epoll readiness scan re-resolves
   the watched file by raw `fd_table[w->fd]` + `f->poll(f,...)` with no ref/RCU (wrong lock)
   while the watch already pins `w->file` -> close+reuse on another thread of the same files
@@ -1054,6 +1188,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   freed-file tryget (freed-fnptr via vtable) / torn nr-vs-array. Fix: hold fixed_files_lock across
   the (nr,array[idx]) read + tryget so the read is consistent and the file is pinned before
   unregister's vfs_close. Code-proof + clean boot (io_uring selftests run, 0 fault, no WD).
+  [Status 2026-11-08: follow-ups (i) F64, (j) F65, (k) F70 all FIXED]
   RECORDED follow-ups (verified-real, NOT yet fixed): (i) signalfd OWNER UAF -- raw task_t* owner
   outlives the owner via fork/SCM_RIGHTS; task_free_rcu frees the task but never NULLs s->owner ->
   child read/poll/close derefs freed task (signalfd.c:79/114/131/145). Fix: signalfd_disown_all in
@@ -1124,6 +1259,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   straddle / in-gap / mid-page / len0 / null-mm / wrap) + code-proof + clean boot (53 selftests; the
   login prompt is a write() of a file-backed .rodata string and renders correctly, proving valid +
   file-backed writes still work and are not zero-filled). RESIDUAL follow-up (l): a concurrent munmap
+  [Status 2026-11-08: (l) PARTIAL: extable landed in b183a70 but covers only copy_*_user; raw derefs still panic]
   between the check and the raw read still panics; the robust fix is a fault-fixup/exception table so
   any kernel-mode fault on a user address returns -EFAULT (would also let copy_*_user/user_buf_check
   drop their file-corrupting prefault for read sources).
@@ -1181,6 +1317,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   (copy_user_strv_selftest: kernel/non-canonical/past-ceiling vector ptr -> -EFAULT; NULL -> empty) +
   code-proof + clean boot (56 selftests; every boot exec/spawn copies a real argv through it).
 - RECORDED (read-only fan-out, HIGH confidence, NOT yet self-verified -- verify before fixing): (n)
+  [Status 2026-11-08: (n)-(q) all FIXED as F72-F75; (r) FIXED as F84]
   sys_brk heap-shrink frees frames before the cross-CPU TLB shootdown (vs munmap's flush-then-free) ->
   sibling-thread stale-TLB UAF write; (o) pty pair lifetime (master_open/slave_open_count/s_pty_head)
   unlocked -> concurrent master+slave close double-frees the pty_t; (p) AF_INET TCP child PCB's raw
@@ -1243,6 +1380,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   dispatch_exec (io_sqe_t snap = *sqe; sqe = &snap) so every read is from the immutable copy -- the
   validate and the use are the same value. Code-proof + io_uring_selftest (NOP dispatch through
   io_uring_enter_impl) still passes + clean boot. Found by a fresh fan-out (futex/scheduler/fork-CoW
+  [Status 2026-11-08: (s) FIXED as F77/F78, (t) FIXED as F83]
   came back SAFE). RECORDED follow-ups from the same fan-out (verify-before-fix): (s) HIGH -- socket
   syscalls (accept/connect/bind/listen/sendmsg/recvmsg + SCM_RIGHTS) use the un-refcounted fd_to_file
   across a BLOCKING op -> a THREAD_SHARE_FILES sibling close() RCU-frees the socket under the blocked
@@ -1255,6 +1393,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pin + fdput on every return path via single-exit goto out, at sys_bind/listen/accept/connect/sendto/
   recvfrom/setsockopt/getpeerpid/shutdown. DHCP exercises sendto/recvfrom (UDP) so the lease proves those
   balance; socketpair/scm_rights/unix_refcount selftests cover the pin primitive; rest code-proof. 58 PASSED,
+  [Status 2026-11-08: (s2) FIXED as F78 (1622ede)]
   clean boot. REMAINING (s2, recorded): w_sys_sendmsg/recvmsg + the SCM_RIGHTS tf loop (~13 returns each +
   unix_sock_sendfd ownership semantics + a bounce[4096] kstack hazard) and epoll/timerfd/signalfd fd_to_file
   -- a dedicated effort, not boot-validatable pre-login.
@@ -1295,6 +1434,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   REMOVED (decl + def), eliminating the footgun (safe-primitives). The whole fd_to_file-across-an-op UAF sweep
   is closed: F73 poll/select, F77 socket syscalls, F78 sendmsg/recvmsg, F80 epoll, F81 timerfd/signalfd.
 - epoll_ctl ADD/MOD read the WATCHED fd raw (fd_table[tfd]) then vfs_tryget in register -> free+reuse UAF ->
+  [Status 2026-11-08: FIXED (b1143b8) as described, but the "cannot be freed/reused" claim below
+  does not hold in general: fdget's tryget-under-RCU races a synchronous kfree of vfs_file_t
+  in most close paths (suspected narrow UAF, untested; see summary item 7)]
   FIXED (F82, follow-up (u), found during F80): the raw read + register's tryget is NOT under rcu_read_lock,
   so a sibling close(tfd) on another CPU can free + reuse the slab slot (ADD: across ep_grow/kmalloc) before
   the tryget bumps it. Mitigated (tryget) and narrower than the epfd bug, but real. Fix: fdget(tfd) (read +
@@ -1321,6 +1463,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   copies under the lock safely (sys_read prefaults the user buffer). Added pty_master_ring_selftest (round-trips
   "hithere" through the locked push/drain). Clean boot 59 PASSED incl. pty_mring + pty_life.
 - AHCI LBA-vs-capacity bound (follow-up (d)) -> ASSESSED SAFE, NOT a memory-safety bug, no fix (2026-06-26):
+  [Status 2026-11-08: SAFE as assessed (unchanged; still no capacity check, no user block-device path)]
   the AHCI read/write paths do not reject an LBA+count past the device's sector capacity. Verified skeptically:
   (1) the MEMORY side of every submit path is bounded by count, INDEPENDENT of lba -- ahci_submit_hhdm/sg/
   read_user all call xfer_bytes_ok(count,512,..) (the F47 wrap+PRDT guard) and cap the PRDT (130/248 entries),
@@ -1334,6 +1477,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   lba outside [part_lba, part_lba+part_size)) would be defense-in-depth against a corrupt/malicious fs image,
   but that is a trusted-fs/feature concern, not a reachable memory-safety bug. Recorded SAFE; not fixed.
 - raw-deref-vs-munmap TOCTOU (follow-up (l)) -> RECORDED, design noted, DEFERRED (big mechanism), no fix this
+  [Status 2026-11-08: PARTIAL: the extable exists (b183a70) but tags only the copy_*_user copy;
+  raw prefault-then-deref sites (pipe_read/pipe_write, pty_master_drain, AF_UNIX send/recv,
+  TCP/UDP recv write-back) still reach kernel_panic on a sibling munmap (local DoS)]
   pass (2026-06-26): a syscall that user_buf_check/prefaults a user buffer then dereferences it RAW (not via
   copy_*_user) has a TOCTOU window -- a THREAD_SHARE_MM sibling munmap()/mprotect() between the check and the
   raw deref unmaps the page, so the kernel deref takes a #PF in kernel mode. The robust fix is a kernel
@@ -1346,6 +1492,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   extable; the extable is a cross-cutting mechanism too large for one audit step. Deferred as a dedicated
   effort; design recorded here so it is known debt, not a buried landmine.
 - 2026-06-26 FAN-OUT (read-only audit over un-swept subsystems; reported by Explore agents, HIGH confidence
+  [Status 2026-11-08: findings (v)(w)(x) FIXED as F85-F87; the SAFE claims (virtio-gpu/input, ELF) UNVERIFIED]
   each, NOT yet independently verified -- VERIFY against the real code before fixing). Two subsystems came back
   SAFE: virtio-gpu/virtio-input virtqueues (every device-writable used-ring id/idx/len and every userspace
   ioctl index is masked to the ring size or bounds-checked; sizes via mul_within_u32/drm_dumb_size; rings
@@ -1400,6 +1547,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   change is provably inert at boot. Clean boot (3rd try past the flaky F55 stall): DHCP, 61 PASSED, no faults.
   All three fan-out candidates (v/x/w) resolved.
 - 2026-06-26 FAN-OUT #3 (5 read-only Explore agents over un-swept subsystems; reported HIGH confidence each,
+  [Status 2026-11-08: (y) F90 and (aa) F89 FIXED; (z) F88 PARTIAL (see (z)); shmem side note FIXED
+  (1eb9aca); the futex/shmem SAFE claims UNVERIFIED]
   NOT yet independently verified -- VERIFY against the real code before fixing). Two SAFE: futex + the
   cleartid-join path (MakaOS has NO robust-list -- only a single-word cleartid join accessed via fault-safe
   copy_to_user; no unbounded user-list walk to cap; F59 waiter lifetime intact; no FUTEX_REQUEUE) and shmem /
@@ -1426,6 +1575,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the lock (so the requester cannot free/return before the wake -> no UAF); ksec_next_seq atomic, skips 0.
   Deterministic ksec_slot_selftest + code-proof. Provably inert at boot (no daemon -> ksec_request -EAGAIN
   early). 3rd re-boot reached DHCP; 62 PASSED incl. ksec_slot + ksec_setuid. All fan-out #3 candidates resolved.
+  [Status 2026-11-08: (z) F88 PARTIAL (37531d7): the struct free is RCU-deferred, but
+  task_files_release vfs_close's each fd (synchronous kfree in most close ops) while the fd_table
+  pointers stay readable, so a /proc/<pid>/fd reader can tryget a freed file (suspected, untested)]
   (z) /proc files_shared UAF (kernel/fs/proc.c: proc_fd_open ~287-297, proc_fd_readdir ~300-318, proc_stat fd
   branch ~591-603): proc_open rcu_read_lock + sched_find_pid pins the TASK struct (RCU-freed in task_free_rcu),
   but the proc fd handlers deref t->files_shared (the target's task_files_t + fdtable_t), which sys_exit frees
@@ -1460,6 +1612,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the worker; the worker publish is a release store and every uring->worker read (close join + ensure_worker
   fast-path) an acquire load. io_uring_test still PASSES + clean boot (DHCP, 61 PASSED).
 - 2026-06-26 FAN-OUT #4 (5 read-only Explore agents over un-swept subsystems; reported HIGH confidence each,
+  [Status 2026-11-08: (bb) F91, (dd) F92, (ee) F93, (cc) F94 all FIXED]
   NOT yet independently verified -- VERIFY against the real code before fixing). One SAFE: AHCI NCQ completion
   (the device-written completed-slot set is done = active_mask & ~sact/~ci, so the device can only CLEAR bits,
   never inject an out-of-range slot index; slots bounded to MAX_NCQ_SLOTS=32; the completer atomically claims
@@ -1598,6 +1751,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   [WD], `More login:` renders. This closes fan-out #4 candidate (cc) -- and with (bb)/(dd)/(ee)/(cc) all fixed,
   ALL of fan-out #4 is now resolved.
 - 2026-06-26 FAN-OUT #5 (5 read-only Explore agents over un-swept subsystems: vmm/page-table teardown, tcp
+  [Status 2026-11-08: (ff) F97, (gg) F95, (hh) F98, (ii) F96 all FIXED; futex SAFE (still no
+  requeue/robust-list); (ff) non-leader execve tgid residual OPEN (correctness)]
   reassembly/retransmit, virtio-net rx/tx ring, futex/robust-list, ext2 dir rename/link/unlink; reported HIGH
   confidence each, NOT yet independently verified -- VERIFY against the real code before fixing, the (bb)/(dd)/
   (ee)/(cc) prescriptions ALL needed refinement). One SAFE: futex (kernel/proc/futex.c, 179 lines) -- the
@@ -1765,6 +1920,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   careful fix -- deserves its own deep turn); then (hh) virtio-net RX bound (trivial surgical fix but malicious-
   device-only, not boot-exercised).
 - 2026-06-26 FAN-OUT #6 (3 read-only Explore agents over un-swept subsystems: AHCI/NVMe DMA scatter-gather,
+  [Status 2026-11-08: (kk) F100 and (ll) F101 FIXED; (jj) F99 PARTIAL (see (jj)); AHCI/NVMe SG SAFE (spot-checked)]
   shmem/CoW fault path, vfs path resolution/symlinks; reported confidence as noted, NOT yet independently
   verified -- VERIFY against the real code before fixing, EVERY fan-out #4/#5 prescription needed refinement).
   AHCI/NVMe SG came back essentially SAFE for the reachable threat model (every reachable PRDT/PRP builder bounds
@@ -1772,6 +1928,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   npages>130, nvme_rw rejects >8KiB; sectors*size funneled through xfer_bytes_ok/mul_within_u32; the only device
   index cqe.cid is nvme_cid_valid-gated; slot/DMA-buffer lifetimes serialized) -- with ONE LATENT-only defect.
   THREE findings:
+  [Status 2026-11-08: (jj) PARTIAL (db95c23): the cross-CPU shootdown now happens, but in both
+  CoW-break paths (vmm_get_user_pages, isr14) pmm_ref_dec(old) runs BEFORE tlb_flush_range, so a
+  narrow stale-TLB read-after-free window remains]
   (jj) HIGH, unprivileged -- CoW break in vmm_get_user_pages does a frame-swap PTE write with only a LOCAL invlpg
   and NO cross-CPU TLB shootdown (kernel/mm/vmm.c ~302-315, the local flush at ~313): all threads of a process
   share one page table (THREAD_SHARE_MM), so `*pte = nf` (swap to the freshly-copied frame) changes the
@@ -1866,6 +2025,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   the sibling syscalls); then (ll) build_prdt bound (trivial defense-in-depth on dead code). NOTE: this fan-out
   ran 3 agents (not the usual ~5); bcache/buffer eviction + tty ldisc deeper remain un-swept for a later round.
 - 2026-06-26 FAN-OUT #7 (5 read-only Explore agents: bcache eviction, tty/pty line discipline, /dev node
+  [Status 2026-11-08: (pp) F102, (mm) F103, (oo) F104, (qq) F105, (nn) F106 all FIXED. OPEN residuals:
+  (oo) pty reopen after full slave close returns NULL (functionality); (qq) two non-SQPOLL threads
+  calling io_uring_enter concurrently can run one SQE twice (correctness). Rest-of-bcache SAFE claim UNVERIFIED]
   lifetime, epoll, io_uring SQ/CQ; reported confidence as noted, NOT yet independently verified -- VERIFY each
   before fixing, EVERY fan-out prescription so far needed refinement). FIVE candidate findings:
   (pp) HIGH, unprivileged LPE -- epoll_close frees epoll_state_t + the epoll vfs_file_t SYNCHRONOUSLY while a
@@ -2143,6 +2305,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     on. Verified by code-proof (strict-conservatism) + a clean SMP boot with the chaselev work-stealing stress
     (20000 ops, 0 missing/0 duplicates) and all 73 selftests, 0 faults.
   OUT-OF-CLASS observations (logged for later scans, NOT this type):
+    [Status 2026-11-08: (a) OPEN (integrity, no frame freed); (b) FIXED (F116, 9b9e7d6);
+    (c) OPEN (dead code, still present with no guard comment)]
     (a) vmm_clone_user_ex intra-walk RW->RO window: a parent sibling can write through a stale RW entry into an
         already-downgraded, now-child-shared frame during the (long) clone before the batched tlb_flush_mm -- a
         CoW-isolation/data-integrity nuance on a still-live shared frame (refcounts stay correct, no frame freed),
@@ -2281,6 +2445,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       kprintf on exhaustion, which never fires at real device counts). The map is a fresh not-present->present
       install at a never-reused VA, so no TLB shootdown is needed (SCAN #2). Boot-proven: every MMIO driver
       (virtio-net/gpu/input, ahci, nvme, hda, ioapic) maps its BARs through it -- net + framebuffer up.
+  [Status 2026-11-08: TCP snd_nxt/state/waiter OPEN; ac97 N/A (ac97.c excluded from the build);
+  timerfd home_cpu, dcache_grow_locked splice, pcache accessed bit OPEN (benign)]
   DOCUMENTED-KNOWN / lower priority (recorded): TCP snd_nxt / send-snapshot / state / waiter (tcp.c, the T4
     "remaining" note at tcp.c:170-174 -- snd_nxt advanced without pcb->lock, send reads an unlocked snapshot,
     pcb->state torn multi-writer, pcb->waiter a single slot that loses a 2nd blocker's wakeup); ac97_write
@@ -2337,6 +2503,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     task_destroy runs once -- do_switch[DEAD] vs sys_wait[ZOMBIE] are state-disjoint), shmem (dec + pages[i]=0
     guard), VMA (rcu unlink before the destroy walk), all alloc-helper error paths kfree directly (not via the
     RCU task_destroy) so no caller double-frees. ALL refcounts are u32 -- no realistic wrap.
+  [Status 2026-11-08: TCP half-open reap FIXED (F119) and listener orphans FIXED (F158), but no
+  per-listener half-open cap (PARTIAL); virtio_net NULL skb FIXED (F120); fat32 FIXED (and excluded
+  from build); drm create_dumb free FIXED (now shmem-backed); pcache_evict_one FIXED (05cdbdd)]
   RECORDED for later (OTHER classes the agents surfaced -- NOT double-free, do NOT fix this turn):
     LEAK (net, remotely-triggerable DoS): half-open TCP child PCBs in TCP_SYN_RCVD are never reaped (tcp.c -- ~128
       KiB per SYN that never gets the final ACK; a SYN flood exhausts kernel memory), and listener close orphans
@@ -2401,6 +2570,10 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     handshake race is closed by reasoning (the s_pcb_wlock establish-or-reap pattern) since TCP is not boot-SMP-
     exercised. SECONDARY (listener-close orphan reaping of completed-but-unaccepted children, + a per-listener
     half-open cap) recorded as a follow-up -- the SYN_RCVD reaper bounds the UNBOUNDED remote DoS (the headline).
+  [Status 2026-11-08: listener-close orphan reaping FIXED (F158); per-listener half-open cap OPEN
+  (no cap, no SYN cookies); ARP cache cap OPEN; AF_UNIX DGRAM queue cap OPEN; task_create_kthread
+  PML4 leak FIXED (e4a83c6); boot-init DMA/MMIO error-path leaks PARTIAL (gpu only, 39a0198);
+  nvme idbuf/smoke page leak OPEN]
   RECORDED (lower-severity leaks, for follow-up): ARP cache no eviction/cap (arp.c -- remote on-link, unbounded,
     ~16 B/entry; add LRU/aging + a cap); AF_UNIX SOCK_DGRAM queue no cap (unix_sock.c unix_sock_sendto -- the lone
     uncapped AF_UNIX queue; add UNIX_DGRAM_QUEUE_MAX like UDP_RX_QUEUE_MAX); task_create_kthread leaks the PML4
@@ -2433,6 +2606,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     "return 1 => valid skb" contract is now sound, so a future caller cannot reintroduce the bug). Verified by the
     DHCP lease (the OFFER/ACK are received through the new loop -> ifconfig IP 10.0.2.15) + code-proof (the
     `if (!skb) continue` drop path).
+  [Status 2026-11-08: vmm_map_mmio checks, task_create_kthread/user, fat32_open all FIXED; the
+  wrong-sentinel `!phys` class PARTIAL: 5 sites in virtio_net.c (virtq_alloc x3, RX loop, TX buffer)
+  still test `!phys`]
   RECORDED (OOM-only / boot-init / dead code -- NOT unprivileged-reachable, lower priority):
     vmm_map_mmio 0-on-exhaustion (F116) deref'd without a 0-check at boot-init MMIO sites: ioapic.c:127 s_base,
       nvme.c:682 s_regs + :622 s_msix_table, ahci.c:1023 s_hba + :1102 s_msix_entry, virtio_net.c:712 msix_table --
@@ -2468,6 +2644,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   UINT64_MAX on OOM (NOT 0), but many DMA-buffer callers tested `if (!phys)` / `== 0`, which NEVER catches OOM ->
   `phys + HHDM_OFFSET` wraps to a wild kernel pointer (~HHDM_OFFSET-1) -> a wild kernel memset / DMA program on OOM.
   Swept the whole tree; mm/** is uniformly clean (== PMM_INVALID_ADDR). The cluster is the driver DMA-init paths.
+  [Status 2026-11-08: F121 FIXED for ahci/hda/virtio_gpu/virtio_input/ac97 (0f5c16e); virtio_net.c was missed]
   FIXED (F121, ONE commit -- same root): extracted PMM_ALLOC_OK(p) := ((p) != PMM_INVALID_ADDR) into pmm.h and gated
     all 20 pmm_buddy_alloc results across 5 drivers through it, so a `!phys`/`==0` mis-check can never recur:
       ahci.c port_init -- had NO checks at all: s_cmdlist_phys/s_fis_phys (239/240) + each s_ctbl_phys[i] (249) were
@@ -2486,6 +2663,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     Verified: a clean boot with ahci/hda/virtio-gpu/virtio-input all initialising proves the non-OOM path is
     unbroken (a valid frame passes PMM_ALLOC_OK exactly as `!phys` passed before); the OOM branch is code-proven (a
     UINT64_MAX result now correctly fails). mm/** already used == PMM_INVALID_ADDR everywhere, so no fix there.
+  [Status 2026-11-08: spawn SPAWN_ATTR_UNVEIL FIXED (F122, ed69751; bad_attr still leaves the child
+  unconfined); ahci_submit_sg missing AHCI_READ_POISON re-check OPEN (live via ahci_read_user)]
   RECORDED (out-of-type, found by the SCAN #8 sweep -- HIGHER severity than the in-type residuals, queued for
   dedicated turns):
     FIXED (F122) -- spawn SPAWN_ATTR_UNVEIL raw user-pointer deref (a SCAN #3 straggler): sys_spawn's
@@ -2504,6 +2683,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     ahci_submit_sg omits the AHCI_READ_POISON sentinel re-check that the sibling AHCI read paths perform after the
       DMA completes, so a poisoned (failed-read) sector can be returned as valid data on an unprivileged file read
       (stale-data-as-valid). Medium; queue for a TOCTOU/sentinel follow-up.
+  [Status 2026-11-08: socket_bind port-0 sentinel OPEN; ignored OOM returns PARTIAL (task_fork
+  still ignores pid_alloc()==0); io_uring DRM_COMMIT fdput FIXED (F128)]
   RECORDED (in-type, lower severity -- the remaining wrong-sentinel / ignored-return residuals):
     socket_bind: port 0 is BOTH a valid "any port" request AND the empty-slot sentinel in the bind table, so the
       0-as-sentinel overload can misclassify; needs an explicit occupied flag rather than port==0.
@@ -2533,6 +2714,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     ipv4_send_ex (guards the IP total_len wrap for ALL L4 protocols); socket callers pass full-width len and surface
     -EMSGSIZE; added EMSGSIZE(90) to errno.h. New udp_send_size_selftest (pure reject-path unit test) + DHCP proves
     the valid path. mm/** uses == PMM_INVALID_ADDR / u64 bounds everywhere; nothing to fix there.
+  [Status 2026-11-08: ext2_vfs_pread u32 offset OPEN; dir_remove_entry name_len clamp OPEN; ext2 loop
+  casts, shmem/mmap narrowings, eth/ipv4 TX u16 SAFE (still bounded)]
   RECORDED (LOW / latent -- narrowing present but bounded downstream, NOT unprivileged OOB):
     fs: ext2_vfs_pread `(uint32_t)offset` (ext2.c:1330) -- bounded by the u32 i_size, no OOB (wrong-offset only at
       >4 GiB, unsupported). dir_remove_entry `(uint8_t)name_len` match vs full-width kmemeq (ext2.c:2173) -- a
@@ -2581,6 +2764,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   Both verified by the new out_struct_zerofill_selftest (pins sizeof(ext2_entry_t)==268 / sizeof(utsname_t)==390 so
     a future field-add that adds uncovered padding fails the build-boot, and asserts the zero-before-fill leaves the
     tail + padding zero) + boot (svcmgr opendir/readdir of /etc/services exercises sys_readdir every boot).
+  [Status 2026-11-08: proc_stat OPEN (latent, still no callers); sin_zero note SAFE as stated]
   RECORDED (not fixed -- dead/unreachable): proc_stat (fs/proc.c:538) fills a partial `struct stat` without zeroing,
     but has NO caller (the live /proc stat path is sys_stat's is_virtual branch, which memsets) -- a latent footgun
     if ever wired up. fat32 readdir/stat fillers -- DEAD (unwired, no VFS hookup).
@@ -2619,6 +2803,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     own ref keeps refcount>=1); task_fork/sys_thread call it (+ now handle the OOM return, fixing a latent
     fd_table_init-ignored NULL-deref); resolve_stdio (which also DOUBLE-FETCHED the slot) reads it once under the
     lock. New fd_table_clone_selftest + heavy boot-exercise (every spawn clones through it; login + DHCP prove it).
+  [Status 2026-11-08: F127, F128, F129 FIXED; TCP lost-wakeup (4 sites) OPEN, unchanged; fs_lookup
+  final-file permission FIXED (34e1c6b, 2026-08-13); mmap re-resolving f->path OPEN; socket_bind
+  pcb free FIXED (F132)]
   RECORDED (real, queued for follow-up turns):
     FIXED (F127): sys_spawn stdio double-fetch (syscall.c:1471) -- unprivileged kernel #PF panic. After
       copy_from_user'ing stdio[3] into a kernel local (1375, EFAULT on a bad ptr), the job-control branch RE-READ
@@ -2690,6 +2877,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     re-take d->lock after sched_sleep and `if (c->reader == g_current) c->reader = NULL;` before the EINTR
     return/loop, making the read path's c->reader handling exhaustive (mirrors signalfd_disown_all + the producer's
     own clear). Verified: code-proof + [evdev_ring] boot-exercise.
+  [Status 2026-11-08: F130-F134 FIXED; pcache_evict_inode inversion OPEN (latent, 0 callers);
+  do_switch switching_from FIXED (b183a70, 2026-08-13; the bug was real)]
   RECORDED (NEW, queued for follow-up):
     FIXED (F131): dcache_invalidate freed a dentry UNCONDITIONALLY (dentry_unlink_and_free_locked -> call_rcu_head,
       NO refcount check) while a path-walk held it by refcount alone OUTSIDE rcu (dcache_lookup rcu_read_unlocks
@@ -2751,6 +2940,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
     lock inventory (docs/LOCKS.md) for any two locks acquired in different orders by different paths.
 
 - 2026-06-27 BUG-TYPE SCAN #13 (lock-ordering / deadlock), led by the ext2_perm_op flaky boot HANG. ROOT-CAUSED this
+  [Status 2026-11-08: the ext2_perm_op hang is FIXED (F135, 1f47765); the "no fix yet" is stale]
   turn (no fix yet -- the fix is a substantial dedicated change). Investigation:
   (1) STATIC lock-order map (3 parallel agents over ext2 mutate / ext2 read+dcache / bcache+pcache+reclaim-kthreads)
     found the blocking-lock graph is ACYCLIC -- NO classic AB-BA inversion. Verified: bcache way-lock is spin_TRYLOCK
@@ -2894,6 +3084,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       orphaned object; the found path is unchanged (exactly one ref to the VMA). Code-proof + boot (mmap/shmem
       selftests PASSED, 0 faults). *** This was the LAST SCAN #15 residual -- SCAN #15 is now FULLY CLOSED
       (F139-F144).
+    [Status 2026-11-08: io_uring lost CQE FIXED (F146); fd_table_init FIXED (F145); sendmsg
+    SCM_RIGHTS not all-or-nothing OPEN (earlier fds stay queued on a later failure)]
     (correctness, NOT leaks) io_uring.c mid-chain ENOMEM loses/skips a CQE (does not rewind *phead) -> userspace hang;
       sendmsg SCM_RIGHTS is not all-or-nothing; elf.c/process.c a few unchecked fd_table_init -> NULL-deref crash (not
       a leak). These are real but out-of-class (hangs/crashes, not resource leaks) -- candidates for later type scans.
@@ -2931,6 +3123,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
       dir_set_dotdot ignored before an unconditional parent link-count swap. Fixed: on dir_remove_entry(src) failure
       ROLL BACK (remove the dst dirent dir_add_entry added) + return 0 so the rename is atomic; gate the link-count
       swap on `&& dir_set_dotdot(...)` so counts stay consistent with the (un-repointed) "..". Code-proof + boot
+      [Status 2026-11-08: F147 FIXED (1c77834); unlink-vs-rename exclusion OPEN (mitigated by rollback);
+      note s_rename_lock is a spinlock held across blocking dir I/O (not re-verified)]
       ([fs_permop] rename + [ext2_dotdot] PASSED, 0 faults). Residual (separate lock-scan item): unlink-vs-rename do
       not mutually exclude (different locks) -- the rollback makes rename atomic w.r.t. its own ops.
     *** FIXED F148 (2026-06-27): vmm.c:191 vmm_map_physical_user (FB map) ignored vmm_page_map -> a holey mapping
@@ -3016,6 +3210,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   unprivileged DoS, unveil is an ordinary syscall any process calls), and a kernel-half path_ptr reads KERNEL memory
   into the unveil entry (info-exposure). Fixed (F154) with copy_from_user (range-check + prefault) -> -EFAULT, the
   exact class+fix that copy_path_from_user already exists for; see AUTOFIX_LOG F154.
+  [Status 2026-11-08: SAFE as stated (unchanged); unverified: sys_read does not check VMA_W on the buffer]
   LOW note (not fixed, recorded): sys_read (syscall.c:~310) validates its buf with user_buf_prefault directly rather
   than user_buf_check/_access_ok -- still defended (a kernel/non-canonical buf has no user VMA so prefault returns -1,
   and prefault rejects addr+len wrap), so NOT exploitable; a uniformity tightening, not a bug. The F153
@@ -3065,6 +3260,9 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   pcache (caller ref + cache ref, evict TOCTOU safe); munmap/brk (dec after TLB shootdown, MMIO skipped); exec/elf
   (mm-aware frees, fresh-image error paths); io_uring fixed-files (tryget + pin-before-unregister, SQPOLL/worker
   stop-joined before release); eventfd/signalfd/timerfd/pty (no pmm refs, lock-guarded single free site, tryget).
+  [Status 2026-11-08: dead mm_t.refcount OPEN (harmless). F159 PARTIAL (599739e): one timer thread
+  now, but tcp_timer_tick still rewinds/restores snd_nxt without pcb->lock while tcp_send reads it
+  and tcp_send_segment advances it (stream corruption, not OOB)]
   DEAD field: mm_t.refcount (mm.c:70) set to 1, never inc/dec'd (thread sharing uses task_mm_t.refs) -- harmless,
   deletable. Out-of-class data race (recorded, not a lifetime bug): tcp_timer_tick now runs from TWO threads and mutates
   pcb seq accounting under rcu_read_lock without pcb->lock (the documented "T4" issue) -- no double-free (reap lists
@@ -3095,6 +3293,7 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   user ring_mask) + fixed-file `idx < nr` + the single-fetched-SQE user_buf_check. The ONLY truncations present are
   BY-DESIGN and structurally non-exploitable (wrong-result only, no OOB): ext2 32-bit i_size/offsets (files are <4 GiB
   so a >4 GiB offset is unreachable; every derived blk_idx/remain_file is also u32 + clamped to i_size + ext2_run_valid
+  [Status 2026-11-08: ext2_vfs_seek u32 truncation OPEN (low); pg_file_idx key SAFE]
   range-checks the physical block); ext2_vfs_seek `cur_pos = (uint32_t)new_pos` (a >4 GiB lseek truncates the SEEK
   position but reads clamp cur_pos to the <=4 GiB file_size -- a POSIX wrong-result nit, recorded LOW, not a bug); vmm
   pg_file_idx `(uint32_t)(off >> PAGE_SHIFT)` used ONLY as a pcache HASH KEY (not an array index; the disk read uses the
@@ -3103,7 +3302,8 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   load-bearing guard named per subsystem, a strong diminishing-returns signal -- the campaign is wound down here (see
   docs/SESSION_2026-06-27_bughunt.md).
 
-- 2026-07-01 CONCURRENCY + INFO-LEAK spot-scan (post-F159), SWEPT CLEAN -- cheap targeted look, no new bug. Concurrency:
+- [Status 2026-11-08: PARTIAL: the "tcp rexmit single-writer after F159" premise ignores tcp_send's snd_nxt use, see F159]
+  2026-07-01 CONCURRENCY + INFO-LEAK spot-scan (post-F159), SWEPT CLEAN -- cheap targeted look, no new bug. Concurrency:
   the T4-class "single-writer/no-lock" premises are all sound (drm s_drm_open_count + input kbd-grab use __atomic_*;
   s_handlers is init-only-write / post-init-read; tcp rexmit is single-writer again after F159; sched/rcu counters are
   per-CPU-owned); IRQ handlers use the notify-thread pattern (virtio_net/virtio_input) or a lock (ahci s_ci_lock) or
@@ -3112,6 +3312,15 @@ botched grant = the F31 bug class). Low priority, do NOT treat as urgent.
   memory-safety + concurrency space is mined out (F135-F159 across SCANs #13-#20 + concurrency); campaign stays wound
   down -- see docs/SESSION_2026-06-27_bughunt.md.
 
-- 2026-07-01 PHASE 5 concrete-security scans COMPLETE. Swept the concrete attacker-goal surface and landed F160-F165: fd-rights confinement (F160, ~80% unenforced incl. mmap-PROT_EXEC bypass), cross-uid authorization (F161 kill() was totally unauthorized; F162 setpgid moved foreign groups), info-disclosure/capability-theft (F163 /proc/<pid>/fd dup'd a foreign fd cross-uid), resource-exhaustion DoS (F164 no per-process fd cap; F165 no nproc cap = fork bomb). VERIFIED SOLID (no fix needed): setuid/ksec LPE + agent registration (root-gated, fail-closed); sandbox unveil/pledge (pledge dispatch-gated; unveil "..": normalize_path collapses ".." with no root underflow BEFORE unveil_ok, applied in fs_lookup for open/stat/access + explicitly in exec/mkdir/link/rename -> the classic prefix-match escape is blocked); target-PID authz surface closed (other pid-target syscalls absent). The concrete-security surface (authz, info-disclosure, resource-DoS, fd-confinement, sandbox-escape) is swept; remaining surface solid.
+- [Status 2026-11-08: F161, F163, F164 FIXED; F162 FIXED (low residual: target pgid not checked to
+  exist in the caller's session). F160 PARTIAL: rights not checked by io_uring READ/WRITE or
+  sendmsg/recvmsg, SCM_RIGHTS ignores RIGHT_SEND_FD, and sys_ftruncate on an ext2 fd checks no
+  write mode/rights/permission (read-only fd can truncate a root-owned file). F165 PARTIAL: sys_spawn
+  never calls user_task_over_cap. The "unveil verified solid" claim is UNVERIFIED and contradicted
+  by sys_spawn lacking unveil_ok (see F38)]
+  2026-07-01 PHASE 5 concrete-security scans COMPLETE. Swept the concrete attacker-goal surface and landed F160-F165: fd-rights confinement (F160, ~80% unenforced incl. mmap-PROT_EXEC bypass), cross-uid authorization (F161 kill() was totally unauthorized; F162 setpgid moved foreign groups), info-disclosure/capability-theft (F163 /proc/<pid>/fd dup'd a foreign fd cross-uid), resource-exhaustion DoS (F164 no per-process fd cap; F165 no nproc cap = fork bomb). VERIFIED SOLID (no fix needed): setuid/ksec LPE + agent registration (root-gated, fail-closed); sandbox unveil/pledge (pledge dispatch-gated; unveil "..": normalize_path collapses ".." with no root underflow BEFORE unveil_ok, applied in fs_lookup for open/stat/access + explicitly in exec/mkdir/link/rename -> the classic prefix-match escape is blocked); target-PID authz surface closed (other pid-target syscalls absent). The concrete-security surface (authz, info-disclosure, resource-DoS, fd-confinement, sandbox-escape) is swept; remaining surface solid.
 
-- 2026-07-01 workflow-scan backlog CLEARED (F166-F171): F166 socket read-buffer prefault corruption, F167 fat32 NULL-derefs, F168 fg_pgid torn write, F169 tcp ephemeral-port SMP race, F170 wake_one dead-entry dispatch, F171 TIOCSPGRP session authz. The LARGE 14-subsystem adversarial (double-refuter) scan otherwise found the codebase clean -- authz/info-disclosure/resource-DoS/memory-safety/concurrency all swept across F135-F171; two workflow candidates (AHCI count-overflow, tcp:928 window-underflow) were verified NOT bugs.
+- [Status 2026-11-08: F166-F170 FIXED (fat32 also excluded from the build). F171 PARTIAL: TIOCSCTTY
+  sets ctty and fg_pgid with no session-leader check, and sys_spawn / wait set the console fg_pgid
+  without authorization]
+  2026-07-01 workflow-scan backlog CLEARED (F166-F171): F166 socket read-buffer prefault corruption, F167 fat32 NULL-derefs, F168 fg_pgid torn write, F169 tcp ephemeral-port SMP race, F170 wake_one dead-entry dispatch, F171 TIOCSPGRP session authz. The LARGE 14-subsystem adversarial (double-refuter) scan otherwise found the codebase clean -- authz/info-disclosure/resource-DoS/memory-safety/concurrency all swept across F135-F171; two workflow candidates (AHCI count-overflow, tcp:928 window-underflow) were verified NOT bugs.
