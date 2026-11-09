@@ -43,6 +43,17 @@ fi
 # from a fresh clone.
 MINIMAL="${MINIMAL:-0}"
 
+# Small single-file programs in userland/apps/<name>/<name>.c, installed as
+# /bin/<name> in every build (MINIMAL included).  One list each for compile and
+# install so they cannot drift.
+#   CORE_UTILS: written against the in-tree libc.h API, linked with plain ld
+#               against the in-tree runtime objects.
+#   POSIX_APPS: ordinary POSIX programs, compiled against the sysroot headers and
+#               linked against the sysroot libc.a (see posix_app below).
+#               kilo is antirez's editor (BSD-2-Clause, vendored unmodified).
+CORE_UTILS="cat echo mkdir rm mv clear reboot uname"
+POSIX_APPS="kilo"
+
 # ── Kernel compile flags (clang, ELF64, freestanding) ─────────────────────
 KERNEL_INCLUDES=(
   -I "$KERNEL_DIR"
@@ -396,6 +407,19 @@ USER_RT=(
 
 USER_LINK="$USERLAND_DIR/link.ld"
 
+# posix_app <name>: build userland/apps/<name>/<name>.c as an ordinary POSIX
+# program: MakaOS sysroot headers only (-nostdinc, plus the compiler's own
+# freestanding headers), static link of crt0.o + the object + libc.a with plain
+# ld.  Works with the host gcc (MINIMAL/bootstrap) and the cross gcc alike.
+posix_app() {
+  local name="$1"
+  "$USER_CC" "${USER_CFLAGS[@]}" "${SYSROOT_CFLAGS[@]}" \
+    -isystem "$("$USER_CC" -print-file-name=include)" \
+    -c "$USERLAND_DIR/apps/$name/$name.c" -o "$BUILD_DIR/user_$name.o"
+  ld -nostdlib -T "$USER_LINK" "$SYSROOT/usr/lib/crt0.o" "$BUILD_DIR/user_$name.o" \
+    --start-group "$SYSROOT/usr/lib/libc.a" --end-group -o "$BUILD_DIR/user_$name.elf"
+}
+
 if [ "$MINIMAL" = "1" ]; then
   echo "[+] MINIMAL: core in-tree programs only (no ports)"
   # Linked with plain ld against the in-tree runtime objects (like the
@@ -407,9 +431,10 @@ if [ "$MINIMAL" = "1" ]; then
     ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_$name.o" \
       -o "$BUILD_DIR/user_$name.elf"
   }
-  for app in login shell svcmgr net ls ps hello cat echo mkdir rm mv clear reboot uname; do
+  for app in login shell svcmgr net ls ps hello $CORE_UTILS; do
     minimal_app "$app"
   done
+  for app in $POSIX_APPS; do posix_app "$app"; done
 fi
 
 if [ "$MINIMAL" != "1" ]; then   # full userland: skipped by MINIMAL=1
@@ -822,13 +847,14 @@ fi
 "$USER_CC" "${USER_CFLAGS[@]}" "$BUILD_DIR/user_ls.o" \
    -o "$BUILD_DIR/user_ls.elf"
 
-# ── Coreutils (cat, echo, mkdir, rm, mv, clear, reboot) ─────────────────
-for util in cat echo mkdir rm mv clear reboot uname; do
+# ── Coreutils ($CORE_UTILS) and POSIX programs ($POSIX_APPS) ────────────
+for util in $CORE_UTILS; do
     "$CC" "${USER_CFLAGS[@]}" "${USER_INCLUDES[@]}" \
         -c "$USERLAND_DIR/apps/$util/$util.c" -o "$BUILD_DIR/user_${util}.o"
     ld -nostdlib -T "$USER_LINK" "${USER_RT[@]}" "$BUILD_DIR/user_${util}.o" \
        -o "$BUILD_DIR/user_${util}.elf"
 done
+for app in $POSIX_APPS; do posix_app "$app"; done
 
 # ── Display server (compositor + client library + demo) ────────────────────
 DISPLAY_DIR="$USERLAND_DIR/apps/display"
@@ -1497,7 +1523,7 @@ else
 fi
 
 # ── Coreutils ────────────────────────────────────────────────────────────
-for util in cat echo mkdir rm mv clear reboot uname; do
+for util in $CORE_UTILS $POSIX_APPS; do
     if [ -f "$BUILD_DIR/user_${util}.elf" ]; then
         ext2_install_bin "$BUILD_DIR/ext2.img" "$BUILD_DIR/user_${util}.elf" "bin/$util"
         echo "[+] $util ELF installed at bin/$util (root:root 0755)"
