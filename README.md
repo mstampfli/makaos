@@ -1,30 +1,9 @@
 # MakaOS
 
-> [!CAUTION]
-> ## MakaOS is a hobby OS. It is NOT usable, and it is NOT secure.
->
-> MakaOS is a learning project. It is not an operating system you can use for anything
-> real, and it is deliberately not hardened. Run it only inside QEMU, and never give it
-> a network or data you care about.
->
-> - **No exploit mitigations worth the name:** no ASLR, no KASLR, no SMAP, no kernel
->   W^X, and `mprotect` silently does nothing.
-> - **Accounts are a toy:** passwords are stored in plaintext (`root` / `toor`).
->   File permissions are checked (owner/group/other bits on open, create, delete and
->   path walk), but only the modes the image was built with exist: `chmod`/`chown`
->   report success and store nothing, and every new file is `0644`, owned by its
->   creator.
-> - **Many syscalls fake success**, and the pledge sandbox allows anything it doesn't
->   list.
-> - **Known holes are open:** the security audit
->   ([docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md)) is old and outdated (June and
->   July 2026, partial), and even it lists 33 open findings, including sandbox escapes
->   and local denial of service. Expect many more it does not list.
-> - **It is not Linux:** its syscall ABI is its own, so Linux programs don't run on it
->   directly.
->
-> Nothing here comes with any guarantee. Treat every "works" in this repository as "worked
-> in QEMU on the author's machine".
+> [!NOTE]
+> **Learning project.** MakaOS runs in QEMU and is not hardened (no exploit mitigations, toy
+> accounts, open findings in [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md)). Don't use it for
+> anything real.
 
 A 64-bit hobby operating system for x86-64, written from scratch: a UEFI bootloader, an
 SMP kernel, a custom libc, and its own userland (about 101,000 lines of C and assembly),
